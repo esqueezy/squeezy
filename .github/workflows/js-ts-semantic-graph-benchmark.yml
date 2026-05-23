@@ -80,7 +80,7 @@ jobs:
             --report target/semantic-graph-benchmark/js-ts-smoke.json \
             --mixed-repo target/benchmark-repos/redux-smoke/src \
             --mixed-iterations 500 \
-            --ra-lsp-probes 0 \
+            --ra-lsp-probes 25 \
             --no-speed-gate
 
       - name: Run full external JS/TS comparison
@@ -96,7 +96,7 @@ jobs:
               --report "target/semantic-graph-benchmark/js-ts-real/$name.json" \
               --mixed-repo "target/benchmark-repos/$name/$package_root" \
               --mixed-iterations 1000 \
-              --ra-lsp-probes 0 \
+              --ra-lsp-probes 25 \
               --no-speed-gate
           done <<'REPOS'
           vite packages/vite/src https://github.com/vitejs/vite
@@ -145,9 +145,14 @@ jobs:
                       if mixed.get('refresh_probe'):
                           rp = mixed['refresh_probe']
                           print(f"- Refresh: edited={rp['edited_files']} reparsed={rp['reparsed_files']} in {rp['refresh_ms']} ms budget_exhausted={rp['budget_exhausted']}", file=out)
-                      if mixed.get('accuracy') and mixed['accuracy'].get('symbols'):
-                          macc = mixed['accuracy']['symbols']
-                          print(f"- Mixed oracle symbols: TP={macc.get('true_positive',0)} FP={macc.get('false_positive',0)} FN={macc.get('false_negative',0)} precision={macc.get('precision',0)} recall={macc.get('recall',0)}", file=out)
+                  if mixed.get('accuracy') and mixed['accuracy'].get('symbols'):
+                      macc = mixed['accuracy']['symbols']
+                      print(f"- Mixed oracle symbols: TP={macc.get('true_positive',0)} FP={macc.get('false_positive',0)} FN={macc.get('false_negative',0)} precision={macc.get('precision',0)} recall={macc.get('recall',0)}", file=out)
+                  if mixed.get('accuracy') and mixed['accuracy'].get('navigation'):
+                      nav = mixed['accuracy']['navigation']
+                      d = nav.get('definitions', {})
+                      r = nav.get('references', {})
+                      print(f"- Navigation: def_probes={d.get('probes',0)}/{d.get('available_probes',0)} def_tp={d.get('true_positive',0)} def_fp={d.get('false_positive',0)} def_fn={d.get('false_negative',0)} ref_symbols={r.get('symbols_sampled',0)}/{r.get('available_symbols',0)} ref_tp={r.get('true_positive',0)} ref_fp={r.get('false_positive',0)} ref_fn={r.get('false_negative',0)} oracle={nav.get('rust_analyzer_lsp_ms','?')}ms", file=out)
                   if report.get("queries"):
                       print("", file=out)
                       print("| Query | Actual | Missing | Extras |", file=out)

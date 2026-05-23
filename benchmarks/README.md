@@ -80,17 +80,26 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
   --report target/semantic-graph-benchmark/js-ts-smoke.json \
   --mixed-repo target/benchmark-repos/redux/src \
   --mixed-iterations 500 \
-  --ra-lsp-probes 0 \
+  --ra-lsp-probes 25 \
   --no-speed-gate
 ```
 
-When the pinned Node `typescript` package is installed, the JS/TS benchmark also
-runs a benchmark-only TypeScript compiler API declaration oracle and reports
-symbol TP/FP/FN. If TypeScript is unavailable, the report records that status
-explicitly and still validates the tree-sitter query spec. The mixed workload
-clocks all nine query types (hierarchy, symbol lookup, signature search, body
-search, reference search, references-to-symbol, callers, callees, call-chain)
-against real JS/TS repos and runs a two-file refresh probe.
+When the pinned Node `typescript` package is installed, the JS/TS benchmark runs
+three oracle tiers:
+1. **Declaration oracle** — TypeScript compiler API compares exported symbol
+   TP/FP/FN for file/name/kind declarations.
+2. **Mixed workload** — all nine query types (hierarchy, symbol lookup, signature
+   search, body search, reference search, references-to-symbol, callers, callees,
+   call-chain) against real JS/TS repos, plus a two-file refresh probe.
+3. **Navigation oracle** — TypeScript Language Service `getDefinitionAtPosition`
+   and `findReferences` probes on sampled call edges and declaration symbols,
+   producing definition TP/FP/FN (including `wrong_target` and `squeezy_only`
+   counts) and reference TP/FP/FN, mirroring the rust-analyzer LSP probes on the
+   Rust benchmark. `--ra-lsp-probes 0` disables the navigation oracle; `--ra-lsp-probes 25`
+   (default) samples 25 definition probes and 25 reference probes.
+
+If Node or TypeScript is unavailable the report records that status explicitly
+and still validates the tree-sitter query spec.
 
 JS/TS full-tier comparison uses five representative open-source repositories:
 Vite, Redux, Axios, Express, and Prettier. A local May 23, 2026 run with the

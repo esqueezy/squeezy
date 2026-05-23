@@ -285,12 +285,16 @@ required expected results are missing or, when a validation oracle is available,
 Squeezy graph build plus query time is not faster than the validation pass for
 the same fixture.
 
-The JS/TS smoke benchmark validates a controlled TSX fixture with query specs and
-can use the TypeScript compiler API as a benchmark-only declaration oracle when
-the `typescript` package is available to Node. That oracle reports symbol
-TP/FP/FN for file/name/kind declarations without becoming a production
-dependency. If Node or TypeScript is unavailable, the report records that status
-explicitly and still runs the tree-sitter query spec.
+The JS/TS smoke benchmark validates a controlled TSX fixture with query specs.
+When the `typescript` npm package is available, the benchmark also runs three
+oracle tiers: a declaration oracle (TypeScript compiler API, reports symbol
+TP/FP/FN for file/name/kind declarations), a mixed workload (all nine query
+types against real repos with a refresh probe), and a navigation oracle
+(TypeScript Language Service `getDefinitionAtPosition` / `findReferences` probes
+on sampled call-edge sites and declaration symbols — the JS/TS equivalent of the
+rust-analyzer LSP probes on the Rust benchmark). If Node or TypeScript is
+unavailable the report records that status explicitly and still runs the
+tree-sitter query spec.
 
 The C and C++ smoke benchmarks validate fixtures with `clang -fsyntax-only` and
 `clang++ -fsyntax-only`, then compare declaration symbols against
