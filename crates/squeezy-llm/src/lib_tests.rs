@@ -9,9 +9,11 @@ async fn unavailable_provider_reports_configuration_error() {
     let request = LlmRequest {
         model: "test-model".to_string(),
         instructions: "test".to_string(),
-        input: "hello".to_string(),
+        input: vec![LlmInputItem::UserText("hello".to_string())],
         max_output_tokens: Some(16),
         previous_response_id: None,
+        tools: Vec::new(),
+        store: false,
     };
 
     let mut stream = provider.stream_response(request, CancellationToken::new());

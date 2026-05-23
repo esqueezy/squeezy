@@ -13,10 +13,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use squeezy_agent::{Agent, AgentEvent};
+use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision, ToolApprovalRequest};
 use squeezy_core::{AppConfig, Result, Role, SqueezyError, TranscriptItem};
 use squeezy_llm::LlmProvider;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
@@ -49,6 +49,33 @@ async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::AssistantDelta { delta, .. } => {
                     app.pending_assistant.push_str(&delta);
+                }
+                AgentEvent::ToolCallQueued { call, .. } => {
+                    app.status = format!("tool queued: {}", call.name);
+                }
+                AgentEvent::ToolCallStarted { call, .. } => {
+                    app.status = format!("running tool: {}", call.name);
+                }
+                AgentEvent::ToolCallCompleted { result, .. } => {
+                    app.status = format!(
+                        "tool {}: {:?} bytes={} truncated={}",
+                        result.tool_name,
+                        result.status,
+                        result.cost_hint.output_bytes,
+                        result.cost_hint.truncated
+                    );
+                }
+                AgentEvent::ApprovalRequested {
+                    request,
+                    decision_tx,
+                    ..
+                } => {
+                    app.status = format!("approve {}? y/n", request.summary);
+                    app.pending_approval = Some(PendingApproval {
+                        request,
+                        decision_tx,
+                    });
+                    break;
                 }
                 AgentEvent::Completed { message, cost, .. } => {
                     app.transcript.push(message);
@@ -101,6 +128,10 @@ async fn handle_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> Result<bo
         return Ok(true);
     }
 
+    if handle_approval_key(app, key) {
+        return Ok(false);
+    }
+
     match key.code {
         KeyCode::Esc => Ok(true),
         KeyCode::Enter => {
@@ -125,10 +156,36 @@ async fn handle_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> Result<bo
             Ok(false)
         }
         KeyCode::Char(ch) => {
-            app.input.push(ch);
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                app.input.push(ch);
+            }
             Ok(false)
         }
         _ => Ok(false),
+    }
+}
+
+fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    let Some(pending) = app.pending_approval.take() else {
+        return false;
+    };
+
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let _ = pending.decision_tx.send(ToolApprovalDecision::Approved);
+            app.status = format!("approved {}", pending.request.tool_name);
+            true
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            let _ = pending.decision_tx.send(ToolApprovalDecision::Denied);
+            app.status = format!("denied {}", pending.request.tool_name);
+            true
+        }
+        _ => {
+            app.status = format!("approve {}? y/n", pending.request.summary);
+            app.pending_approval = Some(pending);
+            true
+        }
     }
 }
 
@@ -199,7 +256,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let tokens = format!(
-        "provider={} model={} status={} in={} out={} cached={} | Enter send | Ctrl-C cancel/quit | Esc quit",
+        "provider={} model={} status={} in={} out={} cached={} | Enter send | y/n approve | Ctrl-C cancel/quit | Esc quit",
         app.provider_name,
         app.model,
         app.status,
@@ -226,6 +283,7 @@ struct TuiApp {
     cost: squeezy_core::CostSnapshot,
     turn_rx: Option<mpsc::Receiver<AgentEvent>>,
     cancel: Option<CancellationToken>,
+    pending_approval: Option<PendingApproval>,
 }
 
 impl TuiApp {
@@ -240,8 +298,14 @@ impl TuiApp {
             cost: squeezy_core::CostSnapshot::default(),
             turn_rx: None,
             cancel: None,
+            pending_approval: None,
         }
     }
+}
+
+struct PendingApproval {
+    request: ToolApprovalRequest,
+    decision_tx: oneshot::Sender<ToolApprovalDecision>,
 }
 
 struct TerminalGuard {

@@ -6,7 +6,9 @@ use std::{
 use clap::Parser;
 use futures_util::StreamExt;
 use squeezy_core::{AppConfig, ProviderConfig};
-use squeezy_llm::{LlmEvent, LlmProvider, LlmRequest, OpenAiProvider, UnavailableProvider};
+use squeezy_llm::{
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, OpenAiProvider, UnavailableProvider,
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
@@ -55,9 +57,11 @@ async fn run_prompt(
     let request = LlmRequest {
         model: config.model,
         instructions: config.instructions,
-        input: prompt,
+        input: vec![LlmInputItem::UserText(prompt)],
         max_output_tokens: config.max_output_tokens,
         previous_response_id: None,
+        tools: Vec::new(),
+        store: config.store_responses,
     };
     let mut stream = provider.stream_response(request, CancellationToken::new());
     let mut stdout = io::stdout().lock();
@@ -68,6 +72,12 @@ async fn run_prompt(
             LlmEvent::TextDelta(delta) => {
                 write!(stdout, "{delta}")?;
                 stdout.flush()?;
+            }
+            LlmEvent::ToolCall(tool_call) => {
+                eprintln!(
+                    "tool call requested but prompt mode has no tools: {}",
+                    tool_call.name
+                );
             }
             LlmEvent::Completed { cost, .. } => {
                 writeln!(stdout)?;

@@ -1,4 +1,4 @@
-use std::{env, fmt, time::Duration};
+use std::{env, fmt, path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,6 +14,10 @@ pub struct AppConfig {
     pub instructions: String,
     pub max_output_tokens: Option<u32>,
     pub tick_rate: Duration,
+    pub workspace_root: PathBuf,
+    pub permissions: PermissionPolicy,
+    pub store_responses: bool,
+    pub max_parallel_tools: usize,
 }
 
 impl AppConfig {
@@ -25,6 +29,11 @@ impl AppConfig {
         let model = var("SQUEEZY_MODEL").unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string());
         let base_url =
             var("OPENAI_BASE_URL").unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string());
+        let store_responses = parse_bool(var("SQUEEZY_STORE_RESPONSES").as_deref());
+        let max_parallel_tools = var("SQUEEZY_MAX_PARALLEL_TOOLS")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(8);
         Self {
             provider: ProviderConfig::OpenAi(OpenAiConfig {
                 api_key_env: "OPENAI_API_KEY".to_string(),
@@ -34,6 +43,10 @@ impl AppConfig {
             instructions: DEFAULT_INSTRUCTIONS.to_string(),
             max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
             tick_rate: Duration::from_millis(50),
+            workspace_root: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            permissions: PermissionPolicy::from_env_vars(var),
+            store_responses,
+            max_parallel_tools,
         }
     }
 }
@@ -53,6 +66,88 @@ pub enum ProviderConfig {
 pub struct OpenAiConfig {
     pub api_key_env: String,
     pub base_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermissionMode {
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl PermissionMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "allow" | "allowed" => Some(Self::Allow),
+            "ask" | "prompt" | "confirm" => Some(Self::Ask),
+            "deny" | "denied" | "refuse" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PermissionScope {
+    Read,
+    Edit,
+    Shell,
+    IgnoredSearch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionPolicy {
+    pub read: PermissionMode,
+    pub edit: PermissionMode,
+    pub shell: PermissionMode,
+    pub ignored_search: PermissionMode,
+}
+
+impl PermissionPolicy {
+    pub fn from_env_vars(mut var: impl FnMut(&str) -> Option<String>) -> Self {
+        Self {
+            read: parse_permission(var("SQUEEZY_READ_PERMISSION"), PermissionMode::Allow),
+            edit: parse_permission(var("SQUEEZY_EDIT_PERMISSION"), PermissionMode::Ask),
+            shell: parse_permission(var("SQUEEZY_SHELL_PERMISSION"), PermissionMode::Ask),
+            ignored_search: parse_permission(
+                var("SQUEEZY_IGNORED_SEARCH_PERMISSION"),
+                PermissionMode::Allow,
+            ),
+        }
+    }
+
+    pub const fn mode_for(&self, scope: PermissionScope) -> PermissionMode {
+        match scope {
+            PermissionScope::Read => self.read,
+            PermissionScope::Edit => self.edit,
+            PermissionScope::Shell => self.shell,
+            PermissionScope::IgnoredSearch => self.ignored_search,
+        }
+    }
+}
+
+impl Default for PermissionPolicy {
+    fn default() -> Self {
+        Self {
+            read: PermissionMode::Allow,
+            edit: PermissionMode::Ask,
+            shell: PermissionMode::Ask,
+            ignored_search: PermissionMode::Allow,
+        }
+    }
+}
+
+fn parse_permission(value: Option<String>, default: PermissionMode) -> PermissionMode {
+    value
+        .as_deref()
+        .and_then(PermissionMode::parse)
+        .unwrap_or(default)
+}
+
+fn parse_bool(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -130,6 +225,10 @@ pub enum SqueezyError {
     Terminal(String),
     #[error("agent error: {0}")]
     Agent(String),
+    #[error("tool error: {0}")]
+    Tool(String),
+    #[error("permission denied: {0}")]
+    Permission(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
