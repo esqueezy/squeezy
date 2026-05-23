@@ -291,8 +291,7 @@ fn csharp_symbol_from_node(
                 )
             })
             .unwrap_or(false);
-        if !inside_type
-            && !(node.kind() == "local_function_statement" && !scope.type_path.is_empty())
+        if !inside_type && (node.kind() != "local_function_statement" || scope.type_path.is_empty())
         {
             kind = SymbolKind::Function;
         }

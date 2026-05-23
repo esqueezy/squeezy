@@ -177,9 +177,9 @@ pub(crate) fn dotnet_source_root_facts(
         let segments = path.split('/').collect::<Vec<_>>();
         let root = if segments.len() >= 3 && matches!(segments[0], "src" | "test" | "tests") {
             format!("{}/{}", segments[0], segments[1])
-        } else if segments.len() >= 2 && lower.contains("/test") {
-            segments[0].to_string()
-        } else if segments.len() >= 2 && matches!(segments[0], "src" | "test" | "tests") {
+        } else if segments.len() >= 2
+            && (lower.contains("/test") || matches!(segments[0], "src" | "test" | "tests"))
+        {
             segments[0].to_string()
         } else {
             continue;
