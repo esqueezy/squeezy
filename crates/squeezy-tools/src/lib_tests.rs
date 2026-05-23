@@ -1559,7 +1559,7 @@ fn run_git(root: &Path, args: &[&str]) {
     );
 }
 
-fn write_skill(dir: &PathBuf, name: &str) {
+fn write_skill(dir: &Path, name: &str) {
     fs::create_dir_all(dir).expect("mkdir skill");
     fs::write(
         dir.join("SKILL.md"),

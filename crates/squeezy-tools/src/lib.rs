@@ -405,7 +405,7 @@ impl ToolRegistry {
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
     ) -> Result<Self> {
-        Self::new_with_configs_and_skills(root, output_config, web_config, SkillsConfig::default())
+        Self::new_inner(root, output_config, web_config, SkillCatalog::empty())
     }
 
     pub fn new_with_configs_and_skills(
@@ -418,11 +418,33 @@ impl ToolRegistry {
         let root = root
             .canonicalize()
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
+        let skills = SkillCatalog::discover(&root, &skills_config);
+        Self::new_inner_canonical(root, output_config, web_config, skills)
+    }
+
+    fn new_inner(
+        root: impl Into<PathBuf>,
+        output_config: ToolOutputConfig,
+        web_config: WebToolConfig,
+        skills: SkillCatalog,
+    ) -> Result<Self> {
+        let root = root.into();
+        let root = root
+            .canonicalize()
+            .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
+        Self::new_inner_canonical(root, output_config, web_config, skills)
+    }
+
+    fn new_inner_canonical(
+        root: PathBuf,
+        output_config: ToolOutputConfig,
+        web_config: WebToolConfig,
+        skills: SkillCatalog,
+    ) -> Result<Self> {
         let output_store = ToolOutputStore::new(&root, output_config)?;
         let http = Arc::new(ReqwestWebHttpClient::new()?);
         let graph = GraphManager::open(&root).ok();
         let vcs = GitVcs::open(&root)?;
-        let skills = SkillCatalog::discover(&root, &skills_config)?;
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -449,7 +471,6 @@ impl ToolRegistry {
         let output_store = ToolOutputStore::new(&root, output_config)?;
         let graph = GraphManager::open(&root).ok();
         let vcs = GitVcs::open(&root)?;
-        let skills = SkillCatalog::discover(&root, &SkillsConfig::default())?;
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -458,7 +479,7 @@ impl ToolRegistry {
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
-            skills: Arc::new(skills),
+            skills: Arc::new(SkillCatalog::empty()),
         })
     }
 

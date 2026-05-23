@@ -1686,6 +1686,7 @@ dependencies = [
  "serde",
  "serde_json",
  "squeezy-core",
+ "tracing",
 ]
 
 [[package]]

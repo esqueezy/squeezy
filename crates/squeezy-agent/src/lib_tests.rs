@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -451,9 +451,9 @@ fn temp_workspace(name: &str) -> PathBuf {
     root
 }
 
-fn config_with_skill_dirs(root: &PathBuf) -> AppConfig {
+fn config_with_skill_dirs(root: &Path) -> AppConfig {
     AppConfig {
-        workspace_root: root.clone(),
+        workspace_root: root.to_path_buf(),
         skills: SkillsConfig {
             user_dir: root.join("user-skills"),
             compat_user_dir: root.join("compat-skills"),
@@ -462,7 +462,7 @@ fn config_with_skill_dirs(root: &PathBuf) -> AppConfig {
     }
 }
 
-fn write_skill(dir: &PathBuf, name: &str, triggers: &[&str]) {
+fn write_skill(dir: &Path, name: &str, triggers: &[&str]) {
     fs::create_dir_all(dir).expect("mkdir skill");
     let triggers = triggers
         .iter()

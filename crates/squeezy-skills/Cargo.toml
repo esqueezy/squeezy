@@ -11,3 +11,4 @@ publish.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 squeezy-core.workspace = true
+tracing.workspace = true
