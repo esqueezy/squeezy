@@ -1,6 +1,7 @@
 use std::{pin::Pin, sync::Arc};
 
 use futures_core::Stream;
+use serde_json::Value;
 use squeezy_core::{CostSnapshot, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
 
@@ -14,15 +15,66 @@ pub type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>;
 pub struct LlmRequest {
     pub model: String,
     pub instructions: String,
-    pub input: String,
+    pub input: Vec<LlmInputItem>,
     pub max_output_tokens: Option<u32>,
     pub previous_response_id: Option<String>,
+    pub tools: Vec<LlmToolSpec>,
+    pub store: bool,
+}
+
+impl LlmRequest {
+    pub fn user_text(
+        model: String,
+        instructions: String,
+        input: String,
+        max_output_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            model,
+            instructions,
+            input: vec![LlmInputItem::UserText(input)],
+            max_output_tokens,
+            previous_response_id: None,
+            tools: Vec::new(),
+            store: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LlmInputItem {
+    UserText(String),
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: Value,
+    },
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+    pub strict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LlmEvent {
     Started,
     TextDelta(String),
+    ToolCall(LlmToolCall),
     Completed {
         response_id: Option<String>,
         cost: CostSnapshot,

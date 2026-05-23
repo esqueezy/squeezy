@@ -1,13 +1,26 @@
 use super::*;
+use crate::{LlmInputItem, LlmToolCall, LlmToolSpec};
+use serde_json::json;
 
 #[test]
 fn request_body_uses_responses_streaming_shape() {
     let request = LlmRequest {
         model: "gpt-test".to_string(),
         instructions: "be brief".to_string(),
-        input: "hello".to_string(),
+        input: vec![LlmInputItem::UserText("hello".to_string())],
         max_output_tokens: Some(32),
         previous_response_id: Some("resp_123".to_string()),
+        tools: vec![LlmToolSpec {
+            name: "grep".to_string(),
+            description: "search files".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"]
+            }),
+            strict: true,
+        }],
+        store: true,
     };
 
     let body = OpenAiProvider::request_body(&request);
@@ -16,9 +29,12 @@ fn request_body_uses_responses_streaming_shape() {
     assert_eq!(body["instructions"], "be brief");
     assert_eq!(body["input"], "hello");
     assert_eq!(body["stream"], true);
-    assert_eq!(body["store"], false);
+    assert_eq!(body["store"], true);
     assert_eq!(body["max_output_tokens"], 32);
     assert_eq!(body["previous_response_id"], "resp_123");
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert_eq!(body["tools"][0]["name"], "grep");
+    assert_eq!(body["tools"][0]["strict"], true);
 }
 
 #[test]
@@ -73,6 +89,91 @@ fn parser_extracts_text_delta() {
         .expect("valid event");
 
     assert_eq!(event, Some(LlmEvent::TextDelta("hello".to_string())));
+}
+
+#[test]
+fn request_body_serializes_tool_outputs_as_input_items() {
+    let request = LlmRequest {
+        model: "gpt-test".to_string(),
+        instructions: "be brief".to_string(),
+        input: vec![
+            LlmInputItem::FunctionCall {
+                call_id: "call_1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle"}),
+            },
+            LlmInputItem::FunctionCallOutput {
+                call_id: "call_1".to_string(),
+                output: "{\"status\":\"success\"}".to_string(),
+            },
+        ],
+        max_output_tokens: None,
+        previous_response_id: None,
+        tools: Vec::new(),
+        store: false,
+    };
+
+    let body = OpenAiProvider::request_body(&request);
+
+    assert_eq!(body["input"][0]["type"], "function_call");
+    assert_eq!(body["input"][0]["arguments"], r#"{"pattern":"needle"}"#);
+    assert_eq!(body["input"][1]["type"], "function_call_output");
+}
+
+#[test]
+fn request_body_sorts_function_tools_by_name() {
+    let request = LlmRequest {
+        model: "gpt-test".to_string(),
+        instructions: "be brief".to_string(),
+        input: vec![LlmInputItem::UserText("hello".to_string())],
+        max_output_tokens: None,
+        previous_response_id: None,
+        tools: vec![
+            LlmToolSpec {
+                name: "write_file".to_string(),
+                description: "write".to_string(),
+                parameters: json!({"type": "object"}),
+                strict: true,
+            },
+            LlmToolSpec {
+                name: "grep".to_string(),
+                description: "search".to_string(),
+                parameters: json!({"type": "object"}),
+                strict: true,
+            },
+        ],
+        store: false,
+    };
+
+    let body = OpenAiProvider::request_body(&request);
+
+    assert_eq!(body["tools"][0]["name"], "grep");
+    assert_eq!(body["tools"][1]["name"], "write_file");
+}
+
+#[test]
+fn parser_extracts_function_call_from_output_item_done() {
+    let event = parse_openai_event(
+        r#"{
+          "type": "response.output_item.done",
+          "item": {
+            "type": "function_call",
+            "call_id": "call_123",
+            "name": "grep",
+            "arguments": "{\"pattern\":\"needle\"}"
+          }
+        }"#,
+    )
+    .expect("valid event");
+
+    assert_eq!(
+        event,
+        Some(LlmEvent::ToolCall(LlmToolCall {
+            call_id: "call_123".to_string(),
+            name: "grep".to_string(),
+            arguments: json!({"pattern": "needle"}),
+        }))
+    );
 }
 
 #[test]

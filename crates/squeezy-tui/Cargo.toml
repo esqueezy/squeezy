@@ -13,5 +13,6 @@ ratatui.workspace = true
 squeezy-agent.workspace = true
 squeezy-core.workspace = true
 squeezy-llm.workspace = true
+squeezy-tools.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

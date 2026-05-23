@@ -7,7 +7,7 @@ Keep personal notes, motivation, research from reference agents, sketches, and i
 Current completed decisions:
 
 - Squeezy itself is implemented fully in Rust.
-- Initial supported platform is macOS.
+- Initial supported platforms are macOS and Linux.
 - Initial UI is a TUI.
 - Initial semantic navigation source language is Rust.
 - Additional source languages are future work.
@@ -20,4 +20,8 @@ Foundation runtime behavior now exists: the workspace builds, the TUI starts, an
 
 Implemented graph behavior is documented in `docs/SEMANTIC_GRAPH.md`.
 
+Tool-call cost strategy is documented in [`tool-call-saving-strategy.md`](tool-call-saving-strategy.md).
+
 Developer setup and verification commands live in the repository root `CONTRIBUTING.md`.
+
+Platform support details live in `docs/PLATFORMS.md`.

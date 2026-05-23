@@ -5,7 +5,7 @@ use squeezy_core::{
     DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_OPENAI_BASE_URL, DEFAULT_OPENAI_MODEL, OpenAiConfig, Result,
     SqueezyError,
 };
-use squeezy_llm::{LlmEvent, LlmProvider, LlmRequest, OpenAiProvider};
+use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, OpenAiProvider};
 use tokio_util::sync::CancellationToken;
 
 const COSTLY_FLAG: &str = "SQUEEZY_RUN_COSTLY_TESTS";
@@ -29,9 +29,13 @@ async fn openai_responses_streaming_costly() -> Result<()> {
         model: env::var("SQUEEZY_COSTLY_MODEL")
             .unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.to_string()),
         instructions: "Reply with exactly: squeezy-ok".to_string(),
-        input: "Reply with exactly: squeezy-ok".to_string(),
+        input: vec![LlmInputItem::UserText(
+            "Reply with exactly: squeezy-ok".to_string(),
+        )],
         max_output_tokens: Some(costly_max_output_tokens()?),
         previous_response_id: None,
+        tools: Vec::new(),
+        store: false,
     };
 
     let mut stream = provider.stream_response(request, CancellationToken::new());
@@ -40,6 +44,11 @@ async fn openai_responses_streaming_costly() -> Result<()> {
         match event? {
             LlmEvent::Started => {}
             LlmEvent::TextDelta(delta) => output.push_str(&delta),
+            LlmEvent::ToolCall(_) => {
+                return Err(SqueezyError::ProviderStream(
+                    "costly OpenAI smoke test should not call tools".to_string(),
+                ));
+            }
             LlmEvent::Completed { .. } => break,
             LlmEvent::Cancelled => {
                 return Err(SqueezyError::ProviderStream(

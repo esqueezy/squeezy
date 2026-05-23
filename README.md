@@ -15,6 +15,10 @@ Every model token is a budgeted resource.
 - A **cost broker** enforces per-turn caps on `grep`, raw reads, and tool calls, and routes trivial work to cheaper models.
 - **Failure memory** keeps the agent from repeating dead-end searches across compactions.
 - The static system prompt is held stable so provider caches actually hit.
+- Current fallback tools use ignore-aware `grep`, path-only `glob`, compact
+  search modes, spill handles, aggregate result budgets, and permission-gated
+  `websearch`/`webfetch` for current external evidence.
+- The tool-call saving roadmap is documented in [`docs/tool-call-saving-strategy.md`](docs/tool-call-saving-strategy.md).
 
 ## Speed
 
@@ -37,7 +41,7 @@ The semantic graph is the primary navigation surface; bounded grep is a labeled 
 
 ## Scope
 
-Squeezy targets Rust source navigation first; Python is planned next. Initial platform is macOS. The UI is a TUI. Squeezy is an MCP client: external MCP servers can be installed and consumed as tools.
+Squeezy targets Rust source navigation first; Python is planned next. Initial platforms are macOS and Linux. The Linux release artifact is built for `x86_64-unknown-linux-musl` so it does not depend on glibc. The UI is a TUI. Squeezy is an MCP client: external MCP servers can be installed and consumed as tools.
 
 Squeezy explicitly does not provide:
 
