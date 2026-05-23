@@ -903,6 +903,19 @@ fn visit_js_ts_node(
         return;
     }
 
+    if parent_symbol
+        .as_ref()
+        .map(|(_, parent_kind)| *parent_kind == SymbolKind::Class)
+        .unwrap_or(false)
+        && matches!(
+            kind,
+            "method_definition" | "public_field_definition" | "field_definition"
+        )
+    {
+        visit_js_ts_children(node, ctx, None, owner_symbol);
+        return;
+    }
+
     if kind == "call_expression" || kind == "new_expression" {
         extract_js_ts_call(node, ctx, owner_symbol.clone());
     } else if let Some(reference_kind) = js_ts_reference_kind(kind) {
@@ -1057,6 +1070,7 @@ fn python_symbol_from_node(
         _ => return None,
     };
     if kind == SymbolKind::Function
+        && node.kind() != "variable_declarator"
         && parent_symbol
             .map(|(_, parent_kind)| *parent_kind == SymbolKind::Class)
             .unwrap_or(false)
@@ -1123,6 +1137,11 @@ fn js_ts_symbol_from_node(
         | "generator_function"
         | "generator_function_declaration" => SymbolKind::Function,
         "interface_declaration" => SymbolKind::Interface,
+        "ambient_declaration"
+        | "internal_module"
+        | "module"
+        | "module_declaration"
+        | "namespace_declaration" => SymbolKind::Module,
         "method_definition" | "method_signature" => SymbolKind::Method,
         "public_field_definition" | "field_definition" | "property_signature" => SymbolKind::Field,
         "type_alias_declaration" => SymbolKind::TypeAlias,
@@ -1133,6 +1152,14 @@ fn js_ts_symbol_from_node(
         && parent_symbol
             .map(|(_, parent_kind)| *parent_kind == SymbolKind::Class)
             .unwrap_or(false)
+    {
+        kind = SymbolKind::Method;
+    }
+    if kind == SymbolKind::Field
+        && parent_symbol
+            .map(|(_, parent_kind)| *parent_kind == SymbolKind::Class)
+            .unwrap_or(false)
+        && js_ts_node_value_is_function_like(node)
     {
         kind = SymbolKind::Method;
     }
@@ -1181,10 +1208,36 @@ fn js_ts_variable_symbol_kind(node: Node<'_>, source: &str) -> Option<SymbolKind
     Some(SymbolKind::Const)
 }
 
+fn js_ts_node_value_is_function_like(node: Node<'_>) -> bool {
+    node.child_by_field_name("value")
+        .map(|value| {
+            matches!(
+                value.kind(),
+                "arrow_function" | "function" | "function_expression" | "generator_function"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn js_ts_symbol_name(node: Node<'_>, kind: SymbolKind, source: &str) -> Option<String> {
+    if kind == SymbolKind::Module {
+        let raw_name = node
+            .child_by_field_name("name")
+            .and_then(|child| node_text(child, source).ok())?
+            .trim()
+            .to_string();
+        if raw_name.starts_with(['"', '\'']) {
+            return None;
+        }
+        return Some(js_ts_clean_property_name(&raw_name)).filter(|text| !text.is_empty());
+    }
     if kind == SymbolKind::Method {
         let raw = node_text(node, source).ok()?.trim_start().to_string();
-        if raw.starts_with("get ") || raw.starts_with("set ") {
+        if raw.starts_with("get ")
+            || raw.starts_with("set ")
+            || raw.contains(" get ")
+            || raw.contains(" set ")
+        {
             return None;
         }
         if let Some(name) = node.child_by_field_name("name") {
@@ -1269,7 +1322,26 @@ fn js_ts_attributes_for_symbol(
     if js_ts_node_has_jsx_descendant(node) {
         attributes.push("jsx:returns-jsx".to_string());
     }
+    attributes.extend(js_ts_decorator_attributes(node, ctx.source));
     attributes
+}
+
+fn js_ts_decorator_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let Ok(raw) = node_text(node, source) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .map(str::trim)
+        .take_while(|line| line.starts_with('@'))
+        .filter_map(|line| {
+            let name = line
+                .trim_start_matches('@')
+                .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'))
+                .next()
+                .unwrap_or_default();
+            (!name.is_empty()).then(|| format!("decorator:{name}"))
+        })
+        .collect()
 }
 
 fn js_ts_node_has_jsx_descendant(node: Node<'_>) -> bool {

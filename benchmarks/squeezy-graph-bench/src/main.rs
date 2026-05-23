@@ -647,7 +647,7 @@ const root = process.argv[1];
 const out = [];
 function walk(dir) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if ([".git", "node_modules", "dist", "build", "coverage"].includes(entry.name)) continue;
+    if ([".git", "dist", "build", "coverage"].includes(entry.name)) continue;
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       walk(full);
@@ -667,9 +667,14 @@ function scan(file) {
     if ((ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) && node.name) emit(file, "Function", node.name.text);
     else if (ts.isClassDeclaration(node) && node.name) emit(file, "Class", node.name.text);
     else if (ts.isInterfaceDeclaration(node)) emit(file, "Interface", node.name.text);
+    else if (ts.isModuleDeclaration(node) && ts.isIdentifier(node.name)) emit(file, "Module", node.name.text);
     else if (ts.isTypeAliasDeclaration(node)) emit(file, "TypeAlias", node.name.text);
     else if (ts.isEnumDeclaration(node)) emit(file, "Enum", node.name.text);
     else if ((ts.isMethodDeclaration(node) || ts.isMethodSignature(node)) && node.name && ts.isIdentifier(node.name)) emit(file, "Method", node.name.text);
+    else if (ts.isPropertyDeclaration(node) && node.name && ts.isIdentifier(node.name)) {
+      const init = node.initializer;
+      if (init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init))) emit(file, "Method", node.name.text);
+    }
     else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
       const init = node.initializer;
       emit(file, init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) ? "Function" : "Const", node.name.text);

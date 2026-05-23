@@ -159,6 +159,7 @@ pub struct SemanticGraph {
     children_by_parent: HashMap<SymbolId, Vec<SymbolId>>,
     edges_by_from: HashMap<SymbolId, Vec<usize>>,
     edges_by_to: HashMap<SymbolId, Vec<usize>>,
+    js_ts_resolver: JsTsResolver,
 }
 
 impl SemanticGraph {
@@ -180,6 +181,7 @@ impl SemanticGraph {
             children_by_parent: HashMap::new(),
             edges_by_from: HashMap::new(),
             edges_by_to: HashMap::new(),
+            js_ts_resolver: JsTsResolver::default(),
         }
     }
 
@@ -530,6 +532,7 @@ impl SemanticGraph {
                     .unwrap_or(true)
         });
         self.rebuild_indexes();
+        self.js_ts_resolver = JsTsResolver::from_files(&self.files);
 
         let imports = self.imports.clone();
         let calls = self.calls.clone();
@@ -713,6 +716,16 @@ impl SemanticGraph {
         }
         if let Some(id) = self.imported_direct_call(&candidates, caller_id, call) {
             return (Some(id), Confidence::ImportResolved, "explicit import");
+        }
+        if self.unresolved_js_ts_imported_direct_call(caller_id, call) {
+            return match candidates.as_slice() {
+                [] => (None, Confidence::External, "unresolved imported symbol"),
+                _ => (
+                    None,
+                    Confidence::CandidateSet,
+                    "unresolved imported symbol candidate set",
+                ),
+            };
         }
         if let Some(id) = self.package_local_direct_call(&candidates, caller_id) {
             return (Some(id), Confidence::Heuristic, "package local");
@@ -984,6 +997,38 @@ impl SemanticGraph {
         single_symbol(candidates)
     }
 
+    fn unresolved_js_ts_imported_direct_call(
+        &self,
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> bool {
+        if call.kind != ParsedCallKind::Direct || call.receiver.is_some() {
+            return false;
+        }
+        let Some(caller) = self.symbols.get(caller_id) else {
+            return false;
+        };
+        if !self
+            .files
+            .get(&caller.file_id)
+            .map(|file| is_js_ts_language(file.language))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        self.imports
+            .iter()
+            .filter(|import| self.import_visible_from_symbol(import, caller))
+            .filter(|import| import.span.start_byte <= call.span.start_byte)
+            .any(|import| {
+                import
+                    .alias
+                    .as_deref()
+                    .map(|alias| alias == call.name)
+                    .unwrap_or_else(|| last_path_segment(&import.path) == call.name)
+            })
+    }
+
     fn package_local_direct_call(
         &self,
         candidates: &[SymbolId],
@@ -1040,7 +1085,10 @@ impl SemanticGraph {
         let Some(file) = self.files.get(&symbol.file_id) else {
             return true;
         };
-        if file.language != squeezy_core::LanguageKind::Python {
+        if is_js_ts_language(file.language) {
+            return self.js_ts_import_matches_symbol(import, symbol);
+        }
+        if file.language != LanguageKind::Python {
             return true;
         }
         let import_segments = python_path_segments(&import.path);
@@ -1721,7 +1769,7 @@ impl SemanticGraph {
             .map(|file| is_js_ts_language(file.language))
             .unwrap_or(false)
         {
-            return js_ts_import_matches_symbol(import, symbol, &self.files);
+            return self.js_ts_import_matches_symbol(import, symbol);
         }
         let mut import_path = path_segments(&import.path);
         if import.is_glob {
@@ -1735,6 +1783,24 @@ impl SemanticGraph {
             return false;
         }
         import_path == self.module_path_for_symbol(symbol)
+    }
+
+    fn js_ts_import_matches_symbol(&self, import: &ParsedImport, symbol: &GraphSymbol) -> bool {
+        let Some(symbol_file) = self.files.get(&symbol.file_id) else {
+            return false;
+        };
+        let Some(module) = js_ts_import_module_part(import) else {
+            return false;
+        };
+        let import_file = self.files.get(&import.file_id);
+        let module_candidates = self.js_ts_resolver.module_candidates(module, import_file);
+        if module_candidates.is_empty() {
+            return false;
+        }
+        let symbol_modules = js_ts_file_module_variants(&symbol_file.relative_path);
+        module_candidates
+            .iter()
+            .any(|candidate| symbol_modules.contains(candidate))
     }
 
     fn qualified_reference_matches_symbol(
@@ -2914,38 +2980,274 @@ fn is_js_ts_language(language: LanguageKind) -> bool {
     )
 }
 
-fn js_ts_import_matches_symbol(
-    import: &ParsedImport,
-    symbol: &GraphSymbol,
-    files: &HashMap<FileId, FileRecord>,
-) -> bool {
-    let Some(file) = files.get(&symbol.file_id) else {
-        return false;
+#[derive(Debug, Clone, Default)]
+struct JsTsResolver {
+    path_mappings: Vec<JsTsPathMapping>,
+    packages: Vec<JsTsPackage>,
+}
+
+#[derive(Debug, Clone)]
+struct JsTsPathMapping {
+    config_dir: String,
+    base_url: Option<String>,
+    pattern: String,
+    targets: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct JsTsPackage {
+    root: String,
+    name: String,
+    exports: Vec<(String, String)>,
+    main_entries: Vec<String>,
+}
+
+impl JsTsResolver {
+    fn from_files(files: &HashMap<FileId, FileRecord>) -> Self {
+        let mut resolver = Self::default();
+        for file in files.values() {
+            if file.relative_path.ends_with("tsconfig.json") {
+                resolver.add_tsconfig(file);
+            } else if file.relative_path.ends_with("package.json") {
+                resolver.add_package(file);
+            }
+        }
+        resolver
+    }
+
+    fn add_tsconfig(&mut self, file: &FileRecord) {
+        let Ok(raw) = std::fs::read_to_string(&file.path) else {
+            return;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return;
+        };
+        let Some(options) = json
+            .get("compilerOptions")
+            .and_then(|value| value.as_object())
+        else {
+            return;
+        };
+        let config_dir = parent_dir_string(&file.relative_path);
+        let base_url = options
+            .get("baseUrl")
+            .and_then(|value| value.as_str())
+            .map(|value| js_ts_normalize_module_path(&join_module_path(&config_dir, value)));
+        if let Some(paths) = options.get("paths").and_then(|value| value.as_object()) {
+            for (pattern, targets) in paths {
+                let targets = targets
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                if !targets.is_empty() {
+                    self.path_mappings.push(JsTsPathMapping {
+                        config_dir: config_dir.clone(),
+                        base_url: base_url.clone(),
+                        pattern: pattern.clone(),
+                        targets,
+                    });
+                }
+            }
+        }
+        if let Some(base_url) = base_url {
+            self.path_mappings.push(JsTsPathMapping {
+                config_dir,
+                base_url: None,
+                pattern: "*".to_string(),
+                targets: vec![format!("{base_url}/*")],
+            });
+        }
+    }
+
+    fn add_package(&mut self, file: &FileRecord) {
+        let Ok(raw) = std::fs::read_to_string(&file.path) else {
+            return;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return;
+        };
+        let Some(name) = json.get("name").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let root = parent_dir_string(&file.relative_path);
+        let mut main_entries = Vec::new();
+        for field in ["types", "typings", "module", "main"] {
+            if let Some(value) = json.get(field).and_then(|value| value.as_str()) {
+                main_entries.push(value.to_string());
+            }
+        }
+        let mut exports = Vec::new();
+        if let Some(value) = json.get("exports") {
+            collect_js_ts_exports(".", value, &mut exports);
+        }
+        self.packages.push(JsTsPackage {
+            root,
+            name: name.to_string(),
+            exports,
+            main_entries,
+        });
+    }
+
+    fn module_candidates(
+        &self,
+        module: &str,
+        import_file: Option<&FileRecord>,
+    ) -> BTreeSet<String> {
+        let mut candidates = BTreeSet::new();
+        if module.starts_with('.') {
+            if let Some(import_file) = import_file {
+                let base = parent_dir_string(&import_file.relative_path);
+                insert_js_ts_module_variants(&mut candidates, &join_module_path(&base, module));
+            }
+            return candidates;
+        }
+
+        insert_js_ts_module_variants(&mut candidates, module);
+
+        for mapping in &self.path_mappings {
+            let Some(star) = match_js_ts_path_pattern(&mapping.pattern, module) else {
+                continue;
+            };
+            for target in &mapping.targets {
+                let replaced = target.replace('*', &star);
+                let with_base = mapping
+                    .base_url
+                    .as_deref()
+                    .map(|base| join_module_path(base, &replaced))
+                    .unwrap_or_else(|| join_module_path(&mapping.config_dir, &replaced));
+                insert_js_ts_module_variants(&mut candidates, &with_base);
+            }
+        }
+
+        for package in &self.packages {
+            let Some(subpath) = js_ts_package_subpath(&package.name, module) else {
+                continue;
+            };
+            let package_subpath = subpath.unwrap_or_default();
+            if package_subpath.is_empty() {
+                insert_js_ts_module_variants(&mut candidates, &package.root);
+                insert_js_ts_module_variants(
+                    &mut candidates,
+                    &join_module_path(&package.root, "src"),
+                );
+                insert_js_ts_module_variants(
+                    &mut candidates,
+                    &join_module_path(&package.root, "index"),
+                );
+                insert_js_ts_module_variants(
+                    &mut candidates,
+                    &join_module_path(&package.root, "src/index"),
+                );
+                for entry in &package.main_entries {
+                    insert_js_ts_module_variants(
+                        &mut candidates,
+                        &join_module_path(&package.root, entry),
+                    );
+                }
+            } else {
+                insert_js_ts_module_variants(
+                    &mut candidates,
+                    &join_module_path(&package.root, &package_subpath),
+                );
+                insert_js_ts_module_variants(
+                    &mut candidates,
+                    &join_module_path(&join_module_path(&package.root, "src"), &package_subpath),
+                );
+            }
+            let export_key = if package_subpath.is_empty() {
+                ".".to_string()
+            } else {
+                format!("./{package_subpath}")
+            };
+            for (_, target) in package.exports.iter().filter(|(key, _)| key == &export_key) {
+                insert_js_ts_module_variants(
+                    &mut candidates,
+                    &join_module_path(&package.root, target),
+                );
+            }
+        }
+
+        candidates
+    }
+}
+
+fn collect_js_ts_exports(key: &str, value: &serde_json::Value, out: &mut Vec<(String, String)>) {
+    if let Some(target) = value.as_str() {
+        out.push((key.to_string(), target.to_string()));
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        return;
     };
-    let mut import_path = import.path.as_str();
-    if !import.is_glob {
-        import_path = import_path
+    if key == "." {
+        for (child_key, child_value) in object {
+            if child_key == "." || child_key.starts_with("./") {
+                collect_js_ts_exports(child_key, child_value, out);
+            }
+        }
+    }
+    for preferred in ["types", "import", "require", "default"] {
+        if let Some(child) = object.get(preferred) {
+            collect_js_ts_exports(key, child, out);
+        }
+    }
+}
+
+fn js_ts_import_module_part(import: &ParsedImport) -> Option<&str> {
+    let path = if import.is_glob {
+        import.path.strip_suffix(".*").unwrap_or(&import.path)
+    } else {
+        import
+            .path
             .rsplit_once('.')
             .map(|(module, _)| module)
-            .unwrap_or(import_path);
+            .unwrap_or(&import.path)
+    };
+    Some(path).filter(|path| !path.is_empty())
+}
+
+fn js_ts_package_subpath(package_name: &str, module: &str) -> Option<Option<String>> {
+    if module == package_name {
+        return Some(None);
     }
-    if import_path.starts_with('.') {
-        let file_module = js_ts_module_path_for_file(&file.relative_path);
-        let import_tail = import_path
-            .trim_start_matches("./")
-            .trim_start_matches("../")
-            .trim_end_matches("/index");
-        return file_module.ends_with(import_tail)
-            || file.relative_path.ends_with(&format!("{import_tail}.js"))
-            || file.relative_path.ends_with(&format!("{import_tail}.jsx"))
-            || file.relative_path.ends_with(&format!("{import_tail}.ts"))
-            || file.relative_path.ends_with(&format!("{import_tail}.tsx"));
+    module
+        .strip_prefix(package_name)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .map(|rest| Some(rest.to_string()))
+}
+
+fn match_js_ts_path_pattern(pattern: &str, module: &str) -> Option<String> {
+    let Some((prefix, suffix)) = pattern.split_once('*') else {
+        return (pattern == module).then(String::new);
+    };
+    module
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))
+        .map(ToString::to_string)
+}
+
+fn insert_js_ts_module_variants(candidates: &mut BTreeSet<String>, path: &str) {
+    let normalized = js_ts_module_path_for_file(path);
+    if normalized.is_empty() {
+        return;
     }
-    true
+    candidates.insert(normalized.clone());
+    if !normalized.ends_with("/index") {
+        candidates.insert(format!("{normalized}/index"));
+    }
+}
+
+fn js_ts_file_module_variants(path: &str) -> BTreeSet<String> {
+    let mut variants = BTreeSet::new();
+    insert_js_ts_module_variants(&mut variants, path);
+    variants
 }
 
 fn js_ts_module_path_for_file(path: &str) -> String {
-    path.trim_start_matches("src/")
+    let without_ext = path
         .trim_end_matches(".jsx")
         .trim_end_matches(".tsx")
         .trim_end_matches(".mjs")
@@ -2954,8 +3256,42 @@ fn js_ts_module_path_for_file(path: &str) -> String {
         .trim_end_matches(".cts")
         .trim_end_matches(".js")
         .trim_end_matches(".ts")
-        .trim_end_matches("/index")
+        .trim_end_matches(".d");
+    let normalized = js_ts_normalize_module_path(without_ext);
+    normalized
+        .strip_suffix("/index")
+        .unwrap_or(&normalized)
         .to_string()
+}
+
+fn parent_dir_string(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(dir, _)| dir.to_string())
+        .unwrap_or_default()
+}
+
+fn join_module_path(base: &str, child: &str) -> String {
+    if base.is_empty() {
+        child.to_string()
+    } else if child.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}/{child}")
+    }
+}
+
+fn js_ts_normalize_module_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
 }
 
 fn paths_match(left: &Path, right: &Path) -> bool {

@@ -14,10 +14,10 @@ navigation questions before the model reads raw files.
   docstrings, class bases, type annotations, class fields, exports, aliases, and
   references from `.py` files.
 - JavaScript and TypeScript declarations: functions, arrow functions assigned to
-  names, classes, methods, fields, interfaces, type aliases, enums,
-  imports/exports, CommonJS require/export aliases, JSX/TSX component-like
-  declarations, calls, member calls, type references, and object/member
-  references.
+  names, classes, methods, class-property arrow methods, fields, interfaces,
+  modules/namespaces, decorators, type aliases, enums, imports/exports, CommonJS
+  require/export aliases, JSX/TSX component-like declarations, calls, member
+  calls, type references, and object/member references.
 - Signatures: raw item header, visibility, attributes, docs, spans, and body
   spans where present.
 - Edges: containment, imports/reexports, references, calls, and macro
@@ -95,10 +95,11 @@ decision instead of walking a likely non-code or dangerous directory.
 - Dynamic attributes, metaclasses, runtime import side effects, monkey-patching,
   and type-inferred receiver dispatch remain heuristic or external.
 - JavaScript and TypeScript ES module imports, CommonJS requires, relative
-  module references, class constructors, direct calls, member calls, and
-  type/interface references are indexed from tree-sitter syntax. JSX/TSX
-  functions/classes with uppercase names or JSX bodies are tagged as
-  component-like. Dynamic imports, computed property access, bundler-only aliases
+  module references, `tsconfig.json` `baseUrl`/`paths`, simple package
+  `exports`, class constructors, direct calls, member calls, and type/interface
+  references are indexed from tree-sitter syntax and checked local config files.
+  JSX/TSX functions/classes with uppercase names or JSX bodies are tagged as
+  component-like. Dynamic imports, computed property access, bundler aliases
   without checked config, package export edge cases, and runtime dispatch are
   explicit candidate, heuristic, external, or fallback results rather than exact
   edges.
@@ -126,7 +127,9 @@ refreshes immediately after debounce. If no events arrive, Squeezy polls every
 hashes, reparses changed files only, removes deleted files, and preserves
 unchanged graph partitions. Body-only edits replace body-derived facts for that
 file. Signature/module/import edits replace that file's stub and rebuild
-cross-file indexes.
+cross-file indexes. JS/TS config edits such as `tsconfig.json` path changes or
+`package.json` export changes rebuild the local resolver and dependent import
+edges without reparsing unchanged source files.
 
 Tree-sitter parse work is parallelized for batches of at least eight files. Each
 worker owns its own parser instance, and the final graph merge plus index rebuild

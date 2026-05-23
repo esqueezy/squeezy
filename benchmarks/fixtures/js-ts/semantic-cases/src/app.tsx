@@ -1,4 +1,6 @@
-import { buildRunner, formatRunner } from "./helpers";
+import { buildRunner, formatRunner } from "@app/helpers";
+import { ButtonController, ButtonNamespace } from "@app/components/Button";
+import { packageEntry } from "squeezy-js-ts-semantic-cases";
 
 interface RunnerProps {
   name: string;
@@ -6,7 +8,10 @@ interface RunnerProps {
 
 class Runner {
   start(props: RunnerProps): string {
-    return buildRunner({ name: formatRunner(props.name) });
+    const controller = new ButtonController();
+    return buildRunner({
+      name: `${formatRunner(props.name)}:${controller.click()}:${ButtonNamespace.makeLabel(packageEntry())}`,
+    });
   }
 }
 

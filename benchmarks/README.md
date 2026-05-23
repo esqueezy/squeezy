@@ -71,9 +71,9 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
   --no-speed-gate
 ```
 
-When the Node `typescript` package is installed, the JS/TS benchmark also runs a
-benchmark-only TypeScript compiler API declaration oracle and reports symbol
-TP/FP/FN. If TypeScript is unavailable, the report records that status
+When the pinned Node `typescript` package is installed, the JS/TS benchmark also
+runs a benchmark-only TypeScript compiler API declaration oracle and reports
+symbol TP/FP/FN. If TypeScript is unavailable, the report records that status
 explicitly and still validates the tree-sitter query spec.
 
 JS/TS full-tier comparison uses five representative open-source repositories:
@@ -82,11 +82,11 @@ TypeScript compiler API oracle produced:
 
 | Repo | Squeezy total | TS oracle | Symbol TP | FP | FN | Precision | Recall |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| axios | 61 ms | 190 ms | 865 | 3 | 30 | 0.9965 | 0.9665 |
-| express | 23 ms | 150 ms | 297 | 0 | 3 | 1.0000 | 0.9900 |
-| prettier | 385 ms | 327 ms | 4,506 | 0 | 127 | 1.0000 | 0.9726 |
-| redux | 14 ms | 159 ms | 130 | 0 | 3 | 1.0000 | 0.9774 |
-| vite | 672 ms | 387 ms | 6,807 | 3 | 347 | 0.9996 | 0.9515 |
+| axios | 60 ms | 217 ms | 867 | 0 | 28 | 1.0000 | 0.9687 |
+| express | 20 ms | 139 ms | 297 | 0 | 3 | 1.0000 | 0.9900 |
+| prettier | 415 ms | 314 ms | 4,511 | 0 | 127 | 1.0000 | 0.9726 |
+| redux | 10 ms | 147 ms | 130 | 0 | 5 | 1.0000 | 0.9630 |
+| vite | 697 ms | 401 ms | 6,802 | 0 | 359 | 1.0000 | 0.9499 |
 
 The run fails if required expected results are missing, the fixture graph build
 plus query time is not faster than compiler validation, or the incremental

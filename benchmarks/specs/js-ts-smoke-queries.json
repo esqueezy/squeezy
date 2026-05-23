@@ -7,7 +7,10 @@
         "File:src/app.tsx",
         "Interface:RunnerProps",
         "Class:Runner",
-        "Function:RunnerView"
+        "Function:RunnerView",
+        "Class:ButtonController",
+        "Method:click",
+        "Module:ButtonNamespace"
       ]
     },
     {
@@ -31,6 +34,13 @@
       "from": "start",
       "to": "buildRunner",
       "expected_contains": ["start -> buildRunner"]
+    },
+    {
+      "id": "js-ts-package-entry-chain",
+      "kind": "call_chain",
+      "from": "start",
+      "to": "packageEntry",
+      "expected_contains": ["start -> packageEntry"]
     },
     {
       "id": "js-ts-references",

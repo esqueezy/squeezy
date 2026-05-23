@@ -577,7 +577,23 @@ class Runner {
     #privateMethod() {}
     [Symbol.iterator]() {}
     run() {}
+    handle = () => options;
 }
+
+class ConstructorLocals {
+    constructor() {
+        const localFactory = () => options;
+    }
+}
+
+namespace RunnerNamespace {
+    export function create() {
+        return options;
+    }
+}
+
+@sealed
+class DecoratedRunner {}
 "#;
     let mut parser = RustParser::new().unwrap();
     let record = ts_record("src/scope.ts", source);
@@ -625,6 +641,27 @@ class Runner {
             .iter()
             .any(|symbol| symbol.name.contains("Symbol.iterator"))
     );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "handle" && symbol.kind == SymbolKind::Method })
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "localFactory" && symbol.kind == SymbolKind::Method })
+    );
+    assert!(
+        parsed.symbols.iter().any(|symbol| {
+            symbol.name == "RunnerNamespace" && symbol.kind == SymbolKind::Module
+        })
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "DecoratedRunner"
+            && symbol.attributes.contains(&"decorator:sealed".to_string())
+    }));
 }
 
 fn record(relative_path: &str, source: &str) -> FileRecord {
