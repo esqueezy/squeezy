@@ -1,0 +1,234 @@
+use std::{
+    collections::VecDeque,
+    fs,
+    path::PathBuf,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use futures_core::Stream;
+use futures_util::stream;
+use serde_json::Value;
+use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision};
+use squeezy_core::{AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, Result};
+use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
+use squeezy_tools::sha256_hex;
+use tokio_util::sync::CancellationToken;
+
+struct ScriptedProvider {
+    responses: Mutex<VecDeque<Vec<Result<LlmEvent>>>>,
+    requests: Mutex<Vec<LlmRequest>>,
+}
+
+impl ScriptedProvider {
+    fn new(responses: Vec<Vec<Result<LlmEvent>>>) -> Self {
+        Self {
+            responses: Mutex::new(responses.into()),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<LlmRequest> {
+        self.requests.lock().expect("requests").clone()
+    }
+}
+
+impl LlmProvider for ScriptedProvider {
+    fn name(&self) -> &'static str {
+        "scripted"
+    }
+
+    fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        self.requests.lock().expect("requests").push(request);
+        let events = self
+            .responses
+            .lock()
+            .expect("responses")
+            .pop_front()
+            .expect("scripted response");
+        let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
+            Box::pin(stream::iter(events));
+        stream
+    }
+}
+
+#[tokio::test]
+async fn parallel_read_and_search_outputs_return_to_model_by_call_id() {
+    let root = temp_workspace("parallel_read_search");
+    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "grep_call".to_string(),
+                name: "grep".to_string(),
+                arguments: serde_json::json!({"pattern": "needle", "include": ["*.rs"]}),
+            })),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_call".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "src.rs"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+
+    drain_turn(agent.start_turn("inspect needle".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0].0, "grep_call");
+    assert_eq!(outputs[1].0, "read_call");
+    assert!(outputs[0].1["content"]["matches"][0]["path"] == "src.rs");
+    assert!(outputs[1].1["content"]["content"] == "fn needle() {}\n");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn denied_write_is_reported_to_model_and_does_not_touch_disk() {
+    let root = temp_workspace("denied_write");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "write_call".to_string(),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({"path": "created.txt", "content": "blocked"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("not written".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.edit = PermissionMode::Ask;
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("write blocked file".to_string(), CancellationToken::new());
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ApprovalRequested { decision_tx, .. } = event {
+            decision_tx
+                .send(ToolApprovalDecision::Denied)
+                .expect("send denial");
+        }
+    }
+
+    assert!(!root.join("created.txt").exists());
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "write_call");
+    assert_eq!(outputs[0].1["status"], "Denied");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn approved_write_edits_real_workspace_file() {
+    let root = temp_workspace("approved_write");
+    fs::write(root.join("sample.txt"), "before").expect("write sample");
+    let expected_sha256 = sha256_hex("before".as_bytes());
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "write_call".to_string(),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "sample.txt",
+                    "content": "after",
+                    "expected_sha256": expected_sha256,
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("edited".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.edit = PermissionMode::Allow;
+    let agent = Agent::new(config, provider);
+
+    drain_turn(agent.start_turn("edit file".to_string(), CancellationToken::new())).await;
+
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "after"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+async fn drain_turn(mut rx: tokio::sync::mpsc::Receiver<AgentEvent>) {
+    while rx.recv().await.is_some() {}
+}
+
+fn function_outputs(request: &LlmRequest) -> Vec<(&str, Value)> {
+    request
+        .input
+        .iter()
+        .filter_map(|item| {
+            let LlmInputItem::FunctionCallOutput { call_id, output } = item else {
+                return None;
+            };
+            Some((
+                call_id.as_str(),
+                serde_json::from_str(output).expect("tool output JSON"),
+            ))
+        })
+        .collect()
+}
+
+fn config_for(root: PathBuf) -> AppConfig {
+    AppConfig {
+        workspace_root: root,
+        permissions: PermissionPolicy {
+            edit: PermissionMode::Allow,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn temp_workspace(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("squeezy_agent_{name}_{nonce}"));
+    fs::create_dir_all(&root).expect("create temp workspace");
+    root
+}
