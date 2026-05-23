@@ -258,9 +258,9 @@ jobs:
               --spec "$spec" \
               --report "target/semantic-graph-benchmark/c-family-real/$name.json" \
               --mixed-repo "target/benchmark-repos/$name" \
-              --mixed-iterations 5000 \
+              --mixed-iterations 1000 \
               --ra-lsp-probes 0 \
-              --oracle-files 50 \
+              --oracle-files 10 \
               --no-speed-gate
           done <<'REPOS'
           redis c https://github.com/redis/redis

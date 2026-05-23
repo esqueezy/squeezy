@@ -11,6 +11,7 @@ template <typename T>
 class Runner : public Base {
 public:
     T run(T value);
+    T peer();
 };
 
 int helper(int value);

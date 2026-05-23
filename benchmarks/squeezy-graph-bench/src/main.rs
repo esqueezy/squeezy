@@ -46,13 +46,11 @@ struct BenchmarkReport {
     language: String,
     fixture: String,
     spec: String,
-    rustc_check_ms: u128,
     validation_ms: u128,
     validation_status: String,
     squeezy_build_ms: u128,
     squeezy_query_ms: u128,
     squeezy_total_ms: u128,
-    faster_than_rustc_check: bool,
     faster_than_validation: bool,
     graph: GraphReport,
     accuracy: AccuracyReport,
@@ -316,13 +314,11 @@ fn main() -> Result<()> {
         language: args.language.as_str().to_string(),
         fixture: args.fixture.display().to_string(),
         spec: args.spec.display().to_string(),
-        rustc_check_ms: validation_ms,
         validation_ms,
         validation_status,
         squeezy_build_ms,
         squeezy_query_ms,
         squeezy_total_ms,
-        faster_than_rustc_check: squeezy_total_ms < validation_ms,
         faster_than_validation: squeezy_total_ms < validation_ms,
         graph: GraphReport {
             files: stats.files,
@@ -452,7 +448,10 @@ fn run_query(graph: &SemanticGraph, query: &QuerySpec) -> Result<QueryReport> {
     })
 }
 
-fn benchmark_symbol_by_name(graph: &SemanticGraph, name: &str) -> Option<squeezy_graph::GraphSymbol> {
+fn benchmark_symbol_by_name(
+    graph: &SemanticGraph,
+    name: &str,
+) -> Option<squeezy_graph::GraphSymbol> {
     let mut symbols = graph.find_symbol_by_name(name);
     symbols.sort_by(|left, right| {
         right
@@ -665,14 +664,24 @@ fn collect_c_family_accuracy(
     })
 }
 
-fn collect_python_oracle_accuracy(root: &Path, graph: &SemanticGraph) -> Result<PythonOracleReport> {
+fn collect_python_oracle_accuracy(
+    root: &Path,
+    graph: &SemanticGraph,
+) -> Result<PythonOracleReport> {
     let started = Instant::now();
     let oracle = collect_python_ast_symbol_scan(root)?;
     let oracle_ms = started.elapsed().as_millis();
-    let unparseable_files = oracle.unparseable_files.into_iter().collect::<BTreeSet<_>>();
+    let unparseable_files = oracle
+        .unparseable_files
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let squeezy_symbols = collect_squeezy_symbol_scan_excluding_files(graph, &unparseable_files);
     let symbols = compare_symbol_sets(&squeezy_symbols, &oracle.symbols);
-    let oracle_unparseable_examples = unparseable_files.iter().take(10).cloned().collect::<Vec<_>>();
+    let oracle_unparseable_examples = unparseable_files
+        .iter()
+        .take(10)
+        .cloned()
+        .collect::<Vec<_>>();
     let oracle_unparseable_files = unparseable_files.len();
 
     Ok(PythonOracleReport {
@@ -752,6 +761,21 @@ fn collect_c_family_squeezy_symbol_scan(
         }
         if !clang_symbol_name_is_comparable(&symbol.name) {
             increment(&mut scan.excluded_by_kind, "UnnamedOrOperator");
+            continue;
+        }
+        // Clang's AST oracle emits `ClassTemplateSpecializationDecl` (not
+        // `CXXRecordDecl`) for `template<> class Foo<int> {}` style
+        // declarations, and our `clang_symbol_kind` mapping intentionally
+        // skips that kind. Squeezy treats the same node as a Class symbol
+        // tagged with `c++:template-specialization`; counting it here would
+        // appear as a false positive against the oracle. Exclude these
+        // symbols symmetrically.
+        if symbol
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "c++:template-specialization")
+        {
+            increment(&mut scan.excluded_by_kind, "TemplateSpecialization");
             continue;
         }
         match normalize_c_family_squeezy_kind(symbol.kind) {
@@ -879,31 +903,89 @@ fn collect_clang_ast_symbol_scan(
         .files
         .iter()
         .filter(|record| record.language == language)
+        .cloned()
         .collect::<Vec<_>>();
     records.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     let indexes = select_scenarios(records.len(), file_limit);
     let selected = indexes.iter().copied().collect::<BTreeSet<_>>();
     let include_dirs = clang_include_dirs(&root, &snapshot.files);
-    let mut scan = SymbolScan::default();
-    let mut parsed_files = 0usize;
-    let mut unparseable_files = Vec::new();
-    let mut excluded_files = records
+    let excluded_initial = records
         .iter()
         .enumerate()
         .filter(|(index, _)| !selected.contains(index))
         .map(|(_, record)| record.relative_path.clone())
         .collect::<Vec<_>>();
 
-    for index in selected {
-        let record = records[index];
-        match clang_ast_symbols_for_file(&root, record, language, &include_dirs) {
+    let selected_records = indexes
+        .iter()
+        .copied()
+        .map(|index| records[index].clone())
+        .collect::<Vec<_>>();
+    if selected_records.is_empty() {
+        return Ok(CFamilyClangSymbolScan {
+            symbols: SymbolScan::default(),
+            parsed_files: 0,
+            candidate_files: records.len(),
+            selected_files: 0,
+            unparseable_files: Vec::new(),
+            excluded_files: excluded_initial,
+        });
+    }
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1)
+        .min(selected_records.len())
+        .max(1);
+    let chunk_size = selected_records.len().div_ceil(worker_count);
+
+    let outputs = std::thread::scope(|scope| -> Result<Vec<ClangAstFileOutput>> {
+        let mut handles = Vec::new();
+        for chunk in selected_records.chunks(chunk_size) {
+            let chunk = chunk.to_vec();
+            let include_dirs = include_dirs.clone();
+            let root = root.clone();
+            handles.push(scope.spawn(move || -> Result<Vec<ClangAstFileOutput>> {
+                let mut out = Vec::with_capacity(chunk.len());
+                for record in chunk {
+                    let result =
+                        clang_ast_symbols_for_file(&root, &record, language, &include_dirs);
+                    out.push(ClangAstFileOutput {
+                        relative_path: record.relative_path.clone(),
+                        result,
+                    });
+                }
+                Ok(out)
+            }));
+        }
+        let mut outputs = Vec::with_capacity(selected_records.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(mut chunk_outputs)) => outputs.append(&mut chunk_outputs),
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    return Err(SqueezyError::Graph(
+                        "clang AST oracle worker panicked".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(outputs)
+    })?;
+
+    let mut scan = SymbolScan::default();
+    let mut parsed_files = 0usize;
+    let mut unparseable_files = Vec::new();
+    let mut excluded_files = excluded_initial;
+    for output in outputs {
+        match output.result {
             Ok(file_scan) => {
                 parsed_files += 1;
                 merge_symbol_scan(&mut scan, file_scan);
             }
             Err(_) => {
-                unparseable_files.push(record.relative_path.clone());
-                excluded_files.push(record.relative_path.clone());
+                unparseable_files.push(output.relative_path.clone());
+                excluded_files.push(output.relative_path);
             }
         }
     }
@@ -916,6 +998,11 @@ fn collect_clang_ast_symbol_scan(
         unparseable_files,
         excluded_files,
     })
+}
+
+struct ClangAstFileOutput {
+    relative_path: String,
+    result: Result<SymbolScan>,
 }
 
 fn clang_ast_symbols_for_file(
@@ -1067,7 +1154,10 @@ fn clang_node_file(node: &Value) -> Option<&str> {
         .or_else(|| node.pointer("/range/begin/file").and_then(Value::as_str))
 }
 
-fn clang_x_language(record: &squeezy_workspace::FileRecord, language: LanguageKind) -> &'static str {
+fn clang_x_language(
+    record: &squeezy_workspace::FileRecord,
+    language: LanguageKind,
+) -> &'static str {
     let extension = record
         .path
         .extension()
@@ -2249,32 +2339,72 @@ fn time_clang_syntax(fixture: &Path, compiler: &str, language: LanguageKind) -> 
     let snapshot = WorkspaceCrawler::new(CrawlOptions::default()).crawl(fixture)?;
     let files = snapshot
         .files
-        .iter()
+        .into_iter()
         .filter(|record| record.language == language)
         .filter(|record| {
             !matches!(
-                record.path.extension().and_then(|extension| extension.to_str()),
+                record
+                    .path
+                    .extension()
+                    .and_then(|extension| extension.to_str()),
                 Some("h" | "hh" | "hpp" | "hxx")
             )
         })
         .collect::<Vec<_>>();
-    let started = Instant::now();
-    for file in files {
-        let status = Command::new(compiler)
-            .arg("-fsyntax-only")
-            .arg(&file.path)
-            .status()?;
-        if !status.success() {
-            return Err(SqueezyError::Graph(format!(
-                "{compiler} validation failed for {} with {status}",
-                file.relative_path
-            )));
-        }
+    if files.is_empty() {
+        return Ok(0);
     }
+
+    let started = Instant::now();
+    let worker_count = std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1)
+        .min(files.len())
+        .max(1);
+    let chunk_size = files.len().div_ceil(worker_count);
+    let compiler = compiler.to_string();
+    std::thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for chunk in files.chunks(chunk_size) {
+            let chunk = chunk.to_vec();
+            let compiler = compiler.clone();
+            handles.push(scope.spawn(move || -> Result<()> {
+                for file in chunk {
+                    let status = Command::new(&compiler)
+                        .arg("-fsyntax-only")
+                        .arg(&file.path)
+                        .status()?;
+                    if !status.success() {
+                        return Err(SqueezyError::Graph(format!(
+                            "{compiler} validation failed for {} with {status}",
+                            file.relative_path
+                        )));
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    return Err(SqueezyError::Graph(
+                        "clang syntax worker panicked".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })?;
     Ok(started.elapsed().as_millis())
 }
 
-fn time_clang_syntax_optional(repo: &Path, compiler: &str, language: LanguageKind) -> (Option<u128>, String) {
+fn time_clang_syntax_optional(
+    repo: &Path,
+    compiler: &str,
+    language: LanguageKind,
+) -> (Option<u128>, String) {
     match time_clang_syntax(repo, compiler, language) {
         Ok(ms) => (Some(ms), format!("{compiler} -fsyntax-only succeeded")),
         Err(err) => (None, format!("{compiler} -fsyntax-only failed: {err}")),
@@ -2756,10 +2886,7 @@ fn print_summary(report: &BenchmarkReport) {
         report.validation_status, report.validation_ms
     );
     println!("squeezy_total_ms: {}", report.squeezy_total_ms);
-    println!(
-        "faster_than_validation: {}",
-        report.faster_than_validation
-    );
+    println!("faster_than_validation: {}", report.faster_than_validation);
     print_accuracy_summary("fixture", &report.accuracy);
     print_navigation_summary("fixture", &report.accuracy.navigation);
     if let Some(python) = &report.python_oracle {

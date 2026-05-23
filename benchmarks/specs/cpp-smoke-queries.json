@@ -8,6 +8,7 @@
         "Class:Base",
         "Class:Runner",
         "Method:run",
+        "Method:peer",
         "Function:helper",
         "Function:call_runner"
       ],
@@ -37,6 +38,16 @@
           "reason": "template and overload resolution is reported as candidate-set confidence"
         }
       ]
+    },
+    {
+      "id": "cpp-same-class-direct-call",
+      "kind": "call_chain",
+      "from": "peer",
+      "to": "helper",
+      "expected_contains": [
+        "peer -> helper"
+      ],
+      "documented_misses": []
     },
     {
       "id": "cpp-base-reference",

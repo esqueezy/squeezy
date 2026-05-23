@@ -10,7 +10,8 @@
         "Field:id",
         "Macro:RUNNER_LIMIT",
         "Function:helper",
-        "Function:runner_run"
+        "Function:runner_run",
+        "Function:consume"
       ],
       "documented_misses": []
     },
@@ -31,6 +32,26 @@
       "to": "helper",
       "expected_contains": [
         "runner_run -> helper"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "c-include-cross-tu-call-chain",
+      "kind": "call_chain",
+      "from": "consume",
+      "to": "helper",
+      "expected_contains": [
+        "consume -> helper"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "c-include-cross-tu-runner-run",
+      "kind": "call_chain",
+      "from": "consume",
+      "to": "runner_run",
+      "expected_contains": [
+        "consume -> runner_run"
       ],
       "documented_misses": []
     },

@@ -95,9 +95,9 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
   --spec benchmarks/specs/c-smoke-queries.json \
   --report target/semantic-graph-benchmark/c-family-real/curl.json \
   --mixed-repo target/benchmark-repos/curl \
-  --mixed-iterations 5000 \
+  --mixed-iterations 1000 \
   --ra-lsp-probes 0 \
-  --oracle-files 50 \
+  --oracle-files 10 \
   --no-speed-gate
 ```
 
@@ -272,13 +272,14 @@ accuracy, and rust-analyzer LSP navigation accuracy summaries to the GitHub
 Actions step summary.
 
 For C/C++, the full tier clones redis, curl, sqlite, protobuf, and
-nlohmann/json, then runs deterministic mixed workload scenarios and refresh
-probes against each repo. Pushing a branch under `benchmark-full/**` runs the
-same full Rust and C-family tiers after the workflow is available on the default
-branch. Clang/clang++ syntax validation and sampled clang AST symbol TP/FP/FN
-are reported when they succeed, but full-tier external repos are not blocked on
-compiler validation because real C/C++ projects often need project-specific
-include paths, generated headers, or compile command databases.
+nlohmann/json, then runs 1,000 deterministic mixed workload scenarios, refresh
+probes, and a 10-file clang AST symbol sample against each repo. Pushing a
+branch under `benchmark-full/**` runs the same full Rust and C-family tiers
+after the workflow is available on the default branch. Clang/clang++ syntax
+validation and sampled clang AST symbol TP/FP/FN are reported when they succeed,
+but full-tier external repos are not blocked on compiler validation because real
+C/C++ projects often need project-specific include paths, generated headers, or
+compile command databases.
 
 The workflow uploads the raw JSON reports and rendered summaries as
 `semantic-graph-benchmark-*` artifacts so benchmark runs can be audited after

@@ -73,13 +73,11 @@ fn python_ast_oracle_reports_unparseable_files_separately() {
 
     assert_eq!(scan.unparseable_files, vec!["invalid.py".to_string()]);
     assert_eq!(scan.symbols.raw_total, 1);
-    assert!(
-        scan.symbols.counts.contains_key(&SymbolKey {
-            file: "valid.py".to_string(),
-            kind: "Function".to_string(),
-            name: "ok".to_string()
-        })
-    );
+    assert!(scan.symbols.counts.contains_key(&SymbolKey {
+        file: "valid.py".to_string(),
+        kind: "Function".to_string(),
+        name: "ok".to_string()
+    }));
 }
 
 #[test]
@@ -98,4 +96,46 @@ fn c_family_clang_oracle_excludes_unselected_files_from_fp_accounting() {
     assert_eq!(scan.candidate_files, 2);
     assert_eq!(scan.excluded_files.len(), 1);
     assert_eq!(scan.symbols.counts.len(), 1);
+}
+
+#[test]
+fn c_family_squeezy_scan_excludes_template_specializations() {
+    use squeezy_core::SymbolId;
+
+    let root = temp_dir("c-family-template-spec").unwrap();
+    let fixture = root.join("specialization.cpp");
+    fs::write(
+        &fixture,
+        r#"
+template <typename T>
+class Box {};
+
+template <>
+class Box<int> {
+public:
+    int value;
+};
+"#,
+    )
+    .unwrap();
+
+    let graph = build_graph(&root).unwrap();
+    let scan = collect_c_family_squeezy_symbol_scan(
+        &graph,
+        LanguageKind::Cpp,
+        &std::collections::BTreeSet::new(),
+    );
+
+    // The `Box<int>` specialization is tagged with
+    // `c++:template-specialization` and must be excluded from the
+    // comparable-symbol scan so it doesn't show up as a Class FP against
+    // the clang AST oracle (which emits `ClassTemplateSpecializationDecl`,
+    // a kind our normalizer skips).
+    assert!(
+        scan.excluded_by_kind.contains_key("TemplateSpecialization"),
+        "expected at least one TemplateSpecialization exclusion in {:?}",
+        scan.excluded_by_kind
+    );
+
+    let _ = SymbolId::new("unused".to_string());
 }
