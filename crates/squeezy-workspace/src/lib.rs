@@ -125,12 +125,21 @@ impl WorkspaceCrawler {
             let Some(file_type) = entry.file_type() else {
                 continue;
             };
-            if !file_type.is_file() {
+            if !file_type.is_file() && !file_type.is_symlink() {
                 continue;
             }
 
             let path = entry.into_path();
             let metadata = fs::metadata(&path)?;
+            if !metadata.is_file() {
+                continue;
+            }
+            if file_type.is_symlink() {
+                let target = fs::canonicalize(&path)?;
+                if !target.starts_with(&root) {
+                    continue;
+                }
+            }
             let size_bytes = metadata.len();
             let relative_path = relative_path(&root, &path)?;
             let extension = path
@@ -205,6 +214,7 @@ impl WorkspaceCrawler {
 
 pub fn classify_language(path: &Path) -> LanguageKind {
     match path.extension().and_then(|extension| extension.to_str()) {
+        Some("go") => LanguageKind::Go,
         Some("py") => LanguageKind::Python,
         Some("rs") => LanguageKind::Rust,
         Some(_) => LanguageKind::Unsupported,
@@ -437,6 +447,7 @@ fn collect_source_markers(
             continue;
         }
         match classify_language(&path) {
+            LanguageKind::Go => signals.push("shallow Go source".to_string()),
             LanguageKind::Rust => signals.push("shallow Rust source".to_string()),
             LanguageKind::Python => signals.push("shallow Python source".to_string()),
             _ => {

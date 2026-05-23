@@ -240,6 +240,186 @@ class Runner:
 }
 
 #[test]
+fn parser_extracts_go_symbols_imports_calls_and_references() {
+    let source = r#"
+package greeter
+
+import (
+    "fmt"
+    util "example.com/acme/app/util"
+    . "example.com/acme/app/dot"
+    _ "example.com/acme/app/sideeffect"
+)
+
+const DefaultName = "Ada"
+var shared = Runner{}
+var First, Second = 1, 2
+var formatter = func() string {
+    var closureLocal string
+    return closureLocal
+}
+
+type Alias = string
+type (
+    AliasFunc = func(string) bool
+    LocalType = Runner
+)
+
+type Greeter interface {
+    Greet(name string) string
+}
+
+type Runner struct {
+    Name string
+    Greeter
+}
+
+func NewRunner(name string) Runner {
+    return Runner{Name: name}
+}
+
+func (r Runner) Greet(name string) string {
+    var localOnly string
+    fmt.Println(name)
+    helper()
+    _ = localOnly
+    return util.Format(name)
+}
+
+func helper() {}
+
+func (r Runner) TestSuiteStyle() {}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = go_record("greeter/runner_test.go", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert_eq!(parsed.package.as_deref(), Some("greeter"));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Greeter" && symbol.kind == SymbolKind::Interface)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Runner" && symbol.kind == SymbolKind::Struct)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Alias" && symbol.kind == SymbolKind::TypeAlias)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "AliasFunc" && symbol.kind == SymbolKind::TypeAlias)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "LocalType" && symbol.kind == SymbolKind::TypeAlias)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Name" && symbol.kind == SymbolKind::Field)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "NewRunner" && symbol.kind == SymbolKind::Function)
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "Greet"
+            && symbol.kind == SymbolKind::Method
+            && symbol
+                .attributes
+                .contains(&"go:receiver:Runner".to_string())
+    }));
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "TestSuiteStyle"
+            && symbol.kind == SymbolKind::Test
+            && symbol
+                .attributes
+                .contains(&"go:receiver:Runner".to_string())
+    }));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "DefaultName" && symbol.kind == SymbolKind::Const)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "First" && symbol.kind == SymbolKind::Static)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Second" && symbol.kind == SymbolKind::Static)
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "name" && symbol.kind == SymbolKind::Static),
+        "local variables must not be exposed as top-level graph declarations"
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "localOnly" && symbol.kind == SymbolKind::Static),
+        "function-local variables must stay out of declaration symbols"
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "closureLocal" && symbol.kind == SymbolKind::Static),
+        "variables inside top-level function literals must stay out of declaration symbols"
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "example.com/acme/app/util"
+                && import.alias.as_deref() == Some("util"))
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "example.com/acme/app/dot" && import.is_glob)
+    );
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|call| call.name == "Println" && call.receiver.as_deref() == Some("fmt"))
+    );
+    assert!(parsed.calls.iter().any(|call| call.name == "helper"));
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "Runner" && reference.kind == ReferenceKind::Type)
+    );
+}
+
+#[test]
 fn python_class_bases_filter_out_keyword_arguments() {
     let bases = python_class_bases("class Foo(Bar, metaclass=Meta, total=False)");
     assert_eq!(bases, vec!["Bar".to_string()]);
@@ -522,6 +702,12 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
 fn python_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Python;
+    record
+}
+
+fn go_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Go;
     record
 }
 

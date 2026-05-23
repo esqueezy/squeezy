@@ -750,6 +750,7 @@ impl SourceSpan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LanguageKind {
+    Go,
     Python,
     Rust,
     Unsupported,
@@ -761,6 +762,7 @@ pub enum SymbolKind {
     Class,
     Crate,
     File,
+    Interface,
     Module,
     Struct,
     Enum,

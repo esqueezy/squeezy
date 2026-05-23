@@ -94,6 +94,66 @@ def make():
 }
 
 #[test]
+fn graph_answers_go_navigation_queries() {
+    let mut parser = RustParser::new().unwrap();
+    let util = go_record(
+        "util/format.go",
+        r#"
+package util
+
+func Format(name string) string {
+    return name
+}
+"#,
+    );
+    let app = go_record(
+        "greeter/runner.go",
+        r#"
+package greeter
+
+import util "example.com/acme/app/util"
+
+type Runner struct {
+    Name string
+}
+
+func NewRunner(name string) Runner {
+    return Runner{Name: name}
+}
+
+func (r Runner) Greet(name string) string {
+    helper()
+    return util.Format(name)
+}
+
+func helper() {}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&util, fs::read_to_string(&util.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&app, fs::read_to_string(&app.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    assert!(
+        graph
+            .find_symbol_by_name("Runner")
+            .iter()
+            .any(|symbol| symbol.kind == SymbolKind::Struct)
+    );
+    let greet = graph.find_symbol_by_name("Greet").pop().unwrap();
+    let helper = graph.find_symbol_by_name("helper").pop().unwrap();
+    let format = graph.find_symbol_by_name("Format").pop().unwrap();
+    assert!(graph.call_chain(&greet.id, &helper.id, 2).is_some());
+    assert!(graph.call_chain(&greet.id, &format.id, 2).is_some());
+    assert!(!graph.reference_search("Format").is_empty());
+}
+
+#[test]
 fn graph_uses_python_navigation_heuristics() {
     let mut parser = RustParser::new().unwrap();
     let greeter = python_record(
@@ -1076,6 +1136,12 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
 fn python_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Python;
+    record
+}
+
+fn go_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Go;
     record
 }
 
