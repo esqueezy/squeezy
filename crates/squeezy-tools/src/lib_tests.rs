@@ -1079,8 +1079,7 @@ async fn write_file_creates_checkpoint_and_checkpoint_undo_restores_file() {
 async fn shell_created_file_is_checkpointed_and_deleted_on_undo() {
     let root = temp_workspace("checkpoint_shell_undo");
     // Disable the OS sandbox so this test focuses on checkpoint behavior;
-    // the deny-default macOS profile + Linux unshare probing are exercised
-    // in dedicated sandbox tests, not the checkpoint suite.
+    // OS sandbox backend coverage lives in shell_sandbox_tests.
     let registry = registry_with_shell_sandbox_off(&root);
 
     let result = registry
