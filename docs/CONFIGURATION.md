@@ -64,6 +64,9 @@ commented examples so that built-in defaults can evolve over time:
 
 [telemetry]
 # enabled = true
+
+# [redaction]
+# custom_patterns = []
 ```
 
 ## Example Project Settings
@@ -78,6 +81,11 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 # max_tool_bytes_read_per_turn = 20000000
 # max_search_files_per_turn = 50000
 # max_tool_result_bytes_per_round = 50000
+
+# [redaction]
+# Add project-specific Rust regex patterns for secrets Squeezy should redact
+# everywhere they appear in tool output, model requests, and UI surfaces.
+# custom_patterns = []
 
 [cache]
 # tool_outputs = ".squeezy/tool_outputs"
@@ -96,6 +104,8 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 - `[permissions]`: `read`, `edit`, `shell`, `ignored_search`, and `web`, each
   set to `allow`, `ask`, or `deny`.
 - `[telemetry]`: `enabled` and `endpoint`.
+- `[redaction]`: `custom_patterns`, an optional list of Rust regex patterns
+  that extend Squeezy's built-in secret redaction.
 - `[web]`: `exa_mcp_url` and `exa_api_key_env`.
 - `[cache]`: `root` and `tool_outputs`. Relative paths resolve against the
   workspace root, not the process working directory.
@@ -139,3 +149,17 @@ Existing environment overrides remain supported, including:
 
 Unknown fields, invalid enum values, and invalid numeric limits are reported as
 configuration errors with a source and dotted path.
+
+## Redaction Policy
+
+Built-in redaction is always enabled. It covers common provider keys, bearer
+tokens, GitHub and AWS tokens, JWTs, private key blocks, URL credentials and
+secret query parameters, and assignment-style values whose names look like
+keys, tokens, credentials, passwords, or secrets.
+
+Custom patterns extend the built-in set and are validated at config load time.
+`config inspect` hides configured patterns so private naming conventions do not
+leak into copied diagnostics. Redaction happens before tool output is returned
+to the model, before large tool output is spilled to disk, before model
+requests are sent, and before TUI/status surfaces display provider errors or
+tool results.

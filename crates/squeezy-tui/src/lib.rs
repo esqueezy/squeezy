@@ -70,6 +70,10 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         result.cost_hint.output_bytes,
                         result.cost_hint.truncated
                     );
+                    if result.cost_hint.redactions > 0 {
+                        app.status
+                            .push_str(&format!(" redactions={}", result.cost_hint.redactions));
+                    }
                 }
                 AgentEvent::ApprovalRequested {
                     request,
@@ -268,7 +272,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let tokens = format!(
-        "provider={} model={} cfg={} status={} tools={} read={}B receipt_hits={} budget_denials={} in={} out={} cached={} cache_write={} cost={} | Enter send | y/n approve | Ctrl-C cancel/quit | Esc quit",
+        "provider={} model={} cfg={} status={} tools={} read={}B receipt_hits={} budget_denials={} redactions={} in={} out={} cached={} cache_write={} cost={} | Enter send | y/n approve | Ctrl-C cancel/quit | Esc quit",
         app.provider_name,
         app.model,
         app.config_sources,
@@ -277,6 +281,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         app.metrics.bytes_read,
         app.metrics.receipt_stub_hits + app.metrics.negative_receipt_hits,
         app.metrics.budget_denials,
+        app.metrics.redactions,
         app.cost
             .input_tokens
             .map_or("-".to_string(), |value| value.to_string()),

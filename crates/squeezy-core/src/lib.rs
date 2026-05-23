@@ -1,10 +1,12 @@
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     env, fmt, fs,
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -61,6 +63,7 @@ pub struct AppConfig {
     pub max_tool_bytes_read_per_turn: u64,
     pub max_search_files_per_turn: u64,
     pub telemetry: TelemetryConfig,
+    pub redaction: RedactionConfig,
     pub skills: SkillsConfig,
     pub graph: GraphConfig,
     pub cache: CacheConfig,
@@ -332,6 +335,7 @@ impl AppConfig {
             settings.telemetry.unwrap_or_default(),
             &mut get_var,
         );
+        let redaction = RedactionConfig::from_settings(settings.redaction.unwrap_or_default())?;
         let permissions = PermissionPolicy::from_settings_and_env(
             settings.permissions.unwrap_or_default(),
             &mut get_var,
@@ -370,6 +374,7 @@ impl AppConfig {
             max_tool_bytes_read_per_turn,
             max_search_files_per_turn,
             telemetry,
+            redaction,
             skills,
             graph,
             cache,
@@ -487,6 +492,13 @@ impl AppConfig {
             "endpoint = {}\n\n",
             toml_string(&self.telemetry.endpoint)
         ));
+
+        output.push_str("[redaction]\n");
+        if self.redaction.custom_patterns.is_empty() {
+            output.push_str("custom_patterns = []\n\n");
+        } else {
+            output.push_str("custom_patterns = [\"<redacted>\"]\n\n");
+        }
 
         output.push_str("[web]\n");
         output.push_str(&format!(
@@ -711,6 +723,7 @@ pub struct SettingsFile {
     pub budgets: Option<BudgetSettings>,
     pub permissions: Option<PermissionSettings>,
     pub telemetry: Option<TelemetrySettings>,
+    pub redaction: Option<RedactionSettings>,
     pub web: Option<WebSettings>,
     pub skills: Option<SkillsSettings>,
     pub graph: Option<GraphSettings>,
@@ -765,6 +778,7 @@ impl SettingsFile {
                 "budgets",
                 "permissions",
                 "telemetry",
+                "redaction",
                 "web",
                 "skills",
                 "graph",
@@ -800,6 +814,9 @@ impl SettingsFile {
             .transpose()?;
         settings.telemetry = optional_table(table, "telemetry", source)?
             .map(|table| TelemetrySettings::from_table(table, source, "telemetry"))
+            .transpose()?;
+        settings.redaction = optional_table(table, "redaction", source)?
+            .map(|table| RedactionSettings::from_table(table, source, "redaction"))
             .transpose()?;
         settings.web = optional_table(table, "web", source)?
             .map(|table| WebSettings::from_table(table, source, "web"))
@@ -842,6 +859,11 @@ impl SettingsFile {
             &mut self.telemetry,
             next.telemetry,
             TelemetrySettings::merge,
+        );
+        merge_option(
+            &mut self.redaction,
+            next.redaction,
+            RedactionSettings::merge,
         );
         merge_option(&mut self.web, next.web, WebSettings::merge);
         merge_option(&mut self.skills, next.skills, SkillsSettings::merge);
@@ -1307,6 +1329,208 @@ impl Default for TelemetryConfig {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RedactionSettings {
+    pub custom_patterns: Option<Vec<String>>,
+}
+
+impl RedactionSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(table, &["custom_patterns"], source, path)?;
+        Ok(Self {
+            custom_patterns: string_array_value(
+                table,
+                "custom_patterns",
+                source,
+                &field(path, "custom_patterns"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.custom_patterns, next.custom_patterns);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedactionConfig {
+    pub custom_patterns: Vec<String>,
+}
+
+impl RedactionConfig {
+    fn from_settings(settings: RedactionSettings) -> Result<Self> {
+        let config = Self {
+            custom_patterns: settings.custom_patterns.unwrap_or_default(),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for (index, pattern) in self.custom_patterns.iter().enumerate() {
+            Regex::new(pattern).map_err(|err| {
+                SqueezyError::Config(format!(
+                    "redaction.custom_patterns.{index}: invalid regex: {err}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn redactor(&self) -> Result<Redactor> {
+        Redactor::new(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactedText {
+    pub text: String,
+    pub redactions: u64,
+}
+
+impl RedactedText {
+    pub fn unchanged(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            redactions: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Redactor {
+    patterns: Vec<RedactionPattern>,
+}
+
+#[derive(Debug, Clone)]
+struct RedactionPattern {
+    kind: &'static str,
+    regex: Regex,
+}
+
+impl Redactor {
+    pub fn new(config: &RedactionConfig) -> Result<Self> {
+        let mut patterns = Vec::new();
+        for (kind, pattern) in DEFAULT_REDACTION_PATTERNS {
+            patterns.push(RedactionPattern {
+                kind,
+                regex: Regex::new(pattern).map_err(|err| {
+                    SqueezyError::Config(format!("built-in redaction pattern {kind}: {err}"))
+                })?,
+            });
+        }
+        for (index, pattern) in config.custom_patterns.iter().enumerate() {
+            patterns.push(RedactionPattern {
+                kind: "custom",
+                regex: Regex::new(pattern).map_err(|err| {
+                    SqueezyError::Config(format!(
+                        "redaction.custom_patterns.{index}: invalid regex: {err}"
+                    ))
+                })?,
+            });
+        }
+        Ok(Self { patterns })
+    }
+
+    pub fn redact(&self, text: &str) -> RedactedText {
+        if text.is_empty() {
+            return RedactedText::unchanged("");
+        }
+
+        let mut output = Cow::Borrowed(text);
+        let mut values = BTreeMap::<String, usize>::new();
+        let mut redactions = 0u64;
+        for pattern in &self.patterns {
+            let next = pattern
+                .regex
+                .replace_all(output.as_ref(), |captures: &Captures<'_>| {
+                    redactions += 1;
+                    redact_capture(pattern.kind, captures, &mut values)
+                });
+            output = Cow::Owned(next.into_owned());
+        }
+        RedactedText {
+            text: output.into_owned(),
+            redactions,
+        }
+    }
+}
+
+impl Default for Redactor {
+    fn default() -> Self {
+        RedactionConfig::default()
+            .redactor()
+            .expect("built-in redaction patterns must compile")
+    }
+}
+
+fn redact_capture(
+    kind: &'static str,
+    captures: &Captures<'_>,
+    values: &mut BTreeMap<String, usize>,
+) -> String {
+    let Some(full) = captures.get(0) else {
+        return "<redacted:unknown#0 bytes=0>".to_string();
+    };
+    let value = captures.name("value").unwrap_or(full);
+    let replacement = redaction_marker(kind, value.as_str(), values);
+    if value.start() == full.start() && value.end() == full.end() {
+        replacement
+    } else {
+        let relative_start = value.start() - full.start();
+        let relative_end = value.end() - full.start();
+        let full_text = full.as_str();
+        format!(
+            "{}{}{}",
+            &full_text[..relative_start],
+            replacement,
+            &full_text[relative_end..]
+        )
+    }
+}
+
+fn redaction_marker(
+    kind: &'static str,
+    value: &str,
+    values: &mut BTreeMap<String, usize>,
+) -> String {
+    let next = values.len() + 1;
+    let ordinal = *values.entry(value.to_string()).or_insert(next);
+    format!("<redacted:{kind}#{ordinal} bytes={}>", value.len())
+}
+
+const DEFAULT_REDACTION_PATTERNS: &[(&str, &str)] = &[
+    (
+        "secret_assignment",
+        r#"(?i)\b[A-Z0-9_]*(?:API|AUTH|BEARER|CREDENTIAL|KEY|PASSWORD|SECRET|TOKEN)[A-Z0-9_]*\s*=\s*["']?(?P<value>[^\s"',;`]+)"#,
+    ),
+    (
+        "url_query",
+        r#"(?i)[?&](?:access_token|api-key|api_key|apikey|code|key|signature|sig|token|x-amz-credential|x-amz-security-token|x-amz-signature)=(?P<value>[^&#\s]+)"#,
+    ),
+    (
+        "url_userinfo",
+        r#"(?i)https?://(?P<value>[^/\s:@]+:[^/\s@]+)@"#,
+    ),
+    (
+        "bearer_token",
+        r#"(?i)\bBearer\s+(?P<value>[A-Za-z0-9._~+/=-]{16,})\b"#,
+    ),
+    ("anthropic_key", r#"\bsk-ant-[A-Za-z0-9_-]{20,}\b"#),
+    ("openai_key", r#"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{20,}\b"#),
+    ("google_key", r#"\bAIza[0-9A-Za-z_-]{20,}\b"#),
+    ("github_token", r#"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"#),
+    ("aws_access_key", r#"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"#),
+    (
+        "jwt",
+        r#"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"#,
+    ),
+    (
+        "private_key",
+        r#"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"#,
+    ),
+];
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct WebSettings {
     pub exa_mcp_url: Option<String>,
     pub exa_api_key_env: Option<String>,
@@ -1682,6 +1906,9 @@ pub fn user_settings_template() -> &'static str {
 [telemetry]
 # enabled = true
 
+# [redaction]
+# custom_patterns = []
+
 # [web]
 # exa_mcp_url = "https://mcp.exa.ai/mcp"
 # exa_api_key_env = "EXA_API_KEY"
@@ -1702,6 +1929,11 @@ pub fn project_settings_template() -> &'static str {
 # max_tool_bytes_read_per_turn = 20000000
 # max_search_files_per_turn = 50000
 # max_tool_result_bytes_per_round = 50000
+
+# [redaction]
+# Add project-specific Rust regex patterns for secrets Squeezy should redact
+# everywhere they appear in tool output, model requests, and UI surfaces.
+# custom_patterns = []
 
 # `[graph]`, `[tui].status_verbosity`, and `[mcp.servers.*]` are parsed and
 # round-trip through `squeezy config inspect` but no runtime consumer reads
@@ -2266,6 +2498,7 @@ pub struct SessionMetrics {
     pub spill_writes: u64,
     pub spill_reads: u64,
     pub budget_denials: u64,
+    pub redactions: u64,
     pub provider: CostSnapshot,
 }
 
@@ -2286,6 +2519,7 @@ impl SessionMetrics {
         self.spill_writes += turn.spill_writes;
         self.spill_reads += turn.spill_reads;
         self.budget_denials += turn.budget_denials;
+        self.redactions += turn.redactions;
         merge_cost_snapshot(&mut self.provider, &turn.provider);
     }
 }
@@ -2306,6 +2540,7 @@ pub struct TurnMetrics {
     pub spill_writes: u64,
     pub spill_reads: u64,
     pub budget_denials: u64,
+    pub redactions: u64,
     pub provider: CostSnapshot,
 }
 

@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use squeezy_core::SkillsConfig;
+use squeezy_core::{RedactionConfig, SkillsConfig};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -395,6 +395,84 @@ async fn secret_name_checks_use_workspace_relative_paths() {
         )
         .await;
     assert_eq!(secret.status, ToolStatus::Denied);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_redacts_secret_looking_content_before_returning() {
+    let root = temp_workspace("read_redaction");
+    fs::write(
+        root.join("plain.txt"),
+        "token = ghp_abcdefghijklmnopqrstuvwxyz\n",
+    )
+    .expect("write plain");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "plain.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let content = result.content["content"].as_str().expect("content");
+    assert!(!content.contains("ghp_abcdefghijklmnopqrstuvwxyz"));
+    assert!(content.contains("<redacted:"));
+    assert!(result.cost_hint.redactions > 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_and_shell_outputs_are_redacted() {
+    let root = temp_workspace("tool_redaction");
+    fs::write(
+        root.join("app.log"),
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz\n",
+    )
+    .expect("write log");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let grep = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "Bearer", "include": ["*.log"]}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(grep.status, ToolStatus::Success);
+    let grep_text = grep.model_output();
+    assert!(!grep_text.contains("abcdefghijklmnopqrstuvwxyz"));
+    assert!(grep_text.contains("<redacted:bearer_token"));
+    assert!(grep.cost_hint.redactions > 0);
+
+    let shell = registry
+        .execute(
+            ToolCall {
+                call_id: "call_2".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf '%s\\n' 'OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz'",
+                    "description": "print test key"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(shell.status, ToolStatus::Success);
+    let stdout = shell.content["stdout"].as_str().expect("stdout");
+    assert!(!stdout.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+    assert!(stdout.contains("OPENAI_API_KEY="));
+    assert!(shell.cost_hint.redactions > 0);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1465,6 +1543,7 @@ async fn skill_tools_list_metadata_and_load_body() {
             user_dir: root.join("user-skills"),
             compat_user_dir: root.join("compat-skills"),
         },
+        RedactionConfig::default(),
     )
     .expect("registry");
 

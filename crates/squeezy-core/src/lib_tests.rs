@@ -490,6 +490,9 @@ fn inspect_redacts_sensitive_config_values() {
 [web]
 exa_api_key_env = "CUSTOM_EXA_KEY"
 
+[redaction]
+custom_patterns = ["internal-[a-z0-9]+"]
+
 [mcp.servers.docs]
 env = { TOKEN = "secret-value" }
 "#,
@@ -501,7 +504,68 @@ env = { TOKEN = "secret-value" }
 
     assert!(inspect.contains("<redacted>"));
     assert!(!inspect.contains("CUSTOM_EXA_KEY"));
+    assert!(!inspect.contains("internal-[a-z0-9]+"));
     assert!(!inspect.contains("secret-value"));
+}
+
+#[test]
+fn redactor_masks_builtin_secret_patterns_with_stable_markers() {
+    let redactor = RedactionConfig::default().redactor().expect("redactor");
+    let input = concat!(
+        "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz ",
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz ",
+        "https://user:pass@example.com?token=secret-token-value ",
+        "github=ghp_abcdefghijklmnopqrstuvwxyz"
+    );
+
+    let redacted = redactor.redact(input);
+
+    assert!(redacted.redactions >= 4);
+    assert!(!redacted.text.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+    assert!(!redacted.text.contains("abcdefghijklmnopqrstuvwxyz "));
+    assert!(!redacted.text.contains("user:pass"));
+    assert!(!redacted.text.contains("secret-token-value"));
+    assert!(!redacted.text.contains("ghp_abcdefghijklmnopqrstuvwxyz"));
+    assert!(redacted.text.contains("OPENAI_API_KEY="));
+    assert!(redacted.text.contains("<redacted:"));
+    assert!(redacted.text.contains("bytes="));
+}
+
+#[test]
+fn redactor_applies_custom_patterns_and_reuses_ordinals() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[redaction]
+custom_patterns = ["internal-[0-9]+"]
+"#,
+        "test",
+    )
+    .expect("settings");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    let redactor = config.redaction.redactor().expect("redactor");
+
+    let redacted = redactor.redact("internal-123 and internal-123");
+
+    assert_eq!(redacted.redactions, 2);
+    assert!(!redacted.text.contains("internal-123"));
+    assert_eq!(redacted.text.matches("<redacted:custom#1").count(), 2);
+}
+
+#[test]
+fn invalid_custom_redaction_pattern_fails_config_loading() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[redaction]
+custom_patterns = ["["]
+"#,
+        "test",
+    )
+    .expect("settings");
+
+    let error = AppConfig::try_from_settings_and_env_vars(settings, None, |_| None)
+        .expect_err("invalid pattern must fail");
+
+    assert!(error.to_string().contains("redaction.custom_patterns.0"));
 }
 
 #[test]

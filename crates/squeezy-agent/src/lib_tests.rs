@@ -103,6 +103,91 @@ async fn turn_stream_reports_provider_error() {
     assert!(saw_error);
 }
 
+#[tokio::test]
+async fn user_input_is_redacted_before_model_request_and_transcript() {
+    let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
+        response_id: Some("resp_1".to_string()),
+        cost: CostSnapshot::default(),
+    })]]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "use sk-abcdefghijklmnopqrstuvwxyz".to_string(),
+        CancellationToken::new(),
+    );
+    let mut user_message = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::UserMessage { message, .. } = event {
+            user_message = Some(message.content);
+        }
+    }
+
+    let user_message = user_message.expect("user message");
+    assert!(!user_message.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+    assert!(user_message.contains("<redacted:openai_key"));
+    let requests = provider.requests();
+    let LlmInputItem::UserText(request_text) = &requests[0].input[0] else {
+        panic!("expected user text");
+    };
+    assert!(!request_text.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+    assert!(request_text.contains("<redacted:openai_key"));
+}
+
+#[tokio::test]
+async fn assistant_text_and_provider_errors_are_redacted_before_events() {
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("token sk-abcdefghijk".to_string())),
+        Ok(LlmEvent::TextDelta("lmnopqrstuvwxyz".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider);
+
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut completed = None;
+    let mut saw_delta = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::AssistantDelta { .. } => saw_delta = true,
+            AgentEvent::Completed {
+                message, metrics, ..
+            } => {
+                completed = Some((message.content, metrics.redactions));
+            }
+            _ => {}
+        }
+    }
+
+    let (message, redactions) = completed.expect("completed");
+    assert!(
+        !saw_delta,
+        "assistant deltas are withheld until redacted safely"
+    );
+    assert!(!message.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+    assert!(message.contains("<redacted:openai_key"));
+    assert!(redactions > 0);
+
+    let provider = Arc::new(MockProvider::new(vec![vec![Err(
+        SqueezyError::ProviderRequest(
+            "failed with token sk-abcdefghijklmnopqrstuvwxyz".to_string(),
+        ),
+    )]]));
+    let agent = Agent::new(AppConfig::default(), provider);
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut failed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Failed { error, .. } = event {
+            failed = Some(error.to_string());
+        }
+    }
+    let failed = failed.expect("failed");
+    assert!(!failed.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+    assert!(failed.contains("<redacted:openai_key"));
+}
+
 #[test]
 fn agent_new_falls_back_to_current_dir_for_invalid_workspace_root() {
     let root = temp_workspace("agent_invalid_root");

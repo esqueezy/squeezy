@@ -11,8 +11,8 @@ use std::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{
-    AppConfig, CostSnapshot, PermissionMode, PermissionScope, SessionMetrics, SqueezyError,
-    TranscriptItem, TurnId, TurnMetrics,
+    AppConfig, CostSnapshot, PermissionMode, PermissionScope, Redactor, SessionMetrics,
+    SqueezyError, TranscriptItem, TurnId, TurnMetrics,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, estimate_cost};
 use squeezy_telemetry::{
@@ -34,6 +34,7 @@ pub struct Agent {
     provider: Arc<dyn LlmProvider>,
     tools: ToolRegistry,
     telemetry: TelemetryClient,
+    redactor: Arc<Redactor>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
     next_turn_id: Arc<AtomicU64>,
     next_approval_id: Arc<AtomicU64>,
@@ -56,16 +57,24 @@ impl Agent {
             output_config.clone(),
             web_config.clone(),
             config.skills.clone(),
+            config.redaction.clone(),
         )
         .unwrap_or_else(|_| {
             ToolRegistry::new_with_configs(".", output_config, web_config)
                 .expect("current directory must be a valid tool root")
         });
+        let redactor = Arc::new(
+            config
+                .redaction
+                .redactor()
+                .expect("validated redaction config must compile"),
+        );
         Self {
             telemetry: TelemetryClient::from_config(&config),
             config,
             provider,
             tools,
+            redactor,
             session_metrics: Arc::new(Mutex::new(SessionMetrics::default())),
             next_turn_id: Arc::new(AtomicU64::new(1)),
             next_approval_id: Arc::new(AtomicU64::new(1)),
@@ -90,6 +99,7 @@ impl Agent {
         let config = self.config.clone();
         let tools = self.tools.clone();
         let telemetry = self.telemetry.clone();
+        let redactor = self.redactor.clone();
         let session_metrics = self.session_metrics.clone();
         let tool_specs = tools
             .specs()
@@ -100,10 +110,11 @@ impl Agent {
         let approval_ids = self.next_approval_id.clone();
 
         tokio::spawn(async move {
+            let redacted_input = redactor.redact(&input);
             if tx
                 .send(AgentEvent::UserMessage {
                     turn_id,
-                    message: TranscriptItem::user(input.clone()),
+                    message: TranscriptItem::user(redacted_input.text.clone()),
                 })
                 .await
                 .is_err()
@@ -117,16 +128,18 @@ impl Agent {
                 config,
                 tools,
                 telemetry: telemetry.clone(),
+                redactor: redactor.clone(),
                 session_metrics,
                 tool_specs,
                 tx: tx.clone(),
                 cancel,
                 approval_ids,
             }
-            .run(input)
+            .run(redacted_input.text)
             .await;
 
             if let Err(error) = outcome {
+                let error = redact_error(error, &redactor);
                 telemetry.spawn(TelemetryEvent::failure_seen(error_kind(&error)));
                 let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
             }
@@ -142,6 +155,7 @@ struct TurnRuntime {
     config: AppConfig,
     tools: ToolRegistry,
     telemetry: TelemetryClient,
+    redactor: Arc<Redactor>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
     tool_specs: Vec<LlmToolSpec>,
     tx: mpsc::Sender<AgentEvent>,
@@ -167,8 +181,8 @@ impl TurnRuntime {
         for _round in 0..MAX_TOOL_ROUNDS {
             let request = LlmRequest {
                 model: self.config.model.clone(),
-                instructions: request_instructions.clone(),
-                input: next_input.clone(),
+                instructions: self.redactor.redact(&request_instructions).text,
+                input: redact_llm_input_items(&next_input, &self.redactor),
                 max_output_tokens: self.config.max_output_tokens,
                 previous_response_id: previous_response_id.clone(),
                 tools: self.tool_specs.clone(),
@@ -196,17 +210,6 @@ impl TurnRuntime {
                     }
                     Ok(LlmEvent::TextDelta(delta)) => {
                         assistant_text.push_str(&delta);
-                        if self
-                            .tx
-                            .send(AgentEvent::AssistantDelta {
-                                turn_id: self.turn_id,
-                                delta,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return Ok(());
-                        }
                     }
                     Ok(LlmEvent::ToolCall(tool_call)) => {
                         let call = ToolCall {
@@ -218,7 +221,7 @@ impl TurnRuntime {
                             .tx
                             .send(AgentEvent::ToolCallQueued {
                                 turn_id: self.turn_id,
-                                call: call.clone(),
+                                call: redact_tool_call(call.clone(), &self.redactor),
                             })
                             .await
                             .is_err()
@@ -255,11 +258,13 @@ impl TurnRuntime {
             }
 
             if !completed {
+                let redacted_message = self.redactor.redact(&assistant_text);
+                broker.metrics.redactions += redacted_message.redactions;
                 let _ = self
                     .tx
                     .send(AgentEvent::Completed {
                         turn_id: self.turn_id,
-                        message: TranscriptItem::assistant(assistant_text),
+                        message: TranscriptItem::assistant(redacted_message.text),
                         response_id: None,
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
@@ -270,11 +275,13 @@ impl TurnRuntime {
             }
 
             if tool_calls.is_empty() {
+                let redacted_message = self.redactor.redact(&assistant_text);
+                broker.metrics.redactions += redacted_message.redactions;
                 let _ = self
                     .tx
                     .send(AgentEvent::Completed {
                         turn_id: self.turn_id,
-                        message: TranscriptItem::assistant(assistant_text),
+                        message: TranscriptItem::assistant(redacted_message.text),
                         response_id,
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
@@ -291,6 +298,7 @@ impl TurnRuntime {
                     tools: &self.tools,
                     config: &self.config,
                     telemetry: self.telemetry.clone(),
+                    redactor: self.redactor.clone(),
                     tx: self.tx.clone(),
                     cancel: self.cancel.clone(),
                     approval_ids: self.approval_ids.clone(),
@@ -321,7 +329,11 @@ impl TurnRuntime {
                 next_input = outputs;
             } else {
                 previous_response_id = None;
-                conversation.extend(tool_calls.into_iter().map(llm_function_call_item));
+                conversation.extend(
+                    tool_calls
+                        .into_iter()
+                        .map(|call| llm_function_call_item(call, &self.redactor)),
+                );
                 conversation.extend(outputs.clone());
                 next_input = conversation.clone();
             }
@@ -348,6 +360,7 @@ struct ToolExecutionContext<'a> {
     tools: &'a ToolRegistry,
     config: &'a AppConfig,
     telemetry: TelemetryClient,
+    redactor: Arc<Redactor>,
     tx: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
@@ -394,6 +407,7 @@ async fn execute_tool_calls(
             call,
             context.tools,
             context.config,
+            &context.redactor,
             &context.tx,
             &context.cancel,
             context.approval_ids.clone(),
@@ -584,7 +598,7 @@ async fn run_one_tool(
         .tx
         .send(AgentEvent::ToolCallStarted {
             turn_id: context.turn_id,
-            call: call.clone(),
+            call: redact_tool_call(call.clone(), &context.redactor),
         })
         .await;
     let started = Instant::now();
@@ -671,6 +685,7 @@ impl CostBroker {
         self.metrics.files_scanned += result.cost_hint.files_scanned;
         self.metrics.bytes_read += result.cost_hint.bytes_read;
         self.metrics.matches_returned += result.cost_hint.matches_returned;
+        self.metrics.redactions += result.cost_hint.redactions;
         if result.content.get("spilled").and_then(Value::as_bool) == Some(true) {
             self.metrics.spill_writes += 1;
         }
@@ -785,6 +800,7 @@ async fn permission_decision(
     call: &ToolCall,
     tools: &ToolRegistry,
     config: &AppConfig,
+    redactor: &Redactor,
     tx: &mpsc::Sender<AgentEvent>,
     cancel: &CancellationToken,
     approval_ids: Arc<AtomicU64>,
@@ -800,7 +816,7 @@ async fn permission_decision(
                 call_id: call.call_id.clone(),
                 tool_name: call.name.clone(),
                 scope,
-                summary: tools.describe_call(call),
+                summary: redactor.redact(&tools.describe_call(call)).text,
             };
             let send_approval = tx.send(AgentEvent::ApprovalRequested {
                 turn_id,
@@ -837,11 +853,85 @@ fn llm_tool_spec(spec: ToolSpec) -> LlmToolSpec {
     }
 }
 
-fn llm_function_call_item(call: ToolCall) -> LlmInputItem {
+fn llm_function_call_item(call: ToolCall, redactor: &Redactor) -> LlmInputItem {
     LlmInputItem::FunctionCall {
         call_id: call.call_id,
         name: call.name,
-        arguments: call.arguments,
+        arguments: redact_json_value(call.arguments, redactor),
+    }
+}
+
+fn redact_llm_input_items(input: &[LlmInputItem], redactor: &Redactor) -> Vec<LlmInputItem> {
+    input
+        .iter()
+        .cloned()
+        .map(|item| match item {
+            LlmInputItem::UserText(text) => LlmInputItem::UserText(redactor.redact(&text).text),
+            LlmInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => LlmInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments: redact_json_value(arguments, redactor),
+            },
+            LlmInputItem::FunctionCallOutput { call_id, output } => {
+                LlmInputItem::FunctionCallOutput {
+                    call_id,
+                    output: redactor.redact(&output).text,
+                }
+            }
+        })
+        .collect()
+}
+
+fn redact_tool_call(mut call: ToolCall, redactor: &Redactor) -> ToolCall {
+    call.arguments = redact_json_value(call.arguments, redactor);
+    call
+}
+
+fn redact_json_value(value: Value, redactor: &Redactor) -> Value {
+    match value {
+        Value::String(text) => Value::String(redactor.redact(&text).text),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| redact_json_value(item, redactor))
+                .collect(),
+        ),
+        Value::Object(entries) => Value::Object(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key, redact_json_value(value, redactor)))
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
+fn redact_error(error: SqueezyError, redactor: &Redactor) -> SqueezyError {
+    match error {
+        SqueezyError::Config(message) => SqueezyError::Config(redactor.redact(&message).text),
+        SqueezyError::ProviderNotConfigured(message) => {
+            SqueezyError::ProviderNotConfigured(redactor.redact(&message).text)
+        }
+        SqueezyError::ProviderRequest(message) => {
+            SqueezyError::ProviderRequest(redactor.redact(&message).text)
+        }
+        SqueezyError::ProviderStream(message) => {
+            SqueezyError::ProviderStream(redactor.redact(&message).text)
+        }
+        SqueezyError::Terminal(message) => SqueezyError::Terminal(redactor.redact(&message).text),
+        SqueezyError::Agent(message) => SqueezyError::Agent(redactor.redact(&message).text),
+        SqueezyError::Workspace(message) => SqueezyError::Workspace(redactor.redact(&message).text),
+        SqueezyError::Parse(message) => SqueezyError::Parse(redactor.redact(&message).text),
+        SqueezyError::Graph(message) => SqueezyError::Graph(redactor.redact(&message).text),
+        SqueezyError::Tool(message) => SqueezyError::Tool(redactor.redact(&message).text),
+        SqueezyError::Permission(message) => {
+            SqueezyError::Permission(redactor.redact(&message).text)
+        }
+        SqueezyError::Io(error) => SqueezyError::Io(error),
     }
 }
 
