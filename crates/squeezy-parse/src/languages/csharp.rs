@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::languages::rust::*;
 use crate::*;
 
 pub(crate) fn extract_csharp(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
@@ -52,7 +53,7 @@ struct CsharpScope {
 }
 
 impl CsharpScope {
-    fn current_namespace(&self) -> Option<String> {
+    pub(crate) fn current_namespace(&self) -> Option<String> {
         if self.namespace_segments.is_empty() {
             None
         } else {
@@ -60,7 +61,7 @@ impl CsharpScope {
         }
     }
 
-    fn record_namespace(&mut self) {
+    pub(crate) fn record_namespace(&mut self) {
         if self.top_namespace.is_some() {
             return;
         }
@@ -184,7 +185,7 @@ fn visit_csharp_children(
     }
 }
 
-fn csharp_namespace_symbol(
+pub(crate) fn csharp_namespace_symbol(
     node: Node<'_>,
     ctx: &ExtractContext<'_>,
     raw_name: &str,
@@ -336,7 +337,7 @@ fn csharp_symbol_from_node(
     })
 }
 
-fn csharp_symbol_name(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn csharp_symbol_name(node: Node<'_>, source: &str) -> Option<String> {
     if let Some(name_node) = node.child_by_field_name("name") {
         return node_text(name_node, source)
             .ok()
@@ -352,21 +353,21 @@ fn csharp_symbol_name(node: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
-fn csharp_field_text(node: Node<'_>, field: &str, source: &str) -> Option<String> {
+pub(crate) fn csharp_field_text(node: Node<'_>, field: &str, source: &str) -> Option<String> {
     let child = node.child_by_field_name(field)?;
     node_text(child, source)
         .ok()
         .map(|text| text.trim().to_string())
 }
 
-fn csharp_qualified_segments(raw: &str) -> Vec<String> {
+pub(crate) fn csharp_qualified_segments(raw: &str) -> Vec<String> {
     raw.split('.')
         .map(|segment| segment.trim().to_string())
         .filter(|segment| !segment.is_empty())
         .collect()
 }
 
-fn csharp_attribute_strings(node: Node<'_>, source: &str) -> Vec<String> {
+pub(crate) fn csharp_attribute_strings(node: Node<'_>, source: &str) -> Vec<String> {
     let mut attributes = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -384,7 +385,7 @@ fn csharp_attribute_strings(node: Node<'_>, source: &str) -> Vec<String> {
     attributes
 }
 
-fn csharp_modifiers(node: Node<'_>, source: &str) -> Vec<String> {
+pub(crate) fn csharp_modifiers(node: Node<'_>, source: &str) -> Vec<String> {
     let mut modifiers = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -397,7 +398,7 @@ fn csharp_modifiers(node: Node<'_>, source: &str) -> Vec<String> {
     modifiers
 }
 
-fn csharp_visibility(modifiers: &[String]) -> Option<String> {
+pub(crate) fn csharp_visibility(modifiers: &[String]) -> Option<String> {
     for visibility in ["public", "internal", "protected", "private", "file"] {
         if modifiers.iter().any(|modifier| modifier == visibility) {
             return Some(visibility.to_string());
@@ -406,7 +407,7 @@ fn csharp_visibility(modifiers: &[String]) -> Option<String> {
     None
 }
 
-fn csharp_semantic_attributes(
+pub(crate) fn csharp_semantic_attributes(
     node: Node<'_>,
     attributes_raw: &[String],
     modifiers: &[String],
@@ -469,7 +470,7 @@ fn csharp_semantic_attributes(
     attributes
 }
 
-fn csharp_attribute_head(attribute: &str) -> String {
+pub(crate) fn csharp_attribute_head(attribute: &str) -> String {
     let body = attribute
         .trim()
         .trim_start_matches('[')
@@ -484,7 +485,7 @@ fn csharp_attribute_head(attribute: &str) -> String {
     head.to_string()
 }
 
-fn csharp_is_test(attributes_raw: &[String]) -> bool {
+pub(crate) fn csharp_is_test(attributes_raw: &[String]) -> bool {
     attributes_raw.iter().any(|attribute| {
         let head = csharp_attribute_head(attribute);
         matches!(
@@ -503,7 +504,7 @@ fn csharp_is_test(attributes_raw: &[String]) -> bool {
     })
 }
 
-fn csharp_is_test_filename(relative_path: &str) -> bool {
+pub(crate) fn csharp_is_test_filename(relative_path: &str) -> bool {
     let file_name = relative_path
         .rsplit(['/', '\\'])
         .next()
@@ -516,7 +517,7 @@ fn csharp_is_test_filename(relative_path: &str) -> bool {
     lower.ends_with("tests") || lower.ends_with("test") || lower.contains(".tests.")
 }
 
-fn csharp_doc_comments(node: Node<'_>, source: &str) -> Vec<String> {
+pub(crate) fn csharp_doc_comments(node: Node<'_>, source: &str) -> Vec<String> {
     let mut docs = Vec::new();
     let mut walker = node;
     while let Some(previous) = walker.prev_named_sibling() {
@@ -540,7 +541,7 @@ fn csharp_doc_comments(node: Node<'_>, source: &str) -> Vec<String> {
     docs
 }
 
-fn first_csharp_string_literal(text: &str) -> Option<String> {
+pub(crate) fn first_csharp_string_literal(text: &str) -> Option<String> {
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         let quote = match ch {
@@ -565,7 +566,7 @@ fn first_csharp_string_literal(text: &str) -> Option<String> {
     None
 }
 
-fn extract_csharp_using_directive(
+pub(crate) fn extract_csharp_using_directive(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
     owner_id: Option<SymbolId>,
@@ -611,7 +612,11 @@ fn extract_csharp_using_directive(
     ctx.imports.push(import);
 }
 
-fn extract_csharp_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+pub(crate) fn extract_csharp_call(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
     let Some(function_node) = node.child_by_field_name("function") else {
         return;
     };
@@ -643,7 +648,7 @@ fn extract_csharp_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: O
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
 }
 
-fn csharp_call_target_parts(
+pub(crate) fn csharp_call_target_parts(
     function_node: Node<'_>,
     target_text: &str,
     source: &str,
@@ -691,7 +696,7 @@ fn csharp_call_target_parts(
     }
 }
 
-fn extract_csharp_object_creation(
+pub(crate) fn extract_csharp_object_creation(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
     owner_id: Option<SymbolId>,
@@ -738,7 +743,7 @@ fn extract_csharp_object_creation(
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
 }
 
-fn extract_csharp_reference(
+pub(crate) fn extract_csharp_reference(
     node: Node<'_>,
     kind: ReferenceKind,
     ctx: &mut ExtractContext<'_>,
@@ -778,7 +783,7 @@ fn extract_csharp_reference(
     });
 }
 
-fn extract_csharp_field_symbols(
+pub(crate) fn extract_csharp_field_symbols(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
@@ -872,7 +877,7 @@ fn extract_csharp_field_symbols(
     }
 }
 
-fn csharp_collect_base_types(node: Node<'_>, source: &str) -> Vec<String> {
+pub(crate) fn csharp_collect_base_types(node: Node<'_>, source: &str) -> Vec<String> {
     let mut bases = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -899,7 +904,7 @@ fn csharp_collect_base_types(node: Node<'_>, source: &str) -> Vec<String> {
     bases
 }
 
-fn extract_csharp_symbol_facts(
+pub(crate) fn extract_csharp_symbol_facts(
     node: Node<'_>,
     symbol: &ParsedSymbol,
     ctx: &mut ExtractContext<'_>,
@@ -940,7 +945,7 @@ fn extract_csharp_symbol_facts(
     }
 }
 
-fn push_csharp_type_reference(
+pub(crate) fn push_csharp_type_reference(
     type_node: Node<'_>,
     symbol: &ParsedSymbol,
     ctx: &mut ExtractContext<'_>,
@@ -963,7 +968,7 @@ fn push_csharp_type_reference(
     });
 }
 
-fn csharp_type_name_from_annotation(annotation: &str) -> Option<String> {
+pub(crate) fn csharp_type_name_from_annotation(annotation: &str) -> Option<String> {
     let mut text = annotation
         .trim()
         .trim_matches(|ch: char| matches!(ch, '?' | '*' | '&' | ' '))
@@ -982,7 +987,7 @@ fn csharp_type_name_from_annotation(annotation: &str) -> Option<String> {
     Some(leaf)
 }
 
-fn is_csharp_declaration_name(node: Node<'_>) -> bool {
+pub(crate) fn is_csharp_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -1019,7 +1024,7 @@ fn is_csharp_declaration_name(node: Node<'_>) -> bool {
         .unwrap_or(false)
 }
 
-fn is_csharp_literal(kind: &str) -> bool {
+pub(crate) fn is_csharp_literal(kind: &str) -> bool {
     matches!(
         kind,
         "string_literal"
@@ -1033,7 +1038,7 @@ fn is_csharp_literal(kind: &str) -> bool {
     )
 }
 
-fn csharp_is_keyword_or_predefined(text: &str) -> bool {
+pub(crate) fn csharp_is_keyword_or_predefined(text: &str) -> bool {
     matches!(
         text,
         "var"
@@ -1065,7 +1070,7 @@ fn csharp_is_keyword_or_predefined(text: &str) -> bool {
     )
 }
 
-fn dedup_csharp_facts(ctx: &mut ExtractContext<'_>) {
+pub(crate) fn dedup_csharp_facts(ctx: &mut ExtractContext<'_>) {
     let mut import_seen = HashSet::new();
     ctx.imports.retain(|import| {
         import_seen.insert(format!(

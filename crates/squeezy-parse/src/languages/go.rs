@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::languages::rust::*;
 use crate::*;
 
 pub(crate) fn extract_go(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
@@ -47,7 +48,7 @@ pub(crate) fn extract_go(file: FileRecord, source: &str, tree: &Tree) -> ParsedF
     }
 }
 
-fn visit_go_node(
+pub(crate) fn visit_go_node(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
     parent_symbol: Option<SymbolId>,
@@ -114,7 +115,7 @@ fn visit_go_node(
     visit_go_children(node, ctx, parent_symbol, owner_symbol);
 }
 
-fn visit_go_children(
+pub(crate) fn visit_go_children(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
     parent_symbol: Option<SymbolId>,
@@ -126,14 +127,14 @@ fn visit_go_children(
     }
 }
 
-fn go_package_name(root: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn go_package_name(root: Node<'_>, source: &str) -> Option<String> {
     let mut cursor = root.walk();
     root.named_children(&mut cursor)
         .find(|child| child.kind() == "package_clause")
         .and_then(|package| first_named_child_text(package, source))
 }
 
-fn go_symbol_from_node(
+pub(crate) fn go_symbol_from_node(
     node: Node<'_>,
     ctx: &ExtractContext<'_>,
     parent_symbol: Option<SymbolId>,
@@ -164,7 +165,7 @@ fn go_symbol_from_node(
     }
 }
 
-fn go_function_symbol(
+pub(crate) fn go_function_symbol(
     node: Node<'_>,
     ctx: &ExtractContext<'_>,
     mut kind: SymbolKind,
@@ -212,7 +213,7 @@ fn go_function_symbol(
     })
 }
 
-fn go_type_symbol(
+pub(crate) fn go_type_symbol(
     node: Node<'_>,
     ctx: &ExtractContext<'_>,
     parent_symbol: Option<SymbolId>,
@@ -257,7 +258,7 @@ fn go_type_symbol(
     })
 }
 
-fn go_field_symbols(
+pub(crate) fn go_field_symbols(
     node: Node<'_>,
     ctx: &ExtractContext<'_>,
     parent_symbol: Option<SymbolId>,
@@ -328,7 +329,7 @@ fn go_field_symbols(
         .collect()
 }
 
-fn extract_go_value_declarations(
+pub(crate) fn extract_go_value_declarations(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
     parent_symbol: Option<SymbolId>,
@@ -371,7 +372,7 @@ fn extract_go_value_declarations(
     }
 }
 
-fn go_value_specs<'tree>(
+pub(crate) fn go_value_specs<'tree>(
     node: Node<'tree>,
     cursor: &mut tree_sitter::TreeCursor<'tree>,
 ) -> Vec<Node<'tree>> {
@@ -389,7 +390,7 @@ fn go_value_specs<'tree>(
     specs
 }
 
-fn go_names_in_spec(node: Node<'_>, source: &str) -> Vec<(String, SourceSpan)> {
+pub(crate) fn go_names_in_spec(node: Node<'_>, source: &str) -> Vec<(String, SourceSpan)> {
     let mut names = Vec::new();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -409,7 +410,11 @@ fn go_names_in_spec(node: Node<'_>, source: &str) -> Vec<(String, SourceSpan)> {
     names
 }
 
-fn extract_go_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+pub(crate) fn extract_go_import(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
     let raw = node_text(node, ctx.source).unwrap_or_default();
     for (path, alias, is_glob, span) in go_import_specs(node, raw, ctx.source) {
         ctx.imports.push(ParsedImport {
@@ -426,7 +431,7 @@ fn extract_go_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Opt
     }
 }
 
-fn go_import_specs(
+pub(crate) fn go_import_specs(
     node: Node<'_>,
     raw: &str,
     source: &str,
@@ -455,7 +460,7 @@ fn go_import_specs(
     specs
 }
 
-fn parse_go_import_spec_text(text: &str) -> Option<(String, Option<String>, bool)> {
+pub(crate) fn parse_go_import_spec_text(text: &str) -> Option<(String, Option<String>, bool)> {
     let text = text.trim().trim_start_matches("import").trim();
     let quote_index = text.find('"').or_else(|| text.find('`'))?;
     let quote = text.as_bytes()[quote_index] as char;
@@ -473,7 +478,11 @@ fn parse_go_import_spec_text(text: &str) -> Option<(String, Option<String>, bool
     Some((path, alias, false))
 }
 
-fn extract_go_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+pub(crate) fn extract_go_call(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
     // tree-sitter-go's `call_expression` always exposes a `function` field on
     // healthy parses. The first-named-child fallback only fires if the grammar
     // we link against ever drops or renames that field, and lets us record a
@@ -520,7 +529,7 @@ fn extract_go_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Optio
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
 }
 
-fn extract_go_selector_reference(
+pub(crate) fn extract_go_selector_reference(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
     owner_id: Option<SymbolId>,
@@ -549,7 +558,7 @@ fn extract_go_selector_reference(
     });
 }
 
-fn extract_go_reference(
+pub(crate) fn extract_go_reference(
     node: Node<'_>,
     kind: ReferenceKind,
     ctx: &mut ExtractContext<'_>,
@@ -586,7 +595,7 @@ fn extract_go_reference(
     });
 }
 
-fn dedup_go_facts(ctx: &mut ExtractContext<'_>) {
+pub(crate) fn dedup_go_facts(ctx: &mut ExtractContext<'_>) {
     let mut symbols = HashSet::new();
     ctx.symbols.retain(|symbol| {
         symbols.insert(format!(
@@ -610,7 +619,7 @@ fn dedup_go_facts(ctx: &mut ExtractContext<'_>) {
     });
 }
 
-fn go_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn go_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
     let receiver = node.child_by_field_name("receiver").or_else(|| {
         let mut cursor = node.walk();
         node.named_children(&mut cursor)
@@ -632,7 +641,7 @@ fn go_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
     is_go_identifier(&name).then_some(name)
 }
 
-fn find_go_type_parent_id(ctx: &ExtractContext<'_>, name: &str) -> Option<SymbolId> {
+pub(crate) fn find_go_type_parent_id(ctx: &ExtractContext<'_>, name: &str) -> Option<SymbolId> {
     // The prepass populates `ctx.go_type_index` with every top-level type
     // declaration in the file so methods declared earlier in source order
     // than their receiver type still attach to the right parent symbol.
@@ -652,7 +661,7 @@ fn find_go_type_parent_id(ctx: &ExtractContext<'_>, name: &str) -> Option<Symbol
         .map(|symbol| symbol.id.clone())
 }
 
-fn collect_go_type_index(
+pub(crate) fn collect_go_type_index(
     root: Node<'_>,
     file: &FileRecord,
     source: &str,
@@ -662,7 +671,7 @@ fn collect_go_type_index(
     index
 }
 
-fn collect_go_type_index_in(
+pub(crate) fn collect_go_type_index_in(
     node: Node<'_>,
     file: &FileRecord,
     source: &str,
@@ -687,7 +696,10 @@ fn collect_go_type_index_in(
     }
 }
 
-fn go_type_index_entry(node: Node<'_>, source: &str) -> Option<(String, SourceSpan, SymbolKind)> {
+pub(crate) fn go_type_index_entry(
+    node: Node<'_>,
+    source: &str,
+) -> Option<(String, SourceSpan, SymbolKind)> {
     let name = node
         .child_by_field_name("name")
         .and_then(|child| node_text(child, source).ok())
@@ -706,7 +718,7 @@ fn go_type_index_entry(node: Node<'_>, source: &str) -> Option<(String, SourceSp
     Some((name, span_from_node(node), kind))
 }
 
-fn go_doc_and_semantic_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+pub(crate) fn go_doc_and_semantic_attributes(node: Node<'_>, source: &str) -> Vec<String> {
     let mut attributes = Vec::new();
     if !go_docs_for_node(node, source).is_empty() {
         attributes.push("go:doc".to_string());
@@ -714,7 +726,7 @@ fn go_doc_and_semantic_attributes(node: Node<'_>, source: &str) -> Vec<String> {
     attributes
 }
 
-fn go_docs_for_node(node: Node<'_>, source: &str) -> Vec<String> {
+pub(crate) fn go_docs_for_node(node: Node<'_>, source: &str) -> Vec<String> {
     let Some(parent) = node.parent() else {
         return Vec::new();
     };
@@ -735,7 +747,7 @@ fn go_docs_for_node(node: Node<'_>, source: &str) -> Vec<String> {
     docs
 }
 
-fn go_visibility(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn go_visibility(node: Node<'_>, source: &str) -> Option<String> {
     let name = node
         .child_by_field_name("name")
         .and_then(|child| node_text(child, source).ok())
@@ -752,12 +764,12 @@ fn go_visibility(node: Node<'_>, source: &str) -> Option<String> {
     })
 }
 
-fn go_is_test_function(relative_path: &str, name: &str) -> bool {
+pub(crate) fn go_is_test_function(relative_path: &str, name: &str) -> bool {
     relative_path.ends_with("_test.go")
         && (name.starts_with("Test") || name.starts_with("Benchmark") || name.starts_with("Fuzz"))
 }
 
-fn go_has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
+pub(crate) fn go_has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
     let mut parent = node.parent();
     while let Some(current) = parent {
         if current.kind() == kind {
@@ -768,7 +780,7 @@ fn go_has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
     false
 }
 
-fn go_reference_kind(kind: &str) -> Option<ReferenceKind> {
+pub(crate) fn go_reference_kind(kind: &str) -> Option<ReferenceKind> {
     match kind {
         "identifier" => Some(ReferenceKind::Identifier),
         "type_identifier" | "qualified_type" | "pointer_type" => Some(ReferenceKind::Type),
@@ -777,7 +789,7 @@ fn go_reference_kind(kind: &str) -> Option<ReferenceKind> {
     }
 }
 
-fn is_go_literal(kind: &str) -> bool {
+pub(crate) fn is_go_literal(kind: &str) -> bool {
     matches!(
         kind,
         "raw_string_literal"
@@ -792,7 +804,7 @@ fn is_go_literal(kind: &str) -> bool {
     )
 }
 
-fn is_go_identifier(text: &str) -> bool {
+pub(crate) fn is_go_identifier(text: &str) -> bool {
     let mut chars = text.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -802,7 +814,7 @@ fn is_go_identifier(text: &str) -> bool {
         && !go_keyword_like(text)
 }
 
-fn go_keyword_like(text: &str) -> bool {
+pub(crate) fn go_keyword_like(text: &str) -> bool {
     matches!(
         text,
         "break"
@@ -833,14 +845,14 @@ fn go_keyword_like(text: &str) -> bool {
     )
 }
 
-fn receiver_from_go_call(target_text: &str) -> Option<String> {
+pub(crate) fn receiver_from_go_call(target_text: &str) -> Option<String> {
     target_text
         .rsplit_once('.')
         .map(|(receiver, _)| receiver.trim().to_string())
         .filter(|receiver| !receiver.is_empty())
 }
 
-fn first_named_child_text(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn first_named_child_text(node: Node<'_>, source: &str) -> Option<String> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .next()
@@ -848,7 +860,7 @@ fn first_named_child_text(node: Node<'_>, source: &str) -> Option<String> {
         .map(|text| text.trim().to_string())
 }
 
-fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
+pub(crate) fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).last()
 }

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::languages::rust::*;
 use crate::*;
 
 pub(crate) fn extract_c_family(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
@@ -41,7 +42,7 @@ pub(crate) fn extract_c_family(file: FileRecord, source: &str, tree: &Tree) -> P
     }
 }
 
-fn dedup_c_family_facts(ctx: &mut ExtractContext<'_>) {
+pub(crate) fn dedup_c_family_facts(ctx: &mut ExtractContext<'_>) {
     type ImportKey = (String, Option<String>, String, Option<String>, bool);
     type CallKey = (String, Option<String>, String, u32, u32);
     type ReferenceKey = (String, Option<String>, String, ReferenceKind, u32, u32);
@@ -94,7 +95,7 @@ fn dedup_c_family_facts(ctx: &mut ExtractContext<'_>) {
 /// the definition (or, if there is no definition, the declaration with
 /// the widest signature) keeps the symbol set aligned with clang and
 /// preserves the most useful span for downstream queries.
-fn collapse_c_family_function_decls(ctx: &mut ExtractContext<'_>) {
+pub(crate) fn collapse_c_family_function_decls(ctx: &mut ExtractContext<'_>) {
     type FunctionGroupKey = (String, Option<String>, SymbolKind, String);
     let mut groups: HashMap<FunctionGroupKey, Vec<usize>> = HashMap::new();
     for (index, symbol) in ctx.symbols.iter().enumerate() {
@@ -136,7 +137,7 @@ fn collapse_c_family_function_decls(ctx: &mut ExtractContext<'_>) {
     });
 }
 
-fn pick_canonical_function_symbol(indexes: &[usize], symbols: &[ParsedSymbol]) -> usize {
+pub(crate) fn pick_canonical_function_symbol(indexes: &[usize], symbols: &[ParsedSymbol]) -> usize {
     let mut best = indexes[0];
     let mut best_score = -1i64;
     for index in indexes {
@@ -154,7 +155,7 @@ fn pick_canonical_function_symbol(indexes: &[usize], symbols: &[ParsedSymbol]) -
     best
 }
 
-fn visit_c_family_node(
+pub(crate) fn visit_c_family_node(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
@@ -209,7 +210,7 @@ fn visit_c_family_node(
     visit_c_family_children(node, ctx, parent_symbol, owner_symbol);
 }
 
-fn visit_c_family_children(
+pub(crate) fn visit_c_family_children(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
@@ -221,7 +222,7 @@ fn visit_c_family_children(
     }
 }
 
-fn c_family_symbol_from_node(
+pub(crate) fn c_family_symbol_from_node(
     node: Node<'_>,
     ctx: &ExtractContext<'_>,
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
@@ -291,7 +292,7 @@ fn c_family_symbol_from_node(
     })
 }
 
-fn extract_c_family_symbol_facts(
+pub(crate) fn extract_c_family_symbol_facts(
     node: Node<'_>,
     symbol: &ParsedSymbol,
     ctx: &mut ExtractContext<'_>,
@@ -347,7 +348,11 @@ fn extract_c_family_symbol_facts(
     }
 }
 
-fn extract_c_include(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+pub(crate) fn extract_c_include(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
     let raw = node_text(node, ctx.source).unwrap_or_default();
     let Some(path) = c_include_path(raw) else {
         return;
@@ -369,7 +374,7 @@ fn extract_c_include(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Opt
     });
 }
 
-fn c_include_path(raw: &str) -> Option<String> {
+pub(crate) fn c_include_path(raw: &str) -> Option<String> {
     let raw = raw.trim();
     let start = raw.find(['"', '<'])?;
     let opener = raw.as_bytes()[start] as char;
@@ -390,7 +395,11 @@ fn c_include_path(raw: &str) -> Option<String> {
 /// `using` aliases like `using It = Vec::iterator;` are folded into Squeezy
 /// as type-alias symbols by the symbol path, so we only emit imports for
 /// the namespace-scoping forms here.
-fn extract_c_using(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+pub(crate) fn extract_c_using(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
     let raw = node_text(node, ctx.source).unwrap_or_default();
     let trimmed = raw.trim().trim_end_matches(';').trim();
     let Some(rest) = trimmed.strip_prefix("using") else {
@@ -430,7 +439,11 @@ fn extract_c_using(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Optio
     });
 }
 
-fn extract_c_family_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+pub(crate) fn extract_c_family_call(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
     let Some(function_node) = node.child_by_field_name("function").or_else(|| {
         let mut cursor = node.walk();
         node.named_children(&mut cursor).next()
@@ -485,7 +498,11 @@ fn extract_c_family_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id:
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
 }
 
-fn extract_c_macro_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+pub(crate) fn extract_c_macro_call(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
     let raw = node_text(node, ctx.source).unwrap_or_default();
     let name = raw
         .split_whitespace()
@@ -517,7 +534,7 @@ fn extract_c_macro_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: 
     extract_body_hit(node, BodyHitKind::Macro, ctx, owner_id);
 }
 
-fn extract_c_family_reference(
+pub(crate) fn extract_c_family_reference(
     node: Node<'_>,
     kind: ReferenceKind,
     ctx: &mut ExtractContext<'_>,
@@ -569,7 +586,7 @@ fn extract_c_family_reference(
     });
 }
 
-fn c_family_symbol_can_own_children(kind: SymbolKind) -> bool {
+pub(crate) fn c_family_symbol_can_own_children(kind: SymbolKind) -> bool {
     matches!(
         kind,
         SymbolKind::Class
@@ -580,14 +597,14 @@ fn c_family_symbol_can_own_children(kind: SymbolKind) -> bool {
     )
 }
 
-fn c_family_symbol_can_own_members(kind: SymbolKind) -> bool {
+pub(crate) fn c_family_symbol_can_own_members(kind: SymbolKind) -> bool {
     matches!(
         kind,
         SymbolKind::Class | SymbolKind::Struct | SymbolKind::Union
     )
 }
 
-fn c_family_parser_name(language: LanguageKind) -> &'static str {
+pub(crate) fn c_family_parser_name(language: LanguageKind) -> &'static str {
     match language {
         LanguageKind::C => "tree-sitter-c",
         LanguageKind::Cpp => "tree-sitter-cpp",
@@ -595,7 +612,7 @@ fn c_family_parser_name(language: LanguageKind) -> &'static str {
     }
 }
 
-fn c_declaration_is_function(node: Node<'_>) -> bool {
+pub(crate) fn c_declaration_is_function(node: Node<'_>) -> bool {
     node.child_by_field_name("declarator")
         .map(c_declarator_is_real_function)
         .unwrap_or(false)
@@ -611,7 +628,7 @@ fn c_declaration_is_function(node: Node<'_>) -> bool {
 /// (`int helper(int)` → `function_declarator > identifier`). Clang's AST
 /// oracle reports the first shape as `FieldDecl`, so we must keep them as
 /// Squeezy `Field` symbols to avoid inflating FP against the oracle.
-fn c_declarator_is_real_function(node: Node<'_>) -> bool {
+pub(crate) fn c_declarator_is_real_function(node: Node<'_>) -> bool {
     match node.kind() {
         "function_declarator" => node
             .child_by_field_name("declarator")
@@ -633,7 +650,7 @@ fn c_declarator_is_real_function(node: Node<'_>) -> bool {
 /// (identifier, field_identifier, qualified_identifier, destructor_name,
 /// operator_name). False for parenthesized/pointer declarators that signal
 /// function pointers.
-fn c_declarator_inner_is_function_name(node: Node<'_>) -> bool {
+pub(crate) fn c_declarator_inner_is_function_name(node: Node<'_>) -> bool {
     match node.kind() {
         "identifier"
         | "field_identifier"
@@ -654,12 +671,16 @@ fn c_declarator_inner_is_function_name(node: Node<'_>) -> bool {
     }
 }
 
-fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
+pub(crate) fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).next()
 }
 
-fn c_family_symbol_name(node: Node<'_>, kind: SymbolKind, source: &str) -> Option<String> {
+pub(crate) fn c_family_symbol_name(
+    node: Node<'_>,
+    kind: SymbolKind,
+    source: &str,
+) -> Option<String> {
     match kind {
         SymbolKind::Macro => c_macro_definition_name(node, source),
         SymbolKind::TypeAlias => c_type_alias_name(node, source),
@@ -681,7 +702,10 @@ fn c_family_symbol_name(node: Node<'_>, kind: SymbolKind, source: &str) -> Optio
 /// Used to distinguish out-of-line method definitions (`void Foo::bar()`)
 /// from namespace-qualified free functions (`void ns::func()`) without a
 /// second pass over the symbol table.
-fn c_family_function_declarator_qualifier(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn c_family_function_declarator_qualifier(
+    node: Node<'_>,
+    source: &str,
+) -> Option<String> {
     let declarator = node.child_by_field_name("declarator")?;
     let text = node_text(declarator, source).ok()?;
     let head = text.split('(').next().unwrap_or(text).trim();
@@ -700,12 +724,12 @@ fn c_family_function_declarator_qualifier(node: Node<'_>, source: &str) -> Optio
 /// Class names follow the type-name convention (uppercase initial or `_t`
 /// suffix), namespace identifiers do not. This is a cheap heuristic; a
 /// post-pass that walks symbols can later upgrade ambiguous cases.
-fn qualifier_is_type_like(qualifier: &str) -> bool {
+pub(crate) fn qualifier_is_type_like(qualifier: &str) -> bool {
     let leaf = qualifier.rsplit("::").next().unwrap_or(qualifier).trim();
     !leaf.is_empty() && looks_like_type_name(leaf)
 }
 
-fn c_named_child_text(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn c_named_child_text(node: Node<'_>, source: &str) -> Option<String> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| {
@@ -724,7 +748,7 @@ fn c_named_child_text(node: Node<'_>, source: &str) -> Option<String> {
         .map(c_family_last_name)
 }
 
-fn c_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn c_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
     if matches!(
         node.kind(),
         "identifier"
@@ -771,7 +795,7 @@ fn c_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
-fn c_type_alias_name(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn c_type_alias_name(node: Node<'_>, source: &str) -> Option<String> {
     node.child_by_field_name("declarator")
         .and_then(|child| c_declarator_name(child, source))
         .or_else(|| {
@@ -784,7 +808,7 @@ fn c_type_alias_name(node: Node<'_>, source: &str) -> Option<String> {
         })
 }
 
-fn c_macro_definition_name(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn c_macro_definition_name(node: Node<'_>, source: &str) -> Option<String> {
     node.child_by_field_name("name")
         .and_then(|child| node_text(child, source).ok())
         .map(str::trim)
@@ -801,7 +825,7 @@ fn c_macro_definition_name(node: Node<'_>, source: &str) -> Option<String> {
         })
 }
 
-fn c_family_body_node(node: Node<'_>) -> Option<Node<'_>> {
+pub(crate) fn c_family_body_node(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("body").or_else(|| {
         let mut cursor = node.walk();
         node.named_children(&mut cursor).find(|child| {
@@ -816,7 +840,11 @@ fn c_family_body_node(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
-fn c_family_attributes_for_node(node: Node<'_>, kind: SymbolKind, signature: &str) -> Vec<String> {
+pub(crate) fn c_family_attributes_for_node(
+    node: Node<'_>,
+    kind: SymbolKind,
+    signature: &str,
+) -> Vec<String> {
     let mut attributes = Vec::new();
     match node.kind() {
         "function_definition" => attributes.push("c-family:definition".to_string()),
@@ -891,7 +919,7 @@ fn c_family_ancestor_kinds(node: Node<'_>) -> CFamilyAncestorFlags {
 /// True when the given identifier appears as a whole-token keyword in the
 /// signature slice. Avoids substring matches like `nonvirtual` or strings
 /// embedded in default parameter values.
-fn signature_has_keyword(signature: &str, keyword: &str) -> bool {
+pub(crate) fn signature_has_keyword(signature: &str, keyword: &str) -> bool {
     for token in signature.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
         if token == keyword {
             return true;
@@ -904,14 +932,14 @@ fn signature_has_keyword(signature: &str, keyword: &str) -> bool {
 /// Foo<int, T> {}` shaped specializations. Tree-sitter-cpp represents these
 /// as `class_specifier` whose `name` field is a `template_type` rather than a
 /// `type_identifier`, with the explicit template arg list nested inside.
-fn c_family_is_template_specialization(node: Node<'_>) -> bool {
+pub(crate) fn c_family_is_template_specialization(node: Node<'_>) -> bool {
     let Some(name) = node.child_by_field_name("name") else {
         return false;
     };
     name.kind() == "template_type"
 }
 
-fn c_family_symbol_confidence(node: Node<'_>, attributes: &[String]) -> Confidence {
+pub(crate) fn c_family_symbol_confidence(node: Node<'_>, attributes: &[String]) -> Confidence {
     if attributes
         .iter()
         .any(|attribute| attribute == "preprocessor:opaque")
@@ -944,7 +972,7 @@ fn c_family_symbol_confidence(node: Node<'_>, attributes: &[String]) -> Confiden
 /// containing aggregate's default applies (`struct` → public, `class` →
 /// private, `union` → public). For non-member symbols we still fall back to
 /// the leading-keyword scan so `static int g;` reports `static`.
-fn c_family_visibility_text(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn c_family_visibility_text(node: Node<'_>, source: &str) -> Option<String> {
     let mut sibling = node.prev_named_sibling();
     while let Some(current) = sibling {
         if current.kind() == "access_specifier"
@@ -982,7 +1010,7 @@ fn c_family_visibility_text(node: Node<'_>, source: &str) -> Option<String> {
     .map(str::to_string)
 }
 
-fn c_family_access_specifier_keyword(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn c_family_access_specifier_keyword(node: Node<'_>, source: &str) -> Option<String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if matches!(child.kind(), "public" | "private" | "protected") {
@@ -998,7 +1026,7 @@ fn c_family_access_specifier_keyword(node: Node<'_>, source: &str) -> Option<Str
         .map(str::to_string)
 }
 
-fn c_family_aggregate_default_access(field_list: Node<'_>) -> Option<&'static str> {
+pub(crate) fn c_family_aggregate_default_access(field_list: Node<'_>) -> Option<&'static str> {
     let parent = field_list.parent()?;
     match parent.kind() {
         "class_specifier" => Some("private"),
@@ -1007,7 +1035,7 @@ fn c_family_aggregate_default_access(field_list: Node<'_>) -> Option<&'static st
     }
 }
 
-fn c_family_reference_kind(node: Node<'_>) -> Option<ReferenceKind> {
+pub(crate) fn c_family_reference_kind(node: Node<'_>) -> Option<ReferenceKind> {
     match node.kind() {
         "identifier" => Some(ReferenceKind::Identifier),
         "type_identifier" | "primitive_type" | "sized_type_specifier" => Some(ReferenceKind::Type),
@@ -1020,7 +1048,7 @@ fn c_family_reference_kind(node: Node<'_>) -> Option<ReferenceKind> {
     }
 }
 
-fn c_family_node_is_declaration_name(node: Node<'_>) -> bool {
+pub(crate) fn c_family_node_is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -1056,7 +1084,7 @@ fn c_family_node_is_declaration_name(node: Node<'_>) -> bool {
     )
 }
 
-fn c_family_type_names_from_signature(signature: &str) -> Vec<String> {
+pub(crate) fn c_family_type_names_from_signature(signature: &str) -> Vec<String> {
     let mut names = Vec::new();
     for token in signature
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' || ch == '~'))
@@ -1072,7 +1100,7 @@ fn c_family_type_names_from_signature(signature: &str) -> Vec<String> {
     names
 }
 
-fn c_family_last_name(path: &str) -> String {
+pub(crate) fn c_family_last_name(path: &str) -> String {
     path.trim()
         .trim_matches(|ch: char| {
             matches!(
@@ -1094,7 +1122,7 @@ fn c_family_last_name(path: &str) -> String {
         .to_string()
 }
 
-fn c_family_receiver_from_call_target(target_text: &str) -> Option<String> {
+pub(crate) fn c_family_receiver_from_call_target(target_text: &str) -> Option<String> {
     target_text
         .rsplit_once("::")
         .or_else(|| target_text.rsplit_once("->"))
@@ -1111,7 +1139,7 @@ fn c_family_receiver_from_call_target(target_text: &str) -> Option<String> {
 /// underscore-free names like `ASSERT`, `LOG`, and `CHECK`. The body
 /// extractor still records the literal call site, so over-flagging only
 /// widens the macro-opaque cone — it never invents calls.
-fn c_family_call_is_macro_like(name: &str) -> bool {
+pub(crate) fn c_family_call_is_macro_like(name: &str) -> bool {
     if name.len() < 2 {
         return false;
     }
@@ -1127,7 +1155,7 @@ fn c_family_call_is_macro_like(name: &str) -> bool {
     has_alpha
 }
 
-fn c_family_builtin_type(text: &str) -> bool {
+pub(crate) fn c_family_builtin_type(text: &str) -> bool {
     matches!(
         text,
         "auto"
@@ -1157,7 +1185,7 @@ fn c_family_builtin_type(text: &str) -> bool {
     )
 }
 
-fn looks_like_type_name(name: &str) -> bool {
+pub(crate) fn looks_like_type_name(name: &str) -> bool {
     name.chars()
         .next()
         .map(|ch| ch.is_ascii_uppercase())
@@ -1165,7 +1193,7 @@ fn looks_like_type_name(name: &str) -> bool {
         || name.ends_with("_t")
 }
 
-fn is_c_family_literal(kind: &str) -> bool {
+pub(crate) fn is_c_family_literal(kind: &str) -> bool {
     matches!(
         kind,
         "string_literal"
