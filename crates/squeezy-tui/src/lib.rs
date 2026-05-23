@@ -193,6 +193,16 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &Agent, input: &str) -> b
     let (name, arguments) = match command {
         "/checkpoints" => ("checkpoint_list", serde_json::json!({})),
         "/undo" => ("checkpoint_undo", serde_json::json!({})),
+        "/checkpoint" => {
+            let Some(checkpoint_id) = parts.next() else {
+                app.status = "usage: /checkpoint <checkpoint_id>".to_string();
+                return true;
+            };
+            (
+                "checkpoint_show",
+                serde_json::json!({ "checkpoint_id": checkpoint_id }),
+            )
+        }
         "/revert-turn" => {
             let Some(group_id) = parts.next() else {
                 app.status = "usage: /revert-turn <turn_id>".to_string();
@@ -227,6 +237,21 @@ fn summarize_local_tool_result(content: &serde_json::Value) -> String {
         .and_then(|value| value.as_array())
     {
         return format!("{} checkpoints", array.len());
+    }
+    if let Some(checkpoint) = content.get("checkpoint") {
+        let id = checkpoint
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("?");
+        let files = checkpoint
+            .get("files")
+            .and_then(|value| value.as_array())
+            .map_or(0, |items| items.len());
+        let skipped = checkpoint
+            .get("skipped_files")
+            .and_then(|value| value.as_array())
+            .map_or(0, |items| items.len());
+        return format!("checkpoint={id} files={files} skipped={skipped}");
     }
     if let Some(rollback) = content.get("rollback") {
         let restored = rollback
@@ -373,7 +398,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let tokens = format!(
-        "provider={} model={} cfg={} status={} tools={} read={}B receipt_hits={} budget_denials={} redactions={} in={} out={} cached={} cache_write={} cost={} | Enter send | /undo /checkpoints /revert-turn | y/a/p approve | n/u/d deny | Ctrl-C cancel/quit | Esc quit",
+        "provider={} model={} cfg={} status={} tools={} read={}B receipt_hits={} budget_denials={} redactions={} in={} out={} cached={} cache_write={} cost={} | Enter send | /undo /checkpoint /checkpoints /revert-turn | y/a/p approve | n/u/d deny | Ctrl-C cancel/quit | Esc quit",
         app.provider_name,
         app.model,
         app.config_sources,

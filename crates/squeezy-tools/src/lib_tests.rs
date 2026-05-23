@@ -1053,6 +1053,56 @@ async fn checkpoint_undo_reports_conflict_and_preserves_dirty_user_change() {
 }
 
 #[tokio::test]
+async fn checkpoint_undo_best_effort_restores_clean_files_while_reporting_conflict() {
+    let root = temp_workspace("checkpoint_best_effort");
+    fs::write(root.join("a.txt"), "before-a").expect("write a");
+    fs::write(root.join("b.txt"), "before-b").expect("write b");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "write".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf agent-a > a.txt && printf agent-b > b.txt",
+                    "description": "edit two files",
+                }),
+            },
+            CancellationToken::new(),
+            "turn-best-effort".to_string(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    fs::write(root.join("a.txt"), "user-a").expect("user edit");
+
+    let undo = registry
+        .execute(
+            ToolCall {
+                call_id: "undo".to_string(),
+                name: "checkpoint_undo".to_string(),
+                arguments: json!({"mode": "best_effort"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(undo.status, ToolStatus::Stale);
+    assert_eq!(undo.content["rollback"]["mode"], "best_effort");
+    assert_eq!(
+        undo.content["rollback"]["conflicts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "user-a");
+    assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "before-b");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn checkpoint_revert_group_restores_multiple_actions_in_reverse_order() {
     let root = temp_workspace("checkpoint_group_revert");
     fs::write(root.join("sample.txt"), "one").expect("write sample");
@@ -1096,6 +1146,62 @@ async fn checkpoint_revert_group_restores_multiple_actions_in_reverse_order() {
     assert_eq!(fs::read_to_string(root.join("sample.txt")).unwrap(), "one");
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn checkpoint_show_returns_patch_metadata_for_specific_checkpoint() {
+    let root = temp_workspace("checkpoint_show");
+    fs::write(root.join("sample.txt"), "before\n").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "write".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "content": "after\n",
+                    "expected_sha256": sha256_hex("before\n".as_bytes()),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-show".to_string(),
+        )
+        .await;
+    let checkpoint_id = result.content["checkpoint"]["id"]
+        .as_str()
+        .expect("checkpoint id")
+        .to_string();
+
+    let shown = registry
+        .execute(
+            ToolCall {
+                call_id: "show".to_string(),
+                name: "checkpoint_show".to_string(),
+                arguments: json!({"checkpoint_id": checkpoint_id}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(shown.status, ToolStatus::Success);
+    assert_eq!(shown.content["checkpoint"]["group_id"], "turn-show");
+    assert!(
+        shown.content["checkpoint"]["files"][0]["patch"]
+            .as_str()
+            .is_some_and(|patch| patch.contains("-before") && patch.contains("+after"))
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn suspicious_shell_mutation_reports_checkpoint_coverage_warning() {
+    let warnings = shell_coverage_warnings("touch /tmp/squeezy-unprotected-test");
+
+    assert_eq!(warnings.len(), 1);
+    assert!(shell_coverage_warnings("printf ok > local.txt").is_empty());
 }
 
 #[tokio::test]
@@ -1931,6 +2037,7 @@ fn tool_specs_are_sorted_by_name() {
         vec![
             "checkpoint_list",
             "checkpoint_revert",
+            "checkpoint_show",
             "checkpoint_undo",
             "diff_context",
             "glob",
