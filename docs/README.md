@@ -34,3 +34,5 @@ Validation harness details live in `docs/VALIDATION_HARNESS.md`.
 
 Configuration is documented in [`CONFIGURATION.md`](CONFIGURATION.md), with
 provider-specific details in [`PROVIDERS.md`](PROVIDERS.md).
+
+Shell sandboxing is documented in [`SHELL_SANDBOXING.md`](SHELL_SANDBOXING.md).

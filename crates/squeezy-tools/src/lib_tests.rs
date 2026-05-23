@@ -18,10 +18,25 @@ use super::*;
 
 static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
 
+fn registry_with_shell_sandbox_off(root: &Path) -> ToolRegistry {
+    let mut shell_sandbox = squeezy_core::ShellSandboxConfig::default();
+    shell_sandbox.mode = squeezy_core::ShellSandboxMode::Off;
+    ToolRegistry::new_inner(
+        root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        shell_sandbox,
+        SkillCatalog::empty(),
+        CrawlOptions::default(),
+        Arc::new(Redactor::default()),
+    )
+    .expect("registry")
+}
+
 #[test]
 fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     let root = temp_workspace("permission_metadata");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_shell_sandbox_off(&root);
 
     let destructive = registry.permission_request(&ToolCall {
         call_id: "rm".to_string(),
@@ -54,7 +69,7 @@ fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
 #[test]
 fn shell_permission_metadata_detects_network_commands() {
     let root = temp_workspace("permission_network_metadata");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_shell_sandbox_off(&root);
     fs::create_dir_all(root.join("src")).expect("mkdir src");
 
     let request = registry.permission_request(&ToolCall {
@@ -97,6 +112,7 @@ fn shell_prefix_analysis_handles_env_assignments_and_bare_shell_wrappers() {
     let safe_env = analyze_shell_command("CI=1 cargo test --workspace");
     assert_eq!(safe_env.capability, PermissionCapability::Compiler);
     assert_eq!(safe_env.rule_target, "cargo test:*");
+    assert!(safe_env.parser_backed);
 
     let secret_env = analyze_shell_command("OPENAI_API_KEY=sk-test cargo test --workspace");
     assert_eq!(secret_env.capability, PermissionCapability::Shell);
@@ -116,21 +132,37 @@ fn shell_prefix_analysis_handles_env_assignments_and_bare_shell_wrappers() {
 }
 
 #[test]
-fn shell_environment_policy_preserves_only_safe_names() {
-    assert!(shell_env_should_preserve("PATH"));
-    assert!(shell_env_should_preserve("CARGO_HOME"));
-    assert!(shell_env_should_preserve("LC_ALL"));
+fn shell_parser_respects_quoted_operators_and_marks_dynamic_commands() {
+    let quoted_segments = shell_segments("printf 'a;b' && cargo test");
+    assert_eq!(quoted_segments, ["printf 'a;b'", "cargo test"]);
 
-    assert!(!shell_env_should_preserve("OPENAI_API_KEY"));
-    assert!(!shell_env_should_preserve("AWS_SECRET_ACCESS_KEY"));
-    assert!(!shell_env_should_preserve("SSH_AUTH_SOCK"));
-    assert!(!shell_env_should_preserve("GITHUB_TOKEN"));
+    let dynamic = analyze_shell_command("echo $(cat file)");
+    assert!(dynamic.parser_backed);
+    assert!(dynamic.dynamic);
+    assert_eq!(dynamic.capability, PermissionCapability::Shell);
+    assert_eq!(dynamic.rule_target, "shell:*");
+}
+
+#[test]
+fn shell_environment_policy_preserves_only_safe_names() {
+    let allowlist = squeezy_core::ShellSandboxConfig::default().env_allowlist;
+    assert!(shell_env_should_preserve("PATH", &allowlist));
+    assert!(shell_env_should_preserve("CARGO_HOME", &allowlist));
+    assert!(shell_env_should_preserve("LC_ALL", &allowlist));
+
+    assert!(!shell_env_should_preserve("OPENAI_API_KEY", &allowlist));
+    assert!(!shell_env_should_preserve(
+        "AWS_SECRET_ACCESS_KEY",
+        &allowlist
+    ));
+    assert!(!shell_env_should_preserve("SSH_AUTH_SOCK", &allowlist));
+    assert!(!shell_env_should_preserve("GITHUB_TOKEN", &allowlist));
 }
 
 #[test]
 fn write_file_permission_request_target_matches_suggested_rule_target() {
     let root = temp_workspace("permission_write_target");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_shell_sandbox_off(&root);
 
     let request = registry.permission_request(&ToolCall {
         call_id: "write".to_string(),
@@ -160,7 +192,7 @@ fn write_file_permission_request_target_matches_suggested_rule_target() {
 #[test]
 fn webfetch_and_websearch_requests_carry_expected_targets() {
     let root = temp_workspace("permission_web_targets");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_shell_sandbox_off(&root);
 
     let webfetch = registry.permission_request(&ToolCall {
         call_id: "fetch".to_string(),
@@ -694,7 +726,7 @@ async fn grep_and_shell_outputs_are_redacted() {
         "Authorization: Bearer abcdefghijklmnopqrstuvwxyz\n",
     )
     .expect("write log");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_shell_sandbox_off(&root);
 
     let grep = registry
         .execute(
@@ -995,7 +1027,7 @@ async fn write_file_rejects_stale_expected_hash() {
 #[tokio::test]
 async fn shell_returns_bounded_output_and_exit_code() {
     let root = temp_workspace("shell");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_shell_sandbox_off(&root);
 
     let result = registry
         .execute(
@@ -1016,6 +1048,44 @@ async fn shell_returns_bounded_output_and_exit_code() {
     assert_eq!(result.content["exit_code"], 0);
     assert_eq!(result.content["env"]["policy"], "allowlist");
     assert_eq!(result.content["env"]["values"], "redacted");
+    assert_eq!(result.content["sandbox"]["mode"], "off");
+    assert!(result.content["policy"]["parser_backed"].as_bool().unwrap());
+    let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
+    assert!(audit.contains("\"call_id\":\"call_1\""));
+    assert!(audit.contains("\"stdout_sha256\""));
+    assert!(!audit.contains("\"stdout\":\"abc\""));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_sensitive_path_reference_is_denied_before_spawn() {
+    let root = temp_workspace("shell_sensitive");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_sensitive".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "cat .env",
+                    "description": "read env"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Denied);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("sensitive path")
+    );
+    let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
+    assert!(audit.contains("\"outcome\":\"denied\""));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1023,7 +1093,7 @@ async fn shell_returns_bounded_output_and_exit_code() {
 #[tokio::test]
 async fn shell_rejects_empty_command_with_structured_policy_reason() {
     let root = temp_workspace("shell_empty");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_shell_sandbox_off(&root);
 
     let result = registry
         .execute(
@@ -1057,7 +1127,7 @@ async fn shell_rejects_empty_command_with_structured_policy_reason() {
 #[tokio::test]
 async fn shell_rejects_workdir_outside_workspace_with_structured_policy_reason() {
     let root = temp_workspace("shell_workdir_policy");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_shell_sandbox_off(&root);
 
     let result = registry
         .execute(
@@ -1091,7 +1161,7 @@ async fn shell_rejects_workdir_outside_workspace_with_structured_policy_reason()
 #[tokio::test]
 async fn shell_timeout_returns_structured_error_and_kills_process() {
     let root = temp_workspace("shell_timeout");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_shell_sandbox_off(&root);
 
     let result = registry
         .execute(
@@ -1124,7 +1194,7 @@ async fn shell_timeout_returns_structured_error_and_kills_process() {
 #[tokio::test]
 async fn shell_output_cap_is_enforced_while_command_runs() {
     let root = temp_workspace("shell_cap");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_shell_sandbox_off(&root);
 
     let result = registry
         .execute(
@@ -1958,6 +2028,7 @@ async fn skill_tools_list_metadata_and_load_body() {
             compat_user_dir: root.join("compat-skills"),
         },
         &GraphConfig::default(),
+        squeezy_core::ShellSandboxConfig::default(),
         Arc::new(Redactor::default()),
     )
     .expect("registry");

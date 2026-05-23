@@ -75,6 +75,14 @@ commented examples so that built-in defaults can evolve over time:
 # action = "ask"
 # source = "project"
 
+# [permissions.shell_sandbox]
+# mode = "required"
+# network = "deny_by_default"
+# audit = true
+# kill_grace_ms = 250
+# env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME", "RUSTFLAGS", "RUST_BACKTRACE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "LC_*"]
+# sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*"]
+
 [telemetry]
 # enabled = true
 
@@ -120,6 +128,16 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   can only downgrade an `Ask` shell verdict to `Deny`; it spends one extra
   LLM round-trip per ambiguous shell call, so leave it off unless that cost
   is acceptable.
+- `[permissions.shell_sandbox]`: OS sandbox settings for the local shell tool.
+  The default `mode = "required"` fails closed when a supported sandbox backend
+  is unavailable. macOS launches through `sandbox-exec`; Linux uses the direct
+  syscall backend for process isolation and network namespace setup where the
+  kernel permits it. `network = "deny_by_default"` keeps network access blocked
+  unless the command is classified as a network command and approved at the
+  permission layer. Shell attempts append redacted JSONL audit entries to
+  `.squeezy/audit/shell.jsonl` when `audit = true`. See
+  [`SHELL_SANDBOXING.md`](SHELL_SANDBOXING.md) for the operational model,
+  usage guidance, and backend behavior.
 - `[[permissions.rules]]`: ordered allow/ask/deny rules with `capability`,
   `target`, `action`, optional `source`, and optional `reason`. Later matching
   rules win, and any session-scoped approvals added through the TUI also stack
@@ -144,9 +162,9 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   destructive flag, timeout/output caps when supplied, and the environment
   policy. Shell execution is policy-first in v0: commands must run inside the
   workspace, use bounded timeout/output caps, and launch with an allowlisted
-  environment whose values are never shown in approvals or tool output.
-  Network-looking shell commands route through the `network` capability for
-  approval/audit, but v0 does not provide OS-level network isolation. Common
+  environment whose values are never shown in approvals or tool output. The
+  command classifier is parser-backed by `tree-sitter-bash`; parse errors,
+  shell expansions, and command substitutions stay conservative. Common
   verification commands such as `cargo test`, `cargo check`, `cargo clippy`,
   and `cargo fmt` classify as `compiler` so projects can allow them without
   broadly allowing arbitrary shell.

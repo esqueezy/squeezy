@@ -79,6 +79,54 @@ fn config_without_env_uses_openai_provider_defaults() {
 }
 
 #[test]
+fn shell_sandbox_settings_parse_and_round_trip() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[permissions.shell_sandbox]
+mode = "best_effort"
+network = "allow_when_approved"
+audit = false
+kill_grace_ms = 500
+env_allowlist = ["PATH", "LC_*"]
+sensitive_path_patterns = [".ssh/**", ".env*"]
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert_eq!(
+        config.permissions.shell_sandbox.mode,
+        ShellSandboxMode::BestEffort
+    );
+    assert_eq!(
+        config.permissions.shell_sandbox.network,
+        ShellSandboxNetworkPolicy::AllowWhenApproved
+    );
+    assert!(!config.permissions.shell_sandbox.audit);
+    assert_eq!(config.permissions.shell_sandbox.kill_grace_ms, 500);
+    assert_eq!(
+        config.permissions.shell_sandbox.env_allowlist,
+        ["PATH", "LC_*"]
+    );
+    assert_eq!(
+        config.permissions.shell_sandbox.sensitive_path_patterns,
+        [".ssh/**", ".env*"]
+    );
+
+    let inspect = config.inspect_redacted();
+    assert!(inspect.contains("[permissions.shell_sandbox]"));
+    assert!(inspect.contains("mode = \"best_effort\""));
+    let round_tripped = SettingsFile::from_toml_str(&inspect, "round-trip")
+        .expect("inspect output parses back as settings");
+    let round_tripped_config = AppConfig::from_settings_and_env_vars(round_tripped, |_| None);
+    assert_eq!(
+        round_tripped_config.permissions.shell_sandbox.mode,
+        ShellSandboxMode::BestEffort
+    );
+}
+
+#[test]
 fn config_reads_supported_env_overrides() {
     let config = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_MODEL" => Some("custom-model".to_string()),

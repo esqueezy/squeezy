@@ -339,7 +339,7 @@ impl AppConfig {
         let permissions = PermissionPolicy::from_settings_and_env(
             settings.permissions.unwrap_or_default(),
             &mut get_var,
-        );
+        )?;
         let skills = SkillsConfig::from_settings_and_env_vars(
             settings.skills.unwrap_or_default(),
             &mut get_var,
@@ -488,6 +488,31 @@ impl AppConfig {
         output.push_str(&format!(
             "shell_classifier = {}\n\n",
             self.permissions.shell_classifier
+        ));
+        output.push_str("[permissions.shell_sandbox]\n");
+        output.push_str(&format!(
+            "mode = {}\n",
+            toml_string(self.permissions.shell_sandbox.mode.as_str())
+        ));
+        output.push_str(&format!(
+            "network = {}\n",
+            toml_string(self.permissions.shell_sandbox.network.as_str())
+        ));
+        output.push_str(&format!(
+            "audit = {}\n",
+            self.permissions.shell_sandbox.audit
+        ));
+        output.push_str(&format!(
+            "kill_grace_ms = {}\n",
+            self.permissions.shell_sandbox.kill_grace_ms
+        ));
+        output.push_str(&format!(
+            "env_allowlist = {}\n",
+            toml_string_array(&self.permissions.shell_sandbox.env_allowlist)
+        ));
+        output.push_str(&format!(
+            "sensitive_path_patterns = {}\n\n",
+            toml_string_array(&self.permissions.shell_sandbox.sensitive_path_patterns)
         ));
         for rule in self
             .permissions
@@ -1317,6 +1342,7 @@ pub struct PermissionSettings {
     pub ignored_search: Option<PermissionMode>,
     pub web: Option<PermissionMode>,
     pub shell_classifier: Option<bool>,
+    pub shell_sandbox: Option<ShellSandboxSettings>,
     pub rules: Vec<PermissionRule>,
 }
 
@@ -1331,6 +1357,7 @@ impl PermissionSettings {
                 "ignored_search",
                 "web",
                 "shell_classifier",
+                "shell_sandbox",
                 "rules",
             ],
             source,
@@ -1353,6 +1380,11 @@ impl PermissionSettings {
                 source,
                 &field(path, "shell_classifier"),
             )?,
+            shell_sandbox: optional_table(table, "shell_sandbox", source)?
+                .map(|table| {
+                    ShellSandboxSettings::from_table(table, source, &field(path, "shell_sandbox"))
+                })
+                .transpose()?,
             rules: permission_rules_value(table, source, &field(path, "rules"))?,
         })
     }
@@ -1364,8 +1396,229 @@ impl PermissionSettings {
         replace_if_some(&mut self.ignored_search, next.ignored_search);
         replace_if_some(&mut self.web, next.web);
         replace_if_some(&mut self.shell_classifier, next.shell_classifier);
+        merge_option(
+            &mut self.shell_sandbox,
+            next.shell_sandbox,
+            ShellSandboxSettings::merge,
+        );
         self.rules.extend(next.rules);
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ShellSandboxSettings {
+    pub mode: Option<String>,
+    pub network: Option<String>,
+    pub audit: Option<bool>,
+    pub kill_grace_ms: Option<u64>,
+    pub env_allowlist: Option<Vec<String>>,
+    pub sensitive_path_patterns: Option<Vec<String>>,
+}
+
+impl ShellSandboxSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(
+            table,
+            &[
+                "mode",
+                "network",
+                "audit",
+                "kill_grace_ms",
+                "env_allowlist",
+                "sensitive_path_patterns",
+            ],
+            source,
+            path,
+        )?;
+        Ok(Self {
+            mode: string_value(table, "mode", source, &field(path, "mode"))?,
+            network: string_value(table, "network", source, &field(path, "network"))?,
+            audit: bool_value(table, "audit", source, &field(path, "audit"))?,
+            kill_grace_ms: u64_value(
+                table,
+                "kill_grace_ms",
+                source,
+                &field(path, "kill_grace_ms"),
+            )?,
+            env_allowlist: string_array_value(
+                table,
+                "env_allowlist",
+                source,
+                &field(path, "env_allowlist"),
+            )?,
+            sensitive_path_patterns: string_array_value(
+                table,
+                "sensitive_path_patterns",
+                source,
+                &field(path, "sensitive_path_patterns"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.mode, next.mode);
+        replace_if_some(&mut self.network, next.network);
+        replace_if_some(&mut self.audit, next.audit);
+        replace_if_some(&mut self.kill_grace_ms, next.kill_grace_ms);
+        replace_if_some(&mut self.env_allowlist, next.env_allowlist);
+        replace_if_some(
+            &mut self.sensitive_path_patterns,
+            next.sensitive_path_patterns,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellSandboxMode {
+    Required,
+    BestEffort,
+    Off,
+}
+
+impl ShellSandboxMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "required" => Some(Self::Required),
+            "best_effort" | "best-effort" => Some(Self::BestEffort),
+            "off" | "disabled" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::BestEffort => "best_effort",
+            Self::Off => "off",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellSandboxNetworkPolicy {
+    DenyByDefault,
+    AllowWhenApproved,
+}
+
+impl ShellSandboxNetworkPolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "deny_by_default" | "deny-by-default" => Some(Self::DenyByDefault),
+            "allow_when_approved" | "allow-when-approved" => Some(Self::AllowWhenApproved),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DenyByDefault => "deny_by_default",
+            Self::AllowWhenApproved => "allow_when_approved",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellSandboxConfig {
+    pub mode: ShellSandboxMode,
+    pub network: ShellSandboxNetworkPolicy,
+    pub audit: bool,
+    pub kill_grace_ms: u64,
+    pub env_allowlist: Vec<String>,
+    pub sensitive_path_patterns: Vec<String>,
+}
+
+impl Default for ShellSandboxConfig {
+    fn default() -> Self {
+        Self {
+            mode: ShellSandboxMode::Required,
+            network: ShellSandboxNetworkPolicy::DenyByDefault,
+            audit: true,
+            kill_grace_ms: 250,
+            env_allowlist: default_shell_env_allowlist(),
+            sensitive_path_patterns: default_sensitive_path_patterns(),
+        }
+    }
+}
+
+impl ShellSandboxConfig {
+    fn from_settings(settings: Option<ShellSandboxSettings>, source: &str) -> Result<Self> {
+        let mut config = Self::default();
+        let Some(settings) = settings else {
+            return Ok(config);
+        };
+        if let Some(mode) = settings.mode {
+            config.mode = ShellSandboxMode::parse(&mode).ok_or_else(|| {
+                SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.mode invalid value {mode:?}; expected required, best_effort, or off"
+                ))
+            })?;
+        }
+        if let Some(network) = settings.network {
+            config.network = ShellSandboxNetworkPolicy::parse(&network).ok_or_else(|| {
+                SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.network invalid value {network:?}; expected deny_by_default or allow_when_approved"
+                ))
+            })?;
+        }
+        if let Some(audit) = settings.audit {
+            config.audit = audit;
+        }
+        if let Some(kill_grace_ms) = settings.kill_grace_ms {
+            config.kill_grace_ms = kill_grace_ms;
+        }
+        if let Some(env_allowlist) = settings.env_allowlist {
+            config.env_allowlist = env_allowlist;
+        }
+        if let Some(sensitive_path_patterns) = settings.sensitive_path_patterns {
+            config.sensitive_path_patterns = sensitive_path_patterns;
+        }
+        Ok(config)
+    }
+}
+
+fn default_shell_env_allowlist() -> Vec<String> {
+    [
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "RUSTFLAGS",
+        "RUST_BACKTRACE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NIX_SSL_CERT_FILE",
+        "LC_*",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn default_sensitive_path_patterns() -> Vec<String> {
+    [
+        ".ssh/**",
+        ".aws/**",
+        ".config/gh/**",
+        ".netrc",
+        ".gnupg/**",
+        ".kube/**",
+        ".docker/config.json",
+        ".cargo/credentials*",
+        ".npmrc",
+        ".pypirc",
+        ".env*",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1385,19 +1638,21 @@ pub struct PermissionPolicy {
     pub ignored_search: PermissionMode,
     pub web: PermissionMode,
     pub shell_classifier: bool,
+    pub shell_sandbox: ShellSandboxConfig,
     pub rules: Vec<PermissionRule>,
 }
 
 impl PermissionPolicy {
     pub fn from_env_vars(mut var: impl FnMut(&str) -> Option<String>) -> Self {
         Self::from_settings_and_env(PermissionSettings::default(), &mut var)
+            .expect("built-in permission defaults are valid")
     }
 
     fn from_settings_and_env(
         settings: PermissionSettings,
         mut var: impl FnMut(&str) -> Option<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             read: parse_permission(
                 var("SQUEEZY_READ_PERMISSION"),
                 settings.read.unwrap_or(PermissionMode::Allow),
@@ -1422,8 +1677,9 @@ impl PermissionPolicy {
                 var("SQUEEZY_SHELL_PERMISSION_CLASSIFIER"),
                 settings.shell_classifier.unwrap_or(false),
             ),
+            shell_sandbox: ShellSandboxConfig::from_settings(settings.shell_sandbox, "settings")?,
             rules: settings.rules,
-        }
+        })
     }
 
     pub const fn mode_for(&self, scope: PermissionScope) -> PermissionMode {
@@ -1515,6 +1771,7 @@ impl Default for PermissionPolicy {
             ignored_search: PermissionMode::Allow,
             web: PermissionMode::Ask,
             shell_classifier: false,
+            shell_sandbox: ShellSandboxConfig::default(),
             rules: Vec::new(),
         }
     }
@@ -2450,6 +2707,14 @@ pub fn user_settings_template() -> &'static str {
 # target = "shell:curl:*"
 # action = "ask"
 # source = "project"
+
+# [permissions.shell_sandbox]
+# mode = "required"                 # required | best_effort | off
+# network = "deny_by_default"       # deny_by_default | allow_when_approved
+# audit = true
+# kill_grace_ms = 250
+# env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME", "RUSTFLAGS", "RUST_BACKTRACE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "LC_*"]
+# sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*"]
 
 [telemetry]
 # enabled = true

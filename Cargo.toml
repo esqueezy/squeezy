@@ -34,6 +34,7 @@ futures-core = "0.3"
 futures-util = "0.3"
 globset = "0.4"
 ignore = "0.4"
+libc = "0.2"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
@@ -47,6 +48,7 @@ toml = "0.5.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.25"
+tree-sitter-bash = "0.25.1"
 tree-sitter-c = "0.24"
 tree-sitter-c-sharp = "0.23.5"
 tree-sitter-cpp = "0.23"

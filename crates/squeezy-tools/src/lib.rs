@@ -2,9 +2,9 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env,
     ffi::OsString,
-    fs,
+    fs::{self, OpenOptions},
     future::Future,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -28,7 +28,8 @@ use squeezy_core::{
     DEFAULT_EXA_MCP_URL, DEFAULT_TOOL_OUTPUT_RETENTION_DAYS, DEFAULT_TOOL_PREVIEW_BYTES,
     DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, FileId, GraphConfig, PermissionCapability, PermissionMode,
     PermissionRequest, PermissionRisk, PermissionRule, PermissionRuleSource, PermissionScope,
-    Redactor, Result, SkillsConfig, SqueezyError,
+    Redactor, Result, ShellSandboxConfig, ShellSandboxMode, ShellSandboxNetworkPolicy,
+    SkillsConfig, SqueezyError,
 };
 use squeezy_graph::{
     DirtyAnnotation, DirtyRange, GraphManager, GraphSymbol, ReferenceHit, SignatureQuery,
@@ -40,6 +41,10 @@ use squeezy_workspace::{
 };
 use tokio::{io::AsyncReadExt, process::Command, sync::Mutex, time};
 use tokio_util::sync::CancellationToken;
+use tree_sitter::{Node, Parser};
+
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 
 const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_BYTES_PER_FILE: usize = 1_000_000;
@@ -385,6 +390,8 @@ pub struct ToolRegistry {
     redactor: Arc<Redactor>,
     crawl_options: Arc<CrawlOptions>,
     compiled_policy: Arc<CompiledIndexingPolicy>,
+    shell_sandbox: Arc<ShellSandboxConfig>,
+    shell_audit: Arc<ShellAuditStore>,
 }
 
 #[derive(Debug, Default)]
@@ -403,6 +410,63 @@ struct DiffSnapshotKey {
 struct CachedDiffSnapshot {
     snapshot: Arc<DiffSnapshot>,
     fetched_at: Instant,
+}
+
+#[derive(Debug)]
+struct ShellAuditStore {
+    path: PathBuf,
+}
+
+impl ShellAuditStore {
+    fn new(root: &Path) -> Self {
+        Self {
+            path: root.join(".squeezy").join("audit").join("shell.jsonl"),
+        }
+    }
+
+    fn append(&self, entry: &Value) -> std::io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        serde_json::to_writer(&mut file, entry)?;
+        file.write_all(b"\n")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ShellSandboxPlan {
+    program: String,
+    args: Vec<String>,
+    backend: &'static str,
+    mode: &'static str,
+    network: &'static str,
+    required: bool,
+}
+
+impl ShellSandboxPlan {
+    fn direct(command: &str, mode: ShellSandboxMode) -> Self {
+        Self {
+            program: "sh".to_string(),
+            args: vec!["-lc".to_string(), command.to_string()],
+            backend: "none",
+            mode: mode.as_str(),
+            network: "not_enforced",
+            required: false,
+        }
+    }
+
+    fn metadata(&self) -> Value {
+        json!({
+            "backend": self.backend,
+            "mode": self.mode,
+            "network": self.network,
+            "required": self.required,
+        })
+    }
 }
 
 impl ToolRegistry {
@@ -426,6 +490,7 @@ impl ToolRegistry {
             root,
             output_config,
             web_config,
+            ShellSandboxConfig::default(),
             SkillCatalog::empty(),
             CrawlOptions::default(),
             Arc::new(Redactor::default()),
@@ -442,6 +507,7 @@ impl ToolRegistry {
             root,
             output_config,
             web_config,
+            ShellSandboxConfig::default(),
             SkillCatalog::empty(),
             crawl_options_from_graph_config(graph_config),
             Arc::new(Redactor::default()),
@@ -454,6 +520,7 @@ impl ToolRegistry {
         web_config: WebToolConfig,
         skills_config: SkillsConfig,
         graph_config: &GraphConfig,
+        shell_sandbox: ShellSandboxConfig,
         redactor: Arc<Redactor>,
     ) -> Result<Self> {
         let root = root.into();
@@ -465,6 +532,7 @@ impl ToolRegistry {
             root,
             output_config,
             web_config,
+            shell_sandbox,
             skills,
             crawl_options_from_graph_config(graph_config),
             redactor,
@@ -475,6 +543,7 @@ impl ToolRegistry {
         root: impl Into<PathBuf>,
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
+        shell_sandbox: ShellSandboxConfig,
         skills: SkillCatalog,
         crawl_options: CrawlOptions,
         redactor: Arc<Redactor>,
@@ -487,6 +556,7 @@ impl ToolRegistry {
             root,
             output_config,
             web_config,
+            shell_sandbox,
             skills,
             crawl_options,
             redactor,
@@ -497,6 +567,7 @@ impl ToolRegistry {
         root: PathBuf,
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
+        shell_sandbox: ShellSandboxConfig,
         skills: SkillCatalog,
         crawl_options: CrawlOptions,
         redactor: Arc<Redactor>,
@@ -511,6 +582,7 @@ impl ToolRegistry {
             GraphManager::open_with_crawl_options(&root, Default::default(), crawl_options.clone())
                 .ok();
         let vcs = GitVcs::open(&root)?;
+        let shell_audit = ShellAuditStore::new(&root);
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -523,6 +595,8 @@ impl ToolRegistry {
             redactor,
             crawl_options: Arc::new(crawl_options),
             compiled_policy,
+            shell_sandbox: Arc::new(shell_sandbox),
+            shell_audit: Arc::new(shell_audit),
         })
     }
 
@@ -544,6 +618,7 @@ impl ToolRegistry {
             GraphManager::open_with_crawl_options(&root, Default::default(), crawl_options.clone())
                 .ok();
         let vcs = GitVcs::open(&root)?;
+        let shell_audit = ShellAuditStore::new(&root);
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -556,6 +631,8 @@ impl ToolRegistry {
             redactor: Arc::new(Redactor::default()),
             crawl_options: Arc::new(crawl_options),
             compiled_policy,
+            shell_sandbox: Arc::new(ShellSandboxConfig::default()),
+            shell_audit: Arc::new(shell_audit),
         })
     }
 
@@ -588,6 +665,77 @@ impl ToolRegistry {
         if let Ok(mut cache) = self.diff_cache.lock() {
             cache.entries.clear();
         }
+    }
+
+    fn prepare_shell_sandbox(
+        &self,
+        command: &str,
+        analysis: &ShellPermissionAnalysis,
+    ) -> std::result::Result<ShellSandboxPlan, String> {
+        match self.shell_sandbox.mode {
+            ShellSandboxMode::Off => Ok(ShellSandboxPlan::direct(command, ShellSandboxMode::Off)),
+            ShellSandboxMode::BestEffort | ShellSandboxMode::Required => {
+                prepare_shell_sandbox_plan(command, analysis, &self.root, &self.shell_sandbox)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn audit_shell(
+        &self,
+        call: &ToolCall,
+        args: &ShellArgs,
+        workdir: &Path,
+        analysis: &ShellPermissionAnalysis,
+        sandbox: Value,
+        timeout_ms: u64,
+        output_cap: usize,
+        outcome: &str,
+        reason: Option<&str>,
+        exit_code: Option<i32>,
+        stdout: &[u8],
+        stderr: &[u8],
+    ) {
+        if !self.shell_sandbox.audit {
+            return;
+        }
+        let env_names = self.shell_sandbox.env_allowlist.clone();
+        let entry = json!({
+            "ts_unix_ms": unix_timestamp_millis(SystemTime::now()),
+            "call_id": call.call_id,
+            "tool": call.name,
+            "command": self.redactor.redact(&truncate_text(&args.command, 500)).text,
+            "cwd": self.relative(workdir).to_string_lossy(),
+            "description": args.description.as_deref().map(|value| self.redactor.redact(value).text),
+            "classification": {
+                "capability": analysis.capability.as_str(),
+                "target": analysis.rule_target,
+                "risk": analysis.risk.as_str(),
+                "network": analysis.network,
+                "destructive": analysis.destructive,
+                "parser_backed": analysis.parser_backed,
+                "dynamic": analysis.dynamic,
+            },
+            "sandbox": sandbox,
+            "env": {
+                "policy": "allowlist",
+                "names": env_names,
+            },
+            "limits": {
+                "timeout_ms": timeout_ms,
+                "output_byte_cap": output_cap,
+            },
+            "outcome": outcome,
+            "reason": reason,
+            "exit_code": exit_code,
+            "output": {
+                "stdout_bytes": stdout.len(),
+                "stderr_bytes": stderr.len(),
+                "stdout_sha256": sha256_hex(stdout),
+                "stderr_sha256": sha256_hex(stderr),
+            },
+        });
+        let _ = self.shell_audit.append(&entry);
     }
 
     /// Cheap permission-scope predicate. Looks only at the user-supplied
@@ -706,6 +854,15 @@ impl ToolRegistry {
                     },
                 );
                 metadata.insert("destructive".to_string(), analysis.destructive.to_string());
+                metadata.insert(
+                    "parser_backed".to_string(),
+                    analysis.parser_backed.to_string(),
+                );
+                metadata.insert("dynamic".to_string(), analysis.dynamic.to_string());
+                metadata.insert(
+                    "sandbox".to_string(),
+                    self.shell_sandbox.mode.as_str().to_string(),
+                );
                 if let Some(timeout_ms) = args.as_ref().and_then(|args| args.timeout_ms) {
                     metadata.insert("timeout_ms".to_string(), timeout_ms.to_string());
                 }
@@ -1932,17 +2089,82 @@ impl ToolRegistry {
             .unwrap_or(DEFAULT_SHELL_OUTPUT_BYTE_CAP)
             .min(MAX_SHELL_OUTPUT_BYTE_CAP);
 
-        let mut command = Command::new("sh");
+        if let Some(pattern) = shell_command_references_sensitive_path(
+            &args.command,
+            &self.shell_sandbox.sensitive_path_patterns,
+        ) {
+            let reason = format!("shell command references sensitive path pattern {pattern:?}");
+            self.audit_shell(
+                call,
+                &args,
+                &workdir,
+                &analysis,
+                json!({"backend": "none", "mode": self.shell_sandbox.mode.as_str(), "status": "denied"}),
+                timeout_ms,
+                output_cap,
+                "denied",
+                Some(&reason),
+                None,
+                &[],
+                &[],
+            );
+            return shell_policy_denied(call, &analysis, reason);
+        }
+
+        let sandbox_plan = match self.prepare_shell_sandbox(&args.command, &analysis) {
+            Ok(plan) => plan,
+            Err(reason) => {
+                self.audit_shell(
+                    call,
+                    &args,
+                    &workdir,
+                    &analysis,
+                    json!({"backend": "none", "mode": self.shell_sandbox.mode.as_str(), "status": "unavailable"}),
+                    timeout_ms,
+                    output_cap,
+                    "denied",
+                    Some(&reason),
+                    None,
+                    &[],
+                    &[],
+                );
+                return shell_policy_denied(call, &analysis, reason);
+            }
+        };
+
+        let mut command = Command::new(&sandbox_plan.program);
         command
-            .arg("-lc")
-            .arg(&args.command)
+            .args(&sandbox_plan.args)
             .current_dir(&workdir)
             .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let preserved_env = apply_shell_environment_policy(&mut command);
+        configure_shell_process_group(&mut command);
+        configure_linux_shell_sandbox(&mut command, &sandbox_plan);
+        let preserved_env = apply_shell_environment_policy(&mut command, &self.shell_sandbox);
         let mut child = match command.spawn() {
             Ok(child) => child,
+            Err(err) if sandbox_plan.required => {
+                let reason = format!(
+                    "shell sandbox backend {} failed to start: {err}",
+                    sandbox_plan.backend
+                );
+                self.audit_shell(
+                    call,
+                    &args,
+                    &workdir,
+                    &analysis,
+                    sandbox_plan.metadata(),
+                    timeout_ms,
+                    output_cap,
+                    "denied",
+                    Some(&reason),
+                    None,
+                    &[],
+                    &[],
+                );
+                return shell_policy_denied(call, &analysis, reason);
+            }
             Err(err) => return tool_error(call, err),
         };
 
@@ -1958,7 +2180,21 @@ impl ToolRegistry {
 
         let status = tokio::select! {
             _ = cancel.cancelled() => {
-                let _ = child.kill().await;
+                terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                self.audit_shell(
+                    call,
+                    &args,
+                    &workdir,
+                    &analysis,
+                    sandbox_plan.metadata(),
+                    timeout_ms,
+                    output_cap,
+                    "cancelled",
+                    Some("shell command cancelled"),
+                    None,
+                    &[],
+                    &[],
+                );
                 return ToolResult::cancelled(call);
             }
             result = time::timeout(Duration::from_millis(timeout_ms), child.wait()) => result,
@@ -1968,7 +2204,7 @@ impl ToolRegistry {
         let exit_status = match status {
             Ok(Ok(status)) => Some(status),
             Err(_) => {
-                let _ = child.kill().await;
+                terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
                 None
             }
             Ok(Err(err)) => return tool_error(call, err),
@@ -1992,12 +2228,55 @@ impl ToolRegistry {
             ..ToolCostHint::default()
         };
         let exit_code = exit_status.as_ref().and_then(|status| status.code());
+        if sandbox_plan.required
+            && shell_sandbox_runtime_unavailable(&sandbox_plan, exit_code, &stderr)
+        {
+            let reason = format!(
+                "required shell sandbox backend {} failed at runtime",
+                sandbox_plan.backend
+            );
+            self.audit_shell(
+                call,
+                &args,
+                &workdir,
+                &analysis,
+                sandbox_plan.metadata(),
+                timeout_ms,
+                output_cap,
+                "denied",
+                Some(&reason),
+                exit_code,
+                &stdout_bytes,
+                &stderr_bytes,
+            );
+            return shell_policy_denied(call, &analysis, reason);
+        }
         let status = if exit_status.as_ref().is_some_and(|status| status.success()) {
             ToolStatus::Success
         } else {
             ToolStatus::Error
         };
         let error = timed_out.then(|| format!("shell command timed out after {timeout_ms} ms"));
+        self.audit_shell(
+            call,
+            &args,
+            &workdir,
+            &analysis,
+            sandbox_plan.metadata(),
+            timeout_ms,
+            output_cap,
+            if timed_out {
+                "timeout"
+            } else if status == ToolStatus::Success {
+                "success"
+            } else {
+                "error"
+            },
+            error.as_deref(),
+            exit_code,
+            &stdout_bytes,
+            &stderr_bytes,
+        );
         self.invalidate_diff_cache();
 
         make_result(
@@ -2017,9 +2296,12 @@ impl ToolRegistry {
                     "risk": analysis.risk.as_str(),
                     "network": if analysis.network { "detected" } else { "none" },
                     "destructive": analysis.destructive,
+                    "parser_backed": analysis.parser_backed,
+                    "dynamic": analysis.dynamic,
                     "timeout_ms": timeout_ms,
                     "output_byte_cap": output_cap,
                 },
+                "sandbox": sandbox_plan.metadata(),
                 "env": {
                     "policy": "allowlist",
                     "values": "redacted",
@@ -2724,6 +3006,12 @@ fn decode_html_entities(input: &str) -> String {
         .replace("&apos;", "'")
 }
 
+fn unix_timestamp_millis(time: SystemTime) -> u128 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
 fn collapse_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -2735,11 +3023,26 @@ struct ShellPermissionAnalysis {
     rule_target: String,
     network: bool,
     destructive: bool,
+    parser_backed: bool,
+    dynamic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedShellCommand {
+    segments: Vec<String>,
+    dynamic: bool,
 }
 
 fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
     let normalized = collapse_whitespace(command);
-    let segments = shell_segments(&normalized);
+    let parsed = parse_shell_command(&normalized);
+    let parser_backed = parsed.is_some();
+    let dynamic = parsed.as_ref().is_some_and(|parsed| parsed.dynamic);
+    let segments = parsed
+        .as_ref()
+        .map(|parsed| parsed.segments.clone())
+        .filter(|segments| !segments.is_empty())
+        .unwrap_or_else(|| shell_segments(&normalized));
     let first = segments
         .first()
         .map(|segment| shell_command_prefix(segment))
@@ -2753,6 +3056,24 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
             rule_target: "shell:*".to_string(),
             network: false,
             destructive: false,
+            parser_backed,
+            dynamic,
+        };
+    }
+
+    if dynamic {
+        return ShellPermissionAnalysis {
+            capability: PermissionCapability::Shell,
+            risk: PermissionRisk::High,
+            rule_target: "shell:*".to_string(),
+            network: segments
+                .iter()
+                .any(|segment| is_network_shell_segment(segment)),
+            destructive: segments
+                .iter()
+                .any(|segment| is_destructive_shell_segment(segment)),
+            parser_backed,
+            dynamic,
         };
     }
 
@@ -2768,6 +3089,8 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
                 .iter()
                 .any(|segment| is_network_shell_segment(segment)),
             destructive: true,
+            parser_backed,
+            dynamic,
         };
     }
     if segments
@@ -2780,6 +3103,8 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
             rule_target: format!("shell:{first}:*"),
             network: true,
             destructive: false,
+            parser_backed,
+            dynamic,
         };
     }
     if segments
@@ -2795,6 +3120,8 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
             ),
             network: false,
             destructive: false,
+            parser_backed,
+            dynamic,
         };
     }
     if segments.iter().all(|segment| is_git_shell_segment(segment)) {
@@ -2814,6 +3141,8 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
             ),
             network: false,
             destructive: false,
+            parser_backed,
+            dynamic,
         };
     }
 
@@ -2823,18 +3152,120 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
         rule_target: format!("{first}:*"),
         network: false,
         destructive: false,
+        parser_backed,
+        dynamic,
     }
 }
 
+fn parse_shell_command(command: &str) -> Option<ParsedShellCommand> {
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_err()
+    {
+        return None;
+    }
+    let tree = parser.parse(command, None)?;
+    let root = tree.root_node();
+    let mut segments = Vec::new();
+    collect_shell_command_nodes(root, command.as_bytes(), &mut segments);
+    Some(ParsedShellCommand {
+        segments: if segments.is_empty() {
+            shell_segments(command)
+        } else {
+            segments
+        },
+        dynamic: root.has_error()
+            || shell_tree_contains_dynamic(root)
+            || shell_text_is_dynamic(command),
+    })
+}
+
+fn collect_shell_command_nodes(node: Node<'_>, bytes: &[u8], segments: &mut Vec<String>) {
+    if node.kind() == "command"
+        && let Ok(text) = node.utf8_text(bytes)
+    {
+        let text = collapse_whitespace(text);
+        if !text.is_empty() {
+            segments.push(text);
+            return;
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_shell_command_nodes(child, bytes, segments);
+    }
+}
+
+fn shell_tree_contains_dynamic(node: Node<'_>) -> bool {
+    if matches!(
+        node.kind(),
+        "command_substitution"
+            | "process_substitution"
+            | "expansion"
+            | "simple_expansion"
+            | "subscript"
+            | "heredoc_redirect"
+    ) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(shell_tree_contains_dynamic)
+}
+
+fn shell_text_is_dynamic(command: &str) -> bool {
+    command.contains("$(")
+        || command.contains('`')
+        || command.contains("${")
+        || command.contains("<(")
+        || command.contains(">(")
+}
+
 fn shell_segments(command: &str) -> Vec<String> {
-    command
-        .split("&&")
-        .flat_map(|part| part.split("||"))
-        .flat_map(|part| part.split(';'))
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(str::to_string)
-        .collect()
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some('\''), '\'') => quote = None,
+            (Some('"'), '"') => quote = None,
+            (Some(_), '\\') => {
+                current.push(ch);
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+                continue;
+            }
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, ';') => {
+                push_shell_segment(&mut segments, &mut current);
+                continue;
+            }
+            (None, '&') if chars.peek() == Some(&'&') => {
+                let _ = chars.next();
+                push_shell_segment(&mut segments, &mut current);
+                continue;
+            }
+            (None, '|') if chars.peek() == Some(&'|') => {
+                let _ = chars.next();
+                push_shell_segment(&mut segments, &mut current);
+                continue;
+            }
+            _ => {}
+        }
+        current.push(ch);
+    }
+    push_shell_segment(&mut segments, &mut current);
+    segments
+}
+
+fn push_shell_segment(segments: &mut Vec<String>, current: &mut String) {
+    let segment = current.trim();
+    if !segment.is_empty() {
+        segments.push(segment.to_string());
+    }
+    current.clear();
 }
 
 fn shell_command_prefix(segment: &str) -> String {
@@ -3547,19 +3978,254 @@ fn shell_policy_denied(
             "risk": analysis.risk.as_str(),
             "network": if analysis.network { "detected" } else { "none" },
             "destructive": analysis.destructive,
+            "parser_backed": analysis.parser_backed,
+            "dynamic": analysis.dynamic,
         }),
         ToolCostHint::default(),
         None,
     )
 }
 
-fn apply_shell_environment_policy(command: &mut Command) -> Vec<String> {
+fn prepare_shell_sandbox_plan(
+    command: &str,
+    analysis: &ShellPermissionAnalysis,
+    root: &Path,
+    config: &ShellSandboxConfig,
+) -> std::result::Result<ShellSandboxPlan, String> {
+    let required = config.mode == ShellSandboxMode::Required;
+    let network = match config.network {
+        ShellSandboxNetworkPolicy::AllowWhenApproved if analysis.network => "allowed_approved",
+        _ if analysis.network => "allowed_detected",
+        _ => "denied",
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        if Path::new("/usr/bin/sandbox-exec").exists() {
+            return Ok(ShellSandboxPlan {
+                program: "/usr/bin/sandbox-exec".to_string(),
+                args: vec![
+                    "-p".to_string(),
+                    macos_shell_sandbox_profile(root, config, network == "denied"),
+                    "sh".to_string(),
+                    "-lc".to_string(),
+                    command.to_string(),
+                ],
+                backend: "macos-sandbox-exec",
+                mode: config.mode.as_str(),
+                network,
+                required,
+            });
+        }
+        if required {
+            return Err(
+                "required shell sandbox unavailable: /usr/bin/sandbox-exec not found".to_string(),
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(ShellSandboxPlan {
+            program: "sh".to_string(),
+            args: vec!["-lc".to_string(), command.to_string()],
+            backend: "linux-direct-syscalls",
+            mode: config.mode.as_str(),
+            network,
+            required,
+        });
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        if required {
+            return Err(format!(
+                "required shell sandbox unavailable on {}",
+                std::env::consts::OS
+            ));
+        }
+    }
+
+    Ok(ShellSandboxPlan::direct(command, config.mode))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_shell_sandbox_profile(
+    root: &Path,
+    config: &ShellSandboxConfig,
+    deny_network: bool,
+) -> String {
+    let mut profile = String::from("(version 1)\n(allow default)\n");
+    if deny_network {
+        profile.push_str("(deny network*)\n");
+    }
+    profile.push_str("(deny file-write*\n  (require-all\n");
+    for path in shell_writable_roots(root) {
+        profile.push_str(&format!(
+            "    (require-not (subpath {}))\n",
+            sandbox_profile_string(&path.display().to_string())
+        ));
+    }
+    profile.push_str("  ))\n");
+    let mut denied_paths = sensitive_absolute_paths(root, config);
+    denied_paths.sort();
+    denied_paths.dedup();
+    for path in denied_paths {
+        profile.push_str(&format!(
+            "(deny file-read* file-write* (subpath {}))\n",
+            sandbox_profile_string(&path.display().to_string())
+        ));
+    }
+    profile
+}
+
+#[cfg(target_os = "macos")]
+fn shell_writable_roots(root: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![
+        root.to_path_buf(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private/tmp"),
+    ];
+    for name in ["TMPDIR", "TEMP", "TMP"] {
+        if let Some(path) = env::var_os(name).map(PathBuf::from) {
+            roots.push(path);
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn sensitive_absolute_paths(root: &Path, config: &ShellSandboxConfig) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for pattern in &config.sensitive_path_patterns {
+        let base = sensitive_pattern_base(pattern);
+        if base.is_empty() {
+            continue;
+        }
+        paths.push(root.join(&base));
+        if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+            paths.push(home.join(&base));
+        }
+    }
+    paths
+}
+
+fn sensitive_pattern_base(pattern: &str) -> String {
+    let trimmed = pattern
+        .trim()
+        .trim_end_matches('*')
+        .trim_end_matches('/')
+        .trim_end_matches("/**");
+    trimmed.trim_start_matches('/').to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_profile_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn shell_command_references_sensitive_path(command: &str, patterns: &[String]) -> Option<String> {
+    let normalized = command.replace('\\', "/");
+    patterns.iter().find_map(|pattern| {
+        let base = sensitive_pattern_base(pattern);
+        if !base.is_empty() && normalized.contains(&base) {
+            Some(pattern.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn shell_sandbox_runtime_unavailable(
+    plan: &ShellSandboxPlan,
+    exit_code: Option<i32>,
+    stderr: &str,
+) -> bool {
+    plan.backend == "macos-sandbox-exec"
+        && exit_code == Some(71)
+        && stderr.contains("sandbox_apply")
+}
+
+fn configure_shell_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+}
+
+fn configure_linux_shell_sandbox(command: &mut Command, plan: &ShellSandboxPlan) {
+    #[cfg(target_os = "linux")]
+    if plan.backend == "linux-direct-syscalls" {
+        let deny_network = plan.network == "denied";
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut flags = libc::CLONE_NEWNS;
+                if deny_network {
+                    flags |= libc::CLONE_NEWNET;
+                }
+                if libc::unshare(flags) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = (command, plan);
+}
+
+async fn terminate_shell_child(child: &mut tokio::process::Child, grace_ms: u64) {
+    if let Some(pid) = child.id() {
+        kill_process_group(pid, libc::SIGTERM);
+        if time::timeout(Duration::from_millis(grace_ms), child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        kill_process_group(pid, libc::SIGKILL);
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+fn kill_process_group(pid: u32, signal: libc::c_int) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(-(pid as libc::pid_t), signal);
+    }
+
+    #[cfg(not(unix))]
+    let _ = (pid, signal);
+}
+
+fn apply_shell_environment_policy(
+    command: &mut Command,
+    config: &ShellSandboxConfig,
+) -> Vec<String> {
     let mut preserved = BTreeMap::<String, OsString>::new();
     for (name, value) in env::vars_os() {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if shell_env_should_preserve(name) {
+        if shell_env_should_preserve(name, &config.env_allowlist) {
             preserved.insert(name.to_string(), value);
         }
     }
@@ -3571,27 +4237,14 @@ fn apply_shell_environment_policy(command: &mut Command) -> Vec<String> {
     preserved.into_keys().collect()
 }
 
-fn shell_env_should_preserve(name: &str) -> bool {
-    matches!(
-        name,
-        "PATH"
-            | "HOME"
-            | "USER"
-            | "LOGNAME"
-            | "SHELL"
-            | "TERM"
-            | "LANG"
-            | "TMPDIR"
-            | "TEMP"
-            | "TMP"
-            | "CARGO_HOME"
-            | "RUSTUP_HOME"
-            | "RUSTFLAGS"
-            | "RUST_BACKTRACE"
-            | "SSL_CERT_FILE"
-            | "SSL_CERT_DIR"
-            | "NIX_SSL_CERT_FILE"
-    ) || name.starts_with("LC_")
+fn shell_env_should_preserve(name: &str, allowlist: &[String]) -> bool {
+    allowlist.iter().any(|pattern| {
+        if let Some(prefix) = pattern.strip_suffix('*') {
+            name.starts_with(prefix)
+        } else {
+            name == pattern
+        }
+    })
 }
 
 fn build_required_glob(pattern: &str) -> std::result::Result<GlobSet, String> {
@@ -3627,7 +4280,9 @@ fn build_include_set(patterns: Option<&[String]>) -> std::result::Result<Option<
 fn read_prefix(path: &Path, limit: usize) -> std::result::Result<Vec<u8>, std::io::Error> {
     let mut file = fs::File::open(path)?;
     let mut bytes = Vec::new();
-    file.by_ref().take(limit as u64).read_to_end(&mut bytes)?;
+    std::io::Read::by_ref(&mut file)
+        .take(limit as u64)
+        .read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -3639,7 +4294,9 @@ fn read_range(
     let mut file = fs::File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = Vec::new();
-    file.by_ref().take(limit as u64).read_to_end(&mut bytes)?;
+    std::io::Read::by_ref(&mut file)
+        .take(limit as u64)
+        .read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
