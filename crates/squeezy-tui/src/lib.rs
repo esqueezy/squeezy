@@ -233,11 +233,23 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
 
 pub(crate) fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
     let permission = &request.permission;
+    let mut details = Vec::new();
+    for key in ["command", "cwd", "env", "network", "destructive"] {
+        if let Some(value) = permission.metadata.get(key) {
+            details.push(format!("{key}={value:?}"));
+        }
+    }
+    let details = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" | {}", details.join(" "))
+    };
     format!(
-        "approve {summary} | risk={risk} target={target} | y once | a user allow | p project allow | u user deny | d project deny | n deny once",
+        "approve {summary} | risk={risk} target={target}{details} | y once | a user allow | p project allow | u user deny | d project deny | n deny once",
         summary = permission.summary,
         risk = permission.risk.as_str(),
         target = permission.target,
+        details = details,
     )
 }
 

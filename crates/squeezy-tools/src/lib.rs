@@ -1,5 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    env,
+    ffi::OsString,
     fs,
     future::Future,
     io::{Read, Seek, SeekFrom},
@@ -49,6 +51,7 @@ const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
 const VERIFY_SHELL_TIMEOUT_MS: u64 = 600_000;
 const DEFAULT_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
+const MAX_SHELL_OUTPUT_BYTE_CAP: usize = 128_000;
 const DEFAULT_WEB_SEARCH_RESULTS: usize = 8;
 const MAX_WEB_SEARCH_RESULTS: usize = 20;
 const DEFAULT_WEB_SEARCH_CONTEXT_CHARS: usize = 10_000;
@@ -198,7 +201,8 @@ impl ToolResult {
             call,
             ToolStatus::Denied,
             json!({
-                "error": reason,
+                "error": reason.clone(),
+                "reason": reason,
                 "permission_denied": true,
             }),
             ToolCostHint::default(),
@@ -682,8 +686,32 @@ impl ToolRegistry {
                     .map(|args| args.command.as_str())
                     .unwrap_or("");
                 let analysis = analyze_shell_command(command);
+                let workdir = args
+                    .as_ref()
+                    .and_then(|args| args.workdir.as_deref())
+                    .unwrap_or(".");
                 metadata.insert("command".to_string(), command.to_string());
+                metadata.insert("cwd".to_string(), workdir.to_string());
                 metadata.insert("shell_prefix".to_string(), analysis.rule_target.clone());
+                metadata.insert(
+                    "env".to_string(),
+                    "allowlist; values redacted from approvals and output".to_string(),
+                );
+                metadata.insert(
+                    "network".to_string(),
+                    if analysis.network {
+                        "detected".to_string()
+                    } else {
+                        "none".to_string()
+                    },
+                );
+                metadata.insert("destructive".to_string(), analysis.destructive.to_string());
+                if let Some(timeout_ms) = args.as_ref().and_then(|args| args.timeout_ms) {
+                    metadata.insert("timeout_ms".to_string(), timeout_ms.to_string());
+                }
+                if let Some(output_byte_cap) = args.as_ref().and_then(|args| args.output_byte_cap) {
+                    metadata.insert("output_byte_cap".to_string(), output_byte_cap.to_string());
+                }
                 if let Some(description) =
                     args.as_ref().and_then(|args| args.description.as_deref())
                 {
@@ -881,7 +909,13 @@ impl ToolRegistry {
                     .as_ref()
                     .map(|args| truncate_text(&args.command, 200))
                     .unwrap_or_else(|| "?".to_string());
-                format!("shell description={description:?} command={command:?}")
+                let workdir = args
+                    .as_ref()
+                    .and_then(|args| args.workdir.as_deref())
+                    .unwrap_or(".");
+                format!(
+                    "shell description={description:?} cwd={workdir:?} env=\"allowlist/redacted\" command={command:?}"
+                )
             }
             "webfetch" => {
                 let args = serde_json::from_value::<WebFetchArgs>(call.arguments.clone()).ok();
@@ -1865,9 +1899,29 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
+        let analysis = analyze_shell_command(&args.command);
+        if args.command.trim().is_empty() {
+            return shell_policy_denied(call, &analysis, "shell command must not be empty");
+        }
+        if args.timeout_ms == Some(0) {
+            return shell_policy_denied(call, &analysis, "shell timeout_ms must be at least 1");
+        }
+        if args.output_byte_cap == Some(0) {
+            return shell_policy_denied(
+                call,
+                &analysis,
+                "shell output_byte_cap must be at least 1",
+            );
+        }
         let workdir = match self.resolve_existing(args.workdir.as_deref().unwrap_or(".")) {
             Ok(path) => path,
-            Err(err) => return tool_error(call, err),
+            Err(err) => {
+                return shell_policy_denied(
+                    call,
+                    &analysis,
+                    format!("shell workdir rejected by cwd policy: {err}"),
+                );
+            }
         };
         let timeout_ms = args
             .timeout_ms
@@ -1876,7 +1930,7 @@ impl ToolRegistry {
         let output_cap = args
             .output_byte_cap
             .unwrap_or(DEFAULT_SHELL_OUTPUT_BYTE_CAP)
-            .min(128_000);
+            .min(MAX_SHELL_OUTPUT_BYTE_CAP);
 
         let mut command = Command::new("sh");
         command
@@ -1886,6 +1940,7 @@ impl ToolRegistry {
             .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        let preserved_env = apply_shell_environment_policy(&mut command);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(err) => return tool_error(call, err),
@@ -1956,6 +2011,20 @@ impl ToolRegistry {
                 "stderr": stderr,
                 "error": error,
                 "truncated": truncated,
+                "policy": {
+                    "capability": analysis.capability.as_str(),
+                    "target": analysis.rule_target,
+                    "risk": analysis.risk.as_str(),
+                    "network": if analysis.network { "detected" } else { "none" },
+                    "destructive": analysis.destructive,
+                    "timeout_ms": timeout_ms,
+                    "output_byte_cap": output_cap,
+                },
+                "env": {
+                    "policy": "allowlist",
+                    "values": "redacted",
+                    "preserved": preserved_env,
+                },
             }),
             cost,
             None,
@@ -2664,6 +2733,8 @@ struct ShellPermissionAnalysis {
     capability: PermissionCapability,
     risk: PermissionRisk,
     rule_target: String,
+    network: bool,
+    destructive: bool,
 }
 
 fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
@@ -2675,6 +2746,16 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
         .filter(|prefix| !prefix.is_empty())
         .unwrap_or_else(|| "shell".to_string());
 
+    if segments.is_empty() {
+        return ShellPermissionAnalysis {
+            capability: PermissionCapability::Shell,
+            risk: PermissionRisk::High,
+            rule_target: "shell:*".to_string(),
+            network: false,
+            destructive: false,
+        };
+    }
+
     if segments
         .iter()
         .any(|segment| is_destructive_shell_segment(segment))
@@ -2683,6 +2764,22 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
             capability: PermissionCapability::Destructive,
             risk: PermissionRisk::Critical,
             rule_target: format!("{first}:*"),
+            network: segments
+                .iter()
+                .any(|segment| is_network_shell_segment(segment)),
+            destructive: true,
+        };
+    }
+    if segments
+        .iter()
+        .any(|segment| is_network_shell_segment(segment))
+    {
+        return ShellPermissionAnalysis {
+            capability: PermissionCapability::Network,
+            risk: PermissionRisk::High,
+            rule_target: format!("shell:{first}:*"),
+            network: true,
+            destructive: false,
         };
     }
     if segments
@@ -2696,6 +2793,8 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
                 "{}:*",
                 shell_command_prefix(segments.first().unwrap_or(&normalized))
             ),
+            network: false,
+            destructive: false,
         };
     }
     if segments.iter().all(|segment| is_git_shell_segment(segment)) {
@@ -2713,6 +2812,8 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
                 "{}:*",
                 shell_command_prefix(segments.first().unwrap_or(&normalized))
             ),
+            network: false,
+            destructive: false,
         };
     }
 
@@ -2720,6 +2821,8 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
         capability: PermissionCapability::Shell,
         risk: PermissionRisk::High,
         rule_target: format!("{first}:*"),
+        network: false,
+        destructive: false,
     }
 }
 
@@ -2736,7 +2839,16 @@ fn shell_segments(command: &str) -> Vec<String> {
 
 fn shell_command_prefix(segment: &str) -> String {
     let mut parts = segment.split_whitespace();
-    let first = parts.next().unwrap_or("shell");
+    let mut first = parts.next().unwrap_or("shell");
+    while let Some((name, _)) = split_env_assignment(first) {
+        if !shell_env_assignment_allowed_for_prefix(name) {
+            return "shell".to_string();
+        }
+        first = parts.next().unwrap_or("shell");
+    }
+    if is_bare_shell_prefix(first) {
+        return "shell".to_string();
+    }
     match first {
         "cargo" | "git" | "npm" | "pnpm" | "yarn" | "bun" | "make" | "just" => parts
             .next()
@@ -2746,16 +2858,106 @@ fn shell_command_prefix(segment: &str) -> String {
     }
 }
 
+fn split_env_assignment(token: &str) -> Option<(&str, &str)> {
+    let (name, value) = token.split_once('=')?;
+    if name.is_empty() {
+        return None;
+    }
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some((name, value))
+}
+
+fn shell_env_assignment_allowed_for_prefix(name: &str) -> bool {
+    matches!(
+        name,
+        "CI" | "NO_COLOR"
+            | "RUST_BACKTRACE"
+            | "RUSTFLAGS"
+            | "CARGO_TERM_COLOR"
+            | "CARGO_INCREMENTAL"
+            | "RUST_LOG"
+    )
+}
+
+fn is_bare_shell_prefix(prefix: &str) -> bool {
+    matches!(
+        prefix,
+        "sh" | "bash"
+            | "zsh"
+            | "fish"
+            | "csh"
+            | "tcsh"
+            | "ksh"
+            | "dash"
+            | "env"
+            | "xargs"
+            | "nice"
+            | "nohup"
+            | "time"
+            | "timeout"
+            | "stdbuf"
+            | "sudo"
+    )
+}
+
 fn is_destructive_shell_segment(segment: &str) -> bool {
     let first = segment.split_whitespace().next().unwrap_or("");
     matches!(
         first,
         "rm" | "rmdir" | "mv" | "dd" | "truncate" | "shred" | "chmod" | "chown" | "sudo"
-    ) || segment.contains(" > ")
+    ) || segment.contains('>')
         || segment.contains(">>")
         || segment.contains("git reset")
         || segment.contains("git clean")
         || segment.contains("git checkout")
+        || segment.contains("git restore")
+        || segment.contains("git stash drop")
+        || segment.contains("git stash clear")
+        || segment.contains("git branch -D")
+        || segment.contains("git push --force")
+        || segment.contains("git push -f")
+        || segment.contains("terraform destroy")
+        || segment.contains("kubectl delete")
+}
+
+fn is_network_shell_segment(segment: &str) -> bool {
+    matches!(
+        shell_command_prefix(segment).as_str(),
+        "curl"
+            | "wget"
+            | "nc"
+            | "netcat"
+            | "ssh"
+            | "scp"
+            | "sftp"
+            | "rsync"
+            | "telnet"
+            | "ftp"
+            | "dig"
+            | "nslookup"
+            | "ping"
+            | "traceroute"
+            | "gh"
+            | "git fetch"
+            | "git pull"
+            | "git push"
+            | "git clone"
+            | "git ls-remote"
+            | "cargo fetch"
+            | "cargo install"
+            | "cargo update"
+            | "npm install"
+            | "pnpm install"
+            | "yarn install"
+            | "bun install"
+    )
 }
 
 fn is_compiler_shell_segment(segment: &str) -> bool {
@@ -3326,6 +3528,70 @@ fn tool_error(call: &ToolCall, err: impl ToString) -> ToolResult {
         ToolCostHint::default(),
         None,
     )
+}
+
+fn shell_policy_denied(
+    call: &ToolCall,
+    analysis: &ShellPermissionAnalysis,
+    reason: impl Into<String>,
+) -> ToolResult {
+    make_result(
+        call,
+        ToolStatus::Denied,
+        json!({
+            "error": reason.into(),
+            "permission_denied": true,
+            "policy_denied": true,
+            "capability": analysis.capability.as_str(),
+            "target": analysis.rule_target,
+            "risk": analysis.risk.as_str(),
+            "network": if analysis.network { "detected" } else { "none" },
+            "destructive": analysis.destructive,
+        }),
+        ToolCostHint::default(),
+        None,
+    )
+}
+
+fn apply_shell_environment_policy(command: &mut Command) -> Vec<String> {
+    let mut preserved = BTreeMap::<String, OsString>::new();
+    for (name, value) in env::vars_os() {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if shell_env_should_preserve(name) {
+            preserved.insert(name.to_string(), value);
+        }
+    }
+
+    command.env_clear();
+    for (name, value) in &preserved {
+        command.env(name, value);
+    }
+    preserved.into_keys().collect()
+}
+
+fn shell_env_should_preserve(name: &str) -> bool {
+    matches!(
+        name,
+        "PATH"
+            | "HOME"
+            | "USER"
+            | "LOGNAME"
+            | "SHELL"
+            | "TERM"
+            | "LANG"
+            | "TMPDIR"
+            | "TEMP"
+            | "TMP"
+            | "CARGO_HOME"
+            | "RUSTUP_HOME"
+            | "RUSTFLAGS"
+            | "RUST_BACKTRACE"
+            | "SSL_CERT_FILE"
+            | "SSL_CERT_DIR"
+            | "NIX_SSL_CERT_FILE"
+    ) || name.starts_with("LC_")
 }
 
 fn build_required_glob(pattern: &str) -> std::result::Result<GlobSet, String> {

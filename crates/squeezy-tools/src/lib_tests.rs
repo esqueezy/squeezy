@@ -34,6 +34,8 @@ fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     assert_eq!(destructive.capability, PermissionCapability::Destructive);
     assert_eq!(destructive.risk, PermissionRisk::Critical);
     assert_eq!(destructive.target, "rm:*");
+    assert_eq!(destructive.metadata["cwd"], ".");
+    assert_eq!(destructive.metadata["destructive"], "true");
 
     let compiler = registry.permission_request(&ToolCall {
         call_id: "test".to_string(),
@@ -47,6 +49,82 @@ fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     assert_eq!(compiler.target, "cargo test:*");
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn shell_permission_metadata_detects_network_commands() {
+    let root = temp_workspace("permission_network_metadata");
+    let registry = ToolRegistry::new(&root).expect("registry");
+    fs::create_dir_all(root.join("src")).expect("mkdir src");
+
+    let request = registry.permission_request(&ToolCall {
+        call_id: "curl".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "curl https://example.com",
+            "workdir": "src",
+            "timeout_ms": 1000,
+            "output_byte_cap": 2048,
+            "description": "fetch"
+        }),
+    });
+
+    assert_eq!(request.capability, PermissionCapability::Network);
+    assert_eq!(request.risk, PermissionRisk::High);
+    assert_eq!(request.target, "shell:curl:*");
+    assert_eq!(request.metadata["network"], "detected");
+    assert_eq!(request.metadata["cwd"], "src");
+    assert_eq!(request.metadata["timeout_ms"], "1000");
+    assert_eq!(request.metadata["output_byte_cap"], "2048");
+    assert!(request.metadata["env"].contains("allowlist"));
+
+    let git_clone = registry.permission_request(&ToolCall {
+        call_id: "git".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "git clone https://example.com/repo.git",
+            "description": "clone"
+        }),
+    });
+    assert_eq!(git_clone.capability, PermissionCapability::Network);
+    assert_eq!(git_clone.target, "shell:git clone:*");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn shell_prefix_analysis_handles_env_assignments_and_bare_shell_wrappers() {
+    let safe_env = analyze_shell_command("CI=1 cargo test --workspace");
+    assert_eq!(safe_env.capability, PermissionCapability::Compiler);
+    assert_eq!(safe_env.rule_target, "cargo test:*");
+
+    let secret_env = analyze_shell_command("OPENAI_API_KEY=sk-test cargo test --workspace");
+    assert_eq!(secret_env.capability, PermissionCapability::Shell);
+    assert_eq!(secret_env.rule_target, "shell:*");
+
+    let bare_shell = analyze_shell_command("bash -lc 'cargo test'");
+    assert_eq!(bare_shell.capability, PermissionCapability::Shell);
+    assert_eq!(bare_shell.rule_target, "shell:*");
+
+    let destructive_network = analyze_shell_command("git push --force origin main");
+    assert_eq!(
+        destructive_network.capability,
+        PermissionCapability::Destructive
+    );
+    assert_eq!(destructive_network.risk, PermissionRisk::Critical);
+    assert!(destructive_network.network);
+}
+
+#[test]
+fn shell_environment_policy_preserves_only_safe_names() {
+    assert!(shell_env_should_preserve("PATH"));
+    assert!(shell_env_should_preserve("CARGO_HOME"));
+    assert!(shell_env_should_preserve("LC_ALL"));
+
+    assert!(!shell_env_should_preserve("OPENAI_API_KEY"));
+    assert!(!shell_env_should_preserve("AWS_SECRET_ACCESS_KEY"));
+    assert!(!shell_env_should_preserve("SSH_AUTH_SOCK"));
+    assert!(!shell_env_should_preserve("GITHUB_TOKEN"));
 }
 
 #[test]
@@ -936,6 +1014,109 @@ async fn shell_returns_bounded_output_and_exit_code() {
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["stdout"], "abc");
     assert_eq!(result.content["exit_code"], 0);
+    assert_eq!(result.content["env"]["policy"], "allowlist");
+    assert_eq!(result.content["env"]["values"], "redacted");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_rejects_empty_command_with_structured_policy_reason() {
+    let root = temp_workspace("shell_empty");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "   ",
+                    "description": "empty"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Denied);
+    assert_eq!(result.content["permission_denied"], true);
+    assert_eq!(result.content["policy_denied"], true);
+    assert_eq!(result.content["capability"], "shell");
+    assert_eq!(result.content["target"], "shell:*");
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("must not be empty")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_rejects_workdir_outside_workspace_with_structured_policy_reason() {
+    let root = temp_workspace("shell_workdir_policy");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "pwd",
+                    "workdir": "..",
+                    "description": "outside"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Denied);
+    assert_eq!(result.content["permission_denied"], true);
+    assert_eq!(result.content["policy_denied"], true);
+    assert_eq!(result.content["capability"], "shell");
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("workdir rejected")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_timeout_returns_structured_error_and_kills_process() {
+    let root = temp_workspace("shell_timeout");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "sleep 2",
+                    "timeout_ms": 25,
+                    "description": "exercise timeout"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert_eq!(result.content["exit_code"], Value::Null);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("timed out")
+    );
+    assert_eq!(result.content["truncated"], true);
 
     let _ = fs::remove_dir_all(root);
 }

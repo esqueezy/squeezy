@@ -36,7 +36,13 @@ fn approval_prompt_surfaces_risk_target_and_persistence_keys() {
         target: "cargo test:*".to_string(),
         risk: PermissionRisk::High,
         summary: "shell description=\"run tests\" command=\"cargo test\"".to_string(),
-        metadata: BTreeMap::new(),
+        metadata: BTreeMap::from([
+            ("command".to_string(), "cargo test".to_string()),
+            ("cwd".to_string(), ".".to_string()),
+            ("env".to_string(), "allowlist/redacted".to_string()),
+            ("network".to_string(), "none".to_string()),
+            ("destructive".to_string(), "false".to_string()),
+        ]),
         suggested_rules: Vec::new(),
     };
     let request = ToolApprovalRequest {
@@ -54,6 +60,23 @@ fn approval_prompt_surfaces_risk_target_and_persistence_keys() {
     assert!(
         prompt.contains("target=cargo test:*"),
         "missing target: {prompt}",
+    );
+    assert!(
+        prompt.contains("command=\"cargo test\""),
+        "missing command metadata: {prompt}",
+    );
+    assert!(prompt.contains("cwd=\".\""), "missing cwd: {prompt}");
+    assert!(
+        prompt.contains("env=\"allowlist/redacted\""),
+        "missing env: {prompt}"
+    );
+    assert!(
+        prompt.contains("network=\"none\""),
+        "missing network: {prompt}"
+    );
+    assert!(
+        prompt.contains("destructive=\"false\""),
+        "missing destructive flag: {prompt}",
     );
     assert!(prompt.contains("y once"));
     assert!(prompt.contains("a user allow"));

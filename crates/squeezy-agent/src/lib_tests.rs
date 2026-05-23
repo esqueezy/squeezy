@@ -590,6 +590,60 @@ async fn trigger_skill_activation_injects_body() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn network_shell_command_is_denied_by_network_permission_policy() {
+    let root = temp_workspace("agent_shell_network_policy");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "curl https://example.com",
+                    "description": "fetch"
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![Ok(LlmEvent::Completed {
+            response_id: Some("resp_2".to_string()),
+            cost: CostSnapshot::default(),
+        })],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            web: PermissionMode::Deny,
+            shell: PermissionMode::Allow,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("fetch".to_string(), CancellationToken::new());
+    let mut denied = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ToolCallCompleted { result, .. } = event
+            && result.call_id == "call_1"
+        {
+            denied = Some(result);
+        }
+    }
+
+    let denied = denied.expect("shell result");
+    assert_eq!(denied.status, ToolStatus::Denied);
+    assert_eq!(denied.content["permission_denied"], true);
+    let error = denied.content["error"].as_str().expect("error");
+    assert!(error.contains("default network permission is deny"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn classifier_verdict_parses_strict_json_action_field() {
     let verdict =

@@ -2444,6 +2444,12 @@ pub fn user_settings_template() -> &'static str {
 # target = "cargo test:*"
 # action = "allow"
 # source = "user"
+#
+# [[permissions.rules]]
+# capability = "network"
+# target = "shell:curl:*"
+# action = "ask"
+# source = "project"
 
 [telemetry]
 # enabled = true

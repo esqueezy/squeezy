@@ -68,6 +68,12 @@ commented examples so that built-in defaults can evolve over time:
 # target = "cargo test:*"
 # action = "allow"
 # source = "user"
+#
+# [[permissions.rules]]
+# capability = "network"
+# target = "shell:curl:*"
+# action = "ask"
+# source = "project"
 
 [telemetry]
 # enabled = true
@@ -128,10 +134,22 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   - `tool:<name>` as a catch-all for tools that do not specify their own scope.
   - `<cmd-prefix>:*` for shell/git/compiler rules (e.g. `cargo test:*`,
     `rm:*`). `*` itself is treated as a wildcard segment in any position.
+  - `shell:<cmd-prefix>:*` for shell commands classified as network attempts
+    (e.g. `shell:curl:*` and `shell:npm install:*`).
   Allow rules on the `destructive` capability and Allow rules with a bare `*`
   target are refused at load time and at approval persistence time; honor
   destructive operations either per-call or by widening the `shell`
   compatibility default.
+  Shell approvals include the command, cwd, risk, target, network posture,
+  destructive flag, timeout/output caps when supplied, and the environment
+  policy. Shell execution is policy-first in v0: commands must run inside the
+  workspace, use bounded timeout/output caps, and launch with an allowlisted
+  environment whose values are never shown in approvals or tool output.
+  Network-looking shell commands route through the `network` capability for
+  approval/audit, but v0 does not provide OS-level network isolation. Common
+  verification commands such as `cargo test`, `cargo check`, `cargo clippy`,
+  and `cargo fmt` classify as `compiler` so projects can allow them without
+  broadly allowing arbitrary shell.
   Rules are matched by walking the configured rules first and the session
   rules last, returning the most recently added matching rule. Permission
   decisions are emitted on the `squeezy::permissions` tracing target with the
