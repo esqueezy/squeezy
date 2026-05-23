@@ -18,6 +18,8 @@ Current completed decisions:
 
 Foundation runtime behavior now exists: the workspace builds, the TUI starts, and the first LLM provider shapes are OpenAI Responses streaming and Anthropic Messages streaming. Graph-backed navigation is still future work.
 
+Implemented graph behavior is documented in `docs/SEMANTIC_GRAPH.md`.
+
 Tool-call cost strategy is documented in [`tool-call-saving-strategy.md`](tool-call-saving-strategy.md).
 
 Developer setup and verification commands live in the repository root `CONTRIBUTING.md`.
