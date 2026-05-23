@@ -4775,6 +4775,29 @@ fn prepare_shell_sandbox_plan(
     root: &Path,
     config: &ShellSandboxConfig,
 ) -> std::result::Result<ShellSandboxPlan, String> {
+    prepare_shell_sandbox_plan_with_probe(
+        command,
+        analysis,
+        root,
+        config,
+        Path::new("/usr/bin/sandbox-exec").exists(),
+        linux_unshare_supported(),
+    )
+}
+
+#[allow(unused_variables)]
+fn prepare_shell_sandbox_plan_with_probe(
+    command: &str,
+    analysis: &ShellPermissionAnalysis,
+    root: &Path,
+    config: &ShellSandboxConfig,
+    macos_sandbox_exec_available: bool,
+    linux_unshare_available: bool,
+) -> std::result::Result<ShellSandboxPlan, String> {
+    if config.mode == ShellSandboxMode::Off {
+        return Ok(ShellSandboxPlan::direct(command, ShellSandboxMode::Off));
+    }
+
     // `root` is only consumed when synthesising the macOS sandbox-exec
     // profile; on Linux and other targets the plan is otherwise the same.
     // Touch the binding so non-macOS clippy doesn't flag it as unused.
@@ -4798,7 +4821,7 @@ fn prepare_shell_sandbox_plan(
 
     #[cfg(target_os = "macos")]
     {
-        if Path::new("/usr/bin/sandbox-exec").exists() {
+        if macos_sandbox_exec_available {
             return Ok(ShellSandboxPlan {
                 program: "/usr/bin/sandbox-exec".to_string(),
                 args: vec![
@@ -4828,7 +4851,7 @@ fn prepare_shell_sandbox_plan(
         // or seccomp policy in the container), required mode must fail
         // closed at sandbox-prepare time rather than silently exit 1
         // after fork.
-        if !linux_unshare_supported() {
+        if !linux_unshare_available {
             if required {
                 return Err(format!(
                     "required shell sandbox unavailable: linux unshare(CLONE_NEWUSER|CLONE_NEWNS{}) failed",
@@ -5165,6 +5188,15 @@ fn shell_sandbox_runtime_unavailable(
     exit_code: Option<i32>,
     stderr: &str,
 ) -> bool {
+    shell_sandbox_runtime_unavailable_with_probe(plan, exit_code, stderr, linux_unshare_supported())
+}
+
+fn shell_sandbox_runtime_unavailable_with_probe(
+    plan: &ShellSandboxPlan,
+    exit_code: Option<i32>,
+    stderr: &str,
+    linux_unshare_available: bool,
+) -> bool {
     match plan.backend {
         "macos-sandbox-exec" => {
             // sandbox-exec returns 71 with a `sandbox_apply` message when
@@ -5179,7 +5211,7 @@ fn shell_sandbox_runtime_unavailable(
             // from a legitimate `exit 1`. Fall back to a probe: re-check
             // the supported-flag at the parent level, and report
             // unavailable if the kernel no longer supports unshare.
-            !linux_unshare_supported() && exit_code == Some(1) && stderr.is_empty()
+            !linux_unshare_available && exit_code == Some(1) && stderr.is_empty()
         }
         _ => false,
     }
