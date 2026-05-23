@@ -1,6 +1,6 @@
 use squeezy_core::LanguageFamily;
 
-use crate::runner::BenchmarkLanguage;
+use crate::cli::BenchmarkLanguage;
 
 pub trait LanguageOracle: Sync {
     fn id(&self) -> &'static str;
@@ -16,7 +16,7 @@ macro_rules! oracle {
         pub mod $module {
             use squeezy_core::LanguageFamily;
 
-            use crate::{oracles::LanguageOracle, runner::BenchmarkLanguage};
+            use crate::{cli::BenchmarkLanguage, oracles::LanguageOracle};
 
             pub struct $type_name;
 
