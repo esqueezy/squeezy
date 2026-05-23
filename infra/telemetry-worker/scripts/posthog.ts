@@ -359,3 +359,5 @@ function trimTrailingSlash(value: string): string {
 }
 
 await main();
+
+export {};
