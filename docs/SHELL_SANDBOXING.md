@@ -7,7 +7,8 @@ Squeezy's shell tool runs local commands behind three separate controls:
 - OS sandboxing limits what an approved command can do after it starts.
 
 Sandboxing is enabled by default and is configured under
-`[permissions.shell_sandbox]`.
+`[permissions.shell_sandbox]`. **The permission policy is the strong gate;
+the OS sandbox is best-effort defense in depth.** See "Limits" below.
 
 ## What It Does
 
@@ -17,29 +18,52 @@ policy.
 
 The current implementation:
 
-- Fails closed by default when a required sandbox backend is unavailable.
+- Fails closed when a required sandbox backend is unavailable: macOS denies if
+  `sandbox-exec` isn't on disk or if the kernel refuses to apply the profile;
+  Linux denies if `unprivileged_userns_clone` is `0` or `/proc/self/ns/user`
+  doesn't exist.
 - Uses `tree-sitter-bash` to classify shell commands before approval.
+- Recursively unwraps shell wrappers (`sh -c "X"`, `bash -lc "Y"`,
+  `env BAR=v cmd`, `nohup cmd`, `nice -n N cmd`, `timeout N cmd`,
+  `xargs ... cmd`, `sudo cmd`, etc.) so destructive/network/compiler
+  classification fires on the inner argv, not just the wrapper.
 - Treats parse errors, command substitutions, shell expansions, heredocs, and
-  other dynamic shell constructs conservatively.
+  other dynamic shell constructs conservatively (capability `Shell`,
+  `dynamic = true`).
 - Runs shell commands in their own process group and terminates the whole group
-  on timeout or cancellation.
-- Applies an allowlisted environment and never returns environment values in
-  approvals or tool results.
-- Blocks command strings that directly reference configured sensitive path
-  patterns such as `.ssh/**`, `.aws/**`, `.netrc`, `.kube/**`, `.npmrc`, and
-  `.env*`.
-- Emits redacted JSONL audit records to `.squeezy/audit/shell.jsonl`.
-- Adds `policy`, `sandbox`, and `env` metadata to shell tool results.
+  on timeout or cancellation (`SIGTERM`, then `SIGKILL` after `kill_grace_ms`).
+- Applies an allowlisted environment via `env_clear` + per-name preservation,
+  and never returns environment values in approvals or tool results.
+- Blocks command strings that reference configured sensitive path patterns
+  such as `.ssh/**`, `.aws/**`, `.netrc`, `.kube/**`, `.npmrc`, and `.env*`.
+  The matcher tokenizes the command, expands `~/` and `$HOME`, and matches
+  on path segments so `cat .environment` is not falsely flagged as `.env`.
+- Emits redacted JSONL audit records to `.squeezy/audit/shell.jsonl` under a
+  process-wide mutex with rotation at 8 MiB and up to four archived files.
+- Adds `policy`, `sandbox`, `sandbox_network`, and `env` metadata to shell
+  tool results.
 
-On macOS, Squeezy launches shell commands through `/usr/bin/sandbox-exec`.
-The generated profile denies network access for non-network commands, denies
-writes outside the workspace and temp directories, and denies reads/writes to
-configured sensitive paths.
+On **macOS**, Squeezy launches shell commands through `/usr/bin/sandbox-exec`
+with a `(deny default)` SBPL profile. The profile then re-allows the minimum
+needed for normal builds and tests: reads under `/usr`, `/bin`, `/sbin`,
+`/System`, `/Library`, `/opt`, `/private/etc`, `/dev/{null,zero,random,urandom}`,
+`$CARGO_HOME`, `$RUSTUP_HOME`, `$HOME/.cargo`, and `$HOME/.rustup`; reads and
+writes under the workspace root, `/tmp`, `/private/tmp`, `/private/var/folders`,
+`$TMPDIR`, `$CARGO_HOME`, `$RUSTUP_HOME`, `$HOME/.cargo`, and `$HOME/.rustup`.
+Sensitive paths are denied on top of the default deny, and network is denied
+unless the command is classified as network and the user sets
+`network = "allow_when_approved"`.
 
-On Linux, Squeezy uses a direct syscall backend. It creates a process group and
-uses namespace syscalls for mount/network isolation where the kernel permits
-them. If the required backend cannot be applied, `mode = "required"` denies the
-tool call instead of silently running unsandboxed.
+On **Linux**, Squeezy uses a direct syscall backend. The pre-spawn probe checks
+`/proc/sys/kernel/unprivileged_userns_clone` and `/proc/self/ns/user`. When
+namespacing is available, the spawned shell calls
+`unshare(CLONE_NEWUSER | CLONE_NEWNS [| CLONE_NEWNET])`, writes
+`/proc/self/{setgroups,uid_map,gid_map}` so the inner uid maps to the parent
+uid, and then `execve`s the shell. On older kernels or containers without
+user-namespace support, the backend reports unavailable; in `mode = "required"`
+the tool call is denied pre-spawn rather than running unsandboxed, and in
+`mode = "best_effort"` the command runs with the remaining shell policy
+controls (env allowlist, timeout, output cap, audit) but no OS isolation.
 
 ## When To Use It
 
@@ -84,15 +108,24 @@ answers "what can this allowed command touch once it runs?"
 ## How It Works
 
 Before spawning the command, Squeezy parses the shell text with
-`tree-sitter-bash`. The classifier extracts command segments, preserves quoted
-operators, marks dynamic constructs as high risk, and maps common command
-families to capabilities such as `compiler`, `git`, `network`, `shell`, or
-`destructive`.
+`tree-sitter-bash`. The classifier:
+
+- Extracts command segments and preserves quoted operators.
+- Recursively unwraps known shell wrappers and analyses the inner argv so
+  `sh -c "rm -rf target"`, `nohup rm -rf target`, and
+  `env BAR=v rm -rf target` all classify as `destructive`.
+- Detects destructive output redirects (`>`, `>>`, `>|`, `&>`, `&>>`, `<>`)
+  with a quote-aware scanner that ignores file-descriptor duplications such
+  as `2>&1` and `>&-`.
+- Marks dynamic constructs (`$( )`, `${ }`, backticks, process substitution,
+  parse errors) as high risk and forces capability `Shell`.
+- Maps common command families to capabilities `compiler`, `git`, `network`,
+  `destructive`, or `shell`.
 
 Squeezy then validates local execution policy:
 
 - The command must not be empty.
-- `workdir` must resolve inside the workspace.
+- `workdir` must canonicalize inside the workspace.
 - `timeout_ms` and `output_byte_cap` must be positive and remain within global
   caps.
 - Environment variables are cleared and rebuilt from the configured allowlist.
@@ -100,9 +133,11 @@ Squeezy then validates local execution policy:
 
 If the command is allowed, Squeezy prepares a sandbox plan:
 
-- `required`: deny if the backend cannot be used.
+- `required`: deny if the backend cannot be used. On macOS this catches a
+  missing or refused `sandbox-exec`; on Linux it catches missing
+  `unprivileged_userns_clone` / `/proc/self/ns/user`.
 - `best_effort`: use the backend when possible and otherwise run with the
-  remaining shell policy controls.
+  remaining shell policy controls (env allowlist, timeout/output cap, audit).
 - `off`: run directly with no OS sandbox.
 
 For process cleanup, Squeezy creates a process group for the shell command. On
@@ -142,30 +177,62 @@ audit = true
 kill_grace_ms = 250
 env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME", "RUSTFLAGS", "RUST_BACKTRACE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "LC_*"]
 sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*"]
+# replace_sensitive_path_patterns = false  # default; user list EXTENDS the floor above.
 ```
 
-`network = "deny_by_default"` keeps network blocked for ordinary shell commands.
-Network-looking commands still route through the `network` permission
-capability before execution.
+`network = "deny_by_default"` keeps the network namespace closed for every
+shell command, including those classified as `network`. The permission policy
+can still ask the user whether to RUN the command (e.g. `curl ...`); if
+approved, the command runs but cannot reach the network. The audit record
+shows `sandbox.network = "denied_classified"` for that case.
 
-`network = "allow_when_approved"` is intended for workflows where a network
-classified shell command should be able to use the network after it passes the
-permission gate.
+`network = "allow_when_approved"` opens the network namespace **only** when
+the command is classified as `network` and the permission policy allowed it.
+All other commands still run with network denied. The audit record shows
+`sandbox.network = "allowed_approved"` when network is opened and
+`"denied"` for everything else.
+
+`env_allowlist` patterns support exact names (e.g. `PATH`) and single
+trailing wildcards (e.g. `LC_*`). Other glob shapes are rejected at config
+load time.
+
+`sensitive_path_patterns` patterns must include a literal prefix before any
+wildcard. By default a user-supplied list **extends** the built-in floor —
+project-specific entries cannot accidentally disable the `.ssh/**`, `.aws/**`,
+`.netrc`, etc. denials. To opt out of the floor, set
+`replace_sensitive_path_patterns = true` and provide the full list.
+
+`kill_grace_ms` accepts values in the range `10..=60_000`. Out-of-range values
+fail loudly at config load.
 
 ## Limits
 
-The sandbox is intentionally local and deterministic. It does not make
-untrusted code safe in the same way as a disposable VM or container with a
-separate user, filesystem, and network stack.
+The sandbox is intentionally local and deterministic. **It is not a substitute
+for a disposable VM or container** with a separate user, filesystem, and
+network stack. The permission policy (capability + target rule matching) is
+the strong gate; the sandbox is best-effort defense in depth.
 
 Known limits:
 
 - macOS `sandbox-exec` is deprecated by Apple, but remains the available native
   command-line sandbox backend on supported macOS systems.
-- Some host sandboxes can prevent `sandbox-exec` from applying a nested profile;
-  in `required` mode Squeezy treats that as a denial.
-- Linux namespace setup depends on kernel and user-namespace policy.
-- Sensitive path matching is conservative and string/path-pattern based before
-  spawn; keep the default deny list and add project-specific paths when needed.
+- Some host sandboxes (CI runners, third-party VPN/EDR products) can prevent
+  `sandbox-exec` from applying a nested profile. In `required` mode Squeezy
+  treats that as a denial; in `best_effort` it falls through.
+- Linux namespace setup depends on kernel build flags and the
+  `unprivileged_userns_clone` sysctl. Common environments where this is
+  disabled: Docker containers with the default seccomp profile, locked-down
+  enterprise Linux distributions, WSL1. In `required` mode Squeezy denies
+  pre-spawn; in `best_effort` the command runs without OS isolation.
+- The classifier is parser-backed but conservative. Truly dynamic constructs
+  (`$(...)`, `${...}`, backticks, process substitution, parse errors) always
+  classify as `Shell` with risk `High`, even if the inner command would look
+  safe; this is deliberate.
+- Sensitive-path matching is path-segment based at the **command text** layer
+  before spawn. It catches `$HOME/.ssh/id_rsa`, `~/.aws/config`, and
+  `cat ./.env.production`; it does NOT inspect what the spawned process
+  actually opens. For OS-level path enforcement, rely on the macOS deny rules
+  or future namespace-based controls.
 - `mode = "off"` removes OS isolation and should not be used for routine agent
-  shell execution.
+  shell execution. Permission policy, env allowlist, timeout/output caps, and
+  audit still apply.

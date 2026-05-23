@@ -4790,14 +4790,13 @@ fn token_contains_sensitive_base(token: &str, base: &str) -> bool {
         // Trailing wildcard support for patterns like `.env*` → base
         // `.env`: require the segment to begin with `.env.` or `.env-`
         // or be exactly `.env`, not match `.environment`.
-        if let Some(rest) = piece.strip_prefix(base) {
-            if rest.is_empty()
+        if let Some(rest) = piece.strip_prefix(base)
+            && (rest.is_empty()
                 || rest.starts_with('.')
                 || rest.starts_with('-')
-                || rest.starts_with('_')
-            {
-                return true;
-            }
+                || rest.starts_with('_'))
+        {
+            return true;
         }
     }
     false
