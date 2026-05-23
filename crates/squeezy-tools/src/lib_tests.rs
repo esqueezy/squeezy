@@ -37,6 +37,7 @@ fn registry_with_shell_sandbox_off_and_output_config(
         shell_sandbox,
         SkillCatalog::empty(),
         CrawlOptions::default(),
+        None,
         Arc::new(Redactor::default()),
     )
     .expect("registry")
@@ -2725,6 +2726,7 @@ async fn skill_tools_list_metadata_and_load_body() {
         },
         &GraphConfig::default(),
         squeezy_core::ShellSandboxConfig::default(),
+        None,
         Arc::new(Redactor::default()),
     )
     .expect("registry");

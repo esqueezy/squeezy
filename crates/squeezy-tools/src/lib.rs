@@ -559,6 +559,7 @@ impl ToolRegistry {
             ShellSandboxConfig::default(),
             SkillCatalog::empty(),
             CrawlOptions::default(),
+            None,
             Arc::new(Redactor::default()),
         )
     }
@@ -576,6 +577,7 @@ impl ToolRegistry {
             ShellSandboxConfig::default(),
             SkillCatalog::empty(),
             crawl_options_from_graph_config(graph_config),
+            None,
             Arc::new(Redactor::default()),
         )
     }
@@ -587,6 +589,7 @@ impl ToolRegistry {
         skills_config: SkillsConfig,
         graph_config: &GraphConfig,
         shell_sandbox: ShellSandboxConfig,
+        cache_root: Option<PathBuf>,
         redactor: Arc<Redactor>,
     ) -> Result<Self> {
         let root = root.into();
@@ -601,6 +604,7 @@ impl ToolRegistry {
             shell_sandbox,
             skills,
             crawl_options_from_graph_config(graph_config),
+            cache_root,
             redactor,
         )
     }
@@ -612,6 +616,7 @@ impl ToolRegistry {
         shell_sandbox: ShellSandboxConfig,
         skills: SkillCatalog,
         crawl_options: CrawlOptions,
+        cache_root: Option<PathBuf>,
         redactor: Arc<Redactor>,
     ) -> Result<Self> {
         let root = root.into();
@@ -625,6 +630,7 @@ impl ToolRegistry {
             shell_sandbox,
             skills,
             crawl_options,
+            cache_root,
             redactor,
         )
     }
@@ -636,6 +642,7 @@ impl ToolRegistry {
         shell_sandbox: ShellSandboxConfig,
         skills: SkillCatalog,
         crawl_options: CrawlOptions,
+        cache_root: Option<PathBuf>,
         redactor: Arc<Redactor>,
     ) -> Result<Self> {
         let output_store = ToolOutputStore::new(&root, output_config)?;
@@ -644,9 +651,13 @@ impl ToolRegistry {
         // `SqueezyError::Config` here instead of silently disabling the
         // policy on every hot-path call.
         let compiled_policy = Arc::new(crawl_options.policy.compile()?);
-        let graph =
-            GraphManager::open_with_crawl_options(&root, Default::default(), crawl_options.clone())
-                .ok();
+        let graph = GraphManager::open_persistent_with_crawl_options(
+            &root,
+            Default::default(),
+            crawl_options.clone(),
+            cache_root,
+        )
+        .ok();
         let vcs = GitVcs::open(&root)?;
         let shell_audit = ShellAuditStore::new(&root);
         let checkpoints = CheckpointStore::open(&root)?;
