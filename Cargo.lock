@@ -1592,6 +1592,7 @@ dependencies = [
  "squeezy-tools",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -1617,6 +1618,7 @@ dependencies = [
  "serde",
  "thiserror",
  "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -1669,6 +1671,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-c",
  "tree-sitter-cpp",
+ "tree-sitter-go",
  "tree-sitter-python",
  "tree-sitter-rust",
 ]
@@ -1678,6 +1681,16 @@ name = "squeezy-rank"
 version = "0.1.0"
 dependencies = [
  "squeezy-core",
+]
+
+[[package]]
+name = "squeezy-skills"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "squeezy-core",
+ "tracing",
 ]
 
 [[package]]
@@ -1711,6 +1724,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "squeezy-core",
+ "squeezy-graph",
+ "squeezy-skills",
+ "squeezy-vcs",
+ "squeezy-workspace",
  "tokio",
  "tokio-util",
 ]
@@ -1730,9 +1747,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "squeezy-vcs"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "squeezy-core",
+]
+
+[[package]]
 name = "squeezy-workspace"
 version = "0.1.0"
 dependencies = [
+ "globset",
  "ignore",
  "squeezy-core",
 ]
@@ -2088,6 +2114,16 @@ name = "tree-sitter-cpp"
 version = "0.23.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df2196ea9d47b4ab4a31b9297eaa5a5d19a0b121dceb9f118f6790ad0ab94743"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-go"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8560a4d2f835cc0d4d2c2e03cbd0dde2f6114b43bc491164238d333e28b16ea"
 dependencies = [
  "cc",
  "tree-sitter-language",

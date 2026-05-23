@@ -62,7 +62,7 @@ fn install_id_is_persisted() {
 #[tokio::test]
 async fn record_buffers_events_for_periodic_batch_flush() {
     let root = std::env::temp_dir().join(format!(
-        "squeezy-telemetry-queue-{}-{}",
+        "squeezy-telemetry-record-{}-{}",
         now_ms(),
         std::process::id()
     ));

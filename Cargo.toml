@@ -8,10 +8,12 @@ members = [
     "crates/squeezy-llm",
     "crates/squeezy-parse",
     "crates/squeezy-rank",
+    "crates/squeezy-skills",
     "crates/squeezy-store",
     "crates/squeezy-telemetry",
     "crates/squeezy-tools",
     "crates/squeezy-tui",
+    "crates/squeezy-vcs",
     "crates/squeezy-workspace",
 ]
 resolver = "3"
@@ -47,6 +49,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.25"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
+tree-sitter-go = "0.25"
 tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 
@@ -56,9 +59,11 @@ squeezy-graph = { path = "crates/squeezy-graph" }
 squeezy-harness = { path = "crates/squeezy-harness" }
 squeezy-llm = { path = "crates/squeezy-llm" }
 squeezy-parse = { path = "crates/squeezy-parse" }
+squeezy-skills = { path = "crates/squeezy-skills" }
 squeezy-telemetry = { path = "crates/squeezy-telemetry" }
 squeezy-tools = { path = "crates/squeezy-tools" }
 squeezy-tui = { path = "crates/squeezy-tui" }
+squeezy-vcs = { path = "crates/squeezy-vcs" }
 squeezy-workspace = { path = "crates/squeezy-workspace" }
 
 [profile.release]

@@ -119,9 +119,9 @@ public:
     )
     .unwrap();
 
-    let graph = build_graph(&root).unwrap();
+    let build = build_graph(&root).unwrap();
     let scan = collect_c_family_squeezy_symbol_scan(
-        &graph,
+        &build.graph,
         LanguageKind::Cpp,
         &std::collections::BTreeSet::new(),
     );
