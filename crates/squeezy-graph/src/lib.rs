@@ -2365,6 +2365,8 @@ pub struct RefreshReport {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LanguageReport {
+    pub c_files: usize,
+    pub cpp_files: usize,
     pub rust_files: usize,
     pub supported_files: usize,
     pub unsupported_files: usize,
@@ -2557,6 +2559,14 @@ fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> Lan
     let mut report = LanguageReport::default();
     for record in records {
         match record.language {
+            LanguageKind::C => {
+                report.c_files += 1;
+                report.supported_files += 1;
+            }
+            LanguageKind::Cpp => {
+                report.cpp_files += 1;
+                report.supported_files += 1;
+            }
             LanguageKind::Python => {
                 report.supported_files += 1;
             }

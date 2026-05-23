@@ -37,7 +37,11 @@ fn telemetry_disabled_when_install_id_cannot_be_persisted() {
 
 #[test]
 fn install_id_is_persisted() {
-    let root = std::env::temp_dir().join(format!("squeezy-telemetry-{}", now_ms()));
+    let root = std::env::temp_dir().join(format!(
+        "squeezy-telemetry-install-{}-{}",
+        now_ms(),
+        std::process::id()
+    ));
     let path = root.join("install_id");
     let config = AppConfig {
         telemetry: telemetry_config(true, "https://telemetry.example/v1/batch"),
@@ -57,7 +61,11 @@ fn install_id_is_persisted() {
 
 #[tokio::test]
 async fn record_buffers_events_for_periodic_batch_flush() {
-    let root = std::env::temp_dir().join(format!("squeezy-telemetry-{}", now_ms()));
+    let root = std::env::temp_dir().join(format!(
+        "squeezy-telemetry-queue-{}-{}",
+        now_ms(),
+        std::process::id()
+    ));
     let path = root.join("install_id");
     let config = AppConfig {
         telemetry: telemetry_config(true, "https://telemetry.example/v1/batch"),
@@ -147,6 +155,8 @@ fn graph_event_carries_timing_counts_and_language_distribution() {
         symbols: 77,
         edges: 42,
         language_distribution: LanguageDistribution {
+            c_files: 2,
+            cpp_files: 3,
             rust_files: 8,
             supported_files: 8,
             unsupported_files: 3,
@@ -158,6 +168,8 @@ fn graph_event_carries_timing_counts_and_language_distribution() {
 
     assert!(text.contains("squeezy_graph_build_completed"));
     assert!(text.contains("\"duration_ms\":125"));
+    assert!(text.contains("\"c_files\":2"));
+    assert!(text.contains("\"cpp_files\":3"));
     assert!(text.contains("\"rust_files\":8"));
     assert!(text.contains("\"unsupported_files\":3"));
     assert!(!text.contains("/Users/"));

@@ -396,6 +396,153 @@ use crate::{config::Config, flags::{defs::Generate, parse::*}};
 }
 
 #[test]
+fn parser_extracts_c_symbols_includes_calls_macros_and_references() {
+    let source = r#"
+#include "runner.h"
+#define RUNNER_MAX 8
+
+typedef struct Runner Runner;
+
+enum RunnerState {
+    RUNNER_READY,
+};
+
+struct Runner {
+    int id;
+};
+
+int helper(int value);
+
+int runner_run(Runner *runner, int value) {
+    if (value > RUNNER_MAX) {
+        return helper(value);
+    }
+    return runner->id;
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = c_record("src/runner.c", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "runner.h")
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "RUNNER_MAX" && symbol.kind == SymbolKind::Macro)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Runner" && symbol.kind == SymbolKind::Struct)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "RUNNER_READY" && symbol.kind == SymbolKind::Variant)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "id" && symbol.kind == SymbolKind::Field)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "runner_run" && symbol.kind == SymbolKind::Function)
+    );
+    assert!(parsed.calls.iter().any(|call| call.name == "helper"));
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "Runner" && reference.kind == ReferenceKind::Type)
+    );
+}
+
+#[test]
+fn parser_extracts_cpp_classes_methods_templates_and_candidate_calls() {
+    let source = r#"
+#include "runner.hpp"
+
+namespace app {
+template <typename T>
+class Runner : public Base {
+public:
+    Runner();
+    int fallback(int value);
+    T run(T value) {
+        return helper(value);
+    }
+};
+
+int helper(int value);
+
+int call_runner(Runner<int>& runner) {
+    return runner.run(1);
+}
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = cpp_record("src/runner.cpp", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "runner.hpp")
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "app" && symbol.kind == SymbolKind::Module)
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "Runner"
+            && symbol.kind == SymbolKind::Class
+            && symbol.attributes.contains(&"c++:template".to_string())
+            && symbol.confidence == Confidence::Partial
+    }));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "run" && symbol.kind == SymbolKind::Method)
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "fallback"
+            && symbol.kind == SymbolKind::Method
+            && symbol
+                .attributes
+                .contains(&"c-family:declaration".to_string())
+    }));
+    assert!(parsed.calls.iter().any(|call| {
+        call.name == "run"
+            && call.kind == ParsedCallKind::Method
+            && call.confidence == Confidence::CandidateSet
+    }));
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "Base" && reference.kind == ReferenceKind::Type)
+    );
+}
+
+#[test]
 fn parser_parallel_records_preserve_order_and_cache_changes() {
     let mut parser = RustParser::new().unwrap();
     let mut records = (0..10)
@@ -522,6 +669,18 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
 fn python_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Python;
+    record
+}
+
+fn c_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::C;
+    record
+}
+
+fn cpp_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Cpp;
     record
 }
 

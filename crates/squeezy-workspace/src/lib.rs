@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
@@ -190,6 +191,7 @@ impl WorkspaceCrawler {
             });
         }
 
+        refine_c_family_header_languages(&mut files);
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         unsupported.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
@@ -205,11 +207,67 @@ impl WorkspaceCrawler {
 
 pub fn classify_language(path: &Path) -> LanguageKind {
     match path.extension().and_then(|extension| extension.to_str()) {
+        Some("c") => LanguageKind::C,
+        Some("cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx") => LanguageKind::Cpp,
+        Some("h") => LanguageKind::Cpp,
         Some("py") => LanguageKind::Python,
         Some("rs") => LanguageKind::Rust,
         Some(_) => LanguageKind::Unsupported,
         None => LanguageKind::Unknown,
     }
+}
+
+fn refine_c_family_header_languages(files: &mut [FileRecord]) {
+    let mut by_stem = BTreeMap::<String, Vec<LanguageKind>>::new();
+    let mut c_files = 0usize;
+    let mut cpp_files = 0usize;
+    for file in files.iter() {
+        match file.language {
+            LanguageKind::C => c_files += 1,
+            LanguageKind::Cpp if !is_plain_c_header(&file.relative_path) => cpp_files += 1,
+            _ => {}
+        }
+        if !is_plain_c_header(&file.relative_path)
+            && let Some(stem) = path_without_extension(&file.relative_path)
+        {
+            by_stem.entry(stem).or_default().push(file.language);
+        }
+    }
+    let project_default = if c_files > cpp_files {
+        LanguageKind::C
+    } else {
+        LanguageKind::Cpp
+    };
+    for file in files.iter_mut() {
+        if !is_plain_c_header(&file.relative_path) {
+            continue;
+        }
+        let Some(stem) = path_without_extension(&file.relative_path) else {
+            file.language = project_default;
+            continue;
+        };
+        let sibling_languages = by_stem.get(&stem).cloned().unwrap_or_default();
+        file.language = if sibling_languages.contains(&LanguageKind::C) {
+            LanguageKind::C
+        } else if sibling_languages.contains(&LanguageKind::Cpp) {
+            LanguageKind::Cpp
+        } else {
+            project_default
+        };
+    }
+}
+
+fn is_plain_c_header(relative_path: &str) -> bool {
+    relative_path
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.eq_ignore_ascii_case("h"))
+        .unwrap_or(false)
+}
+
+fn path_without_extension(relative_path: &str) -> Option<String> {
+    relative_path
+        .rsplit_once('.')
+        .map(|(stem, _)| stem.to_string())
 }
 
 pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
@@ -437,6 +495,8 @@ fn collect_source_markers(
             continue;
         }
         match classify_language(&path) {
+            LanguageKind::C => signals.push("shallow C source".to_string()),
+            LanguageKind::Cpp => signals.push("shallow C/C++ source".to_string()),
             LanguageKind::Rust => signals.push("shallow Rust source".to_string()),
             LanguageKind::Python => signals.push("shallow Python source".to_string()),
             _ => {

@@ -13,6 +13,10 @@ navigation questions before the model reads raw files.
 - Python declarations: classes, functions, methods, imports, calls, decorators,
   docstrings, class bases, type annotations, class fields, exports, aliases, and
   references from `.py` files.
+- C/C++ declarations: includes, namespaces, classes, structs, unions, enums,
+  typedefs/type aliases, fields, functions, methods, constructors/destructors,
+  operators, templates, macro definitions/usages, and declaration/definition
+  spans.
 - Signatures: raw item header, visibility, attributes, docs, spans, and body
   spans where present.
 - Edges: containment, imports/reexports, references, calls, and macro
@@ -89,6 +93,18 @@ decision instead of walking a likely non-code or dangerous directory.
   symbol so behavior-word searches do not have to read raw files first.
 - Dynamic attributes, metaclasses, runtime import side effects, monkey-patching,
   and type-inferred receiver dispatch remain heuristic or external.
+- C/C++ header classification prefers same-stem source files and then project
+  majority when a plain `.h` file has no unambiguous pair. `.hpp`, `.hh`, and
+  `.hxx` are treated as C++.
+- C/C++ include directives are indexed as import facts. Declaration/definition
+  pairing and calls use structural heuristics: namespace/class scope, name,
+  arity, receiver text, and normalized signature tokens. Overloads, templates,
+  function pointers, virtual dispatch, ADL, and macro-dependent calls produce
+  candidate-set, partial, macro-opaque, or conditional confidence instead of
+  exact claims.
+- C/C++ preprocessor directives are indexed but not expanded. Macro definitions,
+  macro invocations, and conditional spans are provenance-bearing evidence for
+  fallback, not compiler-equivalent semantics.
 
 Every result carries a confidence label such as `ExactSyntax`, `ImportResolved`,
 `Heuristic`, `CandidateSet`, `External`, `MacroOpaque`, `ConditionalUnknown`,
@@ -148,6 +164,17 @@ the fixture with a slower CPython `ast` oracle and compares declaration symbols
 against Squeezy's graph. Both fail if required expected results are missing or if
 Squeezy graph build plus query time is not faster than the validation pass for
 the same fixture.
+
+The C and C++ smoke benchmarks validate fixtures with `clang -fsyntax-only` and
+`clang++ -fsyntax-only`, then compare declaration symbols against
+`clang -Xclang -ast-dump=json` output before running the same graph/query/spec
+harness. Clang is a benchmark oracle only; production C/C++ navigation remains
+tree-sitter and local graph analysis. External mixed benchmarks cap sampled
+oracle files by default and exclude unparseable files from Squeezy
+false-positive accounting because real projects often require generated
+headers, compile flags, SDKs, or compile command databases. Known misses must be
+documented for macros, inactive preprocessor branches, templates, overloads,
+generated code, external headers, function pointers, and virtual dispatch.
 
 The mixed benchmark runs deterministic exhaustive scenarios against a real Rust
 repo by default. It generates scenarios from every indexed symbol and resolved

@@ -171,6 +171,8 @@ struct CachedParsedFile {
 pub struct RustParser {
     rust_parser: Parser,
     python_parser: Parser,
+    c_parser: Parser,
+    cpp_parser: Parser,
     cache: HashMap<FileId, CachedParsedFile>,
 }
 
@@ -191,9 +193,13 @@ impl RustParser {
     pub fn new() -> Result<Self> {
         let rust_parser = parser_with_rust_language()?;
         let python_parser = parser_with_python_language()?;
+        let c_parser = parser_with_c_language()?;
+        let cpp_parser = parser_with_cpp_language()?;
         Ok(Self {
             rust_parser,
             python_parser,
+            c_parser,
+            cpp_parser,
             cache: HashMap::new(),
         })
     }
@@ -370,6 +376,8 @@ impl RustParser {
 
     fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser> {
         match language {
+            LanguageKind::C => Ok(&mut self.c_parser),
+            LanguageKind::Cpp => Ok(&mut self.cpp_parser),
             LanguageKind::Rust => Ok(&mut self.rust_parser),
             LanguageKind::Python => Ok(&mut self.python_parser),
             _ => Err(SqueezyError::Parse(format!(
@@ -383,6 +391,8 @@ fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
     let mut parsers = WorkerParsers {
         rust: parser_with_rust_language()?,
         python: parser_with_python_language()?,
+        c: parser_with_c_language()?,
+        cpp: parser_with_cpp_language()?,
     };
     let mut outputs = Vec::with_capacity(jobs.len());
     for job in jobs {
@@ -394,11 +404,15 @@ fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
 struct WorkerParsers {
     rust: Parser,
     python: Parser,
+    c: Parser,
+    cpp: Parser,
 }
 
 impl WorkerParsers {
     fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser> {
         match language {
+            LanguageKind::C => Ok(&mut self.c),
+            LanguageKind::Cpp => Ok(&mut self.cpp),
             LanguageKind::Rust => Ok(&mut self.rust),
             LanguageKind::Python => Ok(&mut self.python),
             _ => Err(SqueezyError::Parse(format!(
@@ -527,6 +541,24 @@ fn parser_with_python_language() -> Result<Parser> {
     Ok(parser)
 }
 
+fn parser_with_c_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = c_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load C grammar: {err}")))?;
+    Ok(parser)
+}
+
+fn parser_with_cpp_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = cpp_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load C++ grammar: {err}")))?;
+    Ok(parser)
+}
+
 fn rust_language() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
 }
@@ -535,12 +567,24 @@ fn python_language() -> tree_sitter::Language {
     tree_sitter_python::LANGUAGE.into()
 }
 
+fn c_language() -> tree_sitter::Language {
+    tree_sitter_c::LANGUAGE.into()
+}
+
+fn cpp_language() -> tree_sitter::Language {
+    tree_sitter_cpp::LANGUAGE.into()
+}
+
 fn is_supported_language(language: LanguageKind) -> bool {
-    matches!(language, LanguageKind::Rust | LanguageKind::Python)
+    matches!(
+        language,
+        LanguageKind::C | LanguageKind::Cpp | LanguageKind::Rust | LanguageKind::Python
+    )
 }
 
 fn extract_language(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
     match file.language {
+        LanguageKind::C | LanguageKind::Cpp => extract_c_family(file, source, tree),
         LanguageKind::Rust => extract_rust(file, source, tree),
         LanguageKind::Python => extract_python(file, source, tree),
         _ => ParsedFile::unsupported(
@@ -571,6 +615,42 @@ fn extract_rust(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
     }
 
     visit_node(root, &mut ctx, None, None);
+
+    ParsedFile {
+        file,
+        symbols: ctx.symbols,
+        imports: ctx.imports,
+        calls: ctx.calls,
+        references: ctx.references,
+        body_hits: ctx.body_hits,
+        unsupported: None,
+        diagnostics: ctx.diagnostics,
+        changed_ranges: Vec::new(),
+    }
+}
+
+fn extract_c_family(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
+    let mut ctx = ExtractContext {
+        file: file.clone(),
+        source,
+        symbols: Vec::new(),
+        imports: Vec::new(),
+        calls: Vec::new(),
+        references: Vec::new(),
+        body_hits: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        ctx.diagnostics.push(ParseDiagnostic {
+            message: "tree-sitter reported parse errors".to_string(),
+            span: Some(span_from_node(root)),
+            confidence: Confidence::Partial,
+        });
+    }
+
+    visit_c_family_node(root, &mut ctx, None, None);
+    dedup_c_family_facts(&mut ctx);
 
     ParsedFile {
         file,
@@ -678,6 +758,848 @@ fn dedup_python_facts(ctx: &mut ExtractContext<'_>) {
             import.is_reexport
         ))
     });
+}
+
+fn dedup_c_family_facts(ctx: &mut ExtractContext<'_>) {
+    let mut symbols = HashSet::new();
+    ctx.symbols
+        .retain(|symbol| symbols.insert(symbol.id.0.clone()));
+    let mut imports = HashSet::new();
+    ctx.imports.retain(|import| {
+        imports.insert(format!(
+            "{}|{:?}|{}|{:?}|{}",
+            import.file_id.0,
+            import.owner_id.as_ref().map(|id| id.0.as_str()),
+            import.path,
+            import.alias,
+            import.is_reexport
+        ))
+    });
+    let mut calls = HashSet::new();
+    ctx.calls.retain(|call| {
+        calls.insert(format!(
+            "{}|{:?}|{}|{}|{}",
+            call.file_id.0,
+            call.caller_id.as_ref().map(|id| id.0.as_str()),
+            call.target_text,
+            call.span.start_byte,
+            call.span.end_byte
+        ))
+    });
+    let mut references = HashSet::new();
+    ctx.references.retain(|reference| {
+        references.insert(format!(
+            "{}|{:?}|{}|{:?}|{}|{}",
+            reference.file_id.0,
+            reference.owner_id.as_ref().map(|id| id.0.as_str()),
+            reference.text,
+            reference.kind,
+            reference.span.start_byte,
+            reference.span.end_byte
+        ))
+    });
+}
+
+fn visit_c_family_node(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<(SymbolId, SymbolKind)>,
+    owner_symbol: Option<SymbolId>,
+) {
+    if node.is_missing() {
+        ctx.diagnostics.push(ParseDiagnostic {
+            message: format!("missing {}", node.kind()),
+            span: Some(span_from_node(node)),
+            confidence: Confidence::Partial,
+        });
+        return;
+    }
+
+    let kind = node.kind();
+    if kind == "preproc_include" {
+        extract_c_include(node, ctx, owner_symbol.clone());
+    }
+
+    if let Some(symbol) = c_family_symbol_from_node(node, ctx, parent_symbol.as_ref()) {
+        extract_c_family_symbol_facts(node, &symbol, ctx);
+        let next_parent = if c_family_symbol_can_own_children(symbol.kind) {
+            Some((symbol.id.clone(), symbol.kind))
+        } else {
+            parent_symbol.clone()
+        };
+        let next_owner = if symbol.body_span.is_some() {
+            Some(symbol.id.clone())
+        } else {
+            owner_symbol.clone()
+        };
+        ctx.symbols.push(symbol);
+        visit_c_family_children(node, ctx, next_parent, next_owner);
+        return;
+    }
+
+    if kind == "call_expression" {
+        extract_c_family_call(node, ctx, owner_symbol.clone());
+    } else if matches!(kind, "preproc_call" | "preproc_function_def") {
+        extract_c_macro_call(node, ctx, owner_symbol.clone());
+    } else if let Some(reference_kind) = c_family_reference_kind(node) {
+        extract_c_family_reference(node, reference_kind, ctx, owner_symbol.clone());
+    } else if is_c_family_literal(kind) {
+        extract_body_hit(node, BodyHitKind::Literal, ctx, owner_symbol.clone());
+    }
+
+    visit_c_family_children(node, ctx, parent_symbol, owner_symbol);
+}
+
+fn visit_c_family_children(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<(SymbolId, SymbolKind)>,
+    owner_symbol: Option<SymbolId>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        visit_c_family_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
+    }
+}
+
+fn c_family_symbol_from_node(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    let mut kind = match node.kind() {
+        "namespace_definition" => SymbolKind::Module,
+        "class_specifier" => SymbolKind::Class,
+        "struct_specifier" => SymbolKind::Struct,
+        "union_specifier" => SymbolKind::Union,
+        "enum_specifier" => SymbolKind::Enum,
+        "enumerator" => SymbolKind::Variant,
+        "function_definition" => SymbolKind::Function,
+        "declaration" if c_declaration_is_function(node) => SymbolKind::Function,
+        "field_declaration" if c_declaration_is_function(node) => SymbolKind::Function,
+        "field_declaration" => SymbolKind::Field,
+        "type_definition" | "alias_declaration" => SymbolKind::TypeAlias,
+        "preproc_def" | "preproc_function_def" => SymbolKind::Macro,
+        _ => return None,
+    };
+    if kind == SymbolKind::Function
+        && parent_symbol
+            .map(|(_, parent_kind)| c_family_symbol_can_own_members(*parent_kind))
+            .unwrap_or(false)
+    {
+        kind = SymbolKind::Method;
+    }
+    if kind == SymbolKind::Function && c_family_function_is_qualified_method(node, ctx.source) {
+        kind = SymbolKind::Method;
+    }
+
+    let name = c_family_symbol_name(node, kind, ctx.source)?;
+    if name.is_empty() {
+        return None;
+    }
+    let body = c_family_body_node(node);
+    let span = span_from_node(node);
+    let body_span = body.map(span_from_node);
+    let signature = signature_text(node, body, ctx.source);
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let mut attributes = c_family_attributes_for_node(node, kind, ctx.source);
+    attributes.sort();
+    attributes.dedup();
+    let confidence = c_family_symbol_confidence(node, &attributes);
+    Some(ParsedSymbol {
+        id: symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span),
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name,
+        kind,
+        span,
+        body_span,
+        signature,
+        visibility: c_family_visibility_text(node, ctx.source),
+        docs: Vec::new(),
+        attributes,
+        provenance: Provenance::new(
+            c_family_parser_name(ctx.file.language),
+            format!("{} declaration", node.kind()),
+        ),
+        confidence,
+        freshness: Freshness::Fresh,
+    })
+}
+
+fn extract_c_family_symbol_facts(
+    node: Node<'_>,
+    symbol: &ParsedSymbol,
+    ctx: &mut ExtractContext<'_>,
+) {
+    if matches!(symbol.kind, SymbolKind::Class | SymbolKind::Struct)
+        && let Some(bases) = node.child_by_field_name("superclasses")
+    {
+        let mut cursor = bases.walk();
+        for base in bases.named_children(&mut cursor) {
+            if let Ok(text) = node_text(base, ctx.source) {
+                let name = c_family_last_name(text);
+                if !name.is_empty() {
+                    ctx.references.push(ParsedReference {
+                        file_id: ctx.file.id.clone(),
+                        owner_id: Some(symbol.id.clone()),
+                        text: name,
+                        kind: ReferenceKind::Type,
+                        span: span_from_node(base),
+                        provenance: Provenance::new(
+                            c_family_parser_name(ctx.file.language),
+                            "base class reference",
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    if matches!(
+        symbol.kind,
+        SymbolKind::Function | SymbolKind::Method | SymbolKind::Field | SymbolKind::TypeAlias
+    ) {
+        for type_name in c_family_type_names_from_signature(&symbol.signature) {
+            ctx.references.push(ParsedReference {
+                file_id: ctx.file.id.clone(),
+                owner_id: Some(symbol.id.clone()),
+                text: type_name.clone(),
+                kind: ReferenceKind::Type,
+                span: symbol.span,
+                provenance: Provenance::new(
+                    c_family_parser_name(ctx.file.language),
+                    "signature type reference",
+                ),
+            });
+            ctx.body_hits.push(BodyHit {
+                file_id: ctx.file.id.clone(),
+                owner_id: Some(symbol.id.clone()),
+                text: type_name,
+                kind: BodyHitKind::Type,
+                span: symbol.span,
+            });
+        }
+    }
+}
+
+fn extract_c_include(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+    let raw = node_text(node, ctx.source).unwrap_or_default();
+    let Some(path) = c_include_path(raw) else {
+        return;
+    };
+    ctx.imports.push(ParsedImport {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        path,
+        alias: None,
+        is_glob: false,
+        is_reexport: false,
+        span: span_from_node(node),
+        provenance: Provenance::new(c_family_parser_name(ctx.file.language), "include directive"),
+    });
+}
+
+fn c_include_path(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let start = raw.find(['"', '<'])?;
+    let opener = raw.as_bytes()[start] as char;
+    let closer = if opener == '"' { '"' } else { '>' };
+    let rest = &raw[start + opener.len_utf8()..];
+    let end = rest.find(closer)?;
+    let path = rest[..end].trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+fn extract_c_family_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+    let Some(function_node) = node.child_by_field_name("function").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).next()
+    }) else {
+        return;
+    };
+    let target_text = node_text(function_node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if target_text.is_empty() {
+        return;
+    }
+    let name = c_family_last_name(&target_text);
+    if name.is_empty() {
+        return;
+    }
+    let receiver = c_family_receiver_from_call_target(&target_text);
+    let arity = node
+        .child_by_field_name("arguments")
+        .or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == "argument_list")
+        })
+        .map(named_child_count)
+        .unwrap_or_default();
+    let kind = if receiver.is_some() {
+        ParsedCallKind::Method
+    } else {
+        ParsedCallKind::Direct
+    };
+    let confidence = if c_family_call_is_macro_like(&name) {
+        Confidence::MacroOpaque
+    } else if receiver.is_some() || target_text.contains('<') {
+        Confidence::CandidateSet
+    } else {
+        Confidence::Heuristic
+    };
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name,
+        target_text: target_text.clone(),
+        receiver,
+        arity,
+        kind,
+        span: span_from_node(node),
+        provenance: Provenance::new(c_family_parser_name(ctx.file.language), "call_expression"),
+        confidence,
+    });
+    extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+}
+
+fn extract_c_macro_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+    let raw = node_text(node, ctx.source).unwrap_or_default();
+    let name = raw
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .split('(')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return;
+    }
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name,
+        target_text: raw.trim().to_string(),
+        receiver: None,
+        arity: 0,
+        kind: ParsedCallKind::Macro,
+        span: span_from_node(node),
+        provenance: Provenance::new(
+            c_family_parser_name(ctx.file.language),
+            "preprocessor macro",
+        ),
+        confidence: Confidence::MacroOpaque,
+    });
+    extract_body_hit(node, BodyHitKind::Macro, ctx, owner_id);
+}
+
+fn extract_c_family_reference(
+    node: Node<'_>,
+    kind: ReferenceKind,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    if c_family_node_is_declaration_name(node) {
+        return;
+    }
+    let text = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if text.is_empty() || c_family_builtin_type(&text) {
+        return;
+    }
+    let text = match kind {
+        ReferenceKind::Path | ReferenceKind::Type | ReferenceKind::Field => {
+            c_family_last_name(&text)
+        }
+        _ => text,
+    };
+    if text.is_empty() {
+        return;
+    }
+    let body_kind = match kind {
+        ReferenceKind::Identifier => BodyHitKind::Identifier,
+        ReferenceKind::Type => BodyHitKind::Type,
+        ReferenceKind::Path => BodyHitKind::Path,
+        ReferenceKind::Field => BodyHitKind::Identifier,
+        ReferenceKind::Attribute => BodyHitKind::Attribute,
+    };
+    ctx.references.push(ParsedReference {
+        file_id: ctx.file.id.clone(),
+        owner_id: owner_id.clone(),
+        text: text.clone(),
+        kind,
+        span: span_from_node(node),
+        provenance: Provenance::new(
+            c_family_parser_name(ctx.file.language),
+            format!("{} reference", node.kind()),
+        ),
+    });
+    ctx.body_hits.push(BodyHit {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        text,
+        kind: body_kind,
+        span: span_from_node(node),
+    });
+}
+
+fn c_family_symbol_can_own_children(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Class
+            | SymbolKind::Struct
+            | SymbolKind::Union
+            | SymbolKind::Enum
+            | SymbolKind::Module
+    )
+}
+
+fn c_family_symbol_can_own_members(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Class | SymbolKind::Struct | SymbolKind::Union
+    )
+}
+
+fn c_family_parser_name(language: LanguageKind) -> &'static str {
+    match language {
+        LanguageKind::C => "tree-sitter-c",
+        LanguageKind::Cpp => "tree-sitter-cpp",
+        _ => "tree-sitter-c-family",
+    }
+}
+
+fn c_declaration_is_function(node: Node<'_>) -> bool {
+    node.child_by_field_name("declarator")
+        .map(c_declarator_contains_function)
+        .unwrap_or_else(|| node_has_descendant_kind(node, "function_declarator"))
+}
+
+fn c_declarator_contains_function(node: Node<'_>) -> bool {
+    if node.kind() == "function_declarator" {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(c_declarator_contains_function)
+}
+
+fn node_has_descendant_kind(node: Node<'_>, wanted: &str) -> bool {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == wanted || node_has_descendant_kind(child, wanted) {
+            return true;
+        }
+    }
+    false
+}
+
+fn c_family_symbol_name(node: Node<'_>, kind: SymbolKind, source: &str) -> Option<String> {
+    match kind {
+        SymbolKind::Macro => c_macro_definition_name(node, source),
+        SymbolKind::TypeAlias => c_type_alias_name(node, source),
+        SymbolKind::Field => c_declarator_name(node, source),
+        SymbolKind::Function | SymbolKind::Method => node
+            .child_by_field_name("declarator")
+            .and_then(|declarator| c_declarator_name(declarator, source))
+            .or_else(|| c_declarator_name(node, source)),
+        _ => node
+            .child_by_field_name("name")
+            .and_then(|child| node_text(child, source).ok())
+            .map(c_family_last_name)
+            .or_else(|| c_named_child_text(node, source)),
+    }
+}
+
+fn c_family_function_is_qualified_method(node: Node<'_>, source: &str) -> bool {
+    let Some(declarator) = node.child_by_field_name("declarator") else {
+        return false;
+    };
+    node_text(declarator, source)
+        .map(|text| text.contains("::"))
+        .unwrap_or(false)
+}
+
+fn c_named_child_text(node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| {
+            matches!(
+                child.kind(),
+                "identifier"
+                    | "type_identifier"
+                    | "field_identifier"
+                    | "qualified_identifier"
+                    | "namespace_identifier"
+                    | "destructor_name"
+                    | "operator_name"
+            )
+        })
+        .and_then(|child| node_text(child, source).ok())
+        .map(c_family_last_name)
+}
+
+fn c_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
+    if matches!(
+        node.kind(),
+        "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "qualified_identifier"
+            | "namespace_identifier"
+            | "destructor_name"
+            | "operator_name"
+    ) {
+        return node_text(node, source).ok().map(c_family_last_name);
+    }
+    if let Some(name) = node
+        .child_by_field_name("name")
+        .and_then(|child| node_text(child, source).ok())
+        .map(c_family_last_name)
+        .filter(|name| !name.is_empty())
+    {
+        return Some(name);
+    }
+    if let Some(name) = node
+        .child_by_field_name("declarator")
+        .and_then(|child| c_declarator_name(child, source))
+    {
+        return Some(name);
+    }
+    let mut cursor = node.walk();
+    let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+    for child in children.into_iter().rev() {
+        if matches!(
+            child.kind(),
+            "parameter_list"
+                | "field_declaration_list"
+                | "argument_list"
+                | "template_argument_list"
+                | "template_parameter_list"
+        ) {
+            continue;
+        }
+        if let Some(name) = c_declarator_name(child, source).filter(|name| !name.is_empty()) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn c_type_alias_name(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("declarator")
+        .and_then(|child| c_declarator_name(child, source))
+        .or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .filter(|child| matches!(child.kind(), "type_identifier" | "identifier"))
+                .filter_map(|child| node_text(child, source).ok())
+                .map(c_family_last_name)
+                .last()
+        })
+}
+
+fn c_macro_definition_name(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("name")
+        .and_then(|child| node_text(child, source).ok())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let raw = node_text(node, source).ok()?;
+            raw.split_whitespace()
+                .nth(1)
+                .and_then(|name| name.split('(').next())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn c_family_body_node(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("body").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).find(|child| {
+            matches!(
+                child.kind(),
+                "compound_statement"
+                    | "field_declaration_list"
+                    | "enumerator_list"
+                    | "declaration_list"
+            )
+        })
+    })
+}
+
+fn c_family_attributes_for_node(node: Node<'_>, kind: SymbolKind, source: &str) -> Vec<String> {
+    let mut attributes = Vec::new();
+    match node.kind() {
+        "function_definition" => attributes.push("c-family:definition".to_string()),
+        "declaration" if matches!(kind, SymbolKind::Function | SymbolKind::Method) => {
+            attributes.push("c-family:declaration".to_string())
+        }
+        "field_declaration" if matches!(kind, SymbolKind::Function | SymbolKind::Method) => {
+            attributes.push("c-family:declaration".to_string())
+        }
+        "field_declaration" => attributes.push("c-family:field".to_string()),
+        "enumerator" => attributes.push("c-family:enum-variant".to_string()),
+        "preproc_def" | "preproc_function_def" => {
+            attributes.push("c-family:macro".to_string());
+            attributes.push("preprocessor:opaque".to_string());
+        }
+        "template_declaration" => attributes.push("c++:template".to_string()),
+        _ => {}
+    }
+    if node_has_ancestor_kind(node, "template_declaration") {
+        attributes.push("c++:template".to_string());
+    }
+    if node_has_ancestor_kind(node, "preproc_if")
+        || node_has_ancestor_kind(node, "preproc_ifdef")
+        || node_has_ancestor_kind(node, "preproc_ifndef")
+    {
+        attributes.push("preprocessor:conditional".to_string());
+    }
+    if let Ok(signature) = node_text(node, source)
+        && signature.contains("virtual ")
+    {
+        attributes.push("c++:virtual".to_string());
+    }
+    attributes
+}
+
+fn c_family_symbol_confidence(node: Node<'_>, attributes: &[String]) -> Confidence {
+    if attributes
+        .iter()
+        .any(|attribute| attribute == "preprocessor:opaque")
+    {
+        return Confidence::MacroOpaque;
+    }
+    if attributes
+        .iter()
+        .any(|attribute| attribute == "preprocessor:conditional")
+    {
+        return Confidence::ConditionalUnknown;
+    }
+    if attributes
+        .iter()
+        .any(|attribute| attribute == "c++:template")
+    {
+        return Confidence::Partial;
+    }
+    if node.kind() == "declaration" {
+        return Confidence::Heuristic;
+    }
+    Confidence::ExactSyntax
+}
+
+fn c_family_visibility_text(node: Node<'_>, source: &str) -> Option<String> {
+    let mut current = Some(node);
+    while let Some(existing) = current {
+        if matches!(existing.kind(), "public" | "private" | "protected") {
+            return Some(existing.kind().to_string());
+        }
+        current = existing.prev_named_sibling();
+        if current
+            .map(|sibling| {
+                !matches!(
+                    sibling.kind(),
+                    "access_specifier" | "public" | "private" | "protected"
+                )
+            })
+            .unwrap_or(false)
+        {
+            break;
+        }
+    }
+    let raw = node_text(node, source).ok()?.trim_start();
+    [
+        "public",
+        "private",
+        "protected",
+        "static",
+        "extern",
+        "inline",
+    ]
+    .into_iter()
+    .find(|keyword| raw.starts_with(*keyword))
+    .map(str::to_string)
+}
+
+fn node_has_ancestor_kind(node: Node<'_>, wanted: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == wanted {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn c_family_reference_kind(node: Node<'_>) -> Option<ReferenceKind> {
+    match node.kind() {
+        "identifier" => Some(ReferenceKind::Identifier),
+        "type_identifier" | "primitive_type" | "sized_type_specifier" => Some(ReferenceKind::Type),
+        "qualified_identifier" | "scoped_identifier" | "namespace_identifier" => {
+            Some(ReferenceKind::Path)
+        }
+        "field_identifier" => Some(ReferenceKind::Field),
+        "attribute_specifier" | "attribute_declaration" => Some(ReferenceKind::Attribute),
+        _ => None,
+    }
+}
+
+fn c_family_node_is_declaration_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent
+        .child_by_field_name("name")
+        .map(|name| name.id() == node.id())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if matches!(
+        parent.kind(),
+        "function_declarator" | "pointer_declarator" | "reference_declarator" | "init_declarator"
+    ) && parent
+        .child_by_field_name("declarator")
+        .map(|declarator| declarator.id() == node.id())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    matches!(
+        parent.kind(),
+        "struct_specifier"
+            | "class_specifier"
+            | "union_specifier"
+            | "enum_specifier"
+            | "enumerator"
+            | "type_definition"
+            | "alias_declaration"
+            | "namespace_definition"
+            | "preproc_def"
+            | "preproc_function_def"
+    )
+}
+
+fn c_family_type_names_from_signature(signature: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for token in signature
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' || ch == '~'))
+    {
+        let name = c_family_last_name(token);
+        if name.is_empty() || c_family_builtin_type(&name) || !looks_like_type_name(&name) {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn c_family_last_name(path: &str) -> String {
+    path.trim()
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '&' | '*' | '(' | ')' | '[' | ']' | '{' | '}' | ';' | ',' | ':' | '<' | '>'
+            )
+        })
+        .rsplit("::")
+        .next()
+        .unwrap_or(path)
+        .rsplit("->")
+        .next()
+        .unwrap_or(path)
+        .rsplit('.')
+        .next()
+        .unwrap_or(path)
+        .trim()
+        .trim_start_matches('~')
+        .to_string()
+}
+
+fn c_family_receiver_from_call_target(target_text: &str) -> Option<String> {
+    target_text
+        .rsplit_once("::")
+        .or_else(|| target_text.rsplit_once("->"))
+        .or_else(|| target_text.rsplit_once('.'))
+        .map(|(receiver, _)| receiver.trim().to_string())
+        .filter(|receiver| !receiver.is_empty())
+}
+
+fn c_family_call_is_macro_like(name: &str) -> bool {
+    name.chars()
+        .any(|ch| ch.is_ascii_lowercase())
+        .then_some(false)
+        .unwrap_or_else(|| name.contains('_') && name.len() > 1)
+}
+
+fn c_family_builtin_type(text: &str) -> bool {
+    matches!(
+        text,
+        "auto"
+            | "bool"
+            | "char"
+            | "const"
+            | "double"
+            | "extern"
+            | "float"
+            | "inline"
+            | "int"
+            | "long"
+            | "mutable"
+            | "register"
+            | "restrict"
+            | "short"
+            | "signed"
+            | "size_t"
+            | "static"
+            | "struct"
+            | "template"
+            | "typename"
+            | "union"
+            | "unsigned"
+            | "void"
+            | "volatile"
+    )
+}
+
+fn looks_like_type_name(name: &str) -> bool {
+    name.chars()
+        .next()
+        .map(|ch| ch.is_ascii_uppercase())
+        .unwrap_or(false)
+        || name.ends_with("_t")
+}
+
+fn is_c_family_literal(kind: &str) -> bool {
+    matches!(
+        kind,
+        "string_literal"
+            | "raw_string_literal"
+            | "number_literal"
+            | "char_literal"
+            | "true"
+            | "false"
+            | "null"
+            | "nullptr"
+    )
 }
 
 fn visit_python_node(

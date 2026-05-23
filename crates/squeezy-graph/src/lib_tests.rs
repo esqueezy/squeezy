@@ -232,6 +232,45 @@ fn graph_manager_refresh_replaces_changed_file_only() {
 }
 
 #[test]
+fn graph_manager_refresh_indexes_c_family_and_reparses_changed_header() {
+    let root = temp_root("graph-manager-c-family-refresh");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src").join("runner.cpp"),
+        "#include \"runner.hpp\"\nint run() { return helper(); }\nint helper() { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("src").join("runner.hpp"), "int run();\n").unwrap();
+
+    let mut manager = GraphManager::open_with_config(
+        &root,
+        RefreshConfig {
+            debounce: Duration::from_millis(0),
+            idle_refresh_interval: Duration::from_millis(0),
+            per_tool_refresh_budget: Duration::from_secs(5),
+        },
+    )
+    .unwrap();
+    assert_eq!(manager.build_report().language.cpp_files, 2);
+    assert_eq!(manager.build_report().language.supported_files, 2);
+    assert!(!manager.graph().find_symbol_by_name("run").is_empty());
+
+    thread::sleep(Duration::from_millis(2));
+    fs::write(
+        root.join("src").join("runner.hpp"),
+        "int run();\nint added();\n",
+    )
+    .unwrap();
+    manager.record_changed_path(root.join("src").join("runner.hpp"));
+    let report = manager.refresh_before_query().unwrap();
+
+    assert!(report.refreshed);
+    assert_eq!(report.reparsed_files, 1);
+    assert_eq!(report.language.cpp_files, 2);
+    assert!(!manager.graph().find_symbol_by_name("added").is_empty());
+}
+
+#[test]
 fn graph_filters_unsupported_files_from_hierarchy() {
     let mut readme = record("README.md", "# docs\n");
     readme.language = LanguageKind::Unsupported;
