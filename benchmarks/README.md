@@ -151,4 +151,6 @@ are treated as a noisy oracle result.
 and pushes. `workflow_dispatch` with `tier=full` clones ripgrep, fd, bat, tokio,
 and serde, runs 5,000 deterministic mixed-workload scenarios per repo, and
 writes timing, symbol accuracy, and rust-analyzer LSP navigation accuracy
-summaries to the GitHub Actions step summary.
+summaries to the GitHub Actions step summary. The workflow also uploads the raw
+JSON reports and rendered summary as the `semantic-graph-benchmark-<tier>`
+artifact so benchmark runs can be audited after the job completes.
