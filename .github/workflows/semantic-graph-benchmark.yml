@@ -170,3 +170,12 @@ jobs:
                       )
           PY
           cat __summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark reports
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: semantic-graph-benchmark-${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
+          path: |
+            target/semantic-graph-benchmark/*.json
+            __summary.md
+          if-no-files-found: error
