@@ -18,6 +18,37 @@ use super::*;
 
 static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
+    let root = temp_workspace("permission_metadata");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let destructive = registry.permission_request(&ToolCall {
+        call_id: "rm".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "rm -rf target",
+            "description": "clean"
+        }),
+    });
+    assert_eq!(destructive.capability, PermissionCapability::Destructive);
+    assert_eq!(destructive.risk, PermissionRisk::Critical);
+    assert_eq!(destructive.target, "rm:*");
+
+    let compiler = registry.permission_request(&ToolCall {
+        call_id: "test".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "cargo test --workspace",
+            "description": "run tests"
+        }),
+    });
+    assert_eq!(compiler.capability, PermissionCapability::Compiler);
+    assert_eq!(compiler.target, "cargo test:*");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn grep_respects_gitignore_by_default_and_can_include_ignored() {
     let root = temp_workspace("grep_ignore");

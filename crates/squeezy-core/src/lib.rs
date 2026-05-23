@@ -480,6 +480,26 @@ impl AppConfig {
             "web = {}\n\n",
             toml_string(self.permissions.web.as_str())
         ));
+        output.push_str(&format!(
+            "shell_classifier = {}\n",
+            self.permissions.shell_classifier
+        ));
+        for rule in self
+            .permissions
+            .rules
+            .iter()
+            .filter(|rule| rule.source != PermissionRuleSource::Builtin)
+        {
+            output.push_str("\n[[permissions.rules]]\n");
+            output.push_str(&format!("capability = {}\n", toml_string(&rule.capability)));
+            output.push_str(&format!("target = {}\n", toml_string(&rule.target)));
+            output.push_str(&format!("action = {}\n", toml_string(rule.action.as_str())));
+            output.push_str(&format!("source = {}\n", toml_string(rule.source.as_str())));
+            if let Some(reason) = &rule.reason {
+                output.push_str(&format!("reason = {}\n", toml_string(reason)));
+            }
+        }
+        output.push('\n');
 
         output.push_str("[telemetry]\n");
         output.push_str(&format!("enabled = {}\n", self.telemetry.enabled));
@@ -733,7 +753,7 @@ impl SettingsFile {
             Err(error) => return Err(error.into()),
         };
         Ok((
-            Self::from_toml_str(&text, &path.display().to_string())?,
+            Self::from_toml_str(&text, &format!("{label}:{}", path.display()))?,
             vec![
                 "defaults".to_string(),
                 format!("{label}:{}", path.display()),
@@ -1095,6 +1115,146 @@ impl PermissionMode {
     }
 }
 
+pub type PermissionAction = PermissionMode;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PermissionCapability {
+    Read,
+    Search,
+    Edit,
+    Shell,
+    Network,
+    Mcp,
+    Git,
+    Compiler,
+    Destructive,
+}
+
+impl PermissionCapability {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "read" => Some(Self::Read),
+            "search" => Some(Self::Search),
+            "edit" | "write" => Some(Self::Edit),
+            "shell" | "bash" | "command" => Some(Self::Shell),
+            "network" | "web" => Some(Self::Network),
+            "mcp" => Some(Self::Mcp),
+            "git" => Some(Self::Git),
+            "compiler" | "verify" => Some(Self::Compiler),
+            "destructive" | "dangerous" => Some(Self::Destructive),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Search => "search",
+            Self::Edit => "edit",
+            Self::Shell => "shell",
+            Self::Network => "network",
+            Self::Mcp => "mcp",
+            Self::Git => "git",
+            Self::Compiler => "compiler",
+            Self::Destructive => "destructive",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermissionRisk {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl PermissionRisk {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermissionRuleSource {
+    Builtin,
+    User,
+    Project,
+    Session,
+}
+
+impl PermissionRuleSource {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "builtin" => Some(Self::Builtin),
+            "user" => Some(Self::User),
+            "project" => Some(Self::Project),
+            "session" => Some(Self::Session),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::User => "user",
+            Self::Project => "project",
+            Self::Session => "session",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRule {
+    pub capability: String,
+    pub target: String,
+    pub action: PermissionAction,
+    pub source: PermissionRuleSource,
+    pub reason: Option<String>,
+}
+
+impl PermissionRule {
+    pub fn new(
+        capability: impl Into<String>,
+        target: impl Into<String>,
+        action: PermissionAction,
+        source: PermissionRuleSource,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            capability: capability.into(),
+            target: target.into(),
+            action,
+            source,
+            reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRequest {
+    pub call_id: String,
+    pub tool_name: String,
+    pub capability: PermissionCapability,
+    pub target: String,
+    pub risk: PermissionRisk,
+    pub summary: String,
+    pub metadata: BTreeMap<String, String>,
+    pub suggested_rules: Vec<PermissionRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionVerdict {
+    pub action: PermissionAction,
+    pub matched_rule: Option<PermissionRule>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PermissionSettings {
     pub read: Option<PermissionMode>,
@@ -1102,13 +1262,23 @@ pub struct PermissionSettings {
     pub shell: Option<PermissionMode>,
     pub ignored_search: Option<PermissionMode>,
     pub web: Option<PermissionMode>,
+    pub shell_classifier: Option<bool>,
+    pub rules: Vec<PermissionRule>,
 }
 
 impl PermissionSettings {
     fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
         reject_unknown_keys(
             table,
-            &["read", "edit", "shell", "ignored_search", "web"],
+            &[
+                "read",
+                "edit",
+                "shell",
+                "ignored_search",
+                "web",
+                "shell_classifier",
+                "rules",
+            ],
             source,
             path,
         )?;
@@ -1123,6 +1293,13 @@ impl PermissionSettings {
                 &field(path, "ignored_search"),
             )?,
             web: permission_value(table, "web", source, &field(path, "web"))?,
+            shell_classifier: bool_value(
+                table,
+                "shell_classifier",
+                source,
+                &field(path, "shell_classifier"),
+            )?,
+            rules: permission_rules_value(table, source, &field(path, "rules"))?,
         })
     }
 
@@ -1132,6 +1309,8 @@ impl PermissionSettings {
         replace_if_some(&mut self.shell, next.shell);
         replace_if_some(&mut self.ignored_search, next.ignored_search);
         replace_if_some(&mut self.web, next.web);
+        replace_if_some(&mut self.shell_classifier, next.shell_classifier);
+        self.rules.extend(next.rules);
     }
 }
 
@@ -1151,6 +1330,8 @@ pub struct PermissionPolicy {
     pub shell: PermissionMode,
     pub ignored_search: PermissionMode,
     pub web: PermissionMode,
+    pub shell_classifier: bool,
+    pub rules: Vec<PermissionRule>,
 }
 
 impl PermissionPolicy {
@@ -1183,6 +1364,11 @@ impl PermissionPolicy {
                 var("SQUEEZY_WEB_PERMISSION"),
                 settings.web.unwrap_or(PermissionMode::Ask),
             ),
+            shell_classifier: parse_bool(
+                var("SQUEEZY_SHELL_PERMISSION_CLASSIFIER"),
+                settings.shell_classifier.unwrap_or(true),
+            ),
+            rules: settings.rules,
         }
     }
 
@@ -1195,6 +1381,38 @@ impl PermissionPolicy {
             PermissionScope::Web => self.web,
         }
     }
+
+    pub fn evaluate(&self, request: &PermissionRequest) -> PermissionVerdict {
+        let matched_rule = self
+            .rules
+            .iter()
+            .rev()
+            .find(|rule| {
+                wildcard_match(request.capability.as_str(), &rule.capability)
+                    && wildcard_match(&request.target, &rule.target)
+            })
+            .cloned();
+        if let Some(rule) = matched_rule {
+            return PermissionVerdict {
+                action: rule.action,
+                reason: rule
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| format!("matched {} permission rule", rule.source.as_str())),
+                matched_rule: Some(rule),
+            };
+        }
+        let action = self.mode_for(legacy_scope_for_capability(request.capability));
+        PermissionVerdict {
+            action,
+            matched_rule: None,
+            reason: format!(
+                "default {} permission is {}",
+                request.capability.as_str(),
+                action.as_str()
+            ),
+        }
+    }
 }
 
 impl Default for PermissionPolicy {
@@ -1205,6 +1423,8 @@ impl Default for PermissionPolicy {
             shell: PermissionMode::Ask,
             ignored_search: PermissionMode::Allow,
             web: PermissionMode::Ask,
+            shell_classifier: true,
+            rules: Vec::new(),
         }
     }
 }
@@ -1214,6 +1434,24 @@ fn parse_permission(value: Option<String>, default: PermissionMode) -> Permissio
         .as_deref()
         .and_then(PermissionMode::parse)
         .unwrap_or(default)
+}
+
+fn parse_bool(value: Option<String>, default: bool) -> bool {
+    value.as_deref().map_or(default, parse_enabled_bool)
+}
+
+fn legacy_scope_for_capability(capability: PermissionCapability) -> PermissionScope {
+    match capability {
+        PermissionCapability::Read => PermissionScope::Read,
+        PermissionCapability::Search => PermissionScope::Read,
+        PermissionCapability::Edit => PermissionScope::Edit,
+        PermissionCapability::Shell => PermissionScope::Shell,
+        PermissionCapability::Network => PermissionScope::Web,
+        PermissionCapability::Mcp => PermissionScope::Shell,
+        PermissionCapability::Git => PermissionScope::Shell,
+        PermissionCapability::Compiler => PermissionScope::Shell,
+        PermissionCapability::Destructive => PermissionScope::Shell,
+    }
 }
 
 fn parse_enabled_bool(value: &str) -> bool {
@@ -1678,6 +1916,19 @@ pub fn user_settings_template() -> &'static str {
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
+# shell_classifier = true
+#
+# [[permissions.rules]]
+# capability = "network"
+# target = "domain:docs.rs"
+# action = "allow"
+# source = "user"
+#
+# [[permissions.rules]]
+# capability = "shell"
+# target = "cargo test:*"
+# action = "allow"
+# source = "user"
 
 [telemetry]
 # enabled = true
@@ -1702,6 +1953,19 @@ pub fn project_settings_template() -> &'static str {
 # max_tool_bytes_read_per_turn = 20000000
 # max_search_files_per_turn = 50000
 # max_tool_result_bytes_per_round = 50000
+
+[permissions]
+# read = "allow"
+# edit = "ask"
+# shell = "ask"
+# ignored_search = "allow"
+# web = "ask"
+#
+# [[permissions.rules]]
+# capability = "compiler"
+# target = "cargo test:*"
+# action = "allow"
+# source = "project"
 
 # `[graph]`, `[tui].status_verbosity`, and `[mcp.servers.*]` are parsed and
 # round-trip through `squeezy config inspect` but no runtime consumer reads
@@ -1742,7 +2006,7 @@ fn load_settings_from_paths(
     {
         let user = SettingsFile::from_toml_str(
             &fs::read_to_string(user_path)?,
-            &user_path.display().to_string(),
+            &format!("user:{}", user_path.display()),
         )?;
         settings.merge(user);
         sources.push(format!("user:{}", user_path.display()));
@@ -1752,7 +2016,7 @@ fn load_settings_from_paths(
     {
         let project = SettingsFile::from_toml_str(
             &fs::read_to_string(project_path)?,
-            &project_path.display().to_string(),
+            &format!("project:{}", project_path.display()),
         )?;
         settings.merge(project);
         sources.push(format!("project:{}", project_path.display()));
@@ -2102,6 +2366,102 @@ fn permission_value(
             "{source}: {path}: invalid permission mode {value:?}; expected allow, ask, or deny"
         ))
     })
+}
+
+fn permission_rules_value(
+    table: &toml::value::Table,
+    source: &str,
+    path: &str,
+) -> Result<Vec<PermissionRule>> {
+    let Some(value) = table.get("rules") else {
+        return Ok(Vec::new());
+    };
+    let rules = value
+        .as_array()
+        .ok_or_else(|| type_error(source, path, "array of tables"))?;
+    rules
+        .iter()
+        .enumerate()
+        .map(|value| {
+            let rule_path = format!("{path}[{}]", value.0);
+            let table = value
+                .1
+                .as_table()
+                .ok_or_else(|| type_error(source, &rule_path, "table"))?;
+            reject_unknown_keys(
+                table,
+                &["capability", "target", "action", "source", "reason"],
+                source,
+                &rule_path,
+            )?;
+            let capability = required_string_value(
+                table,
+                "capability",
+                source,
+                &field(&rule_path, "capability"),
+            )?;
+            if PermissionCapability::parse(&capability).is_none() && !capability.contains('*') {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {} invalid permission capability {capability:?}",
+                    field(&rule_path, "capability")
+                )));
+            }
+            let target =
+                required_string_value(table, "target", source, &field(&rule_path, "target"))?;
+            let action = permission_value(table, "action", source, &field(&rule_path, "action"))?
+                .ok_or_else(|| {
+                SqueezyError::Config(format!(
+                    "{source}: {} missing required permission action",
+                    field(&rule_path, "action")
+                ))
+            })?;
+            let source_value = string_value(table, "source", source, &field(&rule_path, "source"))?
+                .as_deref()
+                .and_then(PermissionRuleSource::parse)
+                .unwrap_or_else(|| default_permission_rule_source(source));
+            let reason = string_value(table, "reason", source, &field(&rule_path, "reason"))?;
+            Ok(PermissionRule::new(
+                capability,
+                target,
+                action,
+                source_value,
+                reason,
+            ))
+        })
+        .collect()
+}
+
+fn required_string_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<String> {
+    string_value(table, key, source, path)?.ok_or_else(|| {
+        SqueezyError::Config(format!("{source}: {path}: missing required string value"))
+    })
+}
+
+fn default_permission_rule_source(source: &str) -> PermissionRuleSource {
+    if source.starts_with("user:") {
+        PermissionRuleSource::User
+    } else {
+        PermissionRuleSource::Project
+    }
+}
+
+fn wildcard_match(value: &str, pattern: &str) -> bool {
+    let value = value.trim();
+    let pattern = pattern.trim();
+    if pattern == "*" || pattern == value {
+        return true;
+    }
+    let Some(star) = pattern.find('*') else {
+        return false;
+    };
+    let (prefix, suffix) = pattern.split_at(star);
+    let suffix = &suffix[1..];
+    value.starts_with(prefix) && value.ends_with(suffix)
 }
 
 fn status_verbosity_value(

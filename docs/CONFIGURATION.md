@@ -61,6 +61,13 @@ commented examples so that built-in defaults can evolve over time:
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
+# shell_classifier = true
+#
+# [[permissions.rules]]
+# capability = "shell"
+# target = "cargo test:*"
+# action = "allow"
+# source = "user"
 
 [telemetry]
 # enabled = true
@@ -93,8 +100,14 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 - `[providers.<id>]`: provider defaults such as `api_key_env`, `base_url`,
   `default_model`, `api_version`, and `region`.
 - `[budgets]`: per-turn and per-tool output limits.
-- `[permissions]`: `read`, `edit`, `shell`, `ignored_search`, and `web`, each
-  set to `allow`, `ask`, or `deny`.
+- `[permissions]`: compatibility defaults `read`, `edit`, `shell`,
+  `ignored_search`, and `web`, each set to `allow`, `ask`, or `deny`.
+  `shell_classifier` enables the narrow LLM fallback for ambiguous shell
+  commands.
+- `[[permissions.rules]]`: ordered allow/ask/deny rules with `capability`,
+  `target`, `action`, optional `source`, and optional `reason`. Later matching
+  rules win. Current capabilities are `read`, `search`, `edit`, `shell`,
+  `network`, `mcp`, `git`, `compiler`, and `destructive`.
 - `[telemetry]`: `enabled` and `endpoint`.
 - `[web]`: `exa_mcp_url` and `exa_api_key_env`.
 - `[cache]`: `root` and `tool_outputs`. Relative paths resolve against the

@@ -348,6 +348,49 @@ fn permission_mode_parses_expected_values() {
 }
 
 #[test]
+fn permission_policy_matches_last_rule_and_reports_source() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[permissions]
+shell = "ask"
+
+[[permissions.rules]]
+capability = "shell"
+target = "cargo test:*"
+action = "deny"
+source = "user"
+
+[[permissions.rules]]
+capability = "shell"
+target = "cargo test:*"
+action = "allow"
+source = "project"
+reason = "project allows tests"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    let verdict = config.permissions.evaluate(&PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: "cargo test:*".to_string(),
+        risk: PermissionRisk::Medium,
+        summary: "cargo test".to_string(),
+        metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    });
+
+    assert_eq!(verdict.action, PermissionAction::Allow);
+    assert_eq!(verdict.reason, "project allows tests");
+    assert_eq!(
+        verdict.matched_rule.as_ref().map(|rule| rule.source),
+        Some(PermissionRuleSource::Project)
+    );
+}
+
+#[test]
 fn section_settings_cover_budgets_permissions_graph_cache_tui_and_mcp() {
     let settings = SettingsFile::from_toml_str(
         r#"

@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
+    env, fs,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -11,8 +11,9 @@ use std::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{
-    AppConfig, CostSnapshot, PermissionMode, PermissionScope, SessionMetrics, SqueezyError,
-    TranscriptItem, TurnId, TurnMetrics,
+    AppConfig, CostSnapshot, PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability,
+    PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope, SessionMetrics,
+    SqueezyError, TranscriptItem, TurnId, TurnMetrics, default_settings_path,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, estimate_cost};
 use squeezy_telemetry::{
@@ -288,6 +289,7 @@ impl TurnRuntime {
                 tool_calls.clone(),
                 ToolExecutionContext {
                     turn_id: self.turn_id,
+                    provider: self.provider.clone(),
                     tools: &self.tools,
                     config: &self.config,
                     telemetry: self.telemetry.clone(),
@@ -345,6 +347,7 @@ impl TurnRuntime {
 #[derive(Clone)]
 struct ToolExecutionContext<'a> {
     turn_id: TurnId,
+    provider: Arc<dyn LlmProvider>,
     tools: &'a ToolRegistry,
     config: &'a AppConfig,
     telemetry: TelemetryClient,
@@ -389,17 +392,7 @@ async fn execute_tool_calls(
             }
         };
 
-        match permission_decision(
-            context.turn_id,
-            call,
-            context.tools,
-            context.config,
-            &context.tx,
-            &context.cancel,
-            context.approval_ids.clone(),
-        )
-        .await
-        {
+        match permission_decision(call, &context).await {
             ApprovalDecision::Approved => approved.push((index, call.clone(), tool_sequence)),
             ApprovalDecision::Denied(reason) => {
                 let result = ToolResult::denied(call, reason);
@@ -781,51 +774,290 @@ fn error_kind(error: &SqueezyError) -> ErrorKind {
 }
 
 async fn permission_decision(
-    turn_id: TurnId,
     call: &ToolCall,
-    tools: &ToolRegistry,
-    config: &AppConfig,
-    tx: &mpsc::Sender<AgentEvent>,
-    cancel: &CancellationToken,
-    approval_ids: Arc<AtomicU64>,
+    context: &ToolExecutionContext<'_>,
 ) -> ApprovalDecision {
-    let scope = tools.permission_scope(call);
-    match config.permissions.mode_for(scope) {
-        PermissionMode::Allow => ApprovalDecision::Approved,
-        PermissionMode::Deny => ApprovalDecision::Denied(format!("{scope:?} permission is denied")),
-        PermissionMode::Ask => {
+    let request = context.tools.permission_request(call);
+    let mut verdict = context.config.permissions.evaluate(&request);
+    if should_classify_shell(context.config, context.provider.name(), &request, &verdict)
+        && let Some(classifier) = classify_ambiguous_shell(
+            context.provider.clone(),
+            context.config,
+            &request,
+            context.cancel.clone(),
+        )
+        .await
+    {
+        verdict = classifier;
+    }
+    match verdict.action {
+        PermissionAction::Allow => ApprovalDecision::Approved,
+        PermissionAction::Deny => ApprovalDecision::Denied(verdict.reason),
+        PermissionAction::Ask => {
             let (decision_tx, decision_rx) = oneshot::channel();
-            let request = ToolApprovalRequest {
-                id: approval_ids.fetch_add(1, Ordering::Relaxed),
+            let approval_request = ToolApprovalRequest {
+                id: context.approval_ids.fetch_add(1, Ordering::Relaxed),
                 call_id: call.call_id.clone(),
                 tool_name: call.name.clone(),
-                scope,
-                summary: tools.describe_call(call),
+                scope: legacy_scope_for_capability(request.capability),
+                permission: request.clone(),
+                matched_rule: verdict.matched_rule,
+                reason: verdict.reason,
             };
-            let send_approval = tx.send(AgentEvent::ApprovalRequested {
-                turn_id,
-                request,
+            let send_approval = context.tx.send(AgentEvent::ApprovalRequested {
+                turn_id: context.turn_id,
+                request: approval_request,
                 decision_tx,
             });
             let send_result = tokio::select! {
-                _ = cancel.cancelled() => return ApprovalDecision::Cancelled,
+                _ = context.cancel.cancelled() => return ApprovalDecision::Cancelled,
                 result = send_approval => result,
             };
             if send_result.is_err() {
                 return ApprovalDecision::Denied("approval channel closed".to_string());
             }
             match tokio::select! {
-                _ = cancel.cancelled() => return ApprovalDecision::Cancelled,
+                _ = context.cancel.cancelled() => return ApprovalDecision::Cancelled,
                 decision = decision_rx => decision,
             } {
-                Ok(ToolApprovalDecision::Approved) => ApprovalDecision::Approved,
-                Ok(ToolApprovalDecision::Denied) => {
-                    ApprovalDecision::Denied("user denied tool call".to_string())
+                Ok(ToolApprovalDecision::Approved | ToolApprovalDecision::AllowOnce) => {
+                    ApprovalDecision::Approved
+                }
+                Ok(ToolApprovalDecision::AllowRuleUser) => {
+                    persist_permission_rule(
+                        context.config,
+                        &request,
+                        PermissionRuleSource::User,
+                        PermissionAction::Allow,
+                    );
+                    ApprovalDecision::Approved
+                }
+                Ok(ToolApprovalDecision::AllowRuleProject) => {
+                    persist_permission_rule(
+                        context.config,
+                        &request,
+                        PermissionRuleSource::Project,
+                        PermissionAction::Allow,
+                    );
+                    ApprovalDecision::Approved
+                }
+                Ok(ToolApprovalDecision::AskRuleUser) => {
+                    persist_permission_rule(
+                        context.config,
+                        &request,
+                        PermissionRuleSource::User,
+                        PermissionAction::Ask,
+                    );
+                    ApprovalDecision::Denied(
+                        "user asked to require approval for future matching calls".to_string(),
+                    )
+                }
+                Ok(ToolApprovalDecision::AskRuleProject) => {
+                    persist_permission_rule(
+                        context.config,
+                        &request,
+                        PermissionRuleSource::Project,
+                        PermissionAction::Ask,
+                    );
+                    ApprovalDecision::Denied(
+                        "user asked to require approval for future matching calls".to_string(),
+                    )
+                }
+                Ok(ToolApprovalDecision::Denied | ToolApprovalDecision::DenyOnce) => {
+                    ApprovalDecision::Denied(permission_denied_reason(
+                        &request,
+                        "user denied tool call",
+                    ))
+                }
+                Ok(ToolApprovalDecision::DenyRuleUser) => {
+                    persist_permission_rule(
+                        context.config,
+                        &request,
+                        PermissionRuleSource::User,
+                        PermissionAction::Deny,
+                    );
+                    ApprovalDecision::Denied(permission_denied_reason(
+                        &request,
+                        "user denied and persisted a user rule",
+                    ))
+                }
+                Ok(ToolApprovalDecision::DenyRuleProject) => {
+                    persist_permission_rule(
+                        context.config,
+                        &request,
+                        PermissionRuleSource::Project,
+                        PermissionAction::Deny,
+                    );
+                    ApprovalDecision::Denied(permission_denied_reason(
+                        &request,
+                        "user denied and persisted a project rule",
+                    ))
                 }
                 Err(_) => ApprovalDecision::Denied("approval was not answered".to_string()),
             }
         }
     }
+}
+
+fn should_classify_shell(
+    config: &AppConfig,
+    provider_name: &str,
+    request: &PermissionRequest,
+    verdict: &squeezy_core::PermissionVerdict,
+) -> bool {
+    config.permissions.shell_classifier
+        && provider_name != "scripted"
+        && request.tool_name == "shell"
+        && request.capability == PermissionCapability::Shell
+        && verdict.action == PermissionAction::Ask
+}
+
+async fn classify_ambiguous_shell(
+    provider: Arc<dyn LlmProvider>,
+    config: &AppConfig,
+    request: &PermissionRequest,
+    cancel: CancellationToken,
+) -> Option<squeezy_core::PermissionVerdict> {
+    let command = request.metadata.get("command")?;
+    let prompt = format!(
+        "Classify this shell command for a coding agent permission gate.\n\
+Return compact JSON with action \"ask\" or \"deny\" and a short reason.\n\
+Never return allow.\n\
+Command: {command:?}\n\
+Working target: {:?}",
+        request.target
+    );
+    let llm_request = LlmRequest {
+        model: config.model.clone(),
+        instructions: "You classify shell-command risk for a local coding agent. Return JSON only."
+            .to_string(),
+        input: vec![LlmInputItem::UserText(prompt)],
+        max_output_tokens: Some(80),
+        previous_response_id: None,
+        tools: Vec::new(),
+        store: false,
+    };
+    let mut stream = provider.stream_response(llm_request, cancel);
+    let mut text = String::new();
+    while let Some(event) = stream.next().await {
+        match event.ok()? {
+            LlmEvent::TextDelta(delta) => text.push_str(&delta),
+            LlmEvent::Completed { .. } => break,
+            LlmEvent::Cancelled => return None,
+            LlmEvent::Started | LlmEvent::ToolCall(_) => {}
+        }
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("\"action\"") && lower.contains("deny") {
+        return Some(squeezy_core::PermissionVerdict {
+            action: PermissionAction::Deny,
+            matched_rule: None,
+            reason: format!("shell classifier denied command: {}", compact_reason(&text)),
+        });
+    }
+    Some(squeezy_core::PermissionVerdict {
+        action: PermissionAction::Ask,
+        matched_rule: None,
+        reason: format!(
+            "shell classifier requires approval: {}",
+            compact_reason(&text)
+        ),
+    })
+}
+
+fn compact_reason(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn legacy_scope_for_capability(capability: PermissionCapability) -> PermissionScope {
+    match capability {
+        PermissionCapability::Read | PermissionCapability::Search => PermissionScope::Read,
+        PermissionCapability::Edit => PermissionScope::Edit,
+        PermissionCapability::Network => PermissionScope::Web,
+        PermissionCapability::Shell
+        | PermissionCapability::Mcp
+        | PermissionCapability::Git
+        | PermissionCapability::Compiler
+        | PermissionCapability::Destructive => PermissionScope::Shell,
+    }
+}
+
+fn permission_denied_reason(request: &PermissionRequest, reason: &str) -> String {
+    format!(
+        "{reason}; capability={} target={} risk={}",
+        request.capability.as_str(),
+        request.target,
+        request.risk.as_str()
+    )
+}
+
+fn persist_permission_rule(
+    config: &AppConfig,
+    request: &PermissionRequest,
+    source: PermissionRuleSource,
+    action: PermissionAction,
+) {
+    let Some(rule) = permission_rule_for_persistence(request, source, action) else {
+        return;
+    };
+    if rule.action == PermissionAction::Allow
+        && request.capability == PermissionCapability::Destructive
+        && rule.target == "*"
+    {
+        return;
+    }
+    let path = match source {
+        PermissionRuleSource::User => default_settings_path(),
+        PermissionRuleSource::Project => config.workspace_root.join(PROJECT_SETTINGS_FILE),
+        PermissionRuleSource::Builtin | PermissionRuleSource::Session => return,
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let text = format!(
+        "\n[[permissions.rules]]\ncapability = {:?}\ntarget = {:?}\naction = {:?}\nsource = {:?}\nreason = {:?}\n",
+        rule.capability,
+        rule.target,
+        rule.action.as_str(),
+        rule.source.as_str(),
+        rule.reason
+            .unwrap_or_else(|| "added from approval prompt".to_string())
+    );
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(text.as_bytes())
+        });
+}
+
+fn permission_rule_for_persistence(
+    request: &PermissionRequest,
+    source: PermissionRuleSource,
+    action: PermissionAction,
+) -> Option<PermissionRule> {
+    let mut rule = request.suggested_rules.first().cloned().unwrap_or_else(|| {
+        PermissionRule::new(
+            request.capability.as_str(),
+            request.target.clone(),
+            action,
+            source,
+            Some("added from approval prompt".to_string()),
+        )
+    });
+    rule.action = action;
+    rule.source = source;
+    if rule.capability == "destructive" && rule.target == "*" && action == PermissionAction::Allow {
+        return None;
+    }
+    Some(rule)
 }
 
 fn llm_tool_spec(spec: ToolSpec) -> LlmToolSpec {
@@ -1120,13 +1352,29 @@ pub struct ToolApprovalRequest {
     pub call_id: String,
     pub tool_name: String,
     pub scope: PermissionScope,
-    pub summary: String,
+    pub permission: PermissionRequest,
+    pub matched_rule: Option<PermissionRule>,
+    pub reason: String,
+}
+
+impl ToolApprovalRequest {
+    pub fn summary(&self) -> &str {
+        &self.permission.summary
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolApprovalDecision {
     Approved,
     Denied,
+    AllowOnce,
+    AllowRuleUser,
+    AllowRuleProject,
+    AskRuleUser,
+    AskRuleProject,
+    DenyOnce,
+    DenyRuleUser,
+    DenyRuleProject,
 }
 
 enum ApprovalDecision {
