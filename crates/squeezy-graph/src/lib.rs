@@ -4,9 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod backend;
+
 use squeezy_core::{
-    Confidence, ContentHash, EdgeKind, FileId, Freshness, LanguageKind, Provenance, Result,
-    SourceSpan, SymbolId, SymbolKind,
+    Confidence, ContentHash, EdgeKind, FileId, Freshness, LanguageFamily, LanguageKind, Provenance,
+    Result, SourceSpan, SymbolId, SymbolKind,
 };
 use squeezy_parse::{
     BodyHit, BodyHitKind, LanguageParser, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport,
@@ -141,6 +143,11 @@ pub struct JavaProjectFact {
     pub provenance: Provenance,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanguageFact {
+    Java(JavaProjectFact),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GraphStats {
     pub files: usize,
@@ -196,6 +203,20 @@ struct CachedJavaProjectFacts {
 }
 
 impl SemanticGraph {
+    #[allow(dead_code)]
+    fn lang_ext(&self, family: LanguageFamily) -> &'static dyn backend::LanguageGraphExt {
+        backend::extension_for_family(family)
+            .unwrap_or_else(|| panic!("missing graph extension for {family:?}"))
+    }
+
+    #[allow(dead_code)]
+    fn lang_ext_for_kind(
+        &self,
+        kind: LanguageKind,
+    ) -> Option<&'static dyn backend::LanguageGraphExt> {
+        LanguageFamily::of(kind).map(|family| self.lang_ext(family))
+    }
+
     pub fn empty() -> Self {
         Self {
             files: HashMap::new(),
@@ -298,6 +319,14 @@ impl SemanticGraph {
 
     pub fn java_project_facts(&self) -> &[JavaProjectFact] {
         &self.java_project_facts
+    }
+
+    pub fn language_facts(&self) -> Vec<LanguageFact> {
+        self.java_project_facts
+            .iter()
+            .cloned()
+            .map(LanguageFact::Java)
+            .collect()
     }
 
     pub fn hierarchy(&self, root: Option<&SymbolId>, max_depth: usize) -> Vec<HierarchyNode> {
@@ -3602,50 +3631,42 @@ impl GraphManager {
 fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> LanguageReport {
     let mut report = LanguageReport::default();
     for record in records {
+        if LanguageFamily::of(record.language).is_some() {
+            report.supported_files += 1;
+        }
         match record.language {
             LanguageKind::C => {
                 report.c_files += 1;
-                report.supported_files += 1;
             }
             LanguageKind::CSharp => {
                 report.csharp_files += 1;
-                report.supported_files += 1;
             }
             LanguageKind::Cpp => {
                 report.cpp_files += 1;
-                report.supported_files += 1;
             }
             LanguageKind::Java => {
                 report.java_files += 1;
-                report.supported_files += 1;
             }
             LanguageKind::JavaScript => {
                 report.javascript_files += 1;
-                report.supported_files += 1;
             }
             LanguageKind::Jsx => {
                 report.jsx_files += 1;
-                report.supported_files += 1;
             }
             LanguageKind::Python => {
                 report.python_files += 1;
-                report.supported_files += 1;
             }
             LanguageKind::Go => {
                 report.go_files += 1;
-                report.supported_files += 1;
             }
             LanguageKind::Rust => {
                 report.rust_files += 1;
-                report.supported_files += 1;
             }
             LanguageKind::TypeScript => {
                 report.typescript_files += 1;
-                report.supported_files += 1;
             }
             LanguageKind::Tsx => {
                 report.tsx_files += 1;
-                report.supported_files += 1;
             }
             LanguageKind::Unsupported => report.unsupported_files += 1,
             LanguageKind::Unknown => report.unknown_files += 1,

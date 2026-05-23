@@ -3,6 +3,8 @@ use std::{
     fs,
 };
 
+pub mod backend;
+
 use squeezy_core::{
     Confidence, ContentHash, EdgeKind, FileId, Freshness, LanguageKind, Provenance, Result,
     SourcePoint, SourceSpan, SqueezyError, SymbolId, SymbolKind,
@@ -422,6 +424,25 @@ impl LanguageParser {
     }
 }
 
+fn parser_for_language_kind(language: LanguageKind) -> Result<Parser> {
+    match language {
+        LanguageKind::C => parser_with_c_language(),
+        LanguageKind::CSharp => parser_with_csharp_language(),
+        LanguageKind::Cpp => parser_with_cpp_language(),
+        LanguageKind::Go => parser_with_go_language(),
+        LanguageKind::Java => parser_with_java_language(),
+        LanguageKind::JavaScript => parser_with_javascript_language(),
+        LanguageKind::Jsx => parser_with_jsx_language(),
+        LanguageKind::Python => parser_with_python_language(),
+        LanguageKind::Rust => parser_with_rust_language(),
+        LanguageKind::TypeScript => parser_with_typescript_language(),
+        LanguageKind::Tsx => parser_with_tsx_language(),
+        _ => Err(SqueezyError::Parse(format!(
+            "unsupported parser language {language:?}"
+        ))),
+    }
+}
+
 fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
     let mut parsers = WorkerParsers {
         csharp: parser_with_csharp_language()?,
@@ -722,40 +743,35 @@ fn cpp_language() -> tree_sitter::Language {
     tree_sitter_cpp::LANGUAGE.into()
 }
 
+fn language_for_kind(language: LanguageKind) -> Option<tree_sitter::Language> {
+    match language {
+        LanguageKind::C => Some(c_language()),
+        LanguageKind::CSharp => Some(csharp_language()),
+        LanguageKind::Cpp => Some(cpp_language()),
+        LanguageKind::Go => Some(go_language()),
+        LanguageKind::Java => Some(java_language()),
+        LanguageKind::JavaScript => Some(javascript_language()),
+        LanguageKind::Jsx => Some(jsx_language()),
+        LanguageKind::Python => Some(python_language()),
+        LanguageKind::Rust => Some(rust_language()),
+        LanguageKind::TypeScript => Some(typescript_language()),
+        LanguageKind::Tsx => Some(tsx_language()),
+        LanguageKind::Unsupported | LanguageKind::Unknown => None,
+    }
+}
+
 fn is_supported_language(language: LanguageKind) -> bool {
-    matches!(
-        language,
-        LanguageKind::C
-            | LanguageKind::CSharp
-            | LanguageKind::Cpp
-            | LanguageKind::Go
-            | LanguageKind::Java
-            | LanguageKind::JavaScript
-            | LanguageKind::Jsx
-            | LanguageKind::Rust
-            | LanguageKind::Python
-            | LanguageKind::TypeScript
-            | LanguageKind::Tsx
-    )
+    backend::is_supported_language(language)
 }
 
 fn extract_language(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
-    match file.language {
-        LanguageKind::C | LanguageKind::Cpp => extract_c_family(file, source, tree),
-        LanguageKind::CSharp => extract_csharp(file, source, tree),
-        LanguageKind::Go => extract_go(file, source, tree),
-        LanguageKind::Java => extract_java(file, source, tree),
-        LanguageKind::JavaScript
-        | LanguageKind::Jsx
-        | LanguageKind::TypeScript
-        | LanguageKind::Tsx => extract_js_ts(file, source, tree),
-        LanguageKind::Rust => extract_rust(file, source, tree),
-        LanguageKind::Python => extract_python(file, source, tree),
-        _ => ParsedFile::unsupported(
-            file.clone(),
-            format!("unsupported language for {}", file.relative_path),
-        ),
+    if let Some(backend) = backend::backend_for_kind(file.language) {
+        return backend.extract(file, source, tree);
     }
+    ParsedFile::unsupported(
+        file.clone(),
+        format!("unsupported language for {}", file.relative_path),
+    )
 }
 
 fn extract_csharp(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
