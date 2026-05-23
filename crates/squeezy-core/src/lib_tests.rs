@@ -1,4 +1,8 @@
+use std::sync::atomic::AtomicU64;
+
 use super::*;
+
+static CONFIG_TEST_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn turn_id_displays_stably() {
@@ -550,11 +554,13 @@ fn inspect_omits_optional_cache_keys_when_unset() {
 #[test]
 fn load_settings_from_paths_merges_user_then_project() {
     let dir = std::env::temp_dir().join(format!(
-        "squeezy_config_paths_{}",
+        "squeezy_config_paths_{}_{}_{}",
+        std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
-            .as_nanos()
+            .as_nanos(),
+        CONFIG_TEST_NONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
     ));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let user_path = dir.join("user.toml");
@@ -610,11 +616,13 @@ default_model = "project-default"
 #[test]
 fn load_settings_from_paths_skips_missing_files() {
     let dir = std::env::temp_dir().join(format!(
-        "squeezy_config_missing_{}",
+        "squeezy_config_missing_{}_{}_{}",
+        std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
-            .as_nanos()
+            .as_nanos(),
+        CONFIG_TEST_NONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
     ));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let user_path = dir.join("does_not_exist.toml");

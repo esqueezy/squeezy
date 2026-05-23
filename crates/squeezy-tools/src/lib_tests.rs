@@ -533,11 +533,13 @@ async fn relative_output_dir_resolves_against_workspace_root() {
 async fn absolute_output_dir_overrides_workspace_root() {
     let root = temp_workspace("output_dir_abs");
     let absolute_dir = std::env::temp_dir().join(format!(
-        "squeezy_output_abs_{}",
+        "squeezy_output_abs_{}_{}_{}",
+        std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
-            .as_nanos()
+            .as_nanos(),
+        WORKSPACE_NONCE.fetch_add(1, Ordering::SeqCst),
     ));
     fs::write(root.join("sample.txt"), "x".repeat(200)).expect("write sample");
     let registry = ToolRegistry::new_with_output_config(
