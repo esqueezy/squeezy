@@ -609,6 +609,83 @@ async fn trigger_skill_activation_injects_body() {
 }
 
 #[tokio::test]
+async fn shell_approval_event_surfaces_new_sandbox_metadata() {
+    // End-to-end: drive a shell call through the agent's approval path,
+    // capture the AgentEvent::ApprovalRequested payload, and confirm the
+    // new metadata keys (timeout_ms, output_byte_cap, sandbox,
+    // sandbox_network, parser_backed) are present and that the env value
+    // is a policy label, not a raw env-var dump.
+    let root = temp_workspace("agent_approval_metadata");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::ToolCall(LlmToolCall {
+            call_id: "call_meta".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({
+                "command": "cargo test --workspace",
+                "description": "run tests",
+                "timeout_ms": 45_000,
+                "output_byte_cap": 16_000,
+            }),
+        })),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_meta".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            shell: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut captured = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ApprovalRequested {
+            request,
+            decision_tx,
+            ..
+        } = event
+        {
+            captured = Some(request.permission.metadata.clone());
+            let _ = decision_tx.send(ToolApprovalDecision::Denied);
+        }
+    }
+    let metadata = captured.expect("approval metadata");
+    for key in [
+        "command",
+        "cwd",
+        "env",
+        "network",
+        "destructive",
+        "timeout_ms",
+        "output_byte_cap",
+        "sandbox",
+        "sandbox_network",
+        "parser_backed",
+    ] {
+        assert!(metadata.contains_key(key), "missing approval key {key}");
+    }
+    assert_eq!(metadata["timeout_ms"], "45000");
+    assert_eq!(metadata["output_byte_cap"], "16000");
+    // The env label may never carry raw env values.
+    let env_label = &metadata["env"];
+    assert!(
+        env_label.contains("allowlist"),
+        "env label should reference allowlist policy",
+    );
+    assert!(
+        !env_label.contains("PATH="),
+        "env label must not include raw env values",
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn network_shell_command_is_denied_by_network_permission_policy() {
     let root = temp_workspace("agent_shell_network_policy");
     let provider = Arc::new(MockProvider::new(vec![

@@ -89,7 +89,7 @@ fn shell_permission_metadata_detects_network_commands() {
     assert_eq!(request.capability, PermissionCapability::Network);
     assert_eq!(request.risk, PermissionRisk::High);
     assert_eq!(request.target, "shell:curl:*");
-    assert_eq!(request.metadata["network"], "detected");
+    assert_eq!(request.metadata["network"], "classified");
     assert_eq!(request.metadata["cwd"], "src");
     assert_eq!(request.metadata["timeout_ms"], "1000");
     assert_eq!(request.metadata["output_byte_cap"], "2048");
@@ -1224,7 +1224,12 @@ async fn shell_output_cap_is_enforced_while_command_runs() {
 }
 
 #[test]
-fn shell_call_description_includes_actual_command() {
+fn shell_call_description_summary_carries_only_description() {
+    // The shell `describe_call` summary intentionally surfaces ONLY the
+    // model-facing description; the command, cwd, env policy, and other
+    // structured fields are emitted via `permission_request().metadata`
+    // and rendered by the TUI in the dedicated approval panel. This
+    // prevents the same value from appearing twice in the approval UI.
     let root = temp_workspace("shell_description");
     let registry = ToolRegistry::new(&root).expect("registry");
     let call = ToolCall {
@@ -1237,9 +1242,15 @@ fn shell_call_description_includes_actual_command() {
     };
 
     let description = registry.describe_call(&call);
-
     assert!(description.contains("list files"));
-    assert!(description.contains("rm -rf target"));
+    assert!(
+        !description.contains("rm -rf target"),
+        "summary must not duplicate the command",
+    );
+    assert!(
+        !description.contains("env="),
+        "summary must not duplicate env policy",
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2241,4 +2252,256 @@ fn web_response(status: u16, headers: Vec<(&str, &str)>, body: &[u8]) -> WebHttp
             .collect(),
         body: body.to_vec(),
     }
+}
+
+// =====================================================================
+// Hardening tests: wrapper bypasses, redirect detection, sensitive
+// paths, audit concurrency, and approval metadata. These pin the
+// review-driven behavior so regressions break CI rather than silently
+// loosening the security floor.
+// =====================================================================
+
+#[test]
+fn wrapper_unwrap_propagates_destructive_through_sh_c() {
+    let analysis = analyze_shell_command("sh -c \"rm -rf /tmp/work\"");
+    assert_eq!(analysis.capability, PermissionCapability::Destructive);
+    assert!(analysis.destructive, "destructive flag must propagate");
+    assert_eq!(analysis.risk, PermissionRisk::Critical);
+}
+
+#[test]
+fn wrapper_unwrap_propagates_destructive_through_bash_lc() {
+    let analysis = analyze_shell_command("bash -lc 'rm -rf target'");
+    assert_eq!(analysis.capability, PermissionCapability::Destructive);
+    assert!(analysis.destructive);
+}
+
+#[test]
+fn wrapper_unwrap_propagates_destructive_through_nohup_and_env() {
+    let nohup = analyze_shell_command("nohup rm -rf target");
+    assert_eq!(nohup.capability, PermissionCapability::Destructive);
+    assert!(nohup.destructive);
+
+    let env_wrap = analyze_shell_command("env CARGO_TERM_COLOR=never rm -rf target");
+    assert_eq!(env_wrap.capability, PermissionCapability::Destructive);
+    assert!(env_wrap.destructive);
+}
+
+#[test]
+fn wrapper_unwrap_propagates_destructive_through_xargs_and_sudo() {
+    let xargs = analyze_shell_command("xargs -I{} rm -rf {}");
+    assert_eq!(xargs.capability, PermissionCapability::Destructive);
+
+    // `sudo` is intrinsically destructive (first-token match), but the
+    // unwrap should still surface inner network classification.
+    let sudo_curl = analyze_shell_command("sudo curl https://example.com");
+    assert_eq!(sudo_curl.capability, PermissionCapability::Destructive);
+    assert!(
+        sudo_curl.network,
+        "inner network classification must bubble up through sudo",
+    );
+}
+
+#[test]
+fn wrapper_unwrap_propagates_network_through_sh_c() {
+    let analysis = analyze_shell_command("sh -c 'curl https://example.com'");
+    assert!(
+        analysis.network,
+        "network classification must propagate through sh -c"
+    );
+    // It's still Shell capability (the wrapper itself is Shell), but the
+    // network bit is what drives sandbox/approval surface.
+    assert!(matches!(
+        analysis.capability,
+        PermissionCapability::Network | PermissionCapability::Shell
+    ));
+}
+
+#[test]
+fn wrapper_unwrap_is_bounded_and_does_not_loop() {
+    // Pathological deeply-nested wrappers should be analysed bounded.
+    let analysis = analyze_shell_command(
+        "nohup nice -n 5 timeout 30 sh -c \"env FOO=bar bash -c 'rm -rf target'\"",
+    );
+    assert!(analysis.destructive);
+    assert_eq!(analysis.capability, PermissionCapability::Destructive);
+}
+
+#[test]
+fn destructive_redirect_detection_ignores_fd_duplication_and_quotes() {
+    // `2>&1` is fd duplication, not a write to file → not destructive.
+    let test_stderr = analyze_shell_command("cargo test 2>&1");
+    assert_eq!(test_stderr.capability, PermissionCapability::Compiler);
+    assert!(!test_stderr.destructive);
+
+    // Quoted `>` is not a redirect.
+    let echo_arrow = analyze_shell_command("echo 'a>b'");
+    assert!(!echo_arrow.destructive);
+
+    // Real output redirect to a filename IS destructive.
+    let true_redirect = analyze_shell_command("echo hi > out.txt");
+    assert_eq!(true_redirect.capability, PermissionCapability::Destructive);
+    assert!(true_redirect.destructive);
+
+    // `>&-` closes a fd; not a write.
+    let close_fd = analyze_shell_command("cargo test 1>&-");
+    assert!(!close_fd.destructive);
+}
+
+#[test]
+fn destructive_git_detection_requires_token_boundaries() {
+    // `git push --force-with-lease` is destructive.
+    let force_lease = analyze_shell_command("git push --force-with-lease");
+    assert!(force_lease.destructive);
+
+    // `git push origin main` is not (no --force).
+    let safe_push = analyze_shell_command("git push origin main");
+    assert!(!safe_push.destructive);
+
+    // Any flag starting with `--force` is treated as destructive: typo or
+    // not, we'd rather over-prompt than miss a real force push.
+    let force_variant = analyze_shell_command("git push --force-lease=origin/main");
+    assert!(force_variant.destructive);
+
+    // Quoted occurrences of the word "force" inside an argument do NOT
+    // trigger destructive classification.
+    let safe_grep = analyze_shell_command("git log --grep 'force'");
+    assert!(!safe_grep.destructive);
+
+    // `git branch -D foo` is destructive (forced delete).
+    let force_delete = analyze_shell_command("git branch -D feature/x");
+    assert!(force_delete.destructive);
+
+    // `git branch foo` is not.
+    let safe_branch = analyze_shell_command("git branch new-feature");
+    assert!(!safe_branch.destructive);
+}
+
+#[test]
+fn sensitive_path_matcher_ignores_substring_false_positives() {
+    let patterns = squeezy_core::ShellSandboxConfig::default().sensitive_path_patterns;
+    // `.environment` should NOT match `.env*`.
+    assert!(
+        shell_command_references_sensitive_path("cat .environment", &patterns).is_none(),
+        "matcher must not false-positive on .environment",
+    );
+    // `cat Cargo.envelope` ditto.
+    assert!(shell_command_references_sensitive_path("cat Cargo.envelope", &patterns).is_none(),);
+}
+
+#[test]
+fn sensitive_path_matcher_catches_quoted_and_expanded_bypasses() {
+    let patterns = squeezy_core::ShellSandboxConfig::default().sensitive_path_patterns;
+    assert!(shell_command_references_sensitive_path("cat .env", &patterns).is_some());
+    assert!(shell_command_references_sensitive_path("cat ./.env.production", &patterns).is_some());
+    assert!(shell_command_references_sensitive_path("cat ~/.ssh/id_rsa", &patterns).is_some());
+    // $HOME expansion: only catches when HOME is set; test the
+    // token-shape detection by setting a known HOME.
+    unsafe {
+        env::set_var("HOME", "/tmp/sensitive-home-test");
+    }
+    assert!(shell_command_references_sensitive_path("cat $HOME/.ssh/id_rsa", &patterns).is_some(),);
+    unsafe {
+        env::remove_var("HOME");
+    }
+}
+
+#[test]
+fn shell_audit_store_is_safe_under_concurrent_appends() {
+    let root = temp_workspace("shell_audit_concurrent");
+    let store = Arc::new(ShellAuditStore::new(&root));
+    let mut handles = Vec::new();
+    for worker in 0..8 {
+        let store = store.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..50 {
+                store
+                    .append(&json!({
+                        "worker": worker,
+                        "i": i,
+                        // Realistic payload to exercise multi-write paths.
+                        "payload": "x".repeat(256),
+                    }))
+                    .expect("audit append");
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("audit worker");
+    }
+    let log =
+        fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log present");
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 8 * 50, "every append must produce one line");
+    for line in &lines {
+        let parsed: Value = serde_json::from_str(line).expect("each line must be valid JSON");
+        assert!(parsed.get("worker").is_some());
+        assert!(parsed.get("i").is_some());
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn shell_approval_metadata_includes_widened_keys() {
+    let root = temp_workspace("approval_metadata_keys");
+    let registry = registry_with_shell_sandbox_off(&root);
+    let request = registry.permission_request(&ToolCall {
+        call_id: "cmd".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "cargo test --workspace",
+            "description": "run tests",
+            "timeout_ms": 60_000,
+            "output_byte_cap": 16_000,
+        }),
+    });
+    for key in [
+        "command",
+        "cwd",
+        "description",
+        "env",
+        "network",
+        "destructive",
+        "timeout_ms",
+        "output_byte_cap",
+        "sandbox",
+        "sandbox_network",
+        "parser_backed",
+    ] {
+        assert!(
+            request.metadata.contains_key(key),
+            "metadata missing key {key}",
+        );
+    }
+    assert_eq!(request.metadata["timeout_ms"], "60000");
+    assert_eq!(request.metadata["output_byte_cap"], "16000");
+    // env value must NOT contain raw env var values; only the policy
+    // label is allowed.
+    assert!(request.metadata["env"].contains("allowlist"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn shell_approval_summary_no_longer_duplicates_command_or_cwd() {
+    let root = temp_workspace("approval_summary_dedupe");
+    let registry = registry_with_shell_sandbox_off(&root);
+    let request = registry.permission_request(&ToolCall {
+        call_id: "cmd".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({"command": "cargo test", "description": "tests"}),
+    });
+    assert!(
+        !request.summary.contains("cargo test"),
+        "summary must not duplicate the command (in metadata)"
+    );
+    assert!(
+        !request.summary.contains("cwd="),
+        "summary must not duplicate cwd"
+    );
+    assert!(
+        !request.summary.contains("env="),
+        "summary must not duplicate env policy"
+    );
+    assert!(request.summary.contains("description=\"tests\""));
+    let _ = fs::remove_dir_all(root);
 }

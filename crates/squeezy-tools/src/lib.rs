@@ -3148,13 +3148,15 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
                 .any(|segment| is_network_shell_segment(segment)),
             destructive: segments
                 .iter()
-                .any(|segment| is_destructive_shell_segment(segment)),
+                .any(|segment| is_destructive_shell_segment(segment))
+                || shell_segment_has_destructive_redirect(&normalized),
             parser_backed,
             dynamic,
         }
     } else if segments
         .iter()
         .any(|segment| is_destructive_shell_segment(segment))
+        || shell_segment_has_destructive_redirect(&normalized)
     {
         ShellPermissionAnalysis {
             capability: PermissionCapability::Destructive,
@@ -3242,7 +3244,7 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
 /// `MAX_WRAPPER_DEPTH` times to cover nested wrappers like
 /// `nohup sh -c "env BAR=v rm -rf /"`.
 fn expand_wrapper_segments(segments: Vec<String>) -> Vec<String> {
-    const MAX_WRAPPER_DEPTH: usize = 4;
+    const MAX_WRAPPER_DEPTH: usize = 8;
     let mut out = Vec::with_capacity(segments.len());
     for segment in segments {
         out.push(segment.clone());
@@ -3805,7 +3807,7 @@ fn destructive_git_pair(tokens: &[&str]) -> bool {
         "push" => tokens
             .iter()
             .skip(2)
-            .any(|tok| *tok == "--force" || *tok == "-f" || *tok == "--force-with-lease"),
+            .any(|tok| *tok == "-f" || tok.starts_with("--force")),
         _ => false,
     }
 }
