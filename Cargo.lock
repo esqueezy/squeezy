@@ -1615,6 +1615,7 @@ dependencies = [
 name = "squeezy-core"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "serde",
  "thiserror",
  "toml",

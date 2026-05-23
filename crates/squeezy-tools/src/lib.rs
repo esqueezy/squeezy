@@ -26,7 +26,7 @@ use squeezy_core::{
     DEFAULT_EXA_MCP_URL, DEFAULT_TOOL_OUTPUT_RETENTION_DAYS, DEFAULT_TOOL_PREVIEW_BYTES,
     DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, FileId, GraphConfig, PermissionCapability, PermissionMode,
     PermissionRequest, PermissionRisk, PermissionRule, PermissionRuleSource, PermissionScope,
-    Result, SkillsConfig, SqueezyError,
+    Redactor, Result, SkillsConfig, SqueezyError,
 };
 use squeezy_graph::{
     DirtyAnnotation, DirtyRange, GraphManager, GraphSymbol, ReferenceHit, SignatureQuery,
@@ -93,6 +93,7 @@ pub struct ToolCostHint {
     pub bytes_read: u64,
     pub matches_returned: u64,
     pub output_bytes: u64,
+    pub redactions: u64,
     pub truncated: bool,
 }
 
@@ -377,6 +378,7 @@ pub struct ToolRegistry {
     vcs: Arc<GitVcs>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
     skills: Arc<SkillCatalog>,
+    redactor: Arc<Redactor>,
     crawl_options: Arc<CrawlOptions>,
     compiled_policy: Arc<CompiledIndexingPolicy>,
 }
@@ -422,6 +424,7 @@ impl ToolRegistry {
             web_config,
             SkillCatalog::empty(),
             CrawlOptions::default(),
+            Arc::new(Redactor::default()),
         )
     }
 
@@ -437,6 +440,7 @@ impl ToolRegistry {
             web_config,
             SkillCatalog::empty(),
             crawl_options_from_graph_config(graph_config),
+            Arc::new(Redactor::default()),
         )
     }
 
@@ -446,6 +450,7 @@ impl ToolRegistry {
         web_config: WebToolConfig,
         skills_config: SkillsConfig,
         graph_config: &GraphConfig,
+        redactor: Arc<Redactor>,
     ) -> Result<Self> {
         let root = root.into();
         let root = root
@@ -458,6 +463,7 @@ impl ToolRegistry {
             web_config,
             skills,
             crawl_options_from_graph_config(graph_config),
+            redactor,
         )
     }
 
@@ -467,12 +473,20 @@ impl ToolRegistry {
         web_config: WebToolConfig,
         skills: SkillCatalog,
         crawl_options: CrawlOptions,
+        redactor: Arc<Redactor>,
     ) -> Result<Self> {
         let root = root.into();
         let root = root
             .canonicalize()
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
-        Self::new_inner_canonical(root, output_config, web_config, skills, crawl_options)
+        Self::new_inner_canonical(
+            root,
+            output_config,
+            web_config,
+            skills,
+            crawl_options,
+            redactor,
+        )
     }
 
     fn new_inner_canonical(
@@ -481,6 +495,7 @@ impl ToolRegistry {
         web_config: WebToolConfig,
         skills: SkillCatalog,
         crawl_options: CrawlOptions,
+        redactor: Arc<Redactor>,
     ) -> Result<Self> {
         let output_store = ToolOutputStore::new(&root, output_config)?;
         let http = Arc::new(ReqwestWebHttpClient::new()?);
@@ -501,6 +516,7 @@ impl ToolRegistry {
             vcs: Arc::new(vcs),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(skills),
+            redactor,
             crawl_options: Arc::new(crawl_options),
             compiled_policy,
         })
@@ -533,6 +549,7 @@ impl ToolRegistry {
             vcs: Arc::new(vcs),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(SkillCatalog::empty()),
+            redactor: Arc::new(Redactor::default()),
             crawl_options: Arc::new(crawl_options),
             compiled_policy,
         })
@@ -2242,7 +2259,57 @@ impl ToolRegistry {
     }
 
     fn finalize_result(&self, result: ToolResult) -> ToolResult {
-        self.output_store.maybe_spill(result)
+        self.output_store
+            .maybe_spill(redact_tool_result(result, &self.redactor))
+    }
+}
+
+fn redact_tool_result(mut result: ToolResult, redactor: &Redactor) -> ToolResult {
+    let original_content = std::mem::take(&mut result.content);
+    let (content, redactions) = redact_json_value(original_content, redactor);
+    if redactions == 0 {
+        result.content = content;
+        return result;
+    }
+    result.content = content;
+    result.cost_hint.redactions += redactions;
+    let output = serde_json::to_vec(&result.content).unwrap_or_default();
+    result.cost_hint.output_bytes = output.len() as u64;
+    result.receipt.output_sha256 = sha256_hex(&output);
+    result
+}
+
+fn redact_json_value(value: Value, redactor: &Redactor) -> (Value, u64) {
+    match value {
+        Value::String(text) => {
+            let redacted = redactor.redact(&text);
+            (Value::String(redacted.text), redacted.redactions)
+        }
+        Value::Array(items) => {
+            let mut redactions = 0;
+            let items = items
+                .into_iter()
+                .map(|item| {
+                    let (item, count) = redact_json_value(item, redactor);
+                    redactions += count;
+                    item
+                })
+                .collect();
+            (Value::Array(items), redactions)
+        }
+        Value::Object(entries) => {
+            let mut redactions = 0;
+            let entries = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    let (value, count) = redact_json_value(value, redactor);
+                    redactions += count;
+                    (key, value)
+                })
+                .collect();
+            (Value::Object(entries), redactions)
+        }
+        value => (value, 0),
     }
 }
 
