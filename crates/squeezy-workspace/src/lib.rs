@@ -13,6 +13,8 @@ use squeezy_core::{ContentHash, FileId, Freshness, LanguageKind, Result, Squeezy
 pub const CRATE_NAME: &str = "squeezy-workspace";
 const SOURCE_SCAN_MAX_DEPTH: usize = 2;
 const SOURCE_SCAN_MAX_ENTRIES: usize = 1_000;
+const DEFAULT_MAX_FILE_BYTES: u64 = 1_000_000;
+const DEFAULT_JAVA_MAX_FILE_BYTES: u64 = 2_000_000;
 const BINARY_GENERATED_PREFIX_BYTES: usize = 4096;
 
 pub fn crate_name() -> &'static str {
@@ -31,7 +33,7 @@ impl Default for CrawlOptions {
     fn default() -> Self {
         Self {
             include_hidden: false,
-            max_file_bytes: 1_000_000,
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             require_indexing_signal: true,
             policy: IndexingPolicy::default(),
         }
@@ -395,6 +397,16 @@ impl WorkspaceCrawler {
                 .extension()
                 .map(|ext| ext.to_string_lossy().to_string());
             let language = classify_language(&path);
+            // Java source files frequently contain many nested declarations
+            // in a single file, so we lift the default cap when the user has
+            // not configured an explicit one.
+            let max_file_bytes = if language == LanguageKind::Java
+                && self.options.max_file_bytes == DEFAULT_MAX_FILE_BYTES
+            {
+                DEFAULT_JAVA_MAX_FILE_BYTES
+            } else {
+                self.options.max_file_bytes
+            };
 
             if let Some(reason) = self.compiled_policy.path_reason(&relative_path, false) {
                 record_excluded_file(
@@ -411,7 +423,7 @@ impl WorkspaceCrawler {
             // Cheap rejection: skip the file before reading it when it is
             // bigger than the per-file byte cap, unless the user opted into
             // indexing large files via `include_classes = ["large_file"]`.
-            if size_bytes > self.options.max_file_bytes
+            if size_bytes > max_file_bytes
                 && !self
                     .compiled_policy
                     .includes_class(ExclusionReason::LargeFile)
@@ -599,6 +611,7 @@ pub fn classify_language(path: &Path) -> LanguageKind {
         Some("h") => LanguageKind::Cpp,
         Some("cs") | Some("csx") => LanguageKind::CSharp,
         Some("go") => LanguageKind::Go,
+        Some("java") => LanguageKind::Java,
         Some("py") => LanguageKind::Python,
         Some("rs") => LanguageKind::Rust,
         Some(_) => LanguageKind::Unsupported,
@@ -908,6 +921,7 @@ fn collect_source_markers(
             LanguageKind::Cpp => signals.push("shallow C/C++ source".to_string()),
             LanguageKind::CSharp => signals.push("shallow C# source".to_string()),
             LanguageKind::Go => signals.push("shallow Go source".to_string()),
+            LanguageKind::Java => signals.push("shallow Java source".to_string()),
             LanguageKind::Rust => signals.push("shallow Rust source".to_string()),
             LanguageKind::Python => signals.push("shallow Python source".to_string()),
             _ => {

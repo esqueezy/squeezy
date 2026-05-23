@@ -16,11 +16,7 @@ fn disabled_client_does_not_send() {
 
 #[test]
 fn telemetry_disabled_when_install_id_cannot_be_persisted() {
-    let root = std::env::temp_dir().join(format!(
-        "squeezy-telemetry-install-block-{}-{}",
-        now_ms(),
-        std::process::id()
-    ));
+    let root = telemetry_temp_root();
     fs::create_dir_all(&root).unwrap();
     // Use a path whose parent already exists as a file, so create_dir_all
     // and the subsequent write both fail deterministically.

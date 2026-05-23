@@ -3330,6 +3330,7 @@ pub enum LanguageKind {
     CSharp,
     Cpp,
     Go,
+    Java,
     Python,
     Rust,
     Unsupported,
