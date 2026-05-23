@@ -1,0 +1,70 @@
+{
+  "queries": [
+    {
+      "id": "python-hierarchy",
+      "kind": "hierarchy_contains",
+      "expected_contains": [
+        "Class:Runner",
+        "Class:Greeter",
+        "Function:prepare_name",
+        "Function:build_runner",
+        "Method:display_name",
+        "Method:run",
+        "Method:greet"
+      ]
+    },
+    {
+      "id": "python-class-signature",
+      "kind": "signature_search",
+      "text": "class Runner",
+      "symbol_kind": "Class",
+      "expected_contains": [
+        "Class:Runner"
+      ]
+    },
+    {
+      "id": "python-route-attribute",
+      "kind": "signature_search",
+      "text": "def run",
+      "symbol_kind": "Method",
+      "attribute": "route:GET /hello/{name}",
+      "expected_contains": [
+        "Method:run"
+      ]
+    },
+    {
+      "id": "python-call-chain",
+      "kind": "call_chain",
+      "from": "run",
+      "to": "prepare_name",
+      "expected_contains": [
+        "run -> prepare_name"
+      ]
+    },
+    {
+      "id": "python-alias-method-call-chain",
+      "kind": "call_chain",
+      "from": "build_runner",
+      "to": "run",
+      "expected_contains": [
+        "build_runner -> run"
+      ]
+    },
+    {
+      "id": "python-property-reference",
+      "kind": "references_to_symbol",
+      "to": "display_name",
+      "expected_contains": [
+        "self.display_name"
+      ]
+    },
+    {
+      "id": "python-references",
+      "kind": "reference_search",
+      "text": "Runner",
+      "expected_contains": [
+        "Runner"
+      ]
+    }
+  ]
+}

@@ -74,6 +74,134 @@ fn helper() {}
 }
 
 #[test]
+fn parser_extracts_python_symbols_imports_calls_and_references() {
+    let source = r#"
+from services.greeter import Greeter as GreeterAlias
+from .models import User
+import helpers
+
+__all__ = ["Runner"]
+
+class Runner(GreeterAlias):
+    """Runs greetings."""
+
+    id: int
+    name: str = Field(default="")
+    db_name = Column(String)
+    django_name = models.CharField(max_length=255)
+
+    @decorator
+    @router.get("/hello/{name}")
+    def run(self, name: GreeterAlias, user: User) -> GreeterAlias:
+        helper = helpers.build(name)
+        return self.greet(helper)
+
+RunnerAlias = Runner
+
+def make_runner():
+    runner = RunnerAlias()
+    return runner.run("Ada")
+
+def test_runner():
+    assert make_runner()
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = python_record("src/package/app.py", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(parsed.symbols.iter().any(|symbol| symbol.name == "Runner"
+        && symbol.kind == SymbolKind::Class
+        && symbol.attributes.contains(&"base:GreeterAlias".to_string())
+        && symbol.docs.iter().any(|doc| doc.contains("Runs greetings"))));
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "run"
+            && symbol.kind == SymbolKind::Method
+            && symbol
+                .attributes
+                .contains(&"route:GET /hello/{name}".to_string())
+            && symbol
+                .attributes
+                .contains(&"framework:web-route".to_string())
+    }));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "make_runner" && symbol.kind == SymbolKind::Function)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "test_runner"
+                && symbol.attributes.contains(&"pytest:test".to_string()))
+    );
+    assert!(parsed.symbols.iter().any(|symbol| symbol.name == "name"
+        && symbol.kind == SymbolKind::Field
+        && symbol.attributes.contains(&"type:str".to_string())
+        && symbol.attributes.contains(&"pydantic:field".to_string())));
+    assert!(parsed.symbols.iter().any(|symbol| symbol.name == "db_name"
+        && symbol.kind == SymbolKind::Field
+        && symbol.attributes.contains(&"sqlalchemy:field".to_string())));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "django_name"
+                && symbol.kind == SymbolKind::Field
+                && symbol.attributes.contains(&"django:field".to_string()))
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "services.greeter.Greeter"
+                && import.alias.as_deref() == Some("GreeterAlias"))
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "package.models.User")
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "Runner" && import.is_reexport)
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "Runner"
+                && import.alias.as_deref() == Some("RunnerAlias"))
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "RunnerAlias"
+                && import.alias.as_deref() == Some("runner"))
+    );
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|call| call.name == "build" && call.kind == ParsedCallKind::Method)
+    );
+    assert!(parsed.calls.iter().any(|call| call.name == "RunnerAlias"));
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "GreeterAlias"
+                && reference.kind == ReferenceKind::Type)
+    );
+}
+
+#[test]
 fn parser_reports_changed_ranges_for_cached_file() {
     let first = "fn one() { alpha(); }\n";
     let second = "fn one() { beta(); }\n";
@@ -241,6 +369,12 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
         language: LanguageKind::Rust,
         freshness: Freshness::Fresh,
     }
+}
+
+fn python_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Python;
+    record
 }
 
 fn temp_root(name: &str) -> PathBuf {

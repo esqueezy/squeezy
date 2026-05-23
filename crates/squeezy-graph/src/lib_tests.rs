@@ -6,7 +6,7 @@ use std::{
 };
 
 use squeezy_core::{ContentHash, FileId, LanguageKind};
-use squeezy_parse::{ParsedFile, RustParser};
+use squeezy_parse::{ParsedFile, ReferenceKind, RustParser};
 use squeezy_workspace::{FileRecord, stable_content_hash};
 
 use super::*;
@@ -58,6 +58,146 @@ fn helper() {}
     let run = graph.find_symbol_by_name("run").pop().unwrap();
     let helper = graph.find_symbol_by_name("helper").pop().unwrap();
     assert!(graph.call_chain(&run.id, &helper.id, 3).is_some());
+}
+
+#[test]
+fn graph_answers_python_navigation_queries() {
+    let source = r#"
+class Greeter:
+    def greet(self, name):
+        return name
+
+def make():
+    greeter = Greeter()
+    return greeter.greet("Ada")
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = python_record("app.py", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    assert!(
+        graph
+            .signature_search(&SignatureQuery {
+                text: "class Greeter".to_string(),
+                kind: Some(SymbolKind::Class),
+                visibility: None,
+                attribute: None,
+            })
+            .iter()
+            .any(|symbol| symbol.name == "Greeter")
+    );
+    let make = graph.find_symbol_by_name("make").pop().unwrap();
+    let greeter = graph.find_symbol_by_name("Greeter").pop().unwrap();
+    assert!(graph.call_chain(&make.id, &greeter.id, 2).is_some());
+    assert!(!graph.reference_search("Greeter").is_empty());
+}
+
+#[test]
+fn graph_uses_python_navigation_heuristics() {
+    let mut parser = RustParser::new().unwrap();
+    let greeter = python_record(
+        "services/greeter.py",
+        r#"
+class Greeter:
+    @property
+    def label(self):
+        return "greeter"
+
+    def greet(self, name):
+        return name
+
+class Other:
+    def greet(self, name):
+        return "other"
+"#,
+    );
+    let helpers = python_record(
+        "helpers.py",
+        r#"
+def build():
+    return "Ada"
+"#,
+    );
+    let app = python_record(
+        "app.py",
+        r#"
+from services.greeter import Greeter as GreeterAlias
+from services.greeter import Other
+import helpers
+
+router = APIRouter()
+
+class Runner(GreeterAlias):
+    """Routes greeting requests."""
+
+    @router.get("/hello/{name}")
+    def run(self, name: GreeterAlias) -> GreeterAlias:
+        return self.label
+
+def make():
+    greeter = GreeterAlias()
+    helpers.build()
+    return greeter.greet("Ada")
+
+def reassign():
+    greeter = GreeterAlias()
+    greeter = Other()
+    return greeter.greet("Ada")
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&greeter, fs::read_to_string(&greeter.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&helpers, fs::read_to_string(&helpers.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&app, fs::read_to_string(&app.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let make = graph.find_symbol_by_name("make").pop().unwrap();
+    let reassign = graph.find_symbol_by_name("reassign").pop().unwrap();
+    let run = graph.find_symbol_by_name("run").pop().unwrap();
+    let greeter_class = graph.find_symbol_by_name("Greeter").pop().unwrap();
+    let other_class = graph.find_symbol_by_name("Other").pop().unwrap();
+    let greet = graph
+        .find_symbol_by_name("greet")
+        .into_iter()
+        .find(|symbol| symbol.parent_id.as_ref() == Some(&greeter_class.id))
+        .unwrap();
+    let other_greet = graph
+        .find_symbol_by_name("greet")
+        .into_iter()
+        .find(|symbol| symbol.parent_id.as_ref() == Some(&other_class.id))
+        .unwrap();
+    let label = graph.find_symbol_by_name("label").pop().unwrap();
+    let build = graph.find_symbol_by_name("build").pop().unwrap();
+
+    assert!(
+        run.attributes
+            .contains(&"route:GET /hello/{name}".to_string())
+            && run.attributes.contains(&"framework:web-route".to_string())
+    );
+    assert!(
+        graph
+            .references_to_symbol(&label.id)
+            .iter()
+            .any(|hit| hit.reference.text == "self.label")
+    );
+    assert!(graph.call_chain(&make.id, &greet.id, 2).is_some());
+    assert!(graph.call_chain(&reassign.id, &other_greet.id, 2).is_some());
+    assert!(graph.call_chain(&make.id, &build.id, 2).is_some());
+    assert!(graph.call_chain(&make.id, &greeter_class.id, 2).is_some());
+    assert!(
+        graph
+            .references_to_symbol(&greeter_class.id)
+            .iter()
+            .any(|hit| hit.reference.kind == ReferenceKind::Type)
+    );
 }
 
 #[test]
@@ -730,6 +870,12 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
         language: LanguageKind::Rust,
         freshness: Freshness::Fresh,
     }
+}
+
+fn python_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Python;
+    record
 }
 
 fn temp_root(name: &str) -> PathBuf {

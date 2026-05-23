@@ -1,8 +1,8 @@
-# Semantic Graph For Rust
+# Semantic Graph
 
-Squeezy's first semantic navigation layer is a Rust graph built from
-`tree-sitter-rust`, workspace file records, and local resolution heuristics. It is
-designed to answer common navigation questions before the model reads raw files.
+Squeezy's semantic navigation layer is built from tree-sitter parsers, workspace
+file records, and local resolution heuristics. It is designed to answer common
+navigation questions before the model reads raw files.
 
 ## What Is Indexed
 
@@ -10,6 +10,9 @@ designed to answer common navigation questions before the model reads raw files.
   hash, language, and freshness.
 - Rust declarations: modules, structs, enums, unions, traits, impls, functions,
   methods, consts, statics, type aliases, macros, and tests.
+- Python declarations: classes, functions, methods, imports, calls, decorators,
+  docstrings, class bases, type annotations, class fields, exports, aliases, and
+  references from `.py` files.
 - Signatures: raw item header, visibility, attributes, docs, spans, and body
   spans where present.
 - Edges: containment, imports/reexports, references, calls, and macro
@@ -22,6 +25,22 @@ fall back to bounded read/grep/list navigation without pretending the graph know
 more than it does.
 
 ## Heuristics
+
+Workspace indexing starts with a defensive root decision before any recursive
+walk. VCS markers such as `.git`, `.jj`, `.hg`, and `.svn`, common project
+config, and shallow source files are strong positive signals. A root `README` is
+recorded as a weak positive signal, but is not enough on its own. Source signals
+scan to depth two with a small entry cap and include Rust, Python, Java, C#,
+C/C++, JavaScript, TypeScript, Go, Ruby, PHP, Swift, Kotlin, Scala, shell, and
+common web files. Common code directories such as `src`, `lib`, `app`,
+`packages`, `crates`, `cmd`, `pkg`, `internal`, and `include` are positive only
+when they contain shallow source files. The user's home directory and protected
+system roots such as `/`, `/System`, `/Library`, `/Users`, `/usr`, and `/var`
+are blocking negative signals. Personal folder names such as `Desktop`,
+`Documents`, and `Downloads` are weak negative signals, but real project markers
+can override them. If there is no strong positive signal, or the root is a
+blocked system/home root, Squeezy returns an empty graph with the indexing
+decision instead of walking a likely non-code or dangerous directory.
 
 - Direct calls resolve when the target is same-file, explicitly imported, or
   syntactically qualified as `Self::name`, `Type::name`, or `module::name` with
@@ -41,6 +60,35 @@ more than it does.
 - Unknown cfg and feature combinations are not silently dropped; callers should
   treat affected results as lower-confidence until compiler facts land in the
   later compiler-as-fact epic.
+- Python constructor calls resolve to local class declarations when the class is
+  same-file or imported unambiguously. `import x as y`, `from x import y as z`,
+  leading-dot relative imports, package `__init__.py` reexports, `__all__`, and
+  simple assignments such as `Alias = Real` or `obj = ClassName()` feed the same
+  import/alias resolver. Alias facts are scoped to their owning symbol and
+  receiver aliases use the latest assignment before the call site.
+- Python method calls use confidence-ranked heuristics: same class first,
+  inherited local classes next, constructor-derived receiver aliases after that,
+  and imported module-qualified functions such as `helpers.build()` when the
+  target file path matches the imported module. Call edges include a `rank=...`
+  provenance reason such as `same file`, `explicit import`, `inherited class`,
+  `constructor alias`, `imported module`, or `package local`.
+- Python class bases and function annotations are indexed as type references.
+  Annotation facts are soft evidence only; no mypy-style type solving, generic
+  constraint solving, or runtime import execution is attempted.
+- Python decorators are kept as raw attributes and tagged for common semantics:
+  `@property`, `@staticmethod`, `@classmethod`, dataclasses, pytest fixtures,
+  FastAPI/Flask-style route decorators with method/path metadata, and common
+  Pydantic validators. Property attribute reads such as `self.name` can bind to
+  local `@property def name(...)` methods.
+- Python class-level annotated assignments and field factories are indexed as
+  fields. This covers dataclass/Pydantic-style fields, SQLAlchemy
+  `Column(...)`/`mapped_column(...)`, and Django `models.*Field(...)` syntax
+  without importing those frameworks.
+- Python test functions/classes are tagged from `test_*`, `*_test.py`, pytest
+  fixtures, and `Test*` class naming. Docstring text is stored on the owning
+  symbol so behavior-word searches do not have to read raw files first.
+- Dynamic attributes, metaclasses, runtime import side effects, monkey-patching,
+  and type-inferred receiver dispatch remain heuristic or external.
 
 Every result carries a confidence label such as `ExactSyntax`, `ImportResolved`,
 `Heuristic`, `CandidateSet`, `External`, `MacroOpaque`, `ConditionalUnknown`,
@@ -48,7 +96,7 @@ Every result carries a confidence label such as `ExactSyntax`, `ImportResolved`,
 
 ## Refresh Policy
 
-`GraphManager` owns a workspace crawler, Rust parser cache, and immutable graph
+`GraphManager` owns a workspace crawler, parser cache, and immutable graph
 query surface. Before graph tool calls, callers should invoke
 `refresh_before_query()`.
 
@@ -93,11 +141,13 @@ confidence, and provenance. Raw file reads should be targeted by these spans.
 
 ## Benchmarks
 
-Semantic graph benchmarks live under `benchmarks/`. The smoke benchmark validates
-the fixture crate with the Rust compiler, builds the Squeezy graph, runs query
-specs, and writes a JSON report. It fails if required expected results are
-missing or if Squeezy graph build plus query time is not faster than compiler
-validation for the same fixture.
+Semantic graph benchmarks live under `benchmarks/`. The Rust smoke benchmark
+validates the fixture crate with the Rust compiler, builds the Squeezy graph,
+runs query specs, and writes a JSON report. The Python smoke benchmark validates
+the fixture with a slower CPython `ast` oracle and compares declaration symbols
+against Squeezy's graph. Both fail if required expected results are missing or if
+Squeezy graph build plus query time is not faster than the validation pass for
+the same fixture.
 
 The mixed benchmark runs deterministic exhaustive scenarios against a real Rust
 repo by default. It generates scenarios from every indexed symbol and resolved
@@ -122,6 +172,16 @@ against Squeezy `references_to_symbol`. This is intentionally a loss tracker
 rather than a hard product dependency: it exposes wrong targets,
 rust-analyzer-only definitions, and Squeezy-only extras while keeping production
 navigation tree-sitter-only.
+
+Python accuracy reporting uses the CPython `ast` oracle as the slower reference
+for class/function/method declaration discovery. It is benchmark-only and does
+not become a production dependency. Python files that CPython `ast` cannot parse
+are reported as `oracle_unparseable` and excluded from Squeezy false-positive
+accounting, because tree-sitter recovery is useful while editing broken or
+future-syntax code even when the oracle cannot treat that file as a module. The
+Python smoke benchmark also carries controlled navigation checks for route
+metadata, constructor-alias method calls, and property references so navigation
+heuristics are regression-tested separately from declaration accuracy.
 
 Known misses must be documented in the query spec with a reason, for example
 macro expansion, trait dispatch, type inference, cfg, glob ambiguity, generated

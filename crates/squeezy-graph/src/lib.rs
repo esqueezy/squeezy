@@ -351,7 +351,7 @@ impl SemanticGraph {
             return Vec::new();
         };
         let mut hits = self
-            .reference_candidate_indexes(&symbol.name)
+            .reference_candidate_indexes_for_symbol(symbol)
             .into_iter()
             .filter_map(|index| self.references.get(index))
             .filter_map(|reference| {
@@ -535,7 +535,7 @@ impl SemanticGraph {
                 .caller_id
                 .clone()
                 .unwrap_or_else(|| file_symbol_id.clone());
-            let (to, confidence) = self.resolve_call(call, &from);
+            let (to, confidence, rank_reason) = self.resolve_call(call, &from);
             self.edges.push(GraphEdge {
                 from,
                 to,
@@ -544,7 +544,10 @@ impl SemanticGraph {
                 span: Some(call.span),
                 confidence,
                 freshness: Freshness::Fresh,
-                provenance: call.provenance.clone(),
+                provenance: Provenance::new(
+                    call.provenance.source.clone(),
+                    format!("{}; rank={rank_reason}", call.provenance.reason),
+                ),
             });
         }
     }
@@ -579,7 +582,7 @@ impl SemanticGraph {
         &self,
         call: &ParsedCall,
         caller_id: &SymbolId,
-    ) -> (Option<SymbolId>, Confidence) {
+    ) -> (Option<SymbolId>, Confidence, &'static str) {
         if call.kind == ParsedCallKind::Macro {
             let candidates = self
                 .symbols_by_name_or_scan(&call.name)
@@ -592,16 +595,28 @@ impl SemanticGraph {
                 })
                 .collect::<Vec<_>>();
             return match candidates.as_slice() {
-                [only] => (Some(only.clone()), Confidence::ExactSyntax),
-                [] => (None, Confidence::MacroOpaque),
-                _ => (None, Confidence::CandidateSet),
+                [only] => (Some(only.clone()), Confidence::ExactSyntax, "macro exact"),
+                [] => (None, Confidence::MacroOpaque, "macro opaque"),
+                _ => (None, Confidence::CandidateSet, "macro candidate set"),
             };
+        }
+
+        if call.kind == ParsedCallKind::Direct
+            && let Some(callee) = self.import_alias_direct_call(caller_id, call)
+        {
+            return (Some(callee), Confidence::ImportResolved, "import alias");
         }
 
         if call.kind == ParsedCallKind::Method
             && let Some(callee) = self.same_impl_method(caller_id, &call.name)
         {
-            return (Some(callee), Confidence::ExactSyntax);
+            return (Some(callee), Confidence::ExactSyntax, "same class or impl");
+        }
+
+        if call.kind == ParsedCallKind::Method
+            && let Some(callee) = self.inherited_python_method(caller_id, call)
+        {
+            return (Some(callee), Confidence::Heuristic, "inherited class");
         }
 
         let candidates = self
@@ -613,7 +628,10 @@ impl SemanticGraph {
                     .map(|symbol| {
                         matches!(
                             symbol.kind,
-                            SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+                            SymbolKind::Class
+                                | SymbolKind::Function
+                                | SymbolKind::Method
+                                | SymbolKind::Test
                         )
                     })
                     .unwrap_or(false)
@@ -621,32 +639,41 @@ impl SemanticGraph {
             .collect::<Vec<_>>();
 
         if let Some(id) = self.qualified_direct_call(&candidates, caller_id, call) {
-            return (Some(id), Confidence::Heuristic);
+            return (Some(id), Confidence::Heuristic, "qualified syntax");
         }
 
         if call.kind == ParsedCallKind::Method {
+            if let Some(id) = self.python_receiver_alias_method(caller_id, call) {
+                return (Some(id), Confidence::Heuristic, "constructor alias");
+            }
+            if let Some(id) = self.python_module_qualified_call(&candidates, caller_id, call) {
+                return (Some(id), Confidence::ImportResolved, "imported module");
+            }
             return match candidates.as_slice() {
-                [] => (None, Confidence::External),
-                _ => (None, Confidence::CandidateSet),
+                [] => (None, Confidence::External, "method external"),
+                _ => (None, Confidence::CandidateSet, "method candidate set"),
             };
         }
 
         if call.receiver.is_some() {
             return match candidates.as_slice() {
-                [] => (None, Confidence::External),
-                _ => (None, Confidence::CandidateSet),
+                [] => (None, Confidence::External, "receiver external"),
+                _ => (None, Confidence::CandidateSet, "receiver candidate set"),
             };
         }
 
         if let Some(id) = self.same_file_direct_call(&candidates, caller_id, call) {
-            return (Some(id), Confidence::ExactSyntax);
+            return (Some(id), Confidence::ExactSyntax, "same file");
         }
         if let Some(id) = self.imported_direct_call(&candidates, caller_id, call) {
-            return (Some(id), Confidence::ImportResolved);
+            return (Some(id), Confidence::ImportResolved, "explicit import");
+        }
+        if let Some(id) = self.package_local_direct_call(&candidates, caller_id) {
+            return (Some(id), Confidence::Heuristic, "package local");
         }
         match candidates.as_slice() {
-            [] => (None, Confidence::External),
-            _ => (None, Confidence::CandidateSet),
+            [] => (None, Confidence::External, "external"),
+            _ => (None, Confidence::CandidateSet, "candidate set"),
         }
     }
 
@@ -786,7 +813,7 @@ impl SemanticGraph {
         for import in self
             .imports
             .iter()
-            .filter(|import| import.file_id == caller.file_id)
+            .filter(|import| self.import_visible_from_symbol(import, caller))
         {
             let alias_or_name = import
                 .alias
@@ -840,7 +867,10 @@ impl SemanticGraph {
             .filter_map(|id| self.symbols.get(id))
             .filter(|symbol| {
                 symbol.file_id == caller.file_id
-                    && matches!(symbol.kind, SymbolKind::Function | SymbolKind::Test)
+                    && matches!(
+                        symbol.kind,
+                        SymbolKind::Class | SymbolKind::Function | SymbolKind::Test
+                    )
             })
             .map(|symbol| symbol.id.clone())
             .collect::<Vec<_>>();
@@ -862,34 +892,10 @@ impl SemanticGraph {
             return None;
         }
         let caller = self.symbols.get(caller_id)?;
-        let imported_names = self
-            .imports
-            .iter()
-            .filter(|import| import.file_id == caller.file_id)
-            .filter_map(|import| {
-                import
-                    .alias
-                    .clone()
-                    .or_else(|| Some(last_path_segment(&import.path)))
-            })
-            .filter(|name| name == &call.name)
-            .collect::<Vec<_>>();
-        if imported_names.is_empty() {
-            return None;
-        }
         let mut imported_candidates = candidates
             .iter()
             .filter_map(|id| self.symbols.get(id))
-            .filter(|symbol| {
-                self.imports.iter().any(|import| {
-                    import.file_id == caller.file_id
-                        && import
-                            .alias
-                            .as_ref()
-                            .map(|alias| alias == &call.name)
-                            .unwrap_or_else(|| last_path_segment(&import.path) == symbol.name)
-                })
-            })
+            .filter(|symbol| self.symbol_is_imported_as(caller, symbol, &call.name))
             .map(|symbol| symbol.id.clone())
             .collect::<Vec<_>>();
         imported_candidates.sort_by(|left, right| left.0.cmp(&right.0));
@@ -900,6 +906,393 @@ impl SemanticGraph {
         }
     }
 
+    fn import_alias_direct_call(
+        &self,
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        if call.kind != ParsedCallKind::Direct || call.receiver.is_some() {
+            return None;
+        }
+        let caller = self.symbols.get(caller_id)?;
+        let candidates = self
+            .imports
+            .iter()
+            .filter(|import| self.import_visible_from_symbol(import, caller))
+            .filter(|import| import.span.start_byte <= call.span.start_byte)
+            .filter(|import| import.alias.as_deref() == Some(call.name.as_str()))
+            .flat_map(|import| {
+                let target_name = last_path_segment(&import.path);
+                self.symbols_by_name_or_scan(&target_name)
+                    .into_iter()
+                    .filter_map(|id| self.symbols.get(&id))
+                    .filter(|symbol| {
+                        matches!(
+                            symbol.kind,
+                            SymbolKind::Class | SymbolKind::Function | SymbolKind::Test
+                        ) && self.import_matches_symbol(import, symbol)
+                    })
+                    .map(|symbol| symbol.id.clone())
+                    .collect::<Vec<_>>()
+            });
+        single_symbol(candidates)
+    }
+
+    fn package_local_direct_call(
+        &self,
+        candidates: &[SymbolId],
+        caller_id: &SymbolId,
+    ) -> Option<SymbolId> {
+        let caller = self.symbols.get(caller_id)?;
+        let caller_file = self.files.get(&caller.file_id)?;
+        single_symbol(
+            candidates
+                .iter()
+                .filter_map(|id| self.symbols.get(id))
+                .filter(|symbol| {
+                    self.files
+                        .get(&symbol.file_id)
+                        .map(|file| {
+                            package_key(&file.relative_path)
+                                == package_key(&caller_file.relative_path)
+                        })
+                        .unwrap_or(false)
+                })
+                .filter(|symbol| {
+                    matches!(
+                        symbol.kind,
+                        SymbolKind::Class | SymbolKind::Function | SymbolKind::Test
+                    )
+                })
+                .map(|symbol| symbol.id.clone()),
+        )
+    }
+
+    fn symbol_is_imported_as(
+        &self,
+        caller: &GraphSymbol,
+        symbol: &GraphSymbol,
+        name: &str,
+    ) -> bool {
+        self.imports
+            .iter()
+            .filter(|import| self.import_visible_from_symbol(import, caller))
+            .filter(|import| {
+                import
+                    .alias
+                    .as_deref()
+                    .map(|alias| alias == name)
+                    .unwrap_or_else(|| last_path_segment(&import.path) == name)
+            })
+            .any(|import| self.import_matches_symbol(import, symbol))
+    }
+
+    fn import_matches_symbol(&self, import: &ParsedImport, symbol: &GraphSymbol) -> bool {
+        if last_path_segment(&import.path) != symbol.name {
+            return false;
+        }
+        let Some(file) = self.files.get(&symbol.file_id) else {
+            return true;
+        };
+        if file.language != squeezy_core::LanguageKind::Python {
+            return true;
+        }
+        let import_segments = python_path_segments(&import.path);
+        if import_segments.len() <= 1 {
+            return true;
+        }
+        let import_module = &import_segments[..import_segments.len() - 1];
+        let symbol_module = python_module_path_for_file(&file.relative_path);
+        path_segments_suffix_match(import_module, &symbol_module)
+    }
+
+    fn import_visible_from_symbol(&self, import: &ParsedImport, caller: &GraphSymbol) -> bool {
+        if import.file_id != caller.file_id {
+            return false;
+        }
+        let Some(owner_id) = &import.owner_id else {
+            return true;
+        };
+        owner_id == &caller.id || self.symbol_is_descendant_of(&caller.id, owner_id)
+    }
+
+    fn import_visible_from_reference(
+        &self,
+        import: &ParsedImport,
+        reference: &ParsedReference,
+    ) -> bool {
+        if import.file_id != reference.file_id {
+            return false;
+        }
+        let Some(owner_id) = &import.owner_id else {
+            return true;
+        };
+        reference
+            .owner_id
+            .as_ref()
+            .map(|reference_owner| {
+                reference_owner == owner_id
+                    || self.symbol_is_descendant_of(reference_owner, owner_id)
+            })
+            .unwrap_or(false)
+    }
+
+    fn symbol_is_descendant_of(&self, child_id: &SymbolId, ancestor_id: &SymbolId) -> bool {
+        let mut current = Some(child_id.clone());
+        while let Some(id) = current {
+            if &id == ancestor_id {
+                return true;
+            }
+            current = self
+                .symbols
+                .get(&id)
+                .and_then(|symbol| symbol.parent_id.clone());
+        }
+        false
+    }
+
+    fn inherited_python_method(&self, caller_id: &SymbolId, call: &ParsedCall) -> Option<SymbolId> {
+        if !matches!(call.receiver.as_deref(), Some("self") | Some("cls")) {
+            return None;
+        }
+        let class_id = self.python_class_for_caller(caller_id)?;
+        self.python_method_in_bases(&class_id, &call.name, 0)
+    }
+
+    fn python_receiver_alias_method(
+        &self,
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        let receiver = call.receiver.as_deref()?;
+        if matches!(receiver, "self" | "cls") {
+            return None;
+        }
+        let caller = self.symbols.get(caller_id)?;
+        let class = self.python_class_for_alias(caller, receiver, Some(call.span.start_byte))?;
+        self.python_method_on_class(&class.id, &call.name)
+    }
+
+    fn python_module_qualified_call(
+        &self,
+        candidates: &[SymbolId],
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        let receiver = call.receiver.as_deref()?;
+        let caller = self.symbols.get(caller_id)?;
+        let receiver_paths = self.python_receiver_module_paths(caller, receiver);
+        if receiver_paths.is_empty() {
+            return None;
+        }
+        single_symbol(
+            candidates
+                .iter()
+                .filter_map(|id| self.symbols.get(id))
+                .filter(|symbol| matches!(symbol.kind, SymbolKind::Function | SymbolKind::Test))
+                .filter(|symbol| is_free_function_like(symbol))
+                .filter(|symbol| {
+                    self.files
+                        .get(&symbol.file_id)
+                        .map(|file| {
+                            let module_path = python_module_path_for_file(&file.relative_path);
+                            receiver_paths.iter().any(|path| path == &module_path)
+                        })
+                        .unwrap_or(false)
+                })
+                .map(|symbol| symbol.id.clone()),
+        )
+    }
+
+    fn python_class_for_alias(
+        &self,
+        caller: &GraphSymbol,
+        alias: &str,
+        before_byte: Option<u32>,
+    ) -> Option<GraphSymbol> {
+        self.python_class_for_alias_in_scope(caller, alias, before_byte, 0)
+    }
+
+    fn python_class_for_alias_in_scope(
+        &self,
+        caller: &GraphSymbol,
+        alias: &str,
+        before_byte: Option<u32>,
+        depth: usize,
+    ) -> Option<GraphSymbol> {
+        if depth > 4 {
+            return None;
+        }
+        let latest = self
+            .imports
+            .iter()
+            .filter(|import| self.import_visible_from_symbol(import, caller))
+            .filter(|import| import.alias.as_deref() == Some(alias))
+            .filter(|import| {
+                before_byte
+                    .map(|byte| import.span.start_byte <= byte)
+                    .unwrap_or(true)
+            })
+            .max_by_key(|import| import.span.start_byte)?;
+        let target_name = last_path_segment(&latest.path);
+        if let Some(class) = single_symbol(
+            self.symbols_by_name_or_scan(&target_name)
+                .into_iter()
+                .filter_map(|id| self.symbols.get(&id))
+                .filter(|symbol| {
+                    symbol.kind == SymbolKind::Class && self.import_matches_symbol(latest, symbol)
+                })
+                .map(|symbol| symbol.id.clone()),
+        )
+        .and_then(|id| self.symbols.get(&id).cloned())
+        {
+            return Some(class);
+        }
+        self.python_class_for_alias_in_scope(caller, &target_name, before_byte, depth + 1)
+    }
+
+    fn python_receiver_module_paths(
+        &self,
+        caller: &GraphSymbol,
+        receiver: &str,
+    ) -> Vec<Vec<String>> {
+        let receiver_segments = python_path_segments(receiver);
+        if receiver_segments.is_empty() {
+            return Vec::new();
+        }
+        let mut paths = BTreeSet::new();
+        for import in self
+            .imports
+            .iter()
+            .filter(|import| self.import_visible_from_symbol(import, caller))
+        {
+            let import_segments = python_path_segments(&import.path);
+            if import.alias.as_deref() == Some(receiver) {
+                paths.insert(import_segments);
+                continue;
+            }
+            if import.path == receiver {
+                paths.insert(import_segments);
+                continue;
+            }
+            if import_segments
+                .first()
+                .map(|segment| segment == &receiver_segments[0])
+                .unwrap_or(false)
+            {
+                let mut resolved = import_segments.clone();
+                if receiver_segments.len() > 1 {
+                    resolved.extend(receiver_segments.iter().skip(1).cloned());
+                }
+                paths.insert(resolved);
+            }
+        }
+        paths.into_iter().collect()
+    }
+
+    fn python_class_for_caller(&self, caller_id: &SymbolId) -> Option<SymbolId> {
+        let caller = self.symbols.get(caller_id)?;
+        if caller.kind == SymbolKind::Class {
+            return Some(caller.id.clone());
+        }
+        let mut current = caller.parent_id.clone();
+        while let Some(id) = current {
+            let symbol = self.symbols.get(&id)?;
+            if symbol.kind == SymbolKind::Class {
+                return Some(symbol.id.clone());
+            }
+            current = symbol.parent_id.clone();
+        }
+        None
+    }
+
+    fn python_method_in_bases(
+        &self,
+        class_id: &SymbolId,
+        method_name: &str,
+        depth: usize,
+    ) -> Option<SymbolId> {
+        if depth > 8 {
+            return None;
+        }
+        let class = self.symbols.get(class_id)?;
+        for base in class
+            .attributes
+            .iter()
+            .filter_map(|attribute| attribute.strip_prefix("base:"))
+        {
+            let base_ids = self.python_class_candidates_for_name_in_file(&class.file_id, base);
+            for base_id in base_ids {
+                if let Some(method) = self.python_method_on_class(&base_id, method_name) {
+                    return Some(method);
+                }
+                if let Some(method) = self.python_method_in_bases(&base_id, method_name, depth + 1)
+                {
+                    return Some(method);
+                }
+            }
+        }
+        None
+    }
+
+    fn python_class_candidates_for_name_in_file(
+        &self,
+        file_id: &FileId,
+        name: &str,
+    ) -> Vec<SymbolId> {
+        let direct_name = last_path_segment(name);
+        let mut class_ids = self
+            .symbols_by_name_or_scan(&direct_name)
+            .into_iter()
+            .filter_map(|id| self.symbols.get(&id))
+            .filter(|symbol| symbol.kind == SymbolKind::Class)
+            .map(|symbol| symbol.id.clone())
+            .collect::<Vec<_>>();
+
+        class_ids.extend(
+            self.imports
+                .iter()
+                .filter(|import| import.file_id == *file_id)
+                .filter(|import| import.alias.as_deref() == Some(name))
+                .flat_map(|import| {
+                    let target_name = last_path_segment(&import.path);
+                    self.symbols_by_name_or_scan(&target_name)
+                        .into_iter()
+                        .filter_map(|id| self.symbols.get(&id))
+                        .filter(|symbol| {
+                            symbol.kind == SymbolKind::Class
+                                && self.import_matches_symbol(import, symbol)
+                        })
+                        .map(|symbol| symbol.id.clone())
+                        .collect::<Vec<_>>()
+                }),
+        );
+
+        class_ids.sort_by(|left, right| left.0.cmp(&right.0));
+        class_ids.dedup();
+        class_ids
+    }
+
+    fn python_method_on_class(&self, class_id: &SymbolId, method_name: &str) -> Option<SymbolId> {
+        single_symbol(
+            self.children_by_parent
+                .get(class_id)?
+                .iter()
+                .filter_map(|child_id| self.symbols.get(child_id))
+                .filter(|symbol| symbol.kind == SymbolKind::Method && symbol.name == method_name)
+                .map(|symbol| symbol.id.clone()),
+        )
+    }
+
+    fn python_method_on_class_or_bases(
+        &self,
+        class_id: &SymbolId,
+        method_name: &str,
+    ) -> Option<SymbolId> {
+        self.python_method_on_class(class_id, method_name)
+            .or_else(|| self.python_method_in_bases(class_id, method_name, 0))
+    }
+
     fn same_impl_method(&self, caller_id: &SymbolId, method_name: &str) -> Option<SymbolId> {
         let caller = self.symbols.get(caller_id)?;
         let impl_id = if caller.kind == SymbolKind::Impl {
@@ -908,7 +1301,10 @@ impl SemanticGraph {
             caller.parent_id.clone()?
         };
         let parent = self.symbols.get(&impl_id)?;
-        if !matches!(parent.kind, SymbolKind::Impl | SymbolKind::Trait) {
+        if !matches!(
+            parent.kind,
+            SymbolKind::Class | SymbolKind::Impl | SymbolKind::Trait
+        ) {
             return None;
         }
         self.children_by_parent
@@ -957,6 +1353,14 @@ impl SemanticGraph {
         if let Some(segment) = self.references_by_text.get(&suffix) {
             indexes.extend(segment.iter().copied());
         }
+        let dot_suffix = format!(".{text}");
+        indexes.extend(
+            self.references
+                .iter()
+                .enumerate()
+                .filter(|(_, reference)| reference.text.ends_with(&dot_suffix))
+                .map(|(index, _)| index),
+        );
         if text.contains("::") {
             indexes.extend(
                 self.references
@@ -971,12 +1375,27 @@ impl SemanticGraph {
         indexes.into_iter().collect()
     }
 
+    fn reference_candidate_indexes_for_symbol(&self, symbol: &GraphSymbol) -> Vec<usize> {
+        let mut indexes = BTreeSet::new();
+        indexes.extend(self.reference_candidate_indexes(&symbol.name));
+        for alias in self
+            .imports
+            .iter()
+            .filter(|import| self.import_matches_symbol(import, symbol))
+            .filter_map(|import| import.alias.as_deref())
+        {
+            indexes.extend(self.reference_candidate_indexes(alias));
+        }
+        indexes.into_iter().collect()
+    }
+
     fn reference_binding_confidence(
         &self,
         symbol: &GraphSymbol,
         reference: &ParsedReference,
     ) -> Option<Confidence> {
         if !reference_text_matches_symbol(reference, symbol)
+            && !self.reference_alias_matches_symbol(symbol, reference)
             && !self.reference_qualifier_matches_symbol(symbol, reference)
         {
             return None;
@@ -996,6 +1415,14 @@ impl SemanticGraph {
         }
         if !self.reference_is_in_symbol_package(symbol, reference) {
             return None;
+        }
+        if self.python_property_reference_matches(symbol, reference) {
+            return Some(Confidence::Heuristic);
+        }
+        if self.reference_alias_matches_symbol(symbol, reference)
+            && reference_kind_can_bind_symbol(reference, symbol)
+        {
+            return Some(Confidence::ImportResolved);
         }
         if self.reference_is_impl_method_declaration_for_trait(symbol, reference) {
             return Some(Confidence::Heuristic);
@@ -1034,6 +1461,55 @@ impl SemanticGraph {
         None
     }
 
+    fn reference_alias_matches_symbol(
+        &self,
+        symbol: &GraphSymbol,
+        reference: &ParsedReference,
+    ) -> bool {
+        self.imports
+            .iter()
+            .filter(|import| self.import_visible_from_reference(import, reference))
+            .filter(|import| import.alias.as_deref() == Some(reference.text.as_str()))
+            .any(|import| self.import_matches_symbol(import, symbol))
+    }
+
+    fn python_property_reference_matches(
+        &self,
+        symbol: &GraphSymbol,
+        reference: &ParsedReference,
+    ) -> bool {
+        if symbol.kind != SymbolKind::Method
+            || reference.kind != ReferenceKind::Field
+            || !symbol
+                .attributes
+                .iter()
+                .any(|attribute| attribute == "python:property")
+            || last_path_segment(&reference.text) != symbol.name
+        {
+            return false;
+        }
+        let Some(receiver) = receiver_from_dotted_reference(&reference.text) else {
+            return false;
+        };
+        let Some(owner_id) = &reference.owner_id else {
+            return false;
+        };
+        let Some(owner) = self.symbols.get(owner_id) else {
+            return false;
+        };
+        if matches!(receiver.as_str(), "self" | "cls") {
+            return self
+                .python_class_for_caller(owner_id)
+                .and_then(|class_id| self.python_method_on_class_or_bases(&class_id, &symbol.name))
+                .map(|method_id| method_id == symbol.id)
+                .unwrap_or(false);
+        }
+        self.python_class_for_alias(owner, &receiver, Some(reference.span.start_byte))
+            .and_then(|class| self.python_method_on_class_or_bases(&class.id, &symbol.name))
+            .map(|method_id| method_id == symbol.id)
+            .unwrap_or(false)
+    }
+
     fn edge_binding_confidence(
         &self,
         symbol: &GraphSymbol,
@@ -1058,6 +1534,12 @@ impl SemanticGraph {
         let Some(reference_file) = self.files.get(&reference.file_id) else {
             return false;
         };
+        if matches!(
+            (symbol_file.language, reference_file.language),
+            (LanguageKind::Python, LanguageKind::Python)
+        ) {
+            return true;
+        }
         package_key(&symbol_file.relative_path) == package_key(&reference_file.relative_path)
     }
 
@@ -1980,6 +2462,9 @@ fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> Lan
     let mut report = LanguageReport::default();
     for record in records {
         match record.language {
+            LanguageKind::Python => {
+                report.supported_files += 1;
+            }
             LanguageKind::Rust => {
                 report.rust_files += 1;
                 report.supported_files += 1;
@@ -2046,7 +2531,8 @@ fn reference_kind_can_bind_symbol(reference: &ParsedReference, symbol: &GraphSym
         return true;
     }
     match symbol.kind {
-        SymbolKind::Struct
+        SymbolKind::Class
+        | SymbolKind::Struct
         | SymbolKind::Enum
         | SymbolKind::Union
         | SymbolKind::Trait
@@ -2058,11 +2544,17 @@ fn reference_kind_can_bind_symbol(reference: &ParsedReference, symbol: &GraphSym
             )
         }
         SymbolKind::Macro => false,
-        SymbolKind::Function | SymbolKind::Method | SymbolKind::Test => false,
+        SymbolKind::Method => matches!(reference.kind, ReferenceKind::Field),
+        SymbolKind::Function | SymbolKind::Test => false,
+        SymbolKind::Field => {
+            matches!(
+                reference.kind,
+                ReferenceKind::Field | ReferenceKind::Identifier
+            )
+        }
         SymbolKind::Crate
         | SymbolKind::File
         | SymbolKind::Impl
-        | SymbolKind::Field
         | SymbolKind::Variant
         | SymbolKind::Unknown => false,
     }
@@ -2138,6 +2630,21 @@ fn path_segments(path: &str) -> Vec<String> {
         .collect()
 }
 
+fn python_path_segments(path: &str) -> Vec<String> {
+    path.split('.')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.trim_end_matches(".*").to_string())
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn receiver_from_dotted_reference(path: &str) -> Option<String> {
+    path.rsplit_once('.')
+        .map(|(receiver, _)| receiver.trim().to_string())
+        .filter(|receiver| !receiver.is_empty())
+}
+
 fn module_path_for_file(path: &str) -> Vec<String> {
     let mut path = path.trim_end_matches(".rs");
     if let Some((_, rest)) = path.split_once("/src/") {
@@ -2162,6 +2669,26 @@ fn module_path_for_file(path: &str) -> Vec<String> {
             .map(ToString::to_string),
     );
     segments
+}
+
+fn python_module_path_for_file(path: &str) -> Vec<String> {
+    let path = path
+        .trim_end_matches(".py")
+        .trim_end_matches("/__init__")
+        .trim_start_matches("src/");
+    path.split('/')
+        .filter(|segment| {
+            !segment.is_empty()
+                && *segment != "__init__"
+                && *segment != "tests"
+                && *segment != "test"
+        })
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn path_segments_suffix_match(left: &[String], right: &[String]) -> bool {
+    left == right || left.ends_with(right) || right.ends_with(left)
 }
 
 fn is_free_function_like(symbol: &GraphSymbol) -> bool {
