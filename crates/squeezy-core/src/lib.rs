@@ -68,48 +68,53 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_env() -> Self {
-        Self::from_env_vars(|name| env::var(name).ok())
+        Self::from_env_vars(None, |name| env::var(name).ok())
     }
 
     pub fn from_env_and_settings() -> Result<Self> {
-        Self::from_default_paths_and_env()
+        Self::from_default_paths_and_env_with_provider_value(None)
     }
 
     pub fn from_env_and_settings_with_provider(provider: &str) -> Result<Self> {
-        Self::from_default_paths_and_env_with_provider(provider)
+        Self::from_default_paths_and_env_with_provider_value(Some(provider))
     }
 
     pub fn from_settings_path_and_env(path: PathBuf) -> Result<Self> {
         let (settings, sources) = SettingsFile::load_optional_source(&path, "settings")?;
-        Self::try_from_settings_and_env_vars_with_sources(settings, sources, |name| {
+        Self::try_from_settings_and_env_vars_with_sources(settings, sources, None, |name| {
             env::var(name).ok()
         })
     }
 
     pub fn from_settings_path_and_env_with_provider(path: PathBuf, provider: &str) -> Result<Self> {
         let (settings, sources) = SettingsFile::load_optional_source(&path, "settings")?;
-        Self::try_from_settings_and_env_vars_with_sources(settings, sources, |name| {
-            if name == "SQUEEZY_PROVIDER" {
-                Some(provider.to_string())
-            } else {
-                env::var(name).ok()
-            }
-        })
+        Self::try_from_settings_and_env_vars_with_sources(
+            settings,
+            sources,
+            Some(provider),
+            |name| env::var(name).ok(),
+        )
     }
 
     pub fn from_env_with_provider(provider: &str) -> Self {
-        Self::from_env_vars(|name| {
-            if name == "SQUEEZY_PROVIDER" {
-                Some(provider.to_string())
-            } else {
-                env::var(name).ok()
-            }
-        })
+        Self::from_env_vars(Some(provider), |name| env::var(name).ok())
     }
 
-    fn from_env_vars(mut var: impl FnMut(&str) -> Option<String>) -> Self {
-        Self::try_from_settings_and_env_vars(SettingsFile::default(), &mut var)
-            .unwrap_or_else(|_| Self::built_in_defaults())
+    fn from_env_vars(
+        cli_provider: Option<&str>,
+        mut var: impl FnMut(&str) -> Option<String>,
+    ) -> Self {
+        Self::try_from_settings_and_env_vars(SettingsFile::default(), cli_provider, &mut var)
+            .unwrap_or_else(|error| {
+                // Surfaces in real runs through tracing; tests have no subscriber
+                // so they fall back silently the way they always did.
+                tracing::warn!(
+                    target: "squeezy_core::config",
+                    %error,
+                    "config resolution failed; falling back to built-in defaults",
+                );
+                Self::built_in_defaults()
+            })
     }
 
     #[cfg(test)]
@@ -117,17 +122,19 @@ impl AppConfig {
         settings: SettingsFile,
         mut var: impl FnMut(&str) -> Option<String>,
     ) -> Self {
-        Self::try_from_settings_and_env_vars(settings, &mut var)
+        Self::try_from_settings_and_env_vars(settings, None, &mut var)
             .unwrap_or_else(|_| Self::built_in_defaults())
     }
 
     fn try_from_settings_and_env_vars(
         settings: SettingsFile,
+        cli_provider: Option<&str>,
         var: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self> {
         Self::try_from_settings_and_env_vars_with_sources(
             settings,
             vec!["defaults".to_string()],
+            cli_provider,
             var,
         )
     }
@@ -135,6 +142,7 @@ impl AppConfig {
     fn try_from_settings_and_env_vars_with_sources(
         settings: SettingsFile,
         mut sources: Vec<String>,
+        cli_provider: Option<&str>,
         mut var: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self> {
         let mut env_used = false;
@@ -147,7 +155,10 @@ impl AppConfig {
         };
 
         let model_settings = settings.model_settings.clone().unwrap_or_default();
-        let provider_name = get_var("SQUEEZY_PROVIDER")
+        let env_provider = get_var("SQUEEZY_PROVIDER");
+        let provider_name = cli_provider
+            .map(str::to_string)
+            .or(env_provider)
             .or(model_settings.provider)
             .or(settings.provider.clone())
             .unwrap_or_else(|| "openai".to_string())
@@ -328,6 +339,9 @@ impl AppConfig {
         if env_used {
             sources.push("env".to_string());
         }
+        if cli_provider.is_some() && !sources.iter().any(|source| source == "cli") {
+            sources.push("cli".to_string());
+        }
         Ok(Self {
             provider,
             model,
@@ -357,51 +371,64 @@ impl AppConfig {
         })
     }
 
-    fn from_default_paths_and_env() -> Result<Self> {
-        Self::from_default_paths_and_env_with_provider_value(None)
-    }
-
-    fn from_default_paths_and_env_with_provider(provider: &str) -> Result<Self> {
-        Self::from_default_paths_and_env_with_provider_value(Some(provider))
-    }
-
     fn from_default_paths_and_env_with_provider_value(provider: Option<&str>) -> Result<Self> {
         let (settings, sources) = load_default_settings_sources()?;
-        Self::try_from_settings_and_env_vars_with_sources(settings, sources, |name| {
-            if name == "SQUEEZY_PROVIDER" {
-                provider.map(str::to_string).or_else(|| env::var(name).ok())
-            } else {
-                env::var(name).ok()
-            }
+        Self::try_from_settings_and_env_vars_with_sources(settings, sources, provider, |name| {
+            env::var(name).ok()
         })
     }
 
     fn built_in_defaults() -> Self {
-        Self::try_from_settings_and_env_vars(SettingsFile::default(), |_| None)
+        Self::try_from_settings_and_env_vars(SettingsFile::default(), None, |_| None)
             .expect("built-in config defaults are valid")
     }
 
+    /// Returns `config_sources` with file paths reduced to short labels
+    /// (`"user"`, `"project"`) for display in narrow status lines. Full
+    /// paths remain available on `config_sources` and via `config inspect`.
+    pub fn config_source_labels(&self) -> Vec<&str> {
+        self.config_sources
+            .iter()
+            .map(|source| match source.split_once(':') {
+                Some((label, _)) => label,
+                None => source.as_str(),
+            })
+            .collect()
+    }
+
+    /// Returns a TOML-shaped report of the effective configuration with
+    /// sensitive values redacted. The output is valid TOML and the same
+    /// document can be parsed back by `SettingsFile::from_toml_str`
+    /// (note: `[graph]`, `[tui].status_verbosity`, and `[mcp.servers.*]`
+    /// sections currently round-trip into the typed model but no consumer
+    /// reads them yet).
     pub fn inspect_redacted(&self) -> String {
-        let provider_name = match &self.provider {
-            ProviderConfig::OpenAi(_) => "openai",
-            ProviderConfig::Anthropic(_) => "anthropic",
-            ProviderConfig::Google(_) => "google",
-            ProviderConfig::AzureOpenAi(_) => "azure_openai",
-            ProviderConfig::Bedrock(_) => "bedrock",
-            ProviderConfig::Ollama(_) => "ollama",
-        };
         let mut output = String::new();
         output.push_str("# effective Squeezy config\n");
-        output.push_str(&format!("sources = {:?}\n\n", self.config_sources));
+        // sources is a debug artifact, emitted as a comment so the document
+        // round-trips through SettingsFile::from_toml_str without choking on
+        // a key that does not belong in user-authored settings.
+        output.push_str(&format!(
+            "# sources = {}\n\n",
+            toml_string_array(&self.config_sources)
+        ));
+
         output.push_str("[model]\n");
-        output.push_str(&format!("provider = {provider_name:?}\n"));
-        output.push_str(&format!("model = {:?}\n", self.model));
-        output.push_str(&format!("profile = {:?}\n", self.profile));
+        output.push_str(&format!(
+            "provider = {}\n",
+            toml_string(provider_kind(&self.provider))
+        ));
+        output.push_str(&format!("model = {}\n", toml_string(&self.model)));
+        output.push_str(&format!(
+            "profile = {}\n",
+            toml_string(self.profile.as_str())
+        ));
         output.push_str(&format!(
             "max_output_tokens = {}\n",
             self.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
         ));
         output.push_str(&format!("store_responses = {}\n\n", self.store_responses));
+
         output.push_str("[budgets]\n");
         output.push_str(&format!(
             "max_parallel_tools = {}\n",
@@ -423,52 +450,156 @@ impl AppConfig {
             "max_tool_result_bytes_per_round = {}\n\n",
             self.max_tool_result_bytes_per_round
         ));
+
         output.push_str("[permissions]\n");
-        output.push_str(&format!("read = {:?}\n", self.permissions.read));
-        output.push_str(&format!("edit = {:?}\n", self.permissions.edit));
-        output.push_str(&format!("shell = {:?}\n", self.permissions.shell));
         output.push_str(&format!(
-            "ignored_search = {:?}\n",
-            self.permissions.ignored_search
+            "read = {}\n",
+            toml_string(self.permissions.read.as_str())
         ));
-        output.push_str(&format!("web = {:?}\n\n", self.permissions.web));
+        output.push_str(&format!(
+            "edit = {}\n",
+            toml_string(self.permissions.edit.as_str())
+        ));
+        output.push_str(&format!(
+            "shell = {}\n",
+            toml_string(self.permissions.shell.as_str())
+        ));
+        output.push_str(&format!(
+            "ignored_search = {}\n",
+            toml_string(self.permissions.ignored_search.as_str())
+        ));
+        output.push_str(&format!(
+            "web = {}\n\n",
+            toml_string(self.permissions.web.as_str())
+        ));
+
         output.push_str("[telemetry]\n");
         output.push_str(&format!("enabled = {}\n", self.telemetry.enabled));
-        output.push_str(&format!("endpoint = {:?}\n\n", self.telemetry.endpoint));
+        output.push_str(&format!(
+            "endpoint = {}\n\n",
+            toml_string(&self.telemetry.endpoint)
+        ));
+
         output.push_str("[web]\n");
-        output.push_str(&format!("exa_mcp_url = {:?}\n", self.exa_mcp_url));
+        output.push_str(&format!(
+            "exa_mcp_url = {}\n",
+            toml_string(&self.exa_mcp_url)
+        ));
         output.push_str("exa_api_key_env = \"<redacted>\"\n\n");
+
         output.push_str("[graph]\n");
-        output.push_str(&format!("languages = {:?}\n", self.graph.languages));
+        output.push_str(&format!(
+            "languages = {}\n",
+            toml_string_array(&self.graph.languages)
+        ));
         output.push_str(&format!("max_file_bytes = {}\n", self.graph.max_file_bytes));
         output.push_str(&format!("include_hidden = {}\n", self.graph.include_hidden));
         output.push_str(&format!(
             "require_indexing_signal = {}\n\n",
             self.graph.require_indexing_signal
         ));
+
         output.push_str("[cache]\n");
-        output.push_str(&format!("root = {:?}\n", self.cache.root));
-        output.push_str(&format!("tool_outputs = {:?}\n\n", self.cache.tool_outputs));
+        if let Some(root) = &self.cache.root {
+            output.push_str(&format!(
+                "root = {}\n",
+                toml_string(&root.display().to_string())
+            ));
+        }
+        if let Some(tool_outputs) = &self.cache.tool_outputs {
+            output.push_str(&format!(
+                "tool_outputs = {}\n",
+                toml_string(&tool_outputs.display().to_string())
+            ));
+        }
+        output.push('\n');
+
         output.push_str("[tui]\n");
         output.push_str(&format!("tick_rate_ms = {}\n", self.tui.tick_rate_ms));
         output.push_str(&format!(
-            "status_verbosity = {:?}\n\n",
-            self.tui.status_verbosity
+            "status_verbosity = {}\n\n",
+            toml_string(self.tui.status_verbosity.as_str())
         ));
+
         for (name, server) in &self.mcp_servers {
-            output.push_str(&format!("[mcp.servers.{name}]\n"));
+            output.push_str(&format!(
+                "[mcp.servers.{}]\n",
+                toml_bare_or_quoted_key(name)
+            ));
             output.push_str(&format!("enabled = {}\n", server.enabled));
-            output.push_str(&format!("transport = {:?}\n", server.transport));
-            output.push_str(&format!("command = {:?}\n", server.command));
-            output.push_str(&format!("args = {:?}\n", server.args));
-            output.push_str(&format!("url = {:?}\n", server.url));
-            output.push_str(&format!("timeout_ms = {:?}\n", server.timeout_ms));
+            output.push_str(&format!(
+                "transport = {}\n",
+                toml_string(server.transport.as_str())
+            ));
+            if let Some(command) = &server.command {
+                output.push_str(&format!("command = {}\n", toml_string(command)));
+            }
+            output.push_str(&format!("args = {}\n", toml_string_array(&server.args)));
+            if let Some(url) = &server.url {
+                output.push_str(&format!("url = {}\n", toml_string(url)));
+            }
+            if let Some(timeout_ms) = server.timeout_ms {
+                output.push_str(&format!("timeout_ms = {timeout_ms}\n"));
+            }
             if !server.env.is_empty() {
                 output.push_str("env = \"<redacted>\"\n");
             }
             output.push('\n');
         }
         output
+    }
+}
+
+fn provider_kind(provider: &ProviderConfig) -> &'static str {
+    match provider {
+        ProviderConfig::OpenAi(_) => "openai",
+        ProviderConfig::Anthropic(_) => "anthropic",
+        ProviderConfig::Google(_) => "google",
+        ProviderConfig::AzureOpenAi(_) => "azure_openai",
+        ProviderConfig::Bedrock(_) => "bedrock",
+        ProviderConfig::Ollama(_) => "ollama",
+    }
+}
+
+fn toml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn toml_string_array<S: AsRef<str>>(values: &[S]) -> String {
+    let mut out = String::from("[");
+    for (i, value) in values.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&toml_string(value.as_ref()));
+    }
+    out.push(']');
+    out
+}
+
+fn toml_bare_or_quoted_key(key: &str) -> String {
+    if !key.is_empty()
+        && key
+            .chars()
+            .all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '-'))
+    {
+        key.to_string()
+    } else {
+        toml_string(key)
     }
 }
 
@@ -540,6 +671,14 @@ impl ModelProfile {
             "balanced" | "default" => Some(Self::Balanced),
             "strong" => Some(Self::Strong),
             _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cheap => "cheap",
+            Self::Balanced => "balanced",
+            Self::Strong => "strong",
         }
     }
 }
@@ -922,6 +1061,14 @@ impl PermissionMode {
             _ => None,
         }
     }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -1285,6 +1432,15 @@ pub enum StatusVerbosity {
     Verbose,
 }
 
+impl StatusVerbosity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Verbose => "verbose",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiConfig {
     pub tick_rate_ms: u64,
@@ -1345,6 +1501,13 @@ pub fn default_settings_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".squeezy/settings.toml"))
 }
 
+/// Walks up the directory tree from `start` looking for `squeezy.toml`.
+///
+/// The starting directory is canonicalized so that `..` segments do not
+/// confuse the walk and so that running from inside a symlinked checkout
+/// resolves to the real workspace root. Falling back to the original path
+/// when canonicalization fails (for example on a path that does not yet
+/// exist) keeps tests and bare invocations working.
 pub fn find_project_settings_path(start: impl AsRef<Path>) -> Option<PathBuf> {
     let start = start.as_ref();
     let mut dir = if start.is_file() {
@@ -1367,78 +1530,103 @@ pub fn find_project_settings_path(start: impl AsRef<Path>) -> Option<PathBuf> {
 }
 
 pub fn user_settings_template() -> &'static str {
-    r#"[model]
-provider = "openai"
-profile = "balanced"
-model = ""
-max_output_tokens = 128
-store_responses = false
+    r#"# User-level Squeezy settings. Uncomment any key you want to override.
+# Values shown after `=` are the built-in defaults that apply when the
+# key is absent or commented out.
 
-[providers.openai]
-api_key_env = "OPENAI_API_KEY"
-base_url = "https://api.openai.com/v1"
-default_model = "gpt-5-nano"
+[model]
+# provider = "openai"          # openai | anthropic | google | azure_openai | bedrock | ollama
+# profile = "balanced"         # cheap | balanced | strong
+# model = "gpt-5-nano"         # provider-specific model id; leave unset to use the provider default
+# max_output_tokens = 128
+# store_responses = false      # only honored by openai/azure_openai
 
-[providers.anthropic]
-api_key_env = "ANTHROPIC_API_KEY"
-base_url = "https://api.anthropic.com/v1"
-default_model = "claude-3-5-haiku-20241022"
+# [providers.openai]
+# api_key_env = "OPENAI_API_KEY"
+# base_url = "https://api.openai.com/v1"
+# default_model = "gpt-5-nano"
+
+# [providers.anthropic]
+# api_key_env = "ANTHROPIC_API_KEY"
+# base_url = "https://api.anthropic.com/v1"
+# default_model = "claude-3-5-haiku-20241022"
 
 [permissions]
-read = "allow"
-edit = "ask"
-shell = "ask"
-ignored_search = "allow"
-web = "ask"
+# read = "allow"
+# edit = "ask"
+# shell = "ask"
+# ignored_search = "allow"
+# web = "ask"
 
 [telemetry]
-enabled = true
+# enabled = true
 
-[web]
-exa_mcp_url = "https://mcp.exa.ai/mcp"
-exa_api_key_env = "EXA_API_KEY"
+# [web]
+# exa_mcp_url = "https://mcp.exa.ai/mcp"
+# exa_api_key_env = "EXA_API_KEY"
 "#
 }
 
 pub fn project_settings_template() -> &'static str {
-    r#"[budgets]
-max_parallel_tools = 8
-max_tool_calls_per_turn = 64
-max_tool_bytes_read_per_turn = 20000000
-max_search_files_per_turn = 50000
-max_tool_result_bytes_per_round = 50000
+    r#"# Project-level Squeezy settings (committed alongside the project).
+# Uncomment any key to override the built-in defaults shown after `=`.
 
-[graph]
-languages = ["rust", "python"]
-max_file_bytes = 1000000
-include_hidden = false
-require_indexing_signal = true
+[budgets]
+# max_parallel_tools = 8
+# max_tool_calls_per_turn = 64
+# max_tool_bytes_read_per_turn = 20000000
+# max_search_files_per_turn = 50000
+# max_tool_result_bytes_per_round = 50000
+
+# `[graph]`, `[tui].status_verbosity`, and `[mcp.servers.*]` are parsed and
+# round-trip through `squeezy config inspect` but no runtime consumer reads
+# them yet; treat them as v0 reservations.
+
+# [graph]
+# languages = ["rust", "python"]
+# max_file_bytes = 1000000
+# include_hidden = false
+# require_indexing_signal = true
 
 [cache]
-tool_outputs = ".squeezy/tool_outputs"
+# Relative paths are resolved against the project root (the directory
+# containing this squeezy.toml).
+# tool_outputs = ".squeezy/tool_outputs"
 
 [tui]
-tick_rate_ms = 50
-status_verbosity = "compact"
+# tick_rate_ms = 50
+# status_verbosity = "compact"   # not wired yet
 "#
 }
 
 fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>)> {
+    let user_path = default_settings_path();
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_path = find_project_settings_path(cwd);
+    load_settings_from_paths(Some(user_path.as_path()), project_path.as_deref())
+}
+
+fn load_settings_from_paths(
+    user_path: Option<&Path>,
+    project_path: Option<&Path>,
+) -> Result<(SettingsFile, Vec<String>)> {
     let mut settings = SettingsFile::default();
     let mut sources = vec!["defaults".to_string()];
-    let user_path = default_settings_path();
-    if user_path.is_file() {
+    if let Some(user_path) = user_path
+        && user_path.is_file()
+    {
         let user = SettingsFile::from_toml_str(
-            &fs::read_to_string(&user_path)?,
+            &fs::read_to_string(user_path)?,
             &user_path.display().to_string(),
         )?;
         settings.merge(user);
         sources.push(format!("user:{}", user_path.display()));
     }
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if let Some(project_path) = find_project_settings_path(cwd) {
+    if let Some(project_path) = project_path
+        && project_path.is_file()
+    {
         let project = SettingsFile::from_toml_str(
-            &fs::read_to_string(&project_path)?,
+            &fs::read_to_string(project_path)?,
             &project_path.display().to_string(),
         )?;
         settings.merge(project);
@@ -1507,6 +1695,16 @@ pub enum McpTransport {
     Stdio,
     Sse,
     Http,
+}
+
+impl McpTransport {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Sse => "sse",
+            Self::Http => "http",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

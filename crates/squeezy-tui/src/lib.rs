@@ -25,7 +25,7 @@ pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()
     let mut app = TuiApp::new(
         agent.provider_name(),
         config.model.clone(),
-        config.config_sources.join(","),
+        config.config_source_labels().join(","),
     );
 
     loop {

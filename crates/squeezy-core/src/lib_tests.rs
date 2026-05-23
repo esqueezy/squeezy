@@ -24,7 +24,7 @@ fn source_span_contains_byte_inclusively() {
 
 #[test]
 fn config_without_env_uses_openai_provider_defaults() {
-    let config = AppConfig::from_env_vars(|_| None);
+    let config = AppConfig::from_env_vars(None, |_| None);
     assert_eq!(config.model, DEFAULT_OPENAI_MODEL);
     assert_eq!(config.max_output_tokens, Some(DEFAULT_MAX_OUTPUT_TOKENS));
     assert_eq!(config.permissions, PermissionPolicy::default());
@@ -69,7 +69,7 @@ fn config_without_env_uses_openai_provider_defaults() {
 
 #[test]
 fn config_reads_supported_env_overrides() {
-    let config = AppConfig::from_env_vars(|name| match name {
+    let config = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_MODEL" => Some("custom-model".to_string()),
         "OPENAI_BASE_URL" => Some("https://example.test/v1".to_string()),
         "SQUEEZY_EDIT_PERMISSION" => Some("allow".to_string()),
@@ -123,7 +123,7 @@ fn config_reads_supported_env_overrides() {
 
 #[test]
 fn config_can_select_anthropic_provider_defaults() {
-    let config = AppConfig::from_env_vars(|name| match name {
+    let config = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_PROVIDER" => Some("anthropic".to_string()),
         _ => None,
     });
@@ -140,7 +140,7 @@ fn config_can_select_anthropic_provider_defaults() {
 
 #[test]
 fn config_reads_anthropic_env_overrides() {
-    let config = AppConfig::from_env_vars(|name| match name {
+    let config = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_PROVIDER" => Some("claude".to_string()),
         "SQUEEZY_MODEL" => Some("claude-test".to_string()),
         "ANTHROPIC_BASE_URL" => Some("https://anthropic.example.test/v1".to_string()),
@@ -253,7 +253,7 @@ default_model = "claude-settings-model"
 
 #[test]
 fn config_can_select_azure_bedrock_and_ollama_defaults() {
-    let azure = AppConfig::from_env_vars(|name| match name {
+    let azure = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_PROVIDER" => Some("azure_openai".to_string()),
         "AZURE_OPENAI_BASE_URL" => Some("https://resource.openai.azure.com/openai/v1".to_string()),
         _ => None,
@@ -261,14 +261,14 @@ fn config_can_select_azure_bedrock_and_ollama_defaults() {
     assert!(matches!(azure.provider, ProviderConfig::AzureOpenAi(_)));
     assert_eq!(azure.model, DEFAULT_AZURE_OPENAI_MODEL);
 
-    let bedrock = AppConfig::from_env_vars(|name| match name {
+    let bedrock = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_PROVIDER" => Some("bedrock".to_string()),
         _ => None,
     });
     assert!(matches!(bedrock.provider, ProviderConfig::Bedrock(_)));
     assert_eq!(bedrock.model, DEFAULT_BEDROCK_MODEL);
 
-    let ollama = AppConfig::from_env_vars(|name| match name {
+    let ollama = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_PROVIDER" => Some("ollama".to_string()),
         _ => None,
     });
@@ -447,4 +447,196 @@ fn generated_templates_parse() {
         .expect("user template parses");
     SettingsFile::from_toml_str(project_settings_template(), "project template")
         .expect("project template parses");
+}
+
+#[test]
+fn cli_provider_does_not_get_tagged_as_env() {
+    let settings = SettingsFile::default();
+    let config = AppConfig::try_from_settings_and_env_vars(settings, Some("openai"), |_| None)
+        .expect("config builds");
+
+    assert_eq!(config.config_sources, vec!["defaults", "cli"]);
+    assert!(matches!(config.provider, ProviderConfig::OpenAi(_)));
+}
+
+#[test]
+fn env_provider_tagged_as_env_not_cli() {
+    let settings = SettingsFile::default();
+    let config = AppConfig::try_from_settings_and_env_vars(settings, None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("openai".to_string()),
+        _ => None,
+    })
+    .expect("config builds");
+
+    assert_eq!(config.config_sources, vec!["defaults", "env"]);
+}
+
+#[test]
+fn cli_and_env_both_tag_when_both_set() {
+    let settings = SettingsFile::default();
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("anthropic"), |name| match name {
+            "SQUEEZY_MODEL" => Some("claude-env".to_string()),
+            _ => None,
+        })
+        .expect("config builds");
+
+    assert_eq!(config.config_sources, vec!["defaults", "env", "cli"]);
+    assert!(matches!(config.provider, ProviderConfig::Anthropic(_)));
+    assert_eq!(config.model, "claude-env");
+}
+
+#[test]
+fn config_source_labels_strip_paths() {
+    let mut config = AppConfig::from_env_vars(None, |_| None);
+    config.config_sources = vec![
+        "defaults".to_string(),
+        "user:/home/me/.squeezy/settings.toml".to_string(),
+        "project:/repo/squeezy.toml".to_string(),
+        "env".to_string(),
+        "cli".to_string(),
+    ];
+
+    assert_eq!(
+        config.config_source_labels(),
+        vec!["defaults", "user", "project", "env", "cli"],
+    );
+}
+
+#[test]
+fn inspect_output_is_valid_toml_and_uses_lowercase_enum_strings() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "anthropic"
+profile = "strong"
+model = "claude-test"
+
+[permissions]
+read = "deny"
+
+[mcp.servers.docs]
+transport = "http"
+url = "https://docs.example/mcp"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    let inspect = config.inspect_redacted();
+
+    assert!(inspect.contains("profile = \"strong\""));
+    assert!(inspect.contains("provider = \"anthropic\""));
+    assert!(inspect.contains("read = \"deny\""));
+    assert!(inspect.contains("status_verbosity = \"compact\""));
+    assert!(inspect.contains("transport = \"http\""));
+    assert!(!inspect.contains("Balanced"));
+    assert!(!inspect.contains("None"));
+
+    SettingsFile::from_toml_str(&inspect, "inspect roundtrip")
+        .expect("inspect output parses as TOML");
+}
+
+#[test]
+fn inspect_omits_optional_cache_keys_when_unset() {
+    let config = AppConfig::from_env_vars(None, |_| None);
+    let inspect = config.inspect_redacted();
+
+    assert!(inspect.contains("[cache]"));
+    assert!(!inspect.contains("root ="));
+    assert!(!inspect.contains("tool_outputs ="));
+}
+
+#[test]
+fn load_settings_from_paths_merges_user_then_project() {
+    let dir = std::env::temp_dir().join(format!(
+        "squeezy_config_paths_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let user_path = dir.join("user.toml");
+    let project_path = dir.join("squeezy.toml");
+    std::fs::write(
+        &user_path,
+        r#"
+[model]
+provider = "openai"
+model = "user-model"
+
+[providers.openai]
+api_key_env = "USER_OPENAI_KEY"
+base_url = "https://user.example/v1"
+"#,
+    )
+    .expect("write user file");
+    std::fs::write(
+        &project_path,
+        r#"
+[model]
+model = "project-model"
+
+[providers.openai]
+default_model = "project-default"
+"#,
+    )
+    .expect("write project file");
+
+    let (settings, sources) =
+        load_settings_from_paths(Some(user_path.as_path()), Some(project_path.as_path()))
+            .expect("merge sources");
+
+    assert_eq!(sources[0], "defaults");
+    assert!(sources[1].starts_with("user:"));
+    assert!(sources[1].contains("user.toml"));
+    assert!(sources[2].starts_with("project:"));
+    assert!(sources[2].contains("squeezy.toml"));
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert_eq!(config.model, "project-model");
+    match config.provider {
+        ProviderConfig::OpenAi(openai) => {
+            assert_eq!(openai.api_key_env, "USER_OPENAI_KEY");
+            assert_eq!(openai.base_url, "https://user.example/v1");
+        }
+        _ => panic!("expected OpenAI provider"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn load_settings_from_paths_skips_missing_files() {
+    let dir = std::env::temp_dir().join(format!(
+        "squeezy_config_missing_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let user_path = dir.join("does_not_exist.toml");
+    let project_path = dir.join("also_missing.toml");
+
+    let (settings, sources) =
+        load_settings_from_paths(Some(user_path.as_path()), Some(project_path.as_path()))
+            .expect("merge sources");
+
+    assert_eq!(sources, vec!["defaults".to_string()]);
+    assert!(settings.providers.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_user_template_contains_no_uncommented_assignments() {
+    for line in user_settings_template().lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
+            continue;
+        }
+        panic!("user template line should be commented or sectional, got: {trimmed:?}");
+    }
 }

@@ -1408,10 +1408,13 @@ struct ToolOutputStore {
 impl ToolOutputStore {
     fn new(root: &Path, config: ToolOutputConfig) -> Result<Self> {
         let config = config.normalized();
+        let dir = match config.output_dir {
+            Some(dir) if dir.is_absolute() => dir,
+            Some(dir) => root.join(dir),
+            None => root.join(".squeezy").join("tool_outputs"),
+        };
         let store = Self {
-            dir: config
-                .output_dir
-                .unwrap_or_else(|| root.join(".squeezy").join("tool_outputs")),
+            dir,
             spill_threshold_bytes: config.spill_threshold_bytes,
             preview_bytes: config.preview_bytes,
             retention: Duration::from_secs(config.retention_days * 24 * 60 * 60),

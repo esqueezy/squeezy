@@ -5,11 +5,11 @@ use std::{
     sync::Arc,
 };
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt;
 use squeezy_core::{
-    AppConfig, ModelProfile, SqueezyError, default_settings_path, project_settings_template,
-    user_settings_template,
+    AppConfig, ModelProfile, PROJECT_SETTINGS_FILE, SqueezyError, default_settings_path,
+    project_settings_template, user_settings_template,
 };
 use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, PROVIDERS, UnavailableProvider,
@@ -21,17 +21,15 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Parser)]
 #[command(name = "squeezy", version, about = "Cost-aware coding agent TUI")]
 struct Cli {
-    #[arg(long, env = "SQUEEZY_PROVIDER", help = "Provider id")]
+    /// Provider id. `SQUEEZY_PROVIDER` is also honored, but goes through the
+    /// env source layer so it is tagged correctly by `config inspect`.
+    #[arg(long, help = "Provider id (openai, anthropic, google, ...)")]
     provider: Option<String>,
-    #[arg(long, env = "SQUEEZY_MODEL")]
+    #[arg(long, help = "Model id; overrides settings and SQUEEZY_MODEL")]
     model: Option<String>,
-    #[arg(
-        long,
-        env = "SQUEEZY_PROFILE",
-        help = "Model profile: cheap, balanced, or strong"
-    )]
+    #[arg(long, help = "Model profile: cheap, balanced, or strong")]
     profile: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Max output tokens; overrides SQUEEZY_MAX_OUTPUT_TOKENS")]
     max_output_tokens: Option<u32>,
     #[arg(long, help = "List configured built-in providers")]
     list_providers: bool,
@@ -60,13 +58,20 @@ enum ConfigCommand {
     Inspect,
     #[command(about = "Create a default user or project settings file")]
     Init {
-        #[arg(long, conflicts_with = "project")]
-        user: bool,
-        #[arg(long, conflicts_with = "user")]
-        project: bool,
-        #[arg(long)]
+        #[command(flatten)]
+        scope: InitScope,
+        #[arg(long, help = "Overwrite an existing file")]
         force: bool,
     },
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct InitScope {
+    #[arg(long, help = "Write the user-level settings file")]
+    user: bool,
+    #[arg(long, help = "Write the project-level settings file")]
+    project: bool,
 }
 
 #[tokio::main]
@@ -116,6 +121,10 @@ async fn main() -> squeezy_core::Result<()> {
     if cli.health {
         println!("squeezy: ok");
         println!("config_sources={}", config.config_sources.join(","));
+        println!(
+            "config_source_labels={}",
+            config.config_source_labels().join(",")
+        );
         return Ok(());
     }
 
@@ -137,7 +146,7 @@ async fn main() -> squeezy_core::Result<()> {
 
 fn config_from_cli(cli: &Cli) -> squeezy_core::Result<AppConfig> {
     let mut config = config_from_cli_provider(cli.provider.as_deref())?;
-    let mut cli_used = cli.provider.is_some();
+    let mut cli_used = false;
     if let Some(model) = &cli.model {
         cli_used = true;
         config.model = model.clone();
@@ -163,21 +172,12 @@ fn handle_config_command(command: &ConfigCommand, cli: &Cli) -> squeezy_core::Re
             print!("{}", config.inspect_redacted());
             Ok(())
         }
-        ConfigCommand::Init {
-            user,
-            project,
-            force,
-        } => {
-            if *user == *project {
-                return Err(SqueezyError::Config(
-                    "config init requires exactly one of --user or --project".to_string(),
-                ));
-            }
-            let (path, template) = if *user {
+        ConfigCommand::Init { scope, force } => {
+            let (path, template) = if scope.user {
                 (default_settings_path(), user_settings_template())
             } else {
                 (
-                    PathBuf::from(squeezy_core::PROJECT_SETTINGS_FILE),
+                    PathBuf::from(PROJECT_SETTINGS_FILE),
                     project_settings_template(),
                 )
             };
@@ -187,7 +187,9 @@ fn handle_config_command(command: &ConfigCommand, cli: &Cli) -> squeezy_core::Re
                     path.display()
                 )));
             }
-            if let Some(parent) = path.parent() {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
                 fs::create_dir_all(parent)?;
             }
             fs::write(&path, template)?;
