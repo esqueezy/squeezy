@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use squeezy_core::{CostSnapshot, OpenAiConfig, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
 
-use crate::{LlmEvent, LlmProvider, LlmRequest, LlmStream};
+use crate::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
@@ -32,15 +32,33 @@ impl OpenAiProvider {
         let mut body = json!({
             "model": request.model,
             "instructions": request.instructions,
-            "input": request.input,
+            "input": openai_input(&request.input),
             "stream": true,
-            "store": false,
+            "store": request.store,
         });
         if let Some(previous_response_id) = &request.previous_response_id {
             body["previous_response_id"] = json!(previous_response_id);
         }
         if let Some(max_output_tokens) = request.max_output_tokens {
             body["max_output_tokens"] = json!(max_output_tokens);
+        }
+        if !request.tools.is_empty() {
+            let mut tools = request.tools.iter().collect::<Vec<_>>();
+            tools.sort_by(|left, right| left.name.cmp(&right.name));
+            body["tools"] = json!(
+                tools
+                    .iter()
+                    .map(|tool| {
+                        json!({
+                            "type": "function",
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                            "strict": tool.strict,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            );
         }
         body
     }
@@ -210,6 +228,13 @@ fn parse_openai_event(data: &str) -> Result<Option<LlmEvent>> {
                 .to_string();
             Ok(Some(LlmEvent::TextDelta(delta)))
         }
+        "response.output_item.done" => {
+            if let Some(tool_call) = parse_tool_call(value.get("item"))? {
+                Ok(Some(LlmEvent::ToolCall(tool_call)))
+            } else {
+                Ok(None)
+            }
+        }
         "response.completed" => {
             let response_id = value
                 .get("response")
@@ -242,6 +267,77 @@ fn parse_openai_event(data: &str) -> Result<Option<LlmEvent>> {
         }
         _ => Ok(None),
     }
+}
+
+fn openai_input(input: &[LlmInputItem]) -> Value {
+    if let [LlmInputItem::UserText(text)] = input {
+        return json!(text);
+    }
+
+    Value::Array(input.iter().map(openai_input_item).collect())
+}
+
+fn openai_input_item(item: &LlmInputItem) -> Value {
+    match item {
+        LlmInputItem::UserText(text) => json!({
+            "role": "user",
+            "content": text,
+        }),
+        LlmInputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        } => json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string()),
+        }),
+        LlmInputItem::FunctionCallOutput { call_id, output } => json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output,
+        }),
+    }
+}
+
+fn parse_tool_call(item: Option<&Value>) -> Result<Option<LlmToolCall>> {
+    let Some(item) = item else {
+        return Ok(None);
+    };
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return Ok(None);
+    }
+
+    let call_id = item
+        .get("call_id")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("id").and_then(Value::as_str))
+        .ok_or_else(|| SqueezyError::ProviderStream("function call missing call_id".to_string()))?
+        .to_string();
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| SqueezyError::ProviderStream("function call missing name".to_string()))?
+        .to_string();
+    let arguments = match item.get("arguments") {
+        Some(Value::String(arguments)) => serde_json::from_str(arguments).map_err(|err| {
+            SqueezyError::ProviderStream(format!("invalid function call arguments: {err}"))
+        })?,
+        Some(arguments @ Value::Object(_)) => arguments.clone(),
+        None => Value::Object(Default::default()),
+        Some(_) => {
+            return Err(SqueezyError::ProviderStream(
+                "function call arguments must be a JSON object or encoded JSON string".to_string(),
+            ));
+        }
+    };
+
+    Ok(Some(LlmToolCall {
+        call_id,
+        name,
+        arguments,
+    }))
 }
 
 fn parse_cost(response: Option<&Value>) -> CostSnapshot {
