@@ -165,6 +165,16 @@ impl Agent {
         next
     }
 
+    /// Execute a single tool call from the TUI / local UX path rather than
+    /// from inside an agent turn. The "manual" group id mirrors how the agent
+    /// labels human-driven invocations so checkpoint grouping stays
+    /// consistent across both entry points.
+    pub async fn execute_local_tool(&self, call: ToolCall) -> ToolResult {
+        self.tools
+            .execute_for_group(call, CancellationToken::new(), "manual".to_string())
+            .await
+    }
+
     pub async fn flush_telemetry(&self) {
         let _ = self.telemetry.flush().await;
     }
@@ -740,7 +750,10 @@ async fn run_one_tool(
         })
         .await;
     let started = Instant::now();
-    let result = context.tools.execute(call, context.cancel.clone()).await;
+    let result = context
+        .tools
+        .execute_for_group(call, context.cancel.clone(), context.turn_id.to_string())
+        .await;
     emit_tool_telemetry(
         context.config,
         &context.telemetry,
@@ -891,7 +904,7 @@ fn emit_tool_telemetry(
         turn_index: turn_id.get(),
         tool_sequence,
         tool_name: &result.tool_name,
-        status: telemetry_tool_status(result.status.clone()),
+        status: telemetry_tool_status(result.status),
         duration,
         cost: ToolCostProperties {
             files_scanned: result.cost_hint.files_scanned,

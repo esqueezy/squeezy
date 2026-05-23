@@ -32,7 +32,10 @@ use squeezy_graph::{
     DirtyAnnotation, DirtyRange, GraphManager, GraphSymbol, ReferenceHit, SignatureQuery,
 };
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog};
-use squeezy_vcs::{DiffFile, DiffFileStatus, DiffMode, DiffOptions, DiffSnapshot, GitVcs};
+use squeezy_vcs::{
+    CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions,
+    DiffSnapshot, GitVcs, RollbackMode, RollbackTarget, WorkspaceSnapshot,
+};
 use squeezy_workspace::{
     CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexCoverage, IndexingPolicy,
 };
@@ -86,7 +89,7 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolStatus {
     Success,
     Error,
@@ -384,6 +387,7 @@ pub struct ToolRegistry {
     http: Arc<dyn WebHttpClient>,
     graph: Arc<StdMutex<Option<GraphManager>>>,
     vcs: Arc<GitVcs>,
+    checkpoints: Arc<CheckpointStore>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
     skills: Arc<SkillCatalog>,
     redactor: Arc<Redactor>,
@@ -515,6 +519,7 @@ impl ToolRegistry {
             GraphManager::open_with_crawl_options(&root, Default::default(), crawl_options.clone())
                 .ok();
         let vcs = GitVcs::open(&root)?;
+        let checkpoints = CheckpointStore::open(&root)?;
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -522,6 +527,7 @@ impl ToolRegistry {
             http,
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
+            checkpoints: Arc::new(checkpoints),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(skills),
             redactor,
@@ -548,6 +554,7 @@ impl ToolRegistry {
             GraphManager::open_with_crawl_options(&root, Default::default(), crawl_options.clone())
                 .ok();
         let vcs = GitVcs::open(&root)?;
+        let checkpoints = CheckpointStore::open(&root)?;
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -555,6 +562,7 @@ impl ToolRegistry {
             http,
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
+            checkpoints: Arc::new(checkpoints),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(SkillCatalog::empty()),
             redactor: Arc::new(Redactor::default()),
@@ -626,6 +634,10 @@ impl ToolRegistry {
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = vec![
+            checkpoint_list_spec(),
+            checkpoint_revert_spec(),
+            checkpoint_show_spec(),
+            checkpoint_undo_spec(),
             diff_context_spec(),
             glob_spec(),
             grep_spec(),
@@ -646,6 +658,7 @@ impl ToolRegistry {
 
     pub fn permission_scope(&self, call: &ToolCall) -> PermissionScope {
         match call.name.as_str() {
+            "checkpoint_undo" | "checkpoint_revert" => PermissionScope::Edit,
             "write_file" => PermissionScope::Edit,
             "shell" | "verify" => PermissionScope::Shell,
             "webfetch" | "websearch" => PermissionScope::Web,
@@ -654,8 +667,9 @@ impl ToolRegistry {
             "read_file" if self.read_file_targets_ignored_policy(&call.arguments) => {
                 PermissionScope::IgnoredSearch
             }
-            "diff_context" | "glob" | "grep" | "read_file" | "read_tool_output"
-            | "symbol_context" | "list_skills" | "load_skill" => PermissionScope::Read,
+            "checkpoint_list" | "checkpoint_show" | "diff_context" | "glob" | "grep"
+            | "read_file" | "read_tool_output" | "symbol_context" | "list_skills"
+            | "load_skill" => PermissionScope::Read,
             _ => PermissionScope::Read,
         }
     }
@@ -665,6 +679,11 @@ impl ToolRegistry {
         let mut suggested_rules = Vec::new();
         let summary = self.describe_call(call);
         let (capability, target, risk) = match call.name.as_str() {
+            "checkpoint_undo" | "checkpoint_revert" => (
+                PermissionCapability::Edit,
+                "workspace:*".to_string(),
+                PermissionRisk::High,
+            ),
             "write_file" => {
                 let args = serde_json::from_value::<WriteFileArgs>(call.arguments.clone()).ok();
                 let path = args.as_ref().map(|args| args.path.as_str()).unwrap_or("*");
@@ -766,8 +785,8 @@ impl ToolRegistry {
                 "workspace:*".to_string(),
                 PermissionRisk::Low,
             ),
-            "diff_context" | "read_file" | "read_tool_output" | "symbol_context"
-            | "list_skills" | "load_skill" => (
+            "checkpoint_list" | "checkpoint_show" | "diff_context" | "read_file"
+            | "read_tool_output" | "symbol_context" | "list_skills" | "load_skill" => (
                 PermissionCapability::Read,
                 "workspace:*".to_string(),
                 PermissionRisk::Low,
@@ -793,7 +812,9 @@ impl ToolRegistry {
     pub fn is_parallel_safe(&self, call: &ToolCall) -> bool {
         matches!(
             call.name.as_str(),
-            "diff_context"
+            "checkpoint_list"
+                | "checkpoint_show"
+                | "diff_context"
                 | "glob"
                 | "grep"
                 | "read_file"
@@ -808,6 +829,33 @@ impl ToolRegistry {
 
     pub fn describe_call(&self, call: &ToolCall) -> String {
         match call.name.as_str() {
+            "checkpoint_list" => "checkpoint_list".to_string(),
+            "checkpoint_show" => {
+                let args =
+                    serde_json::from_value::<CheckpointShowArgs>(call.arguments.clone()).ok();
+                let checkpoint_id = args
+                    .as_ref()
+                    .map(|args| args.checkpoint_id.as_str())
+                    .unwrap_or("?");
+                format!("checkpoint_show checkpoint_id={checkpoint_id:?}")
+            }
+            "checkpoint_undo" => "checkpoint_undo".to_string(),
+            "checkpoint_revert" => {
+                let args =
+                    serde_json::from_value::<CheckpointRevertArgs>(call.arguments.clone()).ok();
+                let group_id = args.as_ref().and_then(|args| args.group_id.as_deref());
+                let checkpoint_id = args.as_ref().and_then(|args| args.checkpoint_id.as_deref());
+                match (group_id, checkpoint_id) {
+                    (Some(group_id), None) => format!("checkpoint_revert group_id={group_id:?}"),
+                    (None, Some(checkpoint_id)) => {
+                        format!("checkpoint_revert checkpoint_id={checkpoint_id:?}")
+                    }
+                    (Some(group_id), Some(checkpoint_id)) => format!(
+                        "checkpoint_revert group_id={group_id:?} checkpoint_id={checkpoint_id:?}"
+                    ),
+                    (None, None) => "checkpoint_revert".to_string(),
+                }
+            }
             "glob" => {
                 let args = serde_json::from_value::<GlobArgs>(call.arguments.clone()).ok();
                 let pattern = args
@@ -933,20 +981,34 @@ impl ToolRegistry {
     }
 
     pub async fn execute(&self, call: ToolCall, cancel: CancellationToken) -> ToolResult {
+        self.execute_for_group(call, cancel, "manual".to_string())
+            .await
+    }
+
+    pub async fn execute_for_group(
+        &self,
+        call: ToolCall,
+        cancel: CancellationToken,
+        group_id: String,
+    ) -> ToolResult {
         if cancel.is_cancelled() {
             return ToolResult::cancelled(&call);
         }
 
         let result = match call.name.as_str() {
+            "checkpoint_list" => self.execute_checkpoint_list(&call).await,
+            "checkpoint_show" => self.execute_checkpoint_show(&call).await,
+            "checkpoint_undo" => self.execute_checkpoint_undo(&call).await,
+            "checkpoint_revert" => self.execute_checkpoint_revert(&call).await,
             "diff_context" => self.execute_diff_context(&call).await,
             "glob" => self.execute_glob(&call, cancel).await,
             "grep" => self.execute_grep(&call, cancel).await,
             "read_file" => self.execute_read_file(&call).await,
             "read_tool_output" => self.execute_read_tool_output(&call).await,
             "symbol_context" => self.execute_symbol_context(&call).await,
-            "verify" => self.execute_verify(&call, cancel).await,
-            "write_file" => self.execute_write_file(&call).await,
-            "shell" => self.execute_shell(&call, cancel).await,
+            "verify" => self.execute_verify(&call, cancel, &group_id).await,
+            "write_file" => self.execute_write_file(&call, &group_id).await,
+            "shell" => self.execute_shell(&call, cancel, &group_id).await,
             "webfetch" => self.execute_webfetch(&call, cancel).await,
             "websearch" => self.execute_websearch(&call, cancel).await,
             "list_skills" => self.execute_list_skills(&call).await,
@@ -964,6 +1026,123 @@ impl ToolRegistry {
             result
         } else {
             self.finalize_result(result)
+        }
+    }
+
+    async fn execute_checkpoint_list(&self, call: &ToolCall) -> ToolResult {
+        if let Err(err) = serde_json::from_value::<CheckpointListArgs>(call.arguments.clone()) {
+            return tool_arg_error(call, err);
+        }
+        match self.checkpoints.read_journal() {
+            Ok(journal) => {
+                let mut checkpoints = journal.checkpoints;
+                checkpoints.sort_by_key(|record| std::cmp::Reverse(record.created_at_ms));
+                make_result(
+                    call,
+                    ToolStatus::Success,
+                    json!({
+                        "checkpoints": checkpoints,
+                        "journal_warnings": journal.journal_warnings,
+                    }),
+                    ToolCostHint {
+                        matches_returned: checkpoints.len() as u64,
+                        ..ToolCostHint::default()
+                    },
+                    None,
+                )
+            }
+            Err(err) => tool_error(call, err),
+        }
+    }
+
+    async fn execute_checkpoint_show(&self, call: &ToolCall) -> ToolResult {
+        let args = match serde_json::from_value::<CheckpointShowArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        match self.checkpoints.show_checkpoint(&args.checkpoint_id) {
+            Ok(Some(checkpoint)) => make_result(
+                call,
+                ToolStatus::Success,
+                json!({ "checkpoint": checkpoint }),
+                ToolCostHint::default(),
+                None,
+            ),
+            Ok(None) => make_result(
+                call,
+                ToolStatus::Stale,
+                json!({
+                    "error": "checkpoint not found",
+                    "checkpoint_id": args.checkpoint_id,
+                }),
+                ToolCostHint::default(),
+                None,
+            ),
+            Err(err) => tool_error(call, err),
+        }
+    }
+
+    async fn execute_checkpoint_undo(&self, call: &ToolCall) -> ToolResult {
+        let args = match serde_json::from_value::<CheckpointUndoArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        match self
+            .checkpoints
+            .rollback(RollbackTarget::Latest, args.mode.unwrap_or_default())
+        {
+            Ok(result) => {
+                self.invalidate_diff_cache();
+                make_result(
+                    call,
+                    if result.conflicts.is_empty() && !result.skipped && result.applied {
+                        ToolStatus::Success
+                    } else {
+                        ToolStatus::Stale
+                    },
+                    json!({ "rollback": result }),
+                    ToolCostHint::default(),
+                    None,
+                )
+            }
+            Err(err) => tool_error(call, err),
+        }
+    }
+
+    async fn execute_checkpoint_revert(&self, call: &ToolCall) -> ToolResult {
+        let args = match serde_json::from_value::<CheckpointRevertArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let target = match (args.group_id.as_deref(), args.checkpoint_id.as_deref()) {
+            (Some(group_id), None) => RollbackTarget::Group(group_id),
+            (None, Some(checkpoint_id)) => RollbackTarget::Checkpoint(checkpoint_id),
+            _ => {
+                return tool_error(
+                    call,
+                    "provide exactly one of group_id or checkpoint_id for checkpoint_revert",
+                );
+            }
+        };
+        match self
+            .checkpoints
+            .rollback(target, args.mode.unwrap_or_default())
+        {
+            Ok(result) => {
+                self.invalidate_diff_cache();
+                make_result(
+                    call,
+                    if result.conflicts.is_empty() && !result.skipped && result.applied {
+                        ToolStatus::Success
+                    } else {
+                        ToolStatus::Stale
+                    },
+                    json!({ "rollback": result }),
+                    ToolCostHint::default(),
+                    None,
+                )
+            }
+            Err(err) => tool_error(call, err),
         }
     }
 
@@ -1712,7 +1891,12 @@ impl ToolRegistry {
         )
     }
 
-    async fn execute_verify(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
+    async fn execute_verify(
+        &self,
+        call: &ToolCall,
+        cancel: CancellationToken,
+        group_id: &str,
+    ) -> ToolResult {
         let args = match serde_json::from_value::<VerifyArgs>(call.arguments.clone()) {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
@@ -1774,7 +1958,7 @@ impl ToolRegistry {
             }),
         };
         let shell_result = self
-            .execute_shell_capped(&shell_call, cancel, VERIFY_SHELL_TIMEOUT_MS)
+            .execute_shell_capped(&shell_call, cancel, VERIFY_SHELL_TIMEOUT_MS, group_id)
             .await;
         let mut content = shell_result.content;
         if let Some(object) = content.as_object_mut() {
@@ -1791,7 +1975,7 @@ impl ToolRegistry {
         )
     }
 
-    async fn execute_write_file(&self, call: &ToolCall) -> ToolResult {
+    async fn execute_write_file(&self, call: &ToolCall, group_id: &str) -> ToolResult {
         let args = match serde_json::from_value::<WriteFileArgs>(call.arguments.clone()) {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
@@ -1811,6 +1995,10 @@ impl ToolRegistry {
             );
         }
 
+        let checkpoint_before = match self.checkpoints.track_tree() {
+            Ok(snapshot) => snapshot,
+            Err(err) => return tool_error(call, err),
+        };
         let before = fs::read(&path).ok();
         let before_sha256 = before.as_ref().map(sha256_hex);
         if before.is_some() && args.expected_sha256.as_deref() != before_sha256.as_deref() {
@@ -1844,22 +2032,30 @@ impl ToolRegistry {
             ..ToolCostHint::default()
         };
 
-        make_result(
+        let mut content = json!({
+            "path": rel.to_string_lossy(),
+            "before_sha256": before_sha256,
+            "after_sha256": after_sha256,
+            "bytes_written": args.content.len(),
+        });
+        self.append_checkpoint_to_content(
+            &mut content,
+            &checkpoint_before,
             call,
+            group_id,
             ToolStatus::Success,
-            json!({
-                "path": rel.to_string_lossy(),
-                "before_sha256": before_sha256,
-                "after_sha256": after_sha256,
-                "bytes_written": args.content.len(),
-            }),
-            cost,
-            Some(after_sha256),
-        )
+            Vec::new(),
+        );
+        make_result(call, ToolStatus::Success, content, cost, Some(after_sha256))
     }
 
-    async fn execute_shell(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
-        self.execute_shell_capped(call, cancel, MAX_SHELL_TIMEOUT_MS)
+    async fn execute_shell(
+        &self,
+        call: &ToolCall,
+        cancel: CancellationToken,
+        group_id: &str,
+    ) -> ToolResult {
+        self.execute_shell_capped(call, cancel, MAX_SHELL_TIMEOUT_MS, group_id)
             .await
     }
 
@@ -1868,6 +2064,7 @@ impl ToolRegistry {
         call: &ToolCall,
         cancel: CancellationToken,
         max_timeout_ms: u64,
+        group_id: &str,
     ) -> ToolResult {
         let args = match serde_json::from_value::<ShellArgs>(call.arguments.clone()) {
             Ok(args) => args,
@@ -1885,6 +2082,11 @@ impl ToolRegistry {
             .output_byte_cap
             .unwrap_or(DEFAULT_SHELL_OUTPUT_BYTE_CAP)
             .min(128_000);
+        let checkpoint_before = match self.checkpoints.track_tree() {
+            Ok(snapshot) => snapshot,
+            Err(err) => return tool_error(call, err),
+        };
+        let coverage_warnings = shell_coverage_warnings(&args.command);
 
         let mut command = Command::new("sh");
         command
@@ -1953,21 +2155,24 @@ impl ToolRegistry {
         let error = timed_out.then(|| format!("shell command timed out after {timeout_ms} ms"));
         self.invalidate_diff_cache();
 
-        make_result(
+        let mut content = json!({
+            "command": args.command,
+            "workdir": self.relative(&workdir).to_string_lossy(),
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "error": error,
+            "truncated": truncated,
+        });
+        self.append_checkpoint_to_content(
+            &mut content,
+            &checkpoint_before,
             call,
+            group_id,
             status,
-            json!({
-                "command": args.command,
-                "workdir": self.relative(&workdir).to_string_lossy(),
-                "exit_code": exit_code,
-                "stdout": stdout,
-                "stderr": stderr,
-                "error": error,
-                "truncated": truncated,
-            }),
-            cost,
-            None,
-        )
+            coverage_warnings,
+        );
+        make_result(call, status, content, cost, None)
     }
 
     async fn execute_websearch(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
@@ -2266,10 +2471,77 @@ impl ToolRegistry {
             .to_path_buf()
     }
 
+    fn append_checkpoint_to_content(
+        &self,
+        content: &mut Value,
+        before: &WorkspaceSnapshot,
+        call: &ToolCall,
+        group_id: &str,
+        status: ToolStatus,
+        coverage_warnings: Vec<String>,
+    ) {
+        match self.checkpoints.create_checkpoint(
+            before,
+            &call.name,
+            &call.call_id,
+            group_id,
+            checkpoint_status_label(status),
+            coverage_warnings,
+        ) {
+            Ok(Some(checkpoint)) => {
+                insert_content_field(content, "checkpoint", checkpoint_json(&checkpoint));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                insert_content_field(content, "checkpoint_error", json!(err.to_string()));
+            }
+        }
+    }
+
     fn finalize_result(&self, result: ToolResult) -> ToolResult {
         self.output_store
             .maybe_spill(redact_tool_result(result, &self.redactor))
     }
+}
+
+fn insert_content_field(content: &mut Value, key: &str, value: Value) {
+    if let Some(object) = content.as_object_mut() {
+        object.insert(key.to_string(), value);
+    }
+}
+
+fn checkpoint_status_label(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Success => "success",
+        ToolStatus::Error => "error",
+        ToolStatus::Denied => "denied",
+        ToolStatus::Stale => "stale",
+        ToolStatus::Cancelled => "cancelled",
+    }
+}
+
+fn checkpoint_json(record: &CheckpointRecord) -> Value {
+    let mut value = json!({
+        "id": record.id,
+        "group_id": record.group_id,
+        "tool_name": record.tool_name,
+        "call_id": record.call_id,
+        "status": record.status,
+        "summary": record.summary,
+        "files": record.files,
+    });
+    if let Some(object) = value.as_object_mut() {
+        if !record.skipped_files.is_empty() {
+            object.insert("skipped_files".to_string(), json!(record.skipped_files));
+        }
+        if !record.coverage_warnings.is_empty() {
+            object.insert(
+                "coverage_warnings".to_string(),
+                json!(record.coverage_warnings),
+            );
+        }
+    }
+    value
 }
 
 fn redact_tool_result(mut result: ToolResult, redactor: &Redactor) -> ToolResult {
@@ -2731,6 +3003,37 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
     }
 }
 
+fn shell_coverage_warnings(command: &str) -> Vec<String> {
+    let segments = shell_segments(&collapse_whitespace(command));
+    let suspicious = segments.iter().any(|segment| {
+        let words = segment.split_whitespace().collect::<Vec<_>>();
+        let mut has_mutation = false;
+        let mut has_outside_path = false;
+        for word in words {
+            let trimmed = word.trim_matches(|ch| matches!(ch, '\'' | '"' | '(' | ')' | ';'));
+            if matches!(
+                trimmed,
+                "rm" | "rmdir" | "mv" | "cp" | "dd" | "truncate" | "touch" | "mkdir"
+            ) || matches!(trimmed, ">" | ">>")
+            {
+                has_mutation = true;
+            }
+            if trimmed.starts_with('/') || trimmed.contains("../") || trimmed == ".." {
+                has_outside_path = true;
+            }
+        }
+        has_mutation && has_outside_path
+    });
+    if suspicious {
+        vec![
+            "shell command may mutate paths outside the workspace; checkpoint rollback only protects workspace files"
+                .to_string(),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
 fn shell_segments(command: &str) -> Vec<String> {
     command
         .split("&&")
@@ -2860,6 +3163,26 @@ struct DiffContextArgs {
     max_symbols_per_file: Option<usize>,
     max_references_per_symbol: Option<usize>,
     max_patch_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckpointListArgs {}
+
+#[derive(Debug, Deserialize)]
+struct CheckpointUndoArgs {
+    mode: Option<RollbackMode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckpointShowArgs {
+    checkpoint_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckpointRevertArgs {
+    group_id: Option<String>,
+    checkpoint_id: Option<String>,
+    mode: Option<RollbackMode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3505,6 +3828,67 @@ pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
         output.push_str(&format!("{byte:02x}"));
     }
     output
+}
+
+fn checkpoint_list_spec() -> ToolSpec {
+    ToolSpec {
+        name: "checkpoint_list".to_string(),
+        description: "List recent recoverable checkpoints created by mutation tools.".to_string(),
+        capability: PermissionCapability::Read,
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {}
+        }),
+    }
+}
+
+fn checkpoint_undo_spec() -> ToolSpec {
+    ToolSpec {
+        name: "checkpoint_undo".to_string(),
+        description: "Undo the latest checkpoint. Default mode is atomic: any conflict leaves all files unchanged. Use best_effort to restore clean files and skip conflicts.".to_string(),
+        capability: PermissionCapability::Edit,
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "mode": {"type": "string", "enum": ["atomic", "best_effort"], "description": "Rollback mode. Default atomic."}
+            }
+        }),
+    }
+}
+
+fn checkpoint_show_spec() -> ToolSpec {
+    ToolSpec {
+        name: "checkpoint_show".to_string(),
+        description: "Inspect one checkpoint, including file metadata, patch text when available, skipped files, and rollback coverage warnings.".to_string(),
+        capability: PermissionCapability::Read,
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "checkpoint_id": {"type": "string", "description": "Checkpoint id returned by checkpoint_list or mutation tool output."}
+            },
+            "required": ["checkpoint_id"]
+        }),
+    }
+}
+
+fn checkpoint_revert_spec() -> ToolSpec {
+    ToolSpec {
+        name: "checkpoint_revert".to_string(),
+        description: "Revert either a checkpoint_id or all checkpoints in a group_id. Default mode is atomic: any conflict leaves all files unchanged. Use best_effort to restore clean files and skip conflicts.".to_string(),
+        capability: PermissionCapability::Edit,
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "group_id": {"type": "string", "description": "Checkpoint group id, usually the agent turn id."},
+                "checkpoint_id": {"type": "string", "description": "Specific checkpoint id to revert."},
+                "mode": {"type": "string", "enum": ["atomic", "best_effort"], "description": "Rollback mode. Default atomic."}
+            }
+        }),
+    }
 }
 
 fn diff_context_spec() -> ToolSpec {

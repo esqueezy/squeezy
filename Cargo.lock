@@ -1738,6 +1738,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "ratatui",
+ "serde_json",
  "squeezy-agent",
  "squeezy-core",
  "squeezy-llm",
@@ -1751,6 +1752,8 @@ name = "squeezy-vcs"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
+ "sha2",
  "squeezy-core",
 ]
 
