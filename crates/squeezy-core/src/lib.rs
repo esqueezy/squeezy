@@ -477,11 +477,11 @@ impl AppConfig {
             toml_string(self.permissions.ignored_search.as_str())
         ));
         output.push_str(&format!(
-            "web = {}\n\n",
+            "web = {}\n",
             toml_string(self.permissions.web.as_str())
         ));
         output.push_str(&format!(
-            "shell_classifier = {}\n",
+            "shell_classifier = {}\n\n",
             self.permissions.shell_classifier
         ));
         for rule in self
@@ -490,7 +490,7 @@ impl AppConfig {
             .iter()
             .filter(|rule| rule.source != PermissionRuleSource::Builtin)
         {
-            output.push_str("\n[[permissions.rules]]\n");
+            output.push_str("[[permissions.rules]]\n");
             output.push_str(&format!("capability = {}\n", toml_string(&rule.capability)));
             output.push_str(&format!("target = {}\n", toml_string(&rule.target)));
             output.push_str(&format!("action = {}\n", toml_string(rule.action.as_str())));
@@ -498,8 +498,8 @@ impl AppConfig {
             if let Some(reason) = &rule.reason {
                 output.push_str(&format!("reason = {}\n", toml_string(reason)));
             }
+            output.push('\n');
         }
-        output.push('\n');
 
         output.push_str("[telemetry]\n");
         output.push_str(&format!("enabled = {}\n", self.telemetry.enabled));
@@ -599,7 +599,10 @@ fn provider_kind(provider: &ProviderConfig) -> &'static str {
     }
 }
 
-fn toml_string(value: &str) -> String {
+/// Escape `value` as a TOML basic string. Public so persistence helpers in
+/// downstream crates (e.g. permission rule writing) can share the same
+/// escaping rules used by `config inspect`.
+pub fn escape_toml_basic_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
     for ch in value.chars() {
@@ -615,6 +618,10 @@ fn toml_string(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+fn toml_string(value: &str) -> String {
+    escape_toml_basic_string(value)
 }
 
 fn toml_string_array<S: AsRef<str>>(values: &[S]) -> String {
@@ -1366,7 +1373,7 @@ impl PermissionPolicy {
             ),
             shell_classifier: parse_bool(
                 var("SQUEEZY_SHELL_PERMISSION_CLASSIFIER"),
-                settings.shell_classifier.unwrap_or(true),
+                settings.shell_classifier.unwrap_or(false),
             ),
             rules: settings.rules,
         }
@@ -1383,9 +1390,22 @@ impl PermissionPolicy {
     }
 
     pub fn evaluate(&self, request: &PermissionRequest) -> PermissionVerdict {
+        self.evaluate_with_extra(request, &[])
+    }
+
+    /// Like [`Self::evaluate`] but lets the caller layer additional rules on
+    /// top of the configured ones. `extra` is treated as appended after
+    /// `self.rules`, so the most recently added session rule wins over any
+    /// rule from the on-disk config.
+    pub fn evaluate_with_extra(
+        &self,
+        request: &PermissionRequest,
+        extra: &[PermissionRule],
+    ) -> PermissionVerdict {
         let matched_rule = self
             .rules
             .iter()
+            .chain(extra.iter())
             .rev()
             .find(|rule| {
                 wildcard_match(request.capability.as_str(), &rule.capability)
@@ -1393,12 +1413,16 @@ impl PermissionPolicy {
             })
             .cloned();
         if let Some(rule) = matched_rule {
-            return PermissionVerdict {
-                action: rule.action,
-                reason: rule
-                    .reason
+            let (action, override_reason) =
+                downgrade_unsafe_action(rule.action, request.capability);
+            let reason = override_reason.unwrap_or_else(|| {
+                rule.reason
                     .clone()
-                    .unwrap_or_else(|| format!("matched {} permission rule", rule.source.as_str())),
+                    .unwrap_or_else(|| format!("matched {} permission rule", rule.source.as_str()))
+            });
+            return PermissionVerdict {
+                action,
+                reason,
                 matched_rule: Some(rule),
             };
         }
@@ -1415,6 +1439,26 @@ impl PermissionPolicy {
     }
 }
 
+/// Belt-and-suspenders safety: refuse to honor an Allow rule that targets the
+/// `destructive` capability, regardless of where the rule came from. Returns
+/// the (possibly downgraded) action and an explanatory reason when a downgrade
+/// happens.
+fn downgrade_unsafe_action(
+    action: PermissionAction,
+    capability: PermissionCapability,
+) -> (PermissionAction, Option<String>) {
+    if action == PermissionAction::Allow && capability == PermissionCapability::Destructive {
+        return (
+            PermissionAction::Ask,
+            Some(
+                "ignoring Allow rule on destructive capability; require explicit per-call approval"
+                    .to_string(),
+            ),
+        );
+    }
+    (action, None)
+}
+
 impl Default for PermissionPolicy {
     fn default() -> Self {
         Self {
@@ -1423,7 +1467,7 @@ impl Default for PermissionPolicy {
             shell: PermissionMode::Ask,
             ignored_search: PermissionMode::Allow,
             web: PermissionMode::Ask,
-            shell_classifier: true,
+            shell_classifier: false,
             rules: Vec::new(),
         }
     }
@@ -1916,7 +1960,19 @@ pub fn user_settings_template() -> &'static str {
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
-# shell_classifier = true
+# shell_classifier = false       # narrow LLM fallback for ambiguous shell commands (extra LLM call)
+#
+# Rule targets use prefix-tagged strings so different scopes don't collide.
+# Known prefixes:
+#   path:<rel-path>      - edit/write rules
+#   domain:<host>        - network rules
+#   search:<provider>    - web search rules
+#   workspace:*          - read/search rules limited to workspace files
+#   ignored:*            - read/search rules that include git-ignored files
+#   tool:<name>          - catch-all per-tool rule
+#   <cmd-prefix>:*       - shell/git/compiler rules (e.g. "cargo test:*", "rm:*")
+# Allow rules on the `destructive` capability are refused at load time; keep
+# them at `ask` or `deny`.
 #
 # [[permissions.rules]]
 # capability = "network"
@@ -2415,6 +2471,15 @@ fn permission_rules_value(
                     field(&rule_path, "action")
                 ))
             })?;
+            if action == PermissionAction::Allow
+                && PermissionCapability::parse(&capability)
+                    == Some(PermissionCapability::Destructive)
+            {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {rule_path}: refuse to load Allow rule on destructive capability; \
+                     destructive actions must be approved per call or via a broader shell scope"
+                )));
+            }
             let source_value = string_value(table, "source", source, &field(&rule_path, "source"))?
                 .as_deref()
                 .and_then(PermissionRuleSource::parse)
@@ -2450,18 +2515,44 @@ fn default_permission_rule_source(source: &str) -> PermissionRuleSource {
     }
 }
 
-fn wildcard_match(value: &str, pattern: &str) -> bool {
+/// Minimal glob matcher for permission rule targets and capabilities.
+///
+/// Supports any number of `*` wildcards. Each `*` matches any (possibly empty)
+/// run of characters; the prefix before the first `*` must anchor to the start
+/// of `value` and the suffix after the last `*` must anchor to the end.
+pub(crate) fn wildcard_match(value: &str, pattern: &str) -> bool {
     let value = value.trim();
     let pattern = pattern.trim();
-    if pattern == "*" || pattern == value {
+    if pattern == value {
         return true;
     }
-    let Some(star) = pattern.find('*') else {
+    if !pattern.contains('*') {
         return false;
-    };
-    let (prefix, suffix) = pattern.split_at(star);
-    let suffix = &suffix[1..];
-    value.starts_with(prefix) && value.ends_with(suffix)
+    }
+    let segments: Vec<&str> = pattern.split('*').collect();
+    let first = segments[0];
+    let last = segments[segments.len() - 1];
+    if !value.starts_with(first) || !value.ends_with(last) {
+        return false;
+    }
+    if first.len() + last.len() > value.len() {
+        return false;
+    }
+    let mut cursor = first.len();
+    let end = value.len() - last.len();
+    for segment in &segments[1..segments.len().saturating_sub(1)] {
+        if segment.is_empty() {
+            continue;
+        }
+        let Some(idx) = value
+            .get(cursor..end)
+            .and_then(|window| window.find(segment))
+        else {
+            return false;
+        };
+        cursor += idx + segment.len();
+    }
+    true
 }
 
 fn status_verbosity_value(

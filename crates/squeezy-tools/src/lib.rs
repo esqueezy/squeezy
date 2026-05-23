@@ -560,17 +560,18 @@ impl ToolRegistry {
             "write_file" => {
                 let args = serde_json::from_value::<WriteFileArgs>(call.arguments.clone()).ok();
                 let path = args.as_ref().map(|args| args.path.as_str()).unwrap_or("*");
+                let rule_target = format!("path:{path}");
                 metadata.insert("path".to_string(), path.to_string());
                 suggested_rules.push(PermissionRule::new(
                     "edit",
-                    path,
+                    rule_target.clone(),
                     PermissionMode::Allow,
                     PermissionRuleSource::Session,
                     Some("approved edit path".to_string()),
                 ));
                 (
                     PermissionCapability::Edit,
-                    format!("path:{path}"),
+                    rule_target,
                     PermissionRisk::High,
                 )
             }

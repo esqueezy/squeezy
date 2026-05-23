@@ -36,7 +36,16 @@ model-facing tool output compact enough to be useful.
   permission request with capability, target, risk, metadata, and suggested
   persistence rules before execution. Compatibility `allow`/`ask`/`deny`
   defaults still work, and ordered `[[permissions.rules]]` entries can target
-  command prefixes, domains, paths, or tool families.
+  command prefixes, domains, paths, or tool families. Session approvals from
+  the TUI are layered on top of file rules and take effect immediately for
+  later tool calls in the same process, so an "Allow user/project rule" choice
+  does not require restarting the agent to be honored. Every verdict is logged
+  via the `squeezy::permissions` tracing target with capability, target, risk,
+  action, matched-rule source, and reason fields.
+- **Destructive safety net.** Allow rules on the `destructive` capability are
+  refused both at config load time and at approval-persistence time, so an
+  approved "Allow project rule" for `rm -rf node_modules` cannot quietly turn
+  into blanket permission for `rm:*` later.
 - **Permission-gated mutation.** Edit, shell, compiler/verify, git, network,
   and destructive tool capabilities route through the same policy engine before
   execution.
@@ -74,9 +83,12 @@ model-facing tool output compact enough to be useful.
 - `SQUEEZY_WEB_PERMISSION` controls the allow/ask/deny policy for `websearch`
   and `webfetch`. The default is `ask`.
 - `SQUEEZY_SHELL_PERMISSION_CLASSIFIER` controls the narrow LLM fallback for
-  ambiguous shell commands. Deterministic command analysis runs first; the
-  classifier can require approval or deny, but it does not silently allow a
-  command.
+  ambiguous shell commands. Disabled by default to keep the per-turn token
+  budget predictable: every ambiguous shell call would otherwise cost one
+  extra round-trip with the agent model. Deterministic command analysis runs
+  first; the classifier can require approval or deny, but it does not silently
+  allow a command, and unparseable classifier output now keeps the verdict at
+  `ask` instead of being heuristically guessed.
 - `SQUEEZY_EXA_MCP_URL` controls the MCP endpoint used by `websearch`. The
   default is `https://mcp.exa.ai/mcp`.
 - `SQUEEZY_EXA_API_KEY_ENV` names the environment variable read for the Exa API

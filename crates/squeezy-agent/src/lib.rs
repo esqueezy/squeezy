@@ -1,8 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env, fs, io,
+    path::PathBuf,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -12,8 +13,9 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, CostSnapshot, PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability,
-    PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope, SessionMetrics,
-    SqueezyError, TranscriptItem, TurnId, TurnMetrics, default_settings_path,
+    PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict,
+    SessionMetrics, SqueezyError, TranscriptItem, TurnId, TurnMetrics, default_settings_path,
+    escape_toml_basic_string,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, estimate_cost};
 use squeezy_telemetry::{
@@ -38,6 +40,11 @@ pub struct Agent {
     session_metrics: Arc<Mutex<SessionMetrics>>,
     next_turn_id: Arc<AtomicU64>,
     next_approval_id: Arc<AtomicU64>,
+    /// In-memory permission rules added via "Allow user/project rule" during
+    /// the current process. Persisted to disk on a best-effort basis; this
+    /// vector also makes the rule take effect immediately for subsequent
+    /// tool calls without having to wait for a settings reload.
+    session_rules: Arc<RwLock<Vec<PermissionRule>>>,
 }
 
 impl Agent {
@@ -70,7 +77,18 @@ impl Agent {
             session_metrics: Arc::new(Mutex::new(SessionMetrics::default())),
             next_turn_id: Arc::new(AtomicU64::new(1)),
             next_approval_id: Arc::new(AtomicU64::new(1)),
+            session_rules: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Snapshot of session-scoped permission rules. Primarily intended for
+    /// tests and debug surfaces; the live rule list lives behind a lock and
+    /// is consulted on every permission decision.
+    pub fn session_rules_snapshot(&self) -> Vec<PermissionRule> {
+        self.session_rules
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     pub fn provider_name(&self) -> &'static str {
@@ -99,6 +117,7 @@ impl Agent {
             .collect::<Vec<_>>();
         let turn_id = TurnId::new(self.next_turn_id.fetch_add(1, Ordering::Relaxed));
         let approval_ids = self.next_approval_id.clone();
+        let session_rules = self.session_rules.clone();
 
         tokio::spawn(async move {
             if tx
@@ -123,6 +142,7 @@ impl Agent {
                 tx: tx.clone(),
                 cancel,
                 approval_ids,
+                session_rules,
             }
             .run(input)
             .await;
@@ -148,6 +168,7 @@ struct TurnRuntime {
     tx: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
+    session_rules: Arc<RwLock<Vec<PermissionRule>>>,
 }
 
 impl TurnRuntime {
@@ -296,6 +317,7 @@ impl TurnRuntime {
                     tx: self.tx.clone(),
                     cancel: self.cancel.clone(),
                     approval_ids: self.approval_ids.clone(),
+                    session_rules: self.session_rules.clone(),
                 },
                 &mut broker,
             )
@@ -354,6 +376,7 @@ struct ToolExecutionContext<'a> {
     tx: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
+    session_rules: Arc<RwLock<Vec<PermissionRule>>>,
 }
 
 async fn execute_tool_calls(
@@ -778,7 +801,11 @@ async fn permission_decision(
     context: &ToolExecutionContext<'_>,
 ) -> ApprovalDecision {
     let request = context.tools.permission_request(call);
-    let mut verdict = context.config.permissions.evaluate(&request);
+    let session_rules = snapshot_session_rules(&context.session_rules);
+    let mut verdict = context
+        .config
+        .permissions
+        .evaluate_with_extra(&request, &session_rules);
     if should_classify_shell(context.config, context.provider.name(), &request, &verdict)
         && let Some(classifier) = classify_ambiguous_shell(
             context.provider.clone(),
@@ -790,6 +817,7 @@ async fn permission_decision(
     {
         verdict = classifier;
     }
+    log_permission_verdict(&request, &verdict);
     match verdict.action {
         PermissionAction::Allow => ApprovalDecision::Approved,
         PermissionAction::Deny => ApprovalDecision::Denied(verdict.reason),
@@ -824,8 +852,8 @@ async fn permission_decision(
                     ApprovalDecision::Approved
                 }
                 Ok(ToolApprovalDecision::AllowRuleUser) => {
-                    persist_permission_rule(
-                        context.config,
+                    install_persistent_rule(
+                        context,
                         &request,
                         PermissionRuleSource::User,
                         PermissionAction::Allow,
@@ -833,8 +861,8 @@ async fn permission_decision(
                     ApprovalDecision::Approved
                 }
                 Ok(ToolApprovalDecision::AllowRuleProject) => {
-                    persist_permission_rule(
-                        context.config,
+                    install_persistent_rule(
+                        context,
                         &request,
                         PermissionRuleSource::Project,
                         PermissionAction::Allow,
@@ -842,8 +870,8 @@ async fn permission_decision(
                     ApprovalDecision::Approved
                 }
                 Ok(ToolApprovalDecision::AskRuleUser) => {
-                    persist_permission_rule(
-                        context.config,
+                    install_persistent_rule(
+                        context,
                         &request,
                         PermissionRuleSource::User,
                         PermissionAction::Ask,
@@ -853,8 +881,8 @@ async fn permission_decision(
                     )
                 }
                 Ok(ToolApprovalDecision::AskRuleProject) => {
-                    persist_permission_rule(
-                        context.config,
+                    install_persistent_rule(
+                        context,
                         &request,
                         PermissionRuleSource::Project,
                         PermissionAction::Ask,
@@ -870,8 +898,8 @@ async fn permission_decision(
                     ))
                 }
                 Ok(ToolApprovalDecision::DenyRuleUser) => {
-                    persist_permission_rule(
-                        context.config,
+                    install_persistent_rule(
+                        context,
                         &request,
                         PermissionRuleSource::User,
                         PermissionAction::Deny,
@@ -882,8 +910,8 @@ async fn permission_decision(
                     ))
                 }
                 Ok(ToolApprovalDecision::DenyRuleProject) => {
-                    persist_permission_rule(
-                        context.config,
+                    install_persistent_rule(
+                        context,
                         &request,
                         PermissionRuleSource::Project,
                         PermissionAction::Deny,
@@ -899,11 +927,48 @@ async fn permission_decision(
     }
 }
 
+fn snapshot_session_rules(session_rules: &Arc<RwLock<Vec<PermissionRule>>>) -> Vec<PermissionRule> {
+    session_rules
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                target: "squeezy::permissions",
+                error = %err,
+                "session permission rule lock was poisoned; treating session rules as empty",
+            );
+            Vec::new()
+        })
+}
+
+fn log_permission_verdict(request: &PermissionRequest, verdict: &PermissionVerdict) {
+    let matched_source = verdict
+        .matched_rule
+        .as_ref()
+        .map(|rule| rule.source.as_str());
+    let matched_target = verdict
+        .matched_rule
+        .as_ref()
+        .map(|rule| rule.target.as_str());
+    tracing::info!(
+        target: "squeezy::permissions",
+        tool = %request.tool_name,
+        capability = %request.capability.as_str(),
+        target = %request.target,
+        risk = %request.risk.as_str(),
+        action = %verdict.action.as_str(),
+        matched_source,
+        matched_target,
+        reason = %verdict.reason,
+        "permission verdict",
+    );
+}
+
 fn should_classify_shell(
     config: &AppConfig,
     provider_name: &str,
     request: &PermissionRequest,
-    verdict: &squeezy_core::PermissionVerdict,
+    verdict: &PermissionVerdict,
 ) -> bool {
     config.permissions.shell_classifier
         && provider_name != "scripted"
@@ -917,11 +982,11 @@ async fn classify_ambiguous_shell(
     config: &AppConfig,
     request: &PermissionRequest,
     cancel: CancellationToken,
-) -> Option<squeezy_core::PermissionVerdict> {
+) -> Option<PermissionVerdict> {
     let command = request.metadata.get("command")?;
     let prompt = format!(
         "Classify this shell command for a coding agent permission gate.\n\
-Return compact JSON with action \"ask\" or \"deny\" and a short reason.\n\
+Return compact JSON with fields {{\"action\": \"ask\"|\"deny\", \"reason\": string}}.\n\
 Never return allow.\n\
 Command: {command:?}\n\
 Working target: {:?}",
@@ -947,22 +1012,65 @@ Working target: {:?}",
             LlmEvent::Started | LlmEvent::ToolCall(_) => {}
         }
     }
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("\"action\"") && lower.contains("deny") {
-        return Some(squeezy_core::PermissionVerdict {
+    Some(parse_classifier_verdict(&text))
+}
+
+/// Parse the classifier's textual response into a verdict. Only `deny` can
+/// flip the verdict; missing or unparseable output leaves the call as `ask`.
+/// Made `pub(crate)` so tests can exercise the JSON parsing rules.
+pub(crate) fn parse_classifier_verdict(text: &str) -> PermissionVerdict {
+    let trimmed = text.trim();
+    let action = extract_json_action(trimmed)
+        .or_else(|| extract_loose_action(trimmed))
+        .unwrap_or(PermissionAction::Ask);
+    let reason_excerpt = compact_reason(trimmed);
+    match action {
+        PermissionAction::Deny => PermissionVerdict {
             action: PermissionAction::Deny,
             matched_rule: None,
-            reason: format!("shell classifier denied command: {}", compact_reason(&text)),
-        });
+            reason: format!("shell classifier denied command: {reason_excerpt}"),
+        },
+        // Allow from the classifier is intentionally disallowed - we keep the
+        // verdict at Ask so a human still confirms.
+        _ => PermissionVerdict {
+            action: PermissionAction::Ask,
+            matched_rule: None,
+            reason: format!("shell classifier requires approval: {reason_excerpt}"),
+        },
     }
-    Some(squeezy_core::PermissionVerdict {
-        action: PermissionAction::Ask,
-        matched_rule: None,
-        reason: format!(
-            "shell classifier requires approval: {}",
-            compact_reason(&text)
-        ),
-    })
+}
+
+fn extract_json_action(text: &str) -> Option<PermissionAction> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let candidate = &text[start..=end];
+    let value: serde_json::Value = serde_json::from_str(candidate).ok()?;
+    let action = value.get("action")?.as_str()?;
+    match action.trim().to_ascii_lowercase().as_str() {
+        "deny" | "denied" | "refuse" => Some(PermissionAction::Deny),
+        "ask" | "prompt" | "confirm" => Some(PermissionAction::Ask),
+        _ => None,
+    }
+}
+
+fn extract_loose_action(text: &str) -> Option<PermissionAction> {
+    // Defensive fallback when the model returns "action: deny" or similar
+    // without strict JSON. Look for a colon-bound "action" field and read the
+    // next bare word.
+    let lower = text.to_ascii_lowercase();
+    let idx = lower.find("action")?;
+    let after = &lower[idx + "action".len()..];
+    let after = after.trim_start_matches(|c: char| !c.is_alphanumeric());
+    if after.starts_with("deny") {
+        Some(PermissionAction::Deny)
+    } else if after.starts_with("ask") {
+        Some(PermissionAction::Ask)
+    } else {
+        None
+    }
 }
 
 fn compact_reason(text: &str) -> String {
@@ -996,49 +1104,109 @@ fn permission_denied_reason(request: &PermissionRequest, reason: &str) -> String
     )
 }
 
-fn persist_permission_rule(
-    config: &AppConfig,
+/// Install a user/project rule both into the in-memory session list and (best
+/// effort) on disk. Returns immediately when the rule cannot be persisted; the
+/// failure is logged but never bubbled to the caller, since the current call
+/// has already been resolved by the approval response.
+fn install_persistent_rule(
+    context: &ToolExecutionContext<'_>,
     request: &PermissionRequest,
     source: PermissionRuleSource,
     action: PermissionAction,
 ) {
     let Some(rule) = permission_rule_for_persistence(request, source, action) else {
+        tracing::warn!(
+            target: "squeezy::permissions",
+            capability = %request.capability.as_str(),
+            target = %request.target,
+            action = %action.as_str(),
+            "refused to install permission rule (e.g. Allow on destructive capability)",
+        );
         return;
     };
-    if rule.action == PermissionAction::Allow
-        && request.capability == PermissionCapability::Destructive
-        && rule.target == "*"
-    {
-        return;
+
+    match context.session_rules.write() {
+        Ok(mut guard) => guard.push(rule.clone()),
+        Err(err) => {
+            tracing::warn!(
+                target: "squeezy::permissions",
+                error = %err,
+                "could not install session permission rule",
+            );
+        }
     }
-    let path = match source {
-        PermissionRuleSource::User => default_settings_path(),
-        PermissionRuleSource::Project => config.workspace_root.join(PROJECT_SETTINGS_FILE),
-        PermissionRuleSource::Builtin | PermissionRuleSource::Session => return,
+
+    let path = match persistence_path_for(context.config, source) {
+        Some(path) => path,
+        None => return,
     };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+    if let Err(err) = write_permission_rule(&path, &rule) {
+        tracing::warn!(
+            target: "squeezy::permissions",
+            path = %path.display(),
+            error = %err,
+            "failed to persist permission rule",
+        );
+    } else {
+        tracing::info!(
+            target: "squeezy::permissions",
+            path = %path.display(),
+            capability = %rule.capability,
+            target = %rule.target,
+            action = %rule.action.as_str(),
+            source = %rule.source.as_str(),
+            "persisted permission rule",
+        );
     }
-    let text = format!(
-        "\n[[permissions.rules]]\ncapability = {:?}\ntarget = {:?}\naction = {:?}\nsource = {:?}\nreason = {:?}\n",
-        rule.capability,
-        rule.target,
-        rule.action.as_str(),
-        rule.source.as_str(),
-        rule.reason
-            .unwrap_or_else(|| "added from approval prompt".to_string())
-    );
-    let _ = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut file| {
-            use std::io::Write;
-            file.write_all(text.as_bytes())
-        });
 }
 
-fn permission_rule_for_persistence(
+fn persistence_path_for(config: &AppConfig, source: PermissionRuleSource) -> Option<PathBuf> {
+    match source {
+        PermissionRuleSource::User => Some(default_settings_path()),
+        PermissionRuleSource::Project => Some(config.workspace_root.join(PROJECT_SETTINGS_FILE)),
+        PermissionRuleSource::Builtin | PermissionRuleSource::Session => None,
+    }
+}
+
+fn write_permission_rule(path: &std::path::Path, rule: &PermissionRule) -> io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let reason = rule
+        .reason
+        .clone()
+        .unwrap_or_else(|| "added from approval prompt".to_string());
+    let mut text = String::new();
+    text.push_str("\n[[permissions.rules]]\n");
+    text.push_str(&format!(
+        "capability = {}\n",
+        escape_toml_basic_string(&rule.capability)
+    ));
+    text.push_str(&format!(
+        "target = {}\n",
+        escape_toml_basic_string(&rule.target)
+    ));
+    text.push_str(&format!(
+        "action = {}\n",
+        escape_toml_basic_string(rule.action.as_str())
+    ));
+    text.push_str(&format!(
+        "source = {}\n",
+        escape_toml_basic_string(rule.source.as_str())
+    ));
+    text.push_str(&format!("reason = {}\n", escape_toml_basic_string(&reason)));
+    file.write_all(text.as_bytes())
+}
+
+/// Pick a rule shape to persist for this approval. Refuses Allow on any
+/// destructive capability (regardless of target), and refuses Allow rules that
+/// would broadly match all paths/commands via a `*` target.
+pub(crate) fn permission_rule_for_persistence(
     request: &PermissionRequest,
     source: PermissionRuleSource,
     action: PermissionAction,
@@ -1054,8 +1222,16 @@ fn permission_rule_for_persistence(
     });
     rule.action = action;
     rule.source = source;
-    if rule.capability == "destructive" && rule.target == "*" && action == PermissionAction::Allow {
-        return None;
+    if action == PermissionAction::Allow {
+        if request.capability == PermissionCapability::Destructive {
+            return None;
+        }
+        if rule.capability == "destructive" {
+            return None;
+        }
+        if rule.target.trim() == "*" {
+            return None;
+        }
     }
     Some(rule)
 }

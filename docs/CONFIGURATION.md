@@ -61,7 +61,7 @@ commented examples so that built-in defaults can evolve over time:
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
-# shell_classifier = true
+# shell_classifier = false       # narrow LLM fallback for ambiguous shell commands (extra LLM call)
 #
 # [[permissions.rules]]
 # capability = "shell"
@@ -102,12 +102,32 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 - `[budgets]`: per-turn and per-tool output limits.
 - `[permissions]`: compatibility defaults `read`, `edit`, `shell`,
   `ignored_search`, and `web`, each set to `allow`, `ask`, or `deny`.
-  `shell_classifier` enables the narrow LLM fallback for ambiguous shell
-  commands.
+  `shell_classifier` (default `false`) enables a narrow LLM fallback that
+  can only downgrade an `Ask` shell verdict to `Deny`; it spends one extra
+  LLM round-trip per ambiguous shell call, so leave it off unless that cost
+  is acceptable.
 - `[[permissions.rules]]`: ordered allow/ask/deny rules with `capability`,
   `target`, `action`, optional `source`, and optional `reason`. Later matching
-  rules win. Current capabilities are `read`, `search`, `edit`, `shell`,
-  `network`, `mcp`, `git`, `compiler`, and `destructive`.
+  rules win, and any session-scoped approvals added through the TUI also stack
+  on top of the file rules. Current capabilities are `read`, `search`, `edit`,
+  `shell`, `network`, `mcp`, `git`, `compiler`, and `destructive`. Targets are
+  prefix-tagged so different scopes do not collide:
+  - `path:<rel-path>` for `edit` rules.
+  - `domain:<host>` for `network` (`webfetch`) rules.
+  - `search:<provider>` for `network` search rules.
+  - `workspace:*` for ordinary read/search rules.
+  - `ignored:*` for read/search rules that include git-ignored files.
+  - `tool:<name>` as a catch-all for tools that do not specify their own scope.
+  - `<cmd-prefix>:*` for shell/git/compiler rules (e.g. `cargo test:*`,
+    `rm:*`). `*` itself is treated as a wildcard segment in any position.
+  Allow rules on the `destructive` capability and Allow rules with a bare `*`
+  target are refused at load time and at approval persistence time; honor
+  destructive operations either per-call or by widening the `shell`
+  compatibility default.
+  Rules are matched by walking the configured rules first and the session
+  rules last, returning the most recently added matching rule. Permission
+  decisions are emitted on the `squeezy::permissions` tracing target with the
+  capability, target, risk, action, matched-rule source, and reason fields.
 - `[telemetry]`: `enabled` and `endpoint`.
 - `[web]`: `exa_mcp_url` and `exa_api_key_env`.
 - `[cache]`: `root` and `tool_outputs`. Relative paths resolve against the
