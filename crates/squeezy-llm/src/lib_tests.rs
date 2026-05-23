@@ -39,6 +39,46 @@ fn registry_estimates_known_model_costs() {
 }
 
 #[test]
+fn registry_does_not_double_subtract_anthropic_cached_input() {
+    // Anthropic's Messages API reports `input_tokens` as already-uncached,
+    // so the OpenAI-style `input - cached - cache_write` math under-counts
+    // the standard share when prompt caching is active.
+    let cached = CostSnapshot {
+        input_tokens: Some(200),
+        output_tokens: Some(50),
+        cached_input_tokens: Some(5_000),
+        cache_write_input_tokens: Some(0),
+        estimated_usd_micros: None,
+    };
+    let uncached = CostSnapshot {
+        input_tokens: Some(200),
+        output_tokens: Some(50),
+        cached_input_tokens: Some(0),
+        cache_write_input_tokens: Some(0),
+        estimated_usd_micros: None,
+    };
+    let cached_estimate =
+        estimate_cost("anthropic", squeezy_core::DEFAULT_ANTHROPIC_MODEL, &cached);
+    let uncached_estimate = estimate_cost(
+        "anthropic",
+        squeezy_core::DEFAULT_ANTHROPIC_MODEL,
+        &uncached,
+    );
+
+    // The 200 standard input tokens must still be billed at the standard rate
+    // even when cache_read is large; the only delta should be the cache_read
+    // surcharge.
+    assert!(cached_estimate.is_some());
+    assert!(uncached_estimate.is_some());
+    assert!(
+        cached_estimate.unwrap() >= uncached_estimate.unwrap(),
+        "cached cost {:?} must be >= uncached cost {:?} (cache_read is additive, not a discount)",
+        cached_estimate,
+        uncached_estimate,
+    );
+}
+
+#[test]
 fn registry_lists_ollama_as_zero_cost_local_provider() {
     let model = models_for_provider("ollama").next().expect("ollama model");
 

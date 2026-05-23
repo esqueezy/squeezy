@@ -74,10 +74,14 @@ impl LlmProvider for GoogleProvider {
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
         let client = self.client.clone();
-        let url = format!(
-            "{}/models/{}:streamGenerateContent?alt=sse&key={}",
-            self.base_url, request.model, self.api_key
-        );
+        // Keep the API key off the URL: `reqwest::Error::Display` appends
+        // `" for url ({url})"` to every transport/stream error message, so a
+        // key-in-query URL would leak the key into `SqueezyError::ProviderRequest`
+        // / `ProviderStream`, the CLI/TUI status line, logs, tracing, and bug
+        // reports on any DNS/TLS/timeout/connection or chunk error. Send it via
+        // Google's documented `x-goog-api-key` header instead.
+        let url = google_stream_url(&self.base_url, &request.model);
+        let api_key = self.api_key.clone();
         let body = Self::request_body(&request);
 
         Box::pin(try_stream! {
@@ -86,7 +90,11 @@ impl LlmProvider for GoogleProvider {
                     yield LlmEvent::Cancelled;
                     return;
                 }
-                response = client.post(&url).json(&body).send() => response,
+                response = client
+                    .post(&url)
+                    .header("x-goog-api-key", &api_key)
+                    .json(&body)
+                    .send() => response,
             };
             let response = response_result
                 .map_err(|err| SqueezyError::ProviderRequest(err.to_string()))?;
@@ -137,6 +145,10 @@ impl LlmProvider for GoogleProvider {
             };
         })
     }
+}
+
+pub(crate) fn google_stream_url(base_url: &str, model: &str) -> String {
+    format!("{base_url}/models/{model}:streamGenerateContent?alt=sse")
 }
 
 fn google_contents(input: &[LlmInputItem]) -> Value {
