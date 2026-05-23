@@ -1710,6 +1710,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "squeezy-core",
+ "squeezy-graph",
+ "squeezy-vcs",
  "tokio",
  "tokio-util",
 ]
@@ -1726,6 +1728,14 @@ dependencies = [
  "squeezy-tools",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "squeezy-vcs"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "squeezy-core",
 ]
 
 [[package]]
