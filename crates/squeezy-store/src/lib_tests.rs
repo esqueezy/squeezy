@@ -103,6 +103,42 @@ fn ensure_repo_profile_reuses_unchanged_light_fingerprint() {
 }
 
 #[test]
+fn registry_round_trip_preserves_optional_git_and_language_fields() {
+    // Guards against a regression where the hand-written TOML writer wrote
+    // `""` (or `false`) for `Option<_>` `None` values and the loader then
+    // produced `Some("")`/`Some(false)`, drifting away from a freshly
+    // detected profile.
+    let root = temp_root("repo_profile_roundtrip");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+
+    let registry_path = root.join("repos.toml");
+    let first = ensure_repo_profile_at(&registry_path, &root, &GraphConfig::default()).unwrap();
+    let reloaded = RepoRegistry::load(&registry_path).unwrap();
+    let loaded = reloaded
+        .profile_for_root(&fs::canonicalize(&root).unwrap())
+        .expect("profile present");
+
+    assert_eq!(loaded.git, first.profile.git);
+    assert!(loaded.git.vcs_type.is_none());
+    assert!(loaded.git.dirty.is_none());
+    for language in &loaded.languages {
+        let original = first
+            .profile
+            .languages
+            .iter()
+            .find(|candidate| candidate.name == language.name)
+            .expect("language present");
+        assert_eq!(language.family, original.family);
+    }
+}
+
+#[test]
 fn generated_and_vendor_coverage_appears_in_profile() {
     let root = temp_root("repo_profile_ignored_coverage");
     fs::create_dir_all(root.join("src")).unwrap();

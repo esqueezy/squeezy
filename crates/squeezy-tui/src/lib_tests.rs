@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use squeezy_core::{
-    AppConfig, PermissionCapability, PermissionRequest, PermissionRisk, PermissionScope,
+    AppConfig, PermissionCapability, PermissionRequest, PermissionRisk, PermissionScope, Role,
     SessionMode,
 };
 use squeezy_llm::UnavailableProvider;
@@ -42,6 +42,10 @@ fn app_surfaces_onboarding_summary_once() {
         app.transcript[0].content,
         "repo profile created: /tmp/project"
     );
+    // The seeded onboarding summary is Squeezy-authored metadata, not an
+    // assistant turn; surfacing it under Role::System keeps provenance
+    // honest and avoids visual collision with later assistant deltas.
+    assert_eq!(app.transcript[0].role, Role::System);
 }
 
 #[test]

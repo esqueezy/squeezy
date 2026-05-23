@@ -158,38 +158,27 @@ impl RepoRegistry {
             ));
 
             out.push_str("\n[repos.git]\n");
-            out.push_str(&format!(
-                "vcs_type = {}\n",
-                toml_optional_string(profile.git.vcs_type.as_deref())
-            ));
-            out.push_str(&format!(
-                "branch = {}\n",
-                toml_optional_string(profile.git.branch.as_deref())
-            ));
-            out.push_str(&format!(
-                "head = {}\n",
-                toml_optional_string(profile.git.head.as_deref())
-            ));
-            out.push_str(&format!(
-                "default_branch = {}\n",
-                toml_optional_string(profile.git.default_branch.as_deref())
-            ));
-            out.push_str(&format!(
-                "dirty = {}\n",
-                profile
-                    .git
-                    .dirty
-                    .map(|dirty| dirty.to_string())
-                    .unwrap_or_else(|| "false".to_string())
-            ));
+            // Optional fields are written only when present so a loaded
+            // profile round-trips back to the same in-memory shape. Writing
+            // `""` for `None` would deserialize to `Some("")`, which differs
+            // from a freshly detected profile and breaks downstream
+            // comparisons.
+            push_optional_string_field(&mut out, "vcs_type", profile.git.vcs_type.as_deref());
+            push_optional_string_field(&mut out, "branch", profile.git.branch.as_deref());
+            push_optional_string_field(&mut out, "head", profile.git.head.as_deref());
+            push_optional_string_field(
+                &mut out,
+                "default_branch",
+                profile.git.default_branch.as_deref(),
+            );
+            if let Some(dirty) = profile.git.dirty {
+                out.push_str(&format!("dirty = {dirty}\n"));
+            }
 
             for language in &profile.languages {
                 out.push_str("\n[[repos.languages]]\n");
                 out.push_str(&format!("name = {}\n", toml_string(&language.name)));
-                out.push_str(&format!(
-                    "family = {}\n",
-                    toml_optional_string(language.family.as_deref())
-                ));
+                push_optional_string_field(&mut out, "family", language.family.as_deref());
                 out.push_str(&format!("files = {}\n", language.files));
                 out.push_str(&format!(
                     "semantic_support = {}\n",
@@ -545,18 +534,24 @@ impl RepoFingerprint {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitState {
+    #[serde(default)]
     pub vcs_type: Option<String>,
+    #[serde(default)]
     pub branch: Option<String>,
+    #[serde(default)]
     pub head: Option<String>,
+    #[serde(default)]
     pub default_branch: Option<String>,
+    #[serde(default)]
     pub dirty: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetectedLanguage {
     pub name: String,
+    #[serde(default)]
     pub family: Option<String>,
     pub files: usize,
     pub semantic_support: SemanticSupport,
@@ -708,9 +703,14 @@ fn crawl_options_from_graph_config(config: &GraphConfig) -> CrawlOptions {
 }
 
 fn detect_git_state(root: &Path) -> GitState {
-    let vcs_type = root.join(".git").exists().then(|| "git".to_string());
+    // Skip the four git subprocess invocations when there is no `.git`
+    // directory. Onboarding runs on every CLI startup, so avoiding the
+    // forks keeps the steady-state cost near zero in non-git roots.
+    if !root.join(".git").exists() {
+        return GitState::default();
+    }
     GitState {
-        vcs_type,
+        vcs_type: Some("git".to_string()),
         branch: git_output(root, &["branch", "--show-current"]),
         head: git_output(root, &["rev-parse", "HEAD"]),
         default_branch: git_output(
@@ -1134,8 +1134,10 @@ fn toml_array(values: &[impl AsRef<str>]) -> String {
     format!("[{body}]")
 }
 
-fn toml_optional_string(value: Option<&str>) -> String {
-    value.map(toml_string).unwrap_or_else(|| "\"\"".to_string())
+fn push_optional_string_field(out: &mut String, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        out.push_str(&format!("{key} = {}\n", toml_string(value)));
+    }
 }
 
 fn toml_string(value: &str) -> String {

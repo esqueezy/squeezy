@@ -153,9 +153,6 @@ async fn main() -> squeezy_core::Result<()> {
     }
 
     let onboarding = prepare_repo_profile(&mut config)?;
-    if let Some(summary) = &onboarding.visible_summary {
-        eprintln!("{summary}");
-    }
 
     show_telemetry_notice_once(&config);
     let telemetry = TelemetryClient::from_config(&config);
@@ -163,6 +160,13 @@ async fn main() -> squeezy_core::Result<()> {
 
     let provider = provider_from_app_config(&config);
     if let Some(prompt) = cli.prompt {
+        // Non-interactive prompt mode has no TUI to seed the summary into,
+        // so surface it on stderr before the streamed completion lands on
+        // stdout. The TUI path skips this print because it shows the same
+        // summary in the transcript's system row.
+        if let Some(summary) = &onboarding.visible_summary {
+            eprintln!("{summary}");
+        }
         let result = run_prompt(config, provider, prompt).await;
         let _ = telemetry.flush().await;
         return result;
