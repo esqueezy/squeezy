@@ -1,17 +1,23 @@
 # Provider And Model Configuration
 
+The full configuration model, source precedence, templates, and inspection
+commands are documented in [`CONFIGURATION.md`](CONFIGURATION.md). This page
+focuses on provider-specific fields.
+
 Squeezy resolves provider settings from these sources, in order:
 
 1. CLI flags
 2. Environment variables
-3. `~/.squeezy/settings.toml`
-4. Built-in defaults
+3. `squeezy.toml`
+4. `~/.squeezy/settings.toml`
+5. Built-in defaults
 
 The default settings path can be overridden with `SQUEEZY_SETTINGS_PATH`.
 
 ## Settings File
 
 ```toml
+[model]
 provider = "openai"
 profile = "balanced"
 model = ""

@@ -89,11 +89,12 @@ pub struct ToolReceipt {
     pub content_sha256: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutputConfig {
     pub spill_threshold_bytes: usize,
     pub preview_bytes: usize,
     pub retention_days: u64,
+    pub output_dir: Option<PathBuf>,
 }
 
 impl Default for ToolOutputConfig {
@@ -102,6 +103,7 @@ impl Default for ToolOutputConfig {
             spill_threshold_bytes: DEFAULT_TOOL_SPILL_THRESHOLD_BYTES,
             preview_bytes: DEFAULT_TOOL_PREVIEW_BYTES,
             retention_days: DEFAULT_TOOL_OUTPUT_RETENTION_DAYS,
+            output_dir: None,
         }
     }
 }
@@ -115,6 +117,7 @@ impl ToolOutputConfig {
             ),
             preview_bytes: nonzero_or(self.preview_bytes, DEFAULT_TOOL_PREVIEW_BYTES),
             retention_days: nonzero_or_u64(self.retention_days, DEFAULT_TOOL_OUTPUT_RETENTION_DAYS),
+            output_dir: self.output_dir,
         }
     }
 }
@@ -1406,7 +1409,9 @@ impl ToolOutputStore {
     fn new(root: &Path, config: ToolOutputConfig) -> Result<Self> {
         let config = config.normalized();
         let store = Self {
-            dir: root.join(".squeezy").join("tool_outputs"),
+            dir: config
+                .output_dir
+                .unwrap_or_else(|| root.join(".squeezy").join("tool_outputs")),
             spill_threshold_bytes: config.spill_threshold_bytes,
             preview_bytes: config.preview_bytes,
             retention: Duration::from_secs(config.retention_days * 24 * 60 * 60),

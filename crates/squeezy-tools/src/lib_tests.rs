@@ -309,6 +309,7 @@ async fn output_spill_uses_registry_config() {
             spill_threshold_bytes: 100,
             preview_bytes: 17,
             retention_days: 1,
+            output_dir: None,
         },
     )
     .expect("registry");

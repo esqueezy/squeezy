@@ -5,9 +5,12 @@ use std::{
     sync::Arc,
 };
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use squeezy_core::{AppConfig, ModelProfile};
+use squeezy_core::{
+    AppConfig, ModelProfile, SqueezyError, default_settings_path, project_settings_template,
+    user_settings_template,
+};
 use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, PROVIDERS, UnavailableProvider,
     models_for_provider, provider_from_config,
@@ -28,8 +31,8 @@ struct Cli {
         help = "Model profile: cheap, balanced, or strong"
     )]
     profile: Option<String>,
-    #[arg(long, default_value_t = squeezy_core::DEFAULT_MAX_OUTPUT_TOKENS)]
-    max_output_tokens: u32,
+    #[arg(long)]
+    max_output_tokens: Option<u32>,
     #[arg(long, help = "List configured built-in providers")]
     list_providers: bool,
     #[arg(long, help = "List built-in model metadata")]
@@ -38,6 +41,32 @@ struct Cli {
     prompt: Option<String>,
     #[arg(long, help = "Check configuration and exit without opening the TUI")]
     health: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    #[command(about = "Inspect or initialize Squeezy configuration")]
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    #[command(about = "Print the effective merged configuration with secrets redacted")]
+    Inspect,
+    #[command(about = "Create a default user or project settings file")]
+    Init {
+        #[arg(long, conflicts_with = "project")]
+        user: bool,
+        #[arg(long, conflicts_with = "user")]
+        project: bool,
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -48,14 +77,11 @@ async fn main() -> squeezy_core::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let mut config = config_from_cli_provider(cli.provider.as_deref())?;
-    if let Some(model) = cli.model {
-        config.model = model;
+    if let Some(Command::Config { command }) = &cli.command {
+        return handle_config_command(command, &cli);
     }
-    if let Some(profile) = cli.profile.as_deref().and_then(ModelProfile::parse) {
-        config.profile = profile;
-    }
-    config.max_output_tokens = Some(cli.max_output_tokens);
+
+    let config = config_from_cli(&cli)?;
 
     if cli.list_providers {
         for provider in PROVIDERS {
@@ -89,6 +115,7 @@ async fn main() -> squeezy_core::Result<()> {
 
     if cli.health {
         println!("squeezy: ok");
+        println!("config_sources={}", config.config_sources.join(","));
         return Ok(());
     }
 
@@ -106,6 +133,68 @@ async fn main() -> squeezy_core::Result<()> {
     let result = squeezy_tui::run(config, provider).await;
     let _ = telemetry.flush().await;
     result
+}
+
+fn config_from_cli(cli: &Cli) -> squeezy_core::Result<AppConfig> {
+    let mut config = config_from_cli_provider(cli.provider.as_deref())?;
+    let mut cli_used = cli.provider.is_some();
+    if let Some(model) = &cli.model {
+        cli_used = true;
+        config.model = model.clone();
+    }
+    if let Some(profile) = cli.profile.as_deref().and_then(ModelProfile::parse) {
+        cli_used = true;
+        config.profile = profile;
+    }
+    if let Some(max_output_tokens) = cli.max_output_tokens {
+        cli_used = true;
+        config.max_output_tokens = Some(max_output_tokens);
+    }
+    if cli_used && !config.config_sources.iter().any(|source| source == "cli") {
+        config.config_sources.push("cli".to_string());
+    }
+    Ok(config)
+}
+
+fn handle_config_command(command: &ConfigCommand, cli: &Cli) -> squeezy_core::Result<()> {
+    match command {
+        ConfigCommand::Inspect => {
+            let config = config_from_cli(cli)?;
+            print!("{}", config.inspect_redacted());
+            Ok(())
+        }
+        ConfigCommand::Init {
+            user,
+            project,
+            force,
+        } => {
+            if *user == *project {
+                return Err(SqueezyError::Config(
+                    "config init requires exactly one of --user or --project".to_string(),
+                ));
+            }
+            let (path, template) = if *user {
+                (default_settings_path(), user_settings_template())
+            } else {
+                (
+                    PathBuf::from(squeezy_core::PROJECT_SETTINGS_FILE),
+                    project_settings_template(),
+                )
+            };
+            if path.exists() && !force {
+                return Err(SqueezyError::Config(format!(
+                    "{} already exists; pass --force to overwrite",
+                    path.display()
+                )));
+            }
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, template)?;
+            println!("wrote {}", path.display());
+            Ok(())
+        }
+    }
 }
 
 async fn run_prompt(

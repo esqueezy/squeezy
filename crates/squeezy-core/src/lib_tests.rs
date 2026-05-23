@@ -160,8 +160,9 @@ fn config_reads_anthropic_env_overrides() {
 
 #[test]
 fn config_reads_settings_file_provider_defaults() {
-    let settings: SettingsFile = toml::from_str(
+    let settings = SettingsFile::from_toml_str(
         r#"
+[model]
 provider = "ollama"
 profile = "cheap"
 
@@ -169,6 +170,7 @@ profile = "cheap"
 base_url = "http://ollama.example/api"
 default_model = "llama-local"
 "#,
+        "test",
     )
     .expect("settings parse");
 
@@ -186,7 +188,7 @@ default_model = "llama-local"
 
 #[test]
 fn env_overrides_settings_file_provider_and_model() {
-    let settings: SettingsFile = toml::from_str(
+    let settings = SettingsFile::from_toml_str(
         r#"
 provider = "ollama"
 model = "llama-local"
@@ -196,6 +198,7 @@ api_key_env = "CUSTOM_GEMINI_KEY"
 base_url = "https://gemini.example/v1"
 default_model = "gemini-local"
 "#,
+        "test",
     )
     .expect("settings parse");
 
@@ -217,7 +220,7 @@ default_model = "gemini-local"
 
 #[test]
 fn provider_override_uses_selected_provider_settings_and_default_model() {
-    let settings: SettingsFile = toml::from_str(
+    let settings = SettingsFile::from_toml_str(
         r#"
 provider = "openai"
 
@@ -229,6 +232,7 @@ api_key_env = "CUSTOM_ANTHROPIC_KEY"
 base_url = "https://anthropic.example/v1"
 default_model = "claude-settings-model"
 "#,
+        "test",
     )
     .expect("settings parse");
 
@@ -278,4 +282,169 @@ fn permission_mode_parses_expected_values() {
     assert_eq!(PermissionMode::parse("ASK"), Some(PermissionMode::Ask));
     assert_eq!(PermissionMode::parse("deny"), Some(PermissionMode::Deny));
     assert_eq!(PermissionMode::parse("maybe"), None);
+}
+
+#[test]
+fn section_settings_cover_budgets_permissions_graph_cache_tui_and_mcp() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "openai"
+model = "gpt-custom"
+max_output_tokens = 512
+store_responses = true
+
+[budgets]
+max_parallel_tools = 3
+tool_spill_threshold_bytes = 1000
+tool_preview_bytes = 200
+max_tool_result_bytes_per_round = 3000
+tool_output_retention_days = 2
+max_tool_calls_per_turn = 4
+max_tool_bytes_read_per_turn = 5000
+max_search_files_per_turn = 6
+
+[permissions]
+read = "allow"
+edit = "deny"
+shell = "ask"
+ignored_search = "allow"
+web = "deny"
+
+[telemetry]
+enabled = false
+endpoint = "https://telemetry.example/batch"
+
+[web]
+exa_mcp_url = "https://search.example/mcp"
+exa_api_key_env = "CUSTOM_EXA_KEY"
+
+[graph]
+languages = ["rust", "csharp"]
+max_file_bytes = 42
+include_hidden = true
+require_indexing_signal = false
+
+[cache]
+root = ".squeezy/cache"
+tool_outputs = ".squeezy/tool_outputs"
+
+[tui]
+tick_rate_ms = 75
+status_verbosity = "verbose"
+
+[mcp.servers.docs]
+enabled = true
+transport = "http"
+url = "https://docs.example/mcp"
+timeout_ms = 5000
+env = { TOKEN = "secret" }
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    assert_eq!(config.model, "gpt-custom");
+    assert_eq!(config.max_output_tokens, Some(512));
+    assert!(config.store_responses);
+    assert_eq!(config.max_parallel_tools, 3);
+    assert_eq!(config.tool_spill_threshold_bytes, 1000);
+    assert_eq!(config.permissions.edit, PermissionMode::Deny);
+    assert!(!config.telemetry.enabled);
+    assert_eq!(config.exa_api_key_env, "CUSTOM_EXA_KEY");
+    assert_eq!(config.graph.languages, vec!["rust", "csharp"]);
+    assert_eq!(
+        config.cache.tool_outputs,
+        Some(PathBuf::from(".squeezy/tool_outputs"))
+    );
+    assert_eq!(config.tui.tick_rate_ms, 75);
+    assert_eq!(config.tui.status_verbosity, StatusVerbosity::Verbose);
+    assert_eq!(config.mcp_servers["docs"].transport, McpTransport::Http);
+}
+
+#[test]
+fn project_settings_override_user_settings_with_deep_provider_merge() {
+    let mut user = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "openai"
+
+[providers.openai]
+api_key_env = "USER_OPENAI_KEY"
+base_url = "https://user.example/v1"
+default_model = "user-model"
+"#,
+        "user",
+    )
+    .expect("user settings");
+    let project = SettingsFile::from_toml_str(
+        r#"
+[model]
+model = "project-model"
+
+[providers.openai]
+default_model = "project-default"
+"#,
+        "project",
+    )
+    .expect("project settings");
+
+    user.merge(project);
+    let config = AppConfig::from_settings_and_env_vars(user, |_| None);
+
+    assert_eq!(config.model, "project-model");
+    match config.provider {
+        ProviderConfig::OpenAi(openai) => {
+            assert_eq!(openai.api_key_env, "USER_OPENAI_KEY");
+            assert_eq!(openai.base_url, "https://user.example/v1");
+        }
+        _ => panic!("expected OpenAI provider"),
+    }
+}
+
+#[test]
+fn config_validation_reports_source_and_path() {
+    let error = SettingsFile::from_toml_str(
+        r#"
+[permissions]
+shell = "sometimes"
+"#,
+        "squeezy.toml",
+    )
+    .expect_err("invalid permission should fail");
+
+    let message = error.to_string();
+    assert!(message.contains("squeezy.toml"));
+    assert!(message.contains("permissions.shell"));
+}
+
+#[test]
+fn inspect_redacts_sensitive_config_values() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[web]
+exa_api_key_env = "CUSTOM_EXA_KEY"
+
+[mcp.servers.docs]
+env = { TOKEN = "secret-value" }
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    let inspect = config.inspect_redacted();
+
+    assert!(inspect.contains("<redacted>"));
+    assert!(!inspect.contains("CUSTOM_EXA_KEY"));
+    assert!(!inspect.contains("secret-value"));
+}
+
+#[test]
+fn generated_templates_parse() {
+    SettingsFile::from_toml_str(user_settings_template(), "user template")
+        .expect("user template parses");
+    SettingsFile::from_toml_str(project_settings_template(), "project template")
+        .expect("project template parses");
 }
