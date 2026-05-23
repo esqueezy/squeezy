@@ -7,7 +7,7 @@ use std::{
 
 use squeezy_core::{ContentHash, FileId, LanguageKind};
 use squeezy_parse::{LanguageParser, ParsedFile, ReferenceKind};
-use squeezy_workspace::{FileRecord, stable_content_hash};
+use squeezy_workspace::{CrawlOptions, FileRecord, stable_content_hash};
 
 use super::*;
 
@@ -289,6 +289,44 @@ fn graph_manager_refresh_replaces_changed_file_only() {
     assert_eq!(report.language.rust_files, 1);
     assert!(manager.graph().find_symbol_by_name("one").is_empty());
     assert!(!manager.graph().find_symbol_by_name("two").is_empty());
+}
+
+#[test]
+fn graph_reports_indexing_policy_coverage() {
+    let root = temp_root("graph-policy-coverage");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("vendor/lib")).unwrap();
+    fs::write(root.join("src").join("lib.rs"), "pub fn indexed() {}\n").unwrap();
+    fs::write(root.join("vendor/lib/lib.rs"), "pub fn vendored() {}\n").unwrap();
+    fs::write(root.join("Cargo.lock"), "# lock\n").unwrap();
+
+    let manager = GraphManager::open_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+    )
+    .unwrap();
+
+    assert!(!manager.graph().find_symbol_by_name("indexed").is_empty());
+    assert!(manager.graph().find_symbol_by_name("vendored").is_empty());
+    // Cargo.lock is a file-level exclusion; vendor/ is a directory-level
+    // pruning (one entry rather than one entry per file under it).
+    assert!(manager.build_report().excluded_files >= 1);
+    assert!(manager.build_report().excluded_dirs >= 1);
+    assert!(
+        manager
+            .build_report()
+            .coverage
+            .reasons
+            .contains_key("vendor")
+    );
+    assert!(
+        manager
+            .build_report()
+            .coverage
+            .reasons
+            .contains_key("lockfile")
+    );
 }
 
 #[test]
@@ -1168,6 +1206,63 @@ impl IntoThing for Local {
             .iter()
             .all(|hit| hit.reference.text != "Self::Output")
     );
+}
+
+#[test]
+fn annotate_dirty_ranges_marks_only_intersecting_symbols_and_clears_on_reapply() {
+    let source = "pub fn first() -> usize { 1 }\npub fn second() -> usize { 2 }\npub fn third() -> usize { 3 }\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let mut graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let mut dirty = HashMap::new();
+    dirty.insert(
+        FileId::new("src/lib.rs"),
+        DirtyAnnotation {
+            status: "modified".to_string(),
+            ranges: vec![DirtyRange {
+                start_line: 1,
+                end_line: 1,
+            }],
+        },
+    );
+    graph.annotate_dirty_ranges(&dirty);
+
+    let dirty_names = graph
+        .dirty_symbols()
+        .into_iter()
+        .map(|symbol| symbol.name)
+        .collect::<Vec<_>>();
+    assert_eq!(dirty_names, vec!["second".to_string()]);
+    assert!(
+        graph
+            .dirty_symbols()
+            .iter()
+            .all(|symbol| symbol.kind != SymbolKind::File)
+    );
+
+    dirty.clear();
+    dirty.insert(
+        FileId::new("src/lib.rs"),
+        DirtyAnnotation {
+            status: "modified".to_string(),
+            ranges: vec![DirtyRange {
+                start_line: 2,
+                end_line: 2,
+            }],
+        },
+    );
+    graph.annotate_dirty_ranges(&dirty);
+    let dirty_names = graph
+        .dirty_symbols()
+        .into_iter()
+        .map(|symbol| symbol.name)
+        .collect::<Vec<_>>();
+    assert_eq!(dirty_names, vec!["third".to_string()]);
+
+    graph.annotate_dirty_ranges(&HashMap::new());
+    assert!(graph.dirty_symbols().is_empty());
 }
 
 fn record(relative_path: &str, source: &str) -> FileRecord {

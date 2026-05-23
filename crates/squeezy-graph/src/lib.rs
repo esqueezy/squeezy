@@ -12,7 +12,7 @@ use squeezy_parse::{
     BodyHit, BodyHitKind, LanguageParser, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport,
     ParsedReference, ParsedSymbol, ReferenceKind, edge_kind_for_call,
 };
-use squeezy_workspace::{CrawlOptions, FileRecord, WorkspaceCrawler};
+use squeezy_workspace::{CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler};
 
 pub const CRATE_NAME: &str = "squeezy-graph";
 const BODY_HIT_TRIGRAM_INDEX_MAX_HITS: usize = 100_000;
@@ -37,6 +37,7 @@ pub struct GraphSymbol {
     pub provenance: Provenance,
     pub confidence: Confidence,
     pub freshness: Freshness,
+    pub dirty: Option<DirtyAnnotation>,
 }
 
 impl From<ParsedSymbol> for GraphSymbol {
@@ -56,8 +57,21 @@ impl From<ParsedSymbol> for GraphSymbol {
             provenance: symbol.provenance,
             confidence: symbol.confidence,
             freshness: symbol.freshness,
+            dirty: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirtyAnnotation {
+    pub status: String,
+    pub ranges: Vec<DirtyRange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirtyRange {
+    pub start_line: u32,
+    pub end_line: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +402,38 @@ impl SemanticGraph {
                 && left.reference.span == right.reference.span
         });
         hits
+    }
+
+    pub fn annotate_dirty_ranges(&mut self, dirty: &HashMap<FileId, DirtyAnnotation>) {
+        for symbol in self.symbols.values_mut() {
+            symbol.dirty = None;
+            let Some(annotation) = dirty.get(&symbol.file_id) else {
+                continue;
+            };
+            if symbol.kind == SymbolKind::File
+                || annotation.ranges.iter().any(|range| {
+                    line_ranges_intersect(symbol.span.start.line, symbol.span.end.line, *range)
+                })
+            {
+                symbol.dirty = Some(annotation.clone());
+            }
+        }
+    }
+
+    pub fn dirty_symbols(&self) -> Vec<GraphSymbol> {
+        let mut symbols = self
+            .symbols
+            .values()
+            .filter(|symbol| symbol.dirty.is_some() && symbol.kind != SymbolKind::File)
+            .cloned()
+            .collect::<Vec<_>>();
+        symbols.sort_by(|left, right| {
+            left.file_id
+                .0
+                .cmp(&right.file_id.0)
+                .then(left.span.start_byte.cmp(&right.span.start_byte))
+        });
+        symbols
     }
 
     pub fn callees(&self, caller: &SymbolId) -> Vec<CallEdgeHit> {
@@ -2465,6 +2511,10 @@ pub struct GraphBuildReport {
     pub files_seen: usize,
     pub parsed_files: usize,
     pub unsupported_files: usize,
+    pub excluded_files: usize,
+    pub excluded_dirs: usize,
+    pub excluded_bytes: u64,
+    pub coverage: IndexCoverage,
     pub bytes_seen: u64,
     pub language: LanguageReport,
     pub stats: GraphStats,
@@ -2478,6 +2528,10 @@ pub struct RefreshReport {
     pub reparsed_files: usize,
     pub duration_ms: u128,
     pub files_seen: usize,
+    pub excluded_files: usize,
+    pub excluded_dirs: usize,
+    pub excluded_bytes: u64,
+    pub coverage: IndexCoverage,
     pub bytes_seen: u64,
     pub bytes_reparsed: u64,
     pub language: LanguageReport,
@@ -2512,9 +2566,17 @@ impl GraphManager {
     }
 
     pub fn open_with_config(root: impl AsRef<Path>, config: RefreshConfig) -> Result<Self> {
+        Self::open_with_crawl_options(root, config, CrawlOptions::default())
+    }
+
+    pub fn open_with_crawl_options(
+        root: impl AsRef<Path>,
+        config: RefreshConfig,
+        crawl_options: CrawlOptions,
+    ) -> Result<Self> {
         let started = Instant::now();
         let root = root.as_ref().to_path_buf();
-        let crawler = WorkspaceCrawler::new(CrawlOptions::default());
+        let crawler = WorkspaceCrawler::new(crawl_options);
         let snapshot = crawler.crawl(&root)?;
         let mut parser = LanguageParser::new()?;
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
@@ -2526,6 +2588,10 @@ impl GraphManager {
             files_seen: snapshot.files.len(),
             parsed_files: parse_summary.parsed_files,
             unsupported_files: parse_summary.unsupported_files,
+            excluded_files: snapshot.coverage.skipped_files,
+            excluded_dirs: snapshot.coverage.skipped_dirs,
+            excluded_bytes: snapshot.coverage.skipped_bytes,
+            coverage: snapshot.coverage.clone(),
             bytes_seen,
             language,
             stats: graph.stats(),
@@ -2573,6 +2639,10 @@ impl GraphManager {
                 reparsed_files: 0,
                 duration_ms: 0,
                 files_seen: self.graph.files.len(),
+                excluded_files: self.build_report.excluded_files,
+                excluded_dirs: self.build_report.excluded_dirs,
+                excluded_bytes: self.build_report.excluded_bytes,
+                coverage: self.build_report.coverage.clone(),
                 bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
                 bytes_reparsed: 0,
                 language: language_report(self.graph.files.values()),
@@ -2594,6 +2664,10 @@ impl GraphManager {
                 reparsed_files: 0,
                 duration_ms: started.elapsed().as_millis(),
                 files_seen: self.graph.files.len(),
+                excluded_files: self.build_report.excluded_files,
+                excluded_dirs: self.build_report.excluded_dirs,
+                excluded_bytes: self.build_report.excluded_bytes,
+                coverage: self.build_report.coverage.clone(),
                 bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
                 bytes_reparsed: 0,
                 language: language_report(self.graph.files.values()),
@@ -2605,6 +2679,7 @@ impl GraphManager {
 
         let snapshot = self.crawler.crawl(&self.root)?;
         let files_seen = snapshot.files.len();
+        let coverage = snapshot.coverage.clone();
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
         let language = language_report(&snapshot.files);
         let current = snapshot
@@ -2667,6 +2742,10 @@ impl GraphManager {
             reparsed_files,
             duration_ms: started.elapsed().as_millis(),
             files_seen,
+            excluded_files: coverage.skipped_files,
+            excluded_dirs: coverage.skipped_dirs,
+            excluded_bytes: coverage.skipped_bytes,
+            coverage,
             bytes_seen,
             bytes_reparsed,
             language,
@@ -2699,6 +2778,10 @@ fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> Lan
     report
 }
 
+fn line_ranges_intersect(start: u32, end: u32, dirty: DirtyRange) -> bool {
+    start <= dirty.end_line && dirty.start_line <= end
+}
+
 fn file_symbol(file: &FileRecord) -> GraphSymbol {
     GraphSymbol {
         id: file_symbol_id(&file.id),
@@ -2720,6 +2803,7 @@ fn file_symbol(file: &FileRecord) -> GraphSymbol {
         provenance: Provenance::new("squeezy-workspace", "workspace file record"),
         confidence: Confidence::ExactSyntax,
         freshness: file.freshness,
+        dirty: None,
     }
 }
 

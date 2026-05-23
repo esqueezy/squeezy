@@ -1617,6 +1617,7 @@ dependencies = [
  "serde",
  "thiserror",
  "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -1680,6 +1681,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "squeezy-skills"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "squeezy-core",
+ "tracing",
+]
+
+[[package]]
 name = "squeezy-store"
 version = "0.1.0"
 dependencies = [
@@ -1710,6 +1721,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "squeezy-core",
+ "squeezy-graph",
+ "squeezy-skills",
+ "squeezy-vcs",
+ "squeezy-workspace",
  "tokio",
  "tokio-util",
 ]
@@ -1729,9 +1744,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "squeezy-vcs"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "squeezy-core",
+]
+
+[[package]]
 name = "squeezy-workspace"
 version = "0.1.0"
 dependencies = [
+ "globset",
  "ignore",
  "squeezy-core",
 ]
