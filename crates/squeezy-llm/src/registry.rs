@@ -171,11 +171,20 @@ pub fn estimate_cost(provider: &str, model: &str, cost: &CostSnapshot) -> Option
         .and_then(|entry| entry.pricing)?;
     let cached_input_tokens = cost.cached_input_tokens.unwrap_or(0);
     let cache_write_input_tokens = cost.cache_write_input_tokens.unwrap_or(0);
-    let standard_input_tokens = cost
-        .input_tokens
-        .unwrap_or(0)
-        .saturating_sub(cached_input_tokens)
-        .saturating_sub(cache_write_input_tokens);
+    // OpenAI/Gemini report `input_tokens` as the total including cached and
+    // cache-write tokens, so the standard share has to be derived by
+    // subtraction. Anthropic's Messages API (and Bedrock's Claude variant)
+    // report `input_tokens` as already-uncached, so the subtraction would
+    // strip out tokens that aren't in the value and undercount the
+    // standard-rate cost (often to zero when caching is active).
+    let standard_input_tokens = match provider {
+        "anthropic" | "bedrock" => cost.input_tokens.unwrap_or(0),
+        _ => cost
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_sub(cached_input_tokens)
+            .saturating_sub(cache_write_input_tokens),
+    };
     Some(
         estimate_tokens(standard_input_tokens, pricing.input_usd_micros_per_mtok)
             + estimate(cost.output_tokens, pricing.output_usd_micros_per_mtok)

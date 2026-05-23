@@ -4,6 +4,22 @@ use super::*;
 use crate::{LlmInputItem, LlmToolCall, LlmToolSpec};
 
 #[test]
+fn stream_url_does_not_contain_api_key() {
+    let url = google_stream_url(
+        "https://generativelanguage.googleapis.com/v1beta",
+        "gemini-test",
+    );
+    assert_eq!(
+        url,
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:streamGenerateContent?alt=sse"
+    );
+    assert!(
+        !url.contains("key="),
+        "API key must travel in the x-goog-api-key header, not the URL"
+    );
+}
+
+#[test]
 fn request_body_uses_generate_content_shape() {
     let request = LlmRequest {
         model: "gemini-test".to_string(),
