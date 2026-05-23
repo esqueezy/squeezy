@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::UNIX_EPOCH,
 };
 
@@ -12,6 +13,7 @@ use squeezy_core::{ContentHash, FileId, Freshness, LanguageKind, Result, Squeezy
 pub const CRATE_NAME: &str = "squeezy-workspace";
 const SOURCE_SCAN_MAX_DEPTH: usize = 2;
 const SOURCE_SCAN_MAX_ENTRIES: usize = 1_000;
+const BINARY_GENERATED_PREFIX_BYTES: usize = 4096;
 
 pub fn crate_name() -> &'static str {
     CRATE_NAME
@@ -44,17 +46,15 @@ pub struct IndexingPolicy {
     pub exclude_classes: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct CompiledIndexingPolicy {
-    include: GlobSet,
-    exclude: GlobSet,
-    include_classes: Vec<String>,
-    exclude_classes: Vec<String>,
-}
-
 impl IndexingPolicy {
-    fn compile(&self) -> Result<CompiledIndexingPolicy> {
+    pub fn compile(&self) -> Result<CompiledIndexingPolicy> {
+        let include_patterns = self
+            .include
+            .iter()
+            .map(|pattern| normalize_path(pattern, false))
+            .collect::<Vec<_>>();
         Ok(CompiledIndexingPolicy {
+            include_patterns,
             include: build_glob_set(&self.include)?,
             exclude: build_glob_set(&self.exclude)?,
             include_classes: self
@@ -69,6 +69,109 @@ impl IndexingPolicy {
                 .collect(),
         })
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledIndexingPolicy {
+    include_patterns: Vec<String>,
+    include: GlobSet,
+    exclude: GlobSet,
+    include_classes: Vec<String>,
+    exclude_classes: Vec<String>,
+}
+
+impl CompiledIndexingPolicy {
+    pub fn empty() -> Self {
+        IndexingPolicy::default()
+            .compile()
+            .expect("default policy compiles")
+    }
+
+    pub fn path_reason(&self, relative_path: &str, is_dir: bool) -> Option<ExclusionReason> {
+        let normalized = normalize_path(relative_path, is_dir);
+        let path = Path::new(&normalized);
+        if self.exclude.is_match(path) {
+            return Some(ExclusionReason::UserExclude);
+        }
+        let reason = default_path_reason(&normalized, is_dir)?;
+        if self.excludes_class(reason) {
+            return Some(reason);
+        }
+        if self.include.is_match(path) || self.includes_class(reason) {
+            return None;
+        }
+        // Don't prune a directory if an `include` glob can match files
+        // *under* it. Otherwise `include = ["vendor/allowed/**"]` would
+        // never see `vendor/allowed/foo.rs` because the walker would have
+        // already skipped `vendor/`.
+        if is_dir && self.include_could_descend(&normalized) {
+            return None;
+        }
+        Some(reason)
+    }
+
+    pub fn file_reason(
+        &self,
+        relative_path: &str,
+        size_bytes: u64,
+        max_file_bytes: u64,
+        prefix: Option<&[u8]>,
+    ) -> Option<ExclusionReason> {
+        if let Some(reason) = self.path_reason(relative_path, false) {
+            return Some(reason);
+        }
+        if size_bytes > max_file_bytes && !self.includes_class(ExclusionReason::LargeFile) {
+            return Some(ExclusionReason::LargeFile);
+        }
+        let bytes = prefix.unwrap_or_default();
+        if looks_binary(bytes) && !self.includes_class(ExclusionReason::Binary) {
+            return Some(ExclusionReason::Binary);
+        }
+        if looks_generated(bytes) && !self.includes_class(ExclusionReason::Generated) {
+            return Some(ExclusionReason::Generated);
+        }
+        None
+    }
+
+    pub fn includes_class(&self, reason: ExclusionReason) -> bool {
+        let class = reason.as_str();
+        self.include_classes
+            .iter()
+            .any(|candidate| candidate == class)
+    }
+
+    pub fn excludes_class(&self, reason: ExclusionReason) -> bool {
+        let class = reason.as_str();
+        self.exclude_classes
+            .iter()
+            .any(|candidate| candidate == class)
+    }
+
+    fn include_could_descend(&self, dir_with_slash: &str) -> bool {
+        if self.include_patterns.is_empty() {
+            return false;
+        }
+        for raw in &self.include_patterns {
+            let literal = literal_prefix(raw);
+            if literal.is_empty() {
+                // Pattern starts with a wildcard (`**/foo`, `*.rs`, etc.):
+                // we must descend everywhere to find potential matches.
+                return true;
+            }
+            if literal.starts_with(dir_with_slash) {
+                return true;
+            }
+            if literal.ends_with('/') && dir_with_slash.starts_with(literal) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn literal_prefix(pattern: &str) -> &str {
+    let cutoff = pattern.find(['*', '?', '[', '{']).unwrap_or(pattern.len());
+    &pattern[..cutoff]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,9 +209,10 @@ pub struct ExcludedPath {
     pub relative_path: String,
     pub size_bytes: u64,
     pub reason: ExclusionReason,
+    pub is_dir: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExclusionReason {
     VcsMetadata,
     Vendor,
@@ -119,6 +223,7 @@ pub enum ExclusionReason {
     Binary,
     LargeFile,
     UserExclude,
+    Hidden,
 }
 
 impl ExclusionReason {
@@ -133,6 +238,7 @@ impl ExclusionReason {
             Self::Binary => "binary",
             Self::LargeFile => "large_file",
             Self::UserExclude => "user_exclude",
+            Self::Hidden => "hidden",
         }
     }
 }
@@ -175,11 +281,34 @@ pub struct IndexingDecision {
 #[derive(Debug, Clone)]
 pub struct WorkspaceCrawler {
     options: CrawlOptions,
+    compiled_policy: Arc<CompiledIndexingPolicy>,
 }
 
 impl WorkspaceCrawler {
     pub fn new(options: CrawlOptions) -> Self {
-        Self { options }
+        // Default policies always compile; user-supplied policies must be
+        // validated up front via `IndexingPolicy::compile` to surface glob
+        // syntax errors loudly rather than silently disabling the policy.
+        let compiled_policy = options
+            .policy
+            .compile()
+            .expect("policy globs must be valid; validate via IndexingPolicy::compile() first");
+        Self {
+            options,
+            compiled_policy: Arc::new(compiled_policy),
+        }
+    }
+
+    pub fn try_new(options: CrawlOptions) -> Result<Self> {
+        let compiled_policy = Arc::new(options.policy.compile()?);
+        Ok(Self {
+            options,
+            compiled_policy,
+        })
+    }
+
+    pub fn policy(&self) -> &Arc<CompiledIndexingPolicy> {
+        &self.compiled_policy
     }
 
     pub fn crawl(&self, root: impl AsRef<Path>) -> Result<WorkspaceSnapshot> {
@@ -196,7 +325,11 @@ impl WorkspaceCrawler {
                 indexing_decision,
             });
         }
-        let policy = self.options.policy.compile()?;
+
+        // Shared collector for directories pruned during walk. Using a Mutex
+        // is OK because the sequential walker calls the filter closure on
+        // one thread at a time.
+        let pruned_dirs: Arc<Mutex<Vec<ExcludedPath>>> = Arc::new(Mutex::new(Vec::new()));
 
         let mut walker = WalkBuilder::new(&root);
         walker
@@ -205,6 +338,20 @@ impl WorkspaceCrawler {
             .git_exclude(true)
             .parents(true)
             .require_git(false);
+
+        let filter_root = root.clone();
+        let filter_policy = self.compiled_policy.clone();
+        let filter_pruned = pruned_dirs.clone();
+        let include_hidden = self.options.include_hidden;
+        walker.filter_entry(move |entry| {
+            keep_entry(
+                entry,
+                &filter_root,
+                filter_policy.as_ref(),
+                include_hidden,
+                &filter_pruned,
+            )
+        });
 
         let mut files = Vec::new();
         let mut unsupported = Vec::new();
@@ -224,17 +371,14 @@ impl WorkspaceCrawler {
             let Some(file_type) = entry.file_type() else {
                 continue;
             };
-            let path = entry.into_path();
-            let relative_path = relative_path(&root, &path)?;
             if file_type.is_dir() {
-                if let Some(reason) = policy.path_reason(&relative_path, true) {
-                    record_excluded_dir(&mut coverage, reason, &relative_path);
-                }
                 continue;
             }
             if !file_type.is_file() {
                 continue;
             }
+            let path = entry.into_path();
+            let relative_path = relative_path(&root, &path)?;
 
             let metadata = fs::metadata(&path)?;
             let size_bytes = metadata.len();
@@ -243,7 +387,7 @@ impl WorkspaceCrawler {
                 .map(|ext| ext.to_string_lossy().to_string());
             let language = classify_language(&path);
 
-            if let Some(reason) = policy.path_reason(&relative_path, false) {
+            if let Some(reason) = self.compiled_policy.path_reason(&relative_path, false) {
                 record_excluded_file(
                     &mut excluded,
                     &mut coverage,
@@ -255,9 +399,13 @@ impl WorkspaceCrawler {
                 continue;
             }
 
-            let bytes = fs::read(&path)?;
+            // Cheap rejection: skip the file before reading it when it is
+            // bigger than the per-file byte cap, unless the user opted into
+            // indexing large files via `include_classes = ["large_file"]`.
             if size_bytes > self.options.max_file_bytes
-                && !policy.includes_class(ExclusionReason::LargeFile)
+                && !self
+                    .compiled_policy
+                    .includes_class(ExclusionReason::LargeFile)
             {
                 record_excluded_file(
                     &mut excluded,
@@ -269,8 +417,10 @@ impl WorkspaceCrawler {
                 );
                 continue;
             }
+
+            let bytes = fs::read(&path)?;
             if looks_binary(&bytes) {
-                if policy.includes_class(ExclusionReason::Binary) {
+                if self.compiled_policy.includes_class(ExclusionReason::Binary) {
                     unsupported.push(unsupported_file(
                         &path,
                         relative_path.clone(),
@@ -290,7 +440,11 @@ impl WorkspaceCrawler {
                 }
                 continue;
             }
-            if looks_generated(&bytes) && !policy.includes_class(ExclusionReason::Generated) {
+            if looks_generated(&bytes)
+                && !self
+                    .compiled_policy
+                    .includes_class(ExclusionReason::Generated)
+            {
                 record_excluded_file(
                     &mut excluded,
                     &mut coverage,
@@ -331,6 +485,18 @@ impl WorkspaceCrawler {
             });
         }
 
+        // Pull pruned directories collected by `filter_entry` into the
+        // snapshot. We do this once so each excluded directory shows up
+        // exactly once, regardless of how many children it had.
+        let mut pruned_dirs = pruned_dirs
+            .lock()
+            .map(|mut guard| std::mem::take(&mut *guard))
+            .unwrap_or_default();
+        for entry in pruned_dirs.drain(..) {
+            record_excluded_dir_entry(&mut coverage, &entry);
+            excluded.push(entry);
+        }
+
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         unsupported.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         excluded.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -347,76 +513,69 @@ impl WorkspaceCrawler {
     }
 }
 
-impl CompiledIndexingPolicy {
-    fn path_reason(&self, relative_path: &str, is_dir: bool) -> Option<ExclusionReason> {
-        let normalized = normalize_path(relative_path, is_dir);
-        let path = Path::new(&normalized);
-        if self.exclude.is_match(path) {
-            return Some(ExclusionReason::UserExclude);
+fn keep_entry(
+    entry: &ignore::DirEntry,
+    root: &Path,
+    policy: &CompiledIndexingPolicy,
+    include_hidden: bool,
+    pruned: &Mutex<Vec<ExcludedPath>>,
+) -> bool {
+    let Some(file_type) = entry.file_type() else {
+        return true;
+    };
+    let path = entry.path();
+    let Ok(rel) = relative_path(root, path) else {
+        return true;
+    };
+    if rel.is_empty() {
+        return true;
+    }
+
+    let is_hidden = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.starts_with('.'))
+        .unwrap_or(false);
+
+    if file_type.is_dir() {
+        if let Some(reason) = policy.path_reason(&rel, true) {
+            if let Ok(mut guard) = pruned.lock() {
+                guard.push(ExcludedPath {
+                    path: path.to_path_buf(),
+                    relative_path: rel,
+                    size_bytes: 0,
+                    reason,
+                    is_dir: true,
+                });
+            }
+            return false;
         }
-        let reason = default_path_reason(&normalized, is_dir)?;
-        if self.include.is_match(path) || self.includes_class(reason) {
-            return None;
+        if is_hidden && !include_hidden {
+            if let Ok(mut guard) = pruned.lock() {
+                guard.push(ExcludedPath {
+                    path: path.to_path_buf(),
+                    relative_path: rel,
+                    size_bytes: 0,
+                    reason: ExclusionReason::Hidden,
+                    is_dir: true,
+                });
+            }
+            return false;
         }
-        Some(reason)
+        return true;
     }
 
-    fn includes_class(&self, reason: ExclusionReason) -> bool {
-        let class = reason.as_str();
-        self.include_classes
-            .iter()
-            .any(|candidate| candidate == class)
+    if !file_type.is_file() {
+        return true;
     }
 
-    #[allow(dead_code)]
-    fn excludes_class(&self, reason: ExclusionReason) -> bool {
-        let class = reason.as_str();
-        self.exclude_classes
-            .iter()
-            .any(|candidate| candidate == class)
+    if is_hidden && !include_hidden && policy.path_reason(&rel, false).is_none() {
+        // Unclassified hidden file: skip silently. We don't count these in
+        // coverage to keep the report focused on policy-driven exclusions.
+        return false;
     }
-}
 
-pub fn default_path_exclusion(relative_path: &str, is_dir: bool) -> Option<ExclusionReason> {
-    IndexingPolicy::default()
-        .compile()
-        .ok()
-        .and_then(|policy| policy.path_reason(relative_path, is_dir))
-}
-
-pub fn policy_path_exclusion(
-    policy: &IndexingPolicy,
-    relative_path: &str,
-    is_dir: bool,
-) -> Option<ExclusionReason> {
-    policy
-        .compile()
-        .ok()
-        .and_then(|policy| policy.path_reason(relative_path, is_dir))
-}
-
-pub fn policy_file_exclusion(
-    policy: &IndexingPolicy,
-    relative_path: &str,
-    size_bytes: u64,
-    max_file_bytes: u64,
-    prefix: Option<&[u8]>,
-) -> Option<ExclusionReason> {
-    let compiled = policy.compile().ok()?;
-    if let Some(reason) = compiled.path_reason(relative_path, false) {
-        return Some(reason);
-    }
-    if size_bytes > max_file_bytes && !compiled.includes_class(ExclusionReason::LargeFile) {
-        return Some(ExclusionReason::LargeFile);
-    }
-    let bytes = prefix.unwrap_or_default();
-    if looks_binary(bytes) && !compiled.includes_class(ExclusionReason::Binary) {
-        return Some(ExclusionReason::Binary);
-    }
-    if looks_generated(bytes) && !compiled.includes_class(ExclusionReason::Generated) {
-        return Some(ExclusionReason::Generated);
-    }
-    None
+    true
 }
 
 pub fn classify_language(path: &Path) -> LanguageKind {
@@ -761,7 +920,7 @@ fn looks_binary(bytes: &[u8]) -> bool {
 }
 
 fn looks_generated(bytes: &[u8]) -> bool {
-    let prefix = &bytes[..bytes.len().min(4096)];
+    let prefix = &bytes[..bytes.len().min(BINARY_GENERATED_PREFIX_BYTES)];
     let text = String::from_utf8_lossy(prefix).to_ascii_lowercase();
     [
         "@generated",
@@ -934,22 +1093,19 @@ fn record_excluded_file(
         relative_path,
         size_bytes,
         reason,
+        is_dir: false,
     });
 }
 
-fn record_excluded_dir(coverage: &mut IndexCoverage, reason: ExclusionReason, relative_path: &str) {
+fn record_excluded_dir_entry(coverage: &mut IndexCoverage, entry: &ExcludedPath) {
     coverage.skipped_dirs += 1;
-    let entry = coverage
+    let bucket = coverage
         .reasons
-        .entry(reason.as_str().to_string())
+        .entry(entry.reason.as_str().to_string())
         .or_default();
-    entry.dirs += 1;
-    if entry.samples.len() < 5 {
-        entry.samples.push(
-            normalize_path(relative_path, true)
-                .trim_end_matches('/')
-                .to_string(),
-        );
+    bucket.dirs += 1;
+    if bucket.samples.len() < 5 {
+        bucket.samples.push(entry.relative_path.clone());
     }
 }
 

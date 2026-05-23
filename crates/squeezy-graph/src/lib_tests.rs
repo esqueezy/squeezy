@@ -249,7 +249,10 @@ fn graph_reports_indexing_policy_coverage() {
 
     assert!(!manager.graph().find_symbol_by_name("indexed").is_empty());
     assert!(manager.graph().find_symbol_by_name("vendored").is_empty());
-    assert!(manager.build_report().excluded_files >= 2);
+    // Cargo.lock is a file-level exclusion; vendor/ is a directory-level
+    // pruning (one entry rather than one entry per file under it).
+    assert!(manager.build_report().excluded_files >= 1);
+    assert!(manager.build_report().excluded_dirs >= 1);
     assert!(
         manager
             .build_report()
