@@ -62,6 +62,13 @@ fn config_without_env_uses_openai_provider_defaults() {
         DEFAULT_MAX_SEARCH_FILES_PER_TURN
     );
     assert_eq!(config.telemetry, TelemetryConfig::default());
+    assert!(config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR));
+    assert!(
+        config
+            .skills
+            .compat_user_dir
+            .ends_with(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
+    );
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.api_key_env, "OPENAI_API_KEY");
@@ -92,6 +99,8 @@ fn config_reads_supported_env_overrides() {
         "SQUEEZY_MAX_SEARCH_FILES_PER_TURN" => Some("78".to_string()),
         "SQUEEZY_TELEMETRY" => Some("off".to_string()),
         "SQUEEZY_TELEMETRY_ENDPOINT" => Some("https://telemetry.example/v1/batch".to_string()),
+        "SQUEEZY_SKILLS_USER_DIR" => Some("/tmp/squeezy-skills".to_string()),
+        "SQUEEZY_SKILLS_COMPAT_USER_DIR" => Some("/tmp/agent-skills".to_string()),
         _ => None,
     });
 
@@ -117,12 +126,62 @@ fn config_reads_supported_env_overrides() {
             endpoint: "https://telemetry.example/v1/batch".to_string()
         }
     );
+    assert_eq!(config.skills.user_dir, PathBuf::from("/tmp/squeezy-skills"));
+    assert_eq!(
+        config.skills.compat_user_dir,
+        PathBuf::from("/tmp/agent-skills")
+    );
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.base_url, "https://example.test/v1");
         }
         _ => panic!("expected OpenAI provider"),
     }
+}
+
+#[test]
+fn config_reads_skill_dirs_from_settings_file() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[skills]
+user_dir = "/custom/squeezy-skills"
+compat_user_dir = "/custom/agent-skills"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    assert_eq!(
+        config.skills.user_dir,
+        PathBuf::from("/custom/squeezy-skills")
+    );
+    assert_eq!(
+        config.skills.compat_user_dir,
+        PathBuf::from("/custom/agent-skills")
+    );
+}
+
+#[test]
+fn config_expands_tilde_skill_dirs_from_settings_file() {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[skills]
+user_dir = "~/.squeezy/skills"
+compat_user_dir = "~/.agents/skills"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    assert_eq!(config.skills.user_dir, home.join(".squeezy/skills"));
+    assert_eq!(config.skills.compat_user_dir, home.join(".agents/skills"));
 }
 
 #[test]

@@ -51,10 +51,11 @@ impl Agent {
             exa_mcp_url: config.exa_mcp_url.clone(),
             exa_api_key: env::var(&config.exa_api_key_env).ok(),
         };
-        let tools = ToolRegistry::new_with_configs(
+        let tools = ToolRegistry::new_with_configs_and_skills(
             config.workspace_root.clone(),
             output_config.clone(),
             web_config.clone(),
+            config.skills.clone(),
         )
         .unwrap_or_else(|_| {
             ToolRegistry::new_with_configs(".", output_config, web_config)
@@ -150,7 +151,12 @@ struct TurnRuntime {
 
 impl TurnRuntime {
     async fn run(self, input: String) -> squeezy_core::Result<()> {
-        let mut conversation = vec![LlmInputItem::UserText(input)];
+        let activation = self.tools.activate_skills_for_input(&input)?;
+        let request_instructions = match self.tools.format_active_skills(&activation.skills) {
+            Some(skills) => format!("{}\n\n{}", self.config.instructions, skills),
+            None => self.config.instructions.clone(),
+        };
+        let mut conversation = vec![LlmInputItem::UserText(activation.task_input)];
         let mut next_input = conversation.clone();
         let mut previous_response_id = None;
         let mut assistant_text = String::new();
@@ -161,7 +167,7 @@ impl TurnRuntime {
         for _round in 0..MAX_TOOL_ROUNDS {
             let request = LlmRequest {
                 model: self.config.model.clone(),
-                instructions: self.config.instructions.clone(),
+                instructions: request_instructions.clone(),
                 input: next_input.clone(),
                 max_output_tokens: self.config.max_output_tokens,
                 previous_response_id: previous_response_id.clone(),

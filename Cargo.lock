@@ -1680,6 +1680,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "squeezy-skills"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "squeezy-core",
+ "tracing",
+]
+
+[[package]]
 name = "squeezy-store"
 version = "0.1.0"
 dependencies = [
@@ -1711,6 +1721,7 @@ dependencies = [
  "sha2",
  "squeezy-core",
  "squeezy-graph",
+ "squeezy-skills",
  "squeezy-vcs",
  "tokio",
  "tokio-util",
