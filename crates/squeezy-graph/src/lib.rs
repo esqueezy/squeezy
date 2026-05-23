@@ -1565,7 +1565,27 @@ impl SemanticGraph {
                     .as_deref()
                     .map(ToString::to_string)
                     .unwrap_or_else(|| last_path_segment(&import.path));
-                (reference_name == symbol.name || reference_name == alias_or_name)
+                // `extract_import` records the whole `use_declaration` span on
+                // every flattened import, so multi-item brace groups whose last
+                // segments collide (e.g. `use crate::{a::Foo, b::Foo}`) would
+                // otherwise let an inner-segment identifier bind to every
+                // colliding import. Require an alias-text match, a full-path
+                // match on the reference text, or no last-segment collisions
+                // within the same import span before allowing the inside-span
+                // shortcut.
+                let collisions = self
+                    .imports
+                    .iter()
+                    .filter(|other| {
+                        other.file_id == import.file_id
+                            && other.span == import.span
+                            && last_path_segment(&other.path) == symbol.name
+                    })
+                    .count();
+                let alias_match = import.alias.as_deref() == Some(reference.text.as_str());
+                let full_path_match = reference.text == import.path;
+                (alias_match || full_path_match || collisions <= 1)
+                    && (reference_name == symbol.name || reference_name == alias_or_name)
                     && last_path_segment(&import.path) == symbol.name
                     && self.import_module_matches_symbol(import, symbol)
             })

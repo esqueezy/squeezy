@@ -692,6 +692,88 @@ fn run() {
 }
 
 #[test]
+fn graph_does_not_cross_bind_same_name_use_tree_siblings() {
+    let source = r#"
+mod a {
+    pub struct Foo;
+}
+
+mod b {
+    pub struct Foo;
+}
+
+use crate::{a::Foo as FA, b::Foo as FB};
+
+fn build() -> (FA, FB) {
+    let fa: FA = a::Foo;
+    let fb: FB = b::Foo;
+    (fa, fb)
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let foos: Vec<_> = graph.find_symbol_by_name("Foo").into_iter().collect();
+    assert_eq!(foos.len(), 2);
+
+    let module_of = |sym: &GraphSymbol| {
+        sym.parent_id
+            .as_ref()
+            .and_then(|id| graph.symbols.get(id))
+            .map(|module| module.name.clone())
+            .unwrap_or_default()
+    };
+    let foo_a = foos
+        .iter()
+        .find(|sym| module_of(sym) == "a")
+        .expect("a::Foo");
+    let foo_b = foos
+        .iter()
+        .find(|sym| module_of(sym) == "b")
+        .expect("b::Foo");
+
+    // Locate the byte offsets of the two `Foo` identifier tokens inside the
+    // `use` clause; with the bug, both references bind to BOTH foo symbols.
+    let use_start = source.find("use crate::{").expect("use clause");
+    let use_end = source[use_start..].find("};").expect("end of use clause") + use_start;
+    let foo_in_a_use = source[use_start..use_end]
+        .find("a::Foo")
+        .expect("a::Foo in use")
+        + use_start
+        + "a::".len();
+    let foo_in_b_use = source[use_start..use_end]
+        .find("b::Foo")
+        .expect("b::Foo in use")
+        + use_start
+        + "b::".len();
+
+    let in_use_clause_only = |hits: &[ReferenceHit]| -> Vec<u32> {
+        hits.iter()
+            .map(|h| h.reference.span.start_byte)
+            .filter(|byte| (*byte as usize) >= use_start && (*byte as usize) < use_end)
+            .collect()
+    };
+    let refs_a_use = in_use_clause_only(&graph.references_to_symbol(&foo_a.id));
+    let refs_b_use = in_use_clause_only(&graph.references_to_symbol(&foo_b.id));
+
+    // Critical no-cross-bind invariant: the inside-use `Foo` token from one
+    // segment must NEVER bind to the other module's struct. (extract_import
+    // currently records the whole `use_declaration` span on every flattened
+    // import, so without the collision guard both inside-segment references
+    // would bind to both Foo symbols.)
+    assert!(
+        !refs_a_use.contains(&(foo_in_b_use as u32)),
+        "a::Foo must not be bound by the `Foo` token inside the b::Foo segment"
+    );
+    assert!(
+        !refs_b_use.contains(&(foo_in_a_use as u32)),
+        "b::Foo must not be bound by the `Foo` token inside the a::Foo segment"
+    );
+}
+
+#[test]
 fn graph_does_not_bind_impl_decl_across_same_name_traits_in_other_modules() {
     let source = r#"
 mod a {
