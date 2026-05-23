@@ -13,6 +13,8 @@ use squeezy_core::{ContentHash, FileId, Freshness, LanguageKind, Result, Squeezy
 pub const CRATE_NAME: &str = "squeezy-workspace";
 const SOURCE_SCAN_MAX_DEPTH: usize = 2;
 const SOURCE_SCAN_MAX_ENTRIES: usize = 1_000;
+const DEFAULT_MAX_FILE_BYTES: u64 = 1_000_000;
+const DEFAULT_JAVA_MAX_FILE_BYTES: u64 = 2_000_000;
 const BINARY_GENERATED_PREFIX_BYTES: usize = 4096;
 
 pub fn crate_name() -> &'static str {
@@ -31,7 +33,7 @@ impl Default for CrawlOptions {
     fn default() -> Self {
         Self {
             include_hidden: false,
-            max_file_bytes: 1_000_000,
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             require_indexing_signal: true,
             policy: IndexingPolicy::default(),
         }
@@ -395,6 +397,16 @@ impl WorkspaceCrawler {
                 .extension()
                 .map(|ext| ext.to_string_lossy().to_string());
             let language = classify_language(&path);
+            // Java source files frequently contain many nested declarations
+            // in a single file, so we lift the default cap when the user has
+            // not configured an explicit one.
+            let max_file_bytes = if language == LanguageKind::Java
+                && self.options.max_file_bytes == DEFAULT_MAX_FILE_BYTES
+            {
+                DEFAULT_JAVA_MAX_FILE_BYTES
+            } else {
+                self.options.max_file_bytes
+            };
 
             if let Some(reason) = self.compiled_policy.path_reason(&relative_path, false) {
                 record_excluded_file(
@@ -411,7 +423,7 @@ impl WorkspaceCrawler {
             // Cheap rejection: skip the file before reading it when it is
             // bigger than the per-file byte cap, unless the user opted into
             // indexing large files via `include_classes = ["large_file"]`.
-            if size_bytes > self.options.max_file_bytes
+            if size_bytes > max_file_bytes
                 && !self
                     .compiled_policy
                     .includes_class(ExclusionReason::LargeFile)
@@ -493,6 +505,8 @@ impl WorkspaceCrawler {
                 freshness: Freshness::Fresh,
             });
         }
+
+        refine_c_family_header_languages(&mut files);
 
         // Pull pruned directories collected by `filter_entry` into the
         // snapshot. We do this once so each excluded directory shows up
@@ -589,9 +603,17 @@ fn keep_entry(
 
 pub fn classify_language(path: &Path) -> LanguageKind {
     match path.extension().and_then(|extension| extension.to_str()) {
+        Some("c") => LanguageKind::C,
+        Some("cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx") => LanguageKind::Cpp,
+        // `.h` could in principle be C; we follow main's convention of binding
+        // it to Cpp since the C/C++ extractor handles both grammars and the
+        // header naming is conventionally C++-leaning in modern code.
+        Some("h") => LanguageKind::Cpp,
+        Some("cs") | Some("csx") => LanguageKind::CSharp,
         Some("cjs" | "js" | "mjs") => LanguageKind::JavaScript,
         Some("cts" | "mts" | "ts") => LanguageKind::TypeScript,
         Some("go") => LanguageKind::Go,
+        Some("java") => LanguageKind::Java,
         Some("jsx") => LanguageKind::Jsx,
         Some("py") => LanguageKind::Python,
         Some("rs") => LanguageKind::Rust,
@@ -599,6 +621,59 @@ pub fn classify_language(path: &Path) -> LanguageKind {
         Some(_) => LanguageKind::Unsupported,
         None => LanguageKind::Unknown,
     }
+}
+
+fn refine_c_family_header_languages(files: &mut [FileRecord]) {
+    let mut by_stem = BTreeMap::<String, Vec<LanguageKind>>::new();
+    let mut c_files = 0usize;
+    let mut cpp_files = 0usize;
+    for file in files.iter() {
+        match file.language {
+            LanguageKind::C => c_files += 1,
+            LanguageKind::Cpp if !is_plain_c_header(&file.relative_path) => cpp_files += 1,
+            _ => {}
+        }
+        if !is_plain_c_header(&file.relative_path)
+            && let Some(stem) = path_without_extension(&file.relative_path)
+        {
+            by_stem.entry(stem).or_default().push(file.language);
+        }
+    }
+    let project_default = if c_files > cpp_files {
+        LanguageKind::C
+    } else {
+        LanguageKind::Cpp
+    };
+    for file in files.iter_mut() {
+        if !is_plain_c_header(&file.relative_path) {
+            continue;
+        }
+        let Some(stem) = path_without_extension(&file.relative_path) else {
+            file.language = project_default;
+            continue;
+        };
+        let sibling_languages = by_stem.get(&stem).cloned().unwrap_or_default();
+        file.language = if sibling_languages.contains(&LanguageKind::C) {
+            LanguageKind::C
+        } else if sibling_languages.contains(&LanguageKind::Cpp) {
+            LanguageKind::Cpp
+        } else {
+            project_default
+        };
+    }
+}
+
+fn is_plain_c_header(relative_path: &str) -> bool {
+    relative_path
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.eq_ignore_ascii_case("h"))
+        .unwrap_or(false)
+}
+
+fn path_without_extension(relative_path: &str) -> Option<String> {
+    relative_path
+        .rsplit_once('.')
+        .map(|(stem, _)| stem.to_string())
 }
 
 pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
@@ -755,6 +830,8 @@ fn code_project_markers(root: &Path) -> Vec<String> {
     [
         "Cargo.toml",
         "CMakeLists.txt",
+        "Directory.Build.props",
+        "Directory.Build.targets",
         "Dockerfile",
         "Justfile",
         "Makefile",
@@ -766,10 +843,12 @@ fn code_project_markers(root: &Path) -> Vec<String> {
         "composer.json",
         "docker-compose.yml",
         "go.mod",
+        "global.json",
         "gradlew",
         "noxfile.py",
         "package.json",
         "package-lock.json",
+        "packages.lock.json",
         "pom.xml",
         "pnpm-lock.yaml",
         "pyproject.toml",
@@ -789,7 +868,23 @@ fn code_project_markers(root: &Path) -> Vec<String> {
     .into_iter()
     .filter(|marker| root.join(marker).exists())
     .map(|marker| format!("project marker {marker}"))
+    .chain(dotnet_project_markers(root))
     .collect()
+}
+
+fn dotnet_project_markers(root: &Path) -> Vec<String> {
+    fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            let extension = path.extension()?.to_str()?;
+            matches!(extension, "csproj" | "sln" | "slnx").then(|| format!("project marker {name}"))
+        })
+        .collect()
 }
 
 fn shallow_source_markers(root: &Path) -> Vec<String> {
@@ -826,7 +921,11 @@ fn collect_source_markers(
             continue;
         }
         match classify_language(&path) {
+            LanguageKind::C => signals.push("shallow C source".to_string()),
+            LanguageKind::Cpp => signals.push("shallow C/C++ source".to_string()),
+            LanguageKind::CSharp => signals.push("shallow C# source".to_string()),
             LanguageKind::Go => signals.push("shallow Go source".to_string()),
+            LanguageKind::Java => signals.push("shallow Java source".to_string()),
             LanguageKind::JavaScript | LanguageKind::Jsx => {
                 signals.push("shallow JavaScript source".to_string())
             }

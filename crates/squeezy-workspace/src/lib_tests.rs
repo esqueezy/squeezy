@@ -459,6 +459,133 @@ fn crawler_classifies_js_ts_files() {
 }
 
 #[test]
+fn crawler_classifies_java_files() {
+    let root = temp_root("crawler_classifies_java_files");
+    fs::write(
+        root.join("Main.java"),
+        "package com.example;\nclass Main {}\n",
+    )
+    .unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "Main.java")
+            .unwrap()
+            .language,
+        LanguageKind::Java
+    );
+}
+
+#[test]
+fn crawler_classifies_csharp_files() {
+    let root = temp_root("crawler_classifies_csharp_files");
+    fs::write(root.join("Program.cs"), "class Program {}\n").unwrap();
+    fs::write(root.join("script.csx"), "System.Console.WriteLine(1);\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    for path in ["Program.cs", "script.csx"] {
+        assert_eq!(
+            snapshot
+                .files
+                .iter()
+                .find(|file| file.relative_path == path)
+                .unwrap()
+                .language,
+            LanguageKind::CSharp
+        );
+    }
+}
+
+#[test]
+fn crawler_classifies_c_and_cpp_files_and_pairs_plain_headers() {
+    let root = temp_root("crawler_classifies_c_and_cpp_files");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src").join("runner.c"),
+        "int runner(void) { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("src").join("runner.h"), "int runner(void);\n").unwrap();
+    fs::write(
+        root.join("src").join("widget.cpp"),
+        "int widget() { return 2; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("src").join("widget.hpp"), "int widget();\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "src/runner.c")
+            .unwrap()
+            .language,
+        LanguageKind::C
+    );
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "src/runner.h")
+            .unwrap()
+            .language,
+        LanguageKind::C
+    );
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "src/widget.cpp")
+            .unwrap()
+            .language,
+        LanguageKind::Cpp
+    );
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "src/widget.hpp")
+            .unwrap()
+            .language,
+        LanguageKind::Cpp
+    );
+}
+
+#[test]
+fn crawler_uses_project_majority_for_ambiguous_c_headers() {
+    let root = temp_root("crawler_uses_project_majority_for_ambiguous_c_headers");
+    fs::write(root.join("main.c"), "int main(void) { return 0; }\n").unwrap();
+    fs::write(root.join("defs.h"), "#define VALUE 1\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "defs.h")
+            .unwrap()
+            .language,
+        LanguageKind::C
+    );
+}
+
+#[test]
 fn crawler_classifies_go_files() {
     let root = temp_root("crawler_classifies_go_files");
     fs::write(root.join("main.go"), "package main\nfunc main() {}\n").unwrap();
@@ -498,6 +625,31 @@ fn crawler_indexes_internal_symlinked_source_files() {
     assert!(snapshot.files.iter().any(|file| {
         file.relative_path == "linked/example.go" && file.language == LanguageKind::Go
     }));
+}
+
+#[test]
+fn crawler_allows_larger_java_sources_by_default() {
+    let root = temp_root("crawler_allows_larger_java_sources_by_default");
+    let mut source = "class Large {\n".to_string();
+    source.push_str(&"void method() {}\n".repeat(80_000));
+    source.push_str("}\n");
+    assert!(source.len() > 1_000_000);
+    assert!(source.len() < 2_000_000);
+    fs::write(root.join("Large.java"), source).unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "Large.java")
+            .unwrap()
+            .language,
+        LanguageKind::Java
+    );
 }
 
 #[test]
@@ -683,7 +835,14 @@ fn common_project_config_is_an_indexing_signal() {
 fn extended_project_markers_are_indexing_signals() {
     for marker in [
         "Dockerfile",
+        "Directory.Build.props",
+        "Directory.Build.targets",
+        "App.csproj",
+        "App.sln",
+        "App.slnx",
+        "global.json",
         "package-lock.json",
+        "packages.lock.json",
         "pnpm-lock.yaml",
         "yarn.lock",
         "tox.ini",

@@ -1,10 +1,12 @@
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     env, fmt, fs,
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -61,6 +63,7 @@ pub struct AppConfig {
     pub max_tool_bytes_read_per_turn: u64,
     pub max_search_files_per_turn: u64,
     pub telemetry: TelemetryConfig,
+    pub redaction: RedactionConfig,
     pub skills: SkillsConfig,
     pub graph: GraphConfig,
     pub cache: CacheConfig,
@@ -332,6 +335,7 @@ impl AppConfig {
             settings.telemetry.unwrap_or_default(),
             &mut get_var,
         );
+        let redaction = RedactionConfig::from_settings(settings.redaction.unwrap_or_default())?;
         let permissions = PermissionPolicy::from_settings_and_env(
             settings.permissions.unwrap_or_default(),
             &mut get_var,
@@ -370,6 +374,7 @@ impl AppConfig {
             max_tool_bytes_read_per_turn,
             max_search_files_per_turn,
             telemetry,
+            redaction,
             skills,
             graph,
             cache,
@@ -507,6 +512,22 @@ impl AppConfig {
             "endpoint = {}\n\n",
             toml_string(&self.telemetry.endpoint)
         ));
+
+        output.push_str("[redaction]\n");
+        if self.redaction.custom_patterns.is_empty() {
+            output.push_str("custom_patterns = []\n\n");
+        } else {
+            // Emit a TOML comment so the document still round-trips through
+            // `SettingsFile::from_toml_str`, but do not echo the literal
+            // patterns. A previous version emitted
+            // `custom_patterns = ["<redacted>"]`, which was itself a valid
+            // (no-op) regex if pasted back into a settings file.
+            output.push_str(&format!(
+                "# {} custom redaction pattern(s) hidden in inspect output\n",
+                self.redaction.custom_patterns.len(),
+            ));
+            output.push_str("custom_patterns = []\n\n");
+        }
 
         output.push_str("[web]\n");
         output.push_str(&format!(
@@ -754,6 +775,7 @@ pub struct SettingsFile {
     pub budgets: Option<BudgetSettings>,
     pub permissions: Option<PermissionSettings>,
     pub telemetry: Option<TelemetrySettings>,
+    pub redaction: Option<RedactionSettings>,
     pub web: Option<WebSettings>,
     pub skills: Option<SkillsSettings>,
     pub graph: Option<GraphSettings>,
@@ -808,6 +830,7 @@ impl SettingsFile {
                 "budgets",
                 "permissions",
                 "telemetry",
+                "redaction",
                 "web",
                 "skills",
                 "graph",
@@ -843,6 +866,9 @@ impl SettingsFile {
             .transpose()?;
         settings.telemetry = optional_table(table, "telemetry", source)?
             .map(|table| TelemetrySettings::from_table(table, source, "telemetry"))
+            .transpose()?;
+        settings.redaction = optional_table(table, "redaction", source)?
+            .map(|table| RedactionSettings::from_table(table, source, "redaction"))
             .transpose()?;
         settings.web = optional_table(table, "web", source)?
             .map(|table| WebSettings::from_table(table, source, "web"))
@@ -885,6 +911,11 @@ impl SettingsFile {
             &mut self.telemetry,
             next.telemetry,
             TelemetrySettings::merge,
+        );
+        merge_option(
+            &mut self.redaction,
+            next.redaction,
+            RedactionSettings::merge,
         );
         merge_option(&mut self.web, next.web, WebSettings::merge);
         merge_option(&mut self.skills, next.skills, SkillsSettings::merge);
@@ -1605,6 +1636,384 @@ impl Default for TelemetryConfig {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RedactionSettings {
+    pub custom_patterns: Option<Vec<String>>,
+}
+
+impl RedactionSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(table, &["custom_patterns"], source, path)?;
+        Ok(Self {
+            custom_patterns: string_array_value(
+                table,
+                "custom_patterns",
+                source,
+                &field(path, "custom_patterns"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.custom_patterns, next.custom_patterns);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedactionConfig {
+    pub custom_patterns: Vec<String>,
+}
+
+impl RedactionConfig {
+    fn from_settings(settings: RedactionSettings) -> Result<Self> {
+        let config = Self {
+            custom_patterns: settings.custom_patterns.unwrap_or_default(),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for (index, pattern) in self.custom_patterns.iter().enumerate() {
+            Regex::new(pattern).map_err(|err| {
+                SqueezyError::Config(format!(
+                    "redaction.custom_patterns.{index}: invalid regex: {err}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn redactor(&self) -> Result<Redactor> {
+        Redactor::new(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactedText {
+    pub text: String,
+    pub redactions: u64,
+}
+
+impl RedactedText {
+    pub fn unchanged(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            redactions: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Redactor {
+    patterns: Vec<RedactionPattern>,
+}
+
+#[derive(Debug, Clone)]
+struct RedactionPattern {
+    kind: &'static str,
+    regex: Regex,
+}
+
+impl Redactor {
+    pub fn new(config: &RedactionConfig) -> Result<Self> {
+        let mut patterns = Vec::new();
+        for (kind, pattern) in DEFAULT_REDACTION_PATTERNS {
+            patterns.push(RedactionPattern {
+                kind,
+                regex: Regex::new(pattern).map_err(|err| {
+                    SqueezyError::Config(format!("built-in redaction pattern {kind}: {err}"))
+                })?,
+            });
+        }
+        for (index, pattern) in config.custom_patterns.iter().enumerate() {
+            patterns.push(RedactionPattern {
+                kind: "custom",
+                regex: Regex::new(pattern).map_err(|err| {
+                    SqueezyError::Config(format!(
+                        "redaction.custom_patterns.{index}: invalid regex: {err}"
+                    ))
+                })?,
+            });
+        }
+        Ok(Self { patterns })
+    }
+
+    pub fn redact(&self, text: &str) -> RedactedText {
+        if text.is_empty() {
+            return RedactedText::unchanged("");
+        }
+
+        // Track allocation lazily: keep `output` borrowed until a pattern
+        // actually replaces something, then own the result. This keeps the
+        // common no-match case allocation-free, which matters because the
+        // redactor runs over every tool result, JSON arg, and model request.
+        let mut output: Cow<'_, str> = Cow::Borrowed(text);
+        let mut values = BTreeMap::<String, usize>::new();
+        let mut redactions = 0u64;
+        for pattern in &self.patterns {
+            let next = pattern
+                .regex
+                .replace_all(output.as_ref(), |captures: &Captures<'_>| {
+                    redactions += 1;
+                    redact_capture(pattern.kind, captures, &mut values)
+                });
+            if let Cow::Owned(owned) = next {
+                output = Cow::Owned(owned);
+            }
+        }
+        match output {
+            Cow::Borrowed(_) => RedactedText::unchanged(text),
+            Cow::Owned(owned) => RedactedText {
+                text: owned,
+                redactions,
+            },
+        }
+    }
+}
+
+/// Incrementally redacts a streaming text channel.
+///
+/// Emitting redacted token deltas naively is unsafe: a secret can be split
+/// across two stream chunks, and a regex applied to either half misses it.
+/// `StreamRedactor` keeps a tail buffer large enough to cover any realistic
+/// single-line token plus a "hold" mode that suppresses output entirely
+/// while a multi-line PEM block is open. Callers append text with [`push`]
+/// (returning what is now safe to emit) and end with [`finish`] (returning
+/// any remaining text after a final redaction pass).
+///
+/// [`push`]: StreamRedactor::push
+/// [`finish`]: StreamRedactor::finish
+#[derive(Debug)]
+pub struct StreamRedactor {
+    redactor: std::sync::Arc<Redactor>,
+    buffer: String,
+    redactions: u64,
+    pem_open: bool,
+}
+
+/// Maximum number of bytes the stream redactor will keep buffered when no
+/// multi-line pattern is open. Sized to comfortably exceed the longest
+/// realistic single-line secret (long JWTs, bearer tokens, signed URLs).
+const STREAM_TAIL_BYTES: usize = 1024;
+
+const PEM_BEGIN: &str = "-----BEGIN";
+const PEM_END: &str = "-----END";
+
+impl StreamRedactor {
+    pub fn new(redactor: std::sync::Arc<Redactor>) -> Self {
+        Self {
+            redactor,
+            buffer: String::new(),
+            redactions: 0,
+            pem_open: false,
+        }
+    }
+
+    /// Append `delta` to the internal buffer and return whatever portion is
+    /// now safe to emit downstream. Returned text is fully redacted.
+    pub fn push(&mut self, delta: &str) -> StreamChunk {
+        if delta.is_empty() {
+            return StreamChunk::empty();
+        }
+        self.buffer.push_str(delta);
+        self.try_emit()
+    }
+
+    /// Flush any remaining buffered text after a final redaction pass.
+    /// Returns the trailing redacted text and the total redactions seen
+    /// since this redactor was created.
+    pub fn finish(&mut self) -> StreamChunk {
+        if self.buffer.is_empty() {
+            return StreamChunk {
+                text: String::new(),
+                redactions: 0,
+            };
+        }
+        let RedactedText { text, redactions } = self.redactor.redact(&self.buffer);
+        self.redactions += redactions;
+        self.buffer.clear();
+        self.pem_open = false;
+        StreamChunk { text, redactions }
+    }
+
+    pub fn total_redactions(&self) -> u64 {
+        self.redactions
+    }
+
+    fn try_emit(&mut self) -> StreamChunk {
+        // If we previously opened a PEM block, hold until we see END.
+        if self.pem_open {
+            if !self.buffer.contains(PEM_END) {
+                return StreamChunk::empty();
+            }
+            self.pem_open = false;
+        } else if let Some(begin) = self.buffer.find(PEM_BEGIN)
+            && !self.buffer[begin..].contains(PEM_END)
+        {
+            self.pem_open = true;
+            return StreamChunk::empty();
+        }
+
+        if self.buffer.len() <= STREAM_TAIL_BYTES {
+            return StreamChunk::empty();
+        }
+
+        // Redaction markers are idempotent w.r.t. the built-in patterns, so
+        // running the redactor over the whole buffer on each push is safe;
+        // the previously-emitted prefix has been removed from `buffer`.
+        let RedactedText { text, redactions } = self.redactor.redact(&self.buffer);
+        self.redactions += redactions;
+
+        if text.len() <= STREAM_TAIL_BYTES {
+            self.buffer = text;
+            return StreamChunk {
+                text: String::new(),
+                redactions,
+            };
+        }
+
+        let mut emit_end = text.len() - STREAM_TAIL_BYTES;
+        emit_end = floor_char_boundary(&text, emit_end);
+        emit_end = avoid_marker_split(&text, emit_end);
+        if emit_end == 0 {
+            self.buffer = text;
+            return StreamChunk {
+                text: String::new(),
+                redactions,
+            };
+        }
+        let emitted = text[..emit_end].to_string();
+        self.buffer = text[emit_end..].to_string();
+        StreamChunk {
+            text: emitted,
+            redactions,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamChunk {
+    pub text: String,
+    pub redactions: u64,
+}
+
+impl StreamChunk {
+    pub fn empty() -> Self {
+        Self {
+            text: String::new(),
+            redactions: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
+
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn avoid_marker_split(text: &str, idx: usize) -> usize {
+    let prefix = &text[..idx];
+    let Some(open) = prefix.rfind("<redacted:") else {
+        return idx;
+    };
+    if prefix[open..].contains('>') {
+        return idx;
+    }
+    floor_char_boundary(text, open)
+}
+
+impl Default for Redactor {
+    fn default() -> Self {
+        RedactionConfig::default()
+            .redactor()
+            .expect("built-in redaction patterns must compile")
+    }
+}
+
+fn redact_capture(
+    kind: &'static str,
+    captures: &Captures<'_>,
+    values: &mut BTreeMap<String, usize>,
+) -> String {
+    let Some(full) = captures.get(0) else {
+        return "<redacted:unknown#0 bytes=0>".to_string();
+    };
+    let value = captures.name("value").unwrap_or(full);
+    let replacement = redaction_marker(kind, value.as_str(), values);
+    if value.start() == full.start() && value.end() == full.end() {
+        replacement
+    } else {
+        let relative_start = value.start() - full.start();
+        let relative_end = value.end() - full.start();
+        let full_text = full.as_str();
+        format!(
+            "{}{}{}",
+            &full_text[..relative_start],
+            replacement,
+            &full_text[relative_end..]
+        )
+    }
+}
+
+fn redaction_marker(
+    kind: &'static str,
+    value: &str,
+    values: &mut BTreeMap<String, usize>,
+) -> String {
+    let next = values.len() + 1;
+    let ordinal = *values.entry(value.to_string()).or_insert(next);
+    format!("<redacted:{kind}#{ordinal} bytes={}>", value.len())
+}
+
+const DEFAULT_REDACTION_PATTERNS: &[(&str, &str)] = &[
+    // Order matters: `secret_assignment` runs first and consumes the value
+    // half of `KEY=...`-style strings, so the per-provider patterns below
+    // typically only fire on bare tokens that appear without an assignment
+    // prefix (for example pasted command output). Keep that contract in
+    // mind when reordering.
+    //
+    // The captured value excludes common trailing punctuation (`)`, `]`,
+    // `}`, `>`, plus separators) so that surrounding shape is preserved in
+    // shell output like `KEY=foo)` or markdown like `KEY=foo]`.
+    (
+        "secret_assignment",
+        r#"(?i)\b[A-Z0-9_]*(?:API|AUTH|BEARER|CREDENTIAL|KEY|PASSWORD|SECRET|TOKEN)[A-Z0-9_]*\s*=\s*["']?(?P<value>[^\s"',;`)\]}>]+)"#,
+    ),
+    (
+        "url_query",
+        r#"(?i)[?&](?:access_token|api-key|api_key|apikey|code|key|signature|sig|token|x-amz-credential|x-amz-security-token|x-amz-signature)=(?P<value>[^&#\s]+)"#,
+    ),
+    (
+        "url_userinfo",
+        r#"(?i)https?://(?P<value>[^/\s:@]+:[^/\s@]+)@"#,
+    ),
+    (
+        "bearer_token",
+        r#"(?i)\bBearer\s+(?P<value>[A-Za-z0-9._~+/=-]{16,})\b"#,
+    ),
+    ("anthropic_key", r#"\bsk-ant-[A-Za-z0-9_-]{20,}\b"#),
+    ("openai_key", r#"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{20,}\b"#),
+    ("google_key", r#"\bAIza[0-9A-Za-z_-]{20,}\b"#),
+    ("github_token", r#"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"#),
+    ("aws_access_key", r#"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"#),
+    (
+        "jwt",
+        r#"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"#,
+    ),
+    (
+        "private_key",
+        r#"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"#,
+    ),
+];
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct WebSettings {
     pub exa_mcp_url: Option<String>,
     pub exa_api_key_env: Option<String>,
@@ -2039,6 +2448,9 @@ pub fn user_settings_template() -> &'static str {
 [telemetry]
 # enabled = true
 
+# [redaction]
+# custom_patterns = []
+
 # [web]
 # exa_mcp_url = "https://mcp.exa.ai/mcp"
 # exa_api_key_env = "EXA_API_KEY"
@@ -2059,6 +2471,11 @@ pub fn project_settings_template() -> &'static str {
 # max_tool_bytes_read_per_turn = 20000000
 # max_search_files_per_turn = 50000
 # max_tool_result_bytes_per_round = 50000
+
+# [redaction]
+# Add project-specific Rust regex patterns for secrets Squeezy should redact
+# everywhere they appear in tool output, model requests, and UI surfaces.
+# custom_patterns = []
 
 [permissions]
 # read = "allow"
@@ -2771,6 +3188,7 @@ pub struct SessionMetrics {
     pub spill_writes: u64,
     pub spill_reads: u64,
     pub budget_denials: u64,
+    pub redactions: u64,
     pub provider: CostSnapshot,
 }
 
@@ -2791,6 +3209,7 @@ impl SessionMetrics {
         self.spill_writes += turn.spill_writes;
         self.spill_reads += turn.spill_reads;
         self.budget_denials += turn.budget_denials;
+        self.redactions += turn.redactions;
         merge_cost_snapshot(&mut self.provider, &turn.provider);
     }
 }
@@ -2811,6 +3230,7 @@ pub struct TurnMetrics {
     pub spill_writes: u64,
     pub spill_reads: u64,
     pub budget_denials: u64,
+    pub redactions: u64,
     pub provider: CostSnapshot,
 }
 
@@ -2906,7 +3326,11 @@ impl SourceSpan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LanguageKind {
+    C,
+    CSharp,
+    Cpp,
     Go,
+    Java,
     JavaScript,
     Jsx,
     Python,

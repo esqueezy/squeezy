@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use squeezy_core::SkillsConfig;
+use squeezy_core::{GraphConfig, Redactor, SkillsConfig};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -574,6 +574,138 @@ async fn secret_name_checks_use_workspace_relative_paths() {
         )
         .await;
     assert_eq!(secret.status, ToolStatus::Denied);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_redacts_secret_looking_content_before_returning() {
+    let root = temp_workspace("read_redaction");
+    fs::write(
+        root.join("plain.txt"),
+        "token = ghp_abcdefghijklmnopqrstuvwxyz\n",
+    )
+    .expect("write plain");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "plain.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let content = result.content["content"].as_str().expect("content");
+    assert!(!content.contains("ghp_abcdefghijklmnopqrstuvwxyz"));
+    assert!(content.contains("<redacted:"));
+    assert!(result.cost_hint.redactions > 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_and_shell_outputs_are_redacted() {
+    let root = temp_workspace("tool_redaction");
+    fs::write(
+        root.join("app.log"),
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz\n",
+    )
+    .expect("write log");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let grep = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "Bearer", "include": ["*.log"]}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(grep.status, ToolStatus::Success);
+    let grep_text = grep.model_output();
+    assert!(!grep_text.contains("abcdefghijklmnopqrstuvwxyz"));
+    assert!(grep_text.contains("<redacted:bearer_token"));
+    assert!(grep.cost_hint.redactions > 0);
+
+    let shell = registry
+        .execute(
+            ToolCall {
+                call_id: "call_2".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf '%s\\n' 'OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz'",
+                    "description": "print test key"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(shell.status, ToolStatus::Success);
+    let stdout = shell.content["stdout"].as_str().expect("stdout");
+    assert!(!stdout.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+    assert!(stdout.contains("OPENAI_API_KEY="));
+    assert!(shell.cost_hint.redactions > 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn spilled_tool_output_file_is_redacted_on_disk() {
+    let root = temp_workspace("spill_redaction");
+    let mut payload = String::new();
+    payload.push_str("token=ghp_abcdefghijklmnopqrstuvwxyz ");
+    payload.push_str(&"padding".repeat(2_000));
+    fs::write(root.join("payload.txt"), &payload).expect("write payload");
+    let registry = ToolRegistry::new_with_output_config(
+        &root,
+        ToolOutputConfig {
+            spill_threshold_bytes: 256,
+            preview_bytes: 32,
+            retention_days: 1,
+            output_dir: None,
+        },
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_spill".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "payload.txt", "limit": 200_000}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["spilled"], true);
+    let handle = result.content["handle"].as_str().expect("handle");
+    let spill_path = root
+        .canonicalize()
+        .expect("canonical")
+        .join(".squeezy")
+        .join("tool_outputs")
+        .join(format!("{handle}.json"));
+    let on_disk = fs::read_to_string(&spill_path).expect("read spill");
+    // Do not interpolate `on_disk` into the panic message; we already
+    // know it would contain the raw secret if the assertion fires, and
+    // CodeQL flags that pattern as cleartext logging.
+    assert!(
+        !on_disk.contains("ghp_abcdefghijklmnopqrstuvwxyz"),
+        "spill file leaked raw secret: {spill_path:?}",
+    );
+    assert!(
+        on_disk.contains("<redacted:"),
+        "spill file should contain redaction marker: {spill_path:?}",
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1645,6 +1777,7 @@ async fn skill_tools_list_metadata_and_load_body() {
             compat_user_dir: root.join("compat-skills"),
         },
         &GraphConfig::default(),
+        Arc::new(Redactor::default()),
     )
     .expect("registry");
 

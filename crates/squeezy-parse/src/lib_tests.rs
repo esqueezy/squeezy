@@ -202,6 +202,320 @@ def test_runner():
 }
 
 #[test]
+fn parser_accepts_csharp_and_tracks_cached_changes() {
+    let first = "namespace Demo;\nclass Runner { void Run() { } }\n";
+    let second = "namespace Demo;\nclass Runner { void Run() { System.Console.WriteLine(1); } }\n";
+    let mut parser = RustParser::new().unwrap();
+    let mut record = csharp_record("src/Runner.cs", first);
+
+    let initial = parser.parse_source(&record, first.to_string()).unwrap();
+    assert!(initial.unsupported.is_none());
+    assert!(initial.diagnostics.is_empty());
+    assert!(initial.changed_ranges.is_empty());
+    assert!(
+        initial
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Demo" && symbol.kind == SymbolKind::Module)
+    );
+    assert!(
+        initial
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Runner" && symbol.kind == SymbolKind::Class)
+    );
+    assert!(
+        initial
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Run" && symbol.kind == SymbolKind::Method)
+    );
+
+    record.hash = ContentHash::new(stable_content_hash(second.as_bytes()));
+    record.size_bytes = second.len() as u64;
+    let updated = parser.parse_source(&record, second.to_string()).unwrap();
+
+    assert!(updated.unsupported.is_none());
+    assert!(updated.diagnostics.is_empty());
+    assert!(!updated.changed_ranges.is_empty());
+    assert!(updated.calls.iter().any(|call| call.name == "WriteLine"));
+}
+
+#[test]
+fn csharp_parser_extracts_symbols_imports_calls_and_references() {
+    let source = r#"
+using System;
+using System.Collections.Generic;
+using static System.Math;
+using Json = System.Text.Json.JsonSerializer;
+
+namespace Squeezy.CSharp.SemanticCases;
+
+public interface IRunner
+{
+    string Run(string input);
+}
+
+public partial record Runner(string Prefix) : IRunner
+{
+    public List<string> History { get; init; } = new();
+
+    public string Run(string input)
+    {
+        var formatted = Format(input);
+        History.Add(formatted);
+        return Json.Serialize(formatted);
+    }
+}
+
+public partial record Runner
+{
+    public string Format(string input) => $"{Prefix}:{Abs(input.Length)}";
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = csharp_record("src/Runner.cs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(parsed.diagnostics.is_empty());
+
+    let namespace_symbol = parsed
+        .symbols
+        .iter()
+        .find(|symbol| {
+            symbol.kind == SymbolKind::Module && symbol.name == "Squeezy.CSharp.SemanticCases"
+        })
+        .expect("namespace symbol");
+    assert!(
+        namespace_symbol
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "csharp:namespace")
+    );
+
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "IRunner"
+            && symbol.kind == SymbolKind::Interface
+            && symbol.visibility.as_deref() == Some("public")
+    }));
+    let runners = parsed
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Struct && symbol.name == "Runner")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        runners.len(),
+        2,
+        "both partial record declarations recorded"
+    );
+    assert!(runners.iter().all(|symbol| {
+        symbol
+            .attributes
+            .iter()
+            .any(|attr| attr == "csharp:partial")
+    }));
+    assert!(parsed.symbols.iter().any(|symbol| symbol.name == "Run"
+        && symbol.kind == SymbolKind::Method
+        && symbol.visibility.as_deref() == Some("public")));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Format" && symbol.kind == SymbolKind::Method)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "History" && symbol.kind == SymbolKind::Field)
+    );
+
+    let imports = parsed
+        .imports
+        .iter()
+        .map(|import| {
+            (
+                import.path.as_str(),
+                import.alias.as_deref(),
+                import.is_glob,
+                import.is_reexport,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(imports.contains(&("System", None, false, false)));
+    assert!(imports.contains(&("System.Collections.Generic", None, false, false)));
+    assert!(imports.contains(&("System.Math.*", None, true, false)));
+    assert!(imports.contains(&(
+        "System.Text.Json.JsonSerializer",
+        Some("Json"),
+        false,
+        false
+    )));
+
+    assert!(parsed.calls.iter().any(|call| call.name == "Format"));
+    assert!(parsed.calls.iter().any(|call| call.name == "Add"
+        && call.kind == ParsedCallKind::Method
+        && call.receiver.as_deref() == Some("History")));
+    assert!(parsed.calls.iter().any(|call| call.name == "Serialize"
+        && call.kind == ParsedCallKind::Method
+        && call.receiver.as_deref() == Some("Json")));
+    assert!(parsed.calls.iter().any(|call| call.name == "Abs"));
+
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "IRunner" && reference.kind == ReferenceKind::Type)
+    );
+    assert!(
+        !parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "string"),
+        "predefined types must not pollute references",
+    );
+}
+
+#[test]
+fn csharp_parser_marks_test_methods_via_attributes_and_filenames() {
+    let source = r#"
+using Xunit;
+using NUnit.Framework;
+
+namespace Demo.Tests;
+
+public class RunnerTests
+{
+    [Fact]
+    public void Runs_inputs_through_the_runner() { }
+
+    [Test]
+    public void Nunit_test_marker() { }
+
+    public void NotATest() { }
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = csharp_record("tests/RunnerTests.cs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Runs_inputs_through_the_runner"
+                && symbol.kind == SymbolKind::Test
+                && symbol.attributes.iter().any(|attr| attr == "csharp:test"))
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Nunit_test_marker"
+                && symbol.kind == SymbolKind::Test
+                && symbol.attributes.iter().any(|attr| attr == "csharp:test"))
+    );
+    let not_test = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "NotATest")
+        .expect("non-test method symbol");
+    assert_ne!(not_test.kind, SymbolKind::Test);
+    assert!(
+        not_test
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "csharp:test-host"),
+        "methods in *Tests.cs files should be marked as test hosts even without attributes",
+    );
+}
+
+#[test]
+fn csharp_parser_emits_base_attributes_for_class_hierarchies() {
+    let source = r#"
+namespace App;
+
+public class Animal { public virtual void Speak() { } }
+
+public class Dog : Animal, IComparable<Dog>
+{
+    public override void Speak() { base.Speak(); }
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = csharp_record("src/Animals.cs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let dog = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Dog")
+        .expect("Dog symbol");
+    assert!(
+        dog.attributes.iter().any(|attr| attr == "base:Animal"),
+        "C# class inheritance should produce `base:` attributes for graph resolution",
+    );
+    assert!(
+        dog.attributes.iter().any(|attr| attr == "base:IComparable"),
+        "Generic base names should be stripped to their leaf identifier",
+    );
+}
+
+#[test]
+fn csharp_parser_records_route_attributes_for_aspnet_controllers() {
+    let source = r#"
+using Microsoft.AspNetCore.Mvc;
+
+namespace App;
+
+[ApiController]
+[Route("api/[controller]")]
+public class UsersController : ControllerBase
+{
+    [HttpGet("{id}")]
+    public IActionResult Get(int id) => Ok(id);
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = csharp_record("src/Controllers/UsersController.cs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let controller = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "UsersController")
+        .expect("controller symbol");
+    assert!(
+        controller
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "framework:aspnet"),
+    );
+    assert!(
+        controller
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "framework:web-route"),
+    );
+    let get = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Get")
+        .expect("Get method");
+    assert!(
+        get.attributes
+            .iter()
+            .any(|attribute| attribute == "route:GET"),
+    );
+    assert!(
+        get.attributes
+            .iter()
+            .any(|attribute| attribute == "route:GET {id}"),
+    );
+}
+
+#[test]
 fn python_parser_skips_calls_inside_decorators() {
     let source = r#"
 from fastapi import APIRouter
@@ -605,6 +919,102 @@ fn extract_python_module_exports_requires_word_boundary() {
 }
 
 #[test]
+fn parser_extracts_java_symbols_imports_calls_and_references() {
+    let source = r#"
+package com.example.app;
+
+import com.example.services.Greeter;
+import static com.example.util.Names.defaultName;
+
+public class Runner extends BaseRunner implements Runnable {
+    private final Greeter greeter;
+
+    public Runner(Greeter greeter) {
+        this.greeter = greeter;
+    }
+
+    @Override
+    public void run() {
+        String name = defaultName();
+        greeter.greet(name);
+        new Helper().assist();
+    }
+}
+
+record Helper(String name) {
+    void assist() {}
+}
+
+@interface Route {
+    String value();
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = java_record("src/main/java/com/example/app/Runner.java", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(parsed.imports.iter().any(|import| {
+        import.path == "com.example.app" && import.alias.as_deref() == Some("__java_package__")
+    }));
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "com.example.services.Greeter")
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "Runner"
+            && symbol.kind == SymbolKind::Class
+            && symbol.visibility.as_deref() == Some("public")
+            && symbol.attributes.contains(&"base:BaseRunner".to_string())
+            && symbol.attributes.contains(&"base:Runnable".to_string())
+    }));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Helper" && symbol.kind == SymbolKind::Struct)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "greeter" && symbol.kind == SymbolKind::Field)
+    );
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|call| call.name == "defaultName" && call.kind == ParsedCallKind::Method)
+    );
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|call| call.name == "greet" && call.receiver.as_deref() == Some("greeter"))
+    );
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|call| call.name == "Helper" && call.kind == ParsedCallKind::Direct)
+    );
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "Greeter" && reference.kind == ReferenceKind::Type)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "value" && symbol.kind == SymbolKind::Method)
+    );
+}
+
+#[test]
 fn parser_reports_changed_ranges_for_cached_file() {
     let first = "fn one() { alpha(); }\n";
     let second = "fn one() { beta(); }\n";
@@ -711,6 +1121,460 @@ use crate::{config::Config, flags::{defs::Generate, parse::*}};
     assert!(imports.contains(&("crate::config::Config", None, false, false)));
     assert!(imports.contains(&("crate::flags::defs::Generate", None, false, false)));
     assert!(imports.contains(&("crate::flags::parse::*", None, true, false)));
+}
+
+#[test]
+fn parser_extracts_c_symbols_includes_calls_macros_and_references() {
+    let source = r#"
+#include "runner.h"
+#define RUNNER_MAX 8
+
+typedef struct Runner Runner;
+
+enum RunnerState {
+    RUNNER_READY,
+};
+
+struct Runner {
+    int id;
+};
+
+int helper(int value);
+
+int runner_run(Runner *runner, int value) {
+    if (value > RUNNER_MAX) {
+        return helper(value);
+    }
+    return runner->id;
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = c_record("src/runner.c", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "runner.h")
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "RUNNER_MAX" && symbol.kind == SymbolKind::Macro)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Runner" && symbol.kind == SymbolKind::Struct)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "RUNNER_READY" && symbol.kind == SymbolKind::Variant)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "id" && symbol.kind == SymbolKind::Field)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "runner_run" && symbol.kind == SymbolKind::Function)
+    );
+    assert!(parsed.calls.iter().any(|call| call.name == "helper"));
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "Runner" && reference.kind == ReferenceKind::Type)
+    );
+}
+
+#[test]
+fn parser_extracts_cpp_classes_methods_templates_and_candidate_calls() {
+    let source = r#"
+#include "runner.hpp"
+
+namespace app {
+template <typename T>
+class Runner : public Base {
+public:
+    Runner();
+    int fallback(int value);
+    T run(T value) {
+        return helper(value);
+    }
+};
+
+int helper(int value);
+
+int call_runner(Runner<int>& runner) {
+    return runner.run(1);
+}
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = cpp_record("src/runner.cpp", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "runner.hpp")
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "app" && symbol.kind == SymbolKind::Module)
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "Runner"
+            && symbol.kind == SymbolKind::Class
+            && symbol.attributes.contains(&"c++:template".to_string())
+            && symbol.confidence == Confidence::Partial
+    }));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "run" && symbol.kind == SymbolKind::Method)
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "fallback"
+            && symbol.kind == SymbolKind::Method
+            && symbol
+                .attributes
+                .contains(&"c-family:declaration".to_string())
+    }));
+    assert!(parsed.calls.iter().any(|call| {
+        call.name == "run"
+            && call.kind == ParsedCallKind::Method
+            && call.confidence == Confidence::CandidateSet
+    }));
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "Base" && reference.kind == ReferenceKind::Type)
+    );
+}
+
+#[test]
+fn parser_demotes_function_pointer_fields_to_field_symbols() {
+    let source = r#"
+struct Runner {
+    int (*callback)(int);
+    int id;
+};
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = c_record("src/runner.c", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    // Function-pointer fields must not be lifted to Function symbols; the
+    // clang AST oracle reports them as FieldDecl and treating them as
+    // Function would inflate Squeezy's FP count.
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "callback" && symbol.kind == SymbolKind::Field),
+        "expected function-pointer field `callback` to be classified as Field"
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "callback" && symbol.kind == SymbolKind::Function),
+        "function-pointer field must not be classified as Function"
+    );
+}
+
+#[test]
+fn parser_distinguishes_namespace_qualified_free_function_from_method() {
+    let source = r#"
+namespace ns {
+int free_function(int value);
+}
+int ns::free_function(int value) {
+    return value;
+}
+
+class Foo {
+public:
+    int method();
+};
+int Foo::method() { return 1; }
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = cpp_record("src/qualified.cpp", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    // `ns::free_function` has a lowercase namespace qualifier, so the
+    // qualifier-is-type-like heuristic keeps it as Function rather than
+    // mis-promoting to Method.
+    let free_functions = parsed
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.name == "free_function")
+        .collect::<Vec<_>>();
+    assert!(
+        free_functions
+            .iter()
+            .any(|symbol| symbol.kind == SymbolKind::Function),
+        "expected `ns::free_function` to remain a Function symbol"
+    );
+
+    // `Foo::method` has an uppercase qualifier so it stays Method.
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "method" && symbol.kind == SymbolKind::Method),
+        "expected `Foo::method` to be classified as Method"
+    );
+}
+
+#[test]
+fn parser_marks_template_specializations_with_attribute() {
+    let source = r#"
+template <typename T>
+class Box {};
+
+template <>
+class Box<int> {
+public:
+    int value;
+};
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = cpp_record("src/box.cpp", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let specializations = parsed
+        .symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.kind == SymbolKind::Class
+                && symbol
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute == "c++:template-specialization")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !specializations.is_empty(),
+        "expected `Box<int>` to be tagged as a template specialization"
+    );
+}
+
+#[test]
+fn parser_detects_all_caps_macro_like_calls() {
+    let source = r#"
+void use_macros(void) {
+    ASSERT(value > 0);
+    LOG("hello");
+    EXPECT_EQ(left, right);
+    helper(value);
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = c_record("src/use_macros.c", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    // `ASSERT` is all-caps but has no underscore — the previous heuristic
+    // missed it; the new one flags any all-caps name >= 2 chars as
+    // macro-like.
+    let assert_call = parsed
+        .calls
+        .iter()
+        .find(|call| call.name == "ASSERT")
+        .expect("ASSERT call should be recorded");
+    assert_eq!(assert_call.confidence, Confidence::MacroOpaque);
+    let log_call = parsed
+        .calls
+        .iter()
+        .find(|call| call.name == "LOG")
+        .expect("LOG call should be recorded");
+    assert_eq!(log_call.confidence, Confidence::MacroOpaque);
+    let expect_call = parsed
+        .calls
+        .iter()
+        .find(|call| call.name == "EXPECT_EQ")
+        .expect("EXPECT_EQ call should be recorded");
+    assert_eq!(expect_call.confidence, Confidence::MacroOpaque);
+
+    // A regular lowercase call remains a non-macro Heuristic.
+    let helper_call = parsed
+        .calls
+        .iter()
+        .find(|call| call.name == "helper")
+        .expect("helper call should be recorded");
+    assert_eq!(helper_call.confidence, Confidence::Heuristic);
+}
+
+#[test]
+fn parser_emits_imports_for_cpp_using_declarations_and_directives() {
+    let source = r#"
+#include <vector>
+
+using std::vector;
+using namespace app;
+
+void run() {
+    vector<int> v;
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = cpp_record("src/uses.cpp", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "std::vector" && !import.is_glob),
+        "expected `using std::vector;` to emit a non-glob import"
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "app" && import.is_glob),
+        "expected `using namespace app;` to emit a glob import"
+    );
+}
+
+#[test]
+fn parser_resolves_cpp_access_modifiers_from_access_specifier_blocks() {
+    let source = r#"
+class Foo {
+public:
+    void public_method();
+private:
+    void private_method();
+    int hidden_field;
+protected:
+    void protected_method();
+};
+
+struct Bar {
+    void default_public();
+private:
+    void explicit_private();
+};
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = cpp_record("src/access.cpp", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let visibility = |name: &str| {
+        parsed
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .and_then(|symbol| symbol.visibility.clone())
+    };
+
+    assert_eq!(visibility("public_method").as_deref(), Some("public"));
+    assert_eq!(visibility("private_method").as_deref(), Some("private"));
+    assert_eq!(visibility("hidden_field").as_deref(), Some("private"));
+    assert_eq!(visibility("protected_method").as_deref(), Some("protected"));
+    // `struct` defaults to public for members declared before the first
+    // access_specifier; explicit `private:` blocks apply to later members.
+    assert_eq!(visibility("default_public").as_deref(), Some("public"));
+    assert_eq!(visibility("explicit_private").as_deref(), Some("private"));
+}
+
+#[test]
+fn parser_collapses_forward_declaration_and_definition() {
+    let source = r#"
+int helper(int value);
+int helper(int value) {
+    return value + 1;
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = c_record("src/collapse.c", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let helpers = parsed
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.name == "helper")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        helpers.len(),
+        1,
+        "expected exactly one canonical `helper` symbol after collapse"
+    );
+    assert!(
+        helpers[0].body_span.is_some(),
+        "definition should win over forward declaration"
+    );
+}
+
+#[test]
+fn parser_includes_record_as_glob_imports() {
+    let source = r#"
+#include "runner.h"
+#include <stdio.h>
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = c_record("src/inc.c", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "runner.h" && import.is_glob),
+        "expected `#include \"runner.h\"` to be recorded as a glob import"
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "stdio.h" && import.is_glob)
+    );
+}
+
+#[test]
+fn parser_detects_virtual_signature_keyword_only_when_relevant() {
+    let source = r#"
+class Base {
+public:
+    virtual void run();
+};
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = cpp_record("src/virtual.cpp", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "run"
+            && symbol.kind == SymbolKind::Method
+            && symbol.attributes.iter().any(|attr| attr == "c++:virtual")
+    }));
+    // `Base` itself is a Class, not a Function/Method/Field, so we must
+    // not propagate `c++:virtual` to it just because the body mentions
+    // the keyword.
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "Base"
+            && symbol.kind == SymbolKind::Class
+            && !symbol.attributes.iter().any(|attr| attr == "c++:virtual")
+    }));
 }
 
 #[test]
@@ -1186,6 +2050,30 @@ fn js_record(relative_path: &str, source: &str) -> FileRecord {
     record
 }
 
+fn java_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Java;
+    record
+}
+
+fn csharp_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::CSharp;
+    record
+}
+
+fn c_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::C;
+    record
+}
+
+fn cpp_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Cpp;
+    record
+}
+
 fn go_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Go;
@@ -1193,11 +2081,15 @@ fn go_record(relative_path: &str, source: &str) -> FileRecord {
 }
 
 fn temp_root(name: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("squeezy-{name}-{nonce}"));
+    let root = std::env::temp_dir().join(format!("squeezy-{name}-{pid}-{counter}-{nonce}"));
     fs::create_dir_all(&root).unwrap();
     root
 }

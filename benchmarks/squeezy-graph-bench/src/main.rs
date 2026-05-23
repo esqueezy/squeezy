@@ -46,19 +46,19 @@ struct BenchmarkReport {
     language: String,
     fixture: String,
     spec: String,
-    rustc_check_ms: u128,
     validation_ms: u128,
     validation_status: String,
     squeezy_build_ms: u128,
     squeezy_query_ms: u128,
     squeezy_total_ms: u128,
     build_phases: BuildPhaseReport,
-    faster_than_rustc_check: bool,
     faster_than_validation: bool,
     graph: GraphReport,
     accuracy: AccuracyReport,
     python_oracle: Option<PythonOracleReport>,
     js_ts_oracle: Option<JsTsOracleReport>,
+    java_oracle: Option<JavaOracleReport>,
+    csharp_oracle: Option<CsharpOracleReport>,
     go_oracle: Option<GoOracleReport>,
     refresh_probe: Option<RefreshProbeReport>,
     heuristic_iterations: Vec<HeuristicIterationReport>,
@@ -179,6 +179,37 @@ struct PythonOracleReport {
 struct JsTsOracleReport {
     oracle_ms: u128,
     status: String,
+    symbols: AccuracySetReport,
+    limitations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct JavaOracleReport {
+    oracle_ms: Option<u128>,
+    status: String,
+    symbols: AccuracySetReport,
+    navigation: QueryOracleReport,
+    limitations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryOracleReport {
+    status: String,
+    query_count: usize,
+    true_positive: usize,
+    false_positive: usize,
+    false_negative: usize,
+    precision: f64,
+    recall: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct CsharpOracleReport {
+    oracle_ms: u128,
+    oracle_build_ms: Option<u128>,
+    status: String,
+    oracle_unparseable_files: usize,
+    oracle_unparseable_examples: Vec<String>,
     symbols: AccuracySetReport,
     limitations: Vec<String>,
 }
@@ -312,6 +343,19 @@ fn main() -> Result<()> {
         .map_err(|err| SqueezyError::Graph(format!("invalid benchmark spec: {err}")))?;
 
     let (validation_ms, validation_status) = match args.language {
+        BenchmarkLanguage::C => (
+            time_clang_syntax(&args.fixture, "clang", LanguageKind::C)?,
+            "clang -fsyntax-only".to_string(),
+        ),
+        BenchmarkLanguage::Cpp => (
+            time_clang_syntax(&args.fixture, "clang++", LanguageKind::Cpp)?,
+            "clang++ -fsyntax-only".to_string(),
+        ),
+        BenchmarkLanguage::CSharp => (
+            time_dotnet_build(&args.fixture)?,
+            "dotnet build".to_string(),
+        ),
+        BenchmarkLanguage::Java => time_java_oracle_optional(&args.fixture),
         BenchmarkLanguage::Rust => (time_cargo_check(&args.fixture)?, "cargo check".to_string()),
         BenchmarkLanguage::Python => (
             time_python_ast_oracle(&args.fixture)?,
@@ -345,7 +389,12 @@ fn main() -> Result<()> {
     let squeezy_query_ms = query_started.elapsed().as_millis();
     let squeezy_total_ms = squeezy_build_ms + squeezy_query_ms;
     let accuracy = match args.language {
+        BenchmarkLanguage::Java => empty_accuracy("rust-analyzer oracle not used for Java"),
         BenchmarkLanguage::Rust => collect_accuracy(&args.fixture, &graph, args.ra_lsp_probes),
+        BenchmarkLanguage::CSharp => empty_accuracy("rust-analyzer oracle not used for C#"),
+        BenchmarkLanguage::C | BenchmarkLanguage::Cpp => {
+            collect_c_family_accuracy(&args.fixture, &graph, args.language, args.oracle_files)?
+        }
         BenchmarkLanguage::Python => empty_accuracy("rust-analyzer oracle not used for Python"),
         BenchmarkLanguage::Go => empty_accuracy("rust-analyzer oracle not used for Go"),
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
@@ -366,11 +415,33 @@ fn main() -> Result<()> {
         }
         _ => None,
     };
+    let csharp_oracle = match args.language {
+        BenchmarkLanguage::CSharp => Some(collect_csharp_oracle_accuracy(&args.fixture, &graph)?),
+        _ => None,
+    };
+    let java_oracle = match args.language {
+        BenchmarkLanguage::Java => Some(collect_java_oracle_accuracy(
+            &args.fixture,
+            &graph,
+            &query_reports,
+        )?),
+        _ => None,
+    };
+    let faster_than_validation =
+        validation_status.starts_with("skipped") || squeezy_total_ms < validation_ms;
 
-    let mixed_workload = if args.language == BenchmarkLanguage::Rust {
+    let mixed_workload = if args.language.supports_mixed_workload() {
         args.mixed_repo
             .as_ref()
-            .map(|repo| run_mixed_workload(repo, args.mixed_iterations, args.ra_lsp_probes))
+            .map(|repo| {
+                run_mixed_workload(
+                    repo,
+                    args.language,
+                    args.mixed_iterations,
+                    args.ra_lsp_probes,
+                    args.oracle_files,
+                )
+            })
             .transpose()?
     } else {
         None
@@ -383,15 +454,13 @@ fn main() -> Result<()> {
         language: args.language.as_str().to_string(),
         fixture: args.fixture.display().to_string(),
         spec: args.spec.display().to_string(),
-        rustc_check_ms: validation_ms,
         validation_ms,
         validation_status,
         squeezy_build_ms,
         squeezy_query_ms,
         squeezy_total_ms,
         build_phases: build.phases,
-        faster_than_rustc_check: validation_ms == 0 || squeezy_total_ms < validation_ms,
-        faster_than_validation: validation_ms == 0 || squeezy_total_ms < validation_ms,
+        faster_than_validation: validation_ms == 0 || faster_than_validation,
         graph: GraphReport {
             files: stats.files,
             symbols: stats.symbols,
@@ -406,6 +475,8 @@ fn main() -> Result<()> {
         accuracy,
         python_oracle,
         js_ts_oracle,
+        java_oracle,
+        csharp_oracle,
         go_oracle,
         refresh_probe,
         heuristic_iterations,
@@ -513,12 +584,14 @@ fn run_query(graph: &SemanticGraph, query: &QuerySpec) -> Result<QueryReport> {
             .into_iter()
             .map(|hit| hit.reference.text)
             .collect(),
+        "java_project_facts" => graph
+            .java_project_facts()
+            .iter()
+            .map(|fact| format!("{}:{}:{}", fact.provider, fact.kind, fact.value))
+            .collect(),
         "references_to_symbol" => {
             let to = required(&query.to, "to")?;
-            let symbol = graph
-                .find_symbol_by_name(to)
-                .into_iter()
-                .next()
+            let symbol = benchmark_symbol_by_name(graph, to)
                 .ok_or_else(|| SqueezyError::Graph(format!("missing symbol {to}")))?;
             graph
                 .references_to_symbol(&symbol.id)
@@ -529,29 +602,30 @@ fn run_query(graph: &SemanticGraph, query: &QuerySpec) -> Result<QueryReport> {
         "call_chain" => {
             let from = required(&query.from, "from")?;
             let to = required(&query.to, "to")?;
-            let from_symbol = graph
-                .find_symbol_by_name(from)
-                .into_iter()
-                .next()
-                .ok_or_else(|| SqueezyError::Graph(format!("missing symbol {from}")))?;
-            let to_symbol = graph
-                .find_symbol_by_name(to)
-                .into_iter()
-                .next()
-                .ok_or_else(|| SqueezyError::Graph(format!("missing symbol {to}")))?;
-            graph
-                .call_chain(&from_symbol.id, &to_symbol.id, 8)
-                .map(|chain| {
-                    vec![
-                        chain
-                            .iter()
-                            .filter_map(|id| graph.symbols.get(id))
-                            .map(|symbol| symbol.name.clone())
-                            .collect::<Vec<_>>()
-                            .join(" -> "),
-                    ]
-                })
-                .unwrap_or_default()
+            let from_symbols = graph.find_symbol_by_name(from);
+            if from_symbols.is_empty() {
+                return Err(SqueezyError::Graph(format!("missing symbol {from}")));
+            }
+            let to_symbols = graph.find_symbol_by_name(to);
+            if to_symbols.is_empty() {
+                return Err(SqueezyError::Graph(format!("missing symbol {to}")));
+            }
+            let mut chains = Vec::new();
+            for from_symbol in &from_symbols {
+                for to_symbol in &to_symbols {
+                    if let Some(chain) = graph.call_chain(&from_symbol.id, &to_symbol.id, 8) {
+                        chains.push(
+                            chain
+                                .iter()
+                                .filter_map(|id| graph.symbols.get(id))
+                                .map(|symbol| symbol.name.clone())
+                                .collect::<Vec<_>>()
+                                .join(" -> "),
+                        );
+                    }
+                }
+            }
+            chains
         }
         unknown => {
             return Err(SqueezyError::Graph(format!(
@@ -580,18 +654,80 @@ fn run_query(graph: &SemanticGraph, query: &QuerySpec) -> Result<QueryReport> {
     })
 }
 
+fn benchmark_symbol_by_name(
+    graph: &SemanticGraph,
+    name: &str,
+) -> Option<squeezy_graph::GraphSymbol> {
+    let mut symbols = graph.find_symbol_by_name(name);
+    symbols.sort_by(|left, right| {
+        right
+            .body_span
+            .is_some()
+            .cmp(&left.body_span.is_some())
+            .then_with(|| left.id.0.cmp(&right.id.0))
+    });
+    symbols.into_iter().next()
+}
+
 fn run_mixed_workload(
     repo: &Path,
+    language: BenchmarkLanguage,
     requested_scenarios: usize,
     ra_lsp_probes: usize,
+    oracle_files: usize,
 ) -> Result<MixedWorkloadReport> {
-    let (compiler_check_ms, compiler_check_status) = time_cargo_check_optional(repo);
-    let (rust_analyzer_ms, rust_analyzer_status) = time_rust_analyzer(repo);
+    let (compiler_check_ms, compiler_check_status) = match language {
+        BenchmarkLanguage::C => time_clang_syntax_optional(repo, "clang", LanguageKind::C),
+        BenchmarkLanguage::CSharp => time_dotnet_build_optional(repo),
+        BenchmarkLanguage::Cpp => time_clang_syntax_optional(repo, "clang++", LanguageKind::Cpp),
+        BenchmarkLanguage::Go => (
+            None,
+            "mixed workload compiler check not used for Go".to_string(),
+        ),
+        BenchmarkLanguage::Java => (
+            None,
+            "mixed workload compiler check not used for Java".to_string(),
+        ),
+        BenchmarkLanguage::Rust => time_cargo_check_optional(repo),
+        BenchmarkLanguage::Python => (None, "mixed workload unsupported for Python".to_string()),
+        BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => (
+            None,
+            "mixed workload unsupported for JavaScript/TypeScript".to_string(),
+        ),
+    };
+    let (rust_analyzer_ms, rust_analyzer_status) = if language == BenchmarkLanguage::Rust {
+        time_rust_analyzer(repo)
+    } else {
+        (
+            None,
+            "rust-analyzer oracle not used for this language".to_string(),
+        )
+    };
 
     let build = build_graph(repo)?;
     let graph = build.graph;
     let squeezy_build_ms = build.phases.total_ms;
-    let accuracy = collect_accuracy(repo, &graph, ra_lsp_probes);
+    let accuracy = match language {
+        BenchmarkLanguage::Rust => collect_accuracy(repo, &graph, ra_lsp_probes),
+        BenchmarkLanguage::CSharp => match collect_csharp_oracle_accuracy(repo, &graph) {
+            Ok(report) => csharp_oracle_to_accuracy(&report),
+            Err(err) => empty_accuracy(&format!("C# semantic oracle failed: {err}")),
+        },
+        BenchmarkLanguage::C | BenchmarkLanguage::Cpp => {
+            collect_c_family_accuracy(repo, &graph, language, oracle_files)?
+        }
+        BenchmarkLanguage::Go => match collect_go_oracle_accuracy(repo, &graph) {
+            Ok(report) => go_oracle_to_accuracy(&report),
+            Err(err) => empty_accuracy(&format!("Go semantic oracle failed: {err}")),
+        },
+        BenchmarkLanguage::Java => {
+            empty_accuracy("mixed workload accuracy oracle not used for Java")
+        }
+        BenchmarkLanguage::Python => empty_accuracy("mixed workload unsupported for Python"),
+        BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
+            empty_accuracy("mixed workload unsupported for JavaScript/TypeScript")
+        }
+    };
 
     let scenarios = build_mixed_scenarios(&graph);
     let scenario_indexes = select_scenarios(scenarios.len(), requested_scenarios);
@@ -621,7 +757,7 @@ fn run_mixed_workload(
         .map(|(tool, micros)| (tool, micros / 1_000))
         .collect::<BTreeMap<_, _>>();
     let squeezy_total_ms = squeezy_build_ms + squeezy_query_ms;
-    let refresh_probe = run_refresh_probe(repo, BenchmarkLanguage::Rust)?;
+    let refresh_probe = run_refresh_probe(repo, language)?;
 
     Ok(MixedWorkloadReport {
         repo: repo.display().to_string(),
@@ -685,6 +821,80 @@ fn empty_accuracy(status: &str) -> AccuracyReport {
         },
         limitations: vec![status.to_string()],
     }
+}
+
+fn collect_c_family_accuracy(
+    root: &Path,
+    graph: &SemanticGraph,
+    language: BenchmarkLanguage,
+    oracle_file_limit: usize,
+) -> Result<AccuracyReport> {
+    let language_kind = language.source_language();
+    let started = Instant::now();
+    let oracle = collect_clang_ast_symbol_scan(root, language_kind, oracle_file_limit)?;
+    let oracle_ms = started.elapsed().as_millis();
+    let excluded_files = oracle
+        .excluded_files
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let squeezy_symbols =
+        collect_c_family_squeezy_symbol_scan(graph, language_kind, &excluded_files);
+    let symbols = compare_symbol_sets(&squeezy_symbols, &oracle.symbols);
+    let skipped = oracle.unparseable_files.len();
+    let status = if skipped == 0 {
+        format!(
+            "clang AST JSON oracle succeeded for {}/{} selected {} files ({} candidates)",
+            oracle.parsed_files,
+            oracle.selected_files,
+            language.as_str(),
+            oracle.candidate_files
+        )
+    } else {
+        format!(
+            "clang AST JSON oracle parsed {}/{} selected {} files ({} candidates); skipped {} unparseable files excluded from Squeezy FP accounting: {}",
+            oracle.parsed_files,
+            oracle.selected_files,
+            language.as_str(),
+            oracle.candidate_files,
+            skipped,
+            oracle
+                .unparseable_files
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    Ok(AccuracyReport {
+        rust_analyzer_symbols_ms: Some(oracle_ms),
+        rust_analyzer_symbol_status: status.clone(),
+        symbols,
+        navigation: NavigationAccuracyReport {
+            rust_analyzer_lsp_ms: None,
+            rust_analyzer_lsp_status: "clang AST navigation oracle not implemented".to_string(),
+            requested_probe_limit: 0,
+            definitions: DefinitionAccuracyReport::default(),
+            references: ReferenceAccuracyReport::default(),
+            limitations: vec![
+                "C/C++ navigation FP/FN is not sampled against clangd yet; this benchmark currently compares declaration symbols against clang AST JSON.".to_string(),
+            ],
+        },
+        limitations: vec![
+            "C/C++ symbol TP/FP/FN compares file/name/kind declaration families exposed by Squeezy and clang AST JSON.".to_string(),
+            "Headers and source files are parsed as standalone translation units with conservative include-dir heuristics; files requiring project-specific generated headers, compile flags, or compile_commands are reported as unparseable and excluded from Squeezy FP accounting.".to_string(),
+            format!(
+                "Oracle file limit is {}; use --oracle-files 0 for exhaustive local runs.",
+                if oracle_file_limit == 0 {
+                    "unlimited".to_string()
+                } else {
+                    oracle_file_limit.to_string()
+                }
+            ),
+        ],
+    })
 }
 
 fn collect_python_oracle_accuracy(
@@ -1032,6 +1242,61 @@ fn collect_squeezy_symbol_scan_excluding_files(
     scan
 }
 
+fn collect_c_family_squeezy_symbol_scan(
+    graph: &SemanticGraph,
+    language: LanguageKind,
+    excluded_files: &BTreeSet<String>,
+) -> SymbolScan {
+    let mut scan = SymbolScan::default();
+    for symbol in graph.symbols.values() {
+        let Some(file) = graph.files.get(&symbol.file_id) else {
+            increment(&mut scan.excluded_by_kind, "MissingFile");
+            continue;
+        };
+        if file.language != language {
+            continue;
+        }
+        scan.raw_total += 1;
+        if excluded_files.contains(&file.relative_path) {
+            increment(&mut scan.excluded_by_kind, "OracleUnparseableFile");
+            continue;
+        }
+        if !clang_symbol_name_is_comparable(&symbol.name) {
+            increment(&mut scan.excluded_by_kind, "UnnamedOrOperator");
+            continue;
+        }
+        // Clang's AST oracle emits `ClassTemplateSpecializationDecl` (not
+        // `CXXRecordDecl`) for `template<> class Foo<int> {}` style
+        // declarations, and our `clang_symbol_kind` mapping intentionally
+        // skips that kind. Squeezy treats the same node as a Class symbol
+        // tagged with `c++:template-specialization`; counting it here would
+        // appear as a false positive against the oracle. Exclude these
+        // symbols symmetrically.
+        if symbol
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "c++:template-specialization")
+        {
+            increment(&mut scan.excluded_by_kind, "TemplateSpecialization");
+            continue;
+        }
+        match normalize_c_family_squeezy_kind(symbol.kind) {
+            Some(kind) => {
+                increment_unique_symbol(
+                    &mut scan.counts,
+                    SymbolKey {
+                        file: file.relative_path.clone(),
+                        kind,
+                        name: normalize_symbol_name(&symbol.name),
+                    },
+                );
+            }
+            None => increment(&mut scan.excluded_by_kind, &format!("{:?}", symbol.kind)),
+        }
+    }
+    scan
+}
+
 #[derive(Debug, Deserialize)]
 struct PythonAstOracleOutput {
     rows: Vec<[String; 3]>,
@@ -1042,6 +1307,16 @@ struct PythonAstOracleOutput {
 struct PythonAstSymbolScan {
     symbols: SymbolScan,
     unparseable_files: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CFamilyClangSymbolScan {
+    symbols: SymbolScan,
+    parsed_files: usize,
+    candidate_files: usize,
+    selected_files: usize,
+    unparseable_files: Vec<String>,
+    excluded_files: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1099,6 +1374,194 @@ fn collect_python_ast_symbol_scan(root: &Path) -> Result<PythonAstSymbolScan> {
     })
 }
 
+fn collect_csharp_oracle_accuracy(
+    root: &Path,
+    graph: &SemanticGraph,
+) -> Result<CsharpOracleReport> {
+    let started = Instant::now();
+    let oracle = collect_csharp_oracle_symbol_scan(root)?;
+    let oracle_ms = started.elapsed().as_millis();
+    let unparseable_files = oracle
+        .unparseable_files
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let squeezy_symbols = collect_squeezy_symbol_scan_excluding_files(graph, &unparseable_files);
+    let symbols = compare_symbol_sets(&squeezy_symbols, &oracle.symbols);
+    let oracle_unparseable_examples = unparseable_files
+        .iter()
+        .take(10)
+        .cloned()
+        .collect::<Vec<_>>();
+    let oracle_unparseable_files = unparseable_files.len();
+
+    let status_text = if oracle_unparseable_files == 0 {
+        "Roslyn C# oracle succeeded".to_string()
+    } else {
+        format!(
+            "Roslyn C# oracle succeeded with {oracle_unparseable_files} unparseable files excluded from symbol FP accounting"
+        )
+    };
+
+    Ok(CsharpOracleReport {
+        oracle_ms,
+        oracle_build_ms: oracle.build_ms,
+        status: status_text,
+        oracle_unparseable_files,
+        oracle_unparseable_examples,
+        symbols,
+        limitations: vec![
+            "The C# oracle uses Roslyn's CSharpSyntaxTree (syntactic, not semantic), so it counts declarations but does not resolve members inherited from referenced assemblies.".to_string(),
+            "Symbol comparison is file/name/kind based; the oracle reports partial declarations once per source file, mirroring squeezy's own behavior.".to_string(),
+            "C# files that Roslyn cannot parse (e.g. invalid syntax) are reported as oracle_unparseable and excluded from Squeezy false-positive accounting.".to_string(),
+        ],
+    })
+}
+
+fn csharp_oracle_to_accuracy(report: &CsharpOracleReport) -> AccuracyReport {
+    AccuracyReport {
+        rust_analyzer_symbols_ms: Some(report.oracle_ms),
+        rust_analyzer_symbol_status: report.status.clone(),
+        symbols: report.symbols.clone(),
+        navigation: NavigationAccuracyReport {
+            rust_analyzer_lsp_ms: None,
+            rust_analyzer_lsp_status: "C# LSP navigation oracle not used".to_string(),
+            requested_probe_limit: 0,
+            definitions: DefinitionAccuracyReport::default(),
+            references: ReferenceAccuracyReport::default(),
+            limitations: vec![
+                "C# accuracy currently compares symbol declarations against Roslyn; LSP-style go-to-definition probes are not exercised yet.".to_string(),
+            ],
+        },
+        limitations: report.limitations.clone(),
+    }
+}
+
+fn go_oracle_to_accuracy(report: &GoOracleReport) -> AccuracyReport {
+    AccuracyReport {
+        rust_analyzer_symbols_ms: Some(report.oracle_ms),
+        rust_analyzer_symbol_status: report.status.clone(),
+        symbols: report.symbols.clone(),
+        navigation: NavigationAccuracyReport {
+            rust_analyzer_lsp_ms: None,
+            rust_analyzer_lsp_status: "Go LSP navigation oracle not used".to_string(),
+            requested_probe_limit: 0,
+            definitions: DefinitionAccuracyReport::default(),
+            references: ReferenceAccuracyReport::default(),
+            limitations: vec![
+                "Go accuracy currently compares symbol declarations against the Go parser/type oracle; LSP-style go-to-definition probes are not exercised yet.".to_string(),
+            ],
+        },
+        limitations: report.limitations.clone(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CsharpOracleOutput {
+    rows: Vec<[String; 3]>,
+    unparseable_files: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CsharpOracleSymbolScan {
+    symbols: SymbolScan,
+    unparseable_files: Vec<String>,
+    build_ms: Option<u128>,
+}
+
+fn collect_csharp_oracle_symbol_scan(root: &Path) -> Result<CsharpOracleSymbolScan> {
+    let (dll, build_ms) = ensure_csharp_oracle_built()?;
+    let output = Command::new("dotnet")
+        .arg(&dll)
+        .arg(root)
+        .output()
+        .map_err(|err| SqueezyError::Graph(format!("failed to run Roslyn C# oracle: {err}")))?;
+    if !output.status.success() {
+        return Err(SqueezyError::Graph(format!(
+            "Roslyn C# oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let output: CsharpOracleOutput = serde_json::from_slice(&output.stdout)
+        .map_err(|err| SqueezyError::Graph(format!("invalid Roslyn C# oracle JSON: {err}")))?;
+    let mut scan = SymbolScan::default();
+    for [file, kind, name] in output.rows {
+        scan.raw_total += 1;
+        increment_symbol(
+            &mut scan.counts,
+            SymbolKey {
+                file,
+                kind,
+                name: normalize_symbol_name(&name),
+            },
+        );
+    }
+    Ok(CsharpOracleSymbolScan {
+        symbols: scan,
+        unparseable_files: output.unparseable_files,
+        build_ms,
+    })
+}
+
+fn ensure_csharp_oracle_built() -> Result<(PathBuf, Option<u128>)> {
+    let project = csharp_oracle_project_dir()?;
+    let dll = project
+        .join("bin")
+        .join("Release")
+        .join("net8.0")
+        .join("CsharpOracle.dll");
+    if dll.exists() {
+        return Ok((dll, None));
+    }
+    let started = Instant::now();
+    let status = Command::new("dotnet")
+        .arg("build")
+        .arg(&project)
+        .arg("-c")
+        .arg("Release")
+        .arg("--nologo")
+        .arg("-v")
+        .arg("minimal")
+        .status()
+        .map_err(|err| SqueezyError::Graph(format!("failed to build Roslyn C# oracle: {err}")))?;
+    let build_ms = started.elapsed().as_millis();
+    if !status.success() {
+        return Err(SqueezyError::Graph(format!(
+            "Roslyn C# oracle build failed with {status}"
+        )));
+    }
+    if !dll.exists() {
+        return Err(SqueezyError::Graph(format!(
+            "Roslyn C# oracle build did not produce {}",
+            dll.display()
+        )));
+    }
+    Ok((dll, Some(build_ms)))
+}
+
+fn csharp_oracle_project_dir() -> Result<PathBuf> {
+    if let Ok(value) = std::env::var("SQUEEZY_CSHARP_ORACLE_DIR")
+        && !value.is_empty()
+    {
+        let path = PathBuf::from(value);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    let candidates: [PathBuf; 3] = [
+        PathBuf::from("benchmarks/oracle/csharp"),
+        PathBuf::from("../oracle/csharp"),
+        PathBuf::from("../../benchmarks/oracle/csharp"),
+    ];
+    for candidate in candidates {
+        if candidate.join("CsharpOracle.csproj").exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(SqueezyError::Graph(
+        "could not locate benchmarks/oracle/csharp; set SQUEEZY_CSHARP_ORACLE_DIR".to_string(),
+    ))
+}
+
 const PYTHON_AST_ORACLE: &str = r#"
 import ast
 import json
@@ -1140,6 +1603,593 @@ for path in sorted(root.rglob("*.py")):
 
 print(json.dumps({"rows": rows, "unparseable_files": unparseable_files}))
 "#;
+
+fn time_java_oracle_optional(root: &Path) -> (u128, String) {
+    if !command_exists("java") {
+        return (0, "skipped: java not found".to_string());
+    }
+    let started = Instant::now();
+    match collect_java_compiler_tree_symbol_scan(root) {
+        Ok((_, status)) if status.starts_with("JDK compiler tree oracle succeeded") => {
+            (started.elapsed().as_millis(), status)
+        }
+        Ok((_, status)) => (0, format!("skipped: {status}")),
+        Err(err) => (0, format!("skipped: Java oracle failed: {err}")),
+    }
+}
+
+fn collect_java_oracle_accuracy(
+    root: &Path,
+    graph: &SemanticGraph,
+    queries: &[QueryReport],
+) -> Result<JavaOracleReport> {
+    if !command_exists("java") {
+        return Ok(JavaOracleReport {
+            oracle_ms: None,
+            status: "skipped: java not found".to_string(),
+            symbols: compare_symbol_sets(
+                &collect_squeezy_symbol_scan(graph),
+                &SymbolScan::default(),
+            ),
+            navigation: collect_query_oracle_accuracy(queries),
+            limitations: java_oracle_limitations(),
+        });
+    }
+    let started = Instant::now();
+    match collect_java_compiler_tree_symbol_scan(root) {
+        Ok((oracle, status)) if status.starts_with("JDK compiler tree oracle succeeded") => {
+            let oracle_ms = started.elapsed().as_millis();
+            let squeezy_symbols = collect_squeezy_symbol_scan(graph);
+            Ok(JavaOracleReport {
+                oracle_ms: Some(oracle_ms),
+                status,
+                symbols: compare_symbol_sets(&squeezy_symbols, &oracle),
+                navigation: collect_query_oracle_accuracy(queries),
+                limitations: java_oracle_limitations(),
+            })
+        }
+        Ok((_, status)) => Ok(JavaOracleReport {
+            oracle_ms: None,
+            status: format!("skipped: {status}"),
+            symbols: compare_symbol_sets(
+                &collect_squeezy_symbol_scan(graph),
+                &SymbolScan::default(),
+            ),
+            navigation: collect_query_oracle_accuracy(queries),
+            limitations: java_oracle_limitations(),
+        }),
+        Err(err) => Ok(JavaOracleReport {
+            oracle_ms: None,
+            status: format!("skipped: Java oracle failed: {err}"),
+            symbols: compare_symbol_sets(
+                &collect_squeezy_symbol_scan(graph),
+                &SymbolScan::default(),
+            ),
+            navigation: collect_query_oracle_accuracy(queries),
+            limitations: java_oracle_limitations(),
+        }),
+    }
+}
+
+fn collect_query_oracle_accuracy(queries: &[QueryReport]) -> QueryOracleReport {
+    let true_positive = queries
+        .iter()
+        .map(|query| {
+            query
+                .expected_contains
+                .iter()
+                .filter(|expected| query.actual.contains(expected))
+                .count()
+        })
+        .sum::<usize>();
+    let false_negative = queries
+        .iter()
+        .map(|query| query.missing.len())
+        .sum::<usize>();
+    // Query specs use expected_contains, not an exhaustive expected set, so
+    // extra results stay visible on each query but are not counted as oracle FP.
+    let false_positive = 0;
+    QueryOracleReport {
+        status: "fixture query truth (minimum expected_contains oracle)".to_string(),
+        query_count: queries.len(),
+        true_positive,
+        false_positive,
+        false_negative,
+        precision: ratio(true_positive, true_positive + false_positive),
+        recall: ratio(true_positive, true_positive + false_negative),
+    }
+}
+
+fn java_oracle_limitations() -> Vec<String> {
+    vec![
+        "The Java oracle uses the JDK compiler tree API for declarations only and does not require successful type attribution.".to_string(),
+        "Symbol comparison is file/name/kind based; overload resolution, dispatch, generated sources, annotation processors, and external libraries remain separate navigation-loss areas.".to_string(),
+        "If java or a JDK compiler is unavailable, the oracle is skipped while fixture query gates still run.".to_string(),
+    ]
+}
+
+#[derive(Debug, Deserialize)]
+struct JavaOracleOutput {
+    rows: Vec<[String; 3]>,
+}
+
+fn collect_java_compiler_tree_symbol_scan(root: &Path) -> Result<(SymbolScan, String)> {
+    let temp = temp_dir("squeezy-java-oracle")?;
+    let oracle_path = temp.join("JavaOracle.java");
+    fs::write(&oracle_path, JAVA_COMPILER_TREE_ORACLE)?;
+    let output = Command::new("java")
+        .arg(&oracle_path)
+        .arg(root)
+        .output()
+        .map_err(|err| SqueezyError::Graph(format!("failed to run Java oracle: {err}")))?;
+    if !output.status.success() {
+        return Ok((
+            SymbolScan::default(),
+            format!(
+                "Java oracle unavailable: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    let output: JavaOracleOutput = serde_json::from_slice(&output.stdout)
+        .map_err(|err| SqueezyError::Graph(format!("invalid Java oracle JSON: {err}")))?;
+    let mut scan = SymbolScan::default();
+    for [file, kind, name] in output.rows {
+        scan.raw_total += 1;
+        increment_symbol(
+            &mut scan.counts,
+            SymbolKey {
+                file,
+                kind,
+                name: normalize_symbol_name(&name),
+            },
+        );
+    }
+    Ok((
+        scan.clone(),
+        format!(
+            "JDK compiler tree oracle succeeded with {} declaration symbols",
+            symbol_count(&scan.counts)
+        ),
+    ))
+}
+
+const JAVA_COMPILER_TREE_ORACLE: &str = r#"
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import javax.tools.JavaCompiler;
+import javax.tools.StandardJavaFileManager;
+import javax.tools.ToolProvider;
+import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.CompilationUnitTree;
+import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.Tree;
+import com.sun.source.util.JavacTask;
+import com.sun.source.util.TreeScanner;
+
+public class JavaOracle {
+  record Row(String file, String kind, String name) {}
+
+  public static void main(String[] args) throws Exception {
+    JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+    if (compiler == null) {
+      System.err.println("JDK compiler is not available");
+      System.exit(2);
+    }
+    Path root = Path.of(args[0]).toAbsolutePath().normalize();
+    List<Path> files = Files.walk(root)
+      .filter(path -> path.toString().endsWith(".java"))
+      .sorted()
+      .toList();
+    List<Row> rows = new ArrayList<>();
+    try (StandardJavaFileManager manager = compiler.getStandardFileManager(null, null, StandardCharsets.UTF_8)) {
+      Iterable units = manager.getJavaFileObjectsFromPaths(files);
+      JavacTask task = (JavacTask) compiler.getTask(null, manager, null, List.of("-proc:none"), null, units);
+      for (CompilationUnitTree unit : task.parse()) {
+        String rel = root.relativize(Path.of(unit.getSourceFile().toUri()).toAbsolutePath().normalize()).toString().replace('\\', '/');
+        new Scanner(rel, rows).scan(unit, null);
+      }
+    }
+    rows.sort(Comparator.comparing(Row::file).thenComparing(Row::kind).thenComparing(Row::name));
+    StringBuilder out = new StringBuilder();
+    out.append("{\"rows\":[");
+    for (int i = 0; i < rows.size(); i++) {
+      Row row = rows.get(i);
+      if (i > 0) out.append(',');
+      out.append("[\"").append(escape(row.file())).append("\",\"")
+        .append(escape(row.kind())).append("\",\"")
+        .append(escape(row.name())).append("\"]");
+    }
+    out.append("]}");
+    System.out.println(out);
+  }
+
+  static class Scanner extends TreeScanner<Void, Void> {
+    private final String file;
+    private final List<Row> rows;
+    private final ArrayDeque<String> classes = new ArrayDeque<>();
+
+    Scanner(String file, List<Row> rows) {
+      this.file = file;
+      this.rows = rows;
+    }
+
+    @Override
+    public Void visitClass(ClassTree node, Void unused) {
+      String kind = switch (node.getKind()) {
+        case CLASS -> "Class";
+        case INTERFACE, ANNOTATION_TYPE -> "Trait";
+        case ENUM -> "Enum";
+        case RECORD -> "Struct";
+        default -> "Class";
+      };
+      String name = node.getSimpleName().toString();
+      if (name.isEmpty()) {
+        return super.visitClass(node, unused);
+      }
+      rows.add(new Row(file, kind, name));
+      classes.push(name);
+      super.visitClass(node, unused);
+      classes.pop();
+      return null;
+    }
+
+    @Override
+    public Void visitMethod(MethodTree node, Void unused) {
+      String name = node.getName().toString();
+      if ("<init>".equals(name) && !classes.isEmpty()) {
+        name = classes.peek();
+      }
+      rows.add(new Row(file, "Method", name));
+      return super.visitMethod(node, unused);
+    }
+  }
+
+  static String escape(String value) {
+    return value.replace("\\", "\\\\").replace("\"", "\\\"");
+  }
+}
+"#;
+
+fn collect_clang_ast_symbol_scan(
+    root: &Path,
+    language: LanguageKind,
+    file_limit: usize,
+) -> Result<CFamilyClangSymbolScan> {
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default()).crawl(root)?;
+    let root = fs::canonicalize(root)?;
+    let mut records = snapshot
+        .files
+        .iter()
+        .filter(|record| record.language == language)
+        .cloned()
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let indexes = select_scenarios(records.len(), file_limit);
+    let selected = indexes.iter().copied().collect::<BTreeSet<_>>();
+    let include_dirs = clang_include_dirs(&root, &snapshot.files);
+    let excluded_initial = records
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !selected.contains(index))
+        .map(|(_, record)| record.relative_path.clone())
+        .collect::<Vec<_>>();
+
+    let selected_records = indexes
+        .iter()
+        .copied()
+        .map(|index| records[index].clone())
+        .collect::<Vec<_>>();
+    if selected_records.is_empty() {
+        return Ok(CFamilyClangSymbolScan {
+            symbols: SymbolScan::default(),
+            parsed_files: 0,
+            candidate_files: records.len(),
+            selected_files: 0,
+            unparseable_files: Vec::new(),
+            excluded_files: excluded_initial,
+        });
+    }
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1)
+        .min(selected_records.len())
+        .max(1);
+    let chunk_size = selected_records.len().div_ceil(worker_count);
+
+    let outputs = std::thread::scope(|scope| -> Result<Vec<ClangAstFileOutput>> {
+        let mut handles = Vec::new();
+        for chunk in selected_records.chunks(chunk_size) {
+            let chunk = chunk.to_vec();
+            let include_dirs = include_dirs.clone();
+            let root = root.clone();
+            handles.push(scope.spawn(move || -> Result<Vec<ClangAstFileOutput>> {
+                let mut out = Vec::with_capacity(chunk.len());
+                for record in chunk {
+                    let result =
+                        clang_ast_symbols_for_file(&root, &record, language, &include_dirs);
+                    out.push(ClangAstFileOutput {
+                        relative_path: record.relative_path.clone(),
+                        result,
+                    });
+                }
+                Ok(out)
+            }));
+        }
+        let mut outputs = Vec::with_capacity(selected_records.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(mut chunk_outputs)) => outputs.append(&mut chunk_outputs),
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    return Err(SqueezyError::Graph(
+                        "clang AST oracle worker panicked".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(outputs)
+    })?;
+
+    let mut scan = SymbolScan::default();
+    let mut parsed_files = 0usize;
+    let mut unparseable_files = Vec::new();
+    let mut excluded_files = excluded_initial;
+    for output in outputs {
+        match output.result {
+            Ok(file_scan) => {
+                parsed_files += 1;
+                merge_symbol_scan(&mut scan, file_scan);
+            }
+            Err(_) => {
+                unparseable_files.push(output.relative_path.clone());
+                excluded_files.push(output.relative_path);
+            }
+        }
+    }
+
+    Ok(CFamilyClangSymbolScan {
+        symbols: scan,
+        parsed_files,
+        candidate_files: records.len(),
+        selected_files: parsed_files + unparseable_files.len(),
+        unparseable_files,
+        excluded_files,
+    })
+}
+
+struct ClangAstFileOutput {
+    relative_path: String,
+    result: Result<SymbolScan>,
+}
+
+fn clang_ast_symbols_for_file(
+    root: &Path,
+    record: &squeezy_workspace::FileRecord,
+    language: LanguageKind,
+    include_dirs: &[PathBuf],
+) -> Result<SymbolScan> {
+    let root = fs::canonicalize(root)?;
+    let main_file = fs::canonicalize(&record.path)?;
+    let compiler = match language {
+        LanguageKind::C => "clang",
+        LanguageKind::Cpp => "clang++",
+        _ => {
+            return Err(SqueezyError::Graph(format!(
+                "clang AST oracle does not support {language:?}"
+            )));
+        }
+    };
+    let x_language = clang_x_language(record, language);
+    let mut command = Command::new(compiler);
+    command
+        .current_dir(&root)
+        .arg("-Xclang")
+        .arg("-ast-dump=json")
+        .arg("-fsyntax-only")
+        .arg("-fno-color-diagnostics")
+        .arg("-Wno-everything")
+        .arg("-x")
+        .arg(x_language);
+    for include_dir in include_dirs {
+        command.arg("-I").arg(include_dir);
+    }
+    command.arg(&main_file);
+
+    let output = command.output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default();
+        return Err(SqueezyError::Graph(format!(
+            "{compiler} AST failed for {} with {}{}",
+            record.relative_path,
+            output.status,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", truncate(detail, 240))
+            }
+        )));
+    }
+
+    let ast: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| SqueezyError::Graph(format!("invalid clang AST JSON: {err}")))?;
+    let mut scan = SymbolScan::default();
+    collect_clang_ast_symbols_from_value(&ast, &root, &main_file, &record.relative_path, &mut scan);
+    Ok(scan)
+}
+
+fn collect_clang_ast_symbols_from_value(
+    node: &Value,
+    root: &Path,
+    main_file: &Path,
+    relative_path: &str,
+    scan: &mut SymbolScan,
+) {
+    if node.get("isImplicit").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
+
+    if let Some(kind) = clang_symbol_kind(node)
+        && clang_node_is_in_main_file(node, root, main_file)
+    {
+        scan.raw_total += 1;
+        if let Some(name) = node
+            .get("name")
+            .and_then(Value::as_str)
+            .map(normalize_clang_symbol_name)
+            .filter(|name| clang_symbol_name_is_comparable(name))
+        {
+            increment_unique_symbol(
+                &mut scan.counts,
+                SymbolKey {
+                    file: relative_path.to_string(),
+                    kind,
+                    name,
+                },
+            );
+        } else {
+            increment(&mut scan.excluded_by_kind, "UnnamedOrOperator");
+        }
+    }
+
+    if let Some(children) = node.get("inner").and_then(Value::as_array) {
+        for child in children {
+            collect_clang_ast_symbols_from_value(child, root, main_file, relative_path, scan);
+        }
+    }
+}
+
+fn clang_symbol_kind(node: &Value) -> Option<String> {
+    let kind = node.get("kind").and_then(Value::as_str)?;
+    match kind {
+        "NamespaceDecl" => Some("Module".to_string()),
+        "RecordDecl" => match node.get("tagUsed").and_then(Value::as_str) {
+            Some("struct") => Some("Struct".to_string()),
+            Some("union") => Some("Union".to_string()),
+            _ => None,
+        },
+        "CXXRecordDecl" => match node.get("tagUsed").and_then(Value::as_str) {
+            Some("struct") => Some("Struct".to_string()),
+            Some("union") => Some("Union".to_string()),
+            Some("class") | None => Some("Class".to_string()),
+            _ => None,
+        },
+        "EnumDecl" => Some("Enum".to_string()),
+        "FunctionDecl" => Some("Function".to_string()),
+        "CXXMethodDecl" => Some("Method".to_string()),
+        "TypedefDecl" | "TypeAliasDecl" => Some("TypeAlias".to_string()),
+        _ => None,
+    }
+}
+
+fn clang_node_is_in_main_file(node: &Value, root: &Path, main_file: &Path) -> bool {
+    if node.pointer("/loc/includedFrom").is_some()
+        || node.pointer("/range/begin/includedFrom").is_some()
+    {
+        return false;
+    }
+    let Some(raw_file) = clang_node_file(node) else {
+        return true;
+    };
+    let path = PathBuf::from(raw_file);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    fs::canonicalize(&absolute)
+        .map(|path| path == main_file)
+        .unwrap_or(false)
+}
+
+fn clang_node_file(node: &Value) -> Option<&str> {
+    node.pointer("/loc/file")
+        .and_then(Value::as_str)
+        .or_else(|| node.pointer("/range/begin/file").and_then(Value::as_str))
+}
+
+fn clang_x_language(
+    record: &squeezy_workspace::FileRecord,
+    language: LanguageKind,
+) -> &'static str {
+    let extension = record
+        .path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    match (language, extension) {
+        (LanguageKind::C, "h") => "c-header",
+        (LanguageKind::Cpp, "h" | "hh" | "hpp" | "hxx") => "c++-header",
+        (LanguageKind::C, _) => "c",
+        (LanguageKind::Cpp, _) => "c++",
+        _ => "c",
+    }
+}
+
+fn clang_include_dirs(root: &Path, files: &[squeezy_workspace::FileRecord]) -> Vec<PathBuf> {
+    let mut dirs = BTreeSet::new();
+    dirs.insert(root.to_path_buf());
+    for name in ["include", "src", "lib", "deps"] {
+        let path = root.join(name);
+        if path.is_dir() {
+            dirs.insert(path);
+        }
+    }
+    for file in files
+        .iter()
+        .filter(|file| matches!(file.language, LanguageKind::C | LanguageKind::Cpp))
+    {
+        let Some(parent) = file.path.parent() else {
+            continue;
+        };
+        let parent_name = parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if matches!(parent_name, "include" | "inc" | "src" | "lib" | "deps") {
+            dirs.insert(parent.to_path_buf());
+        }
+    }
+    let mut dirs = dirs.into_iter().collect::<Vec<_>>();
+    dirs.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then(left.cmp(right))
+    });
+    dirs.truncate(128);
+    dirs
+}
+
+fn normalize_clang_symbol_name(name: &str) -> String {
+    name.trim()
+        .trim_start_matches('~')
+        .split('<')
+        .next()
+        .unwrap_or(name)
+        .rsplit("::")
+        .next()
+        .unwrap_or(name)
+        .to_string()
+}
+
+fn clang_symbol_name_is_comparable(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with("__")
+        && !name.starts_with("operator")
+        && !name.contains("(anonymous")
+}
 
 fn collect_go_ast_symbol_scan(root: &Path) -> Result<GoAstSymbolScan> {
     // The oracle Go program is written to a dedicated sub-directory of the
@@ -1453,6 +2503,32 @@ fn normalize_squeezy_kind(kind: SymbolKind) -> Option<String> {
         SymbolKind::TypeAlias => Some("TypeAlias".to_string()),
         SymbolKind::Macro => Some("Macro".to_string()),
         SymbolKind::Crate
+        | SymbolKind::File
+        | SymbolKind::Field
+        | SymbolKind::Variant
+        | SymbolKind::Unknown => None,
+    }
+}
+
+fn normalize_c_family_squeezy_kind(kind: SymbolKind) -> Option<String> {
+    match kind {
+        SymbolKind::Class => Some("Class".to_string()),
+        SymbolKind::Module => Some("Module".to_string()),
+        SymbolKind::Struct => Some("Struct".to_string()),
+        SymbolKind::Enum => Some("Enum".to_string()),
+        SymbolKind::Union => Some("Union".to_string()),
+        SymbolKind::Function | SymbolKind::Test => Some("Function".to_string()),
+        SymbolKind::Method => Some("Method".to_string()),
+        SymbolKind::TypeAlias => Some("TypeAlias".to_string()),
+        // `Interface` is a Go concept and never produced by the C/C++
+        // parser path, but the type system still needs an arm for it.
+        SymbolKind::Crate
+        | SymbolKind::Trait
+        | SymbolKind::Impl
+        | SymbolKind::Interface
+        | SymbolKind::Const
+        | SymbolKind::Static
+        | SymbolKind::Macro
         | SymbolKind::File
         | SymbolKind::Field
         | SymbolKind::Variant
@@ -2011,6 +3087,10 @@ fn increment_symbol(counts: &mut BTreeMap<SymbolKey, usize>, key: SymbolKey) {
     *counts.entry(key).or_default() += 1;
 }
 
+fn increment_unique_symbol(counts: &mut BTreeMap<SymbolKey, usize>, key: SymbolKey) {
+    counts.entry(key).or_insert(1);
+}
+
 fn symbol_count(counts: &BTreeMap<SymbolKey, usize>) -> usize {
     counts.values().sum()
 }
@@ -2258,13 +3338,22 @@ fn run_refresh_probe(repo: &Path, language: BenchmarkLanguage) -> Result<Refresh
         copied.push(dest);
     }
 
-    let mut manager = GraphManager::open_with_config(
+    // The probe creates a synthetic tree of just-source files, so the
+    // workspace indexing-signal check can fail (no Cargo.toml/pom.xml/etc.
+    // gets copied alongside the source files). Disable the signal
+    // requirement for the probe so refresh always walks the temp tree.
+    let crawl_options = CrawlOptions {
+        require_indexing_signal: false,
+        ..CrawlOptions::default()
+    };
+    let mut manager = GraphManager::open_with_crawl_options(
         &temp_root,
         RefreshConfig {
             debounce: std::time::Duration::from_millis(0),
             idle_refresh_interval: std::time::Duration::from_millis(0),
             per_tool_refresh_budget: std::time::Duration::from_secs(10),
         },
+        crawl_options,
     )?;
 
     let edits = copied.iter().take(2).cloned().collect::<Vec<_>>();
@@ -2357,10 +3446,171 @@ fn time_cargo_check(fixture: &Path) -> Result<u128> {
     }
 }
 
+fn time_dotnet_build(fixture: &Path) -> Result<u128> {
+    let build_target = find_dotnet_build_target(fixture);
+    let started = Instant::now();
+    let mut command = Command::new("dotnet");
+    command.arg("build");
+    if let Some(target) = build_target {
+        command.arg(target);
+    }
+    let status = command
+        .arg("--nologo")
+        .arg("-v")
+        .arg("minimal")
+        .current_dir(fixture)
+        .status()?;
+    let elapsed = started.elapsed().as_millis();
+    if status.success() {
+        Ok(elapsed)
+    } else {
+        Err(SqueezyError::Graph(format!(
+            "dotnet build validation failed with {status}"
+        )))
+    }
+}
+
+fn find_dotnet_build_target(root: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    collect_dotnet_build_targets(root, root, 0, &mut candidates);
+    // Prefer the shallowest candidate (root-level solution beats nested project),
+    // then by extension priority (slnx > sln > csproj), then lexicographic.
+    candidates.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    candidates.into_iter().map(|(_, _, path)| path).next()
+}
+
+fn collect_dotnet_build_targets(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<(usize, usize, PathBuf)>,
+) {
+    if depth > 3 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries = entries.filter_map(|entry| entry.ok()).collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if matches!(name, ".git" | "bin" | "obj" | "packages" | "target") {
+                continue;
+            }
+            collect_dotnet_build_targets(root, &path, depth + 1, out);
+            continue;
+        }
+        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+            continue;
+        };
+        let priority = match extension {
+            "slnx" => 0,
+            "sln" => 1,
+            "csproj" => 2,
+            _ => continue,
+        };
+        let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+        out.push((priority, depth, relative));
+    }
+}
+
 fn time_python_ast_oracle(fixture: &Path) -> Result<u128> {
     let started = Instant::now();
     let _ = collect_python_ast_symbol_scan(fixture)?;
     Ok(started.elapsed().as_millis())
+}
+
+fn time_dotnet_build_optional(repo: &Path) -> (Option<u128>, String) {
+    match time_dotnet_build(repo) {
+        Ok(ms) => (Some(ms), "dotnet build succeeded".to_string()),
+        Err(err) => (None, format!("dotnet build failed: {err}")),
+    }
+}
+
+fn time_clang_syntax(fixture: &Path, compiler: &str, language: LanguageKind) -> Result<u128> {
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default()).crawl(fixture)?;
+    let files = snapshot
+        .files
+        .into_iter()
+        .filter(|record| record.language == language)
+        .filter(|record| {
+            !matches!(
+                record
+                    .path
+                    .extension()
+                    .and_then(|extension| extension.to_str()),
+                Some("h" | "hh" | "hpp" | "hxx")
+            )
+        })
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        return Ok(0);
+    }
+
+    let started = Instant::now();
+    let worker_count = std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1)
+        .min(files.len())
+        .max(1);
+    let chunk_size = files.len().div_ceil(worker_count);
+    let compiler = compiler.to_string();
+    std::thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for chunk in files.chunks(chunk_size) {
+            let chunk = chunk.to_vec();
+            let compiler = compiler.clone();
+            handles.push(scope.spawn(move || -> Result<()> {
+                for file in chunk {
+                    let status = Command::new(&compiler)
+                        .arg("-fsyntax-only")
+                        .arg(&file.path)
+                        .status()?;
+                    if !status.success() {
+                        return Err(SqueezyError::Graph(format!(
+                            "{compiler} validation failed for {} with {status}",
+                            file.relative_path
+                        )));
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    return Err(SqueezyError::Graph(
+                        "clang syntax worker panicked".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(started.elapsed().as_millis())
+}
+
+fn time_clang_syntax_optional(
+    repo: &Path,
+    compiler: &str,
+    language: LanguageKind,
+) -> (Option<u128>, String) {
+    match time_clang_syntax(repo, compiler, language) {
+        Ok(ms) => (Some(ms), format!("{compiler} -fsyntax-only succeeded")),
+        Err(err) => (None, format!("{compiler} -fsyntax-only failed: {err}")),
+    }
 }
 
 fn time_go_ast_oracle(fixture: &Path) -> Result<u128> {
@@ -2889,6 +4139,49 @@ fn print_summary(report: &BenchmarkReport) {
             js_ts.status
         );
     }
+    if let Some(java) = &report.java_oracle {
+        println!(
+            "java_oracle_symbol_accuracy: tp={} fp={} fn={} precision={} recall={} oracle_symbols={} squeezy_symbols={} oracle={}",
+            java.symbols.true_positive,
+            java.symbols.false_positive,
+            java.symbols.false_negative,
+            java.symbols.precision,
+            java.symbols.recall,
+            java.symbols.rust_analyzer_total,
+            java.symbols.squeezy_total,
+            java.oracle_ms
+                .map(|ms| format!("{ms}ms"))
+                .unwrap_or_else(|| java.status.clone())
+        );
+        println!(
+            "java_oracle_navigation_accuracy: queries={} tp={} fp={} fn={} precision={} recall={} oracle={}",
+            java.navigation.query_count,
+            java.navigation.true_positive,
+            java.navigation.false_positive,
+            java.navigation.false_negative,
+            java.navigation.precision,
+            java.navigation.recall,
+            java.navigation.status
+        );
+    }
+    if let Some(csharp) = &report.csharp_oracle {
+        println!(
+            "csharp_oracle_symbol_accuracy: tp={} fp={} fn={} precision={} recall={} oracle_symbols={} squeezy_symbols={} oracle={}ms build={} oracle_unparseable={}",
+            csharp.symbols.true_positive,
+            csharp.symbols.false_positive,
+            csharp.symbols.false_negative,
+            csharp.symbols.precision,
+            csharp.symbols.recall,
+            csharp.symbols.rust_analyzer_total,
+            csharp.symbols.squeezy_total,
+            csharp.oracle_ms,
+            csharp
+                .oracle_build_ms
+                .map(|ms| format!("{ms}ms"))
+                .unwrap_or_else(|| "cached".to_string()),
+            csharp.oracle_unparseable_files,
+        );
+    }
     if let Some(go) = &report.go_oracle {
         println!(
             "go_oracle_symbol_accuracy: tp={} fp={} fn={} precision={} recall={} oracle_symbols={} squeezy_symbols={} oracle={}ms oracle_unparseable={}",
@@ -3099,7 +4392,11 @@ impl DeterministicRng {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchmarkLanguage {
+    C,
+    CSharp,
+    Cpp,
     Go,
+    Java,
     JavaScript,
     Python,
     Rust,
@@ -3109,7 +4406,11 @@ enum BenchmarkLanguage {
 impl BenchmarkLanguage {
     fn parse(value: &str) -> Result<Self> {
         match value {
+            "c" => Ok(Self::C),
+            "csharp" | "cs" => Ok(Self::CSharp),
+            "cpp" | "c++" => Ok(Self::Cpp),
             "go" => Ok(Self::Go),
+            "java" => Ok(Self::Java),
             "javascript" | "js" => Ok(Self::JavaScript),
             "python" => Ok(Self::Python),
             "rust" => Ok(Self::Rust),
@@ -3122,7 +4423,11 @@ impl BenchmarkLanguage {
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::C => "c",
+            Self::CSharp => "csharp",
+            Self::Cpp => "cpp",
             Self::Go => "go",
+            Self::Java => "java",
             Self::JavaScript => "javascript",
             Self::Python => "python",
             Self::Rust => "rust",
@@ -3132,7 +4437,11 @@ impl BenchmarkLanguage {
 
     fn language_kind(self) -> LanguageKind {
         match self {
+            Self::C => LanguageKind::C,
+            Self::CSharp => LanguageKind::CSharp,
+            Self::Cpp => LanguageKind::Cpp,
             Self::Go => LanguageKind::Go,
+            Self::Java => LanguageKind::Java,
             Self::JavaScript => LanguageKind::JavaScript,
             Self::Python => LanguageKind::Python,
             Self::Rust => LanguageKind::Rust,
@@ -3140,11 +4449,33 @@ impl BenchmarkLanguage {
         }
     }
 
+    /// Alias preserved for callers that still spell the bench language as
+    /// its source `LanguageKind`. New code should prefer `language_kind`.
+    fn source_language(self) -> LanguageKind {
+        self.language_kind()
+    }
+
+    fn supports_mixed_workload(self) -> bool {
+        matches!(
+            self,
+            Self::C | Self::CSharp | Self::Cpp | Self::Go | Self::Rust
+        )
+    }
+
     fn comment_text(self) -> &'static str {
         match self {
-            Self::Go | Self::Rust | Self::JavaScript | Self::TypeScript => {
-                "\n// squeezy refresh benchmark edit\n"
-            }
+            // C/Cpp/CSharp/Go/Java/JavaScript/Rust/TypeScript all share `//`
+            // line comments at any position. C# specifically: a `//` line
+            // stays valid both at file scope (alongside `using` directives or
+            // file-scoped namespaces) and inside any member body.
+            Self::C
+            | Self::CSharp
+            | Self::Cpp
+            | Self::Go
+            | Self::Java
+            | Self::JavaScript
+            | Self::Rust
+            | Self::TypeScript => "\n// squeezy refresh benchmark edit\n",
             Self::Python => "\n# squeezy refresh benchmark edit\n",
         }
     }
@@ -3158,6 +4489,7 @@ struct Args {
     mixed_repo: Option<PathBuf>,
     mixed_iterations: usize,
     ra_lsp_probes: usize,
+    oracle_files: usize,
     no_speed_gate: bool,
 }
 
@@ -3170,6 +4502,7 @@ impl Args {
         let mut mixed_repo = None;
         let mut mixed_iterations = 0;
         let mut ra_lsp_probes = 25;
+        let mut oracle_files = 250;
         let mut no_speed_gate = false;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -3201,9 +4534,17 @@ impl Args {
                         SqueezyError::Graph(format!("invalid --ra-lsp-probes {raw}: {err}"))
                     })?;
                 }
+                "--oracle-files" => {
+                    let raw = args.next().ok_or_else(|| {
+                        SqueezyError::Graph("missing --oracle-files value".to_string())
+                    })?;
+                    oracle_files = raw.parse().map_err(|err| {
+                        SqueezyError::Graph(format!("invalid --oracle-files {raw}: {err}"))
+                    })?;
+                }
                 "--help" | "-h" => {
                     println!(
-                        "usage: squeezy-graph-bench [--language rust|python|go|javascript|typescript] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--no-speed-gate]"
+                        "usage: squeezy-graph-bench [--language rust|python|java|c|cpp|csharp|go|javascript|typescript] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--oracle-files <n, default=250, 0=all>] [--no-speed-gate]"
                     );
                     std::process::exit(0);
                 }
@@ -3221,6 +4562,7 @@ impl Args {
             mixed_repo,
             mixed_iterations,
             ra_lsp_probes,
+            oracle_files,
             no_speed_gate,
         })
     }

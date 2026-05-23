@@ -13,9 +13,16 @@ navigation questions before the model reads raw files.
   user-excluded paths.
 - Rust declarations: modules, structs, enums, unions, traits, impls, functions,
   methods, consts, statics, type aliases, macros, and tests.
+- Java declarations: packages, imports, classes, interfaces, enums, records,
+  annotations, methods, constructors, fields, inheritance, implements edges,
+  calls, and references from `.java` files.
 - Python declarations: classes, functions, methods, imports, calls, decorators,
   docstrings, class bases, type annotations, class fields, exports, aliases, and
   references from `.py` files.
+- C/C++ declarations: includes, namespaces, classes, structs, unions, enums,
+  typedefs/type aliases, fields, functions, methods, constructors/destructors,
+  operators, templates, macro definitions/usages, and declaration/definition
+  spans.
 - JavaScript and TypeScript declarations: functions, arrow functions assigned to
   names, classes, methods, class-property arrow methods, fields, interfaces,
   modules/namespaces, decorators, type aliases, enums, imports/exports, CommonJS
@@ -113,6 +120,37 @@ decision instead of walking a likely non-code or dangerous directory.
 - Python test functions/classes are tagged from `test_*`, `*_test.py`, pytest
   fixtures, and `Test*` class naming. Docstring text is stored on the owning
   symbol so behavior-word searches do not have to read raw files first.
+- Java package declarations and imports are indexed as graph facts. Same-file,
+  same-package, explicit imports, constructor calls, inherited type references,
+  and field-receiver method calls with a unique local type target resolve before
+  lower-confidence candidate sets. Static-member imports (`import static
+  a.b.C.method;`) and nested-class imports (`import a.b.Outer.Inner;`) resolve
+  by popping member and enclosing-class segments and matching the symbol's
+  parent class chain. Wildcard imports (`import a.b.*;`,
+  `import static a.b.C.*;`) match every top-level or member symbol whose
+  enclosing chain begins below the imported package or class. Overloads,
+  runtime dispatch, reflection, annotation processors, generated sources, and
+  external classpaths remain heuristic or external.
+- Maven `pom.xml` and Gradle build files contribute optional Java project facts
+  for source roots, test roots, generated-source roots, and simple dependency
+  coordinates. These facts are parsed locally and never require invoking Maven
+  or Gradle. Maven `<dependencyManagement>`, `<pluginManagement>`, and
+  `<plugins>` subtrees are skipped so only real project dependencies are
+  recorded. Parsed project facts are cached per metadata-file content hash and
+  Java source-path signature so incremental refreshes only re-read metadata
+  files whose contents actually changed.
+- Java reference and body indexes intentionally skip low-signal plain identifier
+  occurrences. Type identifiers, scoped paths, field accesses, annotation
+  names (without their argument lists), calls, literals, imports, and
+  declarations remain indexed so broad search does not spend most of its budget
+  on locals, parameter-name echoes, or annotation argument string content.
+- Java declarations of multiple variables in a single `field_declaration`
+  (`private int alpha, beta, gamma;`, interface constant pairs, etc.) produce
+  one symbol per `variable_declarator` so the declaration set matches the JDK
+  compiler tree oracle.
+- Java source files use a higher default large-file cap than other source files
+  so single-file libraries with many nested declarations can still contribute
+  graph facts; explicit workspace crawler caps are still respected.
 - Dynamic attributes, metaclasses, runtime import side effects, monkey-patching,
   and type-inferred receiver dispatch remain heuristic or external.
 - JavaScript and TypeScript ES module imports, CommonJS requires, relative
@@ -129,6 +167,50 @@ decision instead of walking a likely non-code or dangerous directory.
   bundler aliases without checked config, package export edge cases, and
   runtime dispatch are explicit candidate, heuristic, external, or fallback
   results rather than exact edges.
+- C/C++ header classification prefers same-stem source files and then project
+  majority when a plain `.h` file has no unambiguous pair. `.hpp`, `.hh`, and
+  `.hxx` are treated as C++.
+- C/C++ include directives are indexed as glob import facts. Cross-translation-unit
+  direct calls are resolved through includes: when `#include "header.h"` is
+  visible and the called name resolves to a single Function/Method declared in
+  the included header (or a sibling translation unit sharing the header's
+  stem/directory), the call binds to the definition with `ImportResolved`
+  confidence; ambiguous matches stay candidate-set. Declaration/definition
+  pairing and calls also use structural heuristics: namespace/class scope, name,
+  arity, receiver text, and normalized signature tokens. Sibling method calls
+  inside a class without `this->` (parsed as Direct in tree-sitter-cpp) resolve
+  to the same-class peer method when unambiguous. Overloads, templates,
+  function pointers, virtual dispatch, ADL, and macro-dependent calls produce
+  candidate-set, partial, macro-opaque, or conditional confidence instead of
+  exact claims.
+- C/C++ `using foo::Name;` declarations and `using namespace foo;` directives
+  are indexed as import facts so cross-namespace references and calls in real
+  C++ code can resolve via the same import machinery.
+- C/C++ function-pointer struct fields (`int (*cb)(int)`) are kept as `Field`
+  symbols rather than promoted to `Function`/`Method`, matching how clang's
+  AST reports them.
+- C/C++ namespace-qualified free function definitions (`void ns::func() {}`)
+  remain `Function` symbols; only class-qualified definitions
+  (`void Foo::bar() {}`) are promoted to `Method`. The qualifier-leaf
+  type-name heuristic (uppercase-leading or `_t`-suffix) is the cheap
+  syntactic distinguisher.
+- C++ template specializations (`template<> class Foo<int> {}`) are tagged
+  with `c++:template-specialization` and excluded from the comparable-symbol
+  count so they do not appear as false positives against the clang AST
+  oracle (which reports them as `ClassTemplateSpecializationDecl`).
+- C/C++ forward declarations and matching definitions in the same file
+  collapse into a single canonical Function/Method symbol so the
+  declaration-symbol count stays aligned with the clang AST oracle.
+- C++ access modifiers resolve through `public:` / `private:` / `protected:`
+  blocks. Aggregate defaults apply for members declared before the first
+  access specifier (`struct`/`union` default to public, `class` defaults to
+  private).
+- C/C++ preprocessor directives are indexed but not expanded. Macro definitions,
+  macro invocations, and conditional spans are provenance-bearing evidence for
+  fallback, not compiler-equivalent semantics. All-caps call targets at least
+  two characters long are flagged as macro-opaque so common macro-like APIs
+  (`ASSERT`, `LOG`, `EXPECT_EQ`, `CHECK`) widen the macro-opaque cone instead
+  of pretending to be direct function calls.
 - Go package-qualified calls resolve through explicit imports when the imported
   package maps to one indexed package and one function target. Same-package
   direct calls and same-receiver method calls resolve when there is a single
@@ -196,7 +278,10 @@ Semantic graph benchmarks live under `benchmarks/`. The Rust smoke benchmark
 validates the fixture crate with the Rust compiler, builds the Squeezy graph,
 runs query specs, and writes a JSON report. The Python smoke benchmark validates
 the fixture with a slower CPython `ast` oracle and compares declaration symbols
-against Squeezy's graph. Both fail if required expected results are missing or if
+against Squeezy's graph. The Java smoke benchmark uses the JDK compiler tree API
+as a benchmark-only declaration oracle when `java` is available, and still runs
+deterministic query gates when it is not. The language smoke benchmarks fail if
+required expected results are missing or, when a validation oracle is available,
 Squeezy graph build plus query time is not faster than the validation pass for
 the same fixture.
 
@@ -206,6 +291,17 @@ the `typescript` package is available to Node. That oracle reports symbol
 TP/FP/FN for file/name/kind declarations without becoming a production
 dependency. If Node or TypeScript is unavailable, the report records that status
 explicitly and still runs the tree-sitter query spec.
+
+The C and C++ smoke benchmarks validate fixtures with `clang -fsyntax-only` and
+`clang++ -fsyntax-only`, then compare declaration symbols against
+`clang -Xclang -ast-dump=json` output before running the same graph/query/spec
+harness. Clang is a benchmark oracle only; production C/C++ navigation remains
+tree-sitter and local graph analysis. External mixed benchmarks cap sampled
+oracle files by default and exclude unparseable files from Squeezy
+false-positive accounting because real projects often require generated
+headers, compile flags, SDKs, or compile command databases. Known misses must be
+documented for macros, inactive preprocessor branches, templates, overloads,
+generated code, external headers, function pointers, and virtual dispatch.
 
 The mixed benchmark runs deterministic exhaustive scenarios against a real Rust
 repo by default. It generates scenarios from every indexed symbol and resolved
@@ -240,6 +336,16 @@ future-syntax code even when the oracle cannot treat that file as a module. The
 Python smoke benchmark also carries controlled navigation checks for route
 metadata, constructor-alias method calls, and property references so navigation
 heuristics are regression-tested separately from declaration accuracy.
+
+Java accuracy reporting uses the JDK compiler tree API as the reference for
+class/interface/enum/record/method/constructor declaration discovery. It is
+benchmark-only and does not become a production dependency. Java FP/FN counts
+are declaration-only; they do not prove reference, call, dispatch, overload, or
+classpath completeness. The Java smoke spec carries controlled fixture truth
+for imports, constructor calls, field-receiver method calls,
+inheritance/interface references, package-local symbols, and Maven/Gradle
+project facts. The query oracle is an `expected_contains` minimum oracle; extra
+results stay visible per query but are not counted as false positives.
 
 Go accuracy reporting uses a benchmark-only Go parser/AST oracle for
 declaration discovery. It reports symbol TP/FP/FN, precision, recall, examples,

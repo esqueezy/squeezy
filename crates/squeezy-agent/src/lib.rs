@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, CostSnapshot, PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability,
     PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict,
-    SessionMetrics, SqueezyError, TranscriptItem, TurnId, TurnMetrics, default_settings_path,
-    escape_toml_basic_string,
+    Redactor, SessionMetrics, SqueezyError, StreamRedactor, TranscriptItem, TurnId, TurnMetrics,
+    default_settings_path, escape_toml_basic_string,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, estimate_cost};
 use squeezy_telemetry::{
@@ -37,6 +37,7 @@ pub struct Agent {
     provider: Arc<dyn LlmProvider>,
     tools: ToolRegistry,
     telemetry: TelemetryClient,
+    redactor: Arc<Redactor>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
     next_turn_id: Arc<AtomicU64>,
     next_approval_id: Arc<AtomicU64>,
@@ -59,22 +60,44 @@ impl Agent {
             exa_mcp_url: config.exa_mcp_url.clone(),
             exa_api_key: env::var(&config.exa_api_key_env).ok(),
         };
+        // Compile the redactor exactly once and share it with the tool
+        // registry. Pattern compilation can never fail here because the
+        // surrounding config was already validated when loading.
+        let redactor = Arc::new(
+            config
+                .redaction
+                .redactor()
+                .expect("validated redaction config must compile"),
+        );
         let tools = ToolRegistry::new_with_configs_and_skills(
             config.workspace_root.clone(),
             output_config.clone(),
             web_config.clone(),
             config.skills.clone(),
             &config.graph,
+            redactor.clone(),
         )
         .unwrap_or_else(|_| {
-            ToolRegistry::new_with_graph_config(".", output_config, web_config, &config.graph)
-                .expect("current directory must be a valid tool root")
+            // Workspace root unavailable; fall back to the current
+            // directory but keep the configured redactor and graph
+            // policy so the agent never silently downgrades to
+            // default patterns or default crawl options.
+            ToolRegistry::new_with_configs_and_skills(
+                ".",
+                output_config,
+                web_config,
+                config.skills.clone(),
+                &config.graph,
+                redactor.clone(),
+            )
+            .expect("current directory must be a valid tool root")
         });
         Self {
             telemetry: TelemetryClient::from_config(&config),
             config,
             provider,
             tools,
+            redactor,
             session_metrics: Arc::new(Mutex::new(SessionMetrics::default())),
             next_turn_id: Arc::new(AtomicU64::new(1)),
             next_approval_id: Arc::new(AtomicU64::new(1)),
@@ -110,6 +133,7 @@ impl Agent {
         let config = self.config.clone();
         let tools = self.tools.clone();
         let telemetry = self.telemetry.clone();
+        let redactor = self.redactor.clone();
         let session_metrics = self.session_metrics.clone();
         let tool_specs = tools
             .specs()
@@ -121,10 +145,11 @@ impl Agent {
         let session_rules = self.session_rules.clone();
 
         tokio::spawn(async move {
+            let redacted_input = redactor.redact(&input);
             if tx
                 .send(AgentEvent::UserMessage {
                     turn_id,
-                    message: TranscriptItem::user(input.clone()),
+                    message: TranscriptItem::user(redacted_input.text.clone()),
                 })
                 .await
                 .is_err()
@@ -138,17 +163,20 @@ impl Agent {
                 config,
                 tools,
                 telemetry: telemetry.clone(),
+                redactor: redactor.clone(),
                 session_metrics,
                 tool_specs,
                 tx: tx.clone(),
                 cancel,
                 approval_ids,
+                seed_redactions: redacted_input.redactions,
                 session_rules,
             }
-            .run(input)
+            .run(redacted_input.text)
             .await;
 
             if let Err(error) = outcome {
+                let error = redact_error(error, &redactor);
                 telemetry.spawn(TelemetryEvent::failure_seen(error_kind(&error)));
                 let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
             }
@@ -164,34 +192,54 @@ struct TurnRuntime {
     config: AppConfig,
     tools: ToolRegistry,
     telemetry: TelemetryClient,
+    redactor: Arc<Redactor>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
     tool_specs: Vec<LlmToolSpec>,
     tx: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
+    // Redactions that already happened on the raw user input before the
+    // turn loop began; folded into the first round's metrics so the
+    // session metric never undercounts user-side scrubbing.
+    seed_redactions: u64,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
 }
 
 impl TurnRuntime {
-    async fn run(self, input: String) -> squeezy_core::Result<()> {
+    async fn run(mut self, input: String) -> squeezy_core::Result<()> {
         let activation = self.tools.activate_skills_for_input(&input)?;
-        let request_instructions = match self.tools.format_active_skills(&activation.skills) {
+        let raw_instructions = match self.tools.format_active_skills(&activation.skills) {
             Some(skills) => format!("{}\n\n{}", self.config.instructions, skills),
             None => self.config.instructions.clone(),
         };
         let mut conversation = vec![LlmInputItem::UserText(activation.task_input)];
         let mut next_input = conversation.clone();
         let mut previous_response_id = None;
-        let mut assistant_text = String::new();
         let mut total_cost = CostSnapshot::default();
         let mut seen_tool_outputs = SeenToolOutputs::default();
         let mut broker = CostBroker::new(&self.config);
+        broker.metrics.redactions += std::mem::take(&mut self.seed_redactions);
+        // Instructions are static across the turn's tool rounds; redact
+        // them once so the cost is not paid (or double-counted) per round.
+        let redacted_instructions = self.redactor.redact(&raw_instructions);
+        broker.metrics.redactions += redacted_instructions.redactions;
+        let request_instructions = redacted_instructions.text;
+        // Holding a single stream redactor across rounds keeps the tail
+        // buffer alive so a secret straddling a tool-call boundary is
+        // still redacted before being released downstream.
+        let mut assistant_stream = StreamRedactor::new(self.redactor.clone());
+        // The Completed event's message is the concatenation of every
+        // AssistantDelta we have already emitted plus the final flushed
+        // tail. Building it as we go (rather than re-redacting the raw
+        // text at the end) keeps ordinals stable between what streamed
+        // into the TUI and what lands in the transcript.
+        let mut assistant_message = String::new();
 
         for _round in 0..MAX_TOOL_ROUNDS {
             let request = LlmRequest {
                 model: self.config.model.clone(),
                 instructions: request_instructions.clone(),
-                input: next_input.clone(),
+                input: redact_llm_input_items(&next_input, &self.redactor),
                 max_output_tokens: self.config.max_output_tokens,
                 previous_response_id: previous_response_id.clone(),
                 tools: self.tool_specs.clone(),
@@ -218,12 +266,16 @@ impl TurnRuntime {
                         }
                     }
                     Ok(LlmEvent::TextDelta(delta)) => {
-                        assistant_text.push_str(&delta);
+                        let chunk = assistant_stream.push(&delta);
+                        if chunk.text.is_empty() {
+                            continue;
+                        }
+                        assistant_message.push_str(&chunk.text);
                         if self
                             .tx
                             .send(AgentEvent::AssistantDelta {
                                 turn_id: self.turn_id,
-                                delta,
+                                delta: chunk.text,
                             })
                             .await
                             .is_err()
@@ -241,7 +293,7 @@ impl TurnRuntime {
                             .tx
                             .send(AgentEvent::ToolCallQueued {
                                 turn_id: self.turn_id,
-                                call: call.clone(),
+                                call: redact_tool_call(call.clone(), &self.redactor),
                             })
                             .await
                             .is_err()
@@ -278,11 +330,14 @@ impl TurnRuntime {
             }
 
             if !completed {
+                self.flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                    .await;
+                broker.metrics.redactions += assistant_stream.total_redactions();
                 let _ = self
                     .tx
                     .send(AgentEvent::Completed {
                         turn_id: self.turn_id,
-                        message: TranscriptItem::assistant(assistant_text),
+                        message: TranscriptItem::assistant(std::mem::take(&mut assistant_message)),
                         response_id: None,
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
@@ -293,11 +348,14 @@ impl TurnRuntime {
             }
 
             if tool_calls.is_empty() {
+                self.flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                    .await;
+                broker.metrics.redactions += assistant_stream.total_redactions();
                 let _ = self
                     .tx
                     .send(AgentEvent::Completed {
                         turn_id: self.turn_id,
-                        message: TranscriptItem::assistant(assistant_text),
+                        message: TranscriptItem::assistant(std::mem::take(&mut assistant_message)),
                         response_id,
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
@@ -315,6 +373,7 @@ impl TurnRuntime {
                     tools: &self.tools,
                     config: &self.config,
                     telemetry: self.telemetry.clone(),
+                    redactor: self.redactor.clone(),
                     tx: self.tx.clone(),
                     cancel: self.cancel.clone(),
                     approval_ids: self.approval_ids.clone(),
@@ -346,7 +405,11 @@ impl TurnRuntime {
                 next_input = outputs;
             } else {
                 previous_response_id = None;
-                conversation.extend(tool_calls.into_iter().map(llm_function_call_item));
+                conversation.extend(
+                    tool_calls
+                        .into_iter()
+                        .map(|call| llm_function_call_item(call, &self.redactor)),
+                );
                 conversation.extend(outputs.clone());
                 next_input = conversation.clone();
             }
@@ -365,6 +428,29 @@ impl TurnRuntime {
         ));
         self.session_metrics.lock().await.merge_turn(metrics);
     }
+
+    /// Flushes any text the stream redactor is still holding behind its
+    /// tail buffer, emitting it as a final AssistantDelta and appending
+    /// it to the running message accumulator. Idempotent on an already
+    /// flushed stream.
+    async fn flush_assistant_stream(
+        &self,
+        assistant_stream: &mut StreamRedactor,
+        assistant_message: &mut String,
+    ) {
+        let tail = assistant_stream.finish();
+        if tail.text.is_empty() {
+            return;
+        }
+        assistant_message.push_str(&tail.text);
+        let _ = self
+            .tx
+            .send(AgentEvent::AssistantDelta {
+                turn_id: self.turn_id,
+                delta: tail.text,
+            })
+            .await;
+    }
 }
 
 #[derive(Clone)]
@@ -374,6 +460,7 @@ struct ToolExecutionContext<'a> {
     tools: &'a ToolRegistry,
     config: &'a AppConfig,
     telemetry: TelemetryClient,
+    redactor: Arc<Redactor>,
     tx: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
@@ -601,7 +688,7 @@ async fn run_one_tool(
         .tx
         .send(AgentEvent::ToolCallStarted {
             turn_id: context.turn_id,
-            call: call.clone(),
+            call: redact_tool_call(call.clone(), &context.redactor),
         })
         .await;
     let started = Instant::now();
@@ -688,6 +775,7 @@ impl CostBroker {
         self.metrics.files_scanned += result.cost_hint.files_scanned;
         self.metrics.bytes_read += result.cost_hint.bytes_read;
         self.metrics.matches_returned += result.cost_hint.matches_returned;
+        self.metrics.redactions += result.cost_hint.redactions;
         if result.content.get("spilled").and_then(Value::as_bool) == Some(true) {
             self.metrics.spill_writes += 1;
         }
@@ -821,7 +909,9 @@ async fn permission_decision(
     log_permission_verdict(&request, &verdict);
     match verdict.action {
         PermissionAction::Allow => ApprovalDecision::Approved,
-        PermissionAction::Deny => ApprovalDecision::Denied(verdict.reason),
+        PermissionAction::Deny => {
+            ApprovalDecision::Denied(context.redactor.redact(&verdict.reason).text)
+        }
         PermissionAction::Ask => {
             let (decision_tx, decision_rx) = oneshot::channel();
             let approval_request = ToolApprovalRequest {
@@ -829,9 +919,9 @@ async fn permission_decision(
                 call_id: call.call_id.clone(),
                 tool_name: call.name.clone(),
                 scope: legacy_scope_for_capability(request.capability),
-                permission: request.clone(),
+                permission: redact_permission_request(request.clone(), &context.redactor),
                 matched_rule: verdict.matched_rule,
-                reason: verdict.reason,
+                reason: context.redactor.redact(&verdict.reason).text,
             };
             let send_approval = context.tx.send(AgentEvent::ApprovalRequested {
                 turn_id: context.turn_id,
@@ -1246,11 +1336,102 @@ fn llm_tool_spec(spec: ToolSpec) -> LlmToolSpec {
     }
 }
 
-fn llm_function_call_item(call: ToolCall) -> LlmInputItem {
+fn llm_function_call_item(call: ToolCall, redactor: &Redactor) -> LlmInputItem {
     LlmInputItem::FunctionCall {
         call_id: call.call_id,
         name: call.name,
-        arguments: call.arguments,
+        arguments: redact_json_value(call.arguments, redactor),
+    }
+}
+
+fn redact_llm_input_items(input: &[LlmInputItem], redactor: &Redactor) -> Vec<LlmInputItem> {
+    input
+        .iter()
+        .cloned()
+        .map(|item| match item {
+            LlmInputItem::UserText(text) => LlmInputItem::UserText(redactor.redact(&text).text),
+            LlmInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => LlmInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments: redact_json_value(arguments, redactor),
+            },
+            LlmInputItem::FunctionCallOutput { call_id, output } => {
+                LlmInputItem::FunctionCallOutput {
+                    call_id,
+                    output: redactor.redact(&output).text,
+                }
+            }
+        })
+        .collect()
+}
+
+/// Scrub the user/UI-facing surfaces of a `PermissionRequest` so an approval
+/// prompt cannot leak a secret that appeared in a shell command, file path,
+/// or rule metadata. Capability and risk are enum-only and need no redaction.
+fn redact_permission_request(
+    mut request: PermissionRequest,
+    redactor: &Redactor,
+) -> PermissionRequest {
+    request.target = redactor.redact(&request.target).text;
+    request.summary = redactor.redact(&request.summary).text;
+    request.metadata = request
+        .metadata
+        .into_iter()
+        .map(|(key, value)| (key, redactor.redact(&value).text))
+        .collect();
+    request
+}
+
+fn redact_tool_call(mut call: ToolCall, redactor: &Redactor) -> ToolCall {
+    call.arguments = redact_json_value(call.arguments, redactor);
+    call
+}
+
+fn redact_json_value(value: Value, redactor: &Redactor) -> Value {
+    match value {
+        Value::String(text) => Value::String(redactor.redact(&text).text),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| redact_json_value(item, redactor))
+                .collect(),
+        ),
+        Value::Object(entries) => Value::Object(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key, redact_json_value(value, redactor)))
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
+fn redact_error(error: SqueezyError, redactor: &Redactor) -> SqueezyError {
+    match error {
+        SqueezyError::Config(message) => SqueezyError::Config(redactor.redact(&message).text),
+        SqueezyError::ProviderNotConfigured(message) => {
+            SqueezyError::ProviderNotConfigured(redactor.redact(&message).text)
+        }
+        SqueezyError::ProviderRequest(message) => {
+            SqueezyError::ProviderRequest(redactor.redact(&message).text)
+        }
+        SqueezyError::ProviderStream(message) => {
+            SqueezyError::ProviderStream(redactor.redact(&message).text)
+        }
+        SqueezyError::Terminal(message) => SqueezyError::Terminal(redactor.redact(&message).text),
+        SqueezyError::Agent(message) => SqueezyError::Agent(redactor.redact(&message).text),
+        SqueezyError::Workspace(message) => SqueezyError::Workspace(redactor.redact(&message).text),
+        SqueezyError::Parse(message) => SqueezyError::Parse(redactor.redact(&message).text),
+        SqueezyError::Graph(message) => SqueezyError::Graph(redactor.redact(&message).text),
+        SqueezyError::Tool(message) => SqueezyError::Tool(redactor.redact(&message).text),
+        SqueezyError::Permission(message) => {
+            SqueezyError::Permission(redactor.redact(&message).text)
+        }
+        SqueezyError::Io(error) => SqueezyError::Io(error),
     }
 }
 

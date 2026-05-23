@@ -78,6 +78,15 @@ Telemetry must not include:
 - exact model names when they may be user/private configured; telemetry uses
   model family buckets instead.
 
+## Redaction Boundary
+
+Telemetry remains allow-listed to coarse enums and counters. Separately, the
+runtime redaction layer scrubs secret-looking text before it reaches model
+requests, model-visible tool results, spilled tool-output files, provider error
+events, and TUI/status surfaces. Redaction counts may appear in local status and
+metrics, but raw redacted values and custom redaction patterns are not sent in
+telemetry.
+
 ## PostHog Security
 
 The Squeezy binary never contains the PostHog project token. Clients send to a

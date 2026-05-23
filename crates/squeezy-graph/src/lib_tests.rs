@@ -6,7 +6,7 @@ use std::{
 };
 
 use squeezy_core::{ContentHash, FileId, LanguageKind};
-use squeezy_parse::{LanguageParser, ParsedFile, ReferenceKind};
+use squeezy_parse::{LanguageParser, ParsedFile, ReferenceKind, RustParser};
 use squeezy_workspace::{CrawlOptions, FileRecord, stable_content_hash};
 
 use super::*;
@@ -91,6 +91,73 @@ def make():
     let greeter = graph.find_symbol_by_name("Greeter").pop().unwrap();
     assert!(graph.call_chain(&make.id, &greeter.id, 2).is_some());
     assert!(!graph.reference_search("Greeter").is_empty());
+}
+
+#[test]
+fn graph_answers_java_navigation_queries() {
+    let mut parser = LanguageParser::new().unwrap();
+    let greeter = java_record(
+        "src/main/java/com/example/services/Greeter.java",
+        r#"
+package com.example.services;
+
+public class Greeter {
+    public String greet(String name) {
+        return name;
+    }
+}
+"#,
+    );
+    let runner = java_record(
+        "src/main/java/com/example/app/Runner.java",
+        r#"
+package com.example.app;
+
+import com.example.services.Greeter;
+
+public class Runner implements Runnable {
+    private final Greeter greeter;
+
+    public Runner(Greeter greeter) {
+        this.greeter = greeter;
+    }
+
+    public void run() {
+        greeter.greet("Ada");
+    }
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&greeter, fs::read_to_string(&greeter.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    assert!(
+        graph
+            .signature_search(&SignatureQuery {
+                text: "class Runner".to_string(),
+                kind: Some(SymbolKind::Class),
+                visibility: Some("public".to_string()),
+                attribute: None,
+            })
+            .iter()
+            .any(|symbol| symbol.name == "Runner")
+    );
+    let run = graph.find_symbol_by_name("run").pop().unwrap();
+    let greet = graph.find_symbol_by_name("greet").pop().unwrap();
+    assert!(graph.call_chain(&run.id, &greet.id, 3).is_some());
+    assert!(
+        graph
+            .references_to_symbol(&graph.find_symbol_by_name("Greeter").pop().unwrap().id)
+            .iter()
+            .any(|hit| hit.reference.text == "Greeter")
+    );
 }
 
 #[test]
@@ -499,6 +566,90 @@ def reassign():
 }
 
 #[test]
+fn graph_resolves_csharp_this_and_base_method_calls() {
+    let mut parser = LanguageParser::new().unwrap();
+    let animal = csharp_record(
+        "src/Animal.cs",
+        r#"
+namespace App;
+
+public class Animal
+{
+    public virtual string Speak() { return "generic"; }
+}
+"#,
+    );
+    let dog = csharp_record(
+        "src/Dog.cs",
+        r#"
+namespace App;
+
+public class Dog : Animal
+{
+    public string Bark() { return this.Speak(); }
+    public override string Speak() { return base.Speak(); }
+}
+"#,
+    );
+    let parsed = [animal, dog]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let dog_id = graph
+        .find_symbol_by_name("Dog")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("Dog class")
+        .id;
+    let animal_id = graph
+        .find_symbol_by_name("Animal")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("Animal class")
+        .id;
+
+    let speaks = graph.find_symbol_by_name("Speak");
+    let dog_speak_id = speaks
+        .iter()
+        .find(|symbol| symbol.parent_id.as_ref() == Some(&dog_id))
+        .expect("Dog.Speak")
+        .id
+        .clone();
+    let animal_speak_id = speaks
+        .iter()
+        .find(|symbol| symbol.parent_id.as_ref() == Some(&animal_id))
+        .expect("Animal.Speak")
+        .id
+        .clone();
+    let bark = graph
+        .find_symbol_by_name("Bark")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Bark method");
+
+    // `this.Speak()` from `Dog.Bark` must bind to `Dog.Speak` (the override).
+    let this_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == bark.id && edge.kind == EdgeKind::Calls)
+        .expect("Bark -> Speak edge");
+    assert_eq!(this_edge.to.as_ref(), Some(&dog_speak_id));
+
+    // `base.Speak()` from `Dog.Speak` must bind to `Animal.Speak`.
+    let base_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == dog_speak_id && edge.kind == EdgeKind::Calls)
+        .expect("Dog.Speak -> Animal.Speak edge");
+    assert_eq!(base_edge.to.as_ref(), Some(&animal_speak_id));
+}
+
+#[test]
 fn graph_manager_refresh_replaces_changed_file_only() {
     let root = temp_root("graph-manager-refresh");
     fs::create_dir_all(root.join("src")).unwrap();
@@ -515,6 +666,9 @@ fn graph_manager_refresh_replaces_changed_file_only() {
     .unwrap();
     assert!(!manager.graph().find_symbol_by_name("one").is_empty());
     assert_eq!(manager.build_report().language.rust_files, 1);
+    assert_eq!(manager.build_report().language.csharp_files, 0);
+    assert_eq!(manager.build_report().language.go_files, 0);
+    assert_eq!(manager.build_report().language.python_files, 0);
     assert_eq!(manager.build_report().language.supported_files, 1);
 
     thread::sleep(Duration::from_millis(2));
@@ -566,6 +720,45 @@ fn graph_manager_refresh_reports_event_and_unchanged_paths() {
     assert_eq!(changed.language.typescript_files, 1);
     assert!(manager.graph().find_symbol_by_name("one").is_empty());
     assert!(!manager.graph().find_symbol_by_name("two").is_empty());
+}
+
+#[test]
+fn graph_manager_refresh_indexes_c_family_and_reparses_changed_header() {
+    let root = temp_root("graph-manager-c-family-refresh");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src").join("runner.cpp"),
+        "#include \"runner.hpp\"\nint run() { return helper(); }\nint helper() { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("src").join("runner.hpp"), "int run();\n").unwrap();
+
+    let mut manager = GraphManager::open_with_config(
+        &root,
+        RefreshConfig {
+            debounce: Duration::from_millis(0),
+            idle_refresh_interval: Duration::from_millis(0),
+            per_tool_refresh_budget: Duration::from_secs(5),
+        },
+    )
+    .unwrap();
+    assert_eq!(manager.build_report().language.cpp_files, 2);
+    assert_eq!(manager.build_report().language.supported_files, 2);
+    assert!(!manager.graph().find_symbol_by_name("run").is_empty());
+
+    thread::sleep(Duration::from_millis(2));
+    fs::write(
+        root.join("src").join("runner.hpp"),
+        "int run();\nint added();\n",
+    )
+    .unwrap();
+    manager.record_changed_path(root.join("src").join("runner.hpp"));
+    let report = manager.refresh_before_query().unwrap();
+
+    assert!(report.refreshed);
+    assert_eq!(report.reparsed_files, 1);
+    assert_eq!(report.language.cpp_files, 2);
+    assert!(!manager.graph().find_symbol_by_name("added").is_empty());
 }
 
 #[test]
@@ -1486,6 +1679,245 @@ impl IntoThing for Local {
 }
 
 #[test]
+fn graph_resolves_cpp_same_class_direct_method_call() {
+    let mut parser = RustParser::new().unwrap();
+    let record = cpp_record(
+        "src/runner.cpp",
+        r#"
+class Runner {
+public:
+    int run() {
+        return helper();
+    }
+    int helper() {
+        return 0;
+    }
+};
+"#,
+    );
+    let parsed = parser
+        .parse_source(&record, fs::read_to_string(&record.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let helpers = graph.find_symbol_by_name("helper");
+    let helper = helpers
+        .iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Runner::helper method should exist");
+    let run = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Runner::run method should exist");
+
+    // `helper()` inside `run()` parses as a Direct call with no receiver.
+    // Without the same-class fallback the resolver returns CandidateSet.
+    let chain = graph
+        .call_chain(&run.id, &helper.id, 2)
+        .expect("Runner::run -> Runner::helper should resolve");
+    assert!(chain.contains(&helper.id));
+}
+
+#[test]
+fn graph_resolves_c_include_cross_translation_unit_calls() {
+    let mut parser = RustParser::new().unwrap();
+    let header = c_record(
+        "src/runner.h",
+        r#"
+int helper(int value);
+int runner_run(int value);
+"#,
+    );
+    let definition = c_record(
+        "src/runner.c",
+        r#"
+#include "runner.h"
+
+int helper(int value) {
+    return value + 1;
+}
+
+int runner_run(int value) {
+    return helper(value);
+}
+"#,
+    );
+    let consumer = c_record(
+        "src/consumer.c",
+        r#"
+#include "runner.h"
+
+int consume(int value) {
+    return helper(value) + runner_run(value);
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&header, fs::read_to_string(&header.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&definition, fs::read_to_string(&definition.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&consumer, fs::read_to_string(&consumer.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let helper = graph
+        .find_symbol_by_name("helper")
+        .into_iter()
+        .find(|symbol| {
+            graph
+                .files
+                .get(&symbol.file_id)
+                .map(|file| file.relative_path == "src/runner.c")
+                .unwrap_or(false)
+        })
+        .expect("definition-side `helper` should exist");
+    let runner_run = graph
+        .find_symbol_by_name("runner_run")
+        .into_iter()
+        .find(|symbol| {
+            graph
+                .files
+                .get(&symbol.file_id)
+                .map(|file| file.relative_path == "src/runner.c")
+                .unwrap_or(false)
+        })
+        .expect("definition-side `runner_run` should exist");
+    let consume = graph
+        .find_symbol_by_name("consume")
+        .pop()
+        .expect("consume function should exist");
+
+    // Without include-aware resolution these calls would land in
+    // CandidateSet because the consumer file declares neither symbol.
+    assert!(
+        graph.call_chain(&consume.id, &helper.id, 2).is_some(),
+        "consume -> helper should resolve via the include directive"
+    );
+    assert!(
+        graph.call_chain(&consume.id, &runner_run.id, 2).is_some(),
+        "consume -> runner_run should resolve via the include directive"
+    );
+}
+
+#[test]
+fn graph_include_lookup_is_gated_to_c_family_callers() {
+    let mut parser = RustParser::new().unwrap();
+    let rust_caller = record(
+        "src/rust_caller/main.rs",
+        r#"
+fn caller() {
+    helper();
+}
+"#,
+    );
+    let c_definition = c_record(
+        "src/runner/runner.c",
+        r#"
+int helper(int value) {
+    return value;
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&rust_caller, fs::read_to_string(&rust_caller.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(
+                &c_definition,
+                fs::read_to_string(&c_definition.path).unwrap(),
+            )
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let caller = graph
+        .find_symbol_by_name("caller")
+        .pop()
+        .expect("caller function should exist");
+
+    // The include-aware lookup must never appear in the provenance for a
+    // Rust caller, even if other heuristics happen to bind the call.
+    for edge in graph.callees(&caller.id) {
+        assert!(
+            !edge.edge.provenance.reason.contains("include directive"),
+            "Rust caller's call edge should never use the C/C++ include lookup; provenance was {:?}",
+            edge.edge.provenance.reason
+        );
+    }
+}
+
+#[test]
+fn graph_field_reference_with_arrow_access_matches_struct_field() {
+    let mut parser = RustParser::new().unwrap();
+    let record = c_record(
+        "src/runner.c",
+        r#"
+struct Runner {
+    int id;
+};
+
+int peek(struct Runner *runner) {
+    return runner->id;
+}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&record, fs::read_to_string(&record.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let id_field = graph
+        .find_symbol_by_name("id")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Field)
+        .expect("id field should exist");
+
+    // Arrow-access references like `runner->id` should bind to the local
+    // field via the new `last_path_segment` arrow stripping.
+    assert!(
+        graph
+            .references_to_symbol(&id_field.id)
+            .iter()
+            .any(|hit| hit.reference.text.contains("id")),
+        "expected `runner->id` reference to bind to struct field `id`"
+    );
+}
+
+#[test]
+fn include_path_helper_matches_basename_and_suffix() {
+    assert!(include_path_matches_file("runner.h", "src/runner.h"));
+    assert!(include_path_matches_file(
+        "utils/runner.h",
+        "src/utils/runner.h"
+    ));
+    assert!(include_path_matches_file("src/runner.h", "src/runner.h"));
+    assert!(!include_path_matches_file("runner.h", "src/runner_alt.h"));
+    assert!(!include_path_matches_file(
+        "utils/runner.h",
+        "src/utils_x/runner.h"
+    ));
+    assert!(!include_path_matches_file("", "src/runner.h"));
+}
+
+fn c_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::C;
+    record
+}
+
+fn cpp_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Cpp;
+    record
+}
+
+#[test]
 fn annotate_dirty_ranges_marks_only_intersecting_symbols_and_clears_on_reapply() {
     let source = "pub fn first() -> usize { 1 }\npub fn second() -> usize { 2 }\npub fn third() -> usize { 3 }\n";
     let mut parser = LanguageParser::new().unwrap();
@@ -1542,6 +1974,272 @@ fn annotate_dirty_ranges_marks_only_intersecting_symbols_and_clears_on_reapply()
     assert!(graph.dirty_symbols().is_empty());
 }
 
+#[test]
+fn graph_resolves_java_static_member_imports_to_enclosing_class_method() {
+    let mut parser = LanguageParser::new().unwrap();
+    let names = java_record(
+        "src/main/java/com/example/util/Names.java",
+        r#"
+package com.example.util;
+
+public enum Names {
+    DEFAULT;
+
+    public static String defaultName() {
+        return "Ada";
+    }
+}
+"#,
+    );
+    let app = java_record(
+        "src/main/java/com/example/app/Runner.java",
+        r#"
+package com.example.app;
+
+import static com.example.util.Names.defaultName;
+
+public class Runner {
+    public String greet() {
+        return defaultName();
+    }
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&names, fs::read_to_string(&names.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&app, fs::read_to_string(&app.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let names_class = graph.find_symbol_by_name("Names").pop().unwrap();
+    let default_name = graph
+        .find_symbol_by_name("defaultName")
+        .into_iter()
+        .find(|symbol| symbol.parent_id.as_ref() == Some(&names_class.id))
+        .unwrap();
+    let greet = graph
+        .find_symbol_by_name("greet")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .unwrap();
+
+    assert!(graph.call_chain(&greet.id, &default_name.id, 3).is_some());
+}
+
+#[test]
+fn graph_resolves_java_glob_imports_to_classes_in_package() {
+    let mut parser = LanguageParser::new().unwrap();
+    let greeter = java_record(
+        "src/main/java/com/example/services/Greeter.java",
+        r#"
+package com.example.services;
+
+public class Greeter {
+    public String greet(String name) {
+        return name;
+    }
+}
+"#,
+    );
+    let runner = java_record(
+        "src/main/java/com/example/app/Runner.java",
+        r#"
+package com.example.app;
+
+import com.example.services.*;
+
+public class Runner {
+    public Greeter create() {
+        return new Greeter();
+    }
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&greeter, fs::read_to_string(&greeter.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let greeter_class = graph.find_symbol_by_name("Greeter").pop().unwrap();
+    assert!(
+        graph
+            .references_to_symbol(&greeter_class.id)
+            .iter()
+            .any(|hit| hit.reference.text == "Greeter")
+    );
+}
+
+#[test]
+fn graph_resolves_java_nested_class_imports_to_inner_type() {
+    let mut parser = LanguageParser::new().unwrap();
+    let outer = java_record(
+        "src/main/java/com/example/util/Outer.java",
+        r#"
+package com.example.util;
+
+public class Outer {
+    public static class Inner {
+        public String describe() {
+            return "inner";
+        }
+    }
+}
+"#,
+    );
+    let runner = java_record(
+        "src/main/java/com/example/app/Runner.java",
+        r#"
+package com.example.app;
+
+import com.example.util.Outer.Inner;
+
+public class Runner {
+    public Inner make() {
+        return new Inner();
+    }
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&outer, fs::read_to_string(&outer.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let outer_class = graph
+        .find_symbol_by_name("Outer")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .unwrap();
+    let inner_class = graph
+        .find_symbol_by_name("Inner")
+        .into_iter()
+        .find(|symbol| symbol.parent_id.as_ref() == Some(&outer_class.id))
+        .unwrap();
+    assert!(
+        graph
+            .references_to_symbol(&inner_class.id)
+            .iter()
+            .any(|hit| hit.reference.text == "Inner")
+    );
+}
+
+#[test]
+fn graph_emits_one_symbol_per_java_field_declarator() {
+    let mut parser = LanguageParser::new().unwrap();
+    let widget = java_record(
+        "src/main/java/com/example/util/Widget.java",
+        r#"
+package com.example.util;
+
+public class Widget {
+    private int alpha, beta, gamma;
+    public static final String FIRST = "1", SECOND = "2";
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&widget, fs::read_to_string(&widget.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    for name in ["alpha", "beta", "gamma", "FIRST", "SECOND"] {
+        assert!(
+            graph
+                .find_symbol_by_name(name)
+                .into_iter()
+                .any(|symbol| symbol.kind == SymbolKind::Field),
+            "missing field declarator {name}",
+        );
+    }
+}
+
+#[test]
+fn graph_records_only_real_maven_dependencies() {
+    let _ = LanguageParser::new().unwrap();
+    let mut pom = record(
+        "pom.xml",
+        r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.managed</groupId>
+        <artifactId>only-managed</artifactId>
+        <version>1.0.0</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.10.0</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.11.0</version>
+        <dependencies>
+          <dependency>
+            <groupId>org.plugin</groupId>
+            <artifactId>plugin-dep</artifactId>
+            <version>9.9.9</version>
+          </dependency>
+        </dependencies>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+"#,
+    );
+    pom.language = LanguageKind::Unsupported;
+    let parsed = vec![ParsedFile::unsupported(pom, "maven metadata")];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let dependencies = graph
+        .java_project_facts()
+        .iter()
+        .filter(|fact| fact.kind == "dependency")
+        .map(|fact| fact.value.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        dependencies.contains(&"test:org.junit.jupiter:junit-jupiter:5.10.0".to_string()),
+        "expected real dependency to be recorded; got {dependencies:?}",
+    );
+    assert!(
+        !dependencies
+            .iter()
+            .any(|value| value.contains("only-managed")),
+        "managed dependencies should be excluded; got {dependencies:?}",
+    );
+    assert!(
+        !dependencies
+            .iter()
+            .any(|value| value.contains("plugin-dep")),
+        "plugin dependencies should be excluded; got {dependencies:?}",
+    );
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("graph-record");
     let path = root.join(relative_path);
@@ -1583,6 +2281,18 @@ fn unsupported_record(relative_path: &str, source: &str) -> FileRecord {
     record
 }
 
+fn java_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Java;
+    record
+}
+
+fn csharp_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::CSharp;
+    record
+}
+
 fn go_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Go;
@@ -1590,11 +2300,15 @@ fn go_record(relative_path: &str, source: &str) -> FileRecord {
 }
 
 fn temp_root(name: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("squeezy-{name}-{nonce}"));
+    let root = std::env::temp_dir().join(format!("squeezy-{name}-{pid}-{counter}-{nonce}"));
     fs::create_dir_all(&root).unwrap();
     root
 }
