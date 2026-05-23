@@ -1,0 +1,66 @@
+---
+import DocsLayout from "../../layouts/DocsLayout.astro";
+---
+
+<DocsLayout
+  title="Cost Receipts - SqueezyAgent"
+  description="Draft cost receipt docs for SqueezyAgent."
+  activeDoc="/docs/cost-receipts/"
+  heading="Cost receipts"
+  lead="Receipts make context spend visible: what was read, what was sent, what changed, and what was avoided."
+>
+  <section class="doc-block">
+    <span class="status-pill">draft</span>
+    <h2>What a receipt should track</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Code slices</h3>
+        <p>Path, content hash, byte range, line range, freshness, and reason.</p>
+      </article>
+      <article class="card">
+        <h3>Tool output</h3>
+        <p>Bytes scanned, preview size, spill handle, and model-facing tokens.</p>
+      </article>
+      <article class="card">
+        <h3>Repeated reads</h3>
+        <p>Unchanged ranges should return compact receipt references.</p>
+      </article>
+      <article class="card">
+        <h3>Benchmarks</h3>
+        <p>Receipts become the evidence behind any public savings claim.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <h2>Implemented foundation</h2>
+    <p>
+      Current fallback tools already return cost hints, output caps, sha256
+      receipts, spill handles for large outputs, and aggregate result budgets.
+      Receipt-backed read stubs and structure-aware navigation are later
+      structural savings.
+    </p>
+  </section>
+
+  <section class="doc-block">
+    <h2>Concrete tool behaviors</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Search modes</h3>
+        <p>`grep` can return content, files-with-matches, or counts depending on how much context the model actually needs.</p>
+      </article>
+      <article class="card">
+        <h3>Spill handles</h3>
+        <p>Large reads and tool outputs become compact previews plus local handles for exact follow-up ranges.</p>
+      </article>
+      <article class="card">
+        <h3>Aggregate budget</h3>
+        <p>Parallel tool results are packed against one model-facing budget for the whole round.</p>
+      </article>
+      <article class="card">
+        <h3>Stable tool surface</h3>
+        <p>Tool schemas are sorted deterministically to keep provider prompt/cache prefixes stable.</p>
+      </article>
+    </div>
+  </section>
+</DocsLayout>

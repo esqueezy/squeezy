@@ -1,0 +1,54 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import GitHubIcon from "../components/GitHubIcon.astro";
+import { SITE } from "../config";
+---
+
+<BaseLayout
+  title="Contact SqueezyAgent"
+  description="GitHub-first contact options for SqueezyAgent."
+  active="contact"
+>
+  <section class="page-hero">
+    <div class="page-hero-inner">
+      <span class="eyebrow">contact</span>
+      <h1>GitHub first. Email later.</h1>
+      <p class="lead">
+        SqueezyAgent is pre-v0. The first contact path should stay close to the
+        work: issues, discussions, product feedback, and benchmark questions.
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="grid-3">
+      <article class="card">
+        <span class="label">project</span>
+        <h3>GitHub</h3>
+        <p>
+          Follow the implementation, design docs, and release work in the
+          Squeezy repository.
+        </p>
+        <a class="button secondary" href={SITE.repoUrl}><GitHubIcon />Open GitHub</a>
+      </article>
+      <article class="card">
+        <span class="label">feedback</span>
+        <h3>Discussions</h3>
+        <p>
+          Roadmap and positioning feedback should live close to the work so
+          decisions stay visible.
+        </p>
+        <a class="button secondary" href={SITE.discussionsUrl}>GitHub Discussions</a>
+      </article>
+      <article class="card">
+        <span class="label">security</span>
+        <h3>Security contact</h3>
+        <p>
+          A dedicated security email should be added before public release. Do
+          not route sensitive reports through public issues.
+        </p>
+        <a class="button secondary" href={SITE.issuesUrl}>Non-sensitive issues</a>
+      </article>
+    </div>
+  </section>
+</BaseLayout>

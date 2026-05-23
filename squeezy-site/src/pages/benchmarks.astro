@@ -1,0 +1,126 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import TerminalWindow from "../components/TerminalWindow.astro";
+---
+
+<BaseLayout
+  title="SqueezyAgent Benchmarks"
+  description="Benchmark methodology and future cost receipts for SqueezyAgent."
+  active="benchmarks"
+>
+  <section class="page-hero">
+    <div class="page-hero-inner">
+      <span class="eyebrow">methodology before numbers</span>
+      <h1>Receipts before claims.</h1>
+      <p class="lead">
+        SqueezyAgent will publish savings claims only when benchmark traces show
+        real reductions on real coding tasks. The deterministic harness already
+        runs without network access or model spend; live receipt traces come
+        later.
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="grid-2">
+      <div class="section-header">
+        <span class="eyebrow">measurement model</span>
+        <h2>Cost is more than dollars.</h2>
+        <p>
+          A useful benchmark should compare model tokens, tool calls, files read,
+          repeated reads avoided, wall-clock time, and final task correctness.
+          Any single metric can be gamed.
+        </p>
+      </div>
+      <TerminalWindow title="future benchmark receipt">
+        <div class="terminal-body">
+          <div class="terminal-line">
+            <span class="green">task</span>
+            <span>bundled TOML fixture with expected answer checks</span>
+          </div>
+          <div class="terminal-line">
+            <span class="cyan">tokens</span>
+            <span>mock traces today; live costly traces gated by env vars</span>
+          </div>
+          <div class="terminal-line">
+            <span class="amber">tools</span>
+            <span>mock-openai, mock-anthropic, grep-baseline</span>
+          </div>
+          <div class="terminal-line">
+            <span class="muted">result</span>
+            <span>CI-safe deterministic runs before public claims</span>
+          </div>
+        </div>
+      </TerminalWindow>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="section-header">
+      <span class="eyebrow">benchmark rules</span>
+      <h2>How the proof should work.</h2>
+    </div>
+    <div class="grid-3">
+      <article class="card">
+        <h3>Real tasks</h3>
+        <p>Use meaningful coding tasks on real repositories, not toy prompts optimized for the demo.</p>
+      </article>
+      <article class="card">
+        <h3>Full traces</h3>
+        <p>Keep prompts, normalized provider events, token counts, tools, receipts, and verification results attached.</p>
+      </article>
+      <article class="card">
+        <h3>Comparable baselines</h3>
+        <p>Compare against current agents with the same task constraints and honest reporting.</p>
+      </article>
+      <article class="card">
+        <h3>Runtime invariants</h3>
+        <p>Check behaviors like spill handles, aggregate budgets, permission denials, and parallel call ordering.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">current harness fixtures</span>
+      <h2>Small tasks first. Repeatable traces before spectacle.</h2>
+      <p>
+        The current harness fixtures are deliberately tiny. They make cost and
+        behavior regressions easy to catch before Squeezy graduates to larger
+        real-repo benchmark suites.
+      </p>
+    </div>
+    <div class="grid-3">
+      <article class="card">
+        <span class="label">find-function</span>
+        <h3>Find the file defining a function.</h3>
+        <p>Checks whether the agent can answer where `make_widget` is defined.</p>
+      </article>
+      <article class="card">
+        <span class="label">read-after-search</span>
+        <h3>Locate, then answer from a file.</h3>
+        <p>Checks a search-to-read path for the exact `squeezy: ok` health string.</p>
+      </article>
+      <article class="card">
+        <span class="label">ignore-vendor</span>
+        <h3>Avoid vendored false positives.</h3>
+        <p>Checks that local source wins over generated/vendor matches by default.</p>
+      </article>
+      <article class="card">
+        <span class="label">count-pattern</span>
+        <h3>Count only relevant files.</h3>
+        <p>Checks Rust-file scoped counting for `CostSnapshot` mentions.</p>
+      </article>
+      <article class="card">
+        <span class="label">config-text</span>
+        <h3>Find config ownership.</h3>
+        <p>Checks TOML lookup for `max_parallel_tools` without reading unrelated code.</p>
+      </article>
+      <article class="card">
+        <span class="label">live later</span>
+        <h3>Costly traces are explicit.</h3>
+        <p>Live OpenAI and Anthropic runs require opt-in env vars and API keys.</p>
+      </article>
+    </div>
+  </section>
+</BaseLayout>

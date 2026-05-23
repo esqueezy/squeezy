@@ -1,0 +1,47 @@
+---
+import DocsLayout from "../../layouts/DocsLayout.astro";
+---
+
+<DocsLayout
+  title="Install SqueezyAgent"
+  description="Draft installation notes for SqueezyAgent."
+  activeDoc="/docs/install/"
+  heading="Install"
+  lead="Packaging is not final before v0. This page holds the future install path and current expectations."
+>
+  <section class="doc-block">
+    <span class="status-pill">pre-v0 placeholder</span>
+    <h2>Expected product surface</h2>
+    <p>
+      The first supported product surface is a local terminal UI. The current
+      repository builds the CLI locally; packaged v0 release instructions will
+      be published once artifacts are ready.
+    </p>
+  </section>
+
+  <section class="doc-block">
+    <h2>Target platforms</h2>
+    <p>
+      v0 targets macOS and Linux. The Linux release artifact is planned for
+      `x86_64-unknown-linux-musl` so it can run without a glibc dependency.
+    </p>
+  </section>
+
+  <section class="doc-block">
+    <h2>Likely install notes</h2>
+    <p>
+      The docs should cover provider key setup, first-run indexing behavior, and
+      how to run SqueezyAgent inside an existing repository once packaging is
+      stable.
+    </p>
+  </section>
+
+  <section class="doc-block">
+    <h2>Current CLI smoke paths</h2>
+    <p>
+      The CLI supports `--health` for configuration smoke checks and `--prompt`
+      for a one-shot streamed response. Provider and model can be selected with
+      `SQUEEZY_PROVIDER`, `SQUEEZY_MODEL`, or matching flags.
+    </p>
+  </section>
+</DocsLayout>

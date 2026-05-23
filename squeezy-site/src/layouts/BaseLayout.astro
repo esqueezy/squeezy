@@ -1,0 +1,90 @@
+---
+import "../styles/global.css";
+import GitHubIcon from "../components/GitHubIcon.astro";
+import { SITE } from "../config";
+
+const {
+  title = SITE.name,
+  description = SITE.description,
+  active = "",
+  ogImage = "/og.svg"
+} = Astro.props;
+
+const canonicalUrl = new URL(Astro.url.pathname, SITE.url).toString();
+const imageUrl = new URL(ogImage, SITE.url).toString();
+
+const navItems = [
+  { href: "/how-it-works/", label: "How it works", key: "how" },
+  { href: "/docs/", label: "Docs", key: "docs" },
+  { href: "/benchmarks/", label: "Benchmarks", key: "benchmarks" }
+];
+---
+
+<!doctype html>
+<html lang="en" data-accent="amber">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="description" content={description} />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#080a08" />
+    <link rel="canonical" href={canonicalUrl} />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={canonicalUrl} />
+    <meta property="og:image" content={imageUrl} />
+    <meta property="og:site_name" content={SITE.name} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={imageUrl} />
+    <title>{title}</title>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="SqueezyAgent home">
+        <span class="brand-mark">sq</span>
+        <span>SqueezyAgent</span>
+      </a>
+      <nav class="site-nav" aria-label="Primary navigation">
+        {
+          navItems.map((item) => (
+            <a
+              href={item.href}
+              aria-current={active === item.key ? "page" : undefined}
+            >
+              {item.label}
+            </a>
+          ))
+        }
+      </nav>
+      <a class="github-link" href={SITE.repoUrl} aria-label="Open SqueezyAgent on GitHub">
+        <GitHubIcon />
+        <span>GitHub</span>
+      </a>
+    </header>
+    <main>
+      <slot />
+    </main>
+    <footer class="site-footer">
+      <div>
+        <a class="brand footer-brand" href="/" aria-label="SqueezyAgent home">
+          <span class="brand-mark">sq</span>
+          <span>SqueezyAgent</span>
+        </a>
+        <p>
+          A local static engine helps the agent understand code structure before
+          wasting LLM tokens on search.
+        </p>
+      </div>
+      <div class="footer-links">
+        <a href="/docs/">Docs</a>
+        <a href="/benchmarks/">Benchmarks</a>
+        <a href="/contact/">Contact</a>
+        <a href={SITE.repoUrl}>GitHub</a>
+      </div>
+    </footer>
+  </body>
+</html>

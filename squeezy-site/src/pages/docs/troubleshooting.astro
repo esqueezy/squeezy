@@ -1,0 +1,34 @@
+---
+import DocsLayout from "../../layouts/DocsLayout.astro";
+---
+
+<DocsLayout
+  title="Troubleshooting - SqueezyAgent"
+  description="Draft troubleshooting docs for SqueezyAgent."
+  activeDoc="/docs/troubleshooting/"
+  heading="Troubleshooting"
+  lead="Troubleshooting docs will become concrete as the v0 runtime surfaces real failure modes."
+>
+  <section class="doc-block">
+    <span class="status-pill">pre-v0 placeholder</span>
+    <h2>Expected topics</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Indexing failures</h3>
+        <p>Parser errors, ignored paths, large files, unsupported languages, and stale graphs.</p>
+      </article>
+      <article class="card">
+        <h3>Provider setup</h3>
+        <p>Missing credentials, model routing, rate limits, and cache behavior.</p>
+      </article>
+      <article class="card">
+        <h3>Verification</h3>
+        <p>Scoped checks, failing tests, and graph-selected verification commands.</p>
+      </article>
+      <article class="card">
+        <h3>Permissions</h3>
+        <p>Denied shell commands, write approvals, and web access policy.</p>
+      </article>
+    </div>
+  </section>
+</DocsLayout>

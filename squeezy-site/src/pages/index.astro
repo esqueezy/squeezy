@@ -1,0 +1,299 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import GitHubIcon from "../components/GitHubIcon.astro";
+import TerminalWindow from "../components/TerminalWindow.astro";
+import MetricStrip from "../components/MetricStrip.astro";
+import { SITE } from "../config";
+---
+
+<BaseLayout
+  title="SqueezyAgent - Understand code structure before spending tokens"
+  description="SqueezyAgent uses a local static engine to understand code structure before wasting LLM tokens on search."
+  active="home"
+>
+  <section class="hero">
+    <div class="hero-inner">
+      <span class="eyebrow">local static engine / cost-first coding agent</span>
+      <h1>Understand code structure before spending LLM tokens.</h1>
+      <p class="lead">
+        SqueezyAgent is a coding agent built to inspect your repository locally,
+        find the right files and symbols, and send the model only the context it
+        needs. Less blind search. Less repeated reading. Less wasted spend.
+      </p>
+      <div class="hero-actions">
+        <a class="button" href={SITE.repoUrl}><GitHubIcon />Follow on GitHub</a>
+        <a class="button secondary" href="/docs/">Explore the draft docs</a>
+      </div>
+      <div class="hero-visual" aria-label="SqueezyAgent terminal preview">
+        <TerminalWindow title="squeezy plan --task impact-auth-change">
+          <div class="terminal-body">
+            <div class="terminal-line">
+              <span class="prompt">$</span>
+              <span class="command">squeezy ask "what changes if auth middleware moves?"</span>
+            </div>
+            <div class="terminal-line">
+              <span class="green">structure</span>
+              <span>auth code connects to routes, sessions, and tests</span>
+            </div>
+            <div class="terminal-line">
+              <span class="cyan">evidence</span>
+              <span>6 code slices, 4 callers, 3 tests, reasons attached</span>
+            </div>
+            <div class="terminal-line">
+              <span class="amber">budget</span>
+              <span>raw search avoided; compact packet sent to model</span>
+            </div>
+            <div class="terminal-line">
+              <span class="muted">next</span>
+              <span>read exact slices only where patching or verification needs code</span>
+            </div>
+          </div>
+        </TerminalWindow>
+      </div>
+    </div>
+  </section>
+
+  <MetricStrip />
+
+  <section class="section compact">
+    <div class="section-header">
+      <span class="eyebrow">current state</span>
+      <h2>Runnable foundation today. Code-structure engine next.</h2>
+      <p>
+        Main already has the TUI foundation, OpenAI Responses streaming,
+        Anthropic Messages streaming, deterministic validation harness tasks in
+        CI, and bounded fallback tools with receipts and output budgets.
+      </p>
+    </div>
+    <div class="grid-3">
+      <article class="card">
+        <span class="label">providers</span>
+        <h3>OpenAI and Anthropic streaming.</h3>
+        <p>
+          Provider tool calls feed structured tool outputs back into the model
+          loop instead of bypassing Squeezy's runtime controls.
+        </p>
+      </article>
+      <article class="card">
+        <span class="label">tools</span>
+        <h3>Bounded fallback navigation exists.</h3>
+        <p>
+          Ignore-aware grep, path-only glob, capped reads, spill previews,
+          aggregate result budgets, and permission-gated web tools are already
+          part of the foundation.
+        </p>
+      </article>
+      <article class="card">
+        <span class="label">proof</span>
+        <h3>Deterministic harness before live spend.</h3>
+        <p>
+          CI runs mock OpenAI, mock Anthropic, and grep-baseline tasks without
+          network access or model cost.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">the problem</span>
+      <h2>Agents should not burn tokens just to find the right file.</h2>
+      <p>
+        Many coding agents still navigate like a model holding search: list
+        directories, grep broad text, read whole files, forget after compaction,
+        then repeat. That loop is slow and expensive.
+      </p>
+    </div>
+    <div class="grid-3">
+      <article class="card">
+        <span class="label">01 / wasted exploration</span>
+        <h3>Search noise gets billed like useful reasoning.</h3>
+        <p>
+          Raw files, noisy shell output, and repeated reads become model context
+          even when local analysis could have found the right slice.
+        </p>
+      </article>
+      <article class="card">
+        <span class="label">02 / missing structure</span>
+        <h3>Text search sees strings, not code relationships.</h3>
+        <p>
+          Real code work needs files, functions, modules, callers, tests, and
+          dependencies. SqueezyAgent is built to find those locally first.
+        </p>
+      </article>
+      <article class="card">
+        <span class="label">03 / spend control</span>
+        <h3>Teams should own the agent runtime.</h3>
+        <p>
+          SqueezyAgent is designed to make cost visible and enforceable at the
+          navigation layer, not only after the bill arrives.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="section-header">
+      <span class="eyebrow">tool-call savings foundation</span>
+      <h2>The current runtime already refuses obvious waste.</h2>
+      <p>
+        Before the code-structure engine lands, SqueezyAgent already makes
+        fallback tools cheaper and more accountable. That foundation is what the
+        local engine will plug into.
+      </p>
+    </div>
+    <div class="grid-3">
+      <article class="card">
+        <span class="label">search</span>
+        <h3>Path, count, or content.</h3>
+        <p>
+          Grep can return matching lines, files with matches, or a count, so
+          broad exploration does not always ship raw content to the model.
+        </p>
+      </article>
+      <article class="card">
+        <span class="label">spill</span>
+        <h3>Large outputs become handles.</h3>
+        <p>
+          Oversized tool results are stored locally and returned as compact
+          previews with exact-range handles.
+        </p>
+      </article>
+      <article class="card">
+        <span class="label">budget</span>
+        <h3>One round has one budget.</h3>
+        <p>
+          Parallel tool calls are packed against an aggregate result budget
+          instead of each call flooding the next prompt.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">for teams</span>
+      <h2>Control agent spend without surrendering the runtime.</h2>
+      <p>
+        SqueezyAgent is built for organizations and developers who want the
+        capability of model-powered agents without letting provider incentives
+        define every navigation decision.
+      </p>
+    </div>
+    <div class="grid-3">
+      <article class="card">
+        <span class="label">spend visibility</span>
+        <h3>Receipts before invoices.</h3>
+        <p>
+          Track files read, tool output, repeated context avoided, and model
+          tokens as first-class runtime facts.
+        </p>
+      </article>
+      <article class="card">
+        <span class="label">provider neutral</span>
+        <h3>Bring your model. Keep the agent disciplined.</h3>
+        <p>
+          Routing and budgets belong in the agent runtime, not only in the
+          provider billing dashboard.
+        </p>
+      </article>
+      <article class="card">
+        <span class="label">local understanding</span>
+        <h3>Spend CPU before tokens.</h3>
+        <p>
+          Build code structure locally, then ask the model to reason over compact
+          evidence instead of raw repository noise.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="section-header">
+      <span class="eyebrow">the squeezy loop</span>
+      <h2>Use local code analysis before paid model context.</h2>
+      <p>
+        The model should spend tokens on judgment. Your machine should spend CPU
+        on finding files, relationships, receipts, and targeted reads before
+        billable context enters the prompt.
+      </p>
+    </div>
+    <div class="flow" aria-label="SqueezyAgent semantic navigation flow">
+      <div class="flow-step">
+        <span>input</span>
+        <strong>User intent</strong>
+        <p>"Move auth middleware without breaking session tests."</p>
+      </div>
+      <div class="flow-step">
+        <span>local</span>
+        <strong>Static analysis</strong>
+        <p>Parse files, symbols, modules, imports, calls, and tests.</p>
+      </div>
+      <div class="flow-step">
+        <span>graph</span>
+        <strong>Structure lookup</strong>
+        <p>Find owners, dependencies, callers, tests, and likely impact.</p>
+      </div>
+      <div class="flow-step">
+        <span>packet</span>
+        <strong>Evidence packet</strong>
+        <p>Return compact code slices, hashes, and reasons.</p>
+      </div>
+      <div class="flow-step">
+        <span>model</span>
+        <strong>Targeted context</strong>
+        <p>Read slices only when editing or verifying needs text.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="grid-2">
+      <div class="section-header">
+        <span class="eyebrow">cost control</span>
+        <h2>Every read should earn its place in context.</h2>
+        <p>
+          SqueezyAgent is built around receipts, budgets, deduped reads, compact
+          tool output, and local code evidence. The goal is not smaller context for
+          its own sake. The goal is better work with less spend.
+        </p>
+      </div>
+      <TerminalWindow title="receipt-backed context packet">
+        <div class="terminal-body">
+          <div class="terminal-line">
+            <span class="cyan">path</span>
+            <span>crates/agent/src/session.rs:114..188</span>
+          </div>
+          <div class="terminal-line">
+            <span class="green">reason</span>
+            <span>owns compaction receipt replay</span>
+          </div>
+          <div class="terminal-line">
+            <span class="amber">reason</span>
+            <span>import path plus local references</span>
+          </div>
+          <div class="terminal-line">
+            <span class="muted">receipt</span>
+            <span>sha256:3b2... / unchanged ranges deduped</span>
+          </div>
+        </div>
+      </TerminalWindow>
+    </div>
+  </section>
+
+  <section class="section compact">
+    <div class="section-header">
+      <span class="eyebrow">proof before claims</span>
+      <h2>Honest until measured. Sharper when v0 lands.</h2>
+      <p>
+        This site is a draft surface for a product still being built. Public
+        savings claims should come from real receipts, benchmark traces, and
+        repeatable correctness checks.
+      </p>
+      <div class="actions">
+        <a class="button" href="/benchmarks/">Benchmark method</a>
+        <a class="button secondary" href="/docs/">Read the docs</a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

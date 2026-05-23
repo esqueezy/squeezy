@@ -1,0 +1,44 @@
+---
+import DocsLayout from "../../layouts/DocsLayout.astro";
+---
+
+<DocsLayout
+  title="SqueezyAgent Configuration"
+  description="Draft configuration docs for SqueezyAgent."
+  activeDoc="/docs/config/"
+  heading="Configuration"
+  lead="Configuration should keep provider access, budgets, permissions, and indexing behavior explicit."
+>
+  <section class="doc-block">
+    <span class="status-pill">draft</span>
+    <h2>Configuration areas</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Providers</h3>
+        <p>OpenAI Responses and Anthropic Messages streaming provider setup, routing defaults, and cache settings.</p>
+      </article>
+      <article class="card">
+        <h3>Budgets</h3>
+        <p>Per-turn token limits, tool-result limits, and fallback thresholds.</p>
+      </article>
+      <article class="card">
+        <h3>Indexing</h3>
+        <p>Repo roots, ignored paths, Rust semantic support, fallback languages, and graph freshness.</p>
+      </article>
+      <article class="card">
+        <h3>Permissions</h3>
+        <p>Read, write, shell, web, and verification policy by agent mode.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <h2>Current runtime knobs</h2>
+    <p>
+      The foundation already exposes environment-driven controls for provider,
+      model, max output tokens, parallel tool limits, spill thresholds, preview
+      sizes, aggregate tool-result budgets, web permissions, and Exa MCP web
+      search configuration.
+    </p>
+  </section>
+</DocsLayout>

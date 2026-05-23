@@ -1,0 +1,37 @@
+---
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import { DOCS_NAV } from "../../config";
+---
+
+<DocsLayout
+  title="SqueezyAgent Docs"
+  description="Draft product documentation for SqueezyAgent, a pre-v0 cost-first semantic coding agent."
+  activeDoc="overview"
+  heading="Product docs for behavior as it becomes real."
+  lead="These docs are intentionally early. Sections marked pre-v0 describe the intended product surface and will be tightened as implementation lands."
+>
+  <section class="doc-block">
+    <span class="status-pill">draft overview</span>
+    <h2>Start here</h2>
+    <p>
+      SqueezyAgent is a local terminal coding agent designed to reduce wasteful
+      model context by using static analysis, code-structure lookup, and
+      receipt-backed tool output before asking the model to inspect raw code.
+    </p>
+  </section>
+
+  <section class="doc-block">
+    <h2>Doc sections</h2>
+    <div class="doc-card-grid">
+      {
+        DOCS_NAV.map((item) => (
+          <a class="card" href={item.href}>
+            <span class="label">{item.status}</span>
+            <h3>{item.label}</h3>
+            <p>Open the draft page for this product area.</p>
+          </a>
+        ))
+      }
+    </div>
+  </section>
+</DocsLayout>

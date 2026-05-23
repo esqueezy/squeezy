@@ -1,0 +1,48 @@
+---
+import DocsLayout from "../../layouts/DocsLayout.astro";
+---
+
+<DocsLayout
+  title="Permissions - SqueezyAgent"
+  description="Draft permissions docs for SqueezyAgent."
+  activeDoc="/docs/permissions/"
+  heading="Permissions"
+  lead="A local agent should make mutation explicit and keep cheap semantic reads fast."
+>
+  <section class="doc-block">
+    <span class="status-pill">draft</span>
+    <h2>Permission posture</h2>
+    <p>
+      Read-only semantic queries should be cheap and low-friction. File writes,
+      shell commands, web access, and destructive operations should remain gated
+      by mode and user policy.
+    </p>
+  </section>
+
+  <section class="doc-block">
+    <h2>Current foundation</h2>
+    <p>
+      Edit and shell tools route through allow, ask, or deny policy. Web search
+      and fetch are also permission-gated, with host-visible approval summaries
+      and bounded response sizes.
+    </p>
+  </section>
+
+  <section class="doc-block">
+    <h2>Structured denial is part of the loop</h2>
+    <p>
+      When a write or web fetch is denied, the model receives a structured tool
+      result instead of guessing what happened. The file or network request does
+      not proceed, and the agent can continue from the policy result.
+    </p>
+  </section>
+
+  <section class="doc-block">
+    <h2>Modes</h2>
+    <p>
+      Product docs should eventually distinguish planning, building,
+      verification, and general question-answering modes so the tool surface
+      matches the user intent.
+    </p>
+  </section>
+</DocsLayout>

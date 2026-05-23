@@ -1,0 +1,19 @@
+---
+import { DOCS_NAV } from "../config";
+
+const { active = "" } = Astro.props;
+---
+
+<nav class="toc" aria-label="Docs sections">
+  <a href="/docs/" aria-current={active === "overview" ? "page" : undefined}>
+    Overview
+  </a>
+  {
+    DOCS_NAV.map((item) => (
+      <a href={item.href} aria-current={active === item.href ? "page" : undefined}>
+        <span>{item.label}</span>
+        <em>{item.status}</em>
+      </a>
+    ))
+  }
+</nav>

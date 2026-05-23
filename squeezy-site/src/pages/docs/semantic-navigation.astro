@@ -1,0 +1,30 @@
+---
+import DocsLayout from "../../layouts/DocsLayout.astro";
+---
+
+<DocsLayout
+  title="Code Structure Navigation - SqueezyAgent"
+  description="Draft code-structure navigation docs for SqueezyAgent."
+  activeDoc="/docs/semantic-navigation/"
+  heading="Code structure navigation"
+  lead="The core cost-saving bet is simple: ask local code structure before paying the model to search text."
+>
+  <section class="doc-block">
+    <span class="status-pill">pre-v0 placeholder</span>
+    <h2>Rust first</h2>
+    <p>
+      Rust is the first supported source language for structure-aware
+      navigation. The local engine should cover files, declarations, imports,
+      references, call-like syntax, test pairing, and Cargo facts.
+    </p>
+  </section>
+
+  <section class="doc-block">
+    <h2>Clear limits</h2>
+    <p>
+      Static analysis can quickly find useful structure, but it should not
+      pretend every relationship is certain. When local structure is incomplete,
+      SqueezyAgent should say so and use bounded text search as a fallback.
+    </p>
+  </section>
+</DocsLayout>

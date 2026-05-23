@@ -1,0 +1,108 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import TerminalWindow from "../components/TerminalWindow.astro";
+---
+
+<BaseLayout
+  title="How SqueezyAgent Works"
+  description="How SqueezyAgent uses local static analysis to find code structure before spending model context."
+  active="how"
+>
+  <section class="page-hero">
+    <div class="page-hero-inner">
+      <span class="eyebrow">architecture draft</span>
+      <h1>Spend local CPU before paid model context.</h1>
+      <p class="lead">
+        SqueezyAgent puts a deterministic local analysis layer between the user
+        request and the LLM. The agent asks your codebase what connects to what,
+        then sends the model targeted evidence instead of billable search noise.
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="flow">
+      <div class="flow-step">
+        <span>01</span>
+        <strong>Parse</strong>
+        <p>Tree-sitter extracts declarations, imports, outlines, tests, and call-like syntax.</p>
+      </div>
+      <div class="flow-step">
+        <span>02</span>
+        <strong>Index</strong>
+        <p>A local index stores files, functions, modules, references, and tests.</p>
+      </div>
+      <div class="flow-step">
+        <span>03</span>
+        <strong>Look up</strong>
+        <p>The agent asks for ownership, impact, callers, tests, and likely code slices.</p>
+      </div>
+      <div class="flow-step">
+        <span>04</span>
+        <strong>Pack</strong>
+        <p>Results become small evidence packets with paths, hashes, and reasons.</p>
+      </div>
+      <div class="flow-step">
+        <span>05</span>
+        <strong>Act</strong>
+        <p>The model reads exact slices, plans a patch, applies it, and verifies.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="grid-2">
+      <div class="section-header">
+        <span class="eyebrow">local analysis</span>
+        <h2>Useful structure, with clear limits.</h2>
+        <p>
+          SqueezyAgent does not need a full compiler or language server before
+          it can save tokens. It can use fast static analysis to find likely
+          files, functions, callers, and tests, then fall back to bounded text
+          search when local structure is not enough.
+        </p>
+      </div>
+      <TerminalWindow title="symbol_context(AuthLayer)">
+        <div class="terminal-body">
+          <div class="terminal-line">
+            <span class="green">decl</span>
+            <span>crates/server/src/auth/layer.rs:18..44</span>
+          </div>
+          <div class="terminal-line">
+            <span class="cyan">callers</span>
+            <span>router.rs:62, session.rs:101, tests/auth_flow.rs:29</span>
+          </div>
+          <div class="terminal-line">
+            <span class="amber">tests</span>
+            <span>3 paired by module path and proximity</span>
+          </div>
+          <div class="terminal-line">
+            <span class="muted">fallback</span>
+            <span>uncertain edge; bounded text check suggested</span>
+          </div>
+        </div>
+      </TerminalWindow>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">what gets cheaper</span>
+      <h2>Less paid search. More local evidence.</h2>
+    </div>
+    <div class="grid-3">
+      <article class="card">
+        <h3>Repeated reads</h3>
+        <p>Receipts let unchanged file ranges come back as compact references instead of full text.</p>
+      </article>
+      <article class="card">
+        <h3>Broad search</h3>
+        <p>Local structure narrows the target before grep or raw reads enter the loop.</p>
+      </article>
+      <article class="card">
+        <h3>Tool chatter</h3>
+        <p>Intent-level tools answer "who owns this" and "what breaks" without shell archaeology.</p>
+      </article>
+    </div>
+  </section>
+</BaseLayout>
