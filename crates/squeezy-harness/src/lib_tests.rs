@@ -1,4 +1,5 @@
 use super::*;
+use squeezy_llm::{LlmInputItem, LlmToolCall};
 
 #[test]
 fn parses_task_toml_with_provider_traces() {
@@ -143,4 +144,102 @@ async fn mock_runner_uses_trace_events_and_scores_correctness() {
     assert_eq!(result.status, TaskStatus::Passed);
     assert_eq!(result.metrics.input_tokens, Some(3));
     assert_eq!(result.metrics.output_tokens, Some(1));
+}
+
+#[tokio::test]
+async fn agent_runner_scopes_tools_to_materialized_workspace_and_counts_tool_cost() {
+    let suffix = unique_suffix();
+    let path = format!("src/generated-{suffix}.rs");
+    let marker = format!("harness_marker_{suffix}");
+    let task = TaskSpec {
+        id: "tool-workspace".to_string(),
+        title: "Tool workspace".to_string(),
+        prompt: "Find the generated marker".to_string(),
+        workspace: WorkspaceSpec {
+            files: vec![WorkspaceFile {
+                path: path.clone(),
+                content: format!("pub fn generated() {{ /* {marker} */ }}\n"),
+            }],
+        },
+        expect: ExpectSpec {
+            contains: vec![path.clone()],
+        },
+        mock: None,
+        baseline: None,
+    };
+    let provider = Arc::new(ToolUsingProvider::new(marker, path.clone()));
+    let config = AppConfig {
+        workspace_root: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        ..Default::default()
+    };
+
+    let output = run_agent_with_config(&task, RunnerKind::MockOpenai, provider, config)
+        .await
+        .expect("agent run");
+
+    assert!(output.final_answer.contains(&path));
+    assert_eq!(output.metrics.tool_calls, 1);
+    assert!(output.metrics.files_scanned >= 1);
+    assert!(output.metrics.bytes_read > 0);
+    assert_eq!(output.metrics.matches_returned, 1);
+}
+
+#[derive(Debug)]
+struct ToolUsingProvider {
+    marker: String,
+    path: String,
+}
+
+impl ToolUsingProvider {
+    fn new(marker: String, path: String) -> Self {
+        Self { marker, path }
+    }
+}
+
+impl LlmProvider for ToolUsingProvider {
+    fn name(&self) -> &'static str {
+        "tool-using-provider"
+    }
+
+    fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        let tool_output = request.input.iter().find_map(|item| match item {
+            LlmInputItem::FunctionCallOutput { output, .. } => Some(output.as_str()),
+            _ => None,
+        });
+        let events = if let Some(output) = tool_output {
+            let answer = if output.contains(&self.path)
+                && output.contains(&self.marker)
+                && output.contains("\"status\":\"Success\"")
+            {
+                format!("found {}", self.path)
+            } else {
+                format!("missing fixture output: {output}")
+            };
+            vec![
+                Ok(LlmEvent::TextDelta(answer)),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_2".to_string()),
+                    cost: CostSnapshot::default(),
+                }),
+            ]
+        } else {
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "grep_1".to_string(),
+                    name: "grep".to_string(),
+                    arguments: json!({
+                        "pattern": self.marker,
+                        "include": ["*.rs"],
+                        "output_mode": "content"
+                    }),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_1".to_string()),
+                    cost: CostSnapshot::default(),
+                }),
+            ]
+        };
+        Box::pin(stream::iter(events))
+    }
 }

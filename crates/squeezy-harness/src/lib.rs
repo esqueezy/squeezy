@@ -433,6 +433,7 @@ async fn run_agent_with_config(
     mut config: AppConfig,
 ) -> Result<RunnerOutput> {
     let root = materialize_workspace(task)?;
+    config.workspace_root = root.clone();
     let workspace_note = format!(
         "\n\nWorkspace root for this task: {}",
         root.to_string_lossy()
@@ -495,9 +496,12 @@ async fn run_agent_with_config(
             AgentEvent::ToolCallQueued { .. } => {
                 metrics.tool_calls += 1;
             }
-            AgentEvent::ToolCallStarted { .. }
-            | AgentEvent::ToolCallCompleted { .. }
-            | AgentEvent::ApprovalRequested { .. } => {}
+            AgentEvent::ToolCallCompleted { result, .. } => {
+                metrics.files_scanned += result.cost_hint.files_scanned;
+                metrics.bytes_read += result.cost_hint.bytes_read;
+                metrics.matches_returned += result.cost_hint.matches_returned;
+            }
+            AgentEvent::ToolCallStarted { .. } | AgentEvent::ApprovalRequested { .. } => {}
         }
     }
     let _ = fs::remove_dir_all(&root);
