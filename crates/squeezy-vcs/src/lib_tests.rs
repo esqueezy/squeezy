@@ -68,6 +68,59 @@ fn branch_mode_snapshot_reports_files_changed_since_default_branch() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn checkpoint_rollback_restores_modified_added_and_deleted_files() {
+    let root = temp_repo("checkpoint_restore");
+    fs::write(root.join("a.txt"), "A\n").expect("write a");
+    fs::write(root.join("b.txt"), "B\n").expect("write b");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(root.join("a.txt"), "A2\n").expect("modify a");
+    fs::write(root.join("c.txt"), "C\n").expect("write c");
+    fs::remove_file(root.join("b.txt")).expect("remove b");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success")
+        .expect("create checkpoint")
+        .expect("checkpoint");
+
+    assert_eq!(record.summary.files_changed, 3);
+    let rollback = store
+        .rollback(RollbackTarget::Latest)
+        .expect("rollback latest");
+
+    assert!(rollback.conflicts.is_empty());
+    assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A\n");
+    assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "B\n");
+    assert!(!root.join("c.txt").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn checkpoint_rollback_reports_conflicts_without_overwriting_user_changes() {
+    let root = temp_repo("checkpoint_conflict");
+    fs::write(root.join("a.txt"), "A\n").expect("write a");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(root.join("a.txt"), "agent\n").expect("agent edit");
+    store
+        .create_checkpoint(&before, "write_file", "call", "turn-1", "success")
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    fs::write(root.join("a.txt"), "user\n").expect("user edit");
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest)
+        .expect("rollback latest");
+
+    assert_eq!(rollback.conflicts.len(), 1);
+    assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "user\n");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn temp_repo(name: &str) -> PathBuf {
     let base = SystemTime::now()
         .duration_since(UNIX_EPOCH)

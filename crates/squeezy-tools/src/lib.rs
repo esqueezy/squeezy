@@ -32,7 +32,10 @@ use squeezy_graph::{
     DirtyAnnotation, DirtyRange, GraphManager, GraphSymbol, ReferenceHit, SignatureQuery,
 };
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog};
-use squeezy_vcs::{DiffFile, DiffFileStatus, DiffMode, DiffOptions, DiffSnapshot, GitVcs};
+use squeezy_vcs::{
+    CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions,
+    DiffSnapshot, GitVcs, RollbackTarget,
+};
 use squeezy_workspace::{
     CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexCoverage, IndexingPolicy,
 };
@@ -376,6 +379,7 @@ pub struct ToolRegistry {
     http: Arc<dyn WebHttpClient>,
     graph: Arc<StdMutex<Option<GraphManager>>>,
     vcs: Arc<GitVcs>,
+    checkpoints: Arc<CheckpointStore>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
     skills: Arc<SkillCatalog>,
     redactor: Arc<Redactor>,
@@ -507,6 +511,7 @@ impl ToolRegistry {
             GraphManager::open_with_crawl_options(&root, Default::default(), crawl_options.clone())
                 .ok();
         let vcs = GitVcs::open(&root)?;
+        let checkpoints = CheckpointStore::open(&root)?;
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -514,6 +519,7 @@ impl ToolRegistry {
             http,
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
+            checkpoints: Arc::new(checkpoints),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(skills),
             redactor,
@@ -540,6 +546,7 @@ impl ToolRegistry {
             GraphManager::open_with_crawl_options(&root, Default::default(), crawl_options.clone())
                 .ok();
         let vcs = GitVcs::open(&root)?;
+        let checkpoints = CheckpointStore::open(&root)?;
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -547,6 +554,7 @@ impl ToolRegistry {
             http,
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
+            checkpoints: Arc::new(checkpoints),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(SkillCatalog::empty()),
             redactor: Arc::new(Redactor::default()),
@@ -618,6 +626,9 @@ impl ToolRegistry {
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = vec![
+            checkpoint_list_spec(),
+            checkpoint_revert_spec(),
+            checkpoint_undo_spec(),
             diff_context_spec(),
             glob_spec(),
             grep_spec(),
@@ -638,6 +649,7 @@ impl ToolRegistry {
 
     pub fn permission_scope(&self, call: &ToolCall) -> PermissionScope {
         match call.name.as_str() {
+            "checkpoint_undo" | "checkpoint_revert" => PermissionScope::Edit,
             "write_file" => PermissionScope::Edit,
             "shell" | "verify" => PermissionScope::Shell,
             "webfetch" | "websearch" => PermissionScope::Web,
@@ -646,8 +658,10 @@ impl ToolRegistry {
             "read_file" if self.read_file_targets_ignored_policy(&call.arguments) => {
                 PermissionScope::IgnoredSearch
             }
-            "diff_context" | "glob" | "grep" | "read_file" | "read_tool_output"
-            | "symbol_context" | "list_skills" | "load_skill" => PermissionScope::Read,
+            "checkpoint_list" | "diff_context" | "glob" | "grep" | "read_file"
+            | "read_tool_output" | "symbol_context" | "list_skills" | "load_skill" => {
+                PermissionScope::Read
+            }
             _ => PermissionScope::Read,
         }
     }
@@ -657,6 +671,11 @@ impl ToolRegistry {
         let mut suggested_rules = Vec::new();
         let summary = self.describe_call(call);
         let (capability, target, risk) = match call.name.as_str() {
+            "checkpoint_undo" | "checkpoint_revert" => (
+                PermissionCapability::Edit,
+                "checkpoint:*".to_string(),
+                PermissionRisk::High,
+            ),
             "write_file" => {
                 let args = serde_json::from_value::<WriteFileArgs>(call.arguments.clone()).ok();
                 let path = args.as_ref().map(|args| args.path.as_str()).unwrap_or("*");
@@ -758,8 +777,8 @@ impl ToolRegistry {
                 "workspace:*".to_string(),
                 PermissionRisk::Low,
             ),
-            "diff_context" | "read_file" | "read_tool_output" | "symbol_context"
-            | "list_skills" | "load_skill" => (
+            "checkpoint_list" | "diff_context" | "read_file" | "read_tool_output"
+            | "symbol_context" | "list_skills" | "load_skill" => (
                 PermissionCapability::Read,
                 "workspace:*".to_string(),
                 PermissionRisk::Low,
@@ -785,7 +804,8 @@ impl ToolRegistry {
     pub fn is_parallel_safe(&self, call: &ToolCall) -> bool {
         matches!(
             call.name.as_str(),
-            "diff_context"
+            "checkpoint_list"
+                | "diff_context"
                 | "glob"
                 | "grep"
                 | "read_file"
@@ -800,6 +820,21 @@ impl ToolRegistry {
 
     pub fn describe_call(&self, call: &ToolCall) -> String {
         match call.name.as_str() {
+            "checkpoint_list" => "checkpoint_list".to_string(),
+            "checkpoint_undo" => "checkpoint_undo".to_string(),
+            "checkpoint_revert" => {
+                let args =
+                    serde_json::from_value::<CheckpointRevertArgs>(call.arguments.clone()).ok();
+                let group_id = args
+                    .as_ref()
+                    .and_then(|args| args.group_id.as_deref())
+                    .unwrap_or("?");
+                let checkpoint_id = args
+                    .as_ref()
+                    .and_then(|args| args.checkpoint_id.as_deref())
+                    .unwrap_or("?");
+                format!("checkpoint_revert group_id={group_id:?} checkpoint_id={checkpoint_id:?}")
+            }
             "glob" => {
                 let args = serde_json::from_value::<GlobArgs>(call.arguments.clone()).ok();
                 let pattern = args
@@ -925,20 +960,33 @@ impl ToolRegistry {
     }
 
     pub async fn execute(&self, call: ToolCall, cancel: CancellationToken) -> ToolResult {
+        self.execute_for_group(call, cancel, "manual".to_string())
+            .await
+    }
+
+    pub async fn execute_for_group(
+        &self,
+        call: ToolCall,
+        cancel: CancellationToken,
+        group_id: String,
+    ) -> ToolResult {
         if cancel.is_cancelled() {
             return ToolResult::cancelled(&call);
         }
 
         let result = match call.name.as_str() {
+            "checkpoint_list" => self.execute_checkpoint_list(&call).await,
+            "checkpoint_undo" => self.execute_checkpoint_undo(&call).await,
+            "checkpoint_revert" => self.execute_checkpoint_revert(&call).await,
             "diff_context" => self.execute_diff_context(&call).await,
             "glob" => self.execute_glob(&call, cancel).await,
             "grep" => self.execute_grep(&call, cancel).await,
             "read_file" => self.execute_read_file(&call).await,
             "read_tool_output" => self.execute_read_tool_output(&call).await,
             "symbol_context" => self.execute_symbol_context(&call).await,
-            "verify" => self.execute_verify(&call, cancel).await,
-            "write_file" => self.execute_write_file(&call).await,
-            "shell" => self.execute_shell(&call, cancel).await,
+            "verify" => self.execute_verify(&call, cancel, &group_id).await,
+            "write_file" => self.execute_write_file(&call, &group_id).await,
+            "shell" => self.execute_shell(&call, cancel, &group_id).await,
             "webfetch" => self.execute_webfetch(&call, cancel).await,
             "websearch" => self.execute_websearch(&call, cancel).await,
             "list_skills" => self.execute_list_skills(&call).await,
@@ -956,6 +1004,87 @@ impl ToolRegistry {
             result
         } else {
             self.finalize_result(result)
+        }
+    }
+
+    async fn execute_checkpoint_list(&self, call: &ToolCall) -> ToolResult {
+        if let Err(err) = serde_json::from_value::<CheckpointListArgs>(call.arguments.clone()) {
+            return tool_arg_error(call, err);
+        }
+        match self.checkpoints.list_checkpoints() {
+            Ok(mut checkpoints) => {
+                checkpoints.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+                make_result(
+                    call,
+                    ToolStatus::Success,
+                    json!({
+                        "checkpoints": checkpoints,
+                    }),
+                    ToolCostHint {
+                        matches_returned: checkpoints.len() as u64,
+                        ..ToolCostHint::default()
+                    },
+                    None,
+                )
+            }
+            Err(err) => tool_error(call, err),
+        }
+    }
+
+    async fn execute_checkpoint_undo(&self, call: &ToolCall) -> ToolResult {
+        if let Err(err) = serde_json::from_value::<CheckpointUndoArgs>(call.arguments.clone()) {
+            return tool_arg_error(call, err);
+        }
+        match self.checkpoints.rollback(RollbackTarget::Latest) {
+            Ok(result) => {
+                self.invalidate_diff_cache();
+                make_result(
+                    call,
+                    if result.conflicts.is_empty() {
+                        ToolStatus::Success
+                    } else {
+                        ToolStatus::Stale
+                    },
+                    json!({ "rollback": result }),
+                    ToolCostHint::default(),
+                    None,
+                )
+            }
+            Err(err) => tool_error(call, err),
+        }
+    }
+
+    async fn execute_checkpoint_revert(&self, call: &ToolCall) -> ToolResult {
+        let args = match serde_json::from_value::<CheckpointRevertArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let target = match (args.group_id.as_deref(), args.checkpoint_id.as_deref()) {
+            (Some(group_id), None) => RollbackTarget::Group(group_id),
+            (None, Some(checkpoint_id)) => RollbackTarget::Checkpoint(checkpoint_id),
+            _ => {
+                return tool_error(
+                    call,
+                    "provide exactly one of group_id or checkpoint_id for checkpoint_revert",
+                );
+            }
+        };
+        match self.checkpoints.rollback(target) {
+            Ok(result) => {
+                self.invalidate_diff_cache();
+                make_result(
+                    call,
+                    if result.conflicts.is_empty() {
+                        ToolStatus::Success
+                    } else {
+                        ToolStatus::Stale
+                    },
+                    json!({ "rollback": result }),
+                    ToolCostHint::default(),
+                    None,
+                )
+            }
+            Err(err) => tool_error(call, err),
         }
     }
 
@@ -1704,7 +1833,12 @@ impl ToolRegistry {
         )
     }
 
-    async fn execute_verify(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
+    async fn execute_verify(
+        &self,
+        call: &ToolCall,
+        cancel: CancellationToken,
+        group_id: &str,
+    ) -> ToolResult {
         let args = match serde_json::from_value::<VerifyArgs>(call.arguments.clone()) {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
@@ -1766,7 +1900,7 @@ impl ToolRegistry {
             }),
         };
         let shell_result = self
-            .execute_shell_capped(&shell_call, cancel, VERIFY_SHELL_TIMEOUT_MS)
+            .execute_shell_capped(&shell_call, cancel, VERIFY_SHELL_TIMEOUT_MS, group_id)
             .await;
         let mut content = shell_result.content;
         if let Some(object) = content.as_object_mut() {
@@ -1783,7 +1917,7 @@ impl ToolRegistry {
         )
     }
 
-    async fn execute_write_file(&self, call: &ToolCall) -> ToolResult {
+    async fn execute_write_file(&self, call: &ToolCall, group_id: &str) -> ToolResult {
         let args = match serde_json::from_value::<WriteFileArgs>(call.arguments.clone()) {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
@@ -1803,6 +1937,10 @@ impl ToolRegistry {
             );
         }
 
+        let checkpoint_before = match self.checkpoints.track_tree() {
+            Ok(tree) => tree,
+            Err(err) => return tool_error(call, err),
+        };
         let before = fs::read(&path).ok();
         let before_sha256 = before.as_ref().map(sha256_hex);
         if before.is_some() && args.expected_sha256.as_deref() != before_sha256.as_deref() {
@@ -1836,7 +1974,7 @@ impl ToolRegistry {
             ..ToolCostHint::default()
         };
 
-        make_result(
+        let mut result = make_result(
             call,
             ToolStatus::Success,
             json!({
@@ -1847,11 +1985,18 @@ impl ToolRegistry {
             }),
             cost,
             Some(after_sha256),
-        )
+        );
+        self.attach_checkpoint(&mut result, &checkpoint_before, call, group_id);
+        result
     }
 
-    async fn execute_shell(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
-        self.execute_shell_capped(call, cancel, MAX_SHELL_TIMEOUT_MS)
+    async fn execute_shell(
+        &self,
+        call: &ToolCall,
+        cancel: CancellationToken,
+        group_id: &str,
+    ) -> ToolResult {
+        self.execute_shell_capped(call, cancel, MAX_SHELL_TIMEOUT_MS, group_id)
             .await
     }
 
@@ -1860,6 +2005,7 @@ impl ToolRegistry {
         call: &ToolCall,
         cancel: CancellationToken,
         max_timeout_ms: u64,
+        group_id: &str,
     ) -> ToolResult {
         let args = match serde_json::from_value::<ShellArgs>(call.arguments.clone()) {
             Ok(args) => args,
@@ -1877,6 +2023,10 @@ impl ToolRegistry {
             .output_byte_cap
             .unwrap_or(DEFAULT_SHELL_OUTPUT_BYTE_CAP)
             .min(128_000);
+        let checkpoint_before = match self.checkpoints.track_tree() {
+            Ok(tree) => tree,
+            Err(err) => return tool_error(call, err),
+        };
 
         let mut command = Command::new("sh");
         command
@@ -1945,7 +2095,7 @@ impl ToolRegistry {
         let error = timed_out.then(|| format!("shell command timed out after {timeout_ms} ms"));
         self.invalidate_diff_cache();
 
-        make_result(
+        let mut result = make_result(
             call,
             status,
             json!({
@@ -1959,7 +2109,9 @@ impl ToolRegistry {
             }),
             cost,
             None,
-        )
+        );
+        self.attach_checkpoint(&mut result, &checkpoint_before, call, group_id);
+        result
     }
 
     async fn execute_websearch(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
@@ -2258,10 +2410,76 @@ impl ToolRegistry {
             .to_path_buf()
     }
 
+    fn attach_checkpoint(
+        &self,
+        result: &mut ToolResult,
+        before_tree: &str,
+        call: &ToolCall,
+        group_id: &str,
+    ) {
+        let status = match result.status {
+            ToolStatus::Success => "success",
+            ToolStatus::Error => "error",
+            ToolStatus::Denied => "denied",
+            ToolStatus::Stale => "stale",
+            ToolStatus::Cancelled => "cancelled",
+        };
+        let checkpoint = match self.checkpoints.create_checkpoint(
+            before_tree,
+            &call.name,
+            &call.call_id,
+            group_id,
+            status,
+        ) {
+            Ok(checkpoint) => checkpoint,
+            Err(err) => {
+                insert_content_field(
+                    &mut result.content,
+                    "checkpoint_error",
+                    json!(err.to_string()),
+                );
+                refresh_result_receipt(result);
+                return;
+            }
+        };
+        if let Some(checkpoint) = checkpoint {
+            insert_content_field(
+                &mut result.content,
+                "checkpoint",
+                checkpoint_json(&checkpoint),
+            );
+            refresh_result_receipt(result);
+        }
+    }
+
     fn finalize_result(&self, result: ToolResult) -> ToolResult {
         self.output_store
             .maybe_spill(redact_tool_result(result, &self.redactor))
     }
+}
+
+fn insert_content_field(content: &mut Value, key: &str, value: Value) {
+    if let Some(object) = content.as_object_mut() {
+        object.insert(key.to_string(), value);
+    }
+}
+
+fn checkpoint_json(record: &CheckpointRecord) -> Value {
+    json!({
+        "id": record.id,
+        "group_id": record.group_id,
+        "tool_name": record.tool_name,
+        "call_id": record.call_id,
+        "status": record.status,
+        "summary": record.summary,
+        "files": record.files,
+    })
+}
+
+fn refresh_result_receipt(result: &mut ToolResult) {
+    let output = serde_json::to_vec(&result.content).unwrap_or_default();
+    result.cost_hint.output_bytes = result.cost_hint.output_bytes.max(output.len() as u64);
+    result.receipt.output_sha256 = sha256_hex(&output);
 }
 
 fn redact_tool_result(mut result: ToolResult, redactor: &Redactor) -> ToolResult {
@@ -2852,6 +3070,18 @@ struct DiffContextArgs {
     max_symbols_per_file: Option<usize>,
     max_references_per_symbol: Option<usize>,
     max_patch_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckpointListArgs {}
+
+#[derive(Debug, Deserialize)]
+struct CheckpointUndoArgs {}
+
+#[derive(Debug, Deserialize)]
+struct CheckpointRevertArgs {
+    group_id: Option<String>,
+    checkpoint_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3497,6 +3727,45 @@ pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
         output.push_str(&format!("{byte:02x}"));
     }
     output
+}
+
+fn checkpoint_list_spec() -> ToolSpec {
+    ToolSpec {
+        name: "checkpoint_list".to_string(),
+        description: "List recent recoverable checkpoints created by mutation tools.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {}
+        }),
+    }
+}
+
+fn checkpoint_undo_spec() -> ToolSpec {
+    ToolSpec {
+        name: "checkpoint_undo".to_string(),
+        description: "Undo the latest checkpoint if touched files still match the checkpoint after-state; conflicts are reported without overwriting user changes.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {}
+        }),
+    }
+}
+
+fn checkpoint_revert_spec() -> ToolSpec {
+    ToolSpec {
+        name: "checkpoint_revert".to_string(),
+        description: "Revert either a checkpoint_id or all checkpoints in a group_id. Provide exactly one identifier. Conflicts are reported without overwriting user changes.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "group_id": {"type": "string", "description": "Checkpoint group id, usually the agent turn id."},
+                "checkpoint_id": {"type": "string", "description": "Specific checkpoint id to revert."}
+            }
+        }),
+    }
 }
 
 fn diff_context_spec() -> ToolSpec {

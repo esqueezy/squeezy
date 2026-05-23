@@ -915,6 +915,190 @@ async fn write_file_rejects_stale_expected_hash() {
 }
 
 #[tokio::test]
+async fn write_file_creates_checkpoint_and_checkpoint_undo_restores_file() {
+    let root = temp_workspace("checkpoint_write_undo");
+    fs::write(root.join("sample.txt"), "before").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "write".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "content": "after",
+                    "expected_sha256": sha256_hex("before".as_bytes()),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-1".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["checkpoint"]["group_id"], "turn-1");
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "after"
+    );
+
+    let undo = registry
+        .execute(
+            ToolCall {
+                call_id: "undo".to_string(),
+                name: "checkpoint_undo".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(undo.status, ToolStatus::Success);
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "before"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_created_file_is_checkpointed_and_deleted_on_undo() {
+    let root = temp_workspace("checkpoint_shell_undo");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "shell".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf created > created.txt",
+                    "description": "create file"
+                }),
+            },
+            CancellationToken::new(),
+            "turn-2".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["checkpoint"]["group_id"], "turn-2");
+    assert!(root.join("created.txt").exists());
+
+    let undo = registry
+        .execute(
+            ToolCall {
+                call_id: "undo".to_string(),
+                name: "checkpoint_undo".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(undo.status, ToolStatus::Success);
+    assert!(!root.join("created.txt").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn checkpoint_undo_reports_conflict_and_preserves_dirty_user_change() {
+    let root = temp_workspace("checkpoint_conflict");
+    fs::write(root.join("sample.txt"), "before").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "write".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "content": "agent",
+                    "expected_sha256": sha256_hex("before".as_bytes()),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-3".to_string(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    fs::write(root.join("sample.txt"), "user").expect("user edit");
+
+    let undo = registry
+        .execute(
+            ToolCall {
+                call_id: "undo".to_string(),
+                name: "checkpoint_undo".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(undo.status, ToolStatus::Stale);
+    assert_eq!(
+        undo.content["rollback"]["conflicts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(fs::read_to_string(root.join("sample.txt")).unwrap(), "user");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn checkpoint_revert_group_restores_multiple_actions_in_reverse_order() {
+    let root = temp_workspace("checkpoint_group_revert");
+    fs::write(root.join("sample.txt"), "one").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    for (call_id, before, after) in [("write1", "one", "two"), ("write2", "two", "three")] {
+        let result = registry
+            .execute_for_group(
+                ToolCall {
+                    call_id: call_id.to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({
+                        "path": "sample.txt",
+                        "content": after,
+                        "expected_sha256": sha256_hex(before.as_bytes()),
+                    }),
+                },
+                CancellationToken::new(),
+                "turn-group".to_string(),
+            )
+            .await;
+        assert_eq!(result.status, ToolStatus::Success);
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "three"
+    );
+
+    let revert = registry
+        .execute(
+            ToolCall {
+                call_id: "revert".to_string(),
+                name: "checkpoint_revert".to_string(),
+                arguments: json!({"group_id": "turn-group"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(revert.status, ToolStatus::Success);
+    assert_eq!(fs::read_to_string(root.join("sample.txt")).unwrap(), "one");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn shell_returns_bounded_output_and_exit_code() {
     let root = temp_workspace("shell");
     let registry = ToolRegistry::new(&root).expect("registry");
@@ -1745,6 +1929,9 @@ fn tool_specs_are_sorted_by_name() {
     assert_eq!(
         names,
         vec![
+            "checkpoint_list",
+            "checkpoint_revert",
+            "checkpoint_undo",
             "diff_context",
             "glob",
             "grep",

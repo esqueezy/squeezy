@@ -1,10 +1,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Output},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use squeezy_core::{Result, SqueezyError};
 
 pub const CRATE_NAME: &str = "squeezy-vcs";
@@ -17,6 +22,13 @@ pub fn crate_name() -> &'static str {
 #[derive(Debug, Clone)]
 pub struct GitVcs {
     root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointStore {
+    root: PathBuf,
+    git_dir: PathBuf,
+    journal_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -110,6 +122,58 @@ pub struct DiffHunk {
     pub new_lines: u32,
     pub start_line: u32,
     pub end_line: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointRecord {
+    pub id: String,
+    pub group_id: String,
+    pub tool_name: String,
+    pub call_id: String,
+    pub status: String,
+    pub before_tree: String,
+    pub after_tree: String,
+    pub files: Vec<CheckpointFile>,
+    pub summary: DiffSummary,
+    pub created_at_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointFile {
+    pub path: String,
+    pub status: DiffFileStatus,
+    pub before_sha256: Option<String>,
+    pub after_sha256: Option<String>,
+    pub additions: u64,
+    pub deletions: u64,
+    pub binary: bool,
+    pub patch: Option<String>,
+    pub patch_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackResult {
+    pub checkpoint_ids: Vec<String>,
+    pub restored_files: Vec<String>,
+    pub deleted_files: Vec<String>,
+    pub conflicts: Vec<RollbackConflict>,
+    pub skipped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackConflict {
+    pub checkpoint_id: String,
+    pub path: String,
+    pub expected_sha256: Option<String>,
+    pub current_sha256: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackTarget<'a> {
+    Latest,
+    Group(&'a str),
+    Checkpoint(&'a str),
 }
 
 impl GitVcs {
@@ -294,6 +358,7 @@ impl GitVcs {
                 "-z",
                 "--",
                 ".",
+                ":(exclude).squeezy",
             ],
         ) {
             Ok(output) => output,
@@ -342,6 +407,7 @@ impl GitVcs {
                 refish,
                 "--",
                 ".",
+                ":(exclude).squeezy",
             ],
         ) {
             Ok(output) => output,
@@ -389,6 +455,7 @@ impl GitVcs {
                 refish,
                 "--",
                 ".",
+                ":(exclude).squeezy",
             ],
         ) {
             Ok(output) => output,
@@ -456,6 +523,346 @@ impl GitVcs {
     }
 }
 
+impl CheckpointStore {
+    pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root
+            .as_ref()
+            .canonicalize()
+            .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
+        let dir = root.join(".squeezy").join("checkpoints");
+        let git_dir = dir.join("git");
+        let journal_path = dir.join("journal.jsonl");
+        fs::create_dir_all(&git_dir)?;
+        let store = Self {
+            root,
+            git_dir,
+            journal_path,
+        };
+        store.ensure_shadow_repo()?;
+        Ok(store)
+    }
+
+    pub fn track_tree(&self) -> Result<String> {
+        self.ensure_shadow_repo()?;
+        self.git_vec(vec![
+            "add".to_string(),
+            "--all".to_string(),
+            "--".to_string(),
+            ".".to_string(),
+            ":(exclude).squeezy".to_string(),
+        ])?;
+        let output = self.git(["write-tree"])?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    pub fn create_checkpoint(
+        &self,
+        before_tree: &str,
+        tool_name: &str,
+        call_id: &str,
+        group_id: &str,
+        status: &str,
+    ) -> Result<Option<CheckpointRecord>> {
+        let after_tree = self.track_tree()?;
+        if before_tree == after_tree {
+            return Ok(None);
+        }
+        let files = self.checkpoint_files(before_tree, &after_tree)?;
+        if files.is_empty() {
+            return Ok(None);
+        }
+        let mut summary = DiffSummary {
+            files_changed: files.len(),
+            ..DiffSummary::default()
+        };
+        for file in &files {
+            summary.additions += file.additions;
+            summary.deletions += file.deletions;
+            if file.before_sha256.is_none() && file.after_sha256.is_some() {
+                summary.untracked_files += 1;
+            }
+            if file.binary {
+                summary.binary_files += 1;
+            }
+        }
+        let record = CheckpointRecord {
+            id: checkpoint_id(),
+            group_id: group_id.to_string(),
+            tool_name: tool_name.to_string(),
+            call_id: call_id.to_string(),
+            status: status.to_string(),
+            before_tree: before_tree.to_string(),
+            after_tree,
+            files,
+            summary,
+            created_at_ms: now_ms(),
+        };
+        self.append_journal(json!({
+            "kind": "checkpoint",
+            "record": record,
+        }))?;
+        Ok(Some(record))
+    }
+
+    pub fn list_checkpoints(&self) -> Result<Vec<CheckpointRecord>> {
+        let text = match fs::read_to_string(&self.journal_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+        let mut records = Vec::new();
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if value.get("kind").and_then(|kind| kind.as_str()) != Some("checkpoint") {
+                continue;
+            }
+            if let Some(record) = value.get("record")
+                && let Ok(record) = serde_json::from_value::<CheckpointRecord>(record.clone())
+            {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    pub fn rollback(&self, target: RollbackTarget<'_>) -> Result<RollbackResult> {
+        let records = self.list_checkpoints()?;
+        let mut selected = match target {
+            RollbackTarget::Latest => records.into_iter().rev().take(1).collect::<Vec<_>>(),
+            RollbackTarget::Group(group_id) => records
+                .into_iter()
+                .filter(|record| record.group_id == group_id)
+                .collect::<Vec<_>>(),
+            RollbackTarget::Checkpoint(id) => records
+                .into_iter()
+                .filter(|record| record.id == id)
+                .collect::<Vec<_>>(),
+        };
+        if selected.is_empty() {
+            return Ok(RollbackResult {
+                checkpoint_ids: Vec::new(),
+                restored_files: Vec::new(),
+                deleted_files: Vec::new(),
+                conflicts: Vec::new(),
+                skipped: true,
+            });
+        }
+        selected.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+
+        let mut result = RollbackResult {
+            checkpoint_ids: selected.iter().map(|record| record.id.clone()).collect(),
+            restored_files: Vec::new(),
+            deleted_files: Vec::new(),
+            conflicts: Vec::new(),
+            skipped: false,
+        };
+        for record in &selected {
+            self.rollback_record(record, &mut result)?;
+        }
+        self.track_tree()?;
+        self.append_journal(json!({
+            "kind": "rollback",
+            "created_at_ms": now_ms(),
+            "result": result,
+        }))?;
+        Ok(result)
+    }
+
+    fn checkpoint_files(&self, before_tree: &str, after_tree: &str) -> Result<Vec<CheckpointFile>> {
+        let mut statuses = BTreeMap::<String, DiffFileStatus>::new();
+        let output = self.git_vec(vec![
+            "diff".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-renames".to_string(),
+            "--name-status".to_string(),
+            "-z".to_string(),
+            before_tree.to_string(),
+            after_tree.to_string(),
+            "--".to_string(),
+            ".".to_string(),
+        ])?;
+        let fields = nul_fields(&output.stdout);
+        let mut index = 0usize;
+        while index + 1 < fields.len() {
+            let code = fields[index].clone();
+            let path = fields[index + 1].clone();
+            statuses.insert(path, status_kind(&code));
+            index += 2;
+        }
+
+        let mut stats = BTreeMap::<String, FileStat>::new();
+        let output = self.git_vec(vec![
+            "diff".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-renames".to_string(),
+            "--numstat".to_string(),
+            "-z".to_string(),
+            before_tree.to_string(),
+            after_tree.to_string(),
+            "--".to_string(),
+            ".".to_string(),
+        ])?;
+        stats.extend(parse_numstat(&output.stdout));
+
+        let mut files = Vec::new();
+        for (path, status) in statuses {
+            let stat = stats.get(&path).copied().unwrap_or(FileStat {
+                additions: 0,
+                deletions: 0,
+                binary: false,
+            });
+            let patch = self.diff_patch(before_tree, after_tree, &path)?;
+            let before = self.blob_bytes(before_tree, &path).ok();
+            let after = self.blob_bytes(after_tree, &path).ok();
+            files.push(CheckpointFile {
+                path,
+                status,
+                before_sha256: before.as_deref().map(sha256_hex),
+                after_sha256: after.as_deref().map(sha256_hex),
+                additions: stat.additions,
+                deletions: stat.deletions,
+                binary: stat.binary,
+                patch: (!stat.binary).then_some(patch.text),
+                patch_truncated: patch.truncated,
+            });
+        }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(files)
+    }
+
+    fn rollback_record(
+        &self,
+        record: &CheckpointRecord,
+        result: &mut RollbackResult,
+    ) -> Result<()> {
+        for file in &record.files {
+            let path = self.root.join(&file.path);
+            let current_sha256 = if path.exists() {
+                Some(sha256_hex(&fs::read(&path)?))
+            } else {
+                None
+            };
+            if current_sha256 != file.after_sha256 {
+                result.conflicts.push(RollbackConflict {
+                    checkpoint_id: record.id.clone(),
+                    path: file.path.clone(),
+                    expected_sha256: file.after_sha256.clone(),
+                    current_sha256,
+                    reason: "file changed after checkpoint; leaving current content untouched"
+                        .to_string(),
+                });
+                continue;
+            }
+
+            match self.blob_bytes(&record.before_tree, &file.path) {
+                Ok(bytes) => {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&path, bytes)?;
+                    result.restored_files.push(file.path.clone());
+                }
+                Err(_) => {
+                    if path.exists() {
+                        fs::remove_file(&path)?;
+                    }
+                    result.deleted_files.push(file.path.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_shadow_repo(&self) -> Result<()> {
+        if !self.git_dir.join("HEAD").exists() {
+            fs::create_dir_all(&self.git_dir)?;
+            self.git_raw(["init"])?;
+            self.git_raw(["config", "core.autocrlf", "false"])?;
+            self.git_raw(["config", "core.fsmonitor", "false"])?;
+            self.git_raw(["config", "core.quotepath", "false"])?;
+        }
+        let exclude = self.git_dir.join("info").join("exclude");
+        if !exclude.exists() {
+            if let Some(parent) = exclude.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(exclude, "/.squeezy/\n")?;
+        }
+        Ok(())
+    }
+
+    fn diff_patch(&self, before_tree: &str, after_tree: &str, path: &str) -> Result<Patch> {
+        let output = self.git_vec_allow_status(
+            vec![
+                "diff".to_string(),
+                "--patch".to_string(),
+                "--no-ext-diff".to_string(),
+                "--no-renames".to_string(),
+                "--unified=3".to_string(),
+                before_tree.to_string(),
+                after_tree.to_string(),
+                "--".to_string(),
+                path.to_string(),
+            ],
+            &[0],
+        )?;
+        Ok(capped_patch(output.stdout, DEFAULT_MAX_PATCH_BYTES))
+    }
+
+    fn blob_bytes(&self, tree: &str, path: &str) -> std::result::Result<Vec<u8>, String> {
+        self.git_vec(vec!["show".to_string(), format!("{tree}:{path}")])
+            .map(|output| output.stdout)
+            .map_err(|err| err.to_string())
+    }
+
+    fn append_journal(&self, value: serde_json::Value) -> Result<()> {
+        if let Some(parent) = self.journal_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.journal_path)?;
+        serde_json::to_writer(&mut file, &value).map_err(|err| {
+            SqueezyError::Tool(format!("failed to write checkpoint journal: {err}"))
+        })?;
+        file.write_all(b"\n")?;
+        Ok(())
+    }
+
+    fn git<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
+        self.git_vec(args.into_iter().map(str::to_string).collect())
+    }
+
+    fn git_raw<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
+        git_output_vec_allow_status(
+            &self.root,
+            std::iter::once("--git-dir".to_string())
+                .chain(std::iter::once(self.git_dir.to_string_lossy().to_string()))
+                .chain(args.into_iter().map(str::to_string))
+                .collect(),
+            &[0],
+        )
+        .map_err(SqueezyError::Tool)
+    }
+
+    fn git_vec(&self, args: Vec<String>) -> Result<Output> {
+        self.git_vec_allow_status(args, &[0])
+    }
+
+    fn git_vec_allow_status(&self, args: Vec<String>, success: &[i32]) -> Result<Output> {
+        let full_args = std::iter::once("--git-dir".to_string())
+            .chain(std::iter::once(self.git_dir.to_string_lossy().to_string()))
+            .chain(std::iter::once("--work-tree".to_string()))
+            .chain(std::iter::once(self.root.to_string_lossy().to_string()))
+            .chain(args)
+            .collect();
+        git_output_vec_allow_status(&self.root, full_args, success).map_err(SqueezyError::Tool)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FileStat {
     additions: u64,
@@ -483,6 +890,14 @@ fn git_output_allow_status<const N: usize>(
     args: [&str; N],
     success: &[i32],
 ) -> std::result::Result<Output, String> {
+    git_output_vec_allow_status(cwd, args.into_iter().map(str::to_string).collect(), success)
+}
+
+fn git_output_vec_allow_status(
+    cwd: &Path,
+    args: Vec<String>,
+    success: &[i32],
+) -> std::result::Result<Output, String> {
     let output = Command::new("git")
         .args([
             "--no-optional-locks",
@@ -508,6 +923,22 @@ fn git_output_allow_status<const N: usize>(
             stderr
         })
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis())
+}
+
+fn checkpoint_id() -> String {
+    format!("cp-{}", now_ms())
 }
 
 fn default_branch(git_root: &Path) -> Option<String> {
