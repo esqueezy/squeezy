@@ -1,7 +1,5 @@
-mod accuracy;
 mod cli;
 mod harness;
-mod mixed;
 mod oracles;
 mod report;
 mod runner;
