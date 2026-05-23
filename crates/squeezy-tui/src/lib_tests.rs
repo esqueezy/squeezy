@@ -78,12 +78,12 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
 
 #[tokio::test]
 async fn shift_tab_toggles_mode() {
-    let agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
 
     handle_key(
         &mut app,
-        &agent,
+        &mut agent,
         KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
     )
     .await
@@ -94,7 +94,7 @@ async fn shift_tab_toggles_mode() {
 
     handle_key(
         &mut app,
-        &agent,
+        &mut agent,
         KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
     )
     .await
@@ -106,13 +106,13 @@ async fn shift_tab_toggles_mode() {
 
 #[tokio::test]
 async fn slash_plan_and_build_force_modes() {
-    let agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
 
     app.input = "/plan".to_string();
     handle_key(
         &mut app,
-        &agent,
+        &mut agent,
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     )
     .await
@@ -124,7 +124,7 @@ async fn slash_plan_and_build_force_modes() {
     app.input = "/plan".to_string();
     handle_key(
         &mut app,
-        &agent,
+        &mut agent,
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     )
     .await
@@ -135,7 +135,7 @@ async fn slash_plan_and_build_force_modes() {
     app.input = "/build".to_string();
     handle_key(
         &mut app,
-        &agent,
+        &mut agent,
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     )
     .await
@@ -147,14 +147,14 @@ async fn slash_plan_and_build_force_modes() {
 
 #[tokio::test]
 async fn mode_switch_is_refused_during_active_turn() {
-    let agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let (_tx, rx) = mpsc::channel(1);
     app.turn_rx = Some(rx);
 
     handle_key(
         &mut app,
-        &agent,
+        &mut agent,
         KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
     )
     .await
@@ -407,7 +407,7 @@ fn render_uses_two_line_status_footer() {
 
 #[tokio::test]
 async fn ctrl_y_copies_last_assistant_message() {
-    let agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
     let writes = Arc::new(StdMutex::new(Vec::new()));
     let mut app = test_app_with_clipboard(
         SessionMode::Build,
@@ -421,7 +421,7 @@ async fn ctrl_y_copies_last_assistant_message() {
 
     handle_key(
         &mut app,
-        &agent,
+        &mut agent,
         KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
     )
     .await
@@ -437,7 +437,7 @@ async fn ctrl_y_copies_last_assistant_message() {
 
 #[tokio::test]
 async fn slash_copy_transcript_copies_plain_text_transcript() {
-    let agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
     let writes = Arc::new(StdMutex::new(Vec::new()));
     let mut app = test_app_with_clipboard(
         SessionMode::Build,
@@ -449,7 +449,7 @@ async fn slash_copy_transcript_copies_plain_text_transcript() {
     app.transcript.push(TranscriptItem::user("hello"));
     app.transcript.push(TranscriptItem::assistant("answer"));
 
-    assert!(handle_slash_command(&mut app, &agent, "/copy transcript").await);
+    assert!(handle_slash_command(&mut app, &mut agent, "/copy transcript").await);
     assert_eq!(
         writes.lock().unwrap().as_slice(),
         ["user: hello\nassistant: answer"]
@@ -459,7 +459,7 @@ async fn slash_copy_transcript_copies_plain_text_transcript() {
 
 #[tokio::test]
 async fn copy_failure_is_actionable_status() {
-    let agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app_with_clipboard(
         SessionMode::Build,
         Box::new(RecordingClipboard {
@@ -471,7 +471,7 @@ async fn copy_failure_is_actionable_status() {
 
     handle_key(
         &mut app,
-        &agent,
+        &mut agent,
         KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
     )
     .await
@@ -482,12 +482,12 @@ async fn copy_failure_is_actionable_status() {
 
 #[tokio::test]
 async fn transcript_navigation_keys_update_scroll_state() {
-    let agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
 
     handle_key(
         &mut app,
-        &agent,
+        &mut agent,
         KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
     )
     .await
@@ -496,7 +496,7 @@ async fn transcript_navigation_keys_update_scroll_state() {
 
     handle_key(
         &mut app,
-        &agent,
+        &mut agent,
         KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
     )
     .await
@@ -505,7 +505,7 @@ async fn transcript_navigation_keys_update_scroll_state() {
 
     handle_key(
         &mut app,
-        &agent,
+        &mut agent,
         KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
     )
     .await
@@ -605,13 +605,13 @@ async fn completed_event_preserves_scroll_offset_in_history() {
 
 #[tokio::test]
 async fn scroll_keys_preserve_status_text() {
-    let agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     app.status = "tool foo finished".to_string();
 
     handle_key(
         &mut app,
-        &agent,
+        &mut agent,
         KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
     )
     .await
@@ -623,7 +623,7 @@ async fn scroll_keys_preserve_status_text() {
 
     handle_key(
         &mut app,
-        &agent,
+        &mut agent,
         KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
     )
     .await
@@ -635,7 +635,7 @@ async fn scroll_keys_preserve_status_text() {
 
     handle_key(
         &mut app,
-        &agent,
+        &mut agent,
         KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
     )
     .await
