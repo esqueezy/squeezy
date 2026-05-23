@@ -10,6 +10,32 @@ fn disabled_client_does_not_send() {
 }
 
 #[test]
+fn telemetry_disabled_when_install_id_cannot_be_persisted() {
+    let root = std::env::temp_dir().join(format!(
+        "squeezy-telemetry-install-block-{}-{}",
+        now_ms(),
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    // Use a path whose parent already exists as a file, so create_dir_all
+    // and the subsequent write both fail deterministically.
+    let blocker = root.join("blocker");
+    fs::write(&blocker, b"").unwrap();
+    let bad_path = blocker.join("install_id");
+
+    let config = AppConfig {
+        telemetry: telemetry_config(true, "https://telemetry.example/v1/batch"),
+        ..AppConfig::default()
+    };
+    let client = TelemetryClient::from_config_with_install_path(&config, &bad_path);
+    assert!(
+        !client.enabled(),
+        "telemetry must be disabled when install_id cannot be persisted"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn install_id_is_persisted() {
     let root = std::env::temp_dir().join(format!("squeezy-telemetry-{}", now_ms()));
     let path = root.join("install_id");

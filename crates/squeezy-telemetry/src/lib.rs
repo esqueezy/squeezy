@@ -55,8 +55,16 @@ impl TelemetryClient {
         if !config.telemetry.enabled {
             return Self::disabled();
         }
-        let install_id = load_or_create_install_id(install_id_path.as_ref())
-            .unwrap_or_else(|_| random_uuid_like());
+        // If we cannot persist a stable install_id, treat telemetry as
+        // unavailable rather than fabricating a fresh anonymous user per
+        // process. The previous fallback to `random_uuid_like()` silently
+        // violated the documented "stable across sessions on that machine"
+        // guarantee and inflated unique-user counts in degraded environments
+        // (CI, read-only $HOME, missing $HOME, ENOSPC).
+        let install_id = match load_or_create_install_id(install_id_path.as_ref()) {
+            Ok(id) => id,
+            Err(_) => return Self::disabled(),
+        };
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
