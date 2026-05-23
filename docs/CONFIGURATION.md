@@ -73,6 +73,23 @@ commented examples so that built-in defaults can evolve over time:
 # target = "cargo test:*"
 # action = "allow"
 # source = "user"
+#
+# [[permissions.rules]]
+# capability = "network"
+# target = "shell:curl:*"
+# action = "ask"
+# source = "project"
+
+# [permissions.shell_sandbox]
+# mode = "required"
+# network = "deny_by_default"
+# audit = true
+# kill_grace_ms = 250                          # bounded to 10..=60000
+# env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME", "RUSTFLAGS", "RUST_BACKTRACE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "LC_*"]
+# # The list below EXTENDS the built-in floor; set
+# # replace_sensitive_path_patterns = true to replace it instead.
+# sensitive_path_patterns = ["secrets/**", ".vault/**"]
+# replace_sensitive_path_patterns = false
 
 [telemetry]
 # enabled = true
@@ -128,6 +145,29 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   can only downgrade an `Ask` shell verdict to `Deny`; it spends one extra
   LLM round-trip per ambiguous shell call, so leave it off unless that cost
   is acceptable.
+- `[permissions.shell_sandbox]`: OS sandbox settings for the local shell tool.
+  The default `mode = "required"` fails closed when a supported sandbox backend
+  is unavailable. macOS launches through `sandbox-exec` with a `(deny default)`
+  profile that re-allows reads under system prefixes and reads+writes inside
+  the workspace, tmp dirs, and toolchain caches (`$CARGO_HOME`, `$RUSTUP_HOME`,
+  `$HOME/.cargo`, `$HOME/.rustup`). Linux probes
+  `/proc/sys/kernel/unprivileged_userns_clone` and `/proc/self/ns/user` before
+  spawn; when namespacing is available, the child runs in a fresh user, mount,
+  and (optionally) network namespace via `unshare(CLONE_NEWUSER | CLONE_NEWNS |
+  ...)` with a uid_map back to the parent. `network = "deny_by_default"` keeps
+  the network namespace closed for every shell command, including classified
+  network commands (the permission policy still decides whether to RUN them).
+  `network = "allow_when_approved"` opens the network namespace only when the
+  permission policy allowed a classified network command. Shell attempts append
+  redacted JSONL audit entries to `.squeezy/audit/shell.jsonl` when
+  `audit = true`; entries are written under a process-wide mutex with rotation
+  at 8 MiB and four retained rotations. `sensitive_path_patterns` defaults to
+  union semantics: a project-supplied list EXTENDS the built-in floor
+  (`.ssh/**`, `.aws/**`, `.netrc`, etc.). To replace the floor wholesale, set
+  `replace_sensitive_path_patterns = true`. `env_allowlist` entries must be
+  exact names or use a single trailing `*` (e.g. `LC_*`); `kill_grace_ms` is
+  bounded to `10..=60_000`. See [`SHELL_SANDBOXING.md`](SHELL_SANDBOXING.md)
+  for the full operational model and the known limits of the OS layer.
 - `[[permissions.rules]]`: ordered allow/ask/deny rules with `capability`,
   `target`, `action`, optional `source`, and optional `reason`. Later matching
   rules win, and any session-scoped approvals added through the TUI also stack
@@ -142,10 +182,34 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   - `tool:<name>` as a catch-all for tools that do not specify their own scope.
   - `<cmd-prefix>:*` for shell/git/compiler rules (e.g. `cargo test:*`,
     `rm:*`). `*` itself is treated as a wildcard segment in any position.
-  Allow rules on the `destructive` capability and Allow rules with a bare `*`
-  target are refused at load time and at approval persistence time; honor
-  destructive operations either per-call or by widening the `shell`
+  - `shell:<cmd-prefix>:*` for shell commands classified as network attempts
+    (e.g. `shell:curl:*` and `shell:npm install:*`).
+  Allow rules on the `destructive` capability and Allow rules whose `target`
+  is functionally a "match everything" wildcard (`*`, `**`, `* *`, …) are
+  refused at THREE layers so the three paths cannot drift:
+    1. At config load (`squeezy.toml` parse).
+    2. At session-approval persistence time.
+    3. At runtime evaluation (a manually-installed rule with such a target
+       gets downgraded to `Ask`).
+  Honor destructive operations either per-call or by widening the `shell`
   compatibility default.
+  Shell approvals include the command, cwd, description (if supplied), risk,
+  target, network posture, destructive flag, timeout/output caps (if
+  supplied), sandbox mode, sandbox network policy, parser metadata, and the
+  environment policy label (never raw values). The TUI renders the approval
+  prompt on a dedicated multi-line panel; the 1-line status bar holds only a
+  compact "approval pending" banner. Shell execution is policy-first: commands
+  must run inside the workspace, use bounded timeout/output caps, and launch
+  with an allowlisted environment whose values are never shown in approvals
+  or tool output. The command classifier is parser-backed by
+  `tree-sitter-bash`; parse errors, shell expansions, and command
+  substitutions stay conservative. Common verification commands such as
+  `cargo test`, `cargo check`, `cargo clippy`, and `cargo fmt` classify as
+  `compiler` so projects can allow them without broadly allowing arbitrary
+  shell. Wrappers like `sh -c "X"`, `bash -lc "Y"`, `env BAR=v cmd`,
+  `nohup cmd`, `xargs cmd`, and `sudo cmd` are recursively unwrapped (up to 8
+  layers) so destructive/network/compiler classification fires on the inner
+  argv, not just the wrapper.
   Rules are matched by walking the configured rules first and the session
   rules last, returning the most recently added matching rule. Permission
   decisions are emitted on the `squeezy::permissions` tracing target with the

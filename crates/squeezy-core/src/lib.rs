@@ -339,8 +339,9 @@ impl AppConfig {
         let redaction = RedactionConfig::from_settings(settings.redaction.unwrap_or_default())?;
         let permissions = PermissionPolicy::from_settings_and_env(
             settings.permissions.unwrap_or_default(),
+            &sources.join(","),
             &mut get_var,
-        );
+        )?;
         let session_mode = parse_session_mode(
             get_var("SQUEEZY_SESSION_MODE"),
             settings
@@ -504,6 +505,35 @@ impl AppConfig {
             "shell_classifier = {}\n\n",
             self.permissions.shell_classifier
         ));
+        output.push_str("[permissions.shell_sandbox]\n");
+        output.push_str(&format!(
+            "mode = {}\n",
+            toml_string(self.permissions.shell_sandbox.mode.as_str())
+        ));
+        output.push_str(&format!(
+            "network = {}\n",
+            toml_string(self.permissions.shell_sandbox.network.as_str())
+        ));
+        output.push_str(&format!(
+            "audit = {}\n",
+            self.permissions.shell_sandbox.audit
+        ));
+        output.push_str(&format!(
+            "kill_grace_ms = {}\n",
+            self.permissions.shell_sandbox.kill_grace_ms
+        ));
+        output.push_str(&format!(
+            "env_allowlist = {}\n",
+            toml_string_array(&self.permissions.shell_sandbox.env_allowlist)
+        ));
+        output.push_str(&format!(
+            "sensitive_path_patterns = {}\n",
+            toml_string_array(&self.permissions.shell_sandbox.sensitive_path_patterns)
+        ));
+        // The list above is the EFFECTIVE list (built-in floor unioned with
+        // user additions). Round-tripping must not re-union, otherwise an
+        // inspected config would diverge from the running config.
+        output.push_str("replace_sensitive_path_patterns = true\n\n");
         for rule in self
             .permissions
             .rules
@@ -1415,6 +1445,7 @@ pub struct PermissionSettings {
     pub ignored_search: Option<PermissionMode>,
     pub web: Option<PermissionMode>,
     pub shell_classifier: Option<bool>,
+    pub shell_sandbox: Option<ShellSandboxSettings>,
     pub rules: Vec<PermissionRule>,
 }
 
@@ -1429,6 +1460,7 @@ impl PermissionSettings {
                 "ignored_search",
                 "web",
                 "shell_classifier",
+                "shell_sandbox",
                 "rules",
             ],
             source,
@@ -1451,6 +1483,11 @@ impl PermissionSettings {
                 source,
                 &field(path, "shell_classifier"),
             )?,
+            shell_sandbox: optional_table(table, "shell_sandbox", source)?
+                .map(|table| {
+                    ShellSandboxSettings::from_table(table, source, &field(path, "shell_sandbox"))
+                })
+                .transpose()?,
             rules: permission_rules_value(table, source, &field(path, "rules"))?,
         })
     }
@@ -1462,8 +1499,342 @@ impl PermissionSettings {
         replace_if_some(&mut self.ignored_search, next.ignored_search);
         replace_if_some(&mut self.web, next.web);
         replace_if_some(&mut self.shell_classifier, next.shell_classifier);
+        merge_option(
+            &mut self.shell_sandbox,
+            next.shell_sandbox,
+            ShellSandboxSettings::merge,
+        );
         self.rules.extend(next.rules);
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ShellSandboxSettings {
+    pub mode: Option<String>,
+    pub network: Option<String>,
+    pub audit: Option<bool>,
+    pub kill_grace_ms: Option<u64>,
+    pub env_allowlist: Option<Vec<String>>,
+    pub sensitive_path_patterns: Option<Vec<String>>,
+    /// When `true`, the user-provided `sensitive_path_patterns` REPLACE the
+    /// built-in floor. The default behavior (`false` / unset) extends the
+    /// floor so a config that lists a single project pattern still keeps
+    /// the `.ssh/**`, `.aws/**`, `.netrc`, etc. denials.
+    pub replace_sensitive_path_patterns: Option<bool>,
+}
+
+impl ShellSandboxSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(
+            table,
+            &[
+                "mode",
+                "network",
+                "audit",
+                "kill_grace_ms",
+                "env_allowlist",
+                "sensitive_path_patterns",
+                "replace_sensitive_path_patterns",
+            ],
+            source,
+            path,
+        )?;
+        Ok(Self {
+            mode: string_value(table, "mode", source, &field(path, "mode"))?,
+            network: string_value(table, "network", source, &field(path, "network"))?,
+            audit: bool_value(table, "audit", source, &field(path, "audit"))?,
+            kill_grace_ms: u64_value(
+                table,
+                "kill_grace_ms",
+                source,
+                &field(path, "kill_grace_ms"),
+            )?,
+            env_allowlist: string_array_value(
+                table,
+                "env_allowlist",
+                source,
+                &field(path, "env_allowlist"),
+            )?,
+            sensitive_path_patterns: string_array_value(
+                table,
+                "sensitive_path_patterns",
+                source,
+                &field(path, "sensitive_path_patterns"),
+            )?,
+            replace_sensitive_path_patterns: bool_value(
+                table,
+                "replace_sensitive_path_patterns",
+                source,
+                &field(path, "replace_sensitive_path_patterns"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.mode, next.mode);
+        replace_if_some(&mut self.network, next.network);
+        replace_if_some(&mut self.audit, next.audit);
+        replace_if_some(&mut self.kill_grace_ms, next.kill_grace_ms);
+        replace_if_some(&mut self.env_allowlist, next.env_allowlist);
+        replace_if_some(
+            &mut self.sensitive_path_patterns,
+            next.sensitive_path_patterns,
+        );
+        replace_if_some(
+            &mut self.replace_sensitive_path_patterns,
+            next.replace_sensitive_path_patterns,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellSandboxMode {
+    Required,
+    BestEffort,
+    Off,
+}
+
+impl ShellSandboxMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "required" => Some(Self::Required),
+            "best_effort" | "best-effort" => Some(Self::BestEffort),
+            "off" | "disabled" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::BestEffort => "best_effort",
+            Self::Off => "off",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellSandboxNetworkPolicy {
+    DenyByDefault,
+    AllowWhenApproved,
+}
+
+impl ShellSandboxNetworkPolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "deny_by_default" | "deny-by-default" => Some(Self::DenyByDefault),
+            "allow_when_approved" | "allow-when-approved" => Some(Self::AllowWhenApproved),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DenyByDefault => "deny_by_default",
+            Self::AllowWhenApproved => "allow_when_approved",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellSandboxConfig {
+    pub mode: ShellSandboxMode,
+    pub network: ShellSandboxNetworkPolicy,
+    pub audit: bool,
+    pub kill_grace_ms: u64,
+    pub env_allowlist: Vec<String>,
+    pub sensitive_path_patterns: Vec<String>,
+}
+
+impl Default for ShellSandboxConfig {
+    fn default() -> Self {
+        Self {
+            mode: ShellSandboxMode::Required,
+            network: ShellSandboxNetworkPolicy::DenyByDefault,
+            audit: true,
+            kill_grace_ms: 250,
+            env_allowlist: default_shell_env_allowlist(),
+            sensitive_path_patterns: default_sensitive_path_patterns(),
+        }
+    }
+}
+
+const SHELL_SANDBOX_KILL_GRACE_MIN_MS: u64 = 10;
+const SHELL_SANDBOX_KILL_GRACE_MAX_MS: u64 = 60_000;
+
+impl ShellSandboxConfig {
+    fn from_settings(settings: Option<ShellSandboxSettings>, source: &str) -> Result<Self> {
+        let mut config = Self::default();
+        let Some(settings) = settings else {
+            return Ok(config);
+        };
+        if let Some(mode) = settings.mode {
+            config.mode = ShellSandboxMode::parse(&mode).ok_or_else(|| {
+                SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.mode invalid value {mode:?}; expected required, best_effort, or off"
+                ))
+            })?;
+        }
+        if let Some(network) = settings.network {
+            config.network = ShellSandboxNetworkPolicy::parse(&network).ok_or_else(|| {
+                SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.network invalid value {network:?}; expected deny_by_default or allow_when_approved"
+                ))
+            })?;
+        }
+        if let Some(audit) = settings.audit {
+            config.audit = audit;
+        }
+        if let Some(kill_grace_ms) = settings.kill_grace_ms {
+            if !(SHELL_SANDBOX_KILL_GRACE_MIN_MS..=SHELL_SANDBOX_KILL_GRACE_MAX_MS)
+                .contains(&kill_grace_ms)
+            {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.kill_grace_ms {kill_grace_ms} \
+                     outside supported range {SHELL_SANDBOX_KILL_GRACE_MIN_MS}..={SHELL_SANDBOX_KILL_GRACE_MAX_MS}"
+                )));
+            }
+            config.kill_grace_ms = kill_grace_ms;
+        }
+        if let Some(env_allowlist) = settings.env_allowlist {
+            for pattern in &env_allowlist {
+                validate_env_allowlist_pattern(pattern, source)?;
+            }
+            if env_allowlist.is_empty() {
+                tracing::warn!(
+                    target: "squeezy::permissions",
+                    source = %source,
+                    "permissions.shell_sandbox.env_allowlist was set to an empty list; \
+                     shell commands will run with an empty environment"
+                );
+            }
+            config.env_allowlist = env_allowlist;
+        }
+        // sensitive_path_patterns uses UNION semantics: user-provided patterns
+        // EXTEND the built-in floor (.ssh/**, .aws/**, .netrc, …) rather than
+        // replacing it. The built-in floor cannot be silently disabled by
+        // listing a single project-specific pattern. To explicitly disable
+        // the floor, set `replace_sensitive_path_patterns = true`.
+        if let Some(sensitive_path_patterns) = settings.sensitive_path_patterns {
+            for pattern in &sensitive_path_patterns {
+                validate_sensitive_path_pattern(pattern, source)?;
+            }
+            if settings.replace_sensitive_path_patterns.unwrap_or(false) {
+                if sensitive_path_patterns.is_empty() {
+                    tracing::warn!(
+                        target: "squeezy::permissions",
+                        source = %source,
+                        "permissions.shell_sandbox.sensitive_path_patterns was replaced with an empty list; \
+                         pre-spawn shell sensitive-path checks are now disabled"
+                    );
+                }
+                config.sensitive_path_patterns = sensitive_path_patterns;
+            } else {
+                let mut merged = config.sensitive_path_patterns.clone();
+                for pattern in sensitive_path_patterns {
+                    if !merged.contains(&pattern) {
+                        merged.push(pattern);
+                    }
+                }
+                config.sensitive_path_patterns = merged;
+            }
+        }
+        Ok(config)
+    }
+}
+
+/// Valid env_allowlist patterns: exact names like `PATH`, or trailing-`*`
+/// patterns like `LC_*`. We don't support `*FOO`, `FOO_*_BAR`, or any glob
+/// containing characters the runtime matcher doesn't understand.
+fn validate_env_allowlist_pattern(pattern: &str, source: &str) -> Result<()> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return Err(SqueezyError::Config(format!(
+            "{source}: permissions.shell_sandbox.env_allowlist contains empty pattern"
+        )));
+    }
+    let star_count = trimmed.matches('*').count();
+    if star_count > 1 || (star_count == 1 && !trimmed.ends_with('*')) {
+        return Err(SqueezyError::Config(format!(
+            "{source}: permissions.shell_sandbox.env_allowlist pattern {pattern:?} \
+             only supports an exact name or a single trailing `*` (e.g. `LC_*`)"
+        )));
+    }
+    Ok(())
+}
+
+/// Valid sensitive_path_patterns: a leading path segment optionally followed
+/// by trailing wildcards (`/**`, `/*`, or `*`). We disallow patterns whose
+/// runtime base (everything up to the first wildcard) would be empty after
+/// `sensitive_pattern_base`, since they degrade to "match every command".
+fn validate_sensitive_path_pattern(pattern: &str, source: &str) -> Result<()> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return Err(SqueezyError::Config(format!(
+            "{source}: permissions.shell_sandbox.sensitive_path_patterns contains empty pattern"
+        )));
+    }
+    if trimmed == "*" || trimmed == "**" {
+        return Err(SqueezyError::Config(format!(
+            "{source}: permissions.shell_sandbox.sensitive_path_patterns pattern {pattern:?} \
+             matches every command and is refused"
+        )));
+    }
+    // Strip any leading `/` so we look at the same base the runtime does.
+    let body = trimmed.trim_start_matches('/');
+    let base_end = body.find(['*', '?']).unwrap_or(body.len());
+    if base_end == 0 {
+        return Err(SqueezyError::Config(format!(
+            "{source}: permissions.shell_sandbox.sensitive_path_patterns pattern {pattern:?} \
+             must include a literal path prefix before any wildcard"
+        )));
+    }
+    Ok(())
+}
+
+fn default_shell_env_allowlist() -> Vec<String> {
+    [
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "RUSTFLAGS",
+        "RUST_BACKTRACE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NIX_SSL_CERT_FILE",
+        "LC_*",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn default_sensitive_path_patterns() -> Vec<String> {
+    [
+        ".ssh/**",
+        ".aws/**",
+        ".config/gh/**",
+        ".netrc",
+        ".gnupg/**",
+        ".kube/**",
+        ".docker/config.json",
+        ".cargo/credentials*",
+        ".npmrc",
+        ".pypirc",
+        ".env*",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1483,19 +1854,22 @@ pub struct PermissionPolicy {
     pub ignored_search: PermissionMode,
     pub web: PermissionMode,
     pub shell_classifier: bool,
+    pub shell_sandbox: ShellSandboxConfig,
     pub rules: Vec<PermissionRule>,
 }
 
 impl PermissionPolicy {
     pub fn from_env_vars(mut var: impl FnMut(&str) -> Option<String>) -> Self {
-        Self::from_settings_and_env(PermissionSettings::default(), &mut var)
+        Self::from_settings_and_env(PermissionSettings::default(), "defaults", &mut var)
+            .expect("built-in permission defaults are valid")
     }
 
     fn from_settings_and_env(
         settings: PermissionSettings,
+        source: &str,
         mut var: impl FnMut(&str) -> Option<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             read: parse_permission(
                 var("SQUEEZY_READ_PERMISSION"),
                 settings.read.unwrap_or(PermissionMode::Allow),
@@ -1520,8 +1894,9 @@ impl PermissionPolicy {
                 var("SQUEEZY_SHELL_PERMISSION_CLASSIFIER"),
                 settings.shell_classifier.unwrap_or(false),
             ),
+            shell_sandbox: ShellSandboxConfig::from_settings(settings.shell_sandbox, source)?,
             rules: settings.rules,
-        }
+        })
     }
 
     pub const fn mode_for(&self, scope: PermissionScope) -> PermissionMode {
@@ -1559,7 +1934,7 @@ impl PermissionPolicy {
             .cloned();
         if let Some(rule) = matched_rule {
             let (action, override_reason) =
-                downgrade_unsafe_action(rule.action, request.capability);
+                downgrade_unsafe_action(rule.action, request.capability, &rule.target);
             let reason = override_reason.unwrap_or_else(|| {
                 rule.reason
                     .clone()
@@ -1585,23 +1960,49 @@ impl PermissionPolicy {
 }
 
 /// Belt-and-suspenders safety: refuse to honor an Allow rule that targets the
-/// `destructive` capability, regardless of where the rule came from. Returns
-/// the (possibly downgraded) action and an explanatory reason when a downgrade
-/// happens.
+/// `destructive` capability or whose `target` is functionally a "match
+/// everything" wildcard. Returns the (possibly downgraded) action and an
+/// explanatory reason when a downgrade happens.
 fn downgrade_unsafe_action(
     action: PermissionAction,
     capability: PermissionCapability,
+    target: &str,
 ) -> (PermissionAction, Option<String>) {
-    if action == PermissionAction::Allow && capability == PermissionCapability::Destructive {
-        return (
-            PermissionAction::Ask,
-            Some(
-                "ignoring Allow rule on destructive capability; require explicit per-call approval"
-                    .to_string(),
-            ),
-        );
+    if action == PermissionAction::Allow {
+        if capability == PermissionCapability::Destructive {
+            return (
+                PermissionAction::Ask,
+                Some(
+                    "ignoring Allow rule on destructive capability; require explicit per-call approval"
+                        .to_string(),
+                ),
+            );
+        }
+        if target_is_effectively_wildcard(target) {
+            return (
+                PermissionAction::Ask,
+                Some(
+                    "ignoring Allow rule with bare wildcard target; require a narrower target"
+                        .to_string(),
+                ),
+            );
+        }
     }
     (action, None)
+}
+
+/// True when a rule target is functionally identical to "match anything".
+/// We refuse to load or persist Allow rules with such targets because they
+/// undo the entire point of the permission system. The check is shared by
+/// the on-disk load path (`permission_rules_value`), the session
+/// persistence path (`install_persistent_rule`), and the runtime evaluator
+/// (`downgrade_unsafe_action`) so the three layers cannot drift.
+pub fn target_is_effectively_wildcard(target: &str) -> bool {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    trimmed.chars().all(|ch| ch == '*' || ch.is_whitespace())
 }
 
 impl Default for PermissionPolicy {
@@ -1613,6 +2014,7 @@ impl Default for PermissionPolicy {
             ignored_search: PermissionMode::Allow,
             web: PermissionMode::Ask,
             shell_classifier: false,
+            shell_sandbox: ShellSandboxConfig::default(),
             rules: Vec::new(),
         }
     }
@@ -2560,6 +2962,20 @@ pub fn user_settings_template() -> &'static str {
 # target = "cargo test:*"
 # action = "allow"
 # source = "user"
+#
+# [[permissions.rules]]
+# capability = "network"
+# target = "shell:curl:*"
+# action = "ask"
+# source = "project"
+
+# [permissions.shell_sandbox]
+# mode = "required"                 # required | best_effort | off
+# network = "deny_by_default"       # deny_by_default | allow_when_approved
+# audit = true
+# kill_grace_ms = 250
+# env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME", "RUSTFLAGS", "RUST_BACKTRACE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "LC_*"]
+# sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*"]
 
 [telemetry]
 # enabled = true
@@ -3061,14 +3477,21 @@ fn permission_rules_value(
                     field(&rule_path, "action")
                 ))
             })?;
-            if action == PermissionAction::Allow
-                && PermissionCapability::parse(&capability)
+            if action == PermissionAction::Allow {
+                if PermissionCapability::parse(&capability)
                     == Some(PermissionCapability::Destructive)
-            {
-                return Err(SqueezyError::Config(format!(
-                    "{source}: {rule_path}: refuse to load Allow rule on destructive capability; \
-                     destructive actions must be approved per call or via a broader shell scope"
-                )));
+                {
+                    return Err(SqueezyError::Config(format!(
+                        "{source}: {rule_path}: refuse to load Allow rule on destructive capability; \
+                         destructive actions must be approved per call or via a broader shell scope"
+                    )));
+                }
+                if target_is_effectively_wildcard(&target) {
+                    return Err(SqueezyError::Config(format!(
+                        "{source}: {rule_path}: refuse to load Allow rule with bare wildcard target {target:?}; \
+                         narrow the target to a specific path, host, or command prefix"
+                    )));
+                }
             }
             let source_value = string_value(table, "source", source, &field(&rule_path, "source"))?
                 .as_deref()

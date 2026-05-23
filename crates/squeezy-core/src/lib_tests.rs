@@ -80,6 +80,55 @@ fn config_without_env_uses_openai_provider_defaults() {
 }
 
 #[test]
+fn shell_sandbox_settings_parse_and_round_trip() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[permissions.shell_sandbox]
+mode = "best_effort"
+network = "allow_when_approved"
+audit = false
+kill_grace_ms = 500
+env_allowlist = ["PATH", "LC_*"]
+sensitive_path_patterns = [".ssh/**", ".env*"]
+replace_sensitive_path_patterns = true
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert_eq!(
+        config.permissions.shell_sandbox.mode,
+        ShellSandboxMode::BestEffort
+    );
+    assert_eq!(
+        config.permissions.shell_sandbox.network,
+        ShellSandboxNetworkPolicy::AllowWhenApproved
+    );
+    assert!(!config.permissions.shell_sandbox.audit);
+    assert_eq!(config.permissions.shell_sandbox.kill_grace_ms, 500);
+    assert_eq!(
+        config.permissions.shell_sandbox.env_allowlist,
+        ["PATH", "LC_*"]
+    );
+    assert_eq!(
+        config.permissions.shell_sandbox.sensitive_path_patterns,
+        [".ssh/**", ".env*"]
+    );
+
+    let inspect = config.inspect_redacted();
+    assert!(inspect.contains("[permissions.shell_sandbox]"));
+    assert!(inspect.contains("mode = \"best_effort\""));
+    let round_tripped = SettingsFile::from_toml_str(&inspect, "round-trip")
+        .expect("inspect output parses back as settings");
+    let round_tripped_config = AppConfig::from_settings_and_env_vars(round_tripped, |_| None);
+    assert_eq!(
+        round_tripped_config.permissions.shell_sandbox, config.permissions.shell_sandbox,
+        "inspect output must round-trip to the same effective sandbox config",
+    );
+}
+
+#[test]
 fn config_reads_supported_env_overrides() {
     let config = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_MODEL" => Some("custom-model".to_string()),
@@ -456,6 +505,184 @@ source = "user"
         msg.contains("destructive capability"),
         "unexpected message: {msg}"
     );
+}
+
+#[test]
+fn permission_policy_refuses_allow_on_bare_star_target_at_load_time() {
+    let result = SettingsFile::from_toml_str(
+        r#"
+[[permissions.rules]]
+capability = "shell"
+target = "*"
+action = "allow"
+source = "user"
+"#,
+        "test",
+    );
+    let err = result.expect_err("bare-* Allow rule should be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bare wildcard target"),
+        "unexpected message: {msg}"
+    );
+
+    // Functionally identical "**" target must be refused too.
+    let result_double = SettingsFile::from_toml_str(
+        r#"
+[[permissions.rules]]
+capability = "shell"
+target = "**"
+action = "allow"
+source = "user"
+"#,
+        "test",
+    );
+    result_double.expect_err("** Allow rule should also be rejected");
+}
+
+#[test]
+fn target_is_effectively_wildcard_helper_recognizes_match_everything() {
+    use super::target_is_effectively_wildcard as helper;
+    assert!(helper("*"));
+    assert!(helper("**"));
+    assert!(helper("* *"));
+    assert!(helper(" * "));
+    assert!(helper("***"));
+    assert!(helper(""));
+    assert!(!helper("cargo test:*"));
+    assert!(!helper("shell:*"));
+    assert!(!helper("path:src/foo.rs"));
+}
+
+#[test]
+fn permission_policy_downgrades_allow_on_bare_star_runtime_safety_net() {
+    let session_rule = PermissionRule::new(
+        "shell",
+        "**",
+        PermissionAction::Allow,
+        PermissionRuleSource::Session,
+        Some("session opt-in".to_string()),
+    );
+    let policy = PermissionPolicy::default();
+    let request = PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: "rm:*".to_string(),
+        risk: PermissionRisk::High,
+        summary: "rm -rf target".to_string(),
+        metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    };
+    let verdict = policy.evaluate_with_extra(&request, std::slice::from_ref(&session_rule));
+    assert_eq!(verdict.action, PermissionAction::Ask);
+    assert!(
+        verdict.reason.contains("bare wildcard target"),
+        "verdict reason should explain downgrade: {}",
+        verdict.reason,
+    );
+}
+
+fn try_app_config(toml: &str) -> Result<AppConfig> {
+    let settings = SettingsFile::from_toml_str(toml, "test").expect("settings parse");
+    AppConfig::try_from_settings_and_env_vars(settings, None, |_| None)
+}
+
+#[test]
+fn shell_sandbox_config_validates_kill_grace_bounds_and_glob_patterns() {
+    let err = try_app_config(
+        r#"
+[permissions.shell_sandbox]
+kill_grace_ms = 1
+"#,
+    )
+    .expect_err("kill_grace_ms = 1 must be rejected");
+    assert!(format!("{err}").contains("kill_grace_ms"));
+
+    try_app_config(
+        r#"
+[permissions.shell_sandbox]
+kill_grace_ms = 999999
+"#,
+    )
+    .expect_err("kill_grace_ms above ceiling must be rejected");
+
+    let err = try_app_config(
+        r#"
+[permissions.shell_sandbox]
+env_allowlist = ["*_PROXY"]
+"#,
+    )
+    .expect_err("env_allowlist *_PROXY must be rejected");
+    assert!(format!("{err}").contains("env_allowlist"));
+
+    let err = try_app_config(
+        r#"
+[permissions.shell_sandbox]
+sensitive_path_patterns = ["**"]
+"#,
+    )
+    .expect_err("sensitive_path_patterns ** must be rejected");
+    assert!(format!("{err}").contains("sensitive_path_patterns"));
+}
+
+#[test]
+fn shell_sandbox_invalid_mode_is_rejected() {
+    let err = try_app_config(
+        r#"
+[permissions.shell_sandbox]
+mode = "loose"
+"#,
+    )
+    .expect_err("invalid mode must be rejected");
+    assert!(format!("{err}").contains("mode"));
+
+    try_app_config(
+        r#"
+[permissions.shell_sandbox]
+network = "open"
+"#,
+    )
+    .expect_err("invalid network must be rejected");
+}
+
+#[test]
+fn shell_sandbox_sensitive_path_patterns_default_to_union_with_floor() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[permissions.shell_sandbox]
+sensitive_path_patterns = ["secrets/**"]
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    let patterns = &config.permissions.shell_sandbox.sensitive_path_patterns;
+    // The user pattern is present.
+    assert!(patterns.iter().any(|p| p == "secrets/**"));
+    // The default floor is still present.
+    for floor in [".ssh/**", ".aws/**", ".env*", ".netrc"] {
+        assert!(
+            patterns.iter().any(|p| p == floor),
+            "default floor pattern {floor} must remain after union",
+        );
+    }
+}
+
+#[test]
+fn shell_sandbox_replace_sensitive_path_patterns_opts_out_of_union() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[permissions.shell_sandbox]
+sensitive_path_patterns = ["secrets/**"]
+replace_sensitive_path_patterns = true
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    let patterns = &config.permissions.shell_sandbox.sensitive_path_patterns;
+    assert_eq!(patterns.as_slice(), ["secrets/**"]);
 }
 
 #[test]

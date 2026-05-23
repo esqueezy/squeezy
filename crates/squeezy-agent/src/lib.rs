@@ -80,6 +80,7 @@ impl Agent {
             web_config.clone(),
             config.skills.clone(),
             &config.graph,
+            config.permissions.shell_sandbox.clone(),
             redactor.clone(),
         )
         .unwrap_or_else(|_| {
@@ -93,6 +94,7 @@ impl Agent {
                 web_config,
                 config.skills.clone(),
                 &config.graph,
+                config.permissions.shell_sandbox.clone(),
                 redactor.clone(),
             )
             .expect("current directory must be a valid tool root")
@@ -1450,7 +1452,7 @@ pub(crate) fn permission_rule_for_persistence(
         if rule.capability == "destructive" {
             return None;
         }
-        if rule.target.trim() == "*" {
+        if squeezy_core::target_is_effectively_wildcard(&rule.target) {
             return None;
         }
     }
