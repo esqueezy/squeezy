@@ -3331,8 +3331,12 @@ pub enum LanguageKind {
     Cpp,
     Go,
     Java,
+    JavaScript,
+    Jsx,
     Python,
     Rust,
+    TypeScript,
+    Tsx,
     Unsupported,
     Unknown,
 }
