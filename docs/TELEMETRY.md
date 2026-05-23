@@ -48,14 +48,18 @@ Squeezy sends typed events with allowlisted numeric counters and enum values:
 - `squeezy_tool_completed`: one event per first-party Squeezy tool call with
   `turn_index`, `tool_sequence`, tool name/family, status, duration in
   milliseconds, files scanned, bytes read, output bytes, and matches returned.
-- `squeezy_graph_build_completed`: one-shot graph/AST build timing, file counts,
-  Rust/supported/unsupported/unknown language distribution, parsed bytes,
-  symbols, and edges.
-- `squeezy_graph_refresh_completed`: repeated graph refresh timing, changed and
-  reparsed file counts, language distribution, parsed bytes, symbols, edges, and
-  refresh status.
 - `squeezy_failure_seen`: coarse error kind such as provider, tool, permission,
   budget, graph, I/O, config, or unknown.
+
+The schema also reserves `squeezy_graph_build_completed` and
+`squeezy_graph_refresh_completed` (graph build/refresh timing, file counts,
+language distribution, symbols, and edges). These names are accepted by the
+Worker but are not yet emitted by the binary; they are reserved for the
+graph runtime that will own `GraphManager` once it is wired into the session.
+
+Telemetry is silently disabled when the install_id cannot be loaded or
+persisted (read-only `$HOME`, missing `$HOME`, ENOSPC, etc.) so that a
+degraded environment does not invent a fresh anonymous user per process.
 
 Events are buffered locally and sent in small batches, up to 50 events per
 request. Squeezy flushes queued telemetry on normal CLI/TUI exit.
