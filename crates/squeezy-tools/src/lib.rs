@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
     path::{Component, Path, PathBuf},
@@ -127,6 +127,7 @@ impl ToolRegistry {
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = vec![
+            glob_spec(),
             grep_spec(),
             read_file_spec(),
             write_file_spec(),
@@ -140,18 +141,31 @@ impl ToolRegistry {
         match call.name.as_str() {
             "write_file" => PermissionScope::Edit,
             "shell" => PermissionScope::Shell,
+            "glob" if tool_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
             "grep" if grep_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
-            "grep" | "read_file" => PermissionScope::Read,
+            "glob" | "grep" | "read_file" => PermissionScope::Read,
             _ => PermissionScope::Read,
         }
     }
 
     pub fn is_parallel_safe(&self, call: &ToolCall) -> bool {
-        matches!(call.name.as_str(), "grep" | "read_file")
+        matches!(call.name.as_str(), "glob" | "grep" | "read_file")
     }
 
     pub fn describe_call(&self, call: &ToolCall) -> String {
         match call.name.as_str() {
+            "glob" => {
+                let args = serde_json::from_value::<GlobArgs>(call.arguments.clone()).ok();
+                let pattern = args
+                    .as_ref()
+                    .map(|args| args.pattern.as_str())
+                    .unwrap_or("?");
+                let path = args
+                    .as_ref()
+                    .and_then(|args| args.path.as_deref())
+                    .unwrap_or(".");
+                format!("glob pattern={pattern:?} path={path:?}")
+            }
             "grep" => {
                 let args = serde_json::from_value::<GrepArgs>(call.arguments.clone()).ok();
                 let pattern = args
@@ -192,6 +206,7 @@ impl ToolRegistry {
         }
 
         match call.name.as_str() {
+            "glob" => self.execute_glob(&call, cancel).await,
             "grep" => self.execute_grep(&call, cancel).await,
             "read_file" => self.execute_read_file(&call).await,
             "write_file" => self.execute_write_file(&call).await,
@@ -204,6 +219,89 @@ impl ToolRegistry {
                 None,
             ),
         }
+    }
+
+    async fn execute_glob(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
+        let args = match serde_json::from_value::<GlobArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let start = match self.resolve_existing(args.path.as_deref().unwrap_or(".")) {
+            Ok(path) => path,
+            Err(err) => return tool_error(call, err),
+        };
+        let pattern = match build_required_glob(&args.pattern) {
+            Ok(pattern) => pattern,
+            Err(err) => return tool_error(call, err),
+        };
+        let include_ignored = args.include_ignored.unwrap_or(false);
+        let max_paths = args.max_paths.unwrap_or(DEFAULT_MAX_MATCHES).min(1_000);
+        let offset = args.offset.unwrap_or(0);
+
+        let mut builder = WalkBuilder::new(&start);
+        builder
+            .follow_links(false)
+            .hidden(false)
+            .ignore(!include_ignored)
+            .git_ignore(!include_ignored)
+            .git_exclude(!include_ignored)
+            .require_git(false)
+            .parents(true)
+            .sort_by_file_path(|left, right| left.cmp(right));
+
+        let mut paths = Vec::new();
+        let mut skipped_paths = 0usize;
+        let mut skipped_secret_files = 0u64;
+        let mut cost = ToolCostHint::default();
+
+        for entry in builder.build() {
+            if cancel.is_cancelled() {
+                return ToolResult::cancelled(call);
+            }
+            if paths.len() >= max_paths {
+                cost.truncated = true;
+                break;
+            }
+
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if !path.is_file() || contains_vcs_dir(path) {
+                continue;
+            }
+            if is_secret_path(path) {
+                skipped_secret_files += 1;
+                continue;
+            }
+            cost.files_scanned += 1;
+            let rel = self.relative(path);
+            if !pattern.is_match(rel.as_path()) {
+                continue;
+            }
+            if skipped_paths < offset {
+                skipped_paths += 1;
+                continue;
+            }
+            paths.push(json!(rel.to_string_lossy()));
+            cost.matches_returned += 1;
+        }
+
+        make_result(
+            call,
+            ToolStatus::Success,
+            json!({
+                "paths": paths,
+                "metadata": {
+                    "include_ignored": include_ignored,
+                    "offset": offset,
+                    "skipped_secret_files": skipped_secret_files,
+                },
+            }),
+            cost,
+            None,
+        )
     }
 
     async fn execute_grep(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
@@ -236,6 +334,7 @@ impl ToolRegistry {
         };
 
         let include_ignored = args.include_ignored.unwrap_or(false);
+        let output_mode = args.output_mode.unwrap_or_default();
         let max_files = args
             .max_files
             .unwrap_or(DEFAULT_MAX_FILES)
@@ -259,9 +358,12 @@ impl ToolRegistry {
             .git_ignore(!include_ignored)
             .git_exclude(!include_ignored)
             .require_git(false)
-            .parents(true);
+            .parents(true)
+            .sort_by_file_path(|left, right| left.cmp(right));
 
         let mut matches = Vec::new();
+        let mut paths = BTreeSet::new();
+        let mut count = 0u64;
         let mut skipped_matches = 0usize;
         let mut cost = ToolCostHint::default();
         let mut skipped_secret_files = 0u64;
@@ -271,7 +373,10 @@ impl ToolRegistry {
             if cancel.is_cancelled() {
                 return ToolResult::cancelled(call);
             }
-            if scanned_files >= max_files || matches.len() >= max_matches || cost.truncated {
+            if scanned_files >= max_files
+                || output_mode.is_limited(matches.len(), paths.len(), max_matches)
+                || cost.truncated
+            {
                 cost.truncated = true;
                 break;
             }
@@ -319,21 +424,34 @@ impl ToolRegistry {
                     skipped_matches += 1;
                     continue;
                 }
-                let line = truncate_text(line, 500);
-                let next = json!({
-                    "path": rel.to_string_lossy(),
-                    "line": line_index + 1,
-                    "text": line,
-                });
-                let next_len = serde_json::to_string(&next).map_or(0, |text| text.len());
-                if cost.output_bytes + next_len as u64 > output_byte_cap as u64 {
-                    cost.truncated = true;
-                    break;
+                count += 1;
+                match output_mode {
+                    GrepOutputMode::Content => {
+                        let line = truncate_text(line, 500);
+                        let next = json!({
+                            "path": rel.to_string_lossy(),
+                            "line": line_index + 1,
+                            "text": line,
+                        });
+                        let next_len = serde_json::to_string(&next).map_or(0, |text| text.len());
+                        if cost.output_bytes + next_len as u64 > output_byte_cap as u64 {
+                            cost.truncated = true;
+                            break;
+                        }
+                        cost.output_bytes += next_len as u64;
+                        cost.matches_returned += 1;
+                        matches.push(next);
+                    }
+                    GrepOutputMode::FilesWithMatches => {
+                        if paths.insert(rel.to_string_lossy().to_string()) {
+                            cost.matches_returned += 1;
+                        }
+                    }
+                    GrepOutputMode::Count => {
+                        cost.matches_returned = count;
+                    }
                 }
-                cost.output_bytes += next_len as u64;
-                cost.matches_returned += 1;
-                matches.push(next);
-                if matches.len() >= max_matches {
+                if output_mode.is_limited(matches.len(), paths.len(), max_matches) {
                     cost.truncated = true;
                     break;
                 }
@@ -342,6 +460,7 @@ impl ToolRegistry {
 
         let mut metadata = BTreeMap::new();
         metadata.insert("include_ignored".to_string(), json!(include_ignored));
+        metadata.insert("output_mode".to_string(), json!(output_mode.as_str()));
         metadata.insert("offset".to_string(), json!(offset));
         metadata.insert(
             "skipped_secret_files".to_string(),
@@ -356,16 +475,22 @@ impl ToolRegistry {
             );
         }
 
-        make_result(
-            call,
-            ToolStatus::Success,
-            json!({
+        let content = match output_mode {
+            GrepOutputMode::Content => json!({
                 "matches": matches,
                 "metadata": metadata,
             }),
-            cost,
-            None,
-        )
+            GrepOutputMode::FilesWithMatches => json!({
+                "paths": paths.into_iter().collect::<Vec<_>>(),
+                "metadata": metadata,
+            }),
+            GrepOutputMode::Count => json!({
+                "count": count,
+                "metadata": metadata,
+            }),
+        };
+
+        make_result(call, ToolStatus::Success, content, cost, None)
     }
 
     async fn execute_read_file(&self, call: &ToolCall) -> ToolResult {
@@ -623,16 +748,53 @@ impl ToolRegistry {
 }
 
 #[derive(Debug, Deserialize)]
+struct GlobArgs {
+    pattern: String,
+    path: Option<String>,
+    include_ignored: Option<bool>,
+    max_paths: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GrepArgs {
     pattern: String,
     path: Option<String>,
     include: Option<Vec<String>>,
     include_ignored: Option<bool>,
+    output_mode: Option<GrepOutputMode>,
     max_files: Option<usize>,
     max_bytes_per_file: Option<usize>,
     max_matches: Option<usize>,
     output_byte_cap: Option<usize>,
     offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GrepOutputMode {
+    #[default]
+    Content,
+    FilesWithMatches,
+    Count,
+}
+
+impl GrepOutputMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Content => "content",
+            Self::FilesWithMatches => "files_with_matches",
+            Self::Count => "count",
+        }
+    }
+
+    const fn is_limited(self, matches: usize, paths: usize, limit: usize) -> bool {
+        match self {
+            Self::Content => matches >= limit,
+            Self::FilesWithMatches => paths >= limit,
+            Self::Count => false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -659,6 +821,10 @@ struct ShellArgs {
 }
 
 fn grep_include_ignored(arguments: &Value) -> bool {
+    tool_include_ignored(arguments)
+}
+
+fn tool_include_ignored(arguments: &Value) -> bool {
     arguments
         .get("include_ignored")
         .and_then(Value::as_bool)
@@ -705,6 +871,17 @@ fn tool_error(call: &ToolCall, err: impl ToString) -> ToolResult {
         ToolCostHint::default(),
         None,
     )
+}
+
+fn build_required_glob(pattern: &str) -> std::result::Result<GlobSet, String> {
+    let mut builder = GlobSetBuilder::new();
+    if pattern.contains('/') {
+        builder.add(Glob::new(pattern).map_err(|err| err.to_string())?);
+    } else {
+        builder.add(Glob::new(pattern).map_err(|err| err.to_string())?);
+        builder.add(Glob::new(&format!("**/{pattern}")).map_err(|err| err.to_string())?);
+    }
+    builder.build().map_err(|err| err.to_string())
 }
 
 fn build_include_set(patterns: Option<&[String]>) -> std::result::Result<Option<GlobSet>, String> {
@@ -798,7 +975,7 @@ pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
 fn grep_spec() -> ToolSpec {
     ToolSpec {
         name: "grep".to_string(),
-        description: "Search text files under a workspace path. Respects .gitignore by default; set include_ignored=true only when ignored files are intentionally needed. Results are bounded and paginated by offset.".to_string(),
+        description: "Search text files under a workspace path. Respects .gitignore by default; set include_ignored=true only when ignored files are intentionally needed. Use output_mode=count or files_with_matches for broad exploration before reading content.".to_string(),
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
@@ -807,11 +984,31 @@ fn grep_spec() -> ToolSpec {
                 "path": {"type": "string", "description": "Workspace-relative file or directory to search.", "default": "."},
                 "include": {"type": "array", "items": {"type": "string"}, "description": "Optional glob patterns such as *.rs or crates/**/lib.rs."},
                 "include_ignored": {"type": "boolean", "description": "When true, include files ignored by .gitignore and other ignore files. Default false."},
+                "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Return matching lines, only files containing matches, or only a count. Default content."},
                 "max_files": {"type": "integer", "minimum": 1, "maximum": DEFAULT_MAX_FILES},
                 "max_bytes_per_file": {"type": "integer", "minimum": 1, "maximum": DEFAULT_MAX_BYTES_PER_FILE},
                 "max_matches": {"type": "integer", "minimum": 1, "maximum": 1000},
                 "output_byte_cap": {"type": "integer", "minimum": 1, "maximum": 128000},
                 "offset": {"type": "integer", "minimum": 0, "description": "Number of matching lines to skip for pagination."}
+            },
+            "required": ["pattern"]
+        }),
+    }
+}
+
+fn glob_spec() -> ToolSpec {
+    ToolSpec {
+        name: "glob".to_string(),
+        description: "List workspace file paths matching a glob without reading file contents. Respects .gitignore by default; set include_ignored=true only when ignored paths are intentionally needed.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "pattern": {"type": "string", "description": "Glob pattern such as *.rs or crates/**/Cargo.toml."},
+                "path": {"type": "string", "description": "Workspace-relative directory to search.", "default": "."},
+                "include_ignored": {"type": "boolean", "description": "When true, include files ignored by .gitignore and other ignore files. Default false."},
+                "max_paths": {"type": "integer", "minimum": 1, "maximum": 1000},
+                "offset": {"type": "integer", "minimum": 0, "description": "Number of matched paths to skip for pagination."}
             },
             "required": ["pattern"]
         }),

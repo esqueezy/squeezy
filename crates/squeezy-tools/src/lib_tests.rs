@@ -48,6 +48,103 @@ async fn grep_respects_gitignore_by_default_and_can_include_ignored() {
 }
 
 #[tokio::test]
+async fn glob_lists_paths_without_reading_content_and_respects_ignore() {
+    let root = temp_workspace("glob_ignore");
+    fs::write(root.join(".gitignore"), "ignored.rs\n").expect("write gitignore");
+    fs::write(root.join("visible.rs"), "needle\n").expect("write visible");
+    fs::write(root.join("ignored.rs"), "needle\n").expect("write ignored");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let default = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "*.rs"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(default.status, ToolStatus::Success);
+    assert_eq!(default.content["paths"], json!(["visible.rs"]));
+    assert_eq!(default.cost_hint.bytes_read, 0);
+
+    let with_ignored = registry
+        .execute(
+            ToolCall {
+                call_id: "call_2".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "*.rs", "include_ignored": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    let mut paths = with_ignored.content["paths"]
+        .as_array()
+        .expect("paths")
+        .iter()
+        .map(|value| value.as_str().expect("path").to_string())
+        .collect::<Vec<_>>();
+    paths.sort();
+    assert_eq!(paths, vec!["ignored.rs", "visible.rs"]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_count_mode_returns_count_without_line_content() {
+    let root = temp_workspace("grep_count");
+    fs::write(root.join("one.txt"), "needle\nneedle\n").expect("write one");
+    fs::write(root.join("two.txt"), "needle\n").expect("write two");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle", "output_mode": "count"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["count"], 3);
+    assert!(result.content.get("matches").is_none());
+    assert_eq!(result.content["metadata"]["output_mode"], "count");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_files_with_matches_mode_returns_unique_paths() {
+    let root = temp_workspace("grep_files");
+    fs::write(root.join("one.txt"), "needle\nneedle\n").expect("write one");
+    fs::write(root.join("two.txt"), "needle\n").expect("write two");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle", "output_mode": "files_with_matches"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["paths"], json!(["one.txt", "two.txt"]));
+    assert!(result.content.get("matches").is_none());
+    assert_eq!(result.cost_hint.matches_returned, 2);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn read_file_returns_bounded_content_and_hash() {
     let root = temp_workspace("read_file");
     fs::write(root.join("sample.txt"), "abcdef").expect("write sample");
@@ -145,7 +242,10 @@ fn tool_specs_are_sorted_by_name() {
         .map(|spec| spec.name)
         .collect::<Vec<_>>();
 
-    assert_eq!(names, vec!["grep", "read_file", "shell", "write_file"]);
+    assert_eq!(
+        names,
+        vec!["glob", "grep", "read_file", "shell", "write_file"]
+    );
 
     let _ = fs::remove_dir_all(root);
 }

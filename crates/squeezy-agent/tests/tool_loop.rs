@@ -101,6 +101,59 @@ async fn parallel_read_and_search_outputs_return_to_model_by_call_id() {
 }
 
 #[tokio::test]
+async fn glob_and_count_search_outputs_return_to_model() {
+    let root = temp_workspace("glob_count");
+    fs::write(root.join("one.rs"), "fn needle() {}\n").expect("write one");
+    fs::write(root.join("two.rs"), "fn needle() {}\n").expect("write two");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "glob_call".to_string(),
+                name: "glob".to_string(),
+                arguments: serde_json::json!({"pattern": "*.rs"}),
+            })),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "count_call".to_string(),
+                name: "grep".to_string(),
+                arguments: serde_json::json!({
+                    "pattern": "needle",
+                    "include": ["*.rs"],
+                    "output_mode": "count",
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("summarized".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+
+    drain_turn(agent.start_turn("summarize files".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "glob_call");
+    assert_eq!(
+        outputs[0].1["content"]["paths"],
+        serde_json::json!(["one.rs", "two.rs"])
+    );
+    assert_eq!(outputs[1].0, "count_call");
+    assert_eq!(outputs[1].1["content"]["count"], 2);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn denied_write_is_reported_to_model_and_does_not_touch_disk() {
     let root = temp_workspace("denied_write");
     let provider = Arc::new(ScriptedProvider::new(vec![
