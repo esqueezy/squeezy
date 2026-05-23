@@ -162,11 +162,13 @@ fn graph_event_carries_timing_counts_and_language_distribution() {
         symbols: 77,
         edges: 42,
         language_distribution: LanguageDistribution {
+            c_files: 2,
             csharp_files: 2,
+            cpp_files: 3,
             go_files: 1,
             python_files: 4,
             rust_files: 8,
-            supported_files: 15,
+            supported_files: 20,
             unsupported_files: 3,
             unknown_files: 1,
         },
@@ -176,7 +178,9 @@ fn graph_event_carries_timing_counts_and_language_distribution() {
 
     assert!(text.contains("squeezy_graph_build_completed"));
     assert!(text.contains("\"duration_ms\":125"));
+    assert!(text.contains("\"c_files\":2"));
     assert!(text.contains("\"csharp_files\":2"));
+    assert!(text.contains("\"cpp_files\":3"));
     assert!(text.contains("\"go_files\":1"));
     assert!(text.contains("\"python_files\":4"));
     assert!(text.contains("\"rust_files\":8"));
