@@ -352,6 +352,48 @@ fn web_tool_config_normalizes_blank_values() {
     assert_eq!(config.exa_api_key.as_deref(), Some("secret-token"));
 }
 
+#[test]
+fn web_helpers_extract_hosts_and_classify_text_content() {
+    assert_eq!(
+        web_url_host("https://example.com/docs").expect("host"),
+        "example.com"
+    );
+    assert!(is_textual_content_type("application/json; charset=utf-8"));
+    assert!(is_textual_content_type("application/problem+json"));
+    assert!(is_textual_content_type("image/svg+xml"));
+    assert!(!is_textual_content_type("application/octet-stream"));
+}
+
+#[test]
+fn web_call_descriptions_include_host_and_query() {
+    let root = temp_workspace("web_descriptions");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    assert_eq!(
+        registry.describe_call(&ToolCall {
+            call_id: "call_1".to_string(),
+            name: "webfetch".to_string(),
+            arguments: json!({"url": "https://example.com/docs"}),
+        }),
+        "webfetch host=\"example.com\""
+    );
+    assert_eq!(
+        registry.describe_call(&ToolCall {
+            call_id: "call_2".to_string(),
+            name: "websearch".to_string(),
+            arguments: json!({"query": "rust release"}),
+        }),
+        "websearch query=\"rust release\""
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn html_block_stripping_handles_unclosed_blocks() {
+    assert_eq!(html_to_text("<main>before<script>ignored"), "before");
+}
+
 #[tokio::test]
 async fn websearch_sends_exa_mcp_request_and_returns_text() {
     let root = temp_workspace("websearch");
@@ -408,6 +450,236 @@ async fn websearch_sends_exa_mcp_request_and_returns_text() {
 }
 
 #[tokio::test]
+async fn websearch_rejects_invalid_arguments() {
+    let root = temp_workspace("websearch_invalid_args");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "websearch".to_string(),
+                arguments: json!({"num_results": 3}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("invalid tool arguments")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn websearch_rejects_empty_queries_without_http_request() {
+    let root = temp_workspace("websearch_empty");
+    let http = Arc::new(MockWebHttpClient::default());
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http.clone(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "websearch".to_string(),
+                arguments: json!({"query": "  "}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("query must not be empty")
+    );
+    assert!(http.post_requests.lock().expect("post requests").is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn websearch_sends_deep_search_requests() {
+    let root = temp_workspace("websearch_deep");
+    let body =
+        r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"deep results"}]}}"#;
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_post_response(ok_response("application/json", body.as_bytes()));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http.clone(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "websearch".to_string(),
+                arguments: json!({"query": "rust", "search_type": "deep"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["metadata"]["search_type"], "deep");
+    assert_eq!(
+        http.post_requests.lock().expect("post requests")[0].body["params"]["arguments"]["type"],
+        "deep"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn websearch_reports_provider_http_errors() {
+    let root = temp_workspace("websearch_http_error");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_post_response(web_response(
+        503,
+        vec![("content-type", "application/json")],
+        br#"{"error":"unavailable"}"#,
+    ));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "websearch".to_string(),
+                arguments: json!({"query": "rust"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("HTTP 503")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn websearch_reports_missing_text_content() {
+    let root = temp_workspace("websearch_no_text");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_post_response(ok_response(
+        "application/json",
+        br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"   "}]}}"#,
+    ));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "websearch".to_string(),
+                arguments: json!({"query": "rust"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("no text content")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn websearch_reports_http_client_errors() {
+    let root = temp_workspace("websearch_client_error");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_post_error("network unavailable");
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "websearch".to_string(),
+                arguments: json!({"query": "rust"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("network unavailable")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn webfetch_rejects_invalid_arguments() {
+    let root = temp_workspace("webfetch_invalid_args");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("invalid tool arguments")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn webfetch_strips_html_scripts_and_styles() {
     let root = temp_workspace("webfetch_html");
     let html = "<html><head><style>.x{}</style><script>alert(1)</script></head><body>Hello <b>world</b> &amp; docs</body></html>";
@@ -437,6 +709,113 @@ async fn webfetch_strips_html_scripts_and_styles() {
     assert_eq!(result.content["content"], "Hello world & docs");
     let requests = http.get_requests.lock().expect("get requests");
     assert_eq!(*requests, vec!["https://example.com/docs".to_string()]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn webfetch_html_format_returns_raw_html() {
+    let root = temp_workspace("webfetch_html_format");
+    let html = "<html><body>Hello <b>world</b></body></html>";
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(ok_response("text/html", html.as_bytes()));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "https://example.com/docs", "format": "html"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["format"], "html");
+    assert_eq!(result.content["content"], html);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn webfetch_reports_http_status_errors() {
+    let root = temp_workspace("webfetch_http_error");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(web_response(
+        404,
+        vec![("content-type", "text/plain")],
+        b"missing",
+    ));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "https://example.com/missing"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("HTTP status 404")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn webfetch_rejects_unsupported_content_types() {
+    let root = temp_workspace("webfetch_binary");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(web_response(
+        200,
+        vec![("content-type", "application/octet-stream")],
+        b"\x00\x01\x02",
+    ));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "https://example.com/blob"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("unsupported content type")
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -474,6 +853,40 @@ async fn webfetch_reports_cross_host_redirect_without_following() {
     );
     let requests = http.get_requests.lock().expect("get requests");
     assert_eq!(*requests, vec!["https://example.com/start".to_string()]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn webfetch_reports_redirects_without_location() {
+    let root = temp_workspace("webfetch_redirect_no_location");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(web_response(302, Vec::new(), b""));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "https://example.com/start"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("did not include a location")
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -517,6 +930,46 @@ async fn webfetch_follows_same_host_redirects() {
 }
 
 #[tokio::test]
+async fn webfetch_reports_too_many_redirects() {
+    let root = temp_workspace("webfetch_redirect_loop");
+    let http = Arc::new(MockWebHttpClient::default());
+    for index in 0..=MAX_WEB_REDIRECTS {
+        http.push_get_response(redirect_response(&format!("/next-{index}")));
+    }
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http.clone(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "https://example.com/start"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("too many redirects")
+    );
+    assert_eq!(
+        http.get_requests.lock().expect("get requests").len(),
+        MAX_WEB_REDIRECTS + 1
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn webfetch_rejects_non_http_urls() {
     let root = temp_workspace("webfetch_scheme");
     let registry = ToolRegistry::new(&root).expect("registry");
@@ -540,6 +993,40 @@ async fn webfetch_rejects_non_http_urls() {
             .contains("http:// or https://")
     );
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn webfetch_reports_http_client_errors() {
+    let root = temp_workspace("webfetch_client_error");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_error("offline");
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "https://example.com/page"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("offline")
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -647,11 +1134,25 @@ impl MockWebHttpClient {
             .push_back(Ok(response));
     }
 
+    fn push_post_error(&self, error: &str) {
+        self.post_responses
+            .lock()
+            .expect("post responses")
+            .push_back(Err(error.to_string()));
+    }
+
     fn push_get_response(&self, response: WebHttpResponse) {
         self.get_responses
             .lock()
             .expect("get responses")
             .push_back(Ok(response));
+    }
+
+    fn push_get_error(&self, error: &str) {
+        self.get_responses
+            .lock()
+            .expect("get responses")
+            .push_back(Err(error.to_string()));
     }
 }
 

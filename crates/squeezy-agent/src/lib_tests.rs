@@ -103,6 +103,22 @@ async fn turn_stream_reports_provider_error() {
     assert!(saw_error);
 }
 
+#[test]
+fn agent_new_falls_back_to_current_dir_for_invalid_workspace_root() {
+    let root = temp_workspace("agent_invalid_root");
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.join("missing"),
+            ..Default::default()
+        },
+        provider,
+    );
+
+    assert_eq!(agent.provider_name(), "mock");
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn tool_loop_executes_fallback_tool_and_returns_observation() {
     let root = temp_workspace("agent_tool_loop");
