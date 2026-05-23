@@ -45,12 +45,25 @@ fn config_without_env_uses_openai_provider_defaults() {
         config.tool_output_retention_days,
         DEFAULT_TOOL_OUTPUT_RETENTION_DAYS
     );
+    assert_eq!(
+        config.max_tool_calls_per_turn,
+        DEFAULT_MAX_TOOL_CALLS_PER_TURN
+    );
+    assert_eq!(
+        config.max_tool_bytes_read_per_turn,
+        DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN
+    );
+    assert_eq!(
+        config.max_search_files_per_turn,
+        DEFAULT_MAX_SEARCH_FILES_PER_TURN
+    );
+    assert_eq!(config.telemetry, TelemetryConfig::default());
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.api_key_env, "OPENAI_API_KEY");
             assert_eq!(openai.base_url, DEFAULT_OPENAI_BASE_URL);
         }
-        ProviderConfig::Anthropic(_) => panic!("expected OpenAI provider"),
+        _ => panic!("expected OpenAI provider"),
     }
 }
 
@@ -70,6 +83,11 @@ fn config_reads_supported_env_overrides() {
         "SQUEEZY_TOOL_PREVIEW_BYTES" => Some("456".to_string()),
         "SQUEEZY_MAX_TOOL_RESULT_BYTES_PER_ROUND" => Some("7890".to_string()),
         "SQUEEZY_TOOL_OUTPUT_RETENTION_DAYS" => Some("2".to_string()),
+        "SQUEEZY_MAX_TOOL_CALLS_PER_TURN" => Some("12".to_string()),
+        "SQUEEZY_MAX_TOOL_BYTES_READ_PER_TURN" => Some("3456".to_string()),
+        "SQUEEZY_MAX_SEARCH_FILES_PER_TURN" => Some("78".to_string()),
+        "SQUEEZY_TELEMETRY" => Some("off".to_string()),
+        "SQUEEZY_TELEMETRY_ENDPOINT" => Some("https://telemetry.example/v1/batch".to_string()),
         _ => None,
     });
 
@@ -85,11 +103,21 @@ fn config_reads_supported_env_overrides() {
     assert_eq!(config.tool_preview_bytes, 456);
     assert_eq!(config.max_tool_result_bytes_per_round, 7890);
     assert_eq!(config.tool_output_retention_days, 2);
+    assert_eq!(config.max_tool_calls_per_turn, 12);
+    assert_eq!(config.max_tool_bytes_read_per_turn, 3456);
+    assert_eq!(config.max_search_files_per_turn, 78);
+    assert_eq!(
+        config.telemetry,
+        TelemetryConfig {
+            enabled: false,
+            endpoint: "https://telemetry.example/v1/batch".to_string()
+        }
+    );
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.base_url, "https://example.test/v1");
         }
-        ProviderConfig::Anthropic(_) => panic!("expected OpenAI provider"),
+        _ => panic!("expected OpenAI provider"),
     }
 }
 
@@ -106,7 +134,7 @@ fn config_can_select_anthropic_provider_defaults() {
             assert_eq!(anthropic.api_key_env, "ANTHROPIC_API_KEY");
             assert_eq!(anthropic.base_url, DEFAULT_ANTHROPIC_BASE_URL);
         }
-        ProviderConfig::OpenAi(_) => panic!("expected Anthropic provider"),
+        _ => panic!("expected Anthropic provider"),
     }
 }
 
@@ -126,8 +154,122 @@ fn config_reads_anthropic_env_overrides() {
         ProviderConfig::Anthropic(anthropic) => {
             assert_eq!(anthropic.base_url, "https://anthropic.example.test/v1");
         }
-        ProviderConfig::OpenAi(_) => panic!("expected Anthropic provider"),
+        _ => panic!("expected Anthropic provider"),
     }
+}
+
+#[test]
+fn config_reads_settings_file_provider_defaults() {
+    let settings: SettingsFile = toml::from_str(
+        r#"
+provider = "ollama"
+profile = "cheap"
+
+[providers.ollama]
+base_url = "http://ollama.example/api"
+default_model = "llama-local"
+"#,
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    assert_eq!(config.model, "llama-local");
+    assert_eq!(config.profile, ModelProfile::Cheap);
+    match config.provider {
+        ProviderConfig::Ollama(ollama) => {
+            assert_eq!(ollama.base_url, "http://ollama.example/api");
+        }
+        _ => panic!("expected Ollama provider"),
+    }
+}
+
+#[test]
+fn env_overrides_settings_file_provider_and_model() {
+    let settings: SettingsFile = toml::from_str(
+        r#"
+provider = "ollama"
+model = "llama-local"
+
+[providers.google]
+api_key_env = "CUSTOM_GEMINI_KEY"
+base_url = "https://gemini.example/v1"
+default_model = "gemini-local"
+"#,
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("google".to_string()),
+        "SQUEEZY_MODEL" => Some("gemini-env".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(config.model, "gemini-env");
+    match config.provider {
+        ProviderConfig::Google(google) => {
+            assert_eq!(google.api_key_env, "CUSTOM_GEMINI_KEY");
+            assert_eq!(google.base_url, "https://gemini.example/v1");
+        }
+        _ => panic!("expected Google provider"),
+    }
+}
+
+#[test]
+fn provider_override_uses_selected_provider_settings_and_default_model() {
+    let settings: SettingsFile = toml::from_str(
+        r#"
+provider = "openai"
+
+[providers.openai]
+default_model = "openai-settings-model"
+
+[providers.anthropic]
+api_key_env = "CUSTOM_ANTHROPIC_KEY"
+base_url = "https://anthropic.example/v1"
+default_model = "claude-settings-model"
+"#,
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("anthropic".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(config.model, "claude-settings-model");
+    match config.provider {
+        ProviderConfig::Anthropic(anthropic) => {
+            assert_eq!(anthropic.api_key_env, "CUSTOM_ANTHROPIC_KEY");
+            assert_eq!(anthropic.base_url, "https://anthropic.example/v1");
+        }
+        _ => panic!("expected Anthropic provider"),
+    }
+}
+
+#[test]
+fn config_can_select_azure_bedrock_and_ollama_defaults() {
+    let azure = AppConfig::from_env_vars(|name| match name {
+        "SQUEEZY_PROVIDER" => Some("azure_openai".to_string()),
+        "AZURE_OPENAI_BASE_URL" => Some("https://resource.openai.azure.com/openai/v1".to_string()),
+        _ => None,
+    });
+    assert!(matches!(azure.provider, ProviderConfig::AzureOpenAi(_)));
+    assert_eq!(azure.model, DEFAULT_AZURE_OPENAI_MODEL);
+
+    let bedrock = AppConfig::from_env_vars(|name| match name {
+        "SQUEEZY_PROVIDER" => Some("bedrock".to_string()),
+        _ => None,
+    });
+    assert!(matches!(bedrock.provider, ProviderConfig::Bedrock(_)));
+    assert_eq!(bedrock.model, DEFAULT_BEDROCK_MODEL);
+
+    let ollama = AppConfig::from_env_vars(|name| match name {
+        "SQUEEZY_PROVIDER" => Some("ollama".to_string()),
+        _ => None,
+    });
+    assert!(matches!(ollama.provider, ProviderConfig::Ollama(_)));
+    assert_eq!(ollama.model, DEFAULT_OLLAMA_MODEL);
 }
 
 #[test]

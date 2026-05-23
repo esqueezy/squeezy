@@ -183,6 +183,25 @@ cfg-gated Tokio helpers and build-script/test utilities. Bat's rust-analyzer
 project load is degraded on this local toolchain, so its LSP reference numbers
 are treated as a noisy oracle result.
 
+Follow-up reference-FN reduction on May 23, 2026 added grouped `use` tree
+expansion, workspace package scoping for top-level crates, inline-module path
+matching, guarded unit-struct constructor references, and cfg-gated trait impl
+declaration filtering. On deterministic 5,000-scenario local runs with 50 LSP
+reference probes, `ripgrep` moved from TP=15 FP=0 FN=146 to TP=31 FP=1 FN=130.
+`serde` moved from TP=8 FP=3 FN=115 to TP=39 FP=6 FN=84. The remaining misses
+are mostly associated type references, trait method calls through type
+inference, active cfg/feature differences, proc-macro-generated references, and
+cross-crate reexports that need Cargo metadata rather than syntax-only
+heuristics.
+
+A subsequent reference-FN pass on May 23, 2026 bound identifier references
+inside import clauses back to their resolved import entries, and added
+precision-scoped trait associated type projection matching. On deterministic
+5,000-scenario local runs with 50 LSP reference probes, `ripgrep` moved from
+TP=31 FP=1 FN=130 to TP=89 FP=1 FN=72. `serde` moved from TP=39 FP=6 FN=84 to
+TP=49 FP=6 FN=74. A broader associated-type declaration-family heuristic was
+tested but rejected because it increased serde reference FP from 6 to 158.
+
 ## CI
 
 `.github/workflows/semantic-graph-benchmark.yml` runs the smoke benchmark on PRs
