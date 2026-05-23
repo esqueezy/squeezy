@@ -5,7 +5,7 @@ use ratatui::backend::TestBackend;
 use squeezy_core::{
     AppConfig, CostSnapshot, PermissionCapability, PermissionMode, PermissionPolicy,
     PermissionRequest, PermissionRisk, PermissionScope, SessionMode, StatusVerbosity, TuiConfig,
-    TurnMetrics,
+    TurnId, TurnMetrics,
 };
 use squeezy_llm::UnavailableProvider;
 
@@ -523,6 +523,134 @@ fn base64_encoder_supports_osc52_payloads() {
     assert_eq!(base64_encode(b"a"), "YQ==");
     assert_eq!(base64_encode(b"ab"), "YWI=");
     assert_eq!(base64_encode(b"abc"), "YWJj");
+}
+
+#[tokio::test]
+async fn assistant_delta_preserves_scroll_offset_in_history() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_scroll_from_bottom = 8;
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::AssistantDelta {
+        turn_id: TurnId::new(1),
+        delta: "streamed".to_string(),
+    })
+    .await
+    .expect("send delta");
+    drop(tx);
+
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        app.transcript_scroll_from_bottom, 8,
+        "history scroll must survive incoming deltas",
+    );
+    assert_eq!(app.pending_assistant, "streamed");
+}
+
+#[tokio::test]
+async fn completed_event_preserves_scroll_offset_in_history() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_scroll_from_bottom = 5;
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        app.transcript_scroll_from_bottom, 5,
+        "history scroll must survive turn completion",
+    );
+    assert_eq!(app.status, "ready");
+    assert!(app.turn_rx.is_none());
+}
+
+#[tokio::test]
+async fn scroll_keys_preserve_status_text() {
+    let agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.status = "tool foo finished".to_string();
+
+    handle_key(
+        &mut app,
+        &agent,
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(
+        app.status, "tool foo finished",
+        "PageUp must not clobber the status text",
+    );
+
+    handle_key(
+        &mut app,
+        &agent,
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(
+        app.status, "tool foo finished",
+        "Home must not clobber the status text",
+    );
+
+    handle_key(
+        &mut app,
+        &agent,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(
+        app.status, "tool foo finished",
+        "End must not clobber the status text",
+    );
+}
+
+#[test]
+fn status_marker_surfaces_history_scroll_state() {
+    let config = test_config(SessionMode::Build);
+    let mut app = TuiApp::new_with_clipboard(
+        "openai",
+        &config,
+        SessionMode::Build,
+        Box::new(NoopClipboard),
+    );
+
+    let live = format_status_tokens(&app);
+    assert!(
+        !live.contains("scroll=history"),
+        "no marker while at bottom: {live}",
+    );
+
+    app.transcript_scroll_from_bottom = 4;
+    let scrolled = format_status_tokens(&app);
+    assert!(
+        scrolled.contains("scroll=history"),
+        "missing scroll marker: {scrolled}",
+    );
+}
+
+#[test]
+fn osc52_clipboard_rejects_payloads_above_cap() {
+    let mut clipboard = Osc52Clipboard;
+    let oversized = "x".repeat(OSC52_MAX_PAYLOAD_BYTES + 1);
+    let err = clipboard
+        .copy_text(&oversized)
+        .expect_err("oversized payload must fail");
+    assert!(err.contains("exceeds"), "{err}");
+    assert!(err.contains(&OSC52_MAX_PAYLOAD_BYTES.to_string()), "{err}");
 }
 
 fn test_app(mode: SessionMode) -> TuiApp {

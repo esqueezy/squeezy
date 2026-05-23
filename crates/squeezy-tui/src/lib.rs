@@ -61,7 +61,11 @@ async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::AssistantDelta { delta, .. } => {
                     app.pending_assistant.push_str(&delta);
-                    app.transcript_scroll_from_bottom = 0;
+                    // Intentionally preserve `transcript_scroll_from_bottom`
+                    // here: if the user paged up to read history we would
+                    // otherwise yank them back to the bottom on every delta.
+                    // The End key (or any tool/status event that explicitly
+                    // resets) brings them back to live view.
                 }
                 AgentEvent::ToolCallQueued { call, .. } => {
                     app.status = format!("queued {}", call.name);
@@ -109,7 +113,8 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.cost = cost;
                     app.metrics = metrics;
                     app.status = "ready".to_string();
-                    app.transcript_scroll_from_bottom = 0;
+                    // Preserve the user's scroll position; if they paged up
+                    // mid-turn we shouldn't snap them down on completion.
                     app.turn_rx = None;
                     app.cancel = None;
                     break;
@@ -188,24 +193,24 @@ async fn handle_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> Result<bo
 
     match key.code {
         KeyCode::Esc => Ok(true),
+        // Scroll keys intentionally leave `app.status` alone so that
+        // useful messages (tool results, errors, approval prompts) stay
+        // visible while the user navigates history. The status footer
+        // already surfaces a "scrolled" marker when off the bottom.
         KeyCode::PageUp => {
             app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_add(8);
-            app.status = "scrolled transcript".to_string();
             Ok(false)
         }
         KeyCode::PageDown => {
             app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_sub(8);
-            app.status = "scrolled transcript".to_string();
             Ok(false)
         }
         KeyCode::Home => {
             app.transcript_scroll_from_bottom = u16::MAX;
-            app.status = "transcript top".to_string();
             Ok(false)
         }
         KeyCode::End => {
             app.transcript_scroll_from_bottom = 0;
-            app.status = "transcript bottom".to_string();
             Ok(false)
         }
         KeyCode::Enter => {
@@ -655,8 +660,13 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn format_status_tokens(app: &TuiApp) -> String {
+    let scroll_marker = if app.transcript_scroll_from_bottom > 0 {
+        "  scroll=history"
+    } else {
+        ""
+    };
     let context = format!(
-        "{}:{}  mode={}  {}  {}  sandbox={}  telemetry={}  status={}",
+        "{}:{}  mode={}  {}  {}  sandbox={}  telemetry={}  status={}{}",
         app.provider_name,
         app.model,
         app.mode.as_str(),
@@ -665,6 +675,7 @@ fn format_status_tokens(app: &TuiApp) -> String {
         app.permissions.sandbox,
         app.telemetry.as_str(),
         app.status,
+        scroll_marker,
     );
     let spend = format!(
         "cost={} tok={}/{} tools={} budget={}",
@@ -681,7 +692,7 @@ fn format_status_tokens(app: &TuiApp) -> String {
     let hints = if app.pending_approval.is_some() {
         "Y allow once | A user | P project | N deny | U/D deny rule | Ctrl-C cancel"
     } else {
-        "Enter send | Shift-Tab mode | Pg scroll | Ctrl-Y copy | /copy | Ctrl-C cancel | Esc quit"
+        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy | Ctrl-C cancel | Esc quit"
     };
     match app.status_verbosity {
         StatusVerbosity::Compact => format!("{context}  {spend}\n{hints}"),
@@ -743,8 +754,23 @@ trait Clipboard {
 
 struct Osc52Clipboard;
 
+/// Conservative cap on OSC52 clipboard payloads. xterm's default
+/// `selectToClipboard` buffer is 8 KiB; many other emulators silently
+/// drop sequences past their (usually undocumented) limit. We refuse
+/// oversized copies up-front so the status line reports an actionable
+/// error instead of claiming "copied N chars" while the terminal
+/// quietly discarded the escape.
+pub(crate) const OSC52_MAX_PAYLOAD_BYTES: usize = 8 * 1024;
+
 impl Clipboard for Osc52Clipboard {
     fn copy_text(&mut self, text: &str) -> std::result::Result<(), String> {
+        if text.len() > OSC52_MAX_PAYLOAD_BYTES {
+            return Err(format!(
+                "payload {} bytes exceeds terminal clipboard cap of {} bytes",
+                text.len(),
+                OSC52_MAX_PAYLOAD_BYTES,
+            ));
+        }
         let sequence = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
         let mut stdout = io::stdout();
         stdout
