@@ -73,11 +73,9 @@ fn python_ast_oracle_reports_unparseable_files_separately() {
 
     assert_eq!(scan.unparseable_files, vec!["invalid.py".to_string()]);
     assert_eq!(scan.symbols.raw_total, 1);
-    assert!(
-        scan.symbols.counts.contains_key(&SymbolKey {
-            file: "valid.py".to_string(),
-            kind: "Function".to_string(),
-            name: "ok".to_string()
-        })
-    );
+    assert!(scan.symbols.counts.contains_key(&SymbolKey {
+        file: "valid.py".to_string(),
+        kind: "Function".to_string(),
+        name: "ok".to_string()
+    }));
 }
