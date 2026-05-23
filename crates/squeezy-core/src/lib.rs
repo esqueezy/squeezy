@@ -36,6 +36,8 @@ pub const DEFAULT_TICK_RATE_MS: u64 = 50;
 pub const DEFAULT_TELEMETRY_ENDPOINT: &str =
     "https://squeezy-telemetry.esqueezy.workers.dev/v1/batch";
 pub const PROJECT_SETTINGS_FILE: &str = "squeezy.toml";
+pub const DEFAULT_SQUEEZY_SKILLS_DIR: &str = ".squeezy/skills";
+pub const DEFAULT_AGENT_COMPAT_SKILLS_DIR: &str = ".agents/skills";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -59,6 +61,7 @@ pub struct AppConfig {
     pub max_tool_bytes_read_per_turn: u64,
     pub max_search_files_per_turn: u64,
     pub telemetry: TelemetryConfig,
+    pub skills: SkillsConfig,
     pub graph: GraphConfig,
     pub cache: CacheConfig,
     pub tui: TuiConfig,
@@ -333,6 +336,10 @@ impl AppConfig {
             settings.permissions.unwrap_or_default(),
             &mut get_var,
         );
+        let skills = SkillsConfig::from_settings_and_env_vars(
+            settings.skills.unwrap_or_default(),
+            &mut get_var,
+        );
         let graph = GraphConfig::from_settings(settings.graph.unwrap_or_default());
         let cache = CacheConfig::from_settings(settings.cache.unwrap_or_default());
         let tui = TuiConfig::from_settings(settings.tui.unwrap_or_default());
@@ -363,6 +370,7 @@ impl AppConfig {
             max_tool_bytes_read_per_turn,
             max_search_files_per_turn,
             telemetry,
+            skills,
             graph,
             cache,
             tui,
@@ -486,6 +494,16 @@ impl AppConfig {
             toml_string(&self.exa_mcp_url)
         ));
         output.push_str("exa_api_key_env = \"<redacted>\"\n\n");
+
+        output.push_str("[skills]\n");
+        output.push_str(&format!(
+            "user_dir = {}\n",
+            toml_string(&self.skills.user_dir.display().to_string())
+        ));
+        output.push_str(&format!(
+            "compat_user_dir = {}\n\n",
+            toml_string(&self.skills.compat_user_dir.display().to_string())
+        ));
 
         output.push_str("[graph]\n");
         output.push_str(&format!(
@@ -694,6 +712,7 @@ pub struct SettingsFile {
     pub permissions: Option<PermissionSettings>,
     pub telemetry: Option<TelemetrySettings>,
     pub web: Option<WebSettings>,
+    pub skills: Option<SkillsSettings>,
     pub graph: Option<GraphSettings>,
     pub cache: Option<CacheSettings>,
     pub tui: Option<TuiSettings>,
@@ -747,6 +766,7 @@ impl SettingsFile {
                 "permissions",
                 "telemetry",
                 "web",
+                "skills",
                 "graph",
                 "cache",
                 "tui",
@@ -783,6 +803,9 @@ impl SettingsFile {
             .transpose()?;
         settings.web = optional_table(table, "web", source)?
             .map(|table| WebSettings::from_table(table, source, "web"))
+            .transpose()?;
+        settings.skills = optional_table(table, "skills", source)?
+            .map(|table| SkillsSettings::from_table(table, source, "skills"))
             .transpose()?;
         settings.graph = optional_table(table, "graph", source)?
             .map(|table| GraphSettings::from_table(table, source, "graph"))
@@ -821,6 +844,7 @@ impl SettingsFile {
             TelemetrySettings::merge,
         );
         merge_option(&mut self.web, next.web, WebSettings::merge);
+        merge_option(&mut self.skills, next.skills, SkillsSettings::merge);
         merge_option(&mut self.graph, next.graph, GraphSettings::merge);
         merge_option(&mut self.cache, next.cache, CacheSettings::merge);
         merge_option(&mut self.tui, next.tui, TuiSettings::merge);
@@ -1308,6 +1332,73 @@ impl WebSettings {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SkillsSettings {
+    pub user_dir: Option<PathBuf>,
+    pub compat_user_dir: Option<PathBuf>,
+}
+
+impl SkillsSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(table, &["user_dir", "compat_user_dir"], source, path)?;
+        Ok(Self {
+            user_dir: path_value(table, "user_dir", source, &field(path, "user_dir"))?,
+            compat_user_dir: path_value(
+                table,
+                "compat_user_dir",
+                source,
+                &field(path, "compat_user_dir"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.user_dir, next.user_dir);
+        replace_if_some(&mut self.compat_user_dir, next.compat_user_dir);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    pub user_dir: PathBuf,
+    pub compat_user_dir: PathBuf,
+}
+
+impl SkillsConfig {
+    pub fn from_env_vars(mut var: impl FnMut(&str) -> Option<String>) -> Self {
+        Self::from_settings_and_env_vars(SkillsSettings::default(), &mut var)
+    }
+
+    fn from_settings_and_env_vars(
+        settings: SkillsSettings,
+        mut var: impl FnMut(&str) -> Option<String>,
+    ) -> Self {
+        Self {
+            user_dir: expand_home_path(
+                var("SQUEEZY_SKILLS_USER_DIR")
+                    .map(PathBuf::from)
+                    .or(settings.user_dir)
+                    .unwrap_or_else(default_squeezy_skills_dir),
+            ),
+            compat_user_dir: expand_home_path(
+                var("SQUEEZY_SKILLS_COMPAT_USER_DIR")
+                    .map(PathBuf::from)
+                    .or(settings.compat_user_dir)
+                    .unwrap_or_else(default_agent_compat_skills_dir),
+            ),
+        }
+    }
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            user_dir: default_squeezy_skills_dir(),
+            compat_user_dir: default_agent_compat_skills_dir(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphConfig {
     pub languages: Vec<String>,
@@ -1501,6 +1592,36 @@ pub fn default_settings_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".squeezy/settings.toml"))
 }
 
+pub fn default_squeezy_skills_dir() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(DEFAULT_SQUEEZY_SKILLS_DIR))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR))
+}
+
+pub fn default_agent_compat_skills_dir() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
+}
+
+fn expand_home_path(path: PathBuf) -> PathBuf {
+    let Some(path_str) = path.to_str() else {
+        return path;
+    };
+    if path_str == "~" {
+        return env::var_os("HOME").map(PathBuf::from).unwrap_or(path);
+    }
+    if let Some(rest) = path_str.strip_prefix("~/") {
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(rest))
+            .unwrap_or(path);
+    }
+    path
+}
+
 /// Walks up the directory tree from `start` looking for `squeezy.toml`.
 ///
 /// The starting directory is canonicalized so that `..` segments do not
@@ -1564,6 +1685,10 @@ pub fn user_settings_template() -> &'static str {
 # [web]
 # exa_mcp_url = "https://mcp.exa.ai/mcp"
 # exa_api_key_env = "EXA_API_KEY"
+
+# [skills]
+# user_dir = "~/.squeezy/skills"
+# compat_user_dir = "~/.agents/skills"
 "#
 }
 

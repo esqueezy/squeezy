@@ -10,8 +10,8 @@ use std::{
 use futures_core::Stream;
 use futures_util::stream;
 use serde_json::json;
-use squeezy_core::{AppConfig, PermissionMode, PermissionPolicy, Result};
-use squeezy_llm::{LlmEvent, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
+use squeezy_core::{AppConfig, PermissionMode, PermissionPolicy, Result, SkillsConfig};
+use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 use squeezy_tools::{ToolStatus, sha256_hex};
 
 use super::*;
@@ -347,6 +347,100 @@ async fn tool_loop_can_edit_file_with_write_tool() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn inactive_skills_are_not_eagerly_added_to_instructions() {
+    let root = temp_workspace("agent_skill_inactive");
+    write_skill(
+        &root.join(".agents/skills/rust-nav"),
+        "rust-nav",
+        &["rust symbol"],
+    );
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
+
+    let mut rx = agent.start_turn("hello".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("request");
+    assert!(!request.instructions.contains("<active_skills>"));
+    assert!(!request.instructions.contains("Rust Nav"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn explicit_skill_activation_injects_body_and_rewrites_task() {
+    let root = temp_workspace("agent_skill_explicit");
+    write_skill(
+        &root.join(".agents/skills/rust-nav"),
+        "rust-nav",
+        &["rust symbol"],
+    );
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "/skill rust-nav inspect main".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("request");
+    assert!(request.instructions.contains("<active_skills>"));
+    assert!(request.instructions.contains("# Rust Nav"));
+    assert_eq!(
+        request.input,
+        vec![LlmInputItem::UserText("inspect main".to_string())]
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn trigger_skill_activation_injects_body() {
+    let root = temp_workspace("agent_skill_trigger");
+    write_skill(
+        &root.join(".agents/skills/rust-nav"),
+        "rust-nav",
+        &["rust symbol"],
+    );
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "Find this Rust symbol".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("request");
+    assert!(request.instructions.contains("<active_skills>"));
+    assert!(request.instructions.contains("# Rust Nav"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn temp_workspace(name: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -355,4 +449,31 @@ fn temp_workspace(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("squeezy_{name}_{nonce}"));
     fs::create_dir_all(&root).expect("create temp workspace");
     root
+}
+
+fn config_with_skill_dirs(root: &PathBuf) -> AppConfig {
+    AppConfig {
+        workspace_root: root.clone(),
+        skills: SkillsConfig {
+            user_dir: root.join("user-skills"),
+            compat_user_dir: root.join("compat-skills"),
+        },
+        ..Default::default()
+    }
+}
+
+fn write_skill(dir: &PathBuf, name: &str, triggers: &[&str]) {
+    fs::create_dir_all(dir).expect("mkdir skill");
+    let triggers = triggers
+        .iter()
+        .map(|trigger| format!("  - {trigger}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        dir.join("SKILL.md"),
+        format!(
+            "---\nname: {name}\ndescription: Rust navigation skill\ntriggers:\n{triggers}\n---\n# Rust Nav\n\nUse graph tools.\n"
+        ),
+    )
+    .expect("write skill");
 }

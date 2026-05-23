@@ -11,6 +11,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use squeezy_core::SkillsConfig;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -1436,6 +1437,8 @@ fn tool_specs_are_sorted_by_name() {
             "diff_context",
             "glob",
             "grep",
+            "list_skills",
+            "load_skill",
             "read_file",
             "read_tool_output",
             "shell",
@@ -1445,6 +1448,57 @@ fn tool_specs_are_sorted_by_name() {
             "websearch",
             "write_file"
         ]
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn skill_tools_list_metadata_and_load_body() {
+    let root = temp_workspace("skill_tools");
+    write_skill(&root.join(".agents/skills/rust-nav"), "rust-nav");
+    let registry = ToolRegistry::new_with_configs_and_skills(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        SkillsConfig {
+            user_dir: root.join("user-skills"),
+            compat_user_dir: root.join("compat-skills"),
+        },
+    )
+    .expect("registry");
+
+    let list = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "list_skills".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(list.status, ToolStatus::Success);
+    assert_eq!(list.content["skills"][0]["name"], "rust-nav");
+    assert!(list.content.to_string().contains("Rust navigation"));
+    assert!(!list.content.to_string().contains("Use graph tools"));
+
+    let loaded = registry
+        .execute(
+            ToolCall {
+                call_id: "call_2".to_string(),
+                name: "load_skill".to_string(),
+                arguments: json!({"name": "rust-nav"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(loaded.status, ToolStatus::Success);
+    assert_eq!(loaded.content["name"], "rust-nav");
+    assert!(
+        loaded.content["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Use graph tools"))
     );
 
     let _ = fs::remove_dir_all(root);
@@ -1503,6 +1557,17 @@ fn run_git(root: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn write_skill(dir: &PathBuf, name: &str) {
+    fs::create_dir_all(dir).expect("mkdir skill");
+    fs::write(
+        dir.join("SKILL.md"),
+        format!(
+            "---\nname: {name}\ndescription: Rust navigation\ntriggers:\n  - rust symbol\n---\n# Rust Nav\n\nUse graph tools.\n"
+        ),
+    )
+    .expect("write skill");
 }
 
 #[derive(Debug, Clone)]

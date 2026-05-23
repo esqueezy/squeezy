@@ -24,11 +24,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use squeezy_core::{
     DEFAULT_EXA_MCP_URL, DEFAULT_TOOL_OUTPUT_RETENTION_DAYS, DEFAULT_TOOL_PREVIEW_BYTES,
-    DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, FileId, PermissionScope, Result, SqueezyError,
+    DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, FileId, PermissionScope, Result, SkillsConfig,
+    SqueezyError,
 };
 use squeezy_graph::{
     DirtyAnnotation, DirtyRange, GraphManager, GraphSymbol, ReferenceHit, SignatureQuery,
 };
+use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog};
 use squeezy_vcs::{DiffFile, DiffFileStatus, DiffMode, DiffOptions, DiffSnapshot, GitVcs};
 use tokio::{io::AsyncReadExt, process::Command, sync::Mutex, time};
 use tokio_util::sync::CancellationToken;
@@ -365,6 +367,7 @@ pub struct ToolRegistry {
     graph: Arc<StdMutex<Option<GraphManager>>>,
     vcs: Arc<GitVcs>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
+    skills: Arc<SkillCatalog>,
 }
 
 #[derive(Debug, Default)]
@@ -402,6 +405,15 @@ impl ToolRegistry {
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
     ) -> Result<Self> {
+        Self::new_with_configs_and_skills(root, output_config, web_config, SkillsConfig::default())
+    }
+
+    pub fn new_with_configs_and_skills(
+        root: impl Into<PathBuf>,
+        output_config: ToolOutputConfig,
+        web_config: WebToolConfig,
+        skills_config: SkillsConfig,
+    ) -> Result<Self> {
         let root = root.into();
         let root = root
             .canonicalize()
@@ -410,6 +422,7 @@ impl ToolRegistry {
         let http = Arc::new(ReqwestWebHttpClient::new()?);
         let graph = GraphManager::open(&root).ok();
         let vcs = GitVcs::open(&root)?;
+        let skills = SkillCatalog::discover(&root, &skills_config)?;
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -418,6 +431,7 @@ impl ToolRegistry {
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
+            skills: Arc::new(skills),
         })
     }
 
@@ -435,6 +449,7 @@ impl ToolRegistry {
         let output_store = ToolOutputStore::new(&root, output_config)?;
         let graph = GraphManager::open(&root).ok();
         let vcs = GitVcs::open(&root)?;
+        let skills = SkillCatalog::discover(&root, &SkillsConfig::default())?;
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -443,6 +458,7 @@ impl ToolRegistry {
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
+            skills: Arc::new(skills),
         })
     }
 
@@ -490,6 +506,8 @@ impl ToolRegistry {
             shell_spec(),
             webfetch_spec(),
             websearch_spec(),
+            list_skills_spec(),
+            load_skill_spec(),
         ];
         specs.sort_by(|left, right| left.name.cmp(&right.name));
         specs
@@ -503,7 +521,7 @@ impl ToolRegistry {
             "glob" if tool_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
             "grep" if grep_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
             "diff_context" | "glob" | "grep" | "read_file" | "read_tool_output"
-            | "symbol_context" => PermissionScope::Read,
+            | "symbol_context" | "list_skills" | "load_skill" => PermissionScope::Read,
             _ => PermissionScope::Read,
         }
     }
@@ -519,6 +537,8 @@ impl ToolRegistry {
                 | "symbol_context"
                 | "webfetch"
                 | "websearch"
+                | "list_skills"
+                | "load_skill"
         )
     }
 
@@ -620,8 +640,32 @@ impl ToolRegistry {
                 let query = args.as_ref().map(|args| args.query.as_str()).unwrap_or("?");
                 format!("websearch query={query:?}")
             }
+            "list_skills" => "list_skills".to_string(),
+            "load_skill" => {
+                let args = serde_json::from_value::<LoadSkillArgs>(call.arguments.clone()).ok();
+                let name = args.as_ref().map(|args| args.name.as_str()).unwrap_or("?");
+                format!("load_skill name={name:?}")
+            }
             _ => format!("{} {}", call.name, call.arguments),
         }
+    }
+
+    pub fn activate_skills_for_input(&self, input: &str) -> Result<SkillActivation> {
+        self.skills.activate_for_input(input)
+    }
+
+    pub fn format_active_skills(&self, skills: &[LoadedSkill]) -> Option<String> {
+        if skills.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "<active_skills>\n{}\n</active_skills>",
+            skills
+                .iter()
+                .map(LoadedSkill::prompt_block)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))
     }
 
     pub async fn execute(&self, call: ToolCall, cancel: CancellationToken) -> ToolResult {
@@ -641,6 +685,8 @@ impl ToolRegistry {
             "shell" => self.execute_shell(&call, cancel).await,
             "webfetch" => self.execute_webfetch(&call, cancel).await,
             "websearch" => self.execute_websearch(&call, cancel).await,
+            "list_skills" => self.execute_list_skills(&call).await,
+            "load_skill" => self.execute_load_skill(&call).await,
             _ => make_result(
                 &call,
                 ToolStatus::Error,
@@ -720,6 +766,19 @@ impl ToolRegistry {
                 truncated,
                 ..ToolCostHint::default()
             },
+            None,
+        )
+    }
+
+    async fn execute_list_skills(&self, call: &ToolCall) -> ToolResult {
+        if let Err(err) = serde_json::from_value::<ListSkillsArgs>(call.arguments.clone()) {
+            return tool_arg_error(call, err);
+        }
+        make_result(
+            call,
+            ToolStatus::Success,
+            self.skills.summaries_json(),
+            ToolCostHint::default(),
             None,
         )
     }
@@ -886,6 +945,31 @@ impl ToolRegistry {
             })),
             "files": files,
         })
+    }
+
+    async fn execute_load_skill(&self, call: &ToolCall) -> ToolResult {
+        let args = match serde_json::from_value::<LoadSkillArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        match self.skills.load(&args.name) {
+            Ok(skill) => make_result(
+                call,
+                ToolStatus::Success,
+                json!({
+                    "name": skill.summary.name,
+                    "description": skill.summary.description,
+                    "when_to_use": skill.summary.when_to_use,
+                    "source": skill.summary.source,
+                    "location": skill.summary.location,
+                    "base_directory": skill.base_dir,
+                    "content": skill.body,
+                }),
+                ToolCostHint::default(),
+                None,
+            ),
+            Err(err) => tool_error(call, err),
+        }
     }
 
     async fn execute_glob(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
@@ -2317,6 +2401,14 @@ struct ReadToolOutputArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct ListSkillsArgs {}
+
+#[derive(Debug, Deserialize)]
+struct LoadSkillArgs {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct WriteFileArgs {
     path: String,
     content: String,
@@ -2989,6 +3081,33 @@ fn symbol_context_spec() -> ToolSpec {
                 "max_references": {"type": "integer", "minimum": 1, "maximum": 50}
             },
             "required": ["query"]
+        }),
+    }
+}
+
+fn list_skills_spec() -> ToolSpec {
+    ToolSpec {
+        name: "list_skills".to_string(),
+        description: "List locally discovered Squeezy skills by metadata only. Use before load_skill when the task may benefit from specialized instructions. Skill bodies are not included in this listing.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {}
+        }),
+    }
+}
+
+fn load_skill_spec() -> ToolSpec {
+    ToolSpec {
+        name: "load_skill".to_string(),
+        description: "Load one locally discovered skill body into the conversation when the user explicitly requests it or the task matches a listed skill description. Loading a skill only adds instructions and does not change tool permissions.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": {"type": "string", "description": "Exact skill name from list_skills."}
+            },
+            "required": ["name"]
         }),
     }
 }
