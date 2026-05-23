@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use ratatui::backend::TestBackend;
 use squeezy_core::{
     AppConfig, CostSnapshot, PermissionCapability, PermissionMode, PermissionPolicy,
-    PermissionRequest, PermissionRisk, PermissionScope, SessionMode, StatusVerbosity, TuiConfig,
-    TurnId, TurnMetrics,
+    PermissionRequest, PermissionRisk, PermissionScope, Role, SessionMode, StatusVerbosity,
+    TuiConfig, TurnId, TurnMetrics,
 };
 use squeezy_llm::UnavailableProvider;
 
@@ -18,6 +18,7 @@ fn app_starts_ready_with_empty_transcript() {
         "openai",
         &config,
         SessionMode::Build,
+        None,
         Box::new(NoopClipboard),
     );
 
@@ -29,12 +30,36 @@ fn app_starts_ready_with_empty_transcript() {
 }
 
 #[test]
+fn app_surfaces_onboarding_summary_once() {
+    let config = test_config(SessionMode::Build);
+    let app = TuiApp::new_with_clipboard(
+        "openai",
+        &config,
+        SessionMode::Build,
+        Some("repo profile created: /tmp/project".to_string()),
+        Box::new(NoopClipboard),
+    );
+
+    assert_eq!(app.status, "repo profile ready");
+    assert_eq!(app.transcript.len(), 1);
+    assert_eq!(
+        app.transcript[0].content,
+        "repo profile created: /tmp/project"
+    );
+    // The seeded onboarding summary is Squeezy-authored metadata, not an
+    // assistant turn; surfacing it under Role::System keeps provenance
+    // honest and avoids visual collision with later assistant deltas.
+    assert_eq!(app.transcript[0].role, Role::System);
+}
+
+#[test]
 fn status_line_surfaces_current_mode_and_switch_hints() {
     let config = test_config(SessionMode::Plan);
     let mut app = TuiApp::new_with_clipboard(
         "openai",
         &config,
         SessionMode::Plan,
+        None,
         Box::new(NoopClipboard),
     );
     app.status = "ready".to_string();
@@ -278,6 +303,7 @@ fn compact_status_surfaces_context_without_dense_counters() {
         "openai",
         &config,
         SessionMode::Build,
+        None,
         Box::new(NoopClipboard),
     );
     app.repo = RepoStatus {
@@ -323,6 +349,7 @@ fn verbose_status_surfaces_budget_and_cache_details() {
         "openai",
         &config,
         SessionMode::Plan,
+        None,
         Box::new(NoopClipboard),
     );
     app.cost = CostSnapshot {
@@ -362,6 +389,7 @@ fn render_uses_two_line_status_footer() {
         "openai",
         &config,
         SessionMode::Build,
+        None,
         Box::new(NoopClipboard),
     );
     app.repo = RepoStatus {
@@ -625,6 +653,7 @@ fn status_marker_surfaces_history_scroll_state() {
         "openai",
         &config,
         SessionMode::Build,
+        None,
         Box::new(NoopClipboard),
     );
 
@@ -659,7 +688,7 @@ fn test_app(mode: SessionMode) -> TuiApp {
 
 fn test_app_with_clipboard(mode: SessionMode, clipboard: Box<dyn Clipboard>) -> TuiApp {
     let config = test_config(mode);
-    TuiApp::new_with_clipboard("scripted", &config, mode, clipboard)
+    TuiApp::new_with_clipboard("scripted", &config, mode, None, clipboard)
 }
 
 fn test_config(mode: SessionMode) -> AppConfig {
