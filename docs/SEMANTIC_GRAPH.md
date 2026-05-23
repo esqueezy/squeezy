@@ -23,8 +23,9 @@ more than it does.
 
 ## Heuristics
 
-- Direct path calls resolve exactly when a local function or method name is
-  unique.
+- Direct calls resolve when the target is same-file, explicitly imported, or
+  syntactically qualified as `Self::name`, `Type::name`, or `module::name` with
+  one matching local candidate.
 - `self.method()` and sibling method calls inside an impl resolve to the same impl
   first.
 - Other method calls return candidate sets when multiple methods share the name.
@@ -32,6 +33,9 @@ more than it does.
   imports remain candidate sets.
 - References use a funnel: lexical/body-index prefilter, AST context, then local
   symbol-name resolution.
+- External Rust roots such as `std::`, `core::`, `alloc::`, and `proc_macro::`
+  are not collapsed to same-name local symbols, including leaf identifiers inside
+  those scoped paths.
 - Macro calls are recorded but not expanded. Item-position macros, derive macros,
   attribute macros, and proc macros are treated as opaque or partial.
 - Unknown cfg and feature combinations are not silently dropped; callers should
@@ -103,10 +107,10 @@ current Squeezy graph does not expose them as declaration symbols.
 The benchmark also starts rust-analyzer as an LSP server for sampled navigation
 diffs. `textDocument/definition` validates sampled Squeezy call and macro edge
 targets, while `textDocument/references` compares sampled declaration references
-against Squeezy `reference_search`. This is intentionally a loss tracker rather
-than a hard product dependency: it exposes wrong targets, rust-analyzer-only
-definitions, and Squeezy-only/lexical extras while keeping production navigation
-tree-sitter-only.
+against Squeezy `references_to_symbol`. This is intentionally a loss tracker
+rather than a hard product dependency: it exposes wrong targets,
+rust-analyzer-only definitions, and Squeezy-only extras while keeping production
+navigation tree-sitter-only.
 
 Known misses must be documented in the query spec with a reason, for example
 macro expansion, trait dispatch, type inference, cfg, glob ambiguity, generated
@@ -115,9 +119,18 @@ code, or unresolved external code.
 Current external-oracle gaps and known losses:
 
 - the LSP oracle is sampled by `--ra-lsp-probes`, not exhaustive by default
-- lexical reference search has high recall but many same-name false positives
-- unique-name method heuristics can choose the wrong local method for common
-  names such as `get`, `push`, or `clear`
+- broad lexical `reference_search` remains high-recall and noisy; the
+  symbol-aware `references_to_symbol` path is package-local, excludes
+  declarations, and favors precision over recall
+- receiver method calls do not bind to unique same-name local methods unless
+  they are in the same impl, avoiding common wrong targets such as `get`,
+  `push`, or `clear`
+- strictly qualified direct calls such as `Self::from_arg_matches`,
+  `Sender::from_mio`, and `module::render_template` are resolved when a single
+  local syntactic target exists; these can appear as Squeezy-only LSP results
+  when rust-analyzer's active cfg/target view does not include the site
+- cross-package references are conservative until Cargo package/dependency facts
+  are indexed
 - item-generating macros and proc macros are recorded as opaque unless the
   generated item appears in source
 - cfg/feature matrices are not enumerated
@@ -129,6 +142,6 @@ Latest local benchmark snapshot is documented in `benchmarks/README.md`. On the
 May 23, 2026 release run, comparable declaration symbols were 100% TP with 0 FP
 and 0 FN against `rust-analyzer symbols` on five external popular Rust repos:
 ripgrep, fd, bat, tokio, and serde. The LSP navigation oracle does show losses:
-sampled references have large FP counts from lexical matching, and sampled
-definitions miss stdlib, external, trait/deref/autoref, and some local
-method-resolution targets.
+sampled references now have much lower FP counts in the symbol-aware path, but
+FN counts remain high because unresolved cross-package, cfg/feature,
+trait/deref/autoref, macro, and external references are not guessed.

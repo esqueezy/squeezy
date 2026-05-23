@@ -138,6 +138,268 @@ fn beta() -> usize {
     assert!(graph.edges().is_empty());
 }
 
+#[test]
+fn graph_binds_references_to_selected_same_name_symbol() {
+    let mut parser = RustParser::new().unwrap();
+    let first = record(
+        "src/first.rs",
+        r#"
+pub fn target() {}
+
+pub fn caller() {
+    target();
+}
+"#,
+    );
+    let second = record(
+        "src/second.rs",
+        r#"
+pub fn target() {}
+
+pub fn caller() {
+    target();
+}
+"#,
+    );
+    let first_parsed = parser
+        .parse_source(&first, fs::read_to_string(&first.path).unwrap())
+        .unwrap();
+    let second_parsed = parser
+        .parse_source(&second, fs::read_to_string(&second.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![first_parsed, second_parsed]);
+    let mut targets = graph.find_symbol_by_name("target");
+    targets.sort_by(|left, right| left.file_id.0.cmp(&right.file_id.0));
+
+    let first_refs = graph.references_to_symbol(&targets[0].id);
+    let second_refs = graph.references_to_symbol(&targets[1].id);
+
+    assert!(graph.reference_search("target").len() > first_refs.len());
+    assert!(
+        first_refs
+            .iter()
+            .all(|hit| hit.reference.file_id.0 == "src/first.rs")
+    );
+    assert!(
+        second_refs
+            .iter()
+            .all(|hit| hit.reference.file_id.0 == "src/second.rs")
+    );
+}
+
+#[test]
+fn graph_does_not_bind_external_receiver_method_to_unique_local_method() {
+    let source = r#"
+pub struct Local;
+
+impl Local {
+    pub fn get(&self) {}
+}
+
+pub fn caller(map: std::collections::HashMap<String, String>) {
+    map.get("key");
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let caller = graph.find_symbol_by_name("caller").pop().unwrap();
+
+    assert!(
+        graph.callees(&caller.id).iter().all(|hit| hit
+            .callee
+            .as_ref()
+            .map(|symbol| symbol.name.as_str())
+            != Some("get"))
+    );
+}
+
+#[test]
+fn graph_does_not_bind_value_identifier_to_same_name_function() {
+    let source = r#"
+fn lookup() {}
+
+fn caller() {
+    let lookup = 1;
+    let _ = lookup;
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let lookup = graph.find_symbol_by_name("lookup").pop().unwrap();
+
+    assert!(
+        graph
+            .references_to_symbol(&lookup.id)
+            .iter()
+            .all(|hit| hit.reference.span.start_byte < lookup.body_span.unwrap().start_byte)
+    );
+}
+
+#[test]
+fn graph_does_not_bind_enum_variant_path_to_same_name_struct() {
+    let source = r#"
+struct Generate;
+
+enum Mode {
+    Generate,
+}
+
+fn caller() {
+    let _ = Mode::Generate;
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let generate = graph.find_symbol_by_name("Generate").pop().unwrap();
+
+    assert!(
+        graph
+            .references_to_symbol(&generate.id)
+            .iter()
+            .all(|hit| hit.reference.text != "Mode::Generate")
+    );
+}
+
+#[test]
+fn graph_declaration_match_ignores_same_name_signature_parameters() {
+    let source = r#"
+trait Sink {
+    fn finish(&mut self, finish: &usize);
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let finish = graph.find_symbol_by_name("finish").pop().unwrap();
+
+    assert!(graph.references_to_symbol(&finish.id).is_empty());
+}
+
+#[test]
+fn graph_symbol_references_are_package_local_until_cargo_resolution_exists() {
+    let mut parser = RustParser::new().unwrap();
+    let source_package = record("crates/source/src/lib.rs", "pub struct Shared;\n");
+    let user_package = record(
+        "crates/user/src/lib.rs",
+        r#"
+use source::Shared;
+
+pub fn user(_: Shared) {}
+"#,
+    );
+    let source_parsed = parser
+        .parse_source(
+            &source_package,
+            fs::read_to_string(&source_package.path).unwrap(),
+        )
+        .unwrap();
+    let user_parsed = parser
+        .parse_source(
+            &user_package,
+            fs::read_to_string(&user_package.path).unwrap(),
+        )
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![source_parsed, user_parsed]);
+    let shared = graph.find_symbol_by_name("Shared").pop().unwrap();
+
+    assert!(
+        graph.references_to_symbol(&shared.id).iter().all(|hit| hit
+            .reference
+            .file_id
+            .0
+            .starts_with("crates/source/"))
+    );
+}
+
+#[test]
+fn graph_does_not_bind_external_std_path_to_local_type() {
+    let source = r#"
+struct IntoIter;
+
+fn caller() -> std::vec::IntoIter<u8> {
+    todo!()
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let into_iter = graph.find_symbol_by_name("IntoIter").pop().unwrap();
+
+    assert!(graph.references_to_symbol(&into_iter.id).is_empty());
+}
+
+#[test]
+fn graph_resolves_module_qualified_direct_calls() {
+    let mut parser = RustParser::new().unwrap();
+    let output = record("src/output.rs", "pub fn print_entry() {}\n");
+    let walk = record(
+        "src/walk.rs",
+        r#"
+use crate::output;
+
+pub fn scan() {
+    output::print_entry();
+}
+"#,
+    );
+    let output_parsed = parser
+        .parse_source(&output, fs::read_to_string(&output.path).unwrap())
+        .unwrap();
+    let walk_parsed = parser
+        .parse_source(&walk, fs::read_to_string(&walk.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![output_parsed, walk_parsed]);
+    let scan = graph.find_symbol_by_name("scan").pop().unwrap();
+    let print_entry = graph.find_symbol_by_name("print_entry").pop().unwrap();
+
+    assert!(graph.call_chain(&scan.id, &print_entry.id, 2).is_some());
+    assert!(
+        graph
+            .references_to_symbol(&print_entry.id)
+            .iter()
+            .any(|hit| hit.reference.text == "output::print_entry")
+    );
+}
+
+#[test]
+fn graph_resolves_type_qualified_associated_functions() {
+    let source = r#"
+pub struct Command;
+
+impl Command {
+    pub fn new() -> Self {
+        Command
+    }
+}
+
+pub fn caller() {
+    Command::new();
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let caller = graph.find_symbol_by_name("caller").pop().unwrap();
+    let new = graph.find_symbol_by_name("new").pop().unwrap();
+
+    assert!(graph.call_chain(&caller.id, &new.id, 2).is_some());
+    assert!(
+        graph
+            .references_to_symbol(&new.id)
+            .iter()
+            .any(|hit| hit.reference.text == "Command::new")
+    );
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("graph-record");
     let path = root.join(relative_path);

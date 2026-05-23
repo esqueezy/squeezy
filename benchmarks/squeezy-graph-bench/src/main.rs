@@ -206,6 +206,7 @@ struct ReferenceProbe {
     uri: String,
     path: PathBuf,
     position: LspPosition,
+    symbol_id: SymbolId,
     name: String,
 }
 
@@ -838,7 +839,7 @@ fn collect_navigation_accuracy(
 fn navigation_limitations() -> Vec<String> {
     vec![
         "Definition probes compare Squeezy resolved call and macro edge targets with rust-analyzer LSP definitions for sampled call sites.".to_string(),
-        "Reference probes compare Squeezy lexical reference_search results with rust-analyzer LSP references for sampled declarations, with declarations included to match Squeezy's current output surface.".to_string(),
+        "Reference probes compare Squeezy references_to_symbol results with rust-analyzer LSP references for sampled declarations, excluding declarations because the selected symbol already supplies the definition span.".to_string(),
         "Samples are deterministic and capped; increase --ra-lsp-probes for deeper local audits.".to_string(),
         "External dependency definitions are counted as rust-analyzer-only misses because Squeezy currently indexes workspace files only.".to_string(),
     ]
@@ -955,7 +956,7 @@ fn compare_reference_probes(
             .into_iter()
             .collect::<BTreeSet<_>>();
         let squeezy = graph
-            .reference_search(&probe.name)
+            .references_to_symbol(&probe.symbol_id)
             .into_iter()
             .filter_map(|hit| location_key_for_reference_hit(graph, &hit, &probe.name))
             .collect::<BTreeSet<_>>();
@@ -1129,6 +1130,7 @@ fn build_reference_probes(
             uri: path_to_file_uri(&file.path)?,
             path: file.path.clone(),
             position,
+            symbol_id: symbol.id.clone(),
             name: symbol.name.clone(),
         });
     }
@@ -1302,6 +1304,9 @@ enum MixedScenario {
     ReferenceSearch {
         text: String,
     },
+    ReferencesToSymbol {
+        symbol: SymbolId,
+    },
     Callees {
         symbol: SymbolId,
     },
@@ -1322,6 +1327,7 @@ impl MixedScenario {
             MixedScenario::SignatureSearch { .. } => "signature_search",
             MixedScenario::BodySearch { .. } => "body_search",
             MixedScenario::ReferenceSearch { .. } => "reference_search",
+            MixedScenario::ReferencesToSymbol { .. } => "references_to_symbol",
             MixedScenario::Callees { .. } => "callees",
             MixedScenario::Callers { .. } => "callers",
             MixedScenario::CallChain { .. } => "call_chain",
@@ -1381,6 +1387,9 @@ fn build_mixed_scenarios(graph: &SemanticGraph) -> Vec<MixedScenario> {
             symbol: symbol.id.clone(),
         });
         scenarios.push(MixedScenario::Callers {
+            symbol: symbol.id.clone(),
+        });
+        scenarios.push(MixedScenario::ReferencesToSymbol {
             symbol: symbol.id.clone(),
         });
     }
@@ -1453,6 +1462,7 @@ fn run_mixed_scenario(graph: &SemanticGraph, scenario: &MixedScenario) -> usize 
             })
             .len(),
         MixedScenario::ReferenceSearch { text } => graph.reference_search(text).len(),
+        MixedScenario::ReferencesToSymbol { symbol } => graph.references_to_symbol(symbol).len(),
         MixedScenario::Callees { symbol } => graph.callees(symbol).len(),
         MixedScenario::Callers { symbol } => graph.callers(symbol).len(),
         MixedScenario::CallChain { from, to } => graph
@@ -1696,7 +1706,7 @@ impl RustAnalyzerLsp {
             json!({
                 "textDocument": {"uri": uri},
                 "position": {"line": position.line, "character": position.character},
-                "context": {"includeDeclaration": true}
+                "context": {"includeDeclaration": false}
             }),
         )?;
         parse_lsp_locations(&value, &self.root)

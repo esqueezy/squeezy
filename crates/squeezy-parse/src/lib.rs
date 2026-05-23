@@ -807,8 +807,10 @@ fn extract_body_hit(
 fn reference_kind(kind: &str) -> Option<ReferenceKind> {
     match kind {
         "identifier" => Some(ReferenceKind::Identifier),
-        "type_identifier" | "primitive_type" => Some(ReferenceKind::Type),
-        "scoped_identifier" | "scoped_type_identifier" => Some(ReferenceKind::Path),
+        "type_identifier" | "primitive_type" | "scoped_type_identifier" => {
+            Some(ReferenceKind::Type)
+        }
+        "scoped_identifier" => Some(ReferenceKind::Path),
         "field_identifier" | "shorthand_field_identifier" => Some(ReferenceKind::Field),
         "attribute_item" => Some(ReferenceKind::Attribute),
         _ => None,

@@ -73,7 +73,7 @@ a sampled navigation oracle:
 - `textDocument/definition` probes sampled Squeezy call and macro edges and
   compares the resolved target with rust-analyzer's definition target.
 - `textDocument/references` probes sampled declaration symbols and compares
-  Squeezy `reference_search` locations with rust-analyzer references.
+  Squeezy `references_to_symbol` locations with rust-analyzer references.
 - `--ra-lsp-probes N` caps the deterministic sample per repo; the default is 25
   and `0` disables the LSP oracle. Full CI runs 50 probes per external repo.
 
@@ -81,10 +81,11 @@ Navigation reports include available probe counts, sampled probe counts, TP, FP,
 FN, precision, recall, and examples. Definition reports also include
 `wrong_target` for real Squeezy target mismatches and `squeezy_only` for places
 where Squeezy resolved a local-looking target but rust-analyzer returned no
-definition. Reference probes include declarations because Squeezy's current
-`reference_search` output includes declaration-like hits; this makes extra
-same-name lexical matches visible as false positives instead of hiding the
-precision loss.
+definition. Reference probes exclude declarations because the selected symbol
+already supplies the definition span. `references_to_symbol` is intentionally
+more conservative than broad `reference_search`: it uses resolved call/reference
+edges, type-context filters, package-local scoping, and declaration-name-span
+checks to avoid same-name lexical false positives.
 
 ## Local Results
 
@@ -120,17 +121,22 @@ Latest local LSP-oracle run on May 23, 2026 used
 
 | Repo | Scenarios | Squeezy total | RA analysis total | Def probes | Def TP | FP | FN | Squeezy-only | Wrong target | Ref symbols | Ref TP | FP | FN |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| ripgrep | 1,000 | 468 ms | 5,284 ms | 50 / 15,190 | 8 | 2 | 13 | 2 | 0 | 50 / 3,276 | 210 | 4,424 | 0 |
-| fd | 1,000 | 78 ms | 3,753 ms | 50 / 2,122 | 12 | 2 | 12 | 2 | 0 | 50 / 389 | 183 | 495 | 8 |
-| bat | 1,000 | 329 ms | failed locally | 50 / 7,082 | 0 | 8 | 0 | 8 | 0 | 50 / 972 | 0 | 538 | 0 |
-| serde | 1,000 | 430 ms | 7,539 ms | 50 / 9,540 | 4 | 1 | 13 | 1 | 0 | 50 / 2,804 | 146 | 5,087 | 9 |
-| tokio | 1,000 | 1,451 ms | 4,834 ms | 50 / 40,098 | 0 | 6 | 6 | 6 | 0 | 50 / 8,787 | 27 | 15,073 | 0 |
+| ripgrep | 1,000 | 622 ms | 5,288 ms | 50 / 15,190 | 10 | 1 | 11 | 0 | 1 | 50 / 3,276 | 15 | 0 | 146 |
+| fd | 1,000 | 90 ms | 3,746 ms | 50 / 2,122 | 5 | 1 | 19 | 1 | 0 | 50 / 389 | 24 | 1 | 119 |
+| bat | 1,000 | 350 ms | failed locally | 50 / 7,082 | 0 | 2 | 0 | 2 | 0 | 50 / 972 | 0 | 36 | 0 |
+| serde | 1,000 | 592 ms | 7,462 ms | 50 / 9,540 | 0 | 0 | 17 | 0 | 0 | 50 / 2,804 | 8 | 3 | 115 |
+| tokio | 1,000 | 1,912 ms | 4,769 ms | 50 / 40,098 | 0 | 8 | 6 | 8 | 0 | 50 / 8,787 | 0 | 26 | 23 |
 
-The navigation FP/FN numbers are intentionally not zero. They show the main
-accuracy losses Squeezy currently accepts for speed: lexical reference search
-returns many same-name extras, workspace-only indexing misses stdlib/external
-call targets, and method resolution can pick the wrong unique local method for
-common names such as `get` and `push`.
+The navigation FP/FN numbers are intentionally not zero. The latest
+high-precision reference path removes the earlier same-name lexical explosion
+but accepts lower recall until Cargo package resolution, cfg/feature evaluation,
+trait dispatch, deref/autoref, and macro expansion are modeled. It now also
+resolves strict `Self::name`, `Type::name`, and `module::name` direct calls when
+there is one local syntactic target. That improves recall but can show up as
+Squeezy-only against rust-analyzer's active cfg/target view; examples include
+cfg-gated Tokio helpers and build-script/test utilities. Bat's rust-analyzer
+project load is degraded on this local toolchain, so its LSP reference numbers
+are treated as a noisy oracle result.
 
 ## CI
 
