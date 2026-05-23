@@ -281,7 +281,6 @@ impl SemanticGraph {
     /// classifies receiver-less calls as `Direct`, so without this lookup
     /// the call resolver falls through to `same_file_direct_call` (which
     /// filters out `Method`) and the call becomes `CandidateSet`.
-
     pub(crate) fn python_property_reference_matches(
         &self,
         symbol: &GraphSymbol,

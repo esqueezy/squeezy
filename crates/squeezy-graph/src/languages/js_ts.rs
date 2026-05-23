@@ -40,7 +40,6 @@ impl SemanticGraph {
     /// closest syntactic analogue to the Rust `use module::*;` shape that
     /// is already handled — without it, every cross-file C call falls back
     /// to `CandidateSet`.
-
     pub(crate) fn js_ts_import_matches_symbol(
         &self,
         import: &ParsedImport,
