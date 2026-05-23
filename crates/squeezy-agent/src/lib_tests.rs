@@ -733,36 +733,34 @@ fn agent_session_mode_transition_logs_structured_fields() {
 
 #[test]
 fn advertised_tool_specs_are_mode_aware() {
-    let specs = [
-        "diff_context",
-        "glob",
-        "grep",
-        "list_skills",
-        "load_skill",
-        "read_file",
-        "read_tool_output",
-        "shell",
-        "symbol_context",
-        "verify",
-        "webfetch",
-        "websearch",
-        "write_file",
+    let tools = [
+        ("diff_context", PermissionCapability::Read),
+        ("glob", PermissionCapability::Search),
+        ("grep", PermissionCapability::Search),
+        ("list_skills", PermissionCapability::Read),
+        ("load_skill", PermissionCapability::Read),
+        ("read_file", PermissionCapability::Read),
+        ("read_tool_output", PermissionCapability::Read),
+        ("shell", PermissionCapability::Shell),
+        ("symbol_context", PermissionCapability::Read),
+        ("verify", PermissionCapability::Compiler),
+        ("webfetch", PermissionCapability::Network),
+        ("websearch", PermissionCapability::Network),
+        ("write_file", PermissionCapability::Edit),
     ]
-    .into_iter()
-    .map(test_tool_spec)
-    .collect::<Vec<_>>();
+    .map(|(name, capability)| test_advertised_tool(name, capability));
 
-    let build_specs = advertised_tool_specs(&specs, SessionMode::Build);
+    let build_specs = advertised_tool_specs(&tools, SessionMode::Build);
     let build_names = advertised_tool_names(&build_specs);
     assert_eq!(
         build_names,
-        specs
+        tools
             .iter()
-            .map(|spec| spec.name.as_str())
+            .map(|tool| tool.spec.name.as_str())
             .collect::<Vec<_>>()
     );
 
-    let plan_specs = advertised_tool_specs(&specs, SessionMode::Plan);
+    let plan_specs = advertised_tool_specs(&tools, SessionMode::Plan);
     let plan_names = advertised_tool_names(&plan_specs);
     assert_eq!(
         plan_names,
@@ -777,6 +775,26 @@ fn advertised_tool_specs_are_mode_aware() {
             "symbol_context",
         ]
     );
+}
+
+#[test]
+fn registry_specs_carry_capability_aligned_with_permission_request() {
+    let tools = ToolRegistry::new("/tmp").expect("registry");
+    for spec in tools.specs() {
+        let call = ToolCall {
+            call_id: "probe".to_string(),
+            name: spec.name.clone(),
+            arguments: serde_json::json!({}),
+        };
+        let runtime_capability = tools.permission_request(&call).capability;
+        let advertised = !mode_refuses_capability(SessionMode::Plan, spec.capability);
+        let runtime = !mode_refuses_capability(SessionMode::Plan, runtime_capability);
+        assert_eq!(
+            advertised, runtime,
+            "{}: advertised_capability={:?} runtime_capability={:?} disagree on plan-mode admittance",
+            spec.name, spec.capability, runtime_capability,
+        );
+    }
 }
 
 #[test]
@@ -936,13 +954,13 @@ fn permission_request_for_capability(capability: PermissionCapability) -> Permis
     }
 }
 
-fn test_tool_spec(name: &str) -> LlmToolSpec {
-    LlmToolSpec {
+fn test_advertised_tool(name: &str, capability: PermissionCapability) -> AdvertisedTool {
+    advertised_tool(ToolSpec {
         name: name.to_string(),
         description: format!("{name} test tool"),
+        capability,
         parameters: json!({"type": "object"}),
-        strict: false,
-    }
+    })
 }
 
 fn advertised_tool_names(specs: &[LlmToolSpec]) -> Vec<&str> {

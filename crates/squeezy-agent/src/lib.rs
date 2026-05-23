@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -46,7 +46,11 @@ pub struct Agent {
     /// vector also makes the rule take effect immediately for subsequent
     /// tool calls without having to wait for a settings reload.
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
-    session_mode: Arc<RwLock<SessionMode>>,
+    /// Active session mode. Stored as an `AtomicU8` so reads on the hot
+    /// permission/advertisement paths cannot deadlock, cannot be poisoned by
+    /// a panicking writer, and never need a fallback enum value: every byte
+    /// we observe was previously written via `SessionMode::to_u8`.
+    session_mode: Arc<AtomicU8>,
 }
 
 impl Agent {
@@ -104,7 +108,7 @@ impl Agent {
             next_turn_id: Arc::new(AtomicU64::new(1)),
             next_approval_id: Arc::new(AtomicU64::new(1)),
             session_rules: Arc::new(RwLock::new(Vec::new())),
-            session_mode: Arc::new(RwLock::new(initial_session_mode)),
+            session_mode: Arc::new(AtomicU8::new(initial_session_mode.to_u8())),
         }
     }
 
@@ -123,29 +127,31 @@ impl Agent {
     }
 
     pub fn session_mode(&self) -> SessionMode {
-        self.session_mode
-            .read()
-            .map(|guard| *guard)
-            .unwrap_or(self.config.session_mode)
+        load_session_mode(&self.session_mode)
     }
 
+    /// Set the current session mode. Returns true when the mode actually
+    /// changed so callers (notably the TUI) can avoid emitting "switched to"
+    /// status when the request was a no-op.
     pub fn set_session_mode(&self, mode: SessionMode, source: &'static str) -> bool {
-        let mut guard = match self.session_mode.write() {
-            Ok(guard) => guard,
-            Err(err) => {
-                tracing::warn!(
-                    target: "squeezy::permissions",
-                    error = %err,
-                    "session mode lock was poisoned; mode unchanged",
-                );
-                return false;
+        let previous_u8 = self.session_mode.swap(mode.to_u8(), Ordering::AcqRel);
+        let previous = SessionMode::from_u8(previous_u8).unwrap_or_else(|| {
+            // Unreachable in practice: every write goes through this method
+            // or the constructor, both of which use `to_u8`. Log defensively
+            // and treat it as a real change so the new value still wins.
+            tracing::warn!(
+                target: "squeezy::permissions",
+                discriminant = previous_u8,
+                "unexpected session mode discriminant; treating as different",
+            );
+            match mode {
+                SessionMode::Plan => SessionMode::Build,
+                SessionMode::Build => SessionMode::Plan,
             }
-        };
-        let previous = *guard;
+        });
         if previous == mode {
             return false;
         }
-        *guard = mode;
         log_session_mode_transition(previous, mode, source);
         true
     }
@@ -175,11 +181,7 @@ impl Agent {
         let telemetry = self.telemetry.clone();
         let redactor = self.redactor.clone();
         let session_metrics = self.session_metrics.clone();
-        let all_tool_specs = tools
-            .specs()
-            .into_iter()
-            .map(llm_tool_spec)
-            .collect::<Vec<_>>();
+        let all_tool_specs = tools.specs().into_iter().map(advertised_tool).collect();
         let turn_id = TurnId::new(self.next_turn_id.fetch_add(1, Ordering::Relaxed));
         let approval_ids = self.next_approval_id.clone();
         let session_rules = self.session_rules.clone();
@@ -236,7 +238,7 @@ struct TurnRuntime {
     telemetry: TelemetryClient,
     redactor: Arc<Redactor>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
-    all_tool_specs: Vec<LlmToolSpec>,
+    all_tool_specs: Vec<AdvertisedTool>,
     tx: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
@@ -245,7 +247,7 @@ struct TurnRuntime {
     // session metric never undercounts user-side scrubbing.
     seed_redactions: u64,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
-    session_mode: Arc<RwLock<SessionMode>>,
+    session_mode: Arc<AtomicU8>,
 }
 
 impl TurnRuntime {
@@ -279,7 +281,7 @@ impl TurnRuntime {
         let mut assistant_message = String::new();
 
         for _round in 0..MAX_TOOL_ROUNDS {
-            let active_mode = snapshot_session_mode(&self.session_mode, self.config.session_mode);
+            let active_mode = load_session_mode(&self.session_mode);
             let request = LlmRequest {
                 model: self.config.model.clone(),
                 instructions: request_instructions.clone(),
@@ -510,7 +512,7 @@ struct ToolExecutionContext<'a> {
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
-    session_mode: Arc<RwLock<SessionMode>>,
+    session_mode: Arc<AtomicU8>,
 }
 
 async fn execute_tool_calls(
@@ -936,7 +938,7 @@ async fn permission_decision(
     context: &ToolExecutionContext<'_>,
 ) -> ApprovalDecision {
     let request = context.tools.permission_request(call);
-    let active_mode = snapshot_session_mode(&context.session_mode, context.config.session_mode);
+    let active_mode = load_session_mode(&context.session_mode);
     if let Some(verdict) = mode_permission_verdict(active_mode, &request) {
         log_permission_verdict(&request, &verdict);
         return ApprovalDecision::Denied(context.redactor.redact(&verdict.reason).text);
@@ -1069,48 +1071,58 @@ async fn permission_decision(
     }
 }
 
-fn snapshot_session_mode(
-    session_mode: &Arc<RwLock<SessionMode>>,
-    fallback: SessionMode,
-) -> SessionMode {
-    session_mode
-        .read()
-        .map(|guard| *guard)
-        .unwrap_or_else(|err| {
-            tracing::warn!(
-                target: "squeezy::permissions",
-                error = %err,
-                "session mode lock was poisoned; falling back to configured mode",
-            );
-            fallback
-        })
+/// Lock-free read of the active session mode. Defaults to `Build` if the
+/// stored byte is corrupted, but that path is unreachable in normal flow
+/// because every writer goes through `SessionMode::to_u8`.
+fn load_session_mode(session_mode: &Arc<AtomicU8>) -> SessionMode {
+    let raw = session_mode.load(Ordering::Acquire);
+    SessionMode::from_u8(raw).unwrap_or_else(|| {
+        tracing::warn!(
+            target: "squeezy::permissions",
+            discriminant = raw,
+            "unexpected session mode discriminant; defaulting to build",
+        );
+        SessionMode::Build
+    })
 }
 
 pub(crate) fn mode_permission_verdict(
     mode: SessionMode,
     request: &PermissionRequest,
 ) -> Option<PermissionVerdict> {
-    if mode != SessionMode::Plan || !plan_mode_refuses(request.capability) {
+    if !mode_refuses_capability(mode, request.capability) {
         return None;
     }
     Some(PermissionVerdict {
         action: PermissionAction::Deny,
         matched_rule: None,
-        reason: format!("plan mode refuses {}", request.capability.as_str()),
+        reason: format!(
+            "{} mode refuses {}",
+            mode.as_str(),
+            request.capability.as_str()
+        ),
     })
 }
 
-fn plan_mode_refuses(capability: PermissionCapability) -> bool {
-    matches!(
-        capability,
+/// Single source of truth for whether a session mode forbids a capability.
+/// Plan mode allows only Read and Search; Build mode allows everything (the
+/// configured `PermissionPolicy` still applies). The capability list is
+/// intentionally exhaustive (`match`) so adding a new capability is a
+/// compile-time prompt to decide whether plan mode admits it.
+fn mode_refuses_capability(mode: SessionMode, capability: PermissionCapability) -> bool {
+    if mode == SessionMode::Build {
+        return false;
+    }
+    match capability {
+        PermissionCapability::Read | PermissionCapability::Search => false,
         PermissionCapability::Edit
-            | PermissionCapability::Shell
-            | PermissionCapability::Git
-            | PermissionCapability::Network
-            | PermissionCapability::Mcp
-            | PermissionCapability::Compiler
-            | PermissionCapability::Destructive
-    )
+        | PermissionCapability::Shell
+        | PermissionCapability::Git
+        | PermissionCapability::Network
+        | PermissionCapability::Mcp
+        | PermissionCapability::Compiler
+        | PermissionCapability::Destructive => true,
+    }
 }
 
 fn snapshot_session_rules(session_rules: &Arc<RwLock<Vec<PermissionRule>>>) -> Vec<PermissionRule> {
@@ -1432,35 +1444,35 @@ pub(crate) fn permission_rule_for_persistence(
     Some(rule)
 }
 
-fn llm_tool_spec(spec: ToolSpec) -> LlmToolSpec {
-    LlmToolSpec {
-        name: spec.name,
-        description: spec.description,
-        parameters: spec.parameters,
-        strict: false,
+/// Pair of an LLM-facing tool spec and the capability used to decide whether
+/// the tool is advertised in a given session mode. Carrying the capability
+/// alongside the spec keeps the advertisement filter in lock-step with the
+/// per-call permission decision: both consult the same enum, and the source
+/// of truth lives in `squeezy-tools` next to each tool's builder.
+#[derive(Clone)]
+pub(crate) struct AdvertisedTool {
+    spec: LlmToolSpec,
+    capability: PermissionCapability,
+}
+
+pub(crate) fn advertised_tool(spec: ToolSpec) -> AdvertisedTool {
+    AdvertisedTool {
+        capability: spec.capability,
+        spec: LlmToolSpec {
+            name: spec.name,
+            description: spec.description,
+            parameters: spec.parameters,
+            strict: false,
+        },
     }
 }
 
-fn advertised_tool_specs(specs: &[LlmToolSpec], mode: SessionMode) -> Vec<LlmToolSpec> {
-    specs
+fn advertised_tool_specs(tools: &[AdvertisedTool], mode: SessionMode) -> Vec<LlmToolSpec> {
+    tools
         .iter()
-        .filter(|spec| mode == SessionMode::Build || plan_mode_advertises_tool(&spec.name))
-        .cloned()
+        .filter(|tool| !mode_refuses_capability(mode, tool.capability))
+        .map(|tool| tool.spec.clone())
         .collect()
-}
-
-fn plan_mode_advertises_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "diff_context"
-            | "glob"
-            | "grep"
-            | "read_file"
-            | "read_tool_output"
-            | "symbol_context"
-            | "list_skills"
-            | "load_skill"
-    )
 }
 
 fn llm_function_call_item(call: ToolCall, redactor: &Redactor) -> LlmInputItem {

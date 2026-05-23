@@ -1201,10 +1201,15 @@ pub enum SessionMode {
 }
 
 impl SessionMode {
+    /// Parse the two canonical session-mode names. The accepted values are
+    /// only `plan` and `build` (case-insensitive, surrounding whitespace
+    /// ignored) so that the user-visible vocabulary stays in sync with
+    /// `as_str`, error messages, and config docs. Anything else returns
+    /// `None` so configuration loaders can surface a precise error.
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "plan" | "planning" | "read" | "readonly" | "read_only" => Some(Self::Plan),
-            "build" | "building" | "write" | "edit" => Some(Self::Build),
+            "plan" => Some(Self::Plan),
+            "build" => Some(Self::Build),
             _ => None,
         }
     }
@@ -1213,6 +1218,24 @@ impl SessionMode {
         match self {
             Self::Plan => "plan",
             Self::Build => "build",
+        }
+    }
+
+    /// Compact wire form for lock-free storage in an `AtomicU8`. `from_u8`
+    /// rejects unknown discriminants and the caller decides on a safe
+    /// default; see `Agent::session_mode` for the in-process use.
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::Plan => 0,
+            Self::Build => 1,
+        }
+    }
+
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Plan),
+            1 => Some(Self::Build),
+            _ => None,
         }
     }
 }

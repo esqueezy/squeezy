@@ -401,6 +401,12 @@ async fn plan_mode_denies_hidden_shell_verify_and_webfetch_without_approval() {
             "plan mode refuses shell",
         ),
         (
+            "git_call",
+            "shell",
+            serde_json::json!({"command": "git status", "description": "git status probe"}),
+            "plan mode refuses git",
+        ),
+        (
             "verify_call",
             "verify",
             serde_json::json!({}),

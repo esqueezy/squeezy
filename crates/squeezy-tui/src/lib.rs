@@ -150,6 +150,12 @@ async fn handle_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> Result<bo
         return Ok(false);
     }
 
+    // The /plan and /build shortcuts intentionally fire before
+    // `handle_approval_key` and the regular Enter handler so a user can flip
+    // modes between turns without first clearing the input buffer. When an
+    // approval prompt is pending or a turn is in flight, `switch_mode`
+    // refuses the change and the input is preserved so it survives the
+    // current interaction.
     if key.code == KeyCode::Enter
         && let Some(mode) = mode_command(app.input.trim())
     {
@@ -216,7 +222,7 @@ fn switch_mode(
         return;
     }
 
-    let target = requested.unwrap_or_else(|| match app.mode {
+    let target = requested.unwrap_or(match app.mode {
         SessionMode::Plan => SessionMode::Build,
         SessionMode::Build => SessionMode::Plan,
     });
@@ -224,9 +230,17 @@ fn switch_mode(
         app.status = format!("already in {} mode", app.mode.as_str());
         return;
     }
-    agent.set_session_mode(target, source);
-    app.mode = target;
-    app.status = format!("mode switched to {}", app.mode.as_str());
+    if agent.set_session_mode(target, source) {
+        app.mode = target;
+        app.status = format!("mode switched to {}", app.mode.as_str());
+    } else {
+        // Agent saw no change (lock-free path is infallible, so this only
+        // fires when the agent observed the same mode we requested). Resync
+        // the visible status with the underlying truth so the user sees the
+        // authoritative state.
+        app.mode = agent.session_mode();
+        app.status = format!("already in {} mode", app.mode.as_str());
+    }
 }
 
 fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
