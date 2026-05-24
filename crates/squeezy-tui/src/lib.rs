@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    env,
+    env, fmt,
     io::{self, Write},
     path::PathBuf,
     sync::Arc,
@@ -8,6 +8,7 @@ use std::{
 };
 
 use crossterm::{
+    Command,
     cursor::MoveTo,
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -65,6 +66,48 @@ const PROMPT_MAX_HEIGHT: u16 = 8;
 const INLINE_VIEWPORT_HEIGHT: u16 = 18;
 const SLASH_MENU_MAX_ITEMS: usize = 5;
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnableAlternateScroll;
+
+impl Command for EnableAlternateScroll {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[?1007h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::other(
+            "alternate scroll is only supported through ANSI escape sequences",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisableAlternateScroll;
+
+impl Command for DisableAlternateScroll {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[?1007l")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::other(
+            "alternate scroll is only supported through ANSI escape sequences",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SlashCommand {
@@ -641,6 +684,8 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             }
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 select_previous_transcript_entry(app);
+            } else if should_route_plain_arrow_to_transcript_scroll(app, key) {
+                scroll_transcript_up(app, 4);
             } else {
                 recall_prompt_history(app, HistoryDirection::Previous);
             }
@@ -652,6 +697,8 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             }
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 select_next_transcript_entry(app);
+            } else if should_route_plain_arrow_to_transcript_scroll(app, key) {
+                scroll_transcript_down(app, 4);
             } else {
                 recall_prompt_history(app, HistoryDirection::Next);
             }
@@ -717,6 +764,10 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         }
         _ => Ok(false),
     }
+}
+
+fn should_route_plain_arrow_to_transcript_scroll(app: &TuiApp, key: KeyEvent) -> bool {
+    app.alternate_scroll_enabled && app.input.is_empty() && key.modifiers.is_empty()
 }
 
 async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Result<()> {
@@ -3611,15 +3662,23 @@ fn format_status_details(app: &TuiApp) -> String {
     )
 }
 
-fn format_status_hints(app: &TuiApp) -> &'static str {
+fn format_status_hints(app: &TuiApp) -> String {
     if app.pending_approval.is_some() {
-        "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Ctrl-C cancel"
+        return "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Ctrl-C cancel"
+            .to_string();
     } else if app.cancel.is_some() {
-        "Ctrl-C/Esc cancel · Ctrl+J newline · Ctrl-P task · Ctrl-E expand/collapse · Ctrl-Y copy · /help"
+        return "Ctrl-C/Esc cancel · Ctrl+J newline · Ctrl-P task · Ctrl-E expand/collapse · Ctrl-Y copy · /help"
+            .to_string();
     } else if app.exit_armed {
-        "Esc again to exit · Enter send · Ctrl+J newline · Ctrl-P task · Ctrl-E expand/collapse · /help"
+        return "Esc again to exit · Enter send · Ctrl+J newline · Ctrl-P task · Ctrl-E expand/collapse · /help"
+            .to_string();
+    }
+    if app.alternate_scroll_enabled {
+        "Enter send · Wheel/PgUp/PgDn scroll · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
+            .to_string()
     } else {
-        "Enter send · Up/Down history/menu · Ctrl+J newline · PgUp/PgDn scroll · Shift+Up/Down select · Ctrl-E expand/collapse · /help · Esc quit"
+        "Enter send · Up/Down menu/history · Ctrl+J newline · PgUp/PgDn scroll · Ctrl-E expand/collapse · /help"
+            .to_string()
     }
 }
 
@@ -3884,6 +3943,7 @@ struct TuiApp {
     input_history_index: Option<usize>,
     input_history_draft: String,
     slash_menu_index: usize,
+    alternate_scroll_enabled: bool,
     attachments: Vec<ContextAttachment>,
     context_compaction: ContextCompactionState,
     context_estimate: ContextEstimate,
@@ -3988,6 +4048,8 @@ impl TuiApp {
             input_history_index: None,
             input_history_draft: String::new(),
             slash_menu_index: 0,
+            alternate_scroll_enabled: TerminalMode::from(config.tui.alternate_screen)
+                == TerminalMode::AlternateScreen,
             attachments: Vec::new(),
             context_compaction: ContextCompactionState::default(),
             context_estimate: ContextEstimate::default(),
@@ -4233,6 +4295,7 @@ impl TerminalGuard {
                 execute!(
                     stdout,
                     EnterAlternateScreen,
+                    EnableAlternateScroll,
                     Clear(ClearType::All),
                     MoveTo(0, 0),
                     Print(DISABLE_MOUSE_MODES),
@@ -4316,6 +4379,7 @@ impl Drop for TerminalGuard {
                 let _ = execute!(
                     self.terminal.backend_mut(),
                     DisableBracketedPaste,
+                    DisableAlternateScroll,
                     Print(DISABLE_MOUSE_MODES)
                 );
                 let _ = self.terminal.clear();
@@ -4324,6 +4388,7 @@ impl Drop for TerminalGuard {
                 let _ = execute!(
                     self.terminal.backend_mut(),
                     DisableBracketedPaste,
+                    DisableAlternateScroll,
                     Print(DISABLE_MOUSE_MODES),
                     Clear(ClearType::All),
                     MoveTo(0, 0),

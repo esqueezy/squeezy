@@ -72,12 +72,12 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
         "missing toggle hint: {status}",
     );
     assert!(
-        status.contains("Up/Down history/menu"),
-        "missing collapse hint: {status}"
+        status.contains("Wheel/PgUp/PgDn scroll"),
+        "missing scroll hint: {status}"
     );
     assert!(
-        status.contains("PgUp/PgDn scroll"),
-        "missing scroll hint: {status}"
+        status.contains("Up/Down menu/history"),
+        "missing menu/history hint: {status}"
     );
 }
 
@@ -171,7 +171,9 @@ async fn slash_plan_and_build_force_modes() {
 #[tokio::test]
 async fn prompt_history_uses_plain_up_down_when_prompt_is_empty() {
     let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    config.tui.alternate_screen = TuiAlternateScreen::Never;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
     push_input_history(&mut app, "first prompt".to_string());
     push_input_history(&mut app, "second prompt".to_string());
 
@@ -210,6 +212,35 @@ async fn prompt_history_uses_plain_up_down_when_prompt_is_empty() {
     )
     .await
     .expect("history down");
+    assert!(app.input.is_empty());
+}
+
+#[tokio::test]
+async fn alternate_scroll_arrows_scroll_transcript_without_prompt_history() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    push_input_history(&mut app, "previous prompt".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("scroll up");
+
+    assert_eq!(app.transcript_scroll_from_bottom, 4);
+    assert!(app.input.is_empty());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("scroll down");
+
+    assert_eq!(app.transcript_scroll_from_bottom, 0);
     assert!(app.input.is_empty());
 }
 
@@ -966,7 +997,7 @@ fn render_uses_two_line_status_footer() {
         "{output}"
     );
     assert!(!output.contains("ready"), "{output}");
-    assert!(output.contains("Up/Down history/menu"), "{output}");
+    assert!(output.contains("Wheel/PgUp/PgDn scroll"), "{output}");
 }
 
 #[test]
@@ -1068,6 +1099,21 @@ fn auto_mode_is_default_terminal_model() {
         TerminalMode::from(TuiAlternateScreen::Always),
         TerminalMode::AlternateScreen
     );
+}
+
+#[test]
+fn alternate_scroll_commands_use_xterm_private_mode() {
+    let mut enable = String::new();
+    EnableAlternateScroll
+        .write_ansi(&mut enable)
+        .expect("enable alternate scroll");
+    assert_eq!(enable, "\x1b[?1007h");
+
+    let mut disable = String::new();
+    DisableAlternateScroll
+        .write_ansi(&mut disable)
+        .expect("disable alternate scroll");
+    assert_eq!(disable, "\x1b[?1007l");
 }
 
 #[test]
