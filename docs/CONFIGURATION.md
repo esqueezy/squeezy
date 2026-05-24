@@ -68,6 +68,13 @@ commented examples so that built-in defaults can evolve over time:
 # max_event_bytes = 65536
 # max_session_bytes = 52428800
 
+[context]
+# compaction_enabled = true
+# compaction_estimated_tokens = 6000
+# compaction_min_items = 16
+# compaction_recent_items = 6
+# compaction_max_summary_bytes = 12000
+
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
 # base_url = "https://api.openai.com/v1"
@@ -142,6 +149,13 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 # max_event_bytes = 65536
 # max_session_bytes = 52428800
 
+[context]
+# compaction_enabled = true
+# compaction_estimated_tokens = 6000
+# compaction_min_items = 16
+# compaction_recent_items = 6
+# compaction_max_summary_bytes = 12000
+
 # [redaction]
 # Add project-specific Rust regex patterns for secrets Squeezy should redact
 # everywhere they appear in tool output, model requests, and UI surfaces.
@@ -157,7 +171,7 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 # `DEFAULT_CORE_TOOL_NAMES` in `squeezy_core` so future changes only have to
 # touch one place. The values shown here are the current defaults and only
 # need to be set when overriding them.
-# core = ["glob", "grep", "read_file", "read_tool_output", "write_file", "shell", "decl_search", "definition_search", "diff_context", "downstream_flow", "hierarchy", "read_slice", "reference_search", "repo_map", "symbol_context", "upstream_flow"]
+# core = ["glob", "grep", "read_file", "read_tool_output", "write_file", "apply_patch", "shell", "decl_search", "definition_search", "diff_context", "downstream_flow", "hierarchy", "plan_patch", "read_slice", "reference_search", "repo_map", "symbol_context", "upstream_flow"]
 # discoverable = []
 
 [tui]
@@ -186,6 +200,16 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   state. When `log_dir` is unset, sessions are written to `<cache.root>/sessions`
   if `[cache].root` is set, otherwise `.squeezy/sessions`. In the TUI,
   `Shift+Tab` toggles modes; `/plan` and `/build` force a specific mode.
+- `[context]`: deterministic context compaction controls. Squeezy estimates
+  model-visible prompt tokens locally and, when enabled, replaces stale raw
+  conversation/tool output with a compact summary while preserving recent
+  turns, pinned context, active attachments, and seen-output receipts. The TUI
+  also supports `/compact`, `/pin`, `/pins`, and `/unpin`. The
+  `compaction_estimated_tokens` threshold is a local heuristic — Squeezy
+  counts byte length of redacted prompt items and divides by 4 to estimate
+  tokens, so pick a value that maps to your provider's real prompt budget
+  (e.g. set it well below the provider's context window since the heuristic
+  is a lower bound).
 - `[budgets]`: per-turn and per-tool output limits.
 - `[permissions]`: compatibility defaults `read`, `edit`, `shell`,
   `ignored_search`, and `web`, each set to `allow`, `ask`, or `deny`.

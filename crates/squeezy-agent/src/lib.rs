@@ -12,13 +12,15 @@ use std::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{
-    AppConfig, ContextAttachment, ContextAttachmentSource, ContextAttachmentStatus, CostSnapshot,
-    DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, PROJECT_SETTINGS_FILE, PermissionAction,
-    PermissionCapability, PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope,
-    PermissionVerdict, Redactor, ResponseVerbosity, SessionMetrics, SessionMode, SqueezyError,
-    StreamRedactor, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig, TranscriptItem, TurnId,
-    TurnMetrics, context_attachment_preview, context_attachment_storage_text,
-    default_settings_path, detect_context_attachment_kind, escape_toml_basic_string,
+    AppConfig, ContextAttachment, ContextAttachmentSource, ContextAttachmentStatus,
+    ContextCompactionRecord, ContextCompactionState, ContextCompactionTrigger, ContextEstimate,
+    ContextPin, CostSnapshot, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, PROJECT_SETTINGS_FILE,
+    PermissionAction, PermissionCapability, PermissionRequest, PermissionRule,
+    PermissionRuleSource, PermissionScope, PermissionVerdict, Redactor, ResponseVerbosity,
+    SessionMetrics, SessionMode, SqueezyError, StreamRedactor, TaskStateSnapshot, TaskStateStatus,
+    ToolSchemaConfig, TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
+    context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
+    escape_toml_basic_string,
 };
 use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, capabilities_for, estimate_cost,
@@ -26,7 +28,7 @@ use squeezy_llm::{
 use squeezy_store::{
     BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionHandle,
     SessionMetadata, SessionQuery, SessionRecord, SessionResumeState, SessionStatus, SessionStore,
-    SqueezyStore, StoredToolReceipt,
+    SqueezyStore, StoredReadSnapshot, StoredToolReceipt,
 };
 use squeezy_telemetry::{
     ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback, ReportUpload,
@@ -46,6 +48,22 @@ const LOAD_TOOL_SCHEMA_TOOL_NAME: &str = "load_tool_schema";
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_SUMMARY_MAX_CHARS: usize = 320;
+// Compaction summary truncation budgets. These are character (not byte)
+// caps because they pass through `compact_text` → `truncate_chars`. They
+// stay collocated so a future audit can read the total summary growth
+// in one place rather than chasing literals across `build_compaction_summary`.
+const COMPACTION_PREVIOUS_SUMMARY_MAX_CHARS: usize = 1_200;
+const COMPACTION_PIN_SUMMARY_MAX_CHARS: usize = 400;
+const COMPACTION_DURABLE_LINE_MAX_CHARS: usize = 320;
+const COMPACTION_TOOL_ARGS_MAX_CHARS: usize = 260;
+const COMPACTION_TOOL_OUTPUT_MAX_CHARS: usize = 260;
+const COMPACTION_RECEIPT_MAX_CHARS: usize = 260;
+const COMPACTION_UNRESOLVED_MAX_CHARS: usize = 240;
+const COMPACTION_ATTACHMENT_PREVIEW_MAX_CHARS: usize = 220;
+const COMPACTION_DURABLE_LINES_LIMIT: usize = 24;
+const COMPACTION_UNRESOLVED_LINES_LIMIT: usize = 8;
+const COMPACTION_RECEIPT_LINES_LIMIT: usize = 12;
+const COMPACTION_MAX_HISTORY: usize = 20;
 
 #[derive(Debug, Clone, Default)]
 struct ConversationState {
@@ -53,6 +71,7 @@ struct ConversationState {
     conversation: Vec<LlmInputItem>,
     transcript: Vec<TranscriptItem>,
     context_attachments: Vec<ContextAttachment>,
+    context_compaction: ContextCompactionState,
     cost: CostSnapshot,
     metrics: SessionMetrics,
     redactions: u64,
@@ -69,6 +88,7 @@ impl ConversationState {
                 .collect(),
             transcript: state.transcript,
             context_attachments: state.context_attachments,
+            context_compaction: state.context_compaction,
             cost: metadata.cost.clone(),
             metrics: metadata.metrics.clone(),
             redactions: metadata.redactions,
@@ -87,6 +107,7 @@ impl ConversationState {
                 .collect(),
             transcript: self.transcript.clone(),
             context_attachments: self.context_attachments.clone(),
+            context_compaction: self.context_compaction.clone(),
         }
     }
 }
@@ -96,6 +117,12 @@ pub struct ContextAttachmentUpdate {
     pub attachment: ContextAttachment,
     pub duplicate: bool,
     pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextCompactionReport {
+    pub record: ContextCompactionRecord,
+    pub summary: String,
 }
 
 pub type JobId = u64;
@@ -917,6 +944,120 @@ impl Agent {
             .collect()
     }
 
+    pub async fn context_compaction_snapshot(&self) -> ContextCompactionState {
+        self.conversation_state
+            .lock()
+            .await
+            .context_compaction
+            .clone()
+    }
+
+    pub async fn context_estimate_snapshot(&self) -> ContextEstimate {
+        let state = self.conversation_state.lock().await;
+        estimate_context(&state.conversation)
+    }
+
+    pub async fn compact_context_manual(&self) -> squeezy_core::Result<ContextCompactionReport> {
+        let mut state = self.conversation_state.lock().await;
+        let mut conversation = state.conversation.clone();
+        let mut context_compaction = state.context_compaction.clone();
+        let attachments = state.context_attachments.clone();
+        let report = compact_conversation(
+            &mut conversation,
+            &mut context_compaction,
+            &attachments,
+            self.store.as_deref(),
+            &self.config,
+            ContextCompactionTrigger::Manual,
+            true,
+        )
+        .ok_or_else(|| SqueezyError::Agent("not enough context to compact".to_string()))?;
+        state.conversation = conversation;
+        state.context_compaction = context_compaction;
+        state.previous_response_id = None;
+        if let Some(session) = &self.session_log {
+            session.write_resume_state(&state.to_resume_state())?;
+        }
+        drop(state);
+        self.log_compaction_event(&report);
+        Ok(report)
+    }
+
+    pub async fn pin_context_entry(
+        &self,
+        label: String,
+        summary: String,
+        source: String,
+    ) -> squeezy_core::Result<ContextPin> {
+        let mut state = self.conversation_state.lock().await;
+        let pin = ContextPin {
+            id: next_context_pin_id(&state.context_compaction.pinned),
+            label: truncate_chars(&collapse_status_text(&label), 80),
+            summary: truncate_chars(&collapse_status_text(&summary), 800),
+            source: truncate_chars(&collapse_status_text(&source), 80),
+            created_unix_ms: unix_timestamp_millis(),
+        };
+        state.context_compaction.pinned.push(pin.clone());
+        if let Some(session) = &self.session_log {
+            session.write_resume_state(&state.to_resume_state())?;
+        }
+        drop(state);
+        log_session_event(
+            self.session_log.as_ref(),
+            &self.redactor,
+            "context_pin_added",
+            None,
+            Some(format!("pinned {}", pin.id)),
+            json!({ "pin": pin.clone() }),
+        );
+        Ok(pin)
+    }
+
+    pub async fn unpin_context_entry(&self, id: &str) -> squeezy_core::Result<ContextPin> {
+        let mut state = self.conversation_state.lock().await;
+        let Some(index) = state
+            .context_compaction
+            .pinned
+            .iter()
+            .position(|pin| pin.id == id)
+        else {
+            return Err(SqueezyError::Agent(format!("pin {id} not found")));
+        };
+        let pin = state.context_compaction.pinned.remove(index);
+        if let Some(session) = &self.session_log {
+            session.write_resume_state(&state.to_resume_state())?;
+        }
+        drop(state);
+        log_session_event(
+            self.session_log.as_ref(),
+            &self.redactor,
+            "context_pin_removed",
+            None,
+            Some(format!("unpinned {}", pin.id)),
+            json!({ "pin": pin.clone() }),
+        );
+        Ok(pin)
+    }
+
+    fn log_compaction_event(&self, report: &ContextCompactionReport) {
+        log_session_event(
+            self.session_log.as_ref(),
+            &self.redactor,
+            "context_compacted",
+            None,
+            Some(format!(
+                "compacted context gen={} {}->{} estimated tokens",
+                report.record.generation,
+                report.record.before.estimated_tokens,
+                report.record.after.estimated_tokens
+            )),
+            json!({
+                "record": report.record,
+                "summary": report.summary,
+            }),
+        );
+    }
+
     async fn attach_context_bytes(
         &self,
         source: ContextAttachmentSource,
@@ -1230,6 +1371,29 @@ fn request_reasoning_effort(
         .map(|_| effort)
 }
 
+/// Appends a "Pinned context" block to the per-turn instructions.
+///
+/// Pins are user-curated durable facts. They must be visible to the
+/// model on every turn — not only after compaction lands the summary —
+/// otherwise `/pin` is purely UI until the conversation crosses the
+/// compaction threshold. Each pin contributes one line; long summaries
+/// are clipped via `compact_text` so the instructions stay bounded.
+fn instructions_with_pinned_context(instructions: &str, pinned: &[ContextPin]) -> String {
+    if pinned.is_empty() {
+        return instructions.to_string();
+    }
+    let mut block = String::from("Pinned context (preserve across this turn):");
+    for pin in pinned {
+        block.push_str(&format!(
+            "\n- {} {}: {}",
+            pin.id,
+            pin.label,
+            compact_text(&pin.summary, COMPACTION_PIN_SUMMARY_MAX_CHARS),
+        ));
+    }
+    format!("{instructions}\n\n{block}")
+}
+
 fn instructions_with_response_verbosity(
     instructions: &str,
     verbosity: ResponseVerbosity,
@@ -1264,12 +1428,20 @@ impl TurnRuntime {
         };
         let native_text_verbosity = capabilities_for(self.provider.name(), &self.config.model)
             .is_some_and(|capabilities| capabilities.text_verbosity);
-        let raw_instructions = instructions_with_response_verbosity(
+        let verbosity_instructions = instructions_with_response_verbosity(
             &base_instructions,
             self.config.tui.response_verbosity,
             native_text_verbosity,
         );
         let mut prior_state = self.conversation_state.lock().await.clone();
+        // Pinned context must reach the model on every turn, not only
+        // after a compaction has occurred. Inline it into the per-turn
+        // instructions so a `/pin` is immediately visible to the model
+        // even on sessions that never cross the compaction threshold.
+        let raw_instructions = instructions_with_pinned_context(
+            &verbosity_instructions,
+            &prior_state.context_compaction.pinned,
+        );
         let active_attachments = prior_state
             .context_attachments
             .iter()
@@ -1284,8 +1456,50 @@ impl TurnRuntime {
         ));
         let mut conversation = prior_state.conversation.clone();
         conversation.push(user_item.clone());
+        let mut context_compaction = prior_state.context_compaction.clone();
+        if let Some(report) = maybe_compact_conversation(
+            &mut conversation,
+            &mut context_compaction,
+            &active_attachments,
+            self.store.as_deref(),
+            &self.config,
+            ContextCompactionTrigger::Auto,
+        ) {
+            self.log_event(
+                "context_compacted",
+                Some(self.turn_id),
+                Some(format!(
+                    "compacted context gen={} {}->{} estimated tokens",
+                    report.record.generation,
+                    report.record.before.estimated_tokens,
+                    report.record.after.estimated_tokens
+                )),
+                json!({
+                    "record": report.record,
+                    "summary": report.summary,
+                }),
+            );
+            let _ = self
+                .tx
+                .send(AgentEvent::ContextCompacted {
+                    turn_id: self.turn_id,
+                    report,
+                })
+                .await;
+        }
+        // Response-id reuse is gated on the compaction generation being
+        // unchanged for this turn. Invariant: `maybe_compact_conversation`
+        // is the sole bumper of `context_compaction.generation` between
+        // a turn's `prior_state` snapshot and this point — if some future
+        // caller starts bumping it elsewhere (e.g. on resume), the
+        // previous_response_id must be invalidated the same way to keep
+        // the provider state consistent.
         let mut previous_response_id = if self.config.store_responses {
-            prior_state.previous_response_id.take()
+            if context_compaction.generation == prior_state.context_compaction.generation {
+                prior_state.previous_response_id.take()
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1466,14 +1680,15 @@ impl TurnRuntime {
                 conversation.push(LlmInputItem::AssistantText(message.content.clone()));
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
-                self.persist_turn_state(
-                    &conversation,
-                    previous_response_id.clone(),
-                    user_transcript.clone(),
-                    message.clone(),
-                    &total_cost,
-                    &broker.metrics,
-                )
+                self.persist_turn_state(TurnPersistInput {
+                    conversation: &conversation,
+                    response_id: previous_response_id.clone(),
+                    user: user_transcript.clone(),
+                    assistant: message.clone(),
+                    cost: &total_cost,
+                    metrics: &broker.metrics,
+                    context_compaction: context_compaction.clone(),
+                })
                 .await;
                 let _ = self
                     .tx
@@ -1497,14 +1712,15 @@ impl TurnRuntime {
                 conversation.push(LlmInputItem::AssistantText(message.content.clone()));
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
-                self.persist_turn_state(
-                    &conversation,
-                    response_id.clone(),
-                    user_transcript.clone(),
-                    message.clone(),
-                    &total_cost,
-                    &broker.metrics,
-                )
+                self.persist_turn_state(TurnPersistInput {
+                    conversation: &conversation,
+                    response_id: response_id.clone(),
+                    user: user_transcript.clone(),
+                    assistant: message.clone(),
+                    cost: &total_cost,
+                    metrics: &broker.metrics,
+                    context_compaction: context_compaction.clone(),
+                })
                 .await;
                 let _ = self
                     .tx
@@ -1599,15 +1815,16 @@ impl TurnRuntime {
         self.session_metrics.lock().await.merge_turn(metrics);
     }
 
-    async fn persist_turn_state(
-        &self,
-        conversation: &[LlmInputItem],
-        response_id: Option<String>,
-        user: TranscriptItem,
-        assistant: TranscriptItem,
-        cost: &CostSnapshot,
-        metrics: &TurnMetrics,
-    ) {
+    async fn persist_turn_state(&self, input: TurnPersistInput<'_>) {
+        let TurnPersistInput {
+            conversation,
+            response_id,
+            user,
+            assistant,
+            cost,
+            metrics,
+            context_compaction,
+        } = input;
         let mut state = self.conversation_state.lock().await;
         state.conversation = conversation.to_vec();
         state.previous_response_id = if self.config.store_responses {
@@ -1617,6 +1834,13 @@ impl TurnRuntime {
         };
         state.transcript.push(user);
         state.transcript.push(assistant.clone());
+        // Pins added concurrently to this turn (via /pin) are pushed into
+        // `state.context_compaction.pinned` under the same lock. Merge them
+        // into the locally tracked compaction state so the pre-turn clone
+        // does not silently clobber a pin landed mid-turn.
+        let mut merged_compaction = context_compaction;
+        merge_concurrent_pins(&mut merged_compaction, &state.context_compaction.pinned);
+        state.context_compaction = merged_compaction;
         merge_cost(&mut state.cost, cost);
         state.metrics.merge_turn(metrics);
         state.redactions += metrics.redactions;
@@ -1724,6 +1948,36 @@ impl TurnRuntime {
                 delta: tail.text,
             })
             .await;
+    }
+}
+
+struct TurnPersistInput<'a> {
+    conversation: &'a [LlmInputItem],
+    response_id: Option<String>,
+    user: TranscriptItem,
+    assistant: TranscriptItem,
+    cost: &'a CostSnapshot,
+    metrics: &'a TurnMetrics,
+    context_compaction: ContextCompactionState,
+}
+
+/// Re-applies any pins added concurrently while the turn was running.
+///
+/// The turn runner builds its own `ContextCompactionState` clone at turn
+/// start. If `/pin` or `/unpin` lands while the turn is in flight, the
+/// authoritative state is on the shared `conversation_state` mutex; the
+/// pre-turn clone we are about to persist would otherwise silently lose
+/// those concurrent pin edits. This helper unions in pins that exist in
+/// the latest snapshot but are missing from the pre-turn state.
+fn merge_concurrent_pins(compaction: &mut ContextCompactionState, latest_pins: &[ContextPin]) {
+    for pin in latest_pins {
+        if !compaction
+            .pinned
+            .iter()
+            .any(|existing| existing.id == pin.id)
+        {
+            compaction.pinned.push(pin.clone());
+        }
     }
 }
 
@@ -3651,6 +3905,326 @@ fn resume_item_to_llm_input(item: ResumeItem) -> LlmInputItem {
     }
 }
 
+fn maybe_compact_conversation(
+    conversation: &mut Vec<LlmInputItem>,
+    state: &mut ContextCompactionState,
+    attachments: &[ContextAttachment],
+    store: Option<&SqueezyStore>,
+    config: &AppConfig,
+    trigger: ContextCompactionTrigger,
+) -> Option<ContextCompactionReport> {
+    if !config.context_compaction.enabled {
+        return None;
+    }
+    let estimate = estimate_context(conversation);
+    if estimate.items < config.context_compaction.min_items
+        || estimate.estimated_tokens < config.context_compaction.estimated_tokens
+    {
+        return None;
+    }
+    compact_conversation(
+        conversation,
+        state,
+        attachments,
+        store,
+        config,
+        trigger,
+        false,
+    )
+}
+
+fn compact_conversation(
+    conversation: &mut Vec<LlmInputItem>,
+    state: &mut ContextCompactionState,
+    attachments: &[ContextAttachment],
+    store: Option<&SqueezyStore>,
+    config: &AppConfig,
+    trigger: ContextCompactionTrigger,
+    force: bool,
+) -> Option<ContextCompactionReport> {
+    let before = estimate_context(conversation);
+    let keep = config.context_compaction.recent_items.max(1);
+    if !force && before.items <= keep {
+        return None;
+    }
+    let initial_split = conversation.len().saturating_sub(keep);
+    if initial_split == 0 {
+        return None;
+    }
+    // Tool calls and their outputs are pushed as contiguous pairs in the
+    // turn loop. If the naive split falls between a `FunctionCall` and
+    // its matching `FunctionCallOutput`, the recent slice would start
+    // with an orphan output whose `call_id` is no longer declared on the
+    // wire — the OpenAI Responses provider rejects that input. Snap the
+    // boundary forward so any leading `FunctionCallOutput` in `recent`
+    // whose `FunctionCall` lives in `older` is absorbed back into older.
+    let split = snap_compaction_split(conversation, initial_split);
+    if split == 0 || split >= conversation.len() {
+        return None;
+    }
+
+    let older = conversation[..split].to_vec();
+    let recent = conversation[split..].to_vec();
+    let generation = state.generation.saturating_add(1);
+    let summary = build_compaction_summary(generation, state, &older, attachments, store, config);
+    let mut compacted = Vec::with_capacity(recent.len() + 1);
+    compacted.push(LlmInputItem::UserText(summary.clone()));
+    compacted.extend(recent);
+    let after = estimate_context(&compacted);
+    if !force && after.bytes >= before.bytes {
+        return None;
+    }
+    *conversation = compacted;
+
+    let record = ContextCompactionRecord {
+        generation,
+        trigger,
+        compacted_at_ms: unix_timestamp_millis(),
+        before,
+        after,
+        dropped_items: split,
+        summary_bytes: summary.len(),
+    };
+    state.generation = generation;
+    state.summary = Some(summary.clone());
+    state.last = Some(record.clone());
+    state.history.push(record.clone());
+    if state.history.len() > COMPACTION_MAX_HISTORY {
+        let excess = state.history.len() - COMPACTION_MAX_HISTORY;
+        state.history.drain(0..excess);
+    }
+    Some(ContextCompactionReport { record, summary })
+}
+
+/// Adjusts a proposed compaction split point so `recent` does not start
+/// with a `FunctionCallOutput` whose declaring `FunctionCall` has been
+/// dropped into `older`. The OpenAI Responses provider serializes each
+/// `function_call_output` with a bare `call_id` and the API rejects any
+/// payload where a `call_id` is not also present as a `function_call`.
+///
+/// The strategy is to scan forward from `initial_split` and skip past
+/// any `FunctionCallOutput` items whose `call_id` was already declared
+/// by a `FunctionCall` in the older slice. We stop once the next item
+/// in the recent slice is either a non-tool item (text) or a fresh
+/// `FunctionCall` that begins a new pair. The split may grow up to
+/// `conversation.len()`; the caller treats `>= conversation.len()` as
+/// "nothing left to compact" and bails out without bumping generation.
+fn snap_compaction_split(conversation: &[LlmInputItem], initial_split: usize) -> usize {
+    let mut split = initial_split;
+    while split < conversation.len() {
+        match &conversation[split] {
+            LlmInputItem::FunctionCallOutput { call_id, .. } => {
+                let declared_in_older = conversation[..split].iter().any(|item| match item {
+                    LlmInputItem::FunctionCall {
+                        call_id: declared, ..
+                    } => declared == call_id,
+                    _ => false,
+                });
+                if declared_in_older {
+                    split += 1;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    split
+}
+
+fn estimate_context(conversation: &[LlmInputItem]) -> ContextEstimate {
+    let bytes = conversation
+        .iter()
+        .map(llm_item_estimated_bytes)
+        .fold(0usize, usize::saturating_add);
+    ContextEstimate {
+        bytes,
+        estimated_tokens: estimated_tokens(bytes),
+        items: conversation.len(),
+    }
+}
+
+fn estimated_tokens(bytes: usize) -> u64 {
+    bytes.saturating_add(3).saturating_div(4) as u64
+}
+
+fn llm_item_estimated_bytes(item: &LlmInputItem) -> usize {
+    match item {
+        LlmInputItem::UserText(text) | LlmInputItem::AssistantText(text) => text.len(),
+        LlmInputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        } => call_id.len() + name.len() + arguments.to_string().len(),
+        LlmInputItem::FunctionCallOutput { call_id, output } => call_id.len() + output.len(),
+    }
+}
+
+fn build_compaction_summary(
+    generation: u64,
+    state: &ContextCompactionState,
+    older: &[LlmInputItem],
+    attachments: &[ContextAttachment],
+    store: Option<&SqueezyStore>,
+    config: &AppConfig,
+) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Squeezy compacted conversation context (generation {generation})."
+    ));
+    lines.push(
+        "Preserve these durable facts, decisions, pinned entries, seen-file receipts, and unresolved questions; do not ask for raw output already summarized here unless it is needed again."
+            .to_string(),
+    );
+    if let Some(summary) = &state.summary {
+        lines.push(format!(
+            "Previous compacted summary: {}",
+            compact_text(summary, COMPACTION_PREVIOUS_SUMMARY_MAX_CHARS)
+        ));
+    }
+    if !state.pinned.is_empty() {
+        lines.push("Pinned context:".to_string());
+        for pin in &state.pinned {
+            lines.push(format!(
+                "- {} {}: {}",
+                pin.id,
+                pin.label,
+                compact_text(&pin.summary, COMPACTION_PIN_SUMMARY_MAX_CHARS)
+            ));
+        }
+    }
+    let decisions = durable_context_lines(older);
+    if !decisions.is_empty() {
+        lines.push("Durable conversation facts and decisions:".to_string());
+        lines.extend(decisions);
+    }
+    let unresolved = unresolved_question_lines(older);
+    if !unresolved.is_empty() {
+        lines.push("Unresolved questions:".to_string());
+        lines.extend(unresolved);
+    }
+    let active_attachments = attachments
+        .iter()
+        .filter(|attachment| attachment.is_active())
+        .collect::<Vec<_>>();
+    if !active_attachments.is_empty() {
+        lines.push("Active attached context:".to_string());
+        for attachment in active_attachments {
+            lines.push(format!(
+                "- {} {} {}B preview={}",
+                attachment.id,
+                attachment.kind.as_str(),
+                attachment.original_bytes,
+                compact_text(
+                    &collapse_status_text(&attachment.preview),
+                    COMPACTION_ATTACHMENT_PREVIEW_MAX_CHARS
+                )
+            ));
+        }
+    }
+    if let Some(receipts) = receipt_summary_lines(store) {
+        lines.push("Tool/file output receipts already seen:".to_string());
+        lines.extend(receipts);
+    }
+    lines.push(format!(
+        "Compacted {} older model-visible item(s); the most recent context remains verbatim after this summary.",
+        older.len()
+    ));
+    let summary = lines.join("\n");
+    context_attachment_preview(&summary, config.context_compaction.max_summary_bytes).0
+}
+
+fn durable_context_lines(items: &[LlmInputItem]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::UserText(text) => {
+                let compact = compact_text(text, COMPACTION_DURABLE_LINE_MAX_CHARS);
+                (!compact.is_empty()).then(|| format!("- user: {compact}"))
+            }
+            LlmInputItem::AssistantText(text) => {
+                let compact = compact_text(text, COMPACTION_DURABLE_LINE_MAX_CHARS);
+                let lower = compact.to_ascii_lowercase();
+                (lower.contains("decision")
+                    || lower.contains("decided")
+                    || lower.contains("plan")
+                    || lower.contains("assumption")
+                    || lower.contains("must")
+                    || lower.contains("should"))
+                .then(|| format!("- assistant: {compact}"))
+            }
+            LlmInputItem::FunctionCall {
+                name, arguments, ..
+            } => Some(format!(
+                "- tool call {name} args={}",
+                compact_text(&arguments.to_string(), COMPACTION_TOOL_ARGS_MAX_CHARS)
+            )),
+            LlmInputItem::FunctionCallOutput { call_id, output } => Some(format!(
+                "- tool output {call_id}: {}",
+                compact_text(output, COMPACTION_TOOL_OUTPUT_MAX_CHARS)
+            )),
+        })
+        .take(COMPACTION_DURABLE_LINES_LIMIT)
+        .collect()
+}
+
+fn unresolved_question_lines(items: &[LlmInputItem]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::UserText(text) | LlmInputItem::AssistantText(text) => Some(text),
+            _ => None,
+        })
+        .flat_map(|text| text.lines())
+        .filter(|line| line.contains('?'))
+        .map(|line| {
+            format!(
+                "- {}",
+                compact_text(&collapse_status_text(line), COMPACTION_UNRESOLVED_MAX_CHARS)
+            )
+        })
+        .take(COMPACTION_UNRESOLVED_LINES_LIMIT)
+        .collect()
+}
+
+fn receipt_summary_lines(store: Option<&SqueezyStore>) -> Option<Vec<String>> {
+    let store = store?;
+    let mut receipts = store.tool_receipts().ok()?;
+    if receipts.is_empty() {
+        return None;
+    }
+    receipts.sort_by_key(|receipt| std::cmp::Reverse(receipt.created_unix_millis));
+    let lines = receipts
+        .into_iter()
+        .take(COMPACTION_RECEIPT_LINES_LIMIT)
+        .map(|receipt| {
+            let summary = receipt.summary.unwrap_or_else(|| {
+                format!(
+                    "{} output {}B sha={}",
+                    receipt.tool_name, receipt.model_output_bytes, receipt.stable_output_sha256
+                )
+            });
+            format!("- {}", compact_text(&summary, COMPACTION_RECEIPT_MAX_CHARS))
+        })
+        .collect::<Vec<_>>();
+    Some(lines)
+}
+
+fn next_context_pin_id(pins: &[ContextPin]) -> String {
+    let next = pins
+        .iter()
+        .filter_map(|pin| pin.id.strip_prefix("pin-"))
+        .filter_map(|raw| raw.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    format!("pin-{next:04}")
+}
+
+fn compact_text(text: &str, max_chars: usize) -> String {
+    truncate_chars(&collapse_status_text(text), max_chars)
+}
+
 #[derive(Debug, Clone)]
 struct SeenToolOutput {
     call_id: String,
@@ -3658,6 +4232,7 @@ struct SeenToolOutput {
     stable_output_sha256: String,
     content_sha256: Option<String>,
     model_output_bytes: usize,
+    summary: Option<String>,
 }
 
 impl SeenToolOutput {
@@ -3668,6 +4243,7 @@ impl SeenToolOutput {
             stable_output_sha256: stable_output_sha256(result),
             content_sha256: result.receipt.content_sha256.clone(),
             model_output_bytes: result.model_output().len(),
+            summary: Some(tool_result_summary(result)),
         }
     }
 }
@@ -3701,6 +4277,7 @@ impl SeenToolOutputs {
                     stable_output_sha256: receipt.stable_output_sha256,
                     content_sha256: receipt.content_sha256,
                     model_output_bytes: receipt.model_output_bytes,
+                    summary: receipt.summary,
                 };
                 outputs
                     .by_tool_output
@@ -3777,13 +4354,17 @@ impl SeenToolOutputs {
                     .or_insert(seen.clone());
                 if let Some(store) = self.store.as_deref() {
                     let _ = store.put_tool_receipt(&StoredToolReceipt {
-                        tool_name: seen.tool_name,
-                        stable_output_sha256: seen.stable_output_sha256,
-                        call_id: seen.call_id,
-                        content_sha256: seen.content_sha256,
+                        tool_name: seen.tool_name.clone(),
+                        stable_output_sha256: seen.stable_output_sha256.clone(),
+                        call_id: seen.call_id.clone(),
+                        content_sha256: seen.content_sha256.clone(),
                         model_output_bytes: seen.model_output_bytes,
                         created_unix_millis: unix_millis(),
+                        summary: seen.summary.clone(),
                     });
+                    if let Some(snapshot) = read_snapshot_from_result(&result.result, &seen) {
+                        let _ = store.put_read_snapshot(&snapshot);
+                    }
                 }
             }
         }
@@ -3825,6 +4406,39 @@ fn stable_output_sha256(result: &ToolResult) -> String {
         .and_then(Value::as_str)
         .unwrap_or(&result.receipt.output_sha256)
         .to_string()
+}
+
+fn read_snapshot_from_result(
+    result: &ToolResult,
+    seen: &SeenToolOutput,
+) -> Option<StoredReadSnapshot> {
+    if !matches!(result.tool_name.as_str(), "read_file" | "read_slice") {
+        return None;
+    }
+    if result.content.get("read_mode").and_then(Value::as_str) == Some("diff") {
+        return None;
+    }
+    let path = result.content.get("path")?.as_str()?.to_string();
+    let content = result.content.get("content")?.as_str()?.to_string();
+    let start_byte = result
+        .content
+        .get("offset")
+        .and_then(Value::as_u64)
+        .or_else(|| result.content.get("start_byte").and_then(Value::as_u64))
+        .unwrap_or(0);
+    let bytes_returned = result.content.get("bytes_returned")?.as_u64()?;
+    Some(StoredReadSnapshot {
+        path,
+        tool_name: seen.tool_name.clone(),
+        call_id: seen.call_id.clone(),
+        stable_output_sha256: seen.stable_output_sha256.clone(),
+        content_sha256: seen.content_sha256.clone(),
+        start_byte,
+        end_byte: start_byte.saturating_add(bytes_returned),
+        content,
+        model_output_bytes: seen.model_output_bytes,
+        created_unix_millis: unix_millis(),
+    })
 }
 
 fn receipt_stub_result(result: ToolResult, seen: &SeenToolOutput) -> ToolResult {
@@ -4039,6 +4653,10 @@ pub enum AgentEvent {
     },
     JobNotification {
         notification: JobNotification,
+    },
+    ContextCompacted {
+        turn_id: TurnId,
+        report: ContextCompactionReport,
     },
     ApprovalRequested {
         turn_id: TurnId,
