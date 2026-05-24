@@ -2692,21 +2692,188 @@ fn tool_specs_are_sorted_by_name() {
             "checkpoint_revert",
             "checkpoint_show",
             "checkpoint_undo",
+            "decl_search",
+            "definition_search",
             "diff_context",
+            "downstream_flow",
             "glob",
             "grep",
+            "hierarchy",
             "list_skills",
             "load_skill",
             "read_file",
+            "read_slice",
             "read_tool_output",
+            "reference_search",
+            "repo_map",
             "shell",
             "symbol_context",
+            "upstream_flow",
             "verify",
             "webfetch",
             "websearch",
             "write_file"
         ]
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn graph_navigation_tools_answer_architecture_calls_and_exact_slices() {
+    let root = temp_workspace("graph_navigation_tools");
+    write_rust_crate(
+        &root,
+        r#"
+pub mod service {
+    pub struct Runner;
+
+    impl Runner {
+        pub fn run(&self) {
+            helper();
+        }
+    }
+
+    pub fn helper() {}
+}
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let repo_map = registry
+        .execute(
+            ToolCall {
+                call_id: "repo_map".to_string(),
+                name: "repo_map".to_string(),
+                arguments: json!({"max_depth": 4}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(repo_map.status, ToolStatus::Success);
+    assert!(repo_map.content["graph_available"].as_bool().unwrap());
+    assert!(
+        repo_map.content["packets"]
+            .as_array()
+            .expect("repo_map packets")
+            .iter()
+            .any(|packet| packet.to_string().contains("src/lib.rs"))
+    );
+
+    let decl = registry
+        .execute(
+            ToolCall {
+                call_id: "decl".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "run", "kind": "method"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(decl.status, ToolStatus::Success);
+    let packet = &decl.content["packets"][0];
+    assert_uniform_evidence_packet(packet);
+    let run_id = packet["symbol"]["id"].as_str().expect("symbol id");
+
+    let read = registry
+        .execute(
+            ToolCall {
+                call_id: "read".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({"symbol_id": run_id, "span_kind": "body"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(read.status, ToolStatus::Success);
+    assert!(
+        read.content["content"]
+            .as_str()
+            .unwrap()
+            .contains("helper();")
+    );
+    assert_uniform_evidence_packet(&read.content["packets"][0]);
+
+    let upstream = registry
+        .execute(
+            ToolCall {
+                call_id: "upstream".to_string(),
+                name: "upstream_flow".to_string(),
+                arguments: json!({"query": "helper", "kind": "function"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(upstream.status, ToolStatus::Success);
+    assert!(
+        upstream.content["packets"]
+            .as_array()
+            .expect("upstream packets")
+            .iter()
+            .any(|packet| packet["claim"].as_str().unwrap_or("").contains("run"))
+    );
+
+    let hierarchy = registry
+        .execute(
+            ToolCall {
+                call_id: "hierarchy".to_string(),
+                name: "hierarchy".to_string(),
+                arguments: json!({"query": "service", "kind": "module", "max_depth": 3}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(hierarchy.status, ToolStatus::Success);
+    assert!(
+        hierarchy.content["hierarchy"]
+            .to_string()
+            .contains("Runner")
+    );
+
+    let context = registry
+        .execute(
+            ToolCall {
+                call_id: "context".to_string(),
+                name: "symbol_context".to_string(),
+                arguments: json!({"query": "Runner"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(context.status, ToolStatus::Success);
+    assert_uniform_evidence_packet(&context.content["packets"][0]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn graph_navigation_tools_return_unsupported_language_fallback() {
+    let root = temp_workspace("graph_unsupported_fallback");
+    write_rust_crate(&root, "pub fn marker() {}\n");
+    fs::write(root.join("notes.foo"), "needle\n").expect("write unsupported");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "unsupported".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "needle", "path": "notes.foo"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(
+        result.content["fallback"]["status"].as_str(),
+        Some("unsupported_language")
+    );
+    assert_eq!(
+        result.content["fallback"]["suggested_tools"][0]["tool"].as_str(),
+        Some("grep")
+    );
+    assert!(result.content["packets"].as_array().unwrap().is_empty());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2772,6 +2939,23 @@ fn match_paths(result: &ToolResult) -> Vec<String> {
         .iter()
         .map(|value| value["path"].as_str().expect("path").to_string())
         .collect()
+}
+
+fn assert_uniform_evidence_packet(packet: &Value) {
+    for key in [
+        "claim",
+        "spans",
+        "confidence",
+        "freshness",
+        "provenance",
+        "cost_hint",
+        "next_action",
+    ] {
+        assert!(
+            packet.get(key).is_some(),
+            "missing evidence key {key}: {packet}"
+        );
+    }
 }
 
 fn temp_workspace(name: &str) -> PathBuf {
