@@ -126,11 +126,8 @@ export default {
     try {
       batch = JSON.parse(text) as JsonObject;
       validateBatch(batch);
-    } catch (error) {
-      return jsonResponse(400, {
-        error: "invalid_batch",
-        detail: String((error as Error).message || error),
-      });
+    } catch {
+      return jsonResponse(400, { error: "invalid_batch" });
     }
 
     const events = batch.events as JsonObject[];
@@ -169,13 +166,10 @@ async function handleFeedback(request: Request, env: Env): Promise<Response> {
     feedback = JSON.parse(text) as JsonObject;
     validateFeedback(feedback);
   } catch (error) {
-    if (String((error as Error).message || error) === "body_too_large") {
+    if (error instanceof Error && error.message === "body_too_large") {
       return jsonResponse(413, { error: "body_too_large" });
     }
-    return jsonResponse(400, {
-      error: "invalid_feedback",
-      detail: String((error as Error).message || error),
-    });
+    return jsonResponse(400, { error: "invalid_feedback" });
   }
   const response = await sendPostHogEvent(env, {
     event: "squeezy_feedback_submitted",
@@ -214,11 +208,8 @@ async function handleReport(request: Request, env: Env): Promise<Response> {
   let metadata: ReportMetadata;
   try {
     metadata = validateReportHeaders(request.headers);
-  } catch (error) {
-    return jsonResponse(400, {
-      error: "invalid_report",
-      detail: String((error as Error).message || error),
-    });
+  } catch {
+    return jsonResponse(400, { error: "invalid_report" });
   }
   const body = await request.arrayBuffer();
   if (body.byteLength > MAX_REPORT_BYTES) {
