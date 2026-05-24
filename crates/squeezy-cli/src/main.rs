@@ -8,6 +8,7 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt;
+use squeezy_agent::Agent;
 use squeezy_core::{
     AppConfig, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpTransport, ModelProfile,
     PROJECT_SETTINGS_FILE, PermissionMode, ReasoningEffort, ResponseVerbosity, SessionMode,
@@ -181,6 +182,12 @@ enum SessionsCommand {
     Show { id: String },
     #[command(about = "Resume a local session in the TUI")]
     Resume { id: String },
+    #[command(about = "Replay a recorded local session deterministically")]
+    Replay {
+        id: String,
+        #[arg(long, help = "Print replay report as JSON")]
+        json: bool,
+    },
     #[command(about = "Export a redacted local session bundle as JSON")]
     Export { id: String },
     #[command(about = "Preview, save, or send a redacted bug-report archive")]
@@ -786,6 +793,24 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
         SessionsCommand::Resume { id } => {
             let provider = provider_from_app_config(&config);
             squeezy_tui::resume(config, provider, id.clone()).await
+        }
+        SessionsCommand::Replay { id, json } => {
+            let report = Agent::replay_session(config, id).await?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|err| {
+                        SqueezyError::Tool(format!("failed to serialize replay report: {err}"))
+                    })?
+                );
+            } else {
+                println!("turns={}", report.turns);
+                println!("events_replayed={}", report.events_replayed);
+                println!("requests={}", report.request_count);
+                println!("tool_results={}", report.tool_results);
+                println!("final_answer={}", report.final_answer.replace('\n', " "));
+            }
+            Ok(())
         }
         SessionsCommand::Export { id } => {
             let value = store.export(id)?;
