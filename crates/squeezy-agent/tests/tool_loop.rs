@@ -242,10 +242,140 @@ async fn discoverable_tool_schema_load_appends_full_schema_for_later_rounds() {
         &second_names[second_names.len() - 2..],
         &["websearch", "webfetch"]
     );
+    let websearch_spec = requests[1]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "websearch")
+        .expect("loaded websearch schema");
+    let webfetch_spec = requests[1]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "webfetch")
+        .expect("loaded webfetch schema");
+    assert!(
+        websearch_spec.parameters["properties"].is_object(),
+        "loaded websearch schema must carry full parameters: {websearch_spec:?}"
+    );
+    assert!(
+        webfetch_spec.parameters["properties"]["url"].is_object(),
+        "loaded webfetch schema must carry the `url` property: {webfetch_spec:?}"
+    );
     let outputs = function_outputs(&requests[1]);
     assert_eq!(outputs.len(), 2);
     assert_eq!(outputs[0].1["content"]["status"], "attached");
+    assert_eq!(outputs[0].1["content"]["position"], 0);
     assert_eq!(outputs[1].1["content"]["status"], "attached");
+    assert_eq!(outputs[1].1["content"]["position"], 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn loaded_tool_schemas_persist_across_turns() {
+    let root = temp_workspace("lazy_schema_across_turns");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "load_webfetch".to_string(),
+                name: "load_tool_schema".to_string(),
+                arguments: serde_json::json!({"name": "webfetch"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_load".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done turn 1".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_done1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done turn 2".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_done2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.web = PermissionMode::Allow;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("turn one".to_string(), CancellationToken::new())).await;
+    drain_turn(agent.start_turn("turn two".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let first_turn_round_zero = tool_names(&requests[0]);
+    assert!(!first_turn_round_zero.contains(&"webfetch"));
+    let second_turn_round_zero = tool_names(&requests[2]);
+    assert!(
+        second_turn_round_zero.contains(&"webfetch"),
+        "tools loaded in turn 1 should already appear in round 0 of turn 2: {second_turn_round_zero:?}"
+    );
+    let webfetch_spec = requests[2]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "webfetch")
+        .expect("loaded webfetch schema in turn 2");
+    assert!(
+        webfetch_spec.parameters["properties"]["url"].is_object(),
+        "turn-2 webfetch schema must still carry full parameters: {webfetch_spec:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn lazy_schema_loading_disabled_sends_full_schema_set_without_tools_index() {
+    let root = temp_workspace("lazy_schema_disabled");
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("eager".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_final".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let mut config = config_for(root.clone());
+    config.tools.lazy_schema_loading = false;
+    config.permissions.web = PermissionMode::Allow;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("eager run".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let names = tool_names(&requests[0]);
+    for expected in [
+        "update_task_state",
+        "grep",
+        "webfetch",
+        "websearch",
+        "verify",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "lazy=off should advertise the full set including {expected}: {names:?}"
+        );
+    }
+    // `load_tool_schema` is a control tool that only exists in the lazy
+    // path; with lazy=off it should not be advertised at all.
+    assert!(
+        !names.contains(&"load_tool_schema"),
+        "lazy=off should not advertise the synthetic load_tool_schema control tool: {names:?}"
+    );
+    assert!(
+        !requests[0].instructions.contains("<tools_index>"),
+        "lazy=off should not emit a tools_index section: {:?}",
+        requests[0].instructions
+    );
 
     let _ = fs::remove_dir_all(root);
 }

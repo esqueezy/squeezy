@@ -50,9 +50,22 @@ pub const DEFAULT_SESSION_MAX_EVENT_BYTES: usize = 65_536;
 pub const DEFAULT_SESSION_MAX_SESSION_BYTES: usize = 52_428_800;
 pub const DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES: usize = 1_048_576;
 pub const DEFAULT_AGENT_COMPAT_SKILLS_DIR: &str = ".agents/skills";
+/// Tools whose full JSON schema is always sent up-front in every request,
+/// independent of `[tools].lazy_schema_loading`.
+///
+/// These are the cheap-and-likely-needed-every-turn tools: bounded file
+/// reads/writes, search, shell, and graph-backed navigation. Heavyweight
+/// or rarely-used tools (e.g. `verify`, `webfetch`, `websearch`) are
+/// intentionally **not** in this list so they only cost prompt bytes once
+/// the model explicitly attaches them via `load_tool_schema`.
+///
+/// The two synthetic control tools (`update_task_state`, `load_tool_schema`)
+/// are not duplicated here on purpose: they are forced into the request
+/// `tools` array by name in `squeezy_agent::request_tool_specs`, and
+/// `squeezy_agent::tool_is_core_schema` treats them as always-core. Listing
+/// them in two places risks future skew if one site is updated without the
+/// other.
 pub const DEFAULT_CORE_TOOL_NAMES: &[&str] = &[
-    "update_task_state",
-    "load_tool_schema",
     "glob",
     "grep",
     "read_file",
@@ -3889,7 +3902,10 @@ pub fn user_settings_template() -> &'static str {
 
 # [tools]
 # lazy_schema_loading = true
-# core = ["update_task_state", "load_tool_schema", "glob", "grep", "read_file", "read_tool_output", "write_file", "shell", "decl_search", "definition_search", "diff_context", "downstream_flow", "hierarchy", "read_slice", "reference_search", "repo_map", "symbol_context", "upstream_flow"]
+# `update_task_state` and `load_tool_schema` are always-core control tools
+# and do not need to appear in `core`. See `DEFAULT_CORE_TOOL_NAMES` in
+# `squeezy_core` for the authoritative default list.
+# core = ["glob", "grep", "read_file", "read_tool_output", "write_file", "shell", "decl_search", "definition_search", "diff_context", "downstream_flow", "hierarchy", "read_slice", "reference_search", "repo_map", "symbol_context", "upstream_flow"]
 # discoverable = []
 
 [tui]
@@ -3972,7 +3988,10 @@ pub fn project_settings_template() -> &'static str {
 
 # [tools]
 # lazy_schema_loading = true
-# core = ["update_task_state", "load_tool_schema", "glob", "grep", "read_file", "read_tool_output", "write_file", "shell", "decl_search", "definition_search", "diff_context", "downstream_flow", "hierarchy", "read_slice", "reference_search", "repo_map", "symbol_context", "upstream_flow"]
+# `update_task_state` and `load_tool_schema` are always-core control tools
+# and do not need to appear in `core`. See `DEFAULT_CORE_TOOL_NAMES` in
+# `squeezy_core` for the authoritative default list.
+# core = ["glob", "grep", "read_file", "read_tool_output", "write_file", "shell", "decl_search", "definition_search", "diff_context", "downstream_flow", "hierarchy", "read_slice", "reference_search", "repo_map", "symbol_context", "upstream_flow"]
 # discoverable = []
 
 [tui]

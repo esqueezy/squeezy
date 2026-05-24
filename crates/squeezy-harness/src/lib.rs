@@ -5,7 +5,10 @@ use std::{
     io::{BufWriter, Write},
     path::{Component, Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -574,7 +577,11 @@ fn trace_completed(response_id: Option<String>, cost: CostSnapshot) -> TraceEven
 struct ScriptedProvider {
     name: &'static str,
     events: Mutex<VecDeque<TraceEvent>>,
-    prompt_bytes: Mutex<u64>,
+    // `prompt_bytes` is updated exactly once per request and read at most
+    // once per task, so contention is effectively zero. Using `AtomicU64`
+    // avoids the awkward poisoning-on-panic surface that `Mutex<u64>` would
+    // introduce while keeping the increment lock-free.
+    prompt_bytes: AtomicU64,
 }
 
 impl ScriptedProvider {
@@ -587,12 +594,12 @@ impl ScriptedProvider {
         Self {
             name,
             events: Mutex::new(events.into()),
-            prompt_bytes: Mutex::new(0),
+            prompt_bytes: AtomicU64::new(0),
         }
     }
 
     fn prompt_bytes(&self) -> u64 {
-        *self.prompt_bytes.lock().expect("prompt bytes")
+        self.prompt_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -602,7 +609,8 @@ impl LlmProvider for ScriptedProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
-        *self.prompt_bytes.lock().expect("prompt bytes") += request_prompt_bytes(&request);
+        self.prompt_bytes
+            .fetch_add(request_prompt_bytes(&request), Ordering::Relaxed);
         let events = self
             .events
             .lock()

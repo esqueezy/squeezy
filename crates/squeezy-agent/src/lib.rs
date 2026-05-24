@@ -1120,6 +1120,7 @@ impl Agent {
             }
             let mut all_tool_specs = vec![task_state_advertised_tool()];
             all_tool_specs.extend(tools.specs().into_iter().map(advertised_tool));
+            warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
 
             let outcome = TurnRuntime {
                 turn_id,
@@ -3029,6 +3030,12 @@ fn task_state_advertised_tool() -> AdvertisedTool {
     }
 }
 
+/// Synthetic control tool that promotes a discoverable tool's full schema
+/// into the request `tools` array. It is intentionally **not** routed through
+/// the `permissions.rules` engine: lazy loading is a model-facing UX
+/// affordance, and the capability is `Read` so it stays available whenever
+/// lazy loading itself is enabled and the session mode does not refuse read
+/// capabilities.
 fn load_tool_schema_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
@@ -3070,6 +3077,12 @@ fn request_tool_specs(
         return advertised_tool_specs(tools, mode);
     }
 
+    // Per-round `LlmToolSpec` clones are intentional and bounded by the size
+    // of the advertised tool set (~20 first-party tools today). If the spec
+    // set grows materially — for example once MCP brings in many external
+    // tools — switching `AdvertisedTool::spec` to `Arc<LlmToolSpec>` or
+    // emitting `Vec<Arc<LlmToolSpec>>` from this function would zero the
+    // per-round clone cost.
     let mut specs = Vec::new();
     let mut seen = BTreeSet::new();
     for name in [TASK_STATE_TOOL_NAME, LOAD_TOOL_SCHEMA_TOOL_NAME]
@@ -3102,12 +3115,50 @@ fn push_tool_spec_by_name(
         return;
     }
     let Some(tool) = tools.iter().find(|tool| tool.spec.name == name) else {
+        // Misconfigured `[tools].core` / `[tools].discoverable` entries (typos
+        // or names that no longer exist in the registry) are surfaced once at
+        // session start by `warn_unknown_tool_schema_names`. Silently skipping
+        // here keeps the hot path allocation-free.
         return;
     };
     if !mode_refuses_capability(mode, tool.capability) {
         specs.push(tool.spec.clone());
     }
 }
+
+/// Emit `tracing::warn!` for any name in `[tools].core` or
+/// `[tools].discoverable` that does not refer to a known tool. This is run
+/// once at session start (when `all_tool_specs` is built) so a typo like
+/// `core = ["webfectch"]` surfaces as an actionable warning instead of
+/// disappearing silently in the hot path. The two synthetic tools
+/// (`update_task_state`, `load_tool_schema`) are always considered known.
+fn warn_unknown_tool_schema_names(
+    all_tool_specs: &[AdvertisedTool],
+    schema_config: &ToolSchemaConfig,
+) {
+    let mut known: BTreeSet<&str> = all_tool_specs
+        .iter()
+        .map(|tool| tool.spec.name.as_str())
+        .collect();
+    known.insert(TASK_STATE_TOOL_NAME);
+    known.insert(LOAD_TOOL_SCHEMA_TOOL_NAME);
+    for name in schema_config
+        .core
+        .iter()
+        .chain(schema_config.discoverable.iter())
+    {
+        if !known.contains(name.as_str()) {
+            tracing::warn!(
+                target: "squeezy::tools",
+                tool = %name,
+                "[tools] entry references unknown tool; entry will be ignored"
+            );
+        }
+    }
+}
+
+const TOOLS_INDEX_OPENER: &str = "<tools_index>\nDiscoverable tools are listed below with compact metadata. Use load_tool_schema before calling one of these tools.\n";
+const TOOLS_INDEX_CLOSER: &str = "\n</tools_index>";
 
 fn tool_schema_index(
     tools: &[AdvertisedTool],
@@ -3128,19 +3179,27 @@ fn tool_schema_index(
                 "- {} | capability={} | {}",
                 tool.spec.name,
                 tool.capability.as_str(),
-                one_line_tool_description(&tool.spec.description)
+                first_line_of_description(&tool.spec.description)
             )
         })
         .collect::<Vec<_>>();
+    // Alphabetic ordering (not first-load order like `request_tool_specs`)
+    // keeps the rendered `<tools_index>` byte-stable across rounds even if
+    // the registry's iteration order shifts, which matters for provider-side
+    // prompt-prefix caching.
     rows.sort();
     if rows.is_empty() {
         return None;
     }
-    let mut index = String::from(
-        "<tools_index>\nDiscoverable tools are listed below with compact metadata. Use load_tool_schema before calling one of these tools.\n",
+    let mut index = String::with_capacity(
+        TOOLS_INDEX_OPENER.len()
+            + TOOLS_INDEX_CLOSER.len()
+            + rows.iter().map(String::len).sum::<usize>()
+            + rows.len(),
     );
+    index.push_str(TOOLS_INDEX_OPENER);
     index.push_str(&rows.join("\n"));
-    index.push_str("\n</tools_index>");
+    index.push_str(TOOLS_INDEX_CLOSER);
     Some(index)
 }
 
@@ -3156,7 +3215,7 @@ fn instructions_with_tool_index(
     }
 }
 
-fn one_line_tool_description(description: &str) -> String {
+fn first_line_of_description(description: &str) -> String {
     description
         .lines()
         .next()
@@ -3165,6 +3224,18 @@ fn one_line_tool_description(description: &str) -> String {
         .to_string()
 }
 
+/// Returns `true` when `tool`'s full JSON schema must be sent on every
+/// request (no lazy `load_tool_schema` hop). Tools fall into one of three
+/// buckets:
+///   * synthetic control tools (`update_task_state`, `load_tool_schema`)
+///     and every tool when lazy loading is disabled — always-core,
+///   * names listed in `[tools].core` — explicit core,
+///   * everything else (including names listed in `[tools].discoverable`
+///     and any unknown name) — discoverable.
+///
+/// Returning `false` for the implicit-discoverable case is intentional: a
+/// tool that is neither configured-core nor configured-discoverable should
+/// default to discoverable so the cache prefix stays compact.
 fn tool_is_core_schema(tool: &AdvertisedTool, schema_config: &ToolSchemaConfig) -> bool {
     let name = tool.spec.name.as_str();
     if name == TASK_STATE_TOOL_NAME || name == LOAD_TOOL_SCHEMA_TOOL_NAME {
@@ -3173,13 +3244,7 @@ fn tool_is_core_schema(tool: &AdvertisedTool, schema_config: &ToolSchemaConfig) 
     if !schema_config.lazy_schema_loading {
         return true;
     }
-    if schema_config.core_contains(name) {
-        return true;
-    }
-    if schema_config.discoverable_contains(name) {
-        return false;
-    }
-    false
+    schema_config.core_contains(name)
 }
 
 fn llm_function_call_item(call: ToolCall, redactor: &Redactor) -> LlmInputItem {

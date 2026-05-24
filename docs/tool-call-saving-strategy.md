@@ -22,7 +22,15 @@ model-facing tool output compact enough to be useful.
 - **Lazy schema loading.** Long-tail and MCP tools are advertised in a compact
   `tools_index` by default. The always-core `load_tool_schema` tool attaches a
   discoverable tool's full schema when the model needs it, and later rounds in
-  the same session reuse the expanded schema set.
+  the same session reuse the expanded schema set. The `tools_index` text is
+  intentionally byte-stable across rounds: a tool stays listed in the index
+  even after its schema has been attached, so the provider's prompt-cache
+  prefix does not invalidate every time the model loads a new tool. The
+  `tools_index` and `load_tool_schema` are an advisory hint, not an enforced
+  precondition: the registry still owns the actual executors, and the
+  permission engine remains the real safety boundary, so a tool call made
+  without a prior `load_tool_schema` is routed through the normal permission
+  path rather than refused on schema grounds.
 - **Parallel read/search calls.** Independent `glob`, `grep`, `read_file`, and
   `read_tool_output` calls can run concurrently while write and shell calls stay
   serialized. Graph-backed navigation tools use the same read-only execution

@@ -112,7 +112,12 @@ fn config_without_env_uses_openai_provider_defaults() {
     );
     assert!(config.tools.lazy_schema_loading);
     assert!(config.tools.core.contains(&"grep".to_string()));
-    assert!(config.tools.core.contains(&"load_tool_schema".to_string()));
+    // `update_task_state` and `load_tool_schema` are always-core control
+    // tools and are intentionally absent from the configurable `core` list;
+    // `squeezy_agent::request_tool_specs` forces them into the request by
+    // name.
+    assert!(!config.tools.core.contains(&"load_tool_schema".to_string()));
+    assert!(!config.tools.core.contains(&"update_task_state".to_string()));
     assert!(config.tools.discoverable.is_empty());
     assert_eq!(config.telemetry, TelemetryConfig::default());
     assert!(config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR));

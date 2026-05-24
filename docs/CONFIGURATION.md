@@ -152,7 +152,12 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 
 # [tools]
 # lazy_schema_loading = true
-# core = ["update_task_state", "load_tool_schema", "glob", "grep", "read_file", "read_tool_output", "write_file", "shell", "decl_search", "definition_search", "diff_context", "downstream_flow", "hierarchy", "read_slice", "reference_search", "repo_map", "symbol_context", "upstream_flow"]
+# `update_task_state` and `load_tool_schema` are always-core control tools and
+# do not need to appear in `core`. The authoritative default list lives in
+# `DEFAULT_CORE_TOOL_NAMES` in `squeezy_core` so future changes only have to
+# touch one place. The values shown here are the current defaults and only
+# need to be set when overriding them.
+# core = ["glob", "grep", "read_file", "read_tool_output", "write_file", "shell", "decl_search", "definition_search", "diff_context", "downstream_flow", "hierarchy", "read_slice", "reference_search", "repo_map", "symbol_context", "upstream_flow"]
 # discoverable = []
 
 [tui]
