@@ -28,6 +28,13 @@ stable repo id for per-repo user settings; see
 `config inspect` and `--health` both list the source chain so you can see
 which layers actually contributed to a given run.
 
+On first interactive startup, when no provider/model default has been selected,
+Squeezy detects available provider API-key environment variables, asks for a
+provider, model, and supported model options, then saves the result to
+`~/.squeezy/settings.toml`. The startup selector writes environment variable
+names such as `OPENAI_API_KEY`, not secret values. Use `--no-default` to run the
+selector again and replace the saved default.
+
 ## Commands
 
 ```sh
@@ -65,10 +72,11 @@ commented examples so that built-in defaults can evolve over time:
 [model]
 # provider = "openai"
 # profile = "balanced"
-# model = "gpt-5-nano"
-# reasoning_effort = "low"
+# model = "gpt-5.5"
+# reasoning_effort = "medium"
 # max_output_tokens = 128
 # store_responses = false
+# selection_version = 1
 
 [agent]
 # exploration_compiler = true
@@ -90,7 +98,7 @@ commented examples so that built-in defaults can evolve over time:
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
 # base_url = "https://api.openai.com/v1"
-# default_model = "gpt-5-nano"
+# default_model = "gpt-5.5"
 
 [permissions]
 # read = "allow"
@@ -201,9 +209,10 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 ## Sections
 
 - `[model]`: `provider`, `model`, `profile`, `reasoning_effort`,
-  `max_output_tokens`, and `store_responses`. `reasoning_effort` is only sent
-  to providers whose model registry entry marks native reasoning controls as
-  supported.
+  `max_output_tokens`, `store_responses`, and startup selector
+  `selection_version`. `reasoning_effort` accepts `low`, `medium`, `high`, or
+  `xhigh` and is only sent to providers whose model registry entry marks native
+  reasoning controls as supported.
 - `[providers.<id>]`: provider defaults such as `api_key_env`, `base_url`,
   `default_model`, `api_version`, and `region`.
 - `[session]`: `mode`, either `build` (default) or `plan`. Build mode preserves

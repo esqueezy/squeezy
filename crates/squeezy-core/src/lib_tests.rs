@@ -993,6 +993,7 @@ model = "gpt-custom"
 reasoning_effort = "high"
 max_output_tokens = 512
 store_responses = true
+selection_version = 1
 
 [agent]
 exploration_compiler = false
@@ -1197,10 +1198,23 @@ default = "allow"
 
 #[test]
 fn invalid_reasoning_and_tui_verbosity_values_are_rejected() {
-    let reasoning = SettingsFile::from_toml_str(
+    let settings = SettingsFile::from_toml_str(
         r#"
 [model]
 reasoning_effort = "xhigh"
+"#,
+        "test",
+    )
+    .expect("xhigh reasoning effort");
+    assert_eq!(
+        settings.model_settings.unwrap().reasoning_effort,
+        Some(ReasoningEffort::XHigh)
+    );
+
+    let reasoning = SettingsFile::from_toml_str(
+        r#"
+[model]
+reasoning_effort = "extreme"
 "#,
         "test",
     )

@@ -15,7 +15,7 @@ mod registry;
 pub use anthropic::AnthropicProvider;
 pub use bedrock::BedrockProvider;
 pub use google::GoogleProvider;
-pub use ollama::{OllamaProvider, fetch_ollama_context_window};
+pub use ollama::{OllamaProvider, fetch_ollama_context_window, fetch_ollama_model_names};
 pub use openai::OpenAiProvider;
 pub use registry::{
     MODEL_REGISTRY, ModelCapabilities, ModelInfo, ModelLifecycle, ModelLimits, PROVIDERS,

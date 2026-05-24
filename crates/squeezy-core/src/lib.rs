@@ -11,18 +11,19 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5-nano";
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
-pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5-20251001";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-4-7";
 pub const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
-pub const DEFAULT_GOOGLE_MODEL: &str = "gemini-2.5-flash-lite";
+pub const DEFAULT_GOOGLE_MODEL: &str = "gemini-2.5-pro";
 pub const DEFAULT_AZURE_OPENAI_BASE_URL: &str = "";
 pub const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "v1";
 pub const DEFAULT_AZURE_OPENAI_MODEL: &str = DEFAULT_OPENAI_MODEL;
 pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
 pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/api";
-pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3";
+pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
+pub const MODEL_SELECTION_VERSION: u32 = 1;
 pub const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 pub const DEFAULT_EXA_API_KEY_ENV: &str = "EXA_API_KEY";
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 128;
@@ -1066,6 +1067,8 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    #[serde(rename = "xhigh")]
+    XHigh,
 }
 
 impl ReasoningEffort {
@@ -1074,6 +1077,7 @@ impl ReasoningEffort {
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
+            "xhigh" | "x-high" | "x_high" => Some(Self::XHigh),
             _ => None,
         }
     }
@@ -1083,6 +1087,7 @@ impl ReasoningEffort {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
         }
     }
 }
@@ -1332,6 +1337,7 @@ pub struct ModelSettings {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_output_tokens: Option<u32>,
     pub store_responses: Option<bool>,
+    pub selection_version: Option<u32>,
 }
 
 impl ModelSettings {
@@ -1345,6 +1351,7 @@ impl ModelSettings {
                 "reasoning_effort",
                 "max_output_tokens",
                 "store_responses",
+                "selection_version",
             ],
             source,
             path,
@@ -1381,6 +1388,12 @@ impl ModelSettings {
                 source,
                 &field(path, "store_responses"),
             )?,
+            selection_version: u32_value(
+                table,
+                "selection_version",
+                source,
+                &field(path, "selection_version"),
+            )?,
         })
     }
 
@@ -1391,6 +1404,7 @@ impl ModelSettings {
         replace_if_some(&mut self.reasoning_effort, next.reasoning_effort);
         replace_if_some(&mut self.max_output_tokens, next.max_output_tokens);
         replace_if_some(&mut self.store_responses, next.store_responses);
+        replace_if_some(&mut self.selection_version, next.selection_version);
     }
 }
 
@@ -4033,10 +4047,11 @@ pub fn user_settings_template() -> &'static str {
 [model]
 # provider = "openai"          # openai | anthropic | google | azure_openai | bedrock | ollama
 # profile = "balanced"         # cheap | balanced | strong
-# model = "gpt-5-nano"         # provider-specific model id; leave unset to use the provider default
-# reasoning_effort = "low"     # low | medium | high; only sent to capable providers
+# model = "gpt-5.5"            # provider-specific model id; leave unset to use the provider default
+# reasoning_effort = "medium"  # low | medium | high | xhigh; only sent to capable providers
 # max_output_tokens = 128
 # store_responses = false      # only honored by openai/azure_openai
+# selection_version = 1        # maintained by the startup provider/model selector
 
 [agent]
 # exploration_compiler = true  # graph-first planner for common navigation prompts
@@ -4058,12 +4073,12 @@ pub fn user_settings_template() -> &'static str {
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
 # base_url = "https://api.openai.com/v1"
-# default_model = "gpt-5-nano"
+# default_model = "gpt-5.5"
 
 # [providers.anthropic]
 # api_key_env = "ANTHROPIC_API_KEY"
 # base_url = "https://api.anthropic.com/v1"
-# default_model = "claude-haiku-4-5-20251001"
+# default_model = "claude-opus-4-7"
 
 [permissions]
 # read = "allow"
@@ -5015,7 +5030,7 @@ fn reasoning_effort_value(
     };
     ReasoningEffort::parse(&value).ok_or_else(|| {
         SqueezyError::Config(format!(
-            "{source}: {path}: invalid reasoning effort {value:?}; expected low, medium, or high"
+            "{source}: {path}: invalid reasoning effort {value:?}; expected low, medium, high, or xhigh"
         ))
     }).map(Some)
 }
