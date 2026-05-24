@@ -28,8 +28,8 @@ use squeezy_telemetry::{
     ToolStatusKind as TelemetryToolStatusKind, ToolTelemetryReport,
 };
 use squeezy_tools::{
-    ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolResult, ToolSpec,
-    ToolStatus, WebToolConfig, sha256_hex,
+    ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
+    ToolResult, ToolSpec, ToolStatus, WebToolConfig, sha256_hex,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -164,9 +164,16 @@ impl Agent {
                 .redactor()
                 .expect("validated redaction config must compile"),
         );
+        // Open the persistent state store exactly once and share the handle
+        // with the tool registry. redb only allows a single live `Database`
+        // per file (see `state_store_open_rejects_a_second_handle_on_the_same_file`),
+        // so the registry's graph manager must reuse this handle instead of
+        // opening its own — otherwise the second open would fail silently
+        // and graph partitions would never be persisted.
         let store = SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref())
             .ok()
             .map(Arc::new);
+        let runtime = ToolRegistryRuntime::new(store.clone(), redactor.clone());
         let tools = ToolRegistry::new_with_configs_and_skills(
             config.workspace_root.clone(),
             output_config.clone(),
@@ -174,8 +181,7 @@ impl Agent {
             config.skills.clone(),
             &config.graph,
             config.permissions.shell_sandbox.clone(),
-            config.cache.root.clone(),
-            redactor.clone(),
+            runtime.clone(),
         )
         .unwrap_or_else(|_| {
             // Workspace root unavailable; fall back to the current
@@ -189,8 +195,7 @@ impl Agent {
                 config.skills.clone(),
                 &config.graph,
                 config.permissions.shell_sandbox.clone(),
-                config.cache.root.clone(),
-                redactor.clone(),
+                runtime,
             )
             .expect("current directory must be a valid tool root")
         });

@@ -342,6 +342,26 @@ fn state_store_schema_mismatch_backs_up_old_database_without_data_loss() {
     );
 }
 
+#[test]
+fn state_store_open_rejects_a_second_handle_on_the_same_file() {
+    // redb enforces single-process exclusivity by failing the second
+    // `Database::create` with a lock error. Squeezy relies on this contract
+    // to keep agent and tool-registry layers sharing a single
+    // `Arc<SqueezyStore>` instead of accidentally racing two independent
+    // handles against the same file: regressions there silently disable
+    // graph persistence because the second open returns an error that
+    // callers downgrade to `None`. This test pins the redb behavior so we
+    // notice if it ever changes.
+    let root = temp_root("state-dual-open");
+    let first = SqueezyStore::open(&root, None).expect("first open");
+    let second = SqueezyStore::open(&root, None);
+    assert!(
+        second.is_err(),
+        "redb must reject a second open on the same database file"
+    );
+    let _ = first;
+}
+
 fn write_schema_version(path: &std::path::Path, version: u64) {
     const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
     let database = Database::create(path).expect("create old database");

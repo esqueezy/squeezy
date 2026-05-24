@@ -17,7 +17,7 @@ use squeezy_parse::{
     BodyHit, BodyHitKind, LanguageParser, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport,
     ParsedReference, ParsedSymbol, ReferenceKind, edge_kind_for_call,
 };
-use squeezy_store::{GraphStoreMetadata, SqueezyStore};
+use squeezy_store::{GraphStoreMetadata, GraphWriteBatch, SqueezyStore};
 use squeezy_workspace::{CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler};
 
 use crate::languages::{
@@ -2842,6 +2842,12 @@ impl GraphManager {
         Self::open_with_optional_store(root, config, crawl_options, None)
     }
 
+    /// Open a `GraphManager` that uses its own private [`SqueezyStore`] under
+    /// `<workspace_root>/.squeezy/cache` (or `cache_root` when overridden).
+    /// Production callers that already hold a shared `Arc<SqueezyStore>`
+    /// should use [`open_with_store`] instead: redb forbids two `Database`
+    /// handles on the same file, so opening another one here against an
+    /// agent-owned store would fail silently and disable graph persistence.
     pub fn open_persistent_with_crawl_options(
         root: impl AsRef<Path>,
         config: RefreshConfig,
@@ -2853,6 +2859,18 @@ impl GraphManager {
             .ok()
             .map(Arc::new);
         Self::open_with_optional_store(root_path, config, crawl_options, store)
+    }
+
+    /// Open a `GraphManager` against an already-open [`SqueezyStore`]. Pass
+    /// `None` to disable persistence. Sharing one handle keeps the agent and
+    /// the tool registry from racing to acquire redb's exclusive file lock.
+    pub fn open_with_store(
+        root: impl AsRef<Path>,
+        config: RefreshConfig,
+        crawl_options: CrawlOptions,
+        store: Option<Arc<SqueezyStore>>,
+    ) -> Result<Self> {
+        Self::open_with_optional_store(root, config, crawl_options, store)
     }
 
     fn open_with_optional_store(
@@ -2875,10 +2893,14 @@ impl GraphManager {
             load_persisted_partitions(store.as_deref(), store_metadata.as_ref(), &snapshot.files)?;
         let (parsed_missed, parse_summary) = parser.parse_records(&loaded.missed_records)?;
         if let (Some(store), Some(metadata)) = (store.as_deref(), store_metadata.as_ref()) {
-            store.set_graph_metadata(metadata)?;
+            // Coalesce the cold-build writes into one redb transaction so the
+            // first crawl pays a single fsync rather than one per parsed file.
+            let mut batch = GraphWriteBatch::new();
+            batch.set_metadata(metadata.clone());
             for parsed in &parsed_missed {
-                store.put_graph_partition(&parsed.file.id, parsed)?;
+                batch.upsert_partition(&parsed.file.id, parsed)?;
             }
+            store.apply_graph_batch(&batch)?;
         }
         let graph = SemanticGraph::from_parsed(merge_parsed_by_snapshot_order(
             &snapshot.files,
@@ -3119,17 +3141,18 @@ impl GraphManager {
         let unchanged_event_paths = pending_changed_paths
             .len()
             .saturating_sub(event_changed_or_removed);
+        // Accumulate persistence side effects across the refresh and flush in
+        // a single redb transaction at the end. Refreshes can touch dozens of
+        // files (large saves, branch switches) and a per-file commit pays one
+        // fsync each, which dominates wall-clock cost.
+        let mut graph_batch = GraphWriteBatch::new();
         for file_id in &removed_files {
             self.graph.remove_file(file_id);
-            if let Some(store) = self.store.as_deref() {
-                let _ = store.remove_graph_partition(file_id);
-            }
+            graph_batch.remove_partition(file_id);
         }
         for file_id in &unsupported_removed_files {
             self.graph.files.remove(file_id);
-            if let Some(store) = self.store.as_deref() {
-                let _ = store.remove_graph_partition(file_id);
-            }
+            graph_batch.remove_partition(file_id);
         }
         for record in unsupported_changed_records {
             self.graph.files.insert(record.id.clone(), record.clone());
@@ -3147,12 +3170,18 @@ impl GraphManager {
             reparsed_files += 1;
         }
         if !parsed_files.is_empty() {
-            if let Some(store) = self.store.as_deref() {
+            if self.store.is_some() {
                 if let Some(metadata) = &self.store_metadata {
-                    let _ = store.set_graph_metadata(metadata);
+                    graph_batch.set_metadata(metadata.clone());
                 }
                 for parsed in &parsed_files {
-                    let _ = store.put_graph_partition(&parsed.file.id, parsed);
+                    if let Err(err) = graph_batch.upsert_partition(&parsed.file.id, parsed) {
+                        // Encoding failure cannot poison the in-memory graph
+                        // update; skip persistence for the offending file and
+                        // keep going. The warm-start path will re-parse it
+                        // next time.
+                        let _ = err;
+                    }
                 }
             }
             self.graph.replace_files(parsed_files);
@@ -3161,6 +3190,11 @@ impl GraphManager {
             self.graph.rebuild_dotnet_project_facts();
             self.graph.rebuild_semantic_edges();
             self.graph.rebuild_indexes();
+        }
+        if let Some(store) = self.store.as_deref()
+            && !graph_batch.is_empty()
+        {
+            let _ = store.apply_graph_batch(&graph_batch);
         }
 
         self.pending_changed_paths.clear();

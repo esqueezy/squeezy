@@ -123,6 +123,36 @@ impl SqueezyStore {
         write.commit().map_err(store_error)
     }
 
+    /// Apply a coherent set of graph changes (metadata + partition upserts and
+    /// removals) inside a single redb write transaction. Callers should batch
+    /// per-refresh churn through this rather than calling
+    /// [`set_graph_metadata`], [`put_graph_partition`], or
+    /// [`remove_graph_partition`] in a tight loop: each of those commits
+    /// independently and pays a fresh fsync, which dominates wall-clock cost
+    /// on a cold workspace crawl.
+    pub fn apply_graph_batch(&self, batch: &GraphWriteBatch) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let write = self.begin_write()?;
+        if let Some(metadata) = &batch.metadata {
+            let mut meta = write.open_table(META).map_err(store_error)?;
+            insert_json(&mut meta, "graph_metadata", metadata)?;
+        }
+        if !batch.upserts.is_empty() || !batch.removals.is_empty() {
+            let mut table = write.open_table(GRAPH_PARTITIONS).map_err(store_error)?;
+            for (key, value) in &batch.upserts {
+                table
+                    .insert(key.as_str(), value.as_slice())
+                    .map_err(store_error)?;
+            }
+            for key in &batch.removals {
+                table.remove(key.as_str()).map_err(store_error)?;
+            }
+        }
+        write.commit().map_err(store_error)
+    }
+
     pub fn put_tool_receipt(&self, receipt: &StoredToolReceipt) -> Result<()> {
         let write = self.begin_write()?;
         {
@@ -272,6 +302,49 @@ pub struct GraphStoreMetadata {
     pub crawl_options_hash: String,
     pub language_registry_version: String,
     pub graph_format_version: u64,
+}
+
+/// Buffered set of graph state changes to commit atomically via
+/// [`SqueezyStore::apply_graph_batch`]. Encoded payloads accumulate in memory
+/// so the resulting redb write transaction touches each affected table only
+/// once.
+#[derive(Debug, Default)]
+pub struct GraphWriteBatch {
+    metadata: Option<GraphStoreMetadata>,
+    upserts: Vec<(String, Vec<u8>)>,
+    removals: Vec<String>,
+}
+
+impl GraphWriteBatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_metadata(&mut self, metadata: GraphStoreMetadata) {
+        self.metadata = Some(metadata);
+    }
+
+    pub fn upsert_partition<T: Serialize>(
+        &mut self,
+        file_id: &FileId,
+        partition: &T,
+    ) -> Result<()> {
+        let encoded = encode(partition)?;
+        self.upserts.push((file_id.0.clone(), encoded));
+        Ok(())
+    }
+
+    pub fn remove_partition(&mut self, file_id: &FileId) {
+        self.removals.push(file_id.0.clone());
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.metadata.is_none() && self.upserts.is_empty() && self.removals.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.upserts.len() + self.removals.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

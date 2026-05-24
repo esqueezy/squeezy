@@ -15,6 +15,7 @@ use squeezy_core::{
     AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, PermissionScope, Result, SessionMode,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
+use squeezy_store::SqueezyStore;
 use squeezy_tools::sha256_hex;
 use tokio_util::sync::CancellationToken;
 
@@ -700,6 +701,48 @@ async fn repeated_read_result_returns_receipt_stub_across_sessions() {
         "first_session_read"
     );
     assert!(outputs[0].1["content"]["content"].is_null());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn agent_shares_state_store_with_tool_registry_for_graph_persistence() {
+    // Regression for an earlier draft of the persistence change in which the
+    // agent and the tool registry each opened their own `SqueezyStore` on
+    // the workspace. redb forbids a second `Database` handle on the same
+    // file, so the registry's open quietly failed and graph persistence
+    // never ran. Asserting that the shared state store contains a graph
+    // partition entry after one agent turn pins the contract that both
+    // layers reuse the agent's `Arc<SqueezyStore>`.
+    let root = temp_workspace("agent_shared_state_store");
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = 'shared-state-demo'\nversion = '0.1.0'\nedition = '2024'\n",
+    )
+    .expect("write cargo");
+    fs::write(root.join("src/lib.rs"), "pub fn shared_state_demo() {}\n").expect("write lib");
+
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_only".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(config_for(root.clone()), provider);
+    drain_turn(agent.start_turn("warm graph".to_string(), CancellationToken::new())).await;
+    drop(agent);
+
+    let store = SqueezyStore::open(&root, None).expect("reopen state store");
+    let partition: Option<serde_json::Value> = store
+        .graph_partition(&squeezy_core::FileId::new("src/lib.rs"))
+        .expect("graph_partition");
+    assert!(
+        partition.is_some(),
+        "agent must persist graph partitions through the shared state store",
+    );
 
     let _ = fs::remove_dir_all(root);
 }
