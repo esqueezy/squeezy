@@ -1092,6 +1092,44 @@ async fn simple_ls_completes_locally_without_provider_request() {
 
     let mut rx = agent.start_turn("ls".to_string(), CancellationToken::new());
     let mut completed = None;
+    let mut tool_result = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ToolCallCompleted { result, .. } => tool_result = Some(result),
+            AgentEvent::Completed { message, .. } => completed = Some(message.content),
+            _ => {}
+        }
+    }
+
+    assert!(provider.requests().is_empty());
+    let tool_result = tool_result.expect("ls should run through the shell tool");
+    assert_eq!(tool_result.tool_name, "shell");
+    assert_eq!(tool_result.status, ToolStatus::Success);
+    let completed = completed.expect("ls turn should complete");
+    assert!(completed.contains("Cargo.toml"), "{completed}");
+    assert!(completed.contains("src"), "{completed}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn run_ls_phrase_uses_local_tool_path_without_provider_request() {
+    let root = temp_workspace("agent_local_run_ls");
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("write cargo");
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+
+    let mut rx = agent.start_turn(
+        "run ls in current dir".to_string(),
+        CancellationToken::new(),
+    );
+    let mut completed = None;
     while let Some(event) = rx.recv().await {
         if let AgentEvent::Completed { message, .. } = event {
             completed = Some(message.content);
@@ -1099,12 +1137,50 @@ async fn simple_ls_completes_locally_without_provider_request() {
     }
 
     assert!(provider.requests().is_empty());
-    let completed = completed.expect("ls turn should complete");
-    assert!(completed.contains("Top-level entries"), "{completed}");
+    let completed = completed.expect("local run turn should complete");
     assert!(completed.contains("Cargo.toml"), "{completed}");
-    assert!(completed.contains("src/"), "{completed}");
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn tool_loop_guard_stops_repeated_identical_failures() {
+    let call = ToolCall {
+        call_id: "patch-1".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({}),
+    };
+    let first = control_tool_result(
+        &call,
+        ToolStatus::Stale,
+        json!({
+            "error": "search text matched more than once",
+            "path": "src/lib.rs"
+        }),
+    );
+    let second = control_tool_result(
+        &ToolCall {
+            call_id: "patch-2".to_string(),
+            ..call.clone()
+        },
+        ToolStatus::Stale,
+        json!({
+            "error": "search text matched more than once",
+            "path": "src/lib.rs"
+        }),
+    );
+    let mut guard = ToolLoopGuard::default();
+
+    assert!(
+        guard
+            .observe_round(std::slice::from_ref(&call), &[first])
+            .is_none()
+    );
+    let reason = guard
+        .observe_round(&[call], &[second])
+        .expect("second identical failure should stop");
+
+    assert!(reason.contains("repeated apply_patch failure"), "{reason}");
 }
 
 #[tokio::test]

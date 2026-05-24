@@ -380,12 +380,20 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     // resets) brings them back to live view.
                 }
                 AgentEvent::ToolCallQueued { call, .. } => {
-                    app.status = format!("queued {}", tool_call_label(&call));
-                    app.remember_active_tool_call(call);
+                    if is_control_tool_name(&call.name) {
+                        app.status = "planning".to_string();
+                    } else {
+                        app.status = format!("queued {}", tool_call_label(&call));
+                        app.remember_active_tool_call(call);
+                    }
                 }
                 AgentEvent::ToolCallStarted { call, .. } => {
-                    app.status = format!("running {}", tool_call_label(&call));
-                    app.remember_active_tool_call(call);
+                    if is_control_tool_name(&call.name) {
+                        app.status = "planning".to_string();
+                    } else {
+                        app.status = format!("running {}", tool_call_label(&call));
+                        app.remember_active_tool_call(call);
+                    }
                 }
                 AgentEvent::ToolCallCompleted { result, .. } => {
                     app.status = format!(
@@ -409,7 +417,9 @@ async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::TaskStateUpdated { snapshot, .. } => {
                     app.task_state = Some(snapshot);
-                    app.status = "task state updated".to_string();
+                    if app.active_tool_calls.is_empty() {
+                        app.status = "planning".to_string();
+                    }
                 }
                 AgentEvent::JobUpdated { job } => {
                     apply_job_update(app, job);
@@ -2402,7 +2412,11 @@ fn working_line(app: &TuiApp) -> Line<'static> {
         ),
         Style::default().fg(QUIET),
     ));
-    if let Some(call) = app.active_tool_calls.values().next() {
+    if let Some(call) = app
+        .active_tool_calls
+        .values()
+        .find(|call| !is_control_tool_name(&call.name))
+    {
         spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
         spans.extend(active_tool_spans(call));
     }
@@ -3510,10 +3524,82 @@ fn read_tool_output_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 }
 
 fn edit_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
-    vec![Span::styled(
-        tool_call_label_or_name(tool),
-        Style::default().fg(Color::White),
-    )]
+    let files = edit_changed_files(tool);
+    let label = if files.is_empty() {
+        tool_call_label_or_name(tool)
+    } else if files.len() == 1 {
+        files[0].path.clone()
+    } else {
+        format!("{} files", files.len())
+    };
+    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let additions = files.iter().map(|file| file.additions).sum::<u64>();
+    let deletions = files.iter().map(|file| file.deletions).sum::<u64>();
+    if additions > 0 || deletions > 0 {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            format!("+{additions} -{deletions}"),
+            Style::default().fg(QUIET),
+        ));
+    } else if let Some(count) = number_field(&tool.result.content, "matches") {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            format!("{count} matches"),
+            Style::default().fg(GOLD),
+        ));
+    }
+    spans
+}
+
+#[derive(Debug)]
+struct EditChangedFile {
+    path: String,
+    additions: u64,
+    deletions: u64,
+    patch: Option<String>,
+    patch_truncated: bool,
+}
+
+fn edit_changed_files(tool: &ToolTranscript) -> Vec<EditChangedFile> {
+    let mut files = tool.result.content["checkpoint"]["files"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(EditChangedFile {
+                        path: item["path"].as_str()?.to_string(),
+                        additions: item["additions"].as_u64().unwrap_or(0),
+                        deletions: item["deletions"].as_u64().unwrap_or(0),
+                        patch: item["patch"].as_str().map(ToString::to_string),
+                        patch_truncated: item["patch_truncated"].as_bool().unwrap_or(false),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if files.is_empty() {
+        if let Some(items) = tool.result.content["files"].as_array() {
+            files.extend(items.iter().filter_map(|item| {
+                Some(EditChangedFile {
+                    path: item["path"].as_str()?.to_string(),
+                    additions: 0,
+                    deletions: 0,
+                    patch: None,
+                    patch_truncated: false,
+                })
+            }));
+        } else if let Some(path) = string_arg(&tool.result.content, "path") {
+            files.push(EditChangedFile {
+                path,
+                additions: 0,
+                deletions: 0,
+                patch: None,
+                patch_truncated: false,
+            });
+        }
+    }
+    files
 }
 
 fn diff_context_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
@@ -3688,6 +3774,10 @@ fn active_tool_spans(call: &ToolCall) -> Vec<Span<'static>> {
     spans
 }
 
+fn is_control_tool_name(name: &str) -> bool {
+    matches!(name, "update_task_state" | "load_tool_schema")
+}
+
 fn active_tool_action(tool_name: &str) -> &'static str {
     match tool_name {
         "plan_patch" => "Planning ",
@@ -3707,6 +3797,7 @@ fn expanded_tool_detail_lines(
         "repo_map" => expanded_repo_map_detail_lines(tool),
         "diff_context" => expanded_diff_context_detail_lines(tool),
         "plan_patch" => expanded_plan_patch_detail_lines(tool),
+        "apply_patch" | "write_file" => expanded_edit_detail_lines(tool, verbosity),
         "grep" | "glob" | "read_file" | "read_slice" | "read_tool_output" => {
             expanded_read_search_detail_lines(tool, verbosity)
         }
@@ -3846,6 +3937,47 @@ fn expanded_plan_patch_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>>
         lines.push(detail_line(false, QUIET, format!("next {next}")));
     }
     lines
+}
+
+fn expanded_edit_detail_lines(
+    tool: &ToolTranscript,
+    verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let files = edit_changed_files(tool);
+    for file in files {
+        let mut summary = format!("file {}", file.path);
+        if file.additions > 0 || file.deletions > 0 {
+            summary.push_str(&format!(" +{} -{}", file.additions, file.deletions));
+        }
+        if file.patch_truncated {
+            summary.push_str(" · diff truncated");
+        }
+        lines.push(detail_line(false, QUIET, summary));
+        if let Some(patch) = file.patch.as_deref().filter(|patch| !patch.is_empty()) {
+            lines.extend(output_block_lines("diff", patch, verbosity));
+        }
+    }
+    if let Some(matches) = number_field(&tool.result.content, "matches") {
+        lines.push(detail_line(false, QUIET, format!("matches {matches}")));
+    }
+    if let Some(contexts) = tool.result.content["match_contexts"].as_array() {
+        lines.extend(contexts.iter().take(5).filter_map(|context| {
+            let index = context["match_index"].as_u64()?;
+            let line = context["line"].as_u64()?;
+            let preview = context["preview"].as_str()?;
+            Some(detail_line(
+                false,
+                QUIET,
+                format!("match {index} line {line}: {preview}"),
+            ))
+        }));
+    }
+    if lines.is_empty() {
+        expanded_generic_tool_detail_lines(tool, verbosity)
+    } else {
+        lines
+    }
 }
 
 fn expanded_read_search_detail_lines(
@@ -5256,6 +5388,9 @@ impl TuiApp {
     }
 
     fn remember_active_tool_call(&mut self, call: ToolCall) {
+        if is_control_tool_name(&call.name) {
+            return;
+        }
         self.active_tool = Some(call.name.clone());
         self.active_tool_calls.insert(call.call_id.clone(), call);
     }
@@ -5264,7 +5399,7 @@ impl TuiApp {
         self.active_tool = self
             .active_tool_calls
             .values()
-            .next()
+            .find(|call| !is_control_tool_name(&call.name))
             .map(|call| call.name.clone());
     }
 

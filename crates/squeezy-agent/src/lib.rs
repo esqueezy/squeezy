@@ -50,6 +50,9 @@ mod exploration_compiler;
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
 
 const MAX_TOOL_ROUNDS: usize = 32;
+const MAX_CONTROL_ONLY_TOOL_ROUNDS: usize = 2;
+const LOCAL_SHELL_TIMEOUT_MS: u64 = 10_000;
+const LOCAL_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
 const TASK_STATE_TOOL_NAME: &str = "update_task_state";
 const LOAD_TOOL_SCHEMA_TOOL_NAME: &str = "load_tool_schema";
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
@@ -1415,14 +1418,17 @@ impl Agent {
             {
                 return;
             }
-            if let Some(answer) = local_workspace_command_answer(&task_title, &config) {
-                complete_local_command_turn(
+            if let Some(call) = local_shell_command_call(&task_title) {
+                complete_local_tool_turn(
                     turn_id,
                     task_title,
-                    answer,
+                    call,
                     redacted_input.redactions,
-                    HelpTurnDeps {
+                    LocalToolTurnDeps {
                         tx: tx.clone(),
+                        provider: provider.clone(),
+                        tools: tools.clone(),
+                        jobs: jobs.clone(),
                         redactor: redactor.clone(),
                         session_log: session_log.clone(),
                         conversation_state: conversation_state.clone(),
@@ -1431,6 +1437,10 @@ impl Agent {
                         config: config.clone(),
                         task_state: task_state.clone(),
                         session_mode: session_mode.clone(),
+                        cancel: cancel.clone(),
+                        approval_ids: approval_ids.clone(),
+                        session_rules: session_rules.clone(),
+                        loaded_tool_schemas: loaded_tool_schemas.clone(),
                     },
                 )
                 .await;
@@ -1462,20 +1472,16 @@ impl Agent {
                 .await;
                 return;
             }
-            let mcp_errors = tools.refresh_mcp_tools(cancel.clone()).await;
-            for error in mcp_errors {
-                log_session_event(
-                    session_log.as_ref(),
-                    &redactor,
-                    "mcp_discovery_error",
-                    Some(turn_id),
-                    Some(error.clone()),
-                    json!({ "error": error }),
-                );
-            }
             let mut all_tool_specs = vec![task_state_advertised_tool()];
             all_tool_specs.extend(tools.specs().into_iter().map(advertised_tool));
             warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
+            refresh_mcp_tools_in_background(
+                tools.clone(),
+                cancel.clone(),
+                session_log.clone(),
+                redactor.clone(),
+                turn_id,
+            );
 
             let outcome = TurnRuntime {
                 turn_id,
@@ -1550,6 +1556,25 @@ struct HelpTurnDeps {
     config: AppConfig,
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
     session_mode: Arc<AtomicU8>,
+}
+
+struct LocalToolTurnDeps {
+    tx: mpsc::Sender<AgentEvent>,
+    provider: Arc<dyn LlmProvider>,
+    tools: ToolRegistry,
+    jobs: JobRegistry,
+    redactor: Arc<Redactor>,
+    session_log: Option<SessionHandle>,
+    conversation_state: Arc<Mutex<ConversationState>>,
+    session_metrics: Arc<Mutex<SessionMetrics>>,
+    telemetry: TelemetryClient,
+    config: AppConfig,
+    task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
+    session_mode: Arc<AtomicU8>,
+    cancel: CancellationToken,
+    approval_ids: Arc<AtomicU64>,
+    session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
 }
 
 async fn complete_squeezy_help_turn(
@@ -1692,15 +1717,18 @@ async fn complete_squeezy_help_turn(
         .await;
 }
 
-async fn complete_local_command_turn(
+async fn complete_local_tool_turn(
     turn_id: TurnId,
     task_title: String,
-    answer: String,
+    call: ToolCall,
     seed_redactions: u64,
-    deps: HelpTurnDeps,
+    deps: LocalToolTurnDeps,
 ) {
-    let HelpTurnDeps {
+    let LocalToolTurnDeps {
         tx,
+        provider,
+        tools,
+        jobs,
         redactor,
         session_log,
         conversation_state,
@@ -1709,16 +1737,13 @@ async fn complete_local_command_turn(
         config,
         task_state,
         session_mode,
+        cancel,
+        approval_ids,
+        session_rules,
+        loaded_tool_schemas,
     } = deps;
     let user_item = LlmInputItem::UserText(task_title.clone());
     let user_transcript = TranscriptItem::user(task_title.clone());
-    let rendered = redactor.redact(&answer);
-    let message = TranscriptItem::assistant(rendered.text);
-    let metrics = TurnMetrics {
-        redactions: seed_redactions + rendered.redactions,
-        ..TurnMetrics::default()
-    };
-    let cost = CostSnapshot::default();
 
     log_session_event(
         session_log.as_ref(),
@@ -1739,11 +1764,71 @@ async fn complete_local_command_turn(
     .await;
     let _ = tx.send(AgentEvent::Started { turn_id }).await;
     let _ = tx
+        .send(AgentEvent::ToolCallQueued {
+            turn_id,
+            call: redact_tool_call(call.clone(), &redactor),
+        })
+        .await;
+
+    let mut all_tool_specs = vec![task_state_advertised_tool()];
+    all_tool_specs.extend(tools.specs().into_iter().map(advertised_tool));
+    let exploration_state = Arc::new(Mutex::new(ExplorationTurnState::from_plan(None)));
+    let mut broker = CostBroker::new(&config);
+    let results = execute_tool_calls(
+        vec![call],
+        ToolExecutionContext {
+            turn_id,
+            provider,
+            tools: &tools,
+            jobs: &jobs,
+            config: &config,
+            telemetry: telemetry.clone(),
+            redactor: redactor.clone(),
+            tx: tx.clone(),
+            cancel,
+            approval_ids,
+            session_rules,
+            session_mode: session_mode.clone(),
+            session_log: session_log.clone(),
+            task_state: task_state.clone(),
+            all_tool_specs: &all_tool_specs,
+            loaded_tool_schemas,
+            exploration_state,
+        },
+        &mut broker,
+    )
+    .await;
+
+    let message_text = local_tool_completion_message(results.first());
+    let rendered = redactor.redact(&message_text);
+    let message = TranscriptItem::assistant(rendered.text);
+    let mut metrics = broker.metrics.clone();
+    metrics.redactions += seed_redactions + rendered.redactions;
+    let cost = CostSnapshot::default();
+    let _ = tx
         .send(AgentEvent::AssistantDelta {
             turn_id,
             delta: message.content.clone(),
         })
         .await;
+    let terminal_status = if results
+        .first()
+        .is_some_and(|result| result.status == ToolStatus::Success)
+    {
+        TaskStateStatus::Completed
+    } else {
+        TaskStateStatus::Failed
+    };
+    let terminal_summary = results
+        .first()
+        .map(|result| {
+            if result.status == ToolStatus::Success {
+                "local command completed".to_string()
+            } else {
+                format!("local command failed: {}", tool_failure_detail(result))
+            }
+        })
+        .unwrap_or_else(|| "local command produced no result".to_string());
     let latest_task_state = task_state.lock().await.clone();
     publish_task_state_update(
         &tx,
@@ -1754,8 +1839,8 @@ async fn complete_local_command_turn(
         TaskStateSnapshot::terminal_from(
             latest_task_state.as_ref(),
             task_title.clone(),
-            TaskStateStatus::Completed,
-            Some("local workspace command".to_string()),
+            terminal_status,
+            Some(terminal_summary),
         ),
     )
     .await;
@@ -1788,7 +1873,7 @@ async fn complete_local_command_turn(
         &redactor,
         "local_command",
         Some(turn_id),
-        Some("workspace listing".to_string()),
+        results.first().map(tool_result_summary),
         json!({ "command": task_title }),
     );
     log_session_event(
@@ -1821,52 +1906,147 @@ async fn complete_local_command_turn(
         .await;
 }
 
-fn local_workspace_command_answer(input: &str, config: &AppConfig) -> Option<String> {
-    match input.trim() {
-        "ls" | "ls ." => local_ls_answer(config),
-        "pwd" => Some(config.workspace_root.display().to_string()),
-        _ => None,
-    }
+fn refresh_mcp_tools_in_background(
+    tools: ToolRegistry,
+    cancel: CancellationToken,
+    session_log: Option<SessionHandle>,
+    redactor: Arc<Redactor>,
+    turn_id: TurnId,
+) {
+    tokio::spawn(async move {
+        let mcp_errors = tools.refresh_mcp_tools(cancel).await;
+        for error in mcp_errors {
+            log_session_event(
+                session_log.as_ref(),
+                &redactor,
+                "mcp_discovery_error",
+                Some(turn_id),
+                Some(error.clone()),
+                json!({ "error": error }),
+            );
+        }
+    });
 }
 
-fn local_ls_answer(config: &AppConfig) -> Option<String> {
-    let mut entries = fs::read_dir(&config.workspace_root)
-        .ok()?
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| {
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            if file_name == ".git" {
-                return None;
-            }
-            let suffix = entry
-                .file_type()
-                .ok()
-                .filter(|file_type| file_type.is_dir())
-                .map(|_| "/")
-                .unwrap_or("");
-            Some(format!("{file_name}{suffix}"))
-        })
-        .collect::<Vec<_>>();
-    entries.sort();
+fn local_shell_command_call(input: &str) -> Option<ToolCall> {
+    let command = local_shell_command(input)?;
+    Some(ToolCall {
+        call_id: "local-shell-1".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": command,
+            "description": "run the user-requested local command",
+            "timeout_ms": LOCAL_SHELL_TIMEOUT_MS,
+            "output_byte_cap": LOCAL_SHELL_OUTPUT_BYTE_CAP,
+            "output_mode": "raw",
+        }),
+    })
+}
 
-    let total = entries.len();
-    let shown = entries.iter().take(80).cloned().collect::<Vec<_>>();
-    let mut answer = if shown.is_empty() {
-        "No top-level entries found.".to_string()
-    } else {
-        format!(
-            "Top-level entries ({total}):\n\n{}",
-            shown
-                .iter()
-                .map(|entry| format!("- {entry}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    };
-    if total > shown.len() {
-        answer.push_str(&format!("\n\n... {} more", total - shown.len()));
+fn local_shell_command(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed.lines().count() > 1 {
+        return None;
     }
-    Some(answer)
+    if let Some(command) = trimmed.strip_prefix('!') {
+        return nonempty_shell_command(command);
+    }
+    for prefix in ["run ", "execute "] {
+        if let Some(command) = trimmed.strip_prefix(prefix) {
+            let command = nonempty_shell_command(strip_current_dir_suffix(command))?;
+            return looks_like_direct_shell_command(&command).then_some(command);
+        }
+    }
+    let direct = strip_current_dir_suffix(trimmed);
+    if looks_like_direct_shell_command(direct) {
+        return Some(direct.to_string());
+    }
+    None
+}
+
+fn strip_current_dir_suffix(command: &str) -> &str {
+    let command = command.trim();
+    for suffix in [
+        " in current dir",
+        " in current directory",
+        " in this dir",
+        " in this directory",
+        " in the current dir",
+        " in the current directory",
+    ] {
+        if let Some(stripped) = command.strip_suffix(suffix) {
+            return stripped.trim();
+        }
+    }
+    command
+}
+
+fn looks_like_direct_shell_command(input: &str) -> bool {
+    let Some(first) = input.split_whitespace().next() else {
+        return false;
+    };
+    matches!(
+        first,
+        "ls" | "pwd"
+            | "rg"
+            | "grep"
+            | "git"
+            | "cargo"
+            | "make"
+            | "just"
+            | "npm"
+            | "pnpm"
+            | "yarn"
+            | "bun"
+    )
+}
+
+fn nonempty_shell_command(command: &str) -> Option<String> {
+    let command = command.trim().trim_matches('`').trim();
+    (!command.is_empty()).then(|| command.to_string())
+}
+
+fn local_tool_completion_message(result: Option<&ToolResult>) -> String {
+    let Some(result) = result else {
+        return "Local command produced no result.".to_string();
+    };
+    let command = result
+        .content
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("local command");
+    let stdout = result
+        .content
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim_end();
+    let stderr = result
+        .content
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim_end();
+    match result.status {
+        ToolStatus::Success => {
+            if !stdout.is_empty() {
+                stdout.to_string()
+            } else if !stderr.is_empty() {
+                stderr.to_string()
+            } else {
+                format!("`{command}` completed successfully.")
+            }
+        }
+        ToolStatus::Cancelled => format!("`{command}` was cancelled."),
+        _ => {
+            let detail = tool_failure_detail(result);
+            if !stderr.is_empty() {
+                format!("`{command}` failed: {detail}\n\n{stderr}")
+            } else {
+                format!("`{command}` failed: {detail}")
+            }
+        }
+    }
 }
 
 struct TurnRuntime {
@@ -2177,6 +2357,7 @@ impl TurnRuntime {
         }
 
         let mut last_tool_round_summary = None;
+        let mut loop_guard = ToolLoopGuard::default();
         for _round in 0..MAX_TOOL_ROUNDS {
             let active_mode = load_session_mode(&self.session_mode);
             let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();
@@ -2402,6 +2583,9 @@ impl TurnRuntime {
             )
             .await;
             last_tool_round_summary = tool_round_failure_summary(&results);
+            if let Some(reason) = loop_guard.observe_round(&tool_calls, &results) {
+                return Err(SqueezyError::Agent(reason));
+            }
             let results = seen_tool_outputs.prepare_results(results);
             let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
             for pending in &results {
@@ -2907,6 +3091,65 @@ fn tool_round_failure_summary(results: &[ToolResult]) -> Option<String> {
             }
         })
         .or(last_error)
+}
+
+#[derive(Default)]
+struct ToolLoopGuard {
+    control_only_rounds: usize,
+    failure_counts: BTreeMap<String, usize>,
+}
+
+impl ToolLoopGuard {
+    fn observe_round(&mut self, calls: &[ToolCall], results: &[ToolResult]) -> Option<String> {
+        if !calls.is_empty() && calls.iter().all(|call| is_control_tool_name(&call.name)) {
+            self.control_only_rounds += 1;
+            if self.control_only_rounds > MAX_CONTROL_ONLY_TOOL_ROUNDS {
+                return Some(
+                    "agent only updated internal task state; stopping before burning more tool rounds"
+                        .to_string(),
+                );
+            }
+        } else {
+            self.control_only_rounds = 0;
+        }
+
+        for result in results {
+            let Some(key) = repeated_tool_failure_key(result) else {
+                continue;
+            };
+            let count = self.failure_counts.entry(key).or_default();
+            *count += 1;
+            if *count >= 2 {
+                return Some(format!(
+                    "repeated {} failure: {}; stopping before burning more tool rounds",
+                    result.tool_name,
+                    tool_failure_detail(result)
+                ));
+            }
+        }
+        None
+    }
+}
+
+fn repeated_tool_failure_key(result: &ToolResult) -> Option<String> {
+    if result.status != ToolStatus::Error && result.status != ToolStatus::Stale {
+        return None;
+    }
+    let path = result
+        .content
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    Some(format!(
+        "{}:{:?}:{path}:{}",
+        result.tool_name,
+        result.status,
+        tool_failure_detail(result)
+    ))
+}
+
+fn is_control_tool_name(name: &str) -> bool {
+    matches!(name, TASK_STATE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME)
 }
 
 fn tool_failure_detail(result: &ToolResult) -> String {

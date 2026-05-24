@@ -1298,6 +1298,15 @@ async fn apply_patch_rejects_multiple_matches_unless_allowed() {
         )
         .await;
     assert_eq!(rejected.status, ToolStatus::Stale);
+    assert_eq!(rejected.content["matches"], 2);
+    assert_eq!(rejected.content["match_contexts"][0]["line"], 1);
+    assert!(
+        rejected.content["match_contexts"][0]["preview"]
+            .as_str()
+            .is_some_and(|preview| preview.contains("same same")),
+        "{}",
+        rejected.content
+    );
     assert_eq!(
         fs::read_to_string(root.join("sample.txt")).unwrap(),
         "same same\n"
@@ -1322,6 +1331,13 @@ async fn apply_patch_rejects_multiple_matches_unless_allowed() {
         )
         .await;
     assert_eq!(accepted.status, ToolStatus::Success);
+    assert!(
+        accepted.content["checkpoint"]["files"][0]["patch"]
+            .as_str()
+            .is_some_and(|patch| patch.contains("-same same") && patch.contains("+next next")),
+        "{}",
+        accepted.content
+    );
     assert_eq!(
         fs::read_to_string(root.join("sample.txt")).unwrap(),
         "next next\n"

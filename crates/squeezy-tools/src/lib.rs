@@ -4268,10 +4268,11 @@ impl ToolRegistry {
                     call,
                     ToolStatus::Stale,
                     json!({
-                        "error": "search text matched more than once; set allow_multiple=true to replace all matches",
+                        "error": "search text matched more than once; narrow the search text or set allow_multiple=true to replace all matches",
                         "path": rel,
                         "patch_index": index,
                         "matches": matches,
+                        "match_contexts": patch_match_contexts(&state.current, &patch.search, 5),
                     }),
                     ToolCostHint::default(),
                     Some(state.before_sha256.clone()),
@@ -11239,6 +11240,34 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
         output.push_str("...");
     }
     output
+}
+
+fn patch_match_contexts(content: &str, search: &str, max_matches: usize) -> Vec<Value> {
+    content
+        .match_indices(search)
+        .take(max_matches)
+        .enumerate()
+        .map(|(index, (byte_index, _))| {
+            let line = content[..byte_index]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            let line_start = content[..byte_index]
+                .rfind('\n')
+                .map(|position| position + 1)
+                .unwrap_or(0);
+            let line_end = content[byte_index..]
+                .find('\n')
+                .map(|position| byte_index + position)
+                .unwrap_or(content.len());
+            json!({
+                "match_index": index + 1,
+                "line": line,
+                "preview": truncate_text(&content[line_start..line_end], 240),
+            })
+        })
+        .collect()
 }
 
 fn truncate_to_bytes(value: &str, cap: usize) -> (String, bool) {

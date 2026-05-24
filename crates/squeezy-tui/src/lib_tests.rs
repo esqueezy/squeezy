@@ -836,6 +836,42 @@ fn tool_rows_summarize_diff_glob_read_and_plan_outputs() {
 }
 
 #[test]
+fn edit_tool_row_summarizes_checkpoint_diff_and_expands_patch() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("apply_patch", "");
+    result.call_id = "patch-1".to_string();
+    result.content = serde_json::json!({
+        "checkpoint": {
+            "files": [{
+                "path": "src/lib.rs",
+                "additions": 1,
+                "deletions": 1,
+                "patch": "@@ -1 +1 @@\n-old\n+new\n",
+                "patch_truncated": false
+            }]
+        }
+    });
+    app.push_tool_result_with_call(
+        result,
+        Some(ToolCall {
+            call_id: "patch-1".to_string(),
+            name: "apply_patch".to_string(),
+            arguments: serde_json::json!({}),
+        }),
+    );
+    select_previous_transcript_entry(&mut app);
+    toggle_selected_transcript_entry(&mut app);
+
+    let output = render_to_string(&app, 120, 16);
+
+    assert!(output.contains("✔ Edited src/lib.rs · +1 -1"), "{output}");
+    assert!(output.contains("diff"), "{output}");
+    assert!(output.contains("-old"), "{output}");
+    assert!(output.contains("+new"), "{output}");
+    assert!(!output.contains("\"checkpoint\""), "{output}");
+}
+
+#[test]
 fn repeated_invalid_tool_arguments_are_coalesced() {
     let mut app = test_app(SessionMode::Build);
     for index in 0..2 {
@@ -1809,6 +1845,41 @@ async fn queued_tool_event_updates_visible_working_status_without_transcript_row
     assert!(output.contains("Exploring grep getFoo"), "{output}");
     assert!(!output.contains("Queued"), "{output}");
     assert!(!output.contains("args="), "{output}");
+}
+
+#[tokio::test]
+async fn task_state_tool_does_not_replace_visible_active_work() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::ToolCallQueued {
+        turn_id: TurnId::new(1),
+        call: ToolCall {
+            call_id: "task-1".to_string(),
+            name: "update_task_state".to_string(),
+            arguments: serde_json::json!({"status": "running"}),
+        },
+    })
+    .await
+    .expect("send task state");
+    tx.send(AgentEvent::ToolCallQueued {
+        turn_id: TurnId::new(1),
+        call: ToolCall {
+            call_id: "shell-1".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({"command": "ls"}),
+        },
+    })
+    .await
+    .expect("send shell");
+    drop(tx);
+
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(app.active_tool.as_deref(), Some("shell"));
+    let output = render_to_string(&app, 120, 16);
+    assert!(output.contains("Running ls"), "{output}");
+    assert!(!output.contains("update_task_state"), "{output}");
 }
 
 #[test]
