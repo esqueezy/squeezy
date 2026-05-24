@@ -378,7 +378,7 @@ fn transcript_item_formats_role_label() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(text, "> hello");
+    assert_eq!(text, "  • Asked hello");
 }
 
 #[test]
@@ -388,7 +388,7 @@ fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
 
     assert!(app.transcript[0].collapsed);
     let collapsed = render_to_string(&app, 100, 12);
-    assert!(collapsed.contains("●"), "{collapsed}");
+    assert!(collapsed.contains("✔ Ran"), "{collapsed}");
     assert!(collapsed.contains("grep success"), "{collapsed}");
     assert!(
         !collapsed.contains("needle found"),
@@ -717,18 +717,33 @@ fn render_keeps_header_when_transcript_has_content() {
     let output = render_to_string(&app, 120, 16);
     assert!(output.contains(">_ Squeezy v"), "{output}");
     assert!(output.contains("scripted:gpt-test"), "{output}");
-    assert!(output.contains("> hello"), "{output}");
-    assert!(output.contains("● answer"), "{output}");
+    assert!(output.contains("• Asked hello"), "{output}");
+    assert!(output.contains("• Answered answer"), "{output}");
 }
 
 #[test]
-fn render_prompt_uses_turn_state_dot() {
+fn render_prompt_uses_rotating_coin_and_cursor() {
     let mut app = test_app(SessionMode::Build);
     app.input = "ship it".to_string();
     app.turn_visual = TurnVisualState::Running;
 
     let output = render_to_string(&app, 100, 12);
-    assert!(output.contains("•  ship it"), "{output}");
+    assert!(output.contains("◐  ship it|"), "{output}");
+}
+
+#[test]
+fn failure_log_renders_as_detail_under_user_turn() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("hi"));
+    app.push_log("turn failed: provider stream failed".to_string());
+
+    let output = render_to_string(&app, 120, 16);
+    assert!(output.contains("• Asked hi"), "{output}");
+    assert!(
+        output.contains("└ turn failed: provider stream failed"),
+        "{output}"
+    );
+    assert!(!output.contains("chars  turn failed"), "{output}");
 }
 
 #[test]

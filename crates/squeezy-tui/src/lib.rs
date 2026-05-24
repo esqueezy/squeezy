@@ -50,8 +50,8 @@ const LONG_ASSISTANT_CHARS: usize = 1_200;
 const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
 const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
-const AMBER: Color = Color::Rgb(245, 158, 11);
-const GOLD: Color = Color::Rgb(251, 191, 36);
+const AMBER: Color = Color::Rgb(234, 179, 8);
+const GOLD: Color = Color::Rgb(250, 204, 21);
 const MODE_PURPLE: Color = Color::Rgb(168, 85, 247);
 const QUIET: Color = Color::DarkGray;
 const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
@@ -2041,18 +2041,8 @@ fn transcript_scroll_offset(line_count: usize, area_height: u16, from_bottom: u1
 
 #[cfg(test)]
 fn format_transcript_item(item: &TranscriptItem) -> Line<'_> {
-    let (label, color) = match &item.role {
-        Role::User => ("> ", AMBER),
-        Role::Assistant => ("● ", Color::Green),
-        Role::System => ("• ", GOLD),
-    };
-    Line::from(vec![
-        Span::styled(
-            label,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(item.content.as_str()),
-    ])
+    let (action, color) = role_action(&item.role);
+    action_line(false, "• ", GOLD, action, color, item.content.as_str())
 }
 
 fn format_transcript_entry(
@@ -2077,11 +2067,13 @@ fn format_message_entry(
     collapsed: bool,
     selected: bool,
 ) -> Vec<Line<'static>> {
-    let (label, color) = role_style(&item.role);
+    let (action, color) = role_action(&item.role);
     if collapsed {
-        return vec![line_with_label(
+        return vec![action_line(
             selected,
-            label,
+            "• ",
+            GOLD,
+            action,
             color,
             format!(
                 "… {} chars  {}",
@@ -2090,7 +2082,7 @@ fn format_message_entry(
             ),
         )];
     }
-    text_lines(selected, label, color, &item.content)
+    action_text_lines(selected, "• ", GOLD, action, color, &item.content)
 }
 
 fn format_tool_call_entry(call: &ToolCall, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
@@ -2100,11 +2092,13 @@ fn format_tool_call_entry(call: &ToolCall, collapsed: bool, selected: bool) -> V
         compact_text(&call.arguments.to_string(), 140)
     );
     if collapsed {
-        return vec![line_with_label(selected, "◌ ", AMBER, summary)];
+        return vec![action_line(selected, "• ", GOLD, "Queued", AMBER, summary)];
     }
-    let mut lines = vec![line_with_label(
+    let mut lines = vec![action_line(
         selected,
-        "◌ ",
+        "• ",
+        GOLD,
+        "Queued",
         AMBER,
         format!("{} queued", call.name),
     )];
@@ -2123,17 +2117,22 @@ fn format_tool_result_entry(
     tool_output_verbosity: ToolOutputVerbosity,
 ) -> Vec<Line<'static>> {
     let summary = tool_result_summary(result);
+    let (marker, action) = tool_result_action(result.status);
     if collapsed {
-        return vec![line_with_label(
+        return vec![action_line(
             selected,
-            "● ",
+            marker,
+            status_color(result.status),
+            action,
             status_color(result.status),
             summary,
         )];
     }
-    let mut lines = vec![line_with_label(
+    let mut lines = vec![action_line(
         selected,
-        "● ",
+        marker,
+        status_color(result.status),
+        action,
         status_color(result.status),
         summary,
     )];
@@ -2156,21 +2155,16 @@ fn format_log_entry(message: &str, collapsed: bool, selected: bool) -> Vec<Line<
     let color = log_color(message);
     if collapsed {
         let preview = compact_text(message, 140);
-        return vec![line_with_label(
-            selected,
-            "• ",
-            color,
-            format!("… {} chars  {}", message.chars().count(), preview),
-        )];
+        return vec![detail_line(selected, color, preview)];
     }
-    text_lines(selected, "• ", color, message)
+    detail_text_lines(selected, color, message)
 }
 
-fn role_style(role: &Role) -> (&'static str, Color) {
+fn role_action(role: &Role) -> (&'static str, Color) {
     match role {
-        Role::User => ("> ", AMBER),
-        Role::Assistant => ("● ", Color::Green),
-        Role::System => ("• ", GOLD),
+        Role::User => ("Asked", AMBER),
+        Role::Assistant => ("Answered", Color::Green),
+        Role::System => ("Noted", GOLD),
     }
 }
 
@@ -2183,40 +2177,98 @@ fn log_color(message: &str) -> Color {
     }
 }
 
-fn line_with_label(
+fn action_line(
     selected: bool,
     label: &'static str,
-    color: Color,
+    label_color: Color,
+    action: &'static str,
+    action_color: Color,
     content: impl Into<String>,
 ) -> Line<'static> {
     let marker = if selected { "> " } else { "  " };
+    let content = content.into();
+    let spacer = if content.is_empty() { "" } else { " " };
     Line::from(vec![
         Span::raw(marker),
         Span::styled(
             label,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(label_color)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(content.into()),
+        Span::styled(
+            action,
+            Style::default()
+                .fg(action_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(spacer),
+        Span::raw(content),
     ])
 }
 
-fn text_lines(
+fn detail_line(selected: bool, color: Color, content: impl Into<String>) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    Line::from(vec![
+        Span::raw(marker),
+        Span::styled(
+            "└ ",
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(content.into(), Style::default().fg(color)),
+    ])
+}
+
+fn action_text_lines(
     selected: bool,
     label: &'static str,
-    color: Color,
+    label_color: Color,
+    action: &'static str,
+    action_color: Color,
     content: &str,
 ) -> Vec<Line<'static>> {
     if content.is_empty() {
-        return vec![line_with_label(selected, label, color, "")];
+        return vec![action_line(
+            selected,
+            label,
+            label_color,
+            action,
+            action_color,
+            "",
+        )];
     }
     content
         .lines()
         .enumerate()
         .map(|(index, line)| {
             if index == 0 {
-                line_with_label(selected, label, color, line.to_string())
+                action_line(
+                    selected,
+                    label,
+                    label_color,
+                    action,
+                    action_color,
+                    line.to_string(),
+                )
             } else {
                 Line::from(format!("  {line}"))
+            }
+        })
+        .collect()
+}
+
+fn detail_text_lines(selected: bool, color: Color, content: &str) -> Vec<Line<'static>> {
+    if content.is_empty() {
+        return vec![detail_line(selected, color, "")];
+    }
+    content
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 {
+                detail_line(selected, color, line.to_string())
+            } else {
+                Line::from(format!("    {line}"))
             }
         })
         .collect()
@@ -2273,6 +2325,15 @@ fn tool_status_label(status: ToolStatus) -> &'static str {
     }
 }
 
+fn tool_result_action(status: ToolStatus) -> (&'static str, &'static str) {
+    match status {
+        ToolStatus::Success => ("✔ ", "Ran"),
+        ToolStatus::Error | ToolStatus::Stale => ("✖ ", "Failed"),
+        ToolStatus::Denied => ("⚠ ", "Denied"),
+        ToolStatus::Cancelled => ("⚠ ", "Cancelled"),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnVisualState {
     Idle,
@@ -2303,6 +2364,30 @@ fn turn_dot_span(app: &TuiApp) -> Span<'static> {
         "•",
         Style::default()
             .fg(app.turn_visual.color(app.animation_tick))
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
+    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    let frame = FRAMES[(app.animation_tick as usize / 2) % FRAMES.len()];
+    let color = if app.animation_tick % 8 < 4 {
+        GOLD
+    } else {
+        AMBER
+    };
+    Span::styled(
+        frame,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn prompt_cursor_span() -> Span<'static> {
+    Span::styled(
+        "|",
+        Style::default()
+            .fg(GOLD)
+            .bg(PROMPT_BG)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -2361,18 +2446,21 @@ fn prompt_input_lines(app: &TuiApp) -> Vec<Line<'static>> {
     if app.input.is_empty() {
         return vec![Line::from(vec![
             Span::styled(" ", Style::default().bg(PROMPT_BG)),
-            turn_dot_span(app),
+            prompt_coin_span(app),
             Span::styled("  ", Style::default().bg(PROMPT_BG)),
+            prompt_cursor_span(),
         ])];
     }
-    app.input
-        .split('\n')
+    let parts = app.input.split('\n').collect::<Vec<_>>();
+    let last_index = parts.len().saturating_sub(1);
+    parts
+        .iter()
         .enumerate()
         .map(|(index, line)| {
             let prefix = if index == 0 {
                 vec![
                     Span::styled(" ", Style::default().bg(PROMPT_BG)),
-                    turn_dot_span(app),
+                    prompt_coin_span(app),
                     Span::styled("  ", Style::default().bg(PROMPT_BG)),
                 ]
             } else {
@@ -2386,6 +2474,9 @@ fn prompt_input_lines(app: &TuiApp) -> Vec<Line<'static>> {
                 line.to_string(),
                 Style::default().fg(Color::White).bg(PROMPT_BG),
             ));
+            if index == last_index {
+                spans.push(prompt_cursor_span());
+            }
             Line::from(spans)
         })
         .collect()
