@@ -512,7 +512,7 @@ fn tar_archive(sections: &[&BugReportSection]) -> Result<Vec<u8>> {
 }
 
 fn append_tar_file(out: &mut Vec<u8>, path: &str, bytes: &[u8]) -> Result<()> {
-    if path.as_bytes().len() > 100 {
+    if path.len() > 100 {
         return Err(SqueezyError::Tool(format!(
             "bug report tar path is too long: {path}"
         )));
