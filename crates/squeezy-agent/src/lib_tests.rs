@@ -13,7 +13,7 @@ use serde_json::json;
 use squeezy_core::{
     AppConfig, ContextAttachmentKind, PermissionAction, PermissionCapability, PermissionMode,
     PermissionPolicy, PermissionRequest, PermissionRisk, PermissionRuleSource, Result,
-    SessionLogConfig, SessionMode, ShellSandboxMode, SkillsConfig, TaskStateStatus,
+    SessionLogConfig, SessionMode, ShellSandboxMode, SkillsConfig, SubagentConfig, TaskStateStatus,
 };
 use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
@@ -1052,6 +1052,82 @@ async fn inactive_skills_are_not_eagerly_added_to_instructions() {
 }
 
 #[tokio::test]
+async fn squeezy_help_self_question_completes_without_provider_request() {
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "How do I configure Squeezy providers?".to_string(),
+        CancellationToken::new(),
+    );
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed { message, .. } = event {
+            completed = Some(message.content);
+        }
+    }
+
+    assert!(provider.requests().is_empty());
+    let completed = completed.expect("help turn should complete");
+    assert!(completed.contains("Squeezy help"), "{completed}");
+    assert!(
+        completed.contains("docs/external/PROVIDERS.md"),
+        "{completed}"
+    );
+    assert!(completed.contains("[model]"), "{completed}");
+}
+
+#[tokio::test]
+async fn unsupported_squeezy_help_question_refuses_without_provider_request() {
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "Does Squeezy support quantum billing?".to_string(),
+        CancellationToken::new(),
+    );
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed { message, .. } = event {
+            completed = Some(message.content);
+        }
+    }
+
+    assert!(provider.requests().is_empty());
+    let completed = completed.expect("help turn should complete");
+    assert!(completed.contains("won't guess"), "{completed}");
+    assert!(
+        completed.contains("https://squeezyagent.com/docs/"),
+        "{completed}"
+    );
+    assert!(
+        completed.contains("https://github.com/esqueezy/squeezy"),
+        "{completed}"
+    );
+}
+
+#[tokio::test]
+async fn unrelated_questions_still_call_provider() {
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "How do I configure serde?".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
 async fn explicit_skill_activation_injects_body_and_rewrites_task() {
     let root = temp_workspace("agent_skill_explicit");
     write_skill(
@@ -1452,16 +1528,51 @@ fn advertised_tool_specs_are_mode_aware() {
 }
 
 #[test]
-fn task_state_tool_is_advertised_in_build_and_plan_modes() {
-    let tools = [task_state_advertised_tool()];
+fn control_tools_are_advertised_in_build_and_plan_modes() {
+    let tools = core_control_tools(&SubagentConfig::default());
 
     let build_specs = advertised_tool_specs(&tools, SessionMode::Build);
     let build_names = advertised_tool_names(&build_specs);
-    assert_eq!(build_names, vec![TASK_STATE_TOOL_NAME]);
+    assert_eq!(
+        build_names,
+        vec![TASK_STATE_TOOL_NAME, DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]
+    );
 
     let plan_specs = advertised_tool_specs(&tools, SessionMode::Plan);
     let plan_names = advertised_tool_names(&plan_specs);
-    assert_eq!(plan_names, vec![TASK_STATE_TOOL_NAME]);
+    assert_eq!(
+        plan_names,
+        vec![TASK_STATE_TOOL_NAME, DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]
+    );
+}
+
+#[test]
+fn core_control_tools_filter_subagents_when_disabled() {
+    let subagents = SubagentConfig {
+        enabled: false,
+        ..SubagentConfig::default()
+    };
+    let names: Vec<_> = core_control_tools(&subagents)
+        .into_iter()
+        .map(|tool| tool.spec.name)
+        .collect();
+    assert_eq!(names, vec![TASK_STATE_TOOL_NAME.to_string()]);
+
+    let explore_only_off = SubagentConfig {
+        explore_enabled: false,
+        ..SubagentConfig::default()
+    };
+    let names: Vec<_> = core_control_tools(&explore_only_off)
+        .into_iter()
+        .map(|tool| tool.spec.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            TASK_STATE_TOOL_NAME.to_string(),
+            DELEGATE_TOOL_NAME.to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -1484,6 +1595,8 @@ fn warn_unknown_tool_schema_names_emits_warning_for_typo_and_skips_known() {
             "grep".to_string(),
             "webfectch".to_string(), // intentional typo
             "load_tool_schema".to_string(),
+            "delegate".to_string(),
+            "explore".to_string(),
         ],
         discoverable: vec!["totally_made_up".to_string()],
     };
@@ -1509,23 +1622,33 @@ fn warn_unknown_tool_schema_names_emits_warning_for_typo_and_skips_known() {
         !logs.contains("load_tool_schema"),
         "synthetic always-core names must not trigger a warning: {logs}"
     );
+    assert!(
+        !logs.contains("delegate") && !logs.contains("explore"),
+        "subagent control tools must not trigger a warning: {logs}"
+    );
 }
 
 #[test]
 fn lazy_request_tool_specs_keep_core_first_and_mcp_discoverable_by_default() {
-    let tools = [
-        task_state_advertised_tool(),
+    let mut tools = core_control_tools(&SubagentConfig::default());
+    tools.extend([
         test_advertised_tool("grep", PermissionCapability::Search),
         test_advertised_tool("webfetch", PermissionCapability::Network),
         test_advertised_tool("mcp__docs__lookup", PermissionCapability::Mcp),
-    ];
+    ]);
     let config = ToolSchemaConfig::default();
 
     let initial_specs = request_tool_specs(&tools, SessionMode::Build, &config, &[]);
     let initial_names = advertised_tool_names(&initial_specs);
     assert_eq!(
         initial_names,
-        vec![TASK_STATE_TOOL_NAME, LOAD_TOOL_SCHEMA_TOOL_NAME, "grep"]
+        vec![
+            TASK_STATE_TOOL_NAME,
+            DELEGATE_TOOL_NAME,
+            EXPLORE_TOOL_NAME,
+            LOAD_TOOL_SCHEMA_TOOL_NAME,
+            "grep"
+        ]
     );
 
     let loaded_specs = request_tool_specs(
@@ -1543,11 +1666,51 @@ fn lazy_request_tool_specs_keep_core_first_and_mcp_discoverable_by_default() {
         loaded_names,
         vec![
             TASK_STATE_TOOL_NAME,
+            DELEGATE_TOOL_NAME,
+            EXPLORE_TOOL_NAME,
             LOAD_TOOL_SCHEMA_TOOL_NAME,
             "grep",
             "mcp__docs__lookup",
             "webfetch",
         ]
+    );
+}
+
+#[test]
+fn request_tool_specs_skips_disabled_subagent_control_tools() {
+    let subagents = SubagentConfig {
+        enabled: false,
+        ..SubagentConfig::default()
+    };
+    let mut tools = core_control_tools(&subagents);
+    tools.push(test_advertised_tool("grep", PermissionCapability::Search));
+    let config = ToolSchemaConfig::default();
+
+    let specs = request_tool_specs(&tools, SessionMode::Build, &config, &[]);
+    let names = advertised_tool_names(&specs);
+    assert!(
+        !names.contains(&DELEGATE_TOOL_NAME),
+        "delegate must not be advertised when subagents.enabled=false: {names:?}"
+    );
+    assert!(
+        !names.contains(&EXPLORE_TOOL_NAME),
+        "explore must not be advertised when subagents.enabled=false: {names:?}"
+    );
+    assert!(names.contains(&TASK_STATE_TOOL_NAME));
+    assert!(names.contains(&"grep"));
+
+    let explore_only = SubagentConfig {
+        explore_enabled: false,
+        ..SubagentConfig::default()
+    };
+    let mut tools = core_control_tools(&explore_only);
+    tools.push(test_advertised_tool("grep", PermissionCapability::Search));
+    let specs = request_tool_specs(&tools, SessionMode::Build, &config, &[]);
+    let names = advertised_tool_names(&specs);
+    assert!(names.contains(&DELEGATE_TOOL_NAME));
+    assert!(
+        !names.contains(&EXPLORE_TOOL_NAME),
+        "explore must not be advertised when explore_enabled=false: {names:?}"
     );
 }
 

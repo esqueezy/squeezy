@@ -22,7 +22,8 @@ runtime state and is ignored by git in this repository.
 
 Generated repo profiles are separate from project configuration. Squeezy stores
 detected, machine-local repo knowledge in `~/.squeezy/repos.toml` and uses its
-stable repo id for per-repo user settings; see `docs/REPO_PROFILE.md`.
+stable repo id for per-repo user settings; see
+[`REPO_PROFILE.md`](REPO_PROFILE.md).
 
 `config inspect` and `--health` both list the source chain so you can see
 which layers actually contributed to a given run.
@@ -85,6 +86,16 @@ commented examples so that built-in defaults can evolve over time:
 # compaction_min_items = 16
 # compaction_recent_items = 6
 # compaction_max_summary_bytes = 12000
+
+[subagents]
+# enabled = true
+# explore_enabled = true
+# explore_model = "gpt-5-nano"
+# max_tool_calls_per_call = 24
+# max_tool_bytes_read_per_call = 8388608
+# max_search_files_per_call = 2000
+# max_model_rounds = 4
+# max_summary_tokens = 1200
 
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
@@ -224,6 +235,12 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   tokens, so pick a value that maps to your provider's real prompt budget
   (e.g. set it well below the provider's context window since the heuristic
   is a lower bound).
+- `[subagents]`: isolated research-agent controls. `delegate` uses the main
+  model for broad natural-language research; `explore` uses
+  `explore_model` when set, otherwise the provider's cheap default model, and
+  is restricted to read/search/semantic-navigation tools. Subagent tool calls
+  and model rounds are capped separately from the parent turn, and only the
+  final structured summary is returned to the parent conversation.
 - `[budgets]`: per-turn and per-tool output limits.
 - `[permissions]`: compatibility defaults `read`, `edit`, `shell`,
   `ignored_search`, and `web`, each set to `allow`, `ask`, or `deny`.
@@ -368,7 +385,7 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   pruned even when an `include` glob would otherwise re-enable it; the
   exclusion is reported with its normal class reason, not `user_exclude`.
   Canonical supported-language families and recognized extensions are listed in
-  [`docs/LANGUAGES.md`](LANGUAGES.md).
+  [`LANGUAGES.md`](LANGUAGES.md).
 - `[cache]`: `root` and `tool_outputs`. Relative paths resolve against the
   workspace root, not the process working directory. Graph warm-start state,
   cross-session receipt metadata, and internal observations are stored in

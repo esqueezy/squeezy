@@ -60,9 +60,9 @@ default_model = "qwen3"
 ## CLI
 
 ```sh
-cargo run -p squeezy-cli -- --list-providers
-cargo run -p squeezy-cli -- --list-models
-cargo run -p squeezy-cli -- --provider ollama --model qwen3 --prompt "hello"
+cargo run -p squeezy -- --list-providers
+cargo run -p squeezy -- --list-models
+cargo run -p squeezy -- --provider ollama --model qwen3 --prompt "hello"
 ```
 
 Existing env overrides remain supported: `SQUEEZY_PROVIDER`, `SQUEEZY_MODEL`, `SQUEEZY_PROFILE`, provider base URL variables, and provider API-key-env variables.

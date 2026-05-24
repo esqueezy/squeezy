@@ -8,7 +8,7 @@ macOS is built and tested in CI on GitHub-hosted macOS runners. Pull requests
 and pushes to `main` build and upload a debug artifact with:
 
 ```sh
-cargo build -p squeezy-cli
+cargo build -p squeezy
 ```
 
 PR CI runs `cargo test` and `cargo clippy` only on the ARM64 runner image
@@ -23,8 +23,8 @@ Tagged releases build both macOS CPU targets with the workspace `release`
 profile:
 
 ```sh
-cargo build --release -p squeezy-cli --target x86_64-apple-darwin
-cargo build --release -p squeezy-cli --target aarch64-apple-darwin
+cargo build --release -p squeezy --target x86_64-apple-darwin
+cargo build --release -p squeezy --target aarch64-apple-darwin
 ```
 
 CI smoke-tests both debug and release artifacts with:
@@ -32,6 +32,11 @@ CI smoke-tests both debug and release artifacts with:
 ```sh
 squeezy --health
 ```
+
+`squeezy --health` prints `squeezy: ok` followed by `key=value` lines. Today it
+emits `config_sources`, `config_source_labels`, and `help_hint`; consumers must
+tolerate new keys being appended at the end. The `help_hint` line points users
+at the TUI `/help <topic>` command for local Squeezy help.
 
 ## Linux
 
@@ -47,9 +52,9 @@ CI uses the musl target for Linux validation and artifact upload. The jobs set `
 
 - `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings`
 - `cargo test --workspace --all-targets --target x86_64-unknown-linux-musl`
-- `cargo build -p squeezy-cli --target x86_64-unknown-linux-musl`
+- `cargo build -p squeezy --target x86_64-unknown-linux-musl`
 - `cargo llvm-cov --workspace --all-targets --target x86_64-unknown-linux-musl --summary-only` for coverage on pushes to `main` and manual CI runs
-- `cargo build --release -p squeezy-cli --target x86_64-unknown-linux-musl` for tagged releases (driven by [`.github/workflows/release.yml`](../.github/workflows/release.yml))
+- `cargo build --release -p squeezy --target x86_64-unknown-linux-musl` for tagged releases (driven by [`.github/workflows/release.yml`](../../.github/workflows/release.yml))
 - `readelf -l` must not report a program interpreter.
 - `readelf -d` must not report dynamic `NEEDED` dependencies.
 - the binary must pass `--health`, `--version`, and `--help`.

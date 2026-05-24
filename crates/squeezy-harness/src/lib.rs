@@ -229,6 +229,13 @@ pub struct HarnessMetrics {
     pub planner_turns: u64,
     pub planner_tool_calls: u64,
     pub planner_refusals: u64,
+    pub subagent_calls: u64,
+    pub subagent_failures: u64,
+    pub subagent_tool_calls: u64,
+    pub subagent_budget_denials: u64,
+    pub subagent_files_scanned: u64,
+    pub subagent_bytes_read: u64,
+    pub subagent_model_output_bytes: u64,
     pub redactions: u64,
     pub prompt_bytes: u64,
     pub input_tokens: Option<u64>,
@@ -433,8 +440,10 @@ async fn run_replay(task: &TaskSpec, tasks_dir: &Path) -> Result<RunnerOutput> {
     let model = replay.model.clone().unwrap_or_else(|| provider.to_string());
     let mode = replay.mode.unwrap_or(SessionMode::Build);
     let report = Agent::replay_tape(config, task.id.clone(), tape, provider, model, mode).await?;
-    let mut metrics = HarnessMetrics::default();
-    metrics.output_bytes = report.final_answer.len() as u64;
+    let metrics = HarnessMetrics {
+        output_bytes: report.final_answer.len() as u64,
+        ..HarnessMetrics::default()
+    };
     Ok(RunnerOutput {
         final_answer: report.final_answer,
         metrics,
@@ -624,6 +633,13 @@ async fn run_agent_with_config(
                 metrics.planner_turns = turn_metrics.planner_turns;
                 metrics.planner_tool_calls = turn_metrics.planner_tool_calls;
                 metrics.planner_refusals = turn_metrics.planner_refusals;
+                metrics.subagent_calls = turn_metrics.subagent_calls;
+                metrics.subagent_failures = turn_metrics.subagent_failures;
+                metrics.subagent_tool_calls = turn_metrics.subagent_tool_calls;
+                metrics.subagent_budget_denials = turn_metrics.subagent_budget_denials;
+                metrics.subagent_files_scanned = turn_metrics.subagent_files_scanned;
+                metrics.subagent_bytes_read = turn_metrics.subagent_bytes_read;
+                metrics.subagent_model_output_bytes = turn_metrics.subagent_model_output_bytes;
                 metrics.redactions = turn_metrics.redactions;
                 metrics.input_tokens = cost.input_tokens;
                 metrics.output_tokens = cost.output_tokens;
@@ -645,7 +661,10 @@ async fn run_agent_with_config(
             AgentEvent::ToolCallStarted { .. }
             | AgentEvent::ApprovalRequested { .. }
             | AgentEvent::TaskStateUpdated { .. }
-            | AgentEvent::ContextCompacted { .. } => {}
+            | AgentEvent::ContextCompacted { .. }
+            | AgentEvent::SubagentStarted { .. }
+            | AgentEvent::SubagentCompleted { .. }
+            | AgentEvent::SubagentFailed { .. } => {}
             AgentEvent::JobUpdated { .. } | AgentEvent::JobNotification { .. } => {}
         }
     }
