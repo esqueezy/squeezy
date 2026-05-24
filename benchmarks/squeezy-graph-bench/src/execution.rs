@@ -8,13 +8,13 @@ use std::{
 use squeezy_core::{Confidence, Result, SqueezyError, SymbolKind};
 use squeezy_graph::{BodySearchQuery, SemanticGraph, SignatureQuery};
 use squeezy_parse::{BodyHitKind, LanguageParser, ParsedFile};
-use squeezy_workspace::{CrawlOptions, IndexCoverage, WorkspaceCrawler};
+use squeezy_workspace::{CrawlOptions, IndexCoverage, WorkspaceCrawler, WorkspaceSnapshot};
 
 use crate::{
     accuracy::ratio,
     report::{
         BuildPhaseReport, FallbackQualityReport, FallbackReasonReport, GrepBaselineMode,
-        GrepBaselineSpec, QueryBaselineReport, QueryReport, QuerySpec,
+        GrepBaselineSpec, QueryBaselineReport, QueryBaselineStatus, QueryReport, QuerySpec,
     },
 };
 
@@ -24,6 +24,7 @@ pub(crate) struct GraphBuildOutput {
     pub(crate) coverage: IndexCoverage,
     pub(crate) unsupported_files: usize,
     pub(crate) unsupported_file_samples: Vec<String>,
+    pub(crate) snapshot: WorkspaceSnapshot,
 }
 
 pub(crate) fn build_graph(root: &Path) -> Result<GraphBuildOutput> {
@@ -38,6 +39,7 @@ pub(crate) fn build_graph(root: &Path) -> Result<GraphBuildOutput> {
         .take(10)
         .map(|file| file.relative_path.clone())
         .collect();
+    let snapshot_for_grep = snapshot.clone();
     let crawl_ms = crawl_started.elapsed().as_millis();
 
     let parse_started = Instant::now();
@@ -66,6 +68,7 @@ pub(crate) fn build_graph(root: &Path) -> Result<GraphBuildOutput> {
         coverage,
         unsupported_files,
         unsupported_file_samples,
+        snapshot: snapshot_for_grep,
     })
 }
 
@@ -140,7 +143,7 @@ pub(crate) fn declaration_only_parsed(parsed: &[ParsedFile]) -> Vec<ParsedFile> 
 }
 
 pub(crate) fn run_query(
-    root: &Path,
+    snapshot: &WorkspaceSnapshot,
     graph: &SemanticGraph,
     query: &QuerySpec,
     fallback_quality: &FallbackQualityReport,
@@ -269,7 +272,7 @@ pub(crate) fn run_query(
         .collect::<BTreeSet<_>>();
     let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
     let extras = actual.difference(&expected).cloned().collect::<Vec<_>>();
-    let baseline = run_grep_baseline(root, query)?;
+    let baseline = run_grep_baseline(snapshot, query)?;
 
     Ok(QueryReport {
         id: query.id.clone(),
@@ -300,11 +303,15 @@ fn fallback_quality_lines(fallback: &FallbackQualityReport) -> Vec<String> {
     lines
 }
 
-fn run_grep_baseline(root: &Path, query: &QuerySpec) -> Result<QueryBaselineReport> {
+fn run_grep_baseline(
+    snapshot: &WorkspaceSnapshot,
+    query: &QuerySpec,
+) -> Result<QueryBaselineReport> {
     let (baseline, semantic_relation_supported) = grep_baseline_for_query(query);
     if matches!(baseline.mode, GrepBaselineMode::Unsupported) {
         return Ok(QueryBaselineReport {
-            status: baseline
+            status: QueryBaselineStatus::Unsupported,
+            status_detail: baseline
                 .unsupported_reason
                 .unwrap_or_else(|| "grep baseline cannot model this semantic query".to_string()),
             pattern: baseline.pattern,
@@ -323,7 +330,8 @@ fn run_grep_baseline(root: &Path, query: &QuerySpec) -> Result<QueryBaselineRepo
         .filter(|pattern| !pattern.is_empty())
     else {
         return Ok(QueryBaselineReport {
-            status: "skipped: no grep pattern available".to_string(),
+            status: QueryBaselineStatus::Skipped,
+            status_detail: "skipped: no grep pattern available".to_string(),
             pattern: baseline.pattern,
             include: baseline.include,
             files_scanned: 0,
@@ -334,12 +342,11 @@ fn run_grep_baseline(root: &Path, query: &QuerySpec) -> Result<QueryBaselineRepo
         });
     };
 
-    let snapshot = WorkspaceCrawler::new(CrawlOptions::default()).crawl(root)?;
     let mut files_scanned = 0usize;
     let mut bytes_read = 0u64;
     let mut matches = Vec::new();
     let mut matched_paths = BTreeSet::new();
-    for file in snapshot.files {
+    for file in &snapshot.files {
         if !baseline.include.is_empty()
             && !baseline
                 .include
@@ -376,7 +383,8 @@ fn run_grep_baseline(root: &Path, query: &QuerySpec) -> Result<QueryBaselineRepo
     };
 
     Ok(QueryBaselineReport {
-        status: if semantic_relation_supported {
+        status: QueryBaselineStatus::Ran,
+        status_detail: if semantic_relation_supported {
             "grep baseline ran".to_string()
         } else {
             "grep baseline ran; semantic relation not modeled".to_string()
@@ -428,11 +436,18 @@ fn baseline_path_matches(pattern: &str, path: &str) -> bool {
         return path.ends_with(&format!(".{suffix}"));
     }
     let normalized = pattern.trim_start_matches('/');
-    if path == normalized {
+    if normalized.is_empty() {
         return true;
     }
-    path.strip_suffix(normalized)
-        .is_some_and(|prefix| prefix.ends_with('/'))
+    if path == normalized || path == normalized.trim_end_matches('/') {
+        return true;
+    }
+    let dir_prefix = if normalized.ends_with('/') {
+        normalized.to_string()
+    } else {
+        format!("{normalized}/")
+    };
+    path.starts_with(&dir_prefix)
 }
 
 pub(crate) fn benchmark_symbol_by_name(

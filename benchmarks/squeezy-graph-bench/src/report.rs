@@ -179,7 +179,8 @@ pub(crate) struct QueryReport {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct QueryBaselineReport {
-    pub(crate) status: String,
+    pub(crate) status: QueryBaselineStatus,
+    pub(crate) status_detail: String,
     pub(crate) pattern: Option<String>,
     pub(crate) include: Vec<String>,
     pub(crate) files_scanned: usize,
@@ -187,6 +188,14 @@ pub(crate) struct QueryBaselineReport {
     pub(crate) matches_returned: usize,
     pub(crate) actual: Vec<String>,
     pub(crate) semantic_relation_supported: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QueryBaselineStatus {
+    Ran,
+    Skipped,
+    Unsupported,
 }
 
 #[derive(Debug, Serialize)]

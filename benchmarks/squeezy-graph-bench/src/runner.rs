@@ -1,5 +1,7 @@
 use std::{fs, path::PathBuf, time::Instant};
 
+use serde::Serialize;
+
 use squeezy_core::{LanguageKind, Result, SqueezyError};
 
 use crate::{
@@ -34,6 +36,25 @@ fn run_single(args: Args) -> Result<()> {
     enforce_gates(&report, args.no_speed_gate)
 }
 
+#[derive(Debug, Serialize)]
+struct CorpusCaseOutcome {
+    name: String,
+    family: String,
+    tier: String,
+    report: String,
+    status: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CorpusSummary {
+    corpus: String,
+    family: String,
+    tier: String,
+    cases: Vec<CorpusCaseOutcome>,
+    failures: usize,
+}
+
 fn run_corpus(args: crate::cli::CorpusArgs) -> Result<()> {
     let manifest = CorpusManifest::load(&args.corpus)?;
     let cases = manifest
@@ -51,26 +72,86 @@ fn run_corpus(args: crate::cli::CorpusArgs) -> Result<()> {
         )));
     }
 
+    let mut outcomes = Vec::with_capacity(cases.len());
+    let mut failure_messages = Vec::new();
     for case in cases {
-        ensure_repo(&case)?;
-        let bench_args = Args {
-            language: BenchmarkLanguage::parse(&case.language)?,
-            fixture: PathBuf::from(&case.fixture),
-            spec: PathBuf::from(&case.spec),
-            report: args.report_dir.join(&case.report),
-            mixed_repo: case.mixed_repo.as_ref().map(PathBuf::from),
-            mixed_iterations: case.mixed_iterations.unwrap_or(0),
-            ra_lsp_probes: case.ra_lsp_probes.unwrap_or(25),
-            oracle_files: case.oracle_files.unwrap_or(250),
-            no_speed_gate: case.no_speed_gate,
-        };
-        let corpus_case = case.report_case();
-        let report = run_benchmark(&bench_args, Some(corpus_case))?;
-        write_report(&bench_args.report, &report)?;
-        print_summary(&report);
-        enforce_gates(&report, bench_args.no_speed_gate)?;
+        let outcome_name = case.name.clone();
+        let outcome_family = case.family.clone();
+        let outcome_tier = case.tier.clone();
+        let report_path = args.report_dir.join(&case.report);
+        let result = run_corpus_case(&args, &case);
+        match result {
+            Ok(()) => outcomes.push(CorpusCaseOutcome {
+                name: outcome_name,
+                family: outcome_family,
+                tier: outcome_tier,
+                report: report_path.display().to_string(),
+                status: "passed".to_string(),
+                error: None,
+            }),
+            Err(err) => {
+                let message = err.to_string();
+                eprintln!("corpus case {outcome_name} failed: {message}");
+                failure_messages.push(format!("{outcome_name}: {message}"));
+                outcomes.push(CorpusCaseOutcome {
+                    name: outcome_name,
+                    family: outcome_family,
+                    tier: outcome_tier,
+                    report: report_path.display().to_string(),
+                    status: "failed".to_string(),
+                    error: Some(message),
+                });
+            }
+        }
+    }
+
+    let summary = CorpusSummary {
+        corpus: args.corpus.display().to_string(),
+        family: args.family.clone(),
+        tier: args.tier.clone(),
+        failures: failure_messages.len(),
+        cases: outcomes,
+    };
+    fs::create_dir_all(&args.report_dir)?;
+    let summary_path = args.report_dir.join("corpus-summary.json");
+    let summary_text = serde_json::to_string_pretty(&summary)
+        .map_err(|err| SqueezyError::Graph(format!("failed to serialize corpus summary: {err}")))?;
+    fs::write(&summary_path, summary_text)?;
+    println!(
+        "corpus summary: {} cases, {} failures -> {}",
+        summary.cases.len(),
+        summary.failures,
+        summary_path.display()
+    );
+
+    if !failure_messages.is_empty() {
+        return Err(SqueezyError::Graph(format!(
+            "{} corpus case(s) failed: {}",
+            failure_messages.len(),
+            failure_messages.join("; ")
+        )));
     }
     Ok(())
+}
+
+fn run_corpus_case(args: &crate::cli::CorpusArgs, case: &crate::corpus::CorpusCase) -> Result<()> {
+    ensure_repo(case)?;
+    let bench_args = Args {
+        language: BenchmarkLanguage::parse(&case.language)?,
+        fixture: PathBuf::from(&case.fixture),
+        spec: PathBuf::from(&case.spec),
+        report: args.report_dir.join(&case.report),
+        mixed_repo: case.mixed_repo.as_ref().map(PathBuf::from),
+        mixed_iterations: case.mixed_iterations.unwrap_or(0),
+        ra_lsp_probes: case.ra_lsp_probes.unwrap_or(25),
+        oracle_files: case.oracle_files.unwrap_or(250),
+        no_speed_gate: case.no_speed_gate,
+    };
+    let corpus_case = case.report_case();
+    let report = run_benchmark(&bench_args, Some(corpus_case))?;
+    write_report(&bench_args.report, &report)?;
+    print_summary(&report);
+    enforce_gates(&report, bench_args.no_speed_gate)
 }
 
 fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<BenchmarkReport> {
@@ -121,12 +202,13 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         build.unsupported_file_samples,
         &graph,
     );
+    let snapshot = build.snapshot;
 
     let query_started = Instant::now();
     let query_reports = spec
         .queries
         .iter()
-        .map(|query| run_query(&args.fixture, &graph, query, &fallback_quality))
+        .map(|query| run_query(&snapshot, &graph, query, &fallback_quality))
         .collect::<Result<Vec<_>>>()?;
     let squeezy_query_ms = query_started.elapsed().as_millis();
     let squeezy_total_ms = squeezy_build_ms + squeezy_query_ms;
@@ -252,7 +334,7 @@ fn tool_metrics_report(
 ) -> ToolMetricsReport {
     let grep_baseline_queries = query_reports
         .iter()
-        .filter(|query| !query.baseline.status.starts_with("skipped"))
+        .filter(|query| query.baseline.status == QueryBaselineStatus::Ran)
         .count();
     let mixed_scenarios = mixed_workload
         .map(|mixed| mixed.executed_scenarios)
