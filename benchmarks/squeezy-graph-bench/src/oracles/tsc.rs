@@ -1,3 +1,34 @@
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::Write,
+    path::Path,
+    process::{Command, Stdio},
+    time::Instant,
+};
+
+use serde::Deserialize;
+use serde_json::{json, Value};
+use squeezy_core::{EdgeKind, LanguageKind, Result, SqueezyError, SymbolId, SymbolKind};
+use squeezy_graph::SemanticGraph;
+
+use crate::{
+    accuracy::{
+        compare_symbol_sets, increment_symbol, location_key_for_reference_hit,
+        location_matches_symbol, probe_byte_for_edge, probe_byte_for_symbol, push_example, ratio,
+        render_locations,
+    },
+    mixed::select_scenarios,
+    oracles::{
+        common_scan::collect_squeezy_symbol_scan,
+        rust_analyzer::{byte_to_lsp_position, normalize_symbol_name},
+    },
+    report::{
+        AccuracyReport, DefinitionAccuracyReport, JsTsOracleReport, LocationKey,
+        NavigationAccuracyReport, ReferenceAccuracyReport, SymbolKey, SymbolScan,
+    },
+};
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct JsTsOracleSymbol {
     file: String,

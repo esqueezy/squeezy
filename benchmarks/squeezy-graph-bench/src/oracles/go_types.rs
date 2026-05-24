@@ -1,3 +1,28 @@
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::Path,
+    process::Command,
+    time::Instant,
+};
+
+use squeezy_core::{Result, SqueezyError};
+use squeezy_graph::SemanticGraph;
+
+use crate::{
+    accuracy::{compare_symbol_sets, increment_symbol},
+    cli::BenchmarkLanguage,
+    oracles::common_scan::{
+        collect_squeezy_symbol_scan_excluding_files, GoAstOracleOutput, GoAstSymbolScan,
+    },
+    oracles::rust_analyzer::normalize_symbol_name,
+    report::{
+        AccuracyReport, DefinitionAccuracyReport, GoOracleReport, HeuristicIterationReport,
+        NavigationAccuracyReport, ReferenceAccuracyReport, SymbolKey, SymbolScan,
+    },
+    util::temp_dir,
+};
+
 pub(crate) fn collect_go_oracle_accuracy(root: &Path, graph: &SemanticGraph) -> Result<GoOracleReport> {
     let started = Instant::now();
     let oracle = collect_go_ast_symbol_scan(root)?;
@@ -128,6 +153,12 @@ pub(crate) fn collect_go_ast_symbol_scan(root: &Path) -> Result<GoAstSymbolScan>
     let result = run_go_ast_oracle(&script_path, root);
     let _ = fs::remove_dir_all(&oracle_dir);
     result
+}
+
+pub(crate) fn time_go_ast_oracle(fixture: &Path) -> Result<u128> {
+    let started = Instant::now();
+    let _ = collect_go_ast_symbol_scan(fixture)?;
+    Ok(started.elapsed().as_millis())
 }
 
 pub(crate) fn run_go_ast_oracle(script_path: &Path, root: &Path) -> Result<GoAstSymbolScan> {

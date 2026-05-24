@@ -1,3 +1,16 @@
+use std::{collections::BTreeSet, path::Path, time::Instant};
+
+use squeezy_core::Result;
+use squeezy_graph::SemanticGraph;
+
+use crate::{
+    accuracy::compare_symbol_sets,
+    oracles::common_scan::{
+        collect_python_ast_symbol_scan, collect_squeezy_symbol_scan_excluding_files,
+    },
+    report::PythonOracleReport,
+};
+
 pub(crate) fn collect_python_oracle_accuracy(
     root: &Path,
     graph: &SemanticGraph,
@@ -36,4 +49,10 @@ pub(crate) fn collect_python_oracle_accuracy(
             "Python files that CPython ast cannot parse are reported as oracle_unparseable and excluded from Squeezy false-positive accounting; tree-sitter recovery remains useful for production editing workflows.".to_string(),
         ],
     })
+}
+
+pub(crate) fn time_python_ast_oracle(fixture: &Path) -> Result<u128> {
+    let started = Instant::now();
+    let _ = collect_python_ast_symbol_scan(fixture)?;
+    Ok(started.elapsed().as_millis())
 }

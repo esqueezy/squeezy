@@ -1,8 +1,23 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde_json::json;
+use squeezy_core::LanguageKind;
 
-use super::*;
+use crate::{
+    execution::build_graph,
+    harness::toolchain::find_dotnet_build_target,
+    mixed::select_scenarios,
+    oracles::{
+        collect_c_family_squeezy_symbol_scan, collect_clang_ast_symbol_scan,
+        collect_csharp_oracle_symbol_scan, collect_python_ast_symbol_scan,
+    },
+    oracles::rust_analyzer::{byte_to_lsp_position, parse_lsp_locations},
+    report::{LocationKey, LspPosition, SymbolKey},
+    util::{command_exists, temp_dir},
+};
 
 #[test]
 fn select_scenarios_spreads_capped_samples() {

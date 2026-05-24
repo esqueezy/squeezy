@@ -1,3 +1,28 @@
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Instant,
+};
+
+use serde_json::Value;
+use squeezy_core::{LanguageKind, Result, SqueezyError};
+use squeezy_graph::SemanticGraph;
+use squeezy_workspace::{CrawlOptions, WorkspaceCrawler};
+
+use crate::{
+    accuracy::{compare_symbol_sets, increment_unique_symbol, merge_symbol_scan},
+    cli::BenchmarkLanguage,
+    mixed::select_scenarios,
+    oracles::common_scan::{collect_c_family_squeezy_symbol_scan, CFamilyClangSymbolScan},
+    report::{
+        AccuracyReport, DefinitionAccuracyReport, NavigationAccuracyReport,
+        ReferenceAccuracyReport, SymbolKey, SymbolScan,
+    },
+    util::{increment, truncate},
+};
+
 pub(crate) fn collect_c_family_accuracy(
     root: &Path,
     graph: &SemanticGraph,
