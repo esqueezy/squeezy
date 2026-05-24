@@ -2,7 +2,10 @@ use std::{fs, path::PathBuf};
 
 use redb::{Database, TableDefinition};
 use serde_json::json;
-use squeezy_core::{AppConfig, CostSnapshot, FileId, SessionLogConfig, SessionMetrics};
+use squeezy_core::{
+    AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
+    ContextAttachmentStatus, CostSnapshot, FileId, SessionLogConfig, SessionMetrics,
+};
 
 use crate::{GraphStoreMetadata, Observation, ObservationKind, SqueezyStore, StoredToolReceipt};
 
@@ -70,6 +73,55 @@ fn malformed_event_lines_are_counted_as_warnings() {
     let record = store.show(handle.session_id()).expect("show");
     assert_eq!(record.event_warnings, 1);
     assert!(record.events.is_empty());
+}
+
+#[test]
+fn context_attachments_store_redacted_text_and_export_metadata() {
+    let root = temp_root("context-attachments");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let attachment = ContextAttachment {
+        id: "att-0001".to_string(),
+        source: ContextAttachmentSource::Paste,
+        kind: ContextAttachmentKind::Log,
+        status: ContextAttachmentStatus::Attached,
+        label: "pasted context".to_string(),
+        path: None,
+        original_sha256: "original".to_string(),
+        redacted_sha256: Some("redacted".to_string()),
+        original_bytes: 40,
+        stored_bytes: 30,
+        preview_bytes: 20,
+        redactions: 1,
+        preview: "OPENAI_API_KEY=<redacted:openai_key#1 bytes=29>".to_string(),
+        truncated: false,
+    };
+
+    handle
+        .write_context_attachment(
+            &attachment,
+            Some("OPENAI_API_KEY=<redacted:openai_key#1 bytes=29>"),
+        )
+        .expect("write attachment");
+
+    let record = store.show(handle.session_id()).expect("show");
+    assert_eq!(record.attachments, vec![attachment.clone()]);
+    let exported = store.export(handle.session_id()).expect("export");
+    assert_eq!(exported["attachments"][0]["id"].as_str(), Some("att-0001"));
+    let text_path = store
+        .root()
+        .join(handle.session_id())
+        .join("attachments")
+        .join("att-0001.txt");
+    let on_disk = fs::read_to_string(text_path).expect("read attachment text");
+    assert!(on_disk.contains("<redacted:openai_key"));
+    assert!(!on_disk.contains("sk-abcdefghijklmnopqrstuvwxyz"));
 }
 
 #[test]

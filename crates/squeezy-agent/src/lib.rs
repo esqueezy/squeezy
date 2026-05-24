@@ -12,10 +12,13 @@ use std::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{
-    AppConfig, CostSnapshot, PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability,
-    PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict,
-    Redactor, SessionMetrics, SessionMode, SqueezyError, StreamRedactor, TranscriptItem, TurnId,
-    TurnMetrics, default_settings_path, escape_toml_basic_string,
+    AppConfig, ContextAttachment, ContextAttachmentSource, ContextAttachmentStatus, CostSnapshot,
+    DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, PROJECT_SETTINGS_FILE, PermissionAction,
+    PermissionCapability, PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope,
+    PermissionVerdict, Redactor, SessionMetrics, SessionMode, SqueezyError, StreamRedactor,
+    TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
+    context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
+    escape_toml_basic_string,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, estimate_cost};
 use squeezy_store::{
@@ -41,6 +44,7 @@ struct ConversationState {
     previous_response_id: Option<String>,
     conversation: Vec<LlmInputItem>,
     transcript: Vec<TranscriptItem>,
+    context_attachments: Vec<ContextAttachment>,
     cost: CostSnapshot,
     metrics: SessionMetrics,
     redactions: u64,
@@ -56,6 +60,7 @@ impl ConversationState {
                 .map(resume_item_to_llm_input)
                 .collect(),
             transcript: state.transcript,
+            context_attachments: state.context_attachments,
             cost: metadata.cost.clone(),
             metrics: metadata.metrics.clone(),
             redactions: metadata.redactions,
@@ -73,8 +78,16 @@ impl ConversationState {
                 .map(llm_input_to_resume_item)
                 .collect(),
             transcript: self.transcript.clone(),
+            context_attachments: self.context_attachments.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextAttachmentUpdate {
+    pub attachment: ContextAttachment,
+    pub duplicate: bool,
+    pub active: bool,
 }
 
 #[derive(Clone)]
@@ -89,6 +102,7 @@ pub struct Agent {
     conversation_state: Arc<Mutex<ConversationState>>,
     next_turn_id: Arc<AtomicU64>,
     next_approval_id: Arc<AtomicU64>,
+    next_attachment_id: Arc<AtomicU64>,
     /// In-memory permission rules added via "Allow user/project rule" during
     /// the current process. Persisted to disk on a best-effort basis; this
     /// vector also makes the rule take effect immediately for subsequent
@@ -201,6 +215,7 @@ impl Agent {
         });
         let initial_session_mode = config.session_mode;
         let session_metrics = Arc::new(Mutex::new(conversation_state.metrics.clone()));
+        let next_attachment_id = next_attachment_counter(&conversation_state.context_attachments);
         Self {
             telemetry: TelemetryClient::from_config(&config),
             config,
@@ -212,6 +227,7 @@ impl Agent {
             conversation_state: Arc::new(Mutex::new(conversation_state)),
             next_turn_id: Arc::new(AtomicU64::new(1)),
             next_approval_id: Arc::new(AtomicU64::new(1)),
+            next_attachment_id: Arc::new(AtomicU64::new(next_attachment_id)),
             session_rules: Arc::new(RwLock::new(Vec::new())),
             session_mode: Arc::new(AtomicU8::new(initial_session_mode.to_u8())),
             store,
@@ -341,6 +357,229 @@ impl Agent {
         let _ = session.finish(status, state.cost, state.metrics, state.redactions);
     }
 
+    pub async fn attach_pasted_context(
+        &self,
+        text: String,
+    ) -> squeezy_core::Result<ContextAttachmentUpdate> {
+        self.attach_context_bytes(
+            ContextAttachmentSource::Paste,
+            "pasted context".to_string(),
+            None,
+            text.into_bytes(),
+        )
+        .await
+    }
+
+    pub async fn attach_file_context(
+        &self,
+        path: PathBuf,
+    ) -> squeezy_core::Result<ContextAttachmentUpdate> {
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            self.config.workspace_root.join(path)
+        };
+        let bytes = fs::read(&resolved)?;
+        let label = resolved
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attached file")
+            .to_string();
+        let display_path = resolved
+            .strip_prefix(&self.config.workspace_root)
+            .unwrap_or(&resolved)
+            .display()
+            .to_string();
+        self.attach_context_bytes(
+            ContextAttachmentSource::File,
+            label,
+            Some(display_path),
+            bytes,
+        )
+        .await
+    }
+
+    pub async fn detach_context_attachment(
+        &self,
+        id: &str,
+    ) -> squeezy_core::Result<ContextAttachment> {
+        let mut state = self.conversation_state.lock().await;
+        let Some(index) = state
+            .context_attachments
+            .iter()
+            .position(|attachment| attachment.id == id && attachment.is_active())
+        else {
+            return Err(SqueezyError::Agent(format!(
+                "attachment {id} is not active"
+            )));
+        };
+        state.context_attachments[index].status = ContextAttachmentStatus::Removed;
+        let attachment = state.context_attachments[index].clone();
+        self.persist_context_attachments(&state)?;
+        if let Some(session) = &self.session_log {
+            let _ = session.write_context_attachment(&attachment, None);
+        }
+        drop(state);
+        log_session_event(
+            self.session_log.as_ref(),
+            &self.redactor,
+            "context_removed",
+            None,
+            Some(format!("removed {}", attachment.id)),
+            json!({ "attachment": attachment.clone() }),
+        );
+        Ok(attachment)
+    }
+
+    pub async fn context_attachments_snapshot(&self) -> Vec<ContextAttachment> {
+        self.conversation_state
+            .lock()
+            .await
+            .context_attachments
+            .iter()
+            .filter(|attachment| attachment.is_active())
+            .cloned()
+            .collect()
+    }
+
+    async fn attach_context_bytes(
+        &self,
+        source: ContextAttachmentSource,
+        label: String,
+        path: Option<String>,
+        bytes: Vec<u8>,
+    ) -> squeezy_core::Result<ContextAttachmentUpdate> {
+        let original_sha256 = sha256_hex(&bytes);
+        let original_bytes = bytes.len();
+        let text = std::str::from_utf8(&bytes).ok();
+        let kind = detect_context_attachment_kind(Some(&label), &bytes, text);
+
+        let mut state = self.conversation_state.lock().await;
+        if let Some(existing) = state
+            .context_attachments
+            .iter()
+            .find(|attachment| {
+                attachment.original_sha256 == original_sha256 && attachment.is_active()
+            })
+            .cloned()
+        {
+            drop(state);
+            log_session_event(
+                self.session_log.as_ref(),
+                &self.redactor,
+                "context_deduped",
+                None,
+                Some(format!("deduped {}", existing.id)),
+                json!({ "attachment": existing.clone() }),
+            );
+            return Ok(ContextAttachmentUpdate {
+                attachment: existing,
+                duplicate: true,
+                active: true,
+            });
+        }
+
+        let id = self.next_context_attachment_id();
+        let redacted_label = self.redactor.redact(&label).text;
+        let redacted_path = path.map(|value| self.redactor.redact(&value).text);
+        if !kind.is_supported_text() {
+            let attachment = ContextAttachment {
+                id,
+                source,
+                kind,
+                status: ContextAttachmentStatus::Unsupported,
+                label: redacted_label,
+                path: redacted_path,
+                original_sha256,
+                redacted_sha256: None,
+                original_bytes,
+                stored_bytes: 0,
+                preview_bytes: 0,
+                redactions: 0,
+                preview: String::new(),
+                truncated: false,
+            };
+            state.context_attachments.push(attachment.clone());
+            self.persist_context_attachments(&state)?;
+            if let Some(session) = &self.session_log {
+                let _ = session.write_context_attachment(&attachment, None);
+            }
+            drop(state);
+            log_session_event(
+                self.session_log.as_ref(),
+                &self.redactor,
+                "context_unsupported",
+                None,
+                Some(format!("unsupported {}", attachment.id)),
+                json!({ "attachment": attachment.clone() }),
+            );
+            return Ok(ContextAttachmentUpdate {
+                attachment,
+                duplicate: false,
+                active: false,
+            });
+        }
+
+        let text = text.unwrap_or_default();
+        let (bounded_text, truncated) =
+            context_attachment_storage_text(text, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES);
+        let redacted = self.redactor.redact(&bounded_text);
+        let (preview, _) =
+            context_attachment_preview(&redacted.text, self.config.tool_preview_bytes);
+        let attachment = ContextAttachment {
+            id,
+            source,
+            kind,
+            status: ContextAttachmentStatus::Attached,
+            label: redacted_label,
+            path: redacted_path,
+            original_sha256,
+            redacted_sha256: Some(sha256_hex(redacted.text.as_bytes())),
+            original_bytes,
+            stored_bytes: redacted.text.len(),
+            preview_bytes: preview.len(),
+            redactions: redacted.redactions,
+            preview,
+            truncated,
+        };
+        state.redactions += attachment.redactions;
+        state.context_attachments.push(attachment.clone());
+        self.persist_context_attachments(&state)?;
+        if let Some(session) = &self.session_log {
+            let _ = session.write_context_attachment(&attachment, Some(&redacted.text));
+        }
+        drop(state);
+        log_session_event(
+            self.session_log.as_ref(),
+            &self.redactor,
+            "context_attached",
+            None,
+            Some(format!("attached {}", attachment.id)),
+            json!({ "attachment": attachment.clone() }),
+        );
+        Ok(ContextAttachmentUpdate {
+            attachment,
+            duplicate: false,
+            active: true,
+        })
+    }
+
+    fn persist_context_attachments(&self, state: &ConversationState) -> squeezy_core::Result<()> {
+        if let Some(session) = &self.session_log {
+            session.write_resume_state(&state.to_resume_state())?;
+            session.update_metadata(|metadata| {
+                metadata.redactions = state.redactions;
+                metadata.resume_available = true;
+            })?;
+        }
+        Ok(())
+    }
+
+    fn next_context_attachment_id(&self) -> String {
+        let next = self.next_attachment_id.fetch_add(1, Ordering::Relaxed);
+        format!("att-{next:04}")
+    }
+
     pub fn start_turn(
         &self,
         input: String,
@@ -446,14 +685,24 @@ struct TurnRuntime {
 
 impl TurnRuntime {
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
-        let user_transcript = TranscriptItem::user(input.clone());
         let activation = self.tools.activate_skills_for_input(&input)?;
         let raw_instructions = match self.tools.format_active_skills(&activation.skills) {
             Some(skills) => format!("{}\n\n{}", self.config.instructions, skills),
             None => self.config.instructions.clone(),
         };
-        let user_item = LlmInputItem::UserText(activation.task_input);
         let mut prior_state = self.conversation_state.lock().await.clone();
+        let active_attachments = prior_state
+            .context_attachments
+            .iter()
+            .filter(|attachment| attachment.is_active())
+            .cloned()
+            .collect::<Vec<_>>();
+        let user_transcript =
+            TranscriptItem::user(format_user_text_with_context(&input, &active_attachments));
+        let user_item = LlmInputItem::UserText(format_user_text_with_context(
+            &activation.task_input,
+            &active_attachments,
+        ));
         let mut conversation = prior_state.conversation.clone();
         conversation.push(user_item.clone());
         let mut previous_response_id = if self.config.store_responses {
@@ -1965,6 +2214,49 @@ fn start_session_log(config: &AppConfig, provider: &str) -> Option<SessionHandle
             None
         }
     }
+}
+
+fn next_attachment_counter(attachments: &[ContextAttachment]) -> u64 {
+    attachments
+        .iter()
+        .filter_map(|attachment| attachment.id.strip_prefix("att-"))
+        .filter_map(|suffix| suffix.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+fn format_user_text_with_context(input: &str, attachments: &[ContextAttachment]) -> String {
+    if attachments.is_empty() {
+        return input.to_string();
+    }
+    let mut output = input.to_string();
+    output.push_str("\n\nAttached context references:\n");
+    for attachment in attachments {
+        output.push_str(&format!(
+            "- {reference} id={id} source={source} kind={kind} label={label:?} bytes={bytes} stored_bytes={stored_bytes} truncated={truncated}\n",
+            reference = attachment.reference(),
+            id = attachment.id,
+            source = attachment.source.as_str(),
+            kind = attachment.kind.as_str(),
+            label = attachment.label,
+            bytes = attachment.original_bytes,
+            stored_bytes = attachment.stored_bytes,
+            truncated = attachment.truncated,
+        ));
+        if let Some(path) = &attachment.path {
+            output.push_str(&format!("  path={path:?}\n"));
+        }
+        if !attachment.preview.is_empty() {
+            output.push_str("  redacted_preview:\n");
+            for line in attachment.preview.lines().take(20) {
+                output.push_str("    ");
+                output.push_str(line);
+                output.push('\n');
+            }
+        }
+    }
+    output
 }
 
 fn redact_json_payload(payload: Value, redactor: &Redactor) -> Value {

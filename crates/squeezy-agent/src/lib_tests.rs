@@ -11,8 +11,9 @@ use futures_core::Stream;
 use futures_util::stream;
 use serde_json::json;
 use squeezy_core::{
-    AppConfig, PermissionAction, PermissionCapability, PermissionMode, PermissionPolicy,
-    PermissionRequest, PermissionRisk, PermissionRuleSource, Result, SessionMode, SkillsConfig,
+    AppConfig, ContextAttachmentKind, PermissionAction, PermissionCapability, PermissionMode,
+    PermissionPolicy, PermissionRequest, PermissionRisk, PermissionRuleSource, Result, SessionMode,
+    SkillsConfig,
 };
 use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
@@ -137,6 +138,88 @@ async fn user_input_is_redacted_before_model_request_and_transcript() {
     };
     assert!(!request_text.contains("sk-abcdefghijklmnopqrstuvwxyz"));
     assert!(request_text.contains("<redacted:openai_key"));
+}
+
+#[tokio::test]
+async fn pasted_context_is_redacted_deduped_and_sent_as_reference() {
+    let root = temp_workspace("agent_context_attachment");
+    let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
+        response_id: Some("resp_1".to_string()),
+        cost: CostSnapshot::default(),
+    })]]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        tool_preview_bytes: 96,
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+    let raw = "2026-05-24 ERROR failed\nOPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\n";
+
+    let first = agent
+        .attach_pasted_context(raw.to_string())
+        .await
+        .expect("attach paste");
+    let second = agent
+        .attach_pasted_context(raw.to_string())
+        .await
+        .expect("dedupe paste");
+
+    assert!(first.active);
+    assert!(second.duplicate);
+    assert_eq!(first.attachment.id, second.attachment.id);
+    assert!(
+        !first
+            .attachment
+            .preview
+            .contains("sk-abcdefghijklmnopqrstuvwxyz")
+    );
+    assert!(first.attachment.preview.contains("<redacted:"));
+
+    let mut rx = agent.start_turn("explain failure".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+
+    let requests = provider.requests();
+    let LlmInputItem::UserText(request_text) = &requests[0].input[0] else {
+        panic!("expected user text");
+    };
+    assert!(request_text.contains("explain failure"));
+    assert!(request_text.contains(&format!("attachment://{}", first.attachment.id)));
+    assert!(request_text.contains("redacted_preview"));
+    assert!(!request_text.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+
+    let session_id = agent.session_id().expect("session id");
+    let record = agent.show_session(&session_id).expect("show session");
+    assert_eq!(record.attachments.len(), 1);
+    assert_eq!(record.attachments[0].id, first.attachment.id);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn unsupported_image_attachment_is_not_active() {
+    let root = temp_workspace("agent_context_image");
+    let image = root.join("screenshot.png");
+    fs::write(&image, b"\x89PNG\r\n\x1a\nimage bytes").expect("write image");
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let update = agent
+        .attach_file_context(PathBuf::from("screenshot.png"))
+        .await
+        .expect("attach image");
+
+    assert!(!update.active);
+    assert_eq!(
+        update.attachment.kind,
+        ContextAttachmentKind::UnsupportedImage
+    );
+    assert!(agent.context_attachments_snapshot().await.is_empty());
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]

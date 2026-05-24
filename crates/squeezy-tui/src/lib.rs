@@ -1,11 +1,14 @@
 use std::{
     io::{self, Write},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -19,8 +22,8 @@ use ratatui::{
 };
 use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision, ToolApprovalRequest};
 use squeezy_core::{
-    AppConfig, PermissionPolicy, Result, Role, SessionMode, SqueezyError, StatusVerbosity,
-    TelemetryConfig, TranscriptItem,
+    AppConfig, ContextAttachment, PermissionPolicy, Result, Role, SessionMode, SqueezyError,
+    StatusVerbosity, TelemetryConfig, TranscriptItem,
 };
 use squeezy_llm::LlmProvider;
 use squeezy_store::SessionQuery;
@@ -28,6 +31,8 @@ use squeezy_tools::ToolCall;
 use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+
+const INLINE_PASTE_MAX_BYTES: usize = 512;
 
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
     run_inner(config, provider, None, None).await
@@ -70,6 +75,7 @@ async fn run_inner(
         onboarding_summary,
     );
     app.transcript.extend(initial_transcript);
+    app.attachments = agent.context_attachments_snapshot().await;
     if let Some(session_id) = agent.session_id() {
         app.status = format!("session {session_id}");
     }
@@ -187,12 +193,14 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
         return Ok(false);
     }
 
-    let Event::Key(key) = event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))?
-    else {
-        return Ok(false);
-    };
-
-    handle_key(app, agent, key).await
+    match event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))? {
+        Event::Key(key) => handle_key(app, agent, key).await,
+        Event::Paste(text) => {
+            handle_paste(app, agent, text).await?;
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
 }
 
 async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Result<bool> {
@@ -291,12 +299,77 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
     }
 }
 
+async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Result<()> {
+    if app.turn_rx.is_some() || app.pending_approval.is_some() {
+        app.status = "paste unavailable during active turn".to_string();
+        return Ok(());
+    }
+    if is_inline_paste(&text) {
+        app.input.push_str(&text);
+        return Ok(());
+    }
+    match agent.attach_pasted_context(text).await {
+        Ok(update) => {
+            app.attachments = agent.context_attachments_snapshot().await;
+            app.status = attachment_update_status("paste", &update);
+        }
+        Err(error) => app.status = format!("paste attach failed: {error}"),
+    }
+    Ok(())
+}
+
+fn is_inline_paste(text: &str) -> bool {
+    text.len() <= INLINE_PASTE_MAX_BYTES && !text.contains('\n') && !text.contains('\r')
+}
+
 async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
     let mut parts = input.split_whitespace();
     let Some(command) = parts.next() else {
         return false;
     };
     match command {
+        "/attach" => {
+            let path = input.trim_start_matches("/attach").trim();
+            if path.is_empty() {
+                app.status = "usage: /attach <path>".to_string();
+                return true;
+            }
+            match agent.attach_file_context(PathBuf::from(path)).await {
+                Ok(update) => {
+                    app.attachments = agent.context_attachments_snapshot().await;
+                    app.status = attachment_update_status("file", &update);
+                }
+                Err(error) => app.status = format!("attach failed: {error}"),
+            }
+            return true;
+        }
+        "/attachments" => {
+            app.attachments = agent.context_attachments_snapshot().await;
+            if app.attachments.is_empty() {
+                app.status = "no attached context".to_string();
+            } else {
+                app.status = format!("{} attached context item(s)", app.attachments.len());
+                app.transcript
+                    .push(TranscriptItem::system(format_attachment_list(
+                        &app.attachments,
+                    )));
+            }
+            return true;
+        }
+        "/detach" => {
+            let Some(id) = parts.next() else {
+                app.status = "usage: /detach <attachment_id>".to_string();
+                return true;
+            };
+            match agent.detach_context_attachment(id).await {
+                Ok(attachment) => {
+                    app.attachments = agent.context_attachments_snapshot().await;
+                    app.status = format!("detached {}", attachment.id);
+                }
+                Err(error) => app.status = format!("detach failed: {error}"),
+            }
+            return true;
+        }
         "/sessions" => {
             match agent.list_sessions(&SessionQuery::default()) {
                 Ok(sessions) => {
@@ -360,6 +433,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             match agent.resume_current(session_id) {
                 Ok(transcript) => {
                     app.transcript = transcript;
+                    app.attachments = agent.context_attachments_snapshot().await;
                     app.pending_assistant.clear();
                     app.turn_rx = None;
                     app.cancel = None;
@@ -442,6 +516,55 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         summarize_local_tool_result(&result.content)
     );
     true
+}
+
+fn attachment_update_status(
+    source: &str,
+    update: &squeezy_agent::ContextAttachmentUpdate,
+) -> String {
+    let attachment = &update.attachment;
+    if update.duplicate {
+        return format!("deduped {source} as {}", attachment.id);
+    }
+    if !update.active {
+        return format!(
+            "unsupported {source}: {} ({})",
+            attachment.kind.as_str(),
+            attachment.original_bytes
+        );
+    }
+    format!(
+        "attached {source} {} kind={} bytes={} preview={} redactions={}",
+        attachment.id,
+        attachment.kind.as_str(),
+        attachment.original_bytes,
+        attachment.preview_bytes,
+        attachment.redactions,
+    )
+}
+
+fn format_attachment_list(attachments: &[ContextAttachment]) -> String {
+    if attachments.is_empty() {
+        return "No attached context.".to_string();
+    }
+    attachments
+        .iter()
+        .map(format_attachment_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_attachment_line(attachment: &ContextAttachment) -> String {
+    let preview = attachment.preview.replace('\n', " ");
+    let preview = preview.chars().take(80).collect::<String>();
+    format!(
+        "{} {} {} {}B {}",
+        attachment.id,
+        attachment.source.as_str(),
+        attachment.kind.as_str(),
+        attachment.original_bytes,
+        preview
+    )
 }
 
 fn summarize_local_tool_result(content: &serde_json::Value) -> String {
@@ -693,37 +816,72 @@ pub(crate) fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
 
 fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
+    let attachment_height = attachment_panel_height(app);
     if let Some(pending) = app.pending_approval.as_ref() {
         // When an approval is pending, reserve a dedicated panel large
         // enough to show every metadata line of `format_approval_prompt`.
         let prompt = format_approval_prompt(&pending.request);
         let line_count = prompt.matches('\n').count() as u16 + 1;
         let approval_height = line_count.saturating_add(2).clamp(6, 18);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(3),
-                Constraint::Length(approval_height),
-                Constraint::Length(3),
-                Constraint::Length(2),
-            ])
-            .split(area);
-        render_transcript(frame, chunks[0], app);
-        render_approval(frame, chunks[1], &prompt);
-        render_input(frame, chunks[2], app);
-        render_status(frame, chunks[3], app);
+        if attachment_height > 0 {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(3),
+                    Constraint::Length(approval_height),
+                    Constraint::Length(attachment_height),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                ])
+                .split(area);
+            render_transcript(frame, chunks[0], app);
+            render_approval(frame, chunks[1], &prompt);
+            render_attachments(frame, chunks[2], app);
+            render_input(frame, chunks[3], app);
+            render_status(frame, chunks[4], app);
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(3),
+                    Constraint::Length(approval_height),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                ])
+                .split(area);
+            render_transcript(frame, chunks[0], app);
+            render_approval(frame, chunks[1], &prompt);
+            render_input(frame, chunks[2], app);
+            render_status(frame, chunks[3], app);
+        }
     } else {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(5),
-                Constraint::Length(3),
-                Constraint::Length(2),
-            ])
-            .split(area);
-        render_transcript(frame, chunks[0], app);
-        render_input(frame, chunks[1], app);
-        render_status(frame, chunks[2], app);
+        if attachment_height > 0 {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(5),
+                    Constraint::Length(attachment_height),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                ])
+                .split(area);
+            render_transcript(frame, chunks[0], app);
+            render_attachments(frame, chunks[1], app);
+            render_input(frame, chunks[2], app);
+            render_status(frame, chunks[3], app);
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(5),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                ])
+                .split(area);
+            render_transcript(frame, chunks[0], app);
+            render_input(frame, chunks[1], app);
+            render_status(frame, chunks[2], app);
+        }
     }
 }
 
@@ -765,6 +923,30 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let paragraph = Paragraph::new(lines)
         .block(Block::default().title("Squeezy").borders(Borders::ALL))
         .scroll((scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn attachment_panel_height(app: &TuiApp) -> u16 {
+    if app.attachments.is_empty() {
+        0
+    } else {
+        (app.attachments.len() as u16).saturating_add(2).clamp(3, 6)
+    }
+}
+
+fn render_attachments(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let lines = app
+        .attachments
+        .iter()
+        .map(|attachment| Line::from(format_attachment_line(attachment)))
+        .collect::<Vec<_>>();
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("Attached context")
+                .borders(Borders::ALL),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -835,7 +1017,7 @@ fn format_status_tokens(app: &TuiApp) -> String {
     let hints = if app.pending_approval.is_some() {
         "Y allow once | A user | P project | N deny | U/D deny rule | Ctrl-C cancel"
     } else {
-        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy | /sessions /resume | Ctrl-C cancel | Esc quit"
+        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy | /attach /attachments /detach | /sessions /resume | Ctrl-C cancel | Esc quit"
     };
     match app.status_verbosity {
         StatusVerbosity::Compact => format!("{context}  {spend}\n{hints}"),
@@ -1061,6 +1243,7 @@ struct TuiApp {
     permissions: PermissionStatus,
     telemetry: TelemetryStatus,
     input: String,
+    attachments: Vec<ContextAttachment>,
     transcript: Vec<TranscriptItem>,
     transcript_scroll_from_bottom: u16,
     pending_assistant: String,
@@ -1120,6 +1303,7 @@ impl TuiApp {
             permissions: PermissionStatus::from_policy(&config.permissions),
             telemetry: TelemetryStatus::from_config(&config.telemetry),
             input: String::new(),
+            attachments: Vec::new(),
             transcript,
             transcript_scroll_from_bottom: 0,
             pending_assistant: String::new(),
@@ -1147,7 +1331,7 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
@@ -1168,7 +1352,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
