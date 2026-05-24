@@ -26,7 +26,7 @@ pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
 pub const MODEL_SELECTION_VERSION: u32 = 1;
 pub const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 pub const DEFAULT_EXA_API_KEY_ENV: &str = "EXA_API_KEY";
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 128;
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
 pub const DEFAULT_TOOL_SPILL_THRESHOLD_BYTES: usize = 25_000;
 pub const DEFAULT_TOOL_PREVIEW_BYTES: usize = 2_000;
 pub const DEFAULT_MAX_TOOL_RESULT_BYTES_PER_ROUND: usize = 50_000;
@@ -4049,7 +4049,7 @@ pub fn user_settings_template() -> &'static str {
 # profile = "balanced"         # cheap | balanced | strong
 # model = "gpt-5.5"            # provider-specific model id; leave unset to use the provider default
 # reasoning_effort = "medium"  # low | medium | high | xhigh; only sent to capable providers
-# max_output_tokens = 128
+# max_output_tokens = 4096
 # store_responses = false      # only honored by openai/azure_openai
 # selection_version = 1        # maintained by the startup provider/model selector
 
@@ -6146,7 +6146,7 @@ fn normalize_task_text(text: String, limit: usize) -> String {
     output
 }
 
-pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. Use update_task_state to keep visible task progress current: start, meaningful step changes, blockers, verification, and replans from new evidence. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Treat websearch and webfetch results as remote documentation evidence, cite source URLs from their citation metadata when relying on them, and keep remote docs distinct from local code or graph facts. Do not invent URLs. If a tool call is denied, do not retry the same call.";
+pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Respond in the user's language and do not mix languages unless the user asks, code/source text requires it, or you are translating/quoting. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. Use update_task_state to keep visible task progress current: start, meaningful step changes, blockers, verification, and replans from new evidence. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Treat websearch and webfetch results as remote documentation evidence, cite source URLs from their citation metadata when relying on them, and keep remote docs distinct from local code or graph facts. Do not invent URLs. If a tool call is denied, do not retry the same call.";
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

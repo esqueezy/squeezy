@@ -74,7 +74,7 @@ commented examples so that built-in defaults can evolve over time:
 # profile = "balanced"
 # model = "gpt-5.5"
 # reasoning_effort = "medium"
-# max_output_tokens = 128
+# max_output_tokens = 4096
 # store_responses = false
 # selection_version = 1
 

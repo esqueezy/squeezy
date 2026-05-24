@@ -228,6 +228,40 @@ fn parser_extracts_function_call_from_output_item_done() {
 }
 
 #[test]
+fn parser_preserves_malformed_function_arguments_as_tool_error_payload() {
+    let event = parse_openai_event(
+        r#"{
+          "type": "response.output_item.done",
+          "item": {
+            "type": "function_call",
+            "call_id": "call_123",
+            "name": "definition_search",
+            "arguments": "{\"query\":\"getFoo"
+          }
+        }"#,
+    )
+    .expect("malformed arguments stay recoverable");
+
+    let Some(LlmEvent::ToolCall(call)) = event else {
+        panic!("expected tool call");
+    };
+    assert_eq!(call.call_id, "call_123");
+    assert_eq!(call.name, "definition_search");
+    assert_eq!(
+        call.arguments[crate::INVALID_TOOL_ARGUMENTS_KEY],
+        json!(true)
+    );
+    assert!(
+        call.arguments[crate::INVALID_TOOL_ARGUMENTS_ERROR_KEY]
+            .as_str()
+            .unwrap()
+            .contains("EOF"),
+        "{}",
+        call.arguments
+    );
+}
+
+#[test]
 fn parser_extracts_completed_response_id_and_usage() {
     let event = parse_openai_event(
         r#"{

@@ -853,7 +853,8 @@ fn failed_user_turn_marks_status_not_prompt_text() {
     assert_eq!(user_lines[0].spans[1].style.fg, Some(ERROR_RED));
     assert_eq!(user_lines[0].spans[2].style.fg, Some(ERROR_RED));
     assert_eq!(user_lines[0].spans[4].content.as_ref(), "hi");
-    assert_eq!(user_lines[0].spans[4].style.fg, None);
+    assert_eq!(user_lines[0].spans[4].style.fg, Some(Color::White));
+    assert_eq!(user_lines[0].spans[4].style.bg, Some(PROMPT_BG));
 
     let log_lines = format_transcript_entry(
         &app.transcript[1],
@@ -863,6 +864,23 @@ fn failed_user_turn_marks_status_not_prompt_text() {
     );
     assert_eq!(log_lines[0].spans[1].style.fg, Some(ERROR_RED));
     assert_eq!(log_lines[0].spans[2].style.fg, Some(QUIET));
+}
+
+#[test]
+fn user_prompt_text_is_highlighted_in_transcript() {
+    let item = TranscriptItem::user("find getFoo");
+
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let text = lines[0]
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+
+    assert_eq!(lines[0].spans[4].content.as_ref(), "find getFoo");
+    assert_eq!(lines[0].spans[4].style.bg, Some(PROMPT_BG));
+    assert_eq!(lines[0].spans[4].style.fg, Some(Color::White));
+    assert!(!text.contains("◐"), "{text}");
 }
 
 #[test]

@@ -2426,8 +2426,9 @@ fn format_message_entry(
     let failed = outcome == MessageOutcome::Failed;
     let label_color = if failed { ERROR_RED } else { GOLD };
     let action_color = if failed { ERROR_RED } else { color };
+    let content_style = message_content_style(&item.role);
     if collapsed {
-        return vec![action_line(
+        return vec![action_line_styled(
             selected,
             "• ",
             label_color,
@@ -2438,15 +2439,17 @@ fn format_message_entry(
                 item.content.chars().count(),
                 compact_text(&item.content, 140)
             ),
+            content_style,
         )];
     }
-    action_text_lines(
+    action_text_lines_styled(
         selected,
         "• ",
         label_color,
         action,
         action_color,
         &item.content,
+        content_style,
     )
 }
 
@@ -2533,6 +2536,13 @@ fn role_action(role: &Role) -> (&'static str, Color) {
     }
 }
 
+fn message_content_style(role: &Role) -> Style {
+    match role {
+        Role::User => Style::default().fg(Color::White).bg(PROMPT_BG),
+        Role::Assistant | Role::System => Style::default(),
+    }
+}
+
 fn log_color(message: &str) -> Color {
     if is_failure_log(message) {
         ERROR_RED
@@ -2548,6 +2558,26 @@ fn action_line(
     action: &'static str,
     action_color: Color,
     content: impl Into<String>,
+) -> Line<'static> {
+    action_line_styled(
+        selected,
+        label,
+        label_color,
+        action,
+        action_color,
+        content,
+        Style::default(),
+    )
+}
+
+fn action_line_styled(
+    selected: bool,
+    label: &'static str,
+    label_color: Color,
+    action: &'static str,
+    action_color: Color,
+    content: impl Into<String>,
+    content_style: Style,
 ) -> Line<'static> {
     let marker = if selected { "> " } else { "  " };
     let content = content.into();
@@ -2567,7 +2597,7 @@ fn action_line(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(spacer),
-        Span::raw(content),
+        Span::styled(content, content_style),
     ])
 }
 
@@ -2583,22 +2613,24 @@ fn detail_line(selected: bool, color: Color, content: impl Into<String>) -> Line
     ])
 }
 
-fn action_text_lines(
+fn action_text_lines_styled(
     selected: bool,
     label: &'static str,
     label_color: Color,
     action: &'static str,
     action_color: Color,
     content: &str,
+    content_style: Style,
 ) -> Vec<Line<'static>> {
     if content.is_empty() {
-        return vec![action_line(
+        return vec![action_line_styled(
             selected,
             label,
             label_color,
             action,
             action_color,
             "",
+            content_style,
         )];
     }
     content
@@ -2606,16 +2638,20 @@ fn action_text_lines(
         .enumerate()
         .map(|(index, line)| {
             if index == 0 {
-                action_line(
+                action_line_styled(
                     selected,
                     label,
                     label_color,
                     action,
                     action_color,
                     line.to_string(),
+                    content_style,
                 )
             } else {
-                Line::from(format!("  {line}"))
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(line.to_string(), content_style),
+                ])
             }
         })
         .collect()

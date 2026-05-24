@@ -9,7 +9,10 @@ use squeezy_core::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
+use crate::{
+    INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+};
 
 #[derive(Clone)]
 pub struct OpenAiProvider {
@@ -383,9 +386,13 @@ fn parse_tool_call(item: Option<&Value>) -> Result<Option<LlmToolCall>> {
         .ok_or_else(|| SqueezyError::ProviderStream("function call missing name".to_string()))?
         .to_string();
     let arguments = match item.get("arguments") {
-        Some(Value::String(arguments)) => serde_json::from_str(arguments).map_err(|err| {
-            SqueezyError::ProviderStream(format!("invalid function call arguments: {err}"))
-        })?,
+        Some(Value::String(arguments)) => serde_json::from_str(arguments).unwrap_or_else(|err| {
+            json!({
+                INVALID_TOOL_ARGUMENTS_KEY: true,
+                INVALID_TOOL_ARGUMENTS_ERROR_KEY: err.to_string(),
+                INVALID_TOOL_ARGUMENTS_RAW_KEY: arguments,
+            })
+        }),
         Some(arguments @ Value::Object(_)) => arguments.clone(),
         None => Value::Object(Default::default()),
         Some(_) => {

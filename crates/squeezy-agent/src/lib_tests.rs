@@ -16,6 +16,7 @@ use squeezy_core::{
     SessionLogConfig, SessionMode, ShellSandboxMode, SkillsConfig, TaskStateStatus,
 };
 use squeezy_llm::{
+    INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
 };
 use squeezy_tools::{ToolStatus, sha256_hex};
@@ -332,6 +333,66 @@ async fn turn_stream_reports_provider_error() {
     }
 
     assert!(saw_error);
+}
+
+#[tokio::test]
+async fn invalid_tool_arguments_are_returned_to_model_instead_of_failing_turn() {
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_bad".to_string(),
+                name: "definition_search".to_string(),
+                arguments: json!({
+                    INVALID_TOOL_ARGUMENTS_KEY: true,
+                    INVALID_TOOL_ARGUMENTS_ERROR_KEY: "EOF while parsing a string at line 1 column 59",
+                    INVALID_TOOL_ARGUMENTS_RAW_KEY: "{\"query\":\"getFoo",
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: None,
+                cost: Default::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("recovered".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: None,
+                cost: Default::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut rx = agent.start_turn("where is getFoo?".to_string(), CancellationToken::new());
+    let mut completed = None;
+    let mut failed = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Completed { message, .. } => completed = Some(message.content),
+            AgentEvent::Failed { error, .. } => failed = Some(error.to_string()),
+            _ => {}
+        }
+    }
+
+    assert_eq!(completed.as_deref(), Some("recovered"));
+    assert!(failed.is_none(), "{failed:?}");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let output = requests[1]
+        .input
+        .iter()
+        .find_map(|item| match item {
+            LlmInputItem::FunctionCallOutput { output, .. } => Some(output),
+            _ => None,
+        })
+        .expect("tool output returned to model");
+    assert!(
+        output.contains("invalid tool arguments from model"),
+        "{output}"
+    );
+    assert!(output.contains("call the same tool again"), "{output}");
 }
 
 #[tokio::test]

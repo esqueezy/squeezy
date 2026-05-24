@@ -23,6 +23,7 @@ use squeezy_core::{
     detect_context_attachment_kind, escape_toml_basic_string,
 };
 use squeezy_llm::{
+    INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, RequestTokenEstimate,
     capabilities_for, estimate_cost, estimate_request_context, fetch_ollama_context_window,
 };
@@ -2648,6 +2649,37 @@ fn control_tool_result(call: &ToolCall, status: ToolStatus, content: Value) -> T
     }
 }
 
+fn has_invalid_tool_arguments(call: &ToolCall) -> bool {
+    call.arguments
+        .get(INVALID_TOOL_ARGUMENTS_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn invalid_tool_arguments_result(call: &ToolCall) -> ToolResult {
+    let parse_error = call
+        .arguments
+        .get(INVALID_TOOL_ARGUMENTS_ERROR_KEY)
+        .and_then(Value::as_str)
+        .unwrap_or("invalid JSON");
+    let raw = call
+        .arguments
+        .get(INVALID_TOOL_ARGUMENTS_RAW_KEY)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    control_tool_result(
+        call,
+        ToolStatus::Error,
+        json!({
+            "ok": false,
+            "error": "invalid tool arguments from model",
+            "parse_error": parse_error,
+            "raw_arguments_preview": compact_text(raw, 240),
+            "retry": "call the same tool again with complete valid JSON arguments",
+        }),
+    )
+}
+
 async fn execute_tool_calls(
     calls: Vec<ToolCall>,
     context: ToolExecutionContext<'_>,
@@ -2665,6 +2697,20 @@ async fn execute_tool_calls(
         }
         if call.name == LOAD_TOOL_SCHEMA_TOOL_NAME {
             results[index] = Some(handle_load_tool_schema_call(&context, call).await);
+            recorded[index] = true;
+            continue;
+        }
+        if has_invalid_tool_arguments(call) {
+            let result = invalid_tool_arguments_result(call);
+            broker.record_executed_result(&result);
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
             recorded[index] = true;
             continue;
         }
