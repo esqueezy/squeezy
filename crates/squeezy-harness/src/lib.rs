@@ -540,7 +540,9 @@ async fn run_agent_with_config(
             }
             AgentEvent::UserMessage { .. } => {}
             AgentEvent::ToolCallQueued { .. } | AgentEvent::ToolCallCompleted { .. } => {}
-            AgentEvent::ToolCallStarted { .. } | AgentEvent::ApprovalRequested { .. } => {}
+            AgentEvent::ToolCallStarted { .. }
+            | AgentEvent::ApprovalRequested { .. }
+            | AgentEvent::TaskStateUpdated { .. } => {}
         }
     }
     let _ = fs::remove_dir_all(&root);
@@ -612,6 +614,7 @@ fn trace_to_llm_event(event: TraceEvent) -> Result<LlmEvent> {
             cost: CostSnapshot {
                 input_tokens: event.input_tokens,
                 output_tokens: event.output_tokens,
+                reasoning_output_tokens: None,
                 cached_input_tokens: event.cached_input_tokens,
                 cache_write_input_tokens: None,
                 estimated_usd_micros: None,

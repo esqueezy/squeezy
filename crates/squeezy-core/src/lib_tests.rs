@@ -785,6 +785,7 @@ fn section_settings_cover_budgets_permissions_graph_cache_tui_and_mcp() {
 [model]
 provider = "openai"
 model = "gpt-custom"
+reasoning_effort = "high"
 max_output_tokens = 512
 store_responses = true
 
@@ -833,6 +834,10 @@ tool_outputs = ".squeezy/tool_outputs"
 [tui]
 tick_rate_ms = 75
 status_verbosity = "verbose"
+response_verbosity = "concise"
+tool_output_verbosity = "normal"
+transcript_default = "expanded"
+show_reasoning_usage = false
 
 [mcp.servers.docs]
 enabled = true
@@ -840,6 +845,15 @@ transport = "http"
 url = "https://docs.example/mcp"
 timeout_ms = 5000
 env = { TOKEN = "secret" }
+
+[mcp.servers.docs.permissions]
+default = "ask"
+
+[[mcp.servers.docs.permissions.rules]]
+target = "lookup:*"
+action = "allow"
+source = "project"
+reason = "docs lookups are safe"
 "#,
         "test",
     )
@@ -848,6 +862,7 @@ env = { TOKEN = "secret" }
     let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
 
     assert_eq!(config.model, "gpt-custom");
+    assert_eq!(config.reasoning_effort, Some(ReasoningEffort::High));
     assert_eq!(config.max_output_tokens, Some(512));
     assert!(config.store_responses);
     assert_eq!(config.session_mode, SessionMode::Plan);
@@ -867,7 +882,111 @@ env = { TOKEN = "secret" }
     );
     assert_eq!(config.tui.tick_rate_ms, 75);
     assert_eq!(config.tui.status_verbosity, StatusVerbosity::Verbose);
+    assert_eq!(config.tui.response_verbosity, ResponseVerbosity::Concise);
+    assert_eq!(
+        config.tui.tool_output_verbosity,
+        ToolOutputVerbosity::Normal
+    );
+    assert_eq!(config.tui.transcript_default, TranscriptDefault::Expanded);
+    assert!(!config.tui.show_reasoning_usage);
     assert_eq!(config.mcp_servers["docs"].transport, McpTransport::Http);
+    assert_eq!(
+        config.mcp_servers["docs"].permissions.default,
+        Some(PermissionMode::Ask)
+    );
+    assert!(
+        config
+            .permissions
+            .rules
+            .iter()
+            .any(|rule| rule.capability == "mcp"
+                && rule.target == "docs/lookup:*"
+                && rule.action == PermissionMode::Allow)
+    );
+}
+
+#[test]
+fn explicit_user_mcp_rules_outrank_per_server_defaults() {
+    // A user-declared `[[permissions.rules]]` deny must remain the last
+    // word over a per-server `default = "allow"`. We assert this by
+    // resolving the rule list in order and verifying that the final
+    // matching rule for `docs/risky` is the user's Deny.
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[[permissions.rules]]
+capability = "mcp"
+target = "docs/risky"
+action = "deny"
+source = "user"
+reason = "operator-pinned deny"
+
+[mcp.servers.docs]
+enabled = true
+transport = "stdio"
+command = "docs-mcp"
+
+[mcp.servers.docs.permissions]
+default = "allow"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    let rules: Vec<_> = config
+        .permissions
+        .rules
+        .iter()
+        .filter(|rule| rule.capability == "mcp")
+        .collect();
+    // The MCP-derived `docs/*` allow rule must be inserted *before* the
+    // user's explicit `docs/risky` deny so last-write-wins matching
+    // ultimately returns Deny.
+    let server_default_idx = rules
+        .iter()
+        .position(|rule| rule.target == "docs/*")
+        .expect("server-default rule present");
+    let user_deny_idx = rules
+        .iter()
+        .position(|rule| rule.target == "docs/risky" && rule.action == PermissionMode::Deny)
+        .expect("user deny present");
+    assert!(
+        server_default_idx < user_deny_idx,
+        "user `[[permissions.rules]]` must come after MCP-derived rules so explicit policy wins"
+    );
+}
+
+#[test]
+fn invalid_reasoning_and_tui_verbosity_values_are_rejected() {
+    let reasoning = SettingsFile::from_toml_str(
+        r#"
+[model]
+reasoning_effort = "xhigh"
+"#,
+        "test",
+    )
+    .expect_err("invalid reasoning effort");
+    assert!(reasoning.to_string().contains("reasoning_effort"));
+
+    let response = SettingsFile::from_toml_str(
+        r#"
+[tui]
+response_verbosity = "chatty"
+"#,
+        "test",
+    )
+    .expect_err("invalid response verbosity");
+    assert!(response.to_string().contains("response_verbosity"));
+
+    let tool = SettingsFile::from_toml_str(
+        r#"
+[tui]
+tool_output_verbosity = "full"
+"#,
+        "test",
+    )
+    .expect_err("invalid tool output verbosity");
+    assert!(tool.to_string().contains("tool_output_verbosity"));
 }
 
 #[test]
@@ -966,6 +1085,7 @@ env = { TOKEN = "secret-value" }
     assert!(!inspect.contains("CUSTOM_EXA_KEY"));
     assert!(!inspect.contains("internal-[a-z0-9]+"));
     assert!(!inspect.contains("secret-value"));
+    SettingsFile::from_toml_str(&inspect, "inspect").expect("redacted inspect output parses");
 }
 
 #[test]
@@ -1281,6 +1401,10 @@ url = "https://docs.example/mcp"
     assert!(inspect.contains("provider = \"anthropic\""));
     assert!(inspect.contains("read = \"deny\""));
     assert!(inspect.contains("status_verbosity = \"compact\""));
+    assert!(inspect.contains("response_verbosity = \"normal\""));
+    assert!(inspect.contains("tool_output_verbosity = \"compact\""));
+    assert!(inspect.contains("transcript_default = \"compact\""));
+    assert!(inspect.contains("show_reasoning_usage = true"));
     assert!(inspect.contains("transport = \"http\""));
     assert!(!inspect.contains("Balanced"));
     assert!(!inspect.contains("None"));

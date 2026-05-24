@@ -12,7 +12,8 @@ use futures_util::stream;
 use serde_json::json;
 use squeezy_core::{
     AppConfig, PermissionAction, PermissionCapability, PermissionMode, PermissionPolicy,
-    PermissionRequest, PermissionRisk, PermissionRuleSource, Result, SessionMode, SkillsConfig,
+    PermissionRequest, PermissionRisk, PermissionRuleSource, Result, SessionLogConfig, SessionMode,
+    SkillsConfig, TaskStateStatus,
 };
 use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
@@ -88,6 +89,119 @@ async fn turn_stream_accumulates_assistant_text() {
     assert_eq!(
         completed,
         Some(("hello".to_string(), Some("resp_1".to_string())))
+    );
+}
+
+#[tokio::test]
+async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
+    let root = temp_workspace("task_state_session");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "state_1".to_string(),
+                name: TASK_STATE_TOOL_NAME.to_string(),
+                arguments: json!({
+                    "task": "Implement task UX",
+                    "status": "running",
+                    "steps": [
+                        {"title": "Inspect TUI", "status": "completed"},
+                        {"title": "Wire state panel", "status": "active", "detail": "render workflow state"}
+                    ],
+                    "next_action": "run focused tests",
+                    "verification": "running",
+                    "recent_changes": ["added state model"],
+                    "replan_reason": "found existing status footer"
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            session_logs: SessionLogConfig {
+                log_dir: Some(PathBuf::from(".squeezy/sessions")),
+                ..SessionLogConfig::default()
+            },
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+
+    let mut rx = agent.start_turn("implement task UX".to_string(), CancellationToken::new());
+    let mut snapshots = Vec::new();
+    let mut completed_metrics = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::TaskStateUpdated { snapshot, .. } => snapshots.push(snapshot),
+            AgentEvent::Completed { metrics, .. } => completed_metrics = Some(metrics),
+            _ => {}
+        }
+    }
+
+    assert!(
+        snapshots
+            .iter()
+            .any(|snapshot| snapshot.replan_reason.as_deref()
+                == Some("found existing status footer")),
+        "missing replan snapshot: {snapshots:?}",
+    );
+    assert_eq!(
+        snapshots.last().map(|snapshot| snapshot.status),
+        Some(TaskStateStatus::Completed)
+    );
+    assert_eq!(
+        completed_metrics.expect("completed metrics").tool_calls,
+        0,
+        "control state updates must not consume the normal tool-call budget",
+    );
+    let request_names = provider
+        .requests()
+        .into_iter()
+        .flat_map(|request| request.tools.into_iter().map(|tool| tool.name))
+        .collect::<Vec<_>>();
+    assert!(
+        request_names
+            .iter()
+            .any(|name| name == TASK_STATE_TOOL_NAME),
+        "task-state tool was not advertised: {request_names:?}",
+    );
+
+    let session_id = agent.session_id().expect("session id");
+    let exported = agent.export_session(&session_id).expect("export session");
+    let events = exported["events"].as_array().expect("events array");
+    let task_state_event = events
+        .iter()
+        .find(|event| {
+            event["kind"] == "task_state"
+                && event["payload"]["snapshot"]["replan_reason"] == "found existing status footer"
+        })
+        .expect("logged task_state event with replan reason");
+    assert_eq!(
+        task_state_event["payload"]["snapshot"]["steps"][1]["title"],
+        "Wire state panel"
+    );
+    let latest_summary = exported["metadata"]["latest_summary"]
+        .as_str()
+        .expect("latest summary");
+    assert!(
+        latest_summary.contains("Implement task UX"),
+        "{latest_summary}"
+    );
+    assert!(
+        latest_summary.contains("status=completed"),
+        "{latest_summary}"
     );
 }
 
@@ -286,6 +400,57 @@ fn agent_new_falls_back_to_current_dir_for_invalid_workspace_root() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn provider_capability_gate_controls_native_reasoning_and_verbosity_fields() {
+    let mut config = AppConfig {
+        model: squeezy_core::DEFAULT_OPENAI_MODEL.to_string(),
+        reasoning_effort: Some(squeezy_core::ReasoningEffort::High),
+        ..Default::default()
+    };
+    config.tui.response_verbosity = squeezy_core::ResponseVerbosity::Verbose;
+
+    assert_eq!(
+        request_response_verbosity(&config, "openai"),
+        Some(squeezy_core::ResponseVerbosity::Verbose)
+    );
+    assert_eq!(
+        request_reasoning_effort(&config, "openai"),
+        Some(squeezy_core::ReasoningEffort::High)
+    );
+    assert_eq!(request_response_verbosity(&config, "anthropic"), None);
+    assert_eq!(request_reasoning_effort(&config, "anthropic"), None);
+}
+
+#[test]
+fn instructions_skip_prompt_hint_on_default_and_native_capable_models() {
+    use squeezy_core::ResponseVerbosity;
+
+    let base = "system rules";
+
+    // Normal verbosity is the implicit default; never burn tokens
+    // re-stating it in the prompt.
+    assert_eq!(
+        instructions_with_response_verbosity(base, ResponseVerbosity::Normal, false),
+        base,
+    );
+
+    // Native-capable providers receive verbosity via the API
+    // parameter; do not pay for a redundant prompt-side hint.
+    assert_eq!(
+        instructions_with_response_verbosity(base, ResponseVerbosity::Concise, true),
+        base,
+    );
+
+    // For non-native providers, surface the hint so the model still
+    // gets the signal.
+    let concise = instructions_with_response_verbosity(base, ResponseVerbosity::Concise, false);
+    assert!(concise.starts_with(base), "{concise}");
+    assert!(concise.contains("Response verbosity: concise"), "{concise}");
+
+    let verbose = instructions_with_response_verbosity(base, ResponseVerbosity::Verbose, false);
+    assert!(verbose.contains("Response verbosity: verbose"), "{verbose}");
+}
+
 #[tokio::test]
 async fn tool_loop_executes_fallback_tool_and_returns_observation() {
     let root = temp_workspace("agent_tool_loop");
@@ -303,6 +468,7 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
                 cost: CostSnapshot {
                     input_tokens: Some(10),
                     output_tokens: Some(1),
+                    reasoning_output_tokens: Some(2),
                     cached_input_tokens: None,
                     cache_write_input_tokens: None,
                     estimated_usd_micros: None,
@@ -317,6 +483,7 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
                 cost: CostSnapshot {
                     input_tokens: Some(4),
                     output_tokens: Some(2),
+                    reasoning_output_tokens: Some(3),
                     cached_input_tokens: None,
                     cache_write_input_tokens: None,
                     estimated_usd_micros: None,
@@ -349,6 +516,7 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
     let (message, cost) = completed.expect("completed");
     assert_eq!(message, "found it");
     assert_eq!(cost.input_tokens, Some(14));
+    assert_eq!(cost.reasoning_output_tokens, Some(5));
     assert_eq!(provider.requests().len(), 2);
     assert!(!provider.requests()[0].tools.is_empty());
 
@@ -880,15 +1048,23 @@ fn agent_session_mode_transition_logs_structured_fields() {
 #[test]
 fn advertised_tool_specs_are_mode_aware() {
     let tools = [
+        ("decl_search", PermissionCapability::Search),
+        ("definition_search", PermissionCapability::Search),
         ("diff_context", PermissionCapability::Read),
+        ("downstream_flow", PermissionCapability::Read),
         ("glob", PermissionCapability::Search),
         ("grep", PermissionCapability::Search),
+        ("hierarchy", PermissionCapability::Read),
         ("list_skills", PermissionCapability::Read),
         ("load_skill", PermissionCapability::Read),
         ("read_file", PermissionCapability::Read),
+        ("read_slice", PermissionCapability::Read),
         ("read_tool_output", PermissionCapability::Read),
+        ("reference_search", PermissionCapability::Search),
+        ("repo_map", PermissionCapability::Read),
         ("shell", PermissionCapability::Shell),
         ("symbol_context", PermissionCapability::Read),
+        ("upstream_flow", PermissionCapability::Read),
         ("verify", PermissionCapability::Compiler),
         ("webfetch", PermissionCapability::Network),
         ("websearch", PermissionCapability::Network),
@@ -911,16 +1087,37 @@ fn advertised_tool_specs_are_mode_aware() {
     assert_eq!(
         plan_names,
         vec![
+            "decl_search",
+            "definition_search",
             "diff_context",
+            "downstream_flow",
             "glob",
             "grep",
+            "hierarchy",
             "list_skills",
             "load_skill",
             "read_file",
+            "read_slice",
             "read_tool_output",
+            "reference_search",
+            "repo_map",
             "symbol_context",
+            "upstream_flow",
         ]
     );
+}
+
+#[test]
+fn task_state_tool_is_advertised_in_build_and_plan_modes() {
+    let tools = [task_state_advertised_tool()];
+
+    let build_specs = advertised_tool_specs(&tools, SessionMode::Build);
+    let build_names = advertised_tool_names(&build_specs);
+    assert_eq!(build_names, vec![TASK_STATE_TOOL_NAME]);
+
+    let plan_specs = advertised_tool_specs(&tools, SessionMode::Plan);
+    let plan_names = advertised_tool_names(&plan_specs);
+    assert_eq!(plan_names, vec![TASK_STATE_TOOL_NAME]);
 }
 
 #[test]

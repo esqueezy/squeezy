@@ -5,9 +5,11 @@ use ratatui::backend::TestBackend;
 use squeezy_core::{
     AppConfig, CostSnapshot, PermissionCapability, PermissionMode, PermissionPolicy,
     PermissionRequest, PermissionRisk, PermissionScope, Role, SessionMode, StatusVerbosity,
-    TuiConfig, TurnId, TurnMetrics,
+    TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus, TaskVerificationState,
+    ToolOutputVerbosity, TuiConfig, TurnId, TurnMetrics,
 };
 use squeezy_llm::UnavailableProvider;
+use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus};
 
 use super::*;
 
@@ -42,14 +44,14 @@ fn app_surfaces_onboarding_summary_once() {
 
     assert_eq!(app.status, "repo profile ready");
     assert_eq!(app.transcript.len(), 1);
-    assert_eq!(
-        app.transcript[0].content,
-        "repo profile created: /tmp/project"
-    );
+    let TranscriptEntryKind::Message(item) = &app.transcript[0].kind else {
+        panic!("onboarding entry should be a message");
+    };
+    assert_eq!(item.content, "repo profile created: /tmp/project");
     // The seeded onboarding summary is Squeezy-authored metadata, not an
     // assistant turn; surfacing it under Role::System keeps provenance
     // honest and avoids visual collision with later assistant deltas.
-    assert_eq!(app.transcript[0].role, Role::System);
+    assert_eq!(item.role, Role::System);
 }
 
 #[test]
@@ -71,8 +73,8 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
         "missing toggle hint: {status}",
     );
     assert!(
-        status.contains("Ctrl-Y copy"),
-        "missing copy hint: {status}"
+        status.contains("Ctrl-E collapse"),
+        "missing collapse hint: {status}"
     );
 }
 
@@ -176,6 +178,69 @@ fn transcript_item_formats_role_label() {
         .collect::<String>();
 
     assert_eq!(text, "user hello");
+}
+
+#[test]
+fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+
+    assert!(app.transcript[0].collapsed);
+    let collapsed = render_to_string(&app, 100, 12);
+    assert!(collapsed.contains("tool result"), "{collapsed}");
+    assert!(collapsed.contains("grep Success"), "{collapsed}");
+    assert!(
+        !collapsed.contains("needle found"),
+        "collapsed view should hide payload: {collapsed}"
+    );
+
+    select_previous_transcript_entry(&mut app);
+    toggle_selected_transcript_entry(&mut app);
+
+    assert!(!app.transcript[0].collapsed);
+    let expanded = render_to_string(&app, 100, 12);
+    assert!(expanded.contains("needle found"), "{expanded}");
+}
+
+#[tokio::test]
+async fn slash_collapse_and_expand_apply_to_tool_entries() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/expand tools").await);
+    assert!(!app.transcript[0].collapsed);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/collapse tools").await);
+    assert!(app.transcript[0].collapsed);
+}
+
+#[test]
+fn tool_output_verbosity_changes_preview_length() {
+    let result = sample_tool_result("grep", &"x".repeat(1_000));
+    let compact = preview_tool_result(&result, ToolOutputVerbosity::Compact);
+    let verbose = preview_tool_result(&result, ToolOutputVerbosity::Verbose);
+
+    assert!(compact.len() < verbose.len());
+    assert!(compact.ends_with("..."), "{compact}");
+}
+
+#[test]
+fn reasoning_usage_status_is_hidden_when_disabled() {
+    let mut app = test_app(SessionMode::Build);
+    app.cost = CostSnapshot {
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        reasoning_output_tokens: Some(3),
+        ..CostSnapshot::default()
+    };
+
+    let visible = format_status_tokens(&app);
+    assert!(visible.contains("reasoning=3"), "{visible}");
+
+    app.show_reasoning_usage = false;
+    let hidden = format_status_tokens(&app);
+    assert!(!hidden.contains("reasoning=3"), "{hidden}");
 }
 
 #[test]
@@ -355,6 +420,7 @@ fn verbose_status_surfaces_budget_and_cache_details() {
     app.cost = CostSnapshot {
         input_tokens: Some(10),
         output_tokens: Some(5),
+        reasoning_output_tokens: None,
         cached_input_tokens: Some(7),
         cache_write_input_tokens: Some(3),
         estimated_usd_micros: Some(42),
@@ -399,10 +465,89 @@ fn render_uses_two_line_status_footer() {
         available: true,
     };
 
-    let output = render_to_string(&app, 100, 14);
+    let output = render_to_string(&app, 140, 14);
     assert!(output.contains("openai:gpt-test"), "{output}");
     assert!(output.contains("repo=feature"), "{output}");
-    assert!(output.contains("Ctrl-Y copy"), "{output}");
+    assert!(output.contains("Ctrl-E collapse"), "{output}");
+}
+
+#[test]
+fn task_panel_renders_progress_blocker_next_action_and_verification() {
+    let mut app = test_app(SessionMode::Build);
+    app.task_state = Some(sample_task_state());
+
+    let output = render_to_string(&app, 120, 24);
+    assert!(output.contains("Task"), "{output}");
+    assert!(output.contains("Implement task UX"), "{output}");
+    assert!(output.contains("[completed] Inspect TUI"), "{output}");
+    assert!(output.contains("[active] Wire task panel"), "{output}");
+    assert!(output.contains("Blocker: approval pending"), "{output}");
+    assert!(output.contains("Next: run focused tests"), "{output}");
+    assert!(output.contains("Verification: running"), "{output}");
+    assert!(
+        output.contains("Replan: status footer is too compact"),
+        "{output}"
+    );
+}
+
+#[tokio::test]
+async fn ctrl_p_collapses_and_expands_task_panel() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.task_state = Some(sample_task_state());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("collapse task panel");
+    assert!(app.task_panel_collapsed);
+    let collapsed = render_to_string(&app, 120, 16);
+    assert!(collapsed.contains("Task (collapsed)"), "{collapsed}");
+    assert!(collapsed.contains("active=Wire task panel"), "{collapsed}");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("expand task panel");
+    assert!(!app.task_panel_collapsed);
+}
+
+#[tokio::test]
+async fn esc_cancels_active_turn_but_quits_when_idle() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    app.turn_rx = Some(rx);
+    app.cancel = Some(cancel.clone());
+
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("active esc");
+    assert!(!quit);
+    assert!(cancel.is_cancelled());
+    assert_eq!(app.status, "cancelling");
+
+    app.turn_rx = None;
+    app.cancel = None;
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("idle esc");
+    assert!(quit);
 }
 
 #[tokio::test]
@@ -416,8 +561,8 @@ async fn ctrl_y_copies_last_assistant_message() {
             error: None,
         }),
     );
-    app.transcript.push(TranscriptItem::user("hello"));
-    app.transcript.push(TranscriptItem::assistant("answer"));
+    app.push_transcript_item(TranscriptItem::user("hello"));
+    app.push_transcript_item(TranscriptItem::assistant("answer"));
 
     handle_key(
         &mut app,
@@ -446,8 +591,8 @@ async fn slash_copy_transcript_copies_plain_text_transcript() {
             error: None,
         }),
     );
-    app.transcript.push(TranscriptItem::user("hello"));
-    app.transcript.push(TranscriptItem::assistant("answer"));
+    app.push_transcript_item(TranscriptItem::user("hello"));
+    app.push_transcript_item(TranscriptItem::assistant("answer"));
 
     assert!(handle_slash_command(&mut app, &mut agent, "/copy transcript").await);
     assert_eq!(
@@ -473,7 +618,10 @@ async fn slash_feedback_previews_redacted_message_before_send() {
 
     assert_eq!(app.status, "feedback preview ready");
     assert!(app.pending_feedback.is_some());
-    let preview = app.transcript.last().expect("preview").content.clone();
+    let TranscriptEntryKind::Message(item) = &app.transcript.last().expect("preview").kind else {
+        panic!("feedback preview should be a message entry");
+    };
+    let preview = item.content.clone();
     assert!(preview.contains("feedback preview"), "{preview}");
     assert!(preview.contains("<redacted:"), "{preview}");
     assert!(!preview.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
@@ -490,7 +638,7 @@ async fn copy_failure_is_actionable_status() {
             error: Some("clipboard unavailable".to_string()),
         }),
     );
-    app.transcript.push(TranscriptItem::assistant("answer"));
+    app.push_transcript_item(TranscriptItem::assistant("answer"));
 
     handle_key(
         &mut app,
@@ -730,6 +878,31 @@ fn test_config(mode: SessionMode) -> AppConfig {
     }
 }
 
+fn sample_task_state() -> TaskStateSnapshot {
+    TaskStateSnapshot {
+        task: "Implement task UX".to_string(),
+        status: TaskStateStatus::Blocked,
+        summary: Some("Task panel is live".to_string()),
+        steps: vec![
+            TaskStateStep {
+                title: "Inspect TUI".to_string(),
+                status: TaskStepStatus::Completed,
+                detail: None,
+            },
+            TaskStateStep {
+                title: "Wire task panel".to_string(),
+                status: TaskStepStatus::Active,
+                detail: Some("render workflow state".to_string()),
+            },
+        ],
+        blocker: Some("approval pending".to_string()),
+        next_action: Some("run focused tests".to_string()),
+        verification: TaskVerificationState::Running,
+        recent_changes: vec!["added state model".to_string()],
+        replan_reason: Some("status footer is too compact".to_string()),
+    }
+}
+
 fn render_to_string(app: &TuiApp, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
@@ -776,4 +949,22 @@ fn test_agent(mode: SessionMode) -> Agent {
         },
         Arc::new(UnavailableProvider::new("scripted", "test provider")),
     )
+}
+
+fn sample_tool_result(name: &str, output: &str) -> ToolResult {
+    ToolResult {
+        call_id: "call-1".to_string(),
+        tool_name: name.to_string(),
+        status: ToolStatus::Success,
+        content: serde_json::json!({ "output": output }),
+        cost_hint: ToolCostHint {
+            output_bytes: output.len() as u64,
+            ..ToolCostHint::default()
+        },
+        receipt: ToolReceipt {
+            output_sha256: "abcdef1234567890".to_string(),
+            content_sha256: Some("0123456789abcdef".to_string()),
+        },
+        spill_model_output: None,
+    }
 }

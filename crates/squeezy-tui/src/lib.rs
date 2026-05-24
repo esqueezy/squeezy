@@ -20,16 +20,22 @@ use ratatui::{
 };
 use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision, ToolApprovalRequest};
 use squeezy_core::{
-    AppConfig, PermissionPolicy, Result, Role, SessionMode, SqueezyError, StatusVerbosity,
-    TelemetryConfig, TranscriptItem,
+    AppConfig, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode, SqueezyError,
+    StatusVerbosity, TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity, TranscriptDefault,
+    TranscriptItem,
 };
 use squeezy_llm::LlmProvider;
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery, parse_bug_report_section};
 use squeezy_telemetry::PreparedFeedback;
-use squeezy_tools::ToolCall;
+use squeezy_tools::{ToolCall, ToolResult, ToolStatus};
 use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+
+const LONG_ASSISTANT_CHARS: usize = 1_200;
+const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
+const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
+const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
 
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
     run_inner(config, provider, None, None).await
@@ -71,7 +77,9 @@ async fn run_inner(
         agent.session_mode(),
         onboarding_summary,
     );
-    app.transcript.extend(initial_transcript);
+    for item in initial_transcript {
+        app.push_transcript_item(item);
+    }
     if let Some(session_id) = agent.session_id() {
         app.status = format!("session {session_id}");
     }
@@ -94,11 +102,12 @@ async fn run_inner(
 }
 
 async fn drain_agent_events(app: &mut TuiApp) {
-    if let Some(rx) = &mut app.turn_rx {
+    if let Some(mut rx) = app.turn_rx.take() {
+        let mut keep_rx = true;
         while let Ok(event) = rx.try_recv() {
             match event {
                 AgentEvent::UserMessage { message, .. } => {
-                    app.transcript.push(message);
+                    app.push_transcript_item(message);
                     app.pending_assistant.clear();
                     app.transcript_scroll_from_bottom = 0;
                 }
@@ -115,6 +124,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::ToolCallQueued { call, .. } => {
                     app.status = format!("queued {}", call.name);
+                    app.push_tool_call(call);
                 }
                 AgentEvent::ToolCallStarted { call, .. } => {
                     app.status = format!("running {}", call.name);
@@ -135,6 +145,11 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         app.status
                             .push_str(&format!(" redacted={}", result.cost_hint.redactions));
                     }
+                    app.push_tool_result(result);
+                }
+                AgentEvent::TaskStateUpdated { snapshot, .. } => {
+                    app.task_state = Some(snapshot);
+                    app.status = "task state updated".to_string();
                 }
                 AgentEvent::ApprovalRequested {
                     request,
@@ -154,32 +169,37 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     metrics,
                     ..
                 } => {
-                    app.transcript.push(message);
+                    app.push_transcript_item(message);
                     app.pending_assistant.clear();
                     app.cost = cost;
                     app.metrics = metrics;
                     app.status = "ready".to_string();
                     // Preserve the user's scroll position; if they paged up
                     // mid-turn we shouldn't snap them down on completion.
-                    app.turn_rx = None;
                     app.cancel = None;
+                    keep_rx = false;
                     break;
                 }
                 AgentEvent::Cancelled { .. } => {
                     app.status = "cancelled; edit prompt or retry".to_string();
+                    app.push_log("turn cancelled".to_string());
                     app.pending_assistant.clear();
-                    app.turn_rx = None;
                     app.cancel = None;
+                    keep_rx = false;
                     break;
                 }
                 AgentEvent::Failed { error, .. } => {
                     app.status = format_error_status(&error);
+                    app.push_log(format!("turn failed: {}", app.status));
                     app.pending_assistant.clear();
-                    app.turn_rx = None;
                     app.cancel = None;
+                    keep_rx = false;
                     break;
                 }
             }
+        }
+        if keep_rx {
+            app.turn_rx = Some(rx);
         }
     }
 }
@@ -199,9 +219,7 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
 
 async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        if let Some(cancel) = &app.cancel {
-            cancel.cancel();
-            app.status = "cancelling".to_string();
+        if cancel_active_turn(app) {
             return Ok(false);
         }
         return Ok(true);
@@ -209,6 +227,23 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
         copy_to_clipboard(app, ClipboardTarget::LastAssistant);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+        toggle_selected_transcript_entry(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+        if app.task_state.is_some() {
+            app.task_panel_collapsed = !app.task_panel_collapsed;
+            app.status = if app.task_panel_collapsed {
+                "task panel collapsed".to_string()
+            } else {
+                "task panel expanded".to_string()
+            };
+        }
         return Ok(false);
     }
 
@@ -233,12 +268,23 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
+    if key.code == KeyCode::Esc && app.cancel.is_some() {
+        cancel_active_turn(app);
+        return Ok(false);
+    }
+
     if handle_approval_key(app, key) {
         return Ok(false);
     }
 
     match key.code {
-        KeyCode::Esc => Ok(true),
+        KeyCode::Esc => {
+            if cancel_active_turn(app) {
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        }
         // Scroll keys intentionally leave `app.status` alone so that
         // useful messages (tool results, errors, approval prompts) stay
         // visible while the user navigates history. The status footer
@@ -259,6 +305,14 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             app.transcript_scroll_from_bottom = 0;
             Ok(false)
         }
+        KeyCode::Up => {
+            select_previous_transcript_entry(app);
+            Ok(false)
+        }
+        KeyCode::Down => {
+            select_next_transcript_entry(app);
+            Ok(false)
+        }
         KeyCode::Enter => {
             if app.turn_rx.is_some() {
                 app.status = "turn already running; press Ctrl-C to cancel".to_string();
@@ -274,7 +328,13 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
                 return Ok(false);
             }
             let cancel = CancellationToken::new();
-            app.turn_rx = Some(agent.start_turn(input, cancel.clone()));
+            app.task_state = None;
+            app.task_panel_collapsed = false;
+            app.turn_rx = Some(agent.start_turn_with_response_verbosity(
+                input,
+                cancel.clone(),
+                app.response_verbosity,
+            ));
             app.cancel = Some(cancel);
             app.status = "starting turn".to_string();
             Ok(false)
@@ -291,6 +351,18 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         }
         _ => Ok(false),
     }
+}
+
+fn cancel_active_turn(app: &mut TuiApp) -> bool {
+    let Some(cancel) = &app.cancel else {
+        return false;
+    };
+    cancel.cancel();
+    if let Some(pending) = app.pending_approval.take() {
+        let _ = pending.decision_tx.send(ToolApprovalDecision::Cancelled);
+    }
+    app.status = "cancelling".to_string();
+    true
 }
 
 async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
@@ -311,11 +383,59 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             handle_report_command(app, agent, rest).await;
             return true;
         }
+        "/collapse" | "/expand" => {
+            let category = match parts.next() {
+                Some(value) => match parse_transcript_category(value) {
+                    Some(category) => category,
+                    None => {
+                        app.status = "usage: /collapse [all|tools|logs|diffs|receipts|assistant]"
+                            .to_string();
+                        return true;
+                    }
+                },
+                None => TranscriptCategory::All,
+            };
+            let collapsed = command == "/collapse";
+            let changed = set_transcript_collapsed(app, category, collapsed);
+            app.status = format!(
+                "{} {} transcript entr{}",
+                if collapsed { "collapsed" } else { "expanded" },
+                changed,
+                if changed == 1 { "y" } else { "ies" }
+            );
+            return true;
+        }
+        "/verbosity" => {
+            let Some(value) = parts.next() else {
+                app.status = "usage: /verbosity concise|normal|verbose".to_string();
+                return true;
+            };
+            let Some(verbosity) = parse_response_verbosity(value) else {
+                app.status = "usage: /verbosity concise|normal|verbose".to_string();
+                return true;
+            };
+            app.response_verbosity = verbosity;
+            app.status = format!("response verbosity {}", verbosity.as_str());
+            return true;
+        }
+        "/tool-verbosity" => {
+            let Some(value) = parts.next() else {
+                app.status = "usage: /tool-verbosity compact|normal|verbose".to_string();
+                return true;
+            };
+            let Some(verbosity) = parse_tool_output_verbosity(value) else {
+                app.status = "usage: /tool-verbosity compact|normal|verbose".to_string();
+                return true;
+            };
+            app.tool_output_verbosity = verbosity;
+            app.status = format!("tool output verbosity {}", verbosity.as_str());
+            return true;
+        }
         "/sessions" => {
             match agent.list_sessions(&SessionQuery::default()) {
                 Ok(sessions) => {
                     app.status = format!("{} sessions", sessions.len());
-                    app.transcript.push(TranscriptItem::system(
+                    app.push_transcript_item(TranscriptItem::system(
                         sessions
                             .into_iter()
                             .take(10)
@@ -353,7 +473,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                         record.metadata.event_count,
                         record.metadata.redactions
                     );
-                    app.transcript.push(TranscriptItem::system(format!(
+                    app.push_transcript_item(TranscriptItem::system(format!(
                         "{}\nstatus={} started={} branch={} task={}",
                         record.metadata.session_id,
                         record.metadata.status.as_str(),
@@ -373,8 +493,15 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             };
             match agent.resume_current(session_id) {
                 Ok(transcript) => {
-                    app.transcript = transcript;
+                    app.transcript.clear();
+                    app.selected_entry = None;
+                    app.next_entry_id = 0;
+                    for item in transcript {
+                        app.push_transcript_item(item);
+                    }
                     app.pending_assistant.clear();
+                    app.task_state = None;
+                    app.task_panel_collapsed = false;
                     app.turn_rx = None;
                     app.cancel = None;
                     app.status = format!("resumed session {session_id}");
@@ -455,6 +582,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         result.status,
         summarize_local_tool_result(&result.content)
     );
+    app.push_tool_result(result);
     true
 }
 
@@ -468,7 +596,7 @@ async fn handle_feedback_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
             match agent.submit_feedback(&feedback).await {
                 Ok(result) => {
                     app.status = format!("feedback sent {}", result.id);
-                    app.transcript.push(TranscriptItem::system(format!(
+                    app.push_transcript_item(TranscriptItem::system(format!(
                         "feedback sent\nfeedback_id={}",
                         result.id
                     )));
@@ -498,7 +626,7 @@ async fn handle_feedback_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
                 );
                 app.pending_feedback = Some(feedback);
                 app.status = "feedback preview ready".to_string();
-                app.transcript.push(TranscriptItem::system(preview));
+                app.push_transcript_item(TranscriptItem::system(preview));
             }
             Err(error) => app.status = format!("feedback preview failed: {error}"),
         },
@@ -515,7 +643,7 @@ async fn handle_report_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
             match agent.submit_bug_report(&report).await {
                 Ok(result) => {
                     app.status = format!("report sent {}", result.id);
-                    app.transcript.push(TranscriptItem::system(format!(
+                    app.push_transcript_item(TranscriptItem::system(format!(
                         "report sent\nreport_id={}",
                         result.id
                     )));
@@ -548,7 +676,7 @@ async fn handle_report_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
                     preview.push_str("\nRun /report send to upload or /report cancel.");
                     app.pending_report = Some(report);
                     app.status = "report preview ready".to_string();
-                    app.transcript.push(TranscriptItem::system(preview));
+                    app.push_transcript_item(TranscriptItem::system(preview));
                 }
                 Err(error) => app.status = format!("report preview failed: {error}"),
             }
@@ -659,8 +787,7 @@ fn clipboard_text(app: &TuiApp, target: ClipboardTarget) -> Option<String> {
             app.transcript
                 .iter()
                 .rev()
-                .find(|item| item.role == Role::Assistant && !item.content.trim().is_empty())
-                .map(|item| item.content.clone())
+                .find_map(TranscriptEntry::assistant_content)
         }
         ClipboardTarget::Transcript => {
             let text = transcript_plain_text(app);
@@ -676,7 +803,7 @@ fn clipboard_text(app: &TuiApp, target: ClipboardTarget) -> Option<String> {
 fn transcript_plain_text(app: &TuiApp) -> String {
     let mut lines = Vec::new();
     for item in &app.transcript {
-        lines.push(format!("{}: {}", role_label(&item.role), item.content));
+        lines.extend(item.plain_text_lines());
     }
     if !app.pending_assistant.is_empty() {
         lines.push(format!("assistant: {}", app.pending_assistant));
@@ -690,6 +817,99 @@ fn mode_command(input: &str) -> Option<SessionMode> {
         "/build" => Some(SessionMode::Build),
         _ => None,
     }
+}
+
+fn parse_transcript_category(value: &str) -> Option<TranscriptCategory> {
+    match value {
+        "all" => Some(TranscriptCategory::All),
+        "tools" => Some(TranscriptCategory::Tools),
+        "logs" => Some(TranscriptCategory::Logs),
+        "diffs" => Some(TranscriptCategory::Diffs),
+        "receipts" => Some(TranscriptCategory::Receipts),
+        "assistant" => Some(TranscriptCategory::Assistant),
+        _ => None,
+    }
+}
+
+fn parse_response_verbosity(value: &str) -> Option<ResponseVerbosity> {
+    match value {
+        "concise" => Some(ResponseVerbosity::Concise),
+        "normal" => Some(ResponseVerbosity::Normal),
+        "verbose" => Some(ResponseVerbosity::Verbose),
+        _ => None,
+    }
+}
+
+fn parse_tool_output_verbosity(value: &str) -> Option<ToolOutputVerbosity> {
+    match value {
+        "compact" => Some(ToolOutputVerbosity::Compact),
+        "normal" => Some(ToolOutputVerbosity::Normal),
+        "verbose" => Some(ToolOutputVerbosity::Verbose),
+        _ => None,
+    }
+}
+
+fn set_transcript_collapsed(
+    app: &mut TuiApp,
+    category: TranscriptCategory,
+    collapsed: bool,
+) -> usize {
+    let mut changed = 0;
+    for entry in &mut app.transcript {
+        if entry.matches_category(category) && entry.collapsed != collapsed {
+            entry.collapsed = collapsed;
+            changed += 1;
+        }
+    }
+    changed
+}
+
+fn select_previous_transcript_entry(app: &mut TuiApp) {
+    if app.transcript.is_empty() {
+        app.status = "transcript is empty".to_string();
+        return;
+    }
+    app.selected_entry = Some(match app.selected_entry {
+        Some(index) => index.saturating_sub(1),
+        None => app.transcript.len() - 1,
+    });
+    let entry = &app.transcript[app.selected_entry.unwrap()];
+    app.status = format!("selected transcript entry {}", entry.id + 1);
+}
+
+fn select_next_transcript_entry(app: &mut TuiApp) {
+    if app.transcript.is_empty() {
+        app.status = "transcript is empty".to_string();
+        return;
+    }
+    app.selected_entry = Some(match app.selected_entry {
+        Some(index) => (index + 1).min(app.transcript.len() - 1),
+        None => 0,
+    });
+    let entry = &app.transcript[app.selected_entry.unwrap()];
+    app.status = format!("selected transcript entry {}", entry.id + 1);
+}
+
+fn toggle_selected_transcript_entry(app: &mut TuiApp) {
+    let Some(index) = app.selected_entry else {
+        app.status = "select a transcript entry first".to_string();
+        return;
+    };
+    let Some(entry) = app.transcript.get_mut(index) else {
+        app.selected_entry = None;
+        app.status = "select a transcript entry first".to_string();
+        return;
+    };
+    entry.collapsed = !entry.collapsed;
+    app.status = format!(
+        "{} transcript entry {}",
+        if entry.collapsed {
+            "collapsed"
+        } else {
+            "expanded"
+        },
+        entry.id + 1
+    );
 }
 
 fn switch_mode(
@@ -779,6 +999,11 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
 /// future field becomes visible by adding it here AND in the tool
 /// registry; the doc in `docs/CONFIGURATION.md` references this contract.
 pub(crate) const APPROVAL_PROMPT_KEYS: &[&str] = &[
+    "server",
+    "tool",
+    "transport",
+    "target",
+    "arguments",
     "command",
     "cwd",
     "description",
@@ -840,17 +1065,50 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         let prompt = format_approval_prompt(&pending.request);
         let line_count = prompt.matches('\n').count() as u16 + 1;
         let approval_height = line_count.saturating_add(2).clamp(6, 18);
+        if should_show_task_panel(app) {
+            let task_height = task_panel_height(app).min(5);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(3),
+                    Constraint::Length(task_height),
+                    Constraint::Length(approval_height),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                ])
+                .split(area);
+            render_transcript(frame, chunks[0], app);
+            render_task_state(frame, chunks[1], app);
+            render_approval(frame, chunks[2], &prompt);
+            render_input(frame, chunks[3], app);
+            render_status(frame, chunks[4], app);
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(3),
+                    Constraint::Length(approval_height),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                ])
+                .split(area);
+            render_transcript(frame, chunks[0], app);
+            render_approval(frame, chunks[1], &prompt);
+            render_input(frame, chunks[2], app);
+            render_status(frame, chunks[3], app);
+        }
+    } else if should_show_task_panel(app) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(3),
-                Constraint::Length(approval_height),
+                Constraint::Min(5),
+                Constraint::Length(task_panel_height(app)),
                 Constraint::Length(3),
                 Constraint::Length(2),
             ])
             .split(area);
         render_transcript(frame, chunks[0], app);
-        render_approval(frame, chunks[1], &prompt);
+        render_task_state(frame, chunks[1], app);
         render_input(frame, chunks[2], app);
         render_status(frame, chunks[3], app);
     } else {
@@ -868,6 +1126,106 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     }
 }
 
+fn should_show_task_panel(app: &TuiApp) -> bool {
+    app.task_state.is_some()
+}
+
+fn task_panel_height(app: &TuiApp) -> u16 {
+    if app.task_panel_collapsed {
+        return 3;
+    }
+    let line_count = app
+        .task_state
+        .as_ref()
+        .map(|snapshot| format_task_state_lines(snapshot, false).len() as u16)
+        .unwrap_or(1);
+    line_count.saturating_add(2).clamp(4, 12)
+}
+
+fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(snapshot) = app.task_state.as_ref() else {
+        return;
+    };
+    let lines = format_task_state_lines(snapshot, app.task_panel_collapsed);
+    let title = if app.task_panel_collapsed {
+        "Task (collapsed)"
+    } else {
+        "Task"
+    };
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().title(title).borders(Borders::ALL))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn format_task_state_lines(snapshot: &TaskStateSnapshot, collapsed: bool) -> Vec<Line<'static>> {
+    if collapsed {
+        return vec![Line::from(format!(
+            "Task: {} | active={} | blocker={} | next={} | verification={}",
+            task_title(snapshot),
+            snapshot.active_step_title().unwrap_or("-"),
+            snapshot.blocker.as_deref().unwrap_or("-"),
+            snapshot.next_action.as_deref().unwrap_or("-"),
+            snapshot.verification.as_str(),
+        ))];
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(format!(
+        "Task: {}  status={}",
+        task_title(snapshot),
+        snapshot.status.as_str()
+    )));
+    if let Some(summary) = &snapshot.summary {
+        lines.push(Line::from(format!("Summary: {summary}")));
+    }
+    if snapshot.steps.is_empty() {
+        lines.push(Line::from("Steps: -"));
+    } else {
+        for step in &snapshot.steps {
+            let detail = step
+                .detail
+                .as_ref()
+                .map(|detail| format!(" - {detail}"))
+                .unwrap_or_default();
+            lines.push(Line::from(format!(
+                "[{}] {}{}",
+                step.status.as_str(),
+                step.title,
+                detail
+            )));
+        }
+    }
+    if let Some(blocker) = &snapshot.blocker {
+        lines.push(Line::from(format!("Blocker: {blocker}")));
+    }
+    if !snapshot.recent_changes.is_empty() {
+        lines.push(Line::from(format!(
+            "Recent: {}",
+            snapshot.recent_changes.join("; ")
+        )));
+    }
+    if let Some(next_action) = &snapshot.next_action {
+        lines.push(Line::from(format!("Next: {next_action}")));
+    }
+    lines.push(Line::from(format!(
+        "Verification: {}",
+        snapshot.verification.as_str()
+    )));
+    if let Some(reason) = &snapshot.replan_reason {
+        lines.push(Line::from(format!("Replan: {reason}")));
+    }
+    lines
+}
+
+fn task_title(snapshot: &TaskStateSnapshot) -> &str {
+    if snapshot.task.is_empty() {
+        "current turn"
+    } else {
+        snapshot.task.as_str()
+    }
+}
+
 fn render_approval(frame: &mut Frame<'_>, area: Rect, prompt: &str) {
     let paragraph = Paragraph::new(prompt)
         .block(
@@ -881,8 +1239,12 @@ fn render_approval(frame: &mut Frame<'_>, area: Rect, prompt: &str) {
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let mut lines = Vec::new();
-    for item in &app.transcript {
-        lines.push(format_transcript_item(item));
+    for (index, item) in app.transcript.iter().enumerate() {
+        lines.extend(format_transcript_entry(
+            item,
+            app.selected_entry == Some(index),
+            app.tool_output_verbosity,
+        ));
     }
     if !app.pending_assistant.is_empty() {
         lines.push(Line::from(vec![
@@ -916,6 +1278,7 @@ fn transcript_scroll_offset(line_count: usize, area_height: u16, from_bottom: u1
     max_scroll.saturating_sub(from_bottom as usize) as u16
 }
 
+#[cfg(test)]
 fn format_transcript_item(item: &TranscriptItem) -> Line<'_> {
     let (label, color) = match &item.role {
         Role::User => ("user ", Color::Cyan),
@@ -929,6 +1292,228 @@ fn format_transcript_item(item: &TranscriptItem) -> Line<'_> {
         ),
         Span::raw(item.content.as_str()),
     ])
+}
+
+fn format_transcript_entry(
+    entry: &TranscriptEntry,
+    selected: bool,
+    tool_output_verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    match &entry.kind {
+        TranscriptEntryKind::Message(item) => format_message_entry(item, entry.collapsed, selected),
+        TranscriptEntryKind::ToolCall(call) => {
+            format_tool_call_entry(call, entry.collapsed, selected)
+        }
+        TranscriptEntryKind::ToolResult(result) => {
+            format_tool_result_entry(result, entry.collapsed, selected, tool_output_verbosity)
+        }
+        TranscriptEntryKind::Log(message) => format_log_entry(message, entry.collapsed, selected),
+    }
+}
+
+fn format_message_entry(
+    item: &TranscriptItem,
+    collapsed: bool,
+    selected: bool,
+) -> Vec<Line<'static>> {
+    let (label, color) = role_style(&item.role);
+    if collapsed {
+        return vec![line_with_label(
+            selected,
+            label,
+            color,
+            format!(
+                "[collapsed {} chars] {}",
+                item.content.chars().count(),
+                compact_text(&item.content, 140)
+            ),
+        )];
+    }
+    text_lines(selected, label, color, &item.content)
+}
+
+fn format_tool_call_entry(call: &ToolCall, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
+    let summary = format!(
+        "{} queued args={}",
+        call.name,
+        compact_text(&call.arguments.to_string(), 140)
+    );
+    if collapsed {
+        return vec![line_with_label(
+            selected,
+            "tool call ",
+            Color::Magenta,
+            summary,
+        )];
+    }
+    let mut lines = vec![line_with_label(
+        selected,
+        "tool call ",
+        Color::Magenta,
+        format!("{} queued", call.name),
+    )];
+    lines.extend(indented_text_lines(
+        serde_json::to_string_pretty(&call.arguments)
+            .unwrap_or_else(|_| call.arguments.to_string())
+            .as_str(),
+    ));
+    lines
+}
+
+fn format_tool_result_entry(
+    result: &ToolResult,
+    collapsed: bool,
+    selected: bool,
+    tool_output_verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    let summary = tool_result_summary(result);
+    if collapsed {
+        return vec![line_with_label(
+            selected,
+            "tool result ",
+            status_color(result.status),
+            summary,
+        )];
+    }
+    let mut lines = vec![line_with_label(
+        selected,
+        "tool result ",
+        status_color(result.status),
+        summary,
+    )];
+    lines.push(Line::from(format!(
+        "  receipt output={} content={}",
+        short_hash(&result.receipt.output_sha256),
+        result
+            .receipt
+            .content_sha256
+            .as_deref()
+            .map(short_hash)
+            .unwrap_or("-")
+    )));
+    let preview = preview_tool_result(result, tool_output_verbosity);
+    lines.extend(indented_text_lines(&preview));
+    lines
+}
+
+fn format_log_entry(message: &str, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
+    if collapsed {
+        let preview = compact_text(message, 140);
+        return vec![line_with_label(
+            selected,
+            "log ",
+            Color::Yellow,
+            format!("[collapsed {} chars] {}", message.chars().count(), preview),
+        )];
+    }
+    text_lines(selected, "log ", Color::Yellow, message)
+}
+
+fn role_style(role: &Role) -> (&'static str, Color) {
+    match role {
+        Role::User => ("user ", Color::Cyan),
+        Role::Assistant => ("assistant ", Color::Green),
+        Role::System => ("system ", Color::Yellow),
+    }
+}
+
+fn line_with_label(
+    selected: bool,
+    label: &'static str,
+    color: Color,
+    content: impl Into<String>,
+) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    Line::from(vec![
+        Span::raw(marker),
+        Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(content.into()),
+    ])
+}
+
+fn text_lines(
+    selected: bool,
+    label: &'static str,
+    color: Color,
+    content: &str,
+) -> Vec<Line<'static>> {
+    if content.is_empty() {
+        return vec![line_with_label(selected, label, color, "")];
+    }
+    content
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 {
+                line_with_label(selected, label, color, line.to_string())
+            } else {
+                Line::from(format!("  {line}"))
+            }
+        })
+        .collect()
+}
+
+fn indented_text_lines(content: &str) -> Vec<Line<'static>> {
+    content
+        .lines()
+        .map(|line| Line::from(format!("  {line}")))
+        .collect()
+}
+
+fn tool_result_summary(result: &ToolResult) -> String {
+    format!(
+        "{} {:?} {}B{} receipt={}",
+        result.tool_name,
+        result.status,
+        result.cost_hint.output_bytes,
+        if result.cost_hint.truncated {
+            " truncated"
+        } else {
+            ""
+        },
+        short_hash(&result.receipt.output_sha256),
+    )
+}
+
+fn preview_tool_result(result: &ToolResult, verbosity: ToolOutputVerbosity) -> String {
+    let limit = match verbosity {
+        ToolOutputVerbosity::Compact => TOOL_PREVIEW_COMPACT_BYTES,
+        ToolOutputVerbosity::Normal => TOOL_PREVIEW_NORMAL_BYTES,
+        ToolOutputVerbosity::Verbose => TOOL_PREVIEW_VERBOSE_BYTES,
+    };
+    let text = serde_json::to_string_pretty(&result.content)
+        .unwrap_or_else(|_| result.content.to_string());
+    truncate_bytes(&text, limit)
+}
+
+fn status_color(status: ToolStatus) -> Color {
+    match status {
+        ToolStatus::Success => Color::Green,
+        ToolStatus::Error | ToolStatus::Stale => Color::Red,
+        ToolStatus::Denied | ToolStatus::Cancelled => Color::Yellow,
+    }
+}
+
+fn compact_text(text: &str, limit: usize) -> String {
+    truncate_bytes(&text.replace('\n', " "), limit)
+}
+
+fn truncate_bytes(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut end = limit.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+fn short_hash(hash: &str) -> &str {
+    hash.get(..12).unwrap_or(hash)
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -962,10 +1547,11 @@ fn format_status_tokens(app: &TuiApp) -> String {
         scroll_marker,
     );
     let spend = format!(
-        "cost={} tok={}/{} tools={} budget={}",
+        "cost={} tok={}/{}{} tools={} budget={}",
         format_cost(&app.cost),
         format_optional_u64(app.cost.input_tokens),
         format_optional_u64(app.cost.output_tokens),
+        reasoning_status_fragment(app),
         app.metrics.tool_calls,
         if app.metrics.budget_denials == 0 {
             "ok".to_string()
@@ -974,22 +1560,35 @@ fn format_status_tokens(app: &TuiApp) -> String {
         },
     );
     let hints = if app.pending_approval.is_some() {
-        "Y allow once | A user | P project | N deny | U/D deny rule | Ctrl-C cancel"
+        "Y allow once | A user | P project | N deny | U/D deny rule | Ctrl-C/Esc cancel | Ctrl-P task"
+    } else if app.cancel.is_some() {
+        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | Ctrl-P task | /copy | /sessions /resume | Ctrl-C/Esc cancel"
     } else {
-        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy | /sessions /resume /feedback /report | Ctrl-C cancel | Esc quit"
+        "Enter send | Shift-Tab mode | Up/Down select | Ctrl-E collapse | Ctrl-P task | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy /sessions /resume /feedback /report /collapse /expand /verbosity | Esc quit"
     };
     match app.status_verbosity {
         StatusVerbosity::Compact => format!("{context}  {spend}\n{hints}"),
         StatusVerbosity::Verbose => format!(
-            "{context}  {spend}\ncfg={} read={}B receipts={} redactions={} cached={} cache_write={} | {hints}",
+            "{context}  {spend}\ncfg={} read={}B receipts={} redactions={} cached={} cache_write={}{} | {hints}",
             app.config_sources,
             app.metrics.bytes_read,
             app.metrics.receipt_stub_hits + app.metrics.negative_receipt_hits,
             app.metrics.redactions,
             format_optional_u64(app.cost.cached_input_tokens),
             format_optional_u64(app.cost.cache_write_input_tokens),
+            reasoning_status_fragment(app),
         ),
     }
+}
+
+fn reasoning_status_fragment(app: &TuiApp) -> String {
+    if !app.show_reasoning_usage {
+        return String::new();
+    }
+    app.cost
+        .reasoning_output_tokens
+        .map(|tokens| format!(" reasoning={tokens}"))
+        .unwrap_or_default()
 }
 
 fn format_optional_u64(value: Option<u64>) -> String {
@@ -1198,13 +1797,21 @@ struct TuiApp {
     mode: SessionMode,
     config_sources: String,
     status_verbosity: StatusVerbosity,
+    response_verbosity: ResponseVerbosity,
+    tool_output_verbosity: ToolOutputVerbosity,
+    transcript_default: TranscriptDefault,
+    show_reasoning_usage: bool,
     repo: RepoStatus,
     permissions: PermissionStatus,
     telemetry: TelemetryStatus,
     input: String,
-    transcript: Vec<TranscriptItem>,
+    transcript: Vec<TranscriptEntry>,
+    selected_entry: Option<usize>,
+    next_entry_id: u64,
     transcript_scroll_from_bottom: u16,
     pending_assistant: String,
+    task_state: Option<TaskStateSnapshot>,
+    task_panel_collapsed: bool,
     status: String,
     cost: squeezy_core::CostSnapshot,
     metrics: squeezy_core::TurnMetrics,
@@ -1245,27 +1852,41 @@ impl TuiApp {
             // model, so it belongs to the System role. Using Assistant would
             // both mislabel provenance and mix the same color with later
             // assistant turns, making the seam ambiguous in the transcript.
-            transcript.push(TranscriptItem {
-                role: Role::System,
-                content: summary,
-            });
+            let entry = TranscriptEntry::message(
+                0,
+                TranscriptItem {
+                    role: Role::System,
+                    content: summary,
+                },
+                config.tui.transcript_default,
+            );
+            transcript.push(entry);
             "repo profile ready".to_string()
         } else {
             "ready".to_string()
         };
+        let next_entry_id = transcript.len() as u64;
         Self {
             provider_name,
             model: config.model.clone(),
             mode,
             config_sources: config.config_source_labels().join(","),
             status_verbosity: config.tui.status_verbosity,
+            response_verbosity: config.tui.response_verbosity,
+            tool_output_verbosity: config.tui.tool_output_verbosity,
+            transcript_default: config.tui.transcript_default,
+            show_reasoning_usage: config.tui.show_reasoning_usage,
             repo: RepoStatus::detect(config),
             permissions: PermissionStatus::from_policy(&config.permissions),
             telemetry: TelemetryStatus::from_config(&config.telemetry),
             input: String::new(),
             transcript,
+            selected_entry: None,
+            next_entry_id,
             transcript_scroll_from_bottom: 0,
             pending_assistant: String::new(),
+            task_state: None,
+            task_panel_collapsed: false,
             status,
             cost: squeezy_core::CostSnapshot::default(),
             metrics: squeezy_core::TurnMetrics::default(),
@@ -1277,6 +1898,159 @@ impl TuiApp {
             clipboard,
         }
     }
+
+    fn push_transcript_item(&mut self, item: TranscriptItem) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::message(id, item, self.transcript_default));
+    }
+
+    fn push_tool_call(&mut self, call: ToolCall) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::tool_call(
+            id,
+            call,
+            self.transcript_default,
+        ));
+    }
+
+    fn push_tool_result(&mut self, result: ToolResult) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::tool_result(
+            id,
+            result,
+            self.transcript_default,
+        ));
+    }
+
+    fn push_log(&mut self, message: String) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::log(id, message, self.transcript_default));
+    }
+
+    fn push_entry(&mut self, entry: TranscriptEntry) {
+        self.transcript.push(entry);
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_entry_id;
+        self.next_entry_id += 1;
+        id
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptEntry {
+    id: u64,
+    kind: TranscriptEntryKind,
+    collapsed: bool,
+}
+
+impl TranscriptEntry {
+    fn message(id: u64, item: TranscriptItem, transcript_default: TranscriptDefault) -> Self {
+        let collapsed = transcript_default == TranscriptDefault::Compact
+            && item.role == Role::Assistant
+            && item.content.chars().count() > LONG_ASSISTANT_CHARS;
+        Self {
+            id,
+            kind: TranscriptEntryKind::Message(item),
+            collapsed,
+        }
+    }
+
+    fn tool_call(id: u64, call: ToolCall, transcript_default: TranscriptDefault) -> Self {
+        Self {
+            id,
+            kind: TranscriptEntryKind::ToolCall(call),
+            collapsed: transcript_default == TranscriptDefault::Compact,
+        }
+    }
+
+    fn tool_result(id: u64, result: ToolResult, transcript_default: TranscriptDefault) -> Self {
+        Self {
+            id,
+            kind: TranscriptEntryKind::ToolResult(result),
+            collapsed: transcript_default == TranscriptDefault::Compact,
+        }
+    }
+
+    fn log(id: u64, message: String, transcript_default: TranscriptDefault) -> Self {
+        Self {
+            id,
+            kind: TranscriptEntryKind::Log(message),
+            collapsed: transcript_default == TranscriptDefault::Compact,
+        }
+    }
+
+    fn matches_category(&self, category: TranscriptCategory) -> bool {
+        match category {
+            TranscriptCategory::All => true,
+            TranscriptCategory::Tools => matches!(
+                self.kind,
+                TranscriptEntryKind::ToolCall(_) | TranscriptEntryKind::ToolResult(_)
+            ),
+            TranscriptCategory::Logs => match &self.kind {
+                TranscriptEntryKind::Log(_) => true,
+                TranscriptEntryKind::Message(item) => item.role == Role::System,
+                _ => false,
+            },
+            TranscriptCategory::Diffs => match &self.kind {
+                TranscriptEntryKind::ToolResult(result) => result.tool_name.contains("diff"),
+                _ => false,
+            },
+            TranscriptCategory::Receipts => match &self.kind {
+                TranscriptEntryKind::ToolResult(result) => !result.receipt.output_sha256.is_empty(),
+                _ => false,
+            },
+            TranscriptCategory::Assistant => match &self.kind {
+                TranscriptEntryKind::Message(item) => item.role == Role::Assistant,
+                _ => false,
+            },
+        }
+    }
+
+    fn plain_text_lines(&self) -> Vec<String> {
+        match &self.kind {
+            TranscriptEntryKind::Message(item) => {
+                vec![format!("{}: {}", role_label(&item.role), item.content)]
+            }
+            TranscriptEntryKind::ToolCall(call) => {
+                vec![format!("tool call: {}", call.name)]
+            }
+            TranscriptEntryKind::ToolResult(result) => {
+                vec![format!("tool result: {}", tool_result_summary(result))]
+            }
+            TranscriptEntryKind::Log(message) => vec![format!("log: {message}")],
+        }
+    }
+
+    fn assistant_content(&self) -> Option<String> {
+        match &self.kind {
+            TranscriptEntryKind::Message(item)
+                if item.role == Role::Assistant && !item.content.trim().is_empty() =>
+            {
+                Some(item.content.clone())
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TranscriptEntryKind {
+    Message(TranscriptItem),
+    ToolCall(ToolCall),
+    ToolResult(ToolResult),
+    Log(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptCategory {
+    All,
+    Tools,
+    Logs,
+    Diffs,
+    Receipts,
+    Assistant,
 }
 
 struct PendingApproval {

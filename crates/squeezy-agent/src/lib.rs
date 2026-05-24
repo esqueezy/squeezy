@@ -14,10 +14,13 @@ use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, CostSnapshot, PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability,
     PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict,
-    Redactor, SessionMetrics, SessionMode, SqueezyError, StreamRedactor, TranscriptItem, TurnId,
-    TurnMetrics, default_settings_path, escape_toml_basic_string,
+    Redactor, ResponseVerbosity, SessionMetrics, SessionMode, SqueezyError, StreamRedactor,
+    TaskStateSnapshot, TaskStateStatus, TranscriptItem, TurnId, TurnMetrics, default_settings_path,
+    escape_toml_basic_string,
 };
-use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, estimate_cost};
+use squeezy_llm::{
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, capabilities_for, estimate_cost,
+};
 use squeezy_store::{
     BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionHandle,
     SessionMetadata, SessionQuery, SessionRecord, SessionResumeState, SessionStatus, SessionStore,
@@ -30,12 +33,13 @@ use squeezy_telemetry::{
 };
 use squeezy_tools::{
     ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
-    ToolResult, ToolSpec, ToolStatus, WebToolConfig, sha256_hex,
+    ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig, sha256_hex,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 const MAX_TOOL_ROUNDS: usize = 8;
+const TASK_STATE_TOOL_NAME: &str = "update_task_state";
 
 #[derive(Debug, Clone, Default)]
 struct ConversationState {
@@ -174,29 +178,35 @@ impl Agent {
         let store = SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref())
             .ok()
             .map(Arc::new);
-        let runtime = ToolRegistryRuntime::new(store.clone(), redactor.clone());
-        let tools = ToolRegistry::new_with_configs_and_skills(
+        let registry_runtime = ToolRegistryRuntime::new(store.clone(), redactor.clone());
+        let tools = ToolRegistry::new_with_configs_skills_and_mcp(
             config.workspace_root.clone(),
-            output_config.clone(),
-            web_config.clone(),
+            ToolRuntimeConfig {
+                output: output_config.clone(),
+                web: web_config.clone(),
+                shell_sandbox: config.permissions.shell_sandbox.clone(),
+                mcp_servers: config.mcp_servers.clone(),
+            },
             config.skills.clone(),
             &config.graph,
-            config.permissions.shell_sandbox.clone(),
-            runtime.clone(),
+            registry_runtime.clone(),
         )
         .unwrap_or_else(|_| {
             // Workspace root unavailable; fall back to the current
             // directory but keep the configured redactor and graph
             // policy so the agent never silently downgrades to
             // default patterns or default crawl options.
-            ToolRegistry::new_with_configs_and_skills(
+            ToolRegistry::new_with_configs_skills_and_mcp(
                 ".",
-                output_config,
-                web_config,
+                ToolRuntimeConfig {
+                    output: output_config,
+                    web: web_config,
+                    shell_sandbox: config.permissions.shell_sandbox.clone(),
+                    mcp_servers: config.mcp_servers.clone(),
+                },
                 config.skills.clone(),
                 &config.graph,
-                config.permissions.shell_sandbox.clone(),
-                runtime,
+                registry_runtime,
             )
             .expect("current directory must be a valid tool root")
         });
@@ -391,14 +401,23 @@ impl Agent {
         input: String,
         cancel: CancellationToken,
     ) -> mpsc::Receiver<AgentEvent> {
+        self.start_turn_with_response_verbosity(input, cancel, self.config.tui.response_verbosity)
+    }
+
+    pub fn start_turn_with_response_verbosity(
+        &self,
+        input: String,
+        cancel: CancellationToken,
+        response_verbosity: ResponseVerbosity,
+    ) -> mpsc::Receiver<AgentEvent> {
         let (tx, rx) = mpsc::channel(128);
         let provider = self.provider.clone();
-        let config = self.config.clone();
+        let mut config = self.config.clone();
+        config.tui.response_verbosity = response_verbosity;
         let tools = self.tools.clone();
         let telemetry = self.telemetry.clone();
         let redactor = self.redactor.clone();
         let session_metrics = self.session_metrics.clone();
-        let all_tool_specs = tools.specs().into_iter().map(advertised_tool).collect();
         let turn_id = TurnId::new(self.next_turn_id.fetch_add(1, Ordering::Relaxed));
         let approval_ids = self.next_approval_id.clone();
         let session_rules = self.session_rules.clone();
@@ -406,10 +425,15 @@ impl Agent {
         let session_log = self.session_log.clone();
         let conversation_state = self.conversation_state.clone();
         let store = self.store.clone();
+        let task_state = Arc::new(Mutex::new(None));
 
         tokio::spawn(async move {
             let redacted_input = redactor.redact(&input);
+            let task_title = redacted_input.text.clone();
             let failure_session_log = session_log.clone();
+            // Echo the user message into the TUI before kicking MCP
+            // discovery so a slow/flaky external server never delays the
+            // prompt the user just submitted.
             if tx
                 .send(AgentEvent::UserMessage {
                     turn_id,
@@ -420,6 +444,19 @@ impl Agent {
             {
                 return;
             }
+            let mcp_errors = tools.refresh_mcp_tools(cancel.clone()).await;
+            for error in mcp_errors {
+                log_session_event(
+                    session_log.as_ref(),
+                    &redactor,
+                    "mcp_discovery_error",
+                    Some(turn_id),
+                    Some(error.clone()),
+                    json!({ "error": error }),
+                );
+            }
+            let mut all_tool_specs = vec![task_state_advertised_tool()];
+            all_tool_specs.extend(tools.specs().into_iter().map(advertised_tool));
 
             let outcome = TurnRuntime {
                 turn_id,
@@ -439,12 +476,28 @@ impl Agent {
                 session_log,
                 conversation_state,
                 store,
+                task_state: task_state.clone(),
             }
-            .run(redacted_input.text)
+            .run(task_title.clone())
             .await;
 
             if let Err(error) = outcome {
                 let error = redact_error(error, &redactor);
+                let latest_task_state = task_state.lock().await.clone();
+                publish_task_state_update(
+                    &tx,
+                    failure_session_log.as_ref(),
+                    &redactor,
+                    &task_state,
+                    turn_id,
+                    TaskStateSnapshot::terminal_from(
+                        latest_task_state.as_ref(),
+                        task_title,
+                        TaskStateStatus::Failed,
+                        Some(error.to_string()),
+                    ),
+                )
+                .await;
                 if let Some(session) = failure_session_log {
                     let _ = session.append_event(SessionEvent::new(
                         "failed",
@@ -487,16 +540,68 @@ struct TurnRuntime {
     session_log: Option<SessionHandle>,
     conversation_state: Arc<Mutex<ConversationState>>,
     store: Option<Arc<SqueezyStore>>,
+    task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
+}
+
+fn request_response_verbosity(
+    config: &AppConfig,
+    provider_name: &str,
+) -> Option<ResponseVerbosity> {
+    capabilities_for(provider_name, &config.model)
+        .filter(|capabilities| capabilities.text_verbosity)
+        .map(|_| config.tui.response_verbosity)
+}
+
+fn request_reasoning_effort(
+    config: &AppConfig,
+    provider_name: &str,
+) -> Option<squeezy_core::ReasoningEffort> {
+    let effort = config.reasoning_effort?;
+    capabilities_for(provider_name, &config.model)
+        .filter(|capabilities| capabilities.reasoning_effort)
+        .map(|_| effort)
+}
+
+fn instructions_with_response_verbosity(
+    instructions: &str,
+    verbosity: ResponseVerbosity,
+    native_text_verbosity: bool,
+) -> String {
+    // Cost-first: skip the prompt-side hint when the model already
+    // accepts the `text.verbosity` API parameter (one signal is enough)
+    // and when the value is the implicit default (Normal). This keeps
+    // the system prompt lean on the common path.
+    if native_text_verbosity || verbosity == ResponseVerbosity::Normal {
+        return instructions.to_string();
+    }
+    let guidance = match verbosity {
+        ResponseVerbosity::Concise => {
+            "Response verbosity: concise. Prefer short, direct answers unless the task requires detail."
+        }
+        ResponseVerbosity::Verbose => {
+            "Response verbosity: verbose. Include fuller rationale, context, and verification details when useful."
+        }
+        ResponseVerbosity::Normal => unreachable!("handled above"),
+    };
+    format!("{instructions}\n\n{guidance}")
 }
 
 impl TurnRuntime {
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
+        let task_title = input.clone();
         let user_transcript = TranscriptItem::user(input.clone());
         let activation = self.tools.activate_skills_for_input(&input)?;
-        let raw_instructions = match self.tools.format_active_skills(&activation.skills) {
+        let base_instructions = match self.tools.format_active_skills(&activation.skills) {
             Some(skills) => format!("{}\n\n{}", self.config.instructions, skills),
             None => self.config.instructions.clone(),
         };
+        let native_text_verbosity = capabilities_for(self.provider.name(), &self.config.model)
+            .is_some_and(|capabilities| capabilities.text_verbosity);
+        let raw_instructions = instructions_with_response_verbosity(
+            &base_instructions,
+            self.config.tui.response_verbosity,
+            native_text_verbosity,
+        );
         let user_item = LlmInputItem::UserText(activation.task_input);
         let mut prior_state = self.conversation_state.lock().await.clone();
         let mut conversation = prior_state.conversation.clone();
@@ -536,6 +641,8 @@ impl TurnRuntime {
             user_item_summary(&user_item),
             json!({}),
         );
+        self.publish_task_state(TaskStateSnapshot::starting(task_title.clone()))
+            .await;
 
         for _round in 0..MAX_TOOL_ROUNDS {
             let active_mode = load_session_mode(&self.session_mode);
@@ -544,6 +651,8 @@ impl TurnRuntime {
                 instructions: request_instructions.clone(),
                 input: redact_llm_input_items(&next_input, &self.redactor),
                 max_output_tokens: self.config.max_output_tokens,
+                response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
+                reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
                 previous_response_id: previous_response_id.clone(),
                 tools: advertised_tool_specs(&self.all_tool_specs, active_mode),
                 store: self.config.store_responses,
@@ -636,6 +745,12 @@ impl TurnRuntime {
                         // or `finish_session`). Recording the event here
                         // still makes the cancellation discoverable in
                         // `events.jsonl` and `squeezy sessions show`.
+                        self.publish_terminal_task_state(
+                            TaskStateStatus::Cancelled,
+                            Some("turn cancelled".to_string()),
+                            &task_title,
+                        )
+                        .await;
                         self.log_event(
                             "cancelled",
                             Some(self.turn_id),
@@ -660,6 +775,8 @@ impl TurnRuntime {
                 broker.metrics.redactions += assistant_stream.total_redactions();
                 let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
                 conversation.push(LlmInputItem::AssistantText(message.content.clone()));
+                self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
+                    .await;
                 self.persist_turn_state(
                     &conversation,
                     previous_response_id.clone(),
@@ -689,6 +806,8 @@ impl TurnRuntime {
                 broker.metrics.redactions += assistant_stream.total_redactions();
                 let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
                 conversation.push(LlmInputItem::AssistantText(message.content.clone()));
+                self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
+                    .await;
                 self.persist_turn_state(
                     &conversation,
                     response_id.clone(),
@@ -727,6 +846,7 @@ impl TurnRuntime {
                     session_rules: self.session_rules.clone(),
                     session_mode: self.session_mode.clone(),
                     session_log: self.session_log.clone(),
+                    task_state: self.task_state.clone(),
                 },
                 &mut broker,
             )
@@ -819,16 +939,59 @@ impl TurnRuntime {
             });
         }
         drop(state);
+        let summary = self.current_task_summary().await.unwrap_or_else(|| {
+            if assistant.content.trim().is_empty() {
+                "assistant completed".to_string()
+            } else {
+                assistant.content.clone()
+            }
+        });
         self.log_event(
             "assistant_completed",
             Some(self.turn_id),
-            Some(assistant.content),
+            Some(summary),
             json!({
                 "response_id": response_id,
                 "cost": cost,
                 "metrics": metrics,
             }),
         );
+    }
+
+    async fn publish_task_state(&self, snapshot: TaskStateSnapshot) {
+        publish_task_state_update(
+            &self.tx,
+            self.session_log.as_ref(),
+            &self.redactor,
+            &self.task_state,
+            self.turn_id,
+            snapshot,
+        )
+        .await;
+    }
+
+    async fn publish_terminal_task_state(
+        &self,
+        status: TaskStateStatus,
+        summary: Option<String>,
+        fallback_task: &str,
+    ) {
+        let latest = self.task_state.lock().await.clone();
+        self.publish_task_state(TaskStateSnapshot::terminal_from(
+            latest.as_ref(),
+            fallback_task.to_string(),
+            status,
+            summary,
+        ))
+        .await;
+    }
+
+    async fn current_task_summary(&self) -> Option<String> {
+        self.task_state
+            .lock()
+            .await
+            .as_ref()
+            .map(TaskStateSnapshot::compact_summary)
     }
 
     fn log_event(
@@ -886,6 +1049,106 @@ struct ToolExecutionContext<'a> {
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
     session_mode: Arc<AtomicU8>,
     session_log: Option<SessionHandle>,
+    task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
+}
+
+async fn handle_task_state_call(context: &ToolExecutionContext<'_>, call: &ToolCall) -> ToolResult {
+    let snapshot = match serde_json::from_value::<TaskStateSnapshot>(call.arguments.clone()) {
+        Ok(snapshot) => snapshot.normalized(),
+        Err(error) => {
+            return control_tool_result(
+                call,
+                ToolStatus::Error,
+                json!({ "ok": false, "error": format!("invalid task state: {error}") }),
+            );
+        }
+    };
+    publish_task_state_update(
+        &context.tx,
+        context.session_log.as_ref(),
+        &context.redactor,
+        &context.task_state,
+        context.turn_id,
+        snapshot.clone(),
+    )
+    .await;
+    control_tool_result(
+        call,
+        ToolStatus::Success,
+        json!({ "ok": true, "summary": snapshot.compact_summary() }),
+    )
+}
+
+async fn publish_task_state_update(
+    tx: &mpsc::Sender<AgentEvent>,
+    session_log: Option<&SessionHandle>,
+    redactor: &Redactor,
+    task_state: &Arc<Mutex<Option<TaskStateSnapshot>>>,
+    turn_id: TurnId,
+    snapshot: TaskStateSnapshot,
+) {
+    let snapshot = redact_task_state(snapshot.normalized(), redactor);
+    {
+        let mut state = task_state.lock().await;
+        *state = Some(snapshot.clone());
+    }
+    log_session_event(
+        session_log,
+        redactor,
+        "task_state",
+        Some(turn_id),
+        Some(snapshot.compact_summary()),
+        json!({ "snapshot": snapshot }),
+    );
+    let _ = tx
+        .send(AgentEvent::TaskStateUpdated { turn_id, snapshot })
+        .await;
+}
+
+fn redact_task_state(mut snapshot: TaskStateSnapshot, redactor: &Redactor) -> TaskStateSnapshot {
+    snapshot.task = redactor.redact(&snapshot.task).text;
+    snapshot.summary = snapshot.summary.map(|value| redactor.redact(&value).text);
+    snapshot.blocker = snapshot.blocker.map(|value| redactor.redact(&value).text);
+    snapshot.next_action = snapshot
+        .next_action
+        .map(|value| redactor.redact(&value).text);
+    snapshot.replan_reason = snapshot
+        .replan_reason
+        .map(|value| redactor.redact(&value).text);
+    snapshot.steps = snapshot
+        .steps
+        .into_iter()
+        .map(|mut step| {
+            step.title = redactor.redact(&step.title).text;
+            step.detail = step.detail.map(|value| redactor.redact(&value).text);
+            step
+        })
+        .collect();
+    snapshot.recent_changes = snapshot
+        .recent_changes
+        .into_iter()
+        .map(|value| redactor.redact(&value).text)
+        .collect();
+    snapshot.normalized()
+}
+
+fn control_tool_result(call: &ToolCall, status: ToolStatus, content: Value) -> ToolResult {
+    let output = serde_json::to_vec(&content).unwrap_or_default();
+    ToolResult {
+        call_id: call.call_id.clone(),
+        tool_name: call.name.clone(),
+        status,
+        content,
+        cost_hint: ToolCostHint {
+            output_bytes: output.len() as u64,
+            ..ToolCostHint::default()
+        },
+        receipt: ToolReceipt {
+            output_sha256: sha256_hex(output),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    }
 }
 
 async fn execute_tool_calls(
@@ -898,6 +1161,12 @@ async fn execute_tool_calls(
     let mut recorded = vec![false; calls.len()];
 
     for (index, call) in calls.iter().enumerate() {
+        if call.name == TASK_STATE_TOOL_NAME {
+            results[index] = Some(handle_task_state_call(&context, call).await);
+            recorded[index] = true;
+            continue;
+        }
+
         let tool_sequence = match broker.reserve_call() {
             Ok(tool_sequence) => tool_sequence,
             Err((tool_sequence, reason)) => {
@@ -1464,6 +1733,7 @@ async fn permission_decision(
                         "user denied and persisted a project rule",
                     ))
                 }
+                Ok(ToolApprovalDecision::Cancelled) => ApprovalDecision::Cancelled,
                 Err(_) => ApprovalDecision::Denied("approval was not answered".to_string()),
             }
         }
@@ -1605,6 +1875,8 @@ Working target: {:?}",
             .to_string(),
         input: vec![LlmInputItem::UserText(prompt)],
         max_output_tokens: Some(80),
+        response_verbosity: None,
+        reasoning_effort: None,
         previous_response_id: None,
         tools: Vec::new(),
         store: false,
@@ -1694,8 +1966,8 @@ fn legacy_scope_for_capability(capability: PermissionCapability) -> PermissionSc
         PermissionCapability::Read | PermissionCapability::Search => PermissionScope::Read,
         PermissionCapability::Edit => PermissionScope::Edit,
         PermissionCapability::Network => PermissionScope::Web,
+        PermissionCapability::Mcp => PermissionScope::Mcp,
         PermissionCapability::Shell
-        | PermissionCapability::Mcp
         | PermissionCapability::Git
         | PermissionCapability::Compiler
         | PermissionCapability::Destructive => PermissionScope::Shell,
@@ -1866,6 +2138,44 @@ pub(crate) fn advertised_tool(spec: ToolSpec) -> AdvertisedTool {
     }
 }
 
+fn task_state_advertised_tool() -> AdvertisedTool {
+    AdvertisedTool {
+        capability: PermissionCapability::Read,
+        spec: LlmToolSpec {
+            name: TASK_STATE_TOOL_NAME.to_string(),
+            description: "Update the visible task/plan/progress state for the current turn. Use this for task title, step statuses, blockers, recent changes, next action, verification state, and replan reasons.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "task": {"type": "string", "description": "Short task title."},
+                    "status": {"type": "string", "enum": ["running", "blocked", "completed", "cancelled", "failed"], "description": "Overall task state. Default running."},
+                    "summary": {"type": ["string", "null"], "description": "Short state summary."},
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "title": {"type": "string"},
+                                "status": {"type": "string", "enum": ["pending", "active", "completed", "blocked", "skipped"]},
+                                "detail": {"type": ["string", "null"]}
+                            }
+                        },
+                        "description": "Ordered plan/progress steps."
+                    },
+                    "blocker": {"type": ["string", "null"], "description": "Current blocker, if any."},
+                    "next_action": {"type": ["string", "null"], "description": "What the agent intends to do next."},
+                    "verification": {"type": "string", "enum": ["not_started", "running", "passed", "failed", "skipped"], "description": "Verification state. Default not_started."},
+                    "recent_changes": {"type": "array", "items": {"type": "string"}, "description": "Short bullets for user-visible changes already made."},
+                    "replan_reason": {"type": ["string", "null"], "description": "Why the plan changed, if it changed."}
+                }
+            }),
+            strict: false,
+        },
+    }
+}
+
 fn advertised_tool_specs(tools: &[AdvertisedTool], mode: SessionMode) -> Vec<LlmToolSpec> {
     tools
         .iter()
@@ -1979,6 +2289,8 @@ fn redact_error(error: SqueezyError, redactor: &Redactor) -> SqueezyError {
 fn merge_cost(total: &mut CostSnapshot, next: &CostSnapshot) {
     total.input_tokens = add_optional(total.input_tokens, next.input_tokens);
     total.output_tokens = add_optional(total.output_tokens, next.output_tokens);
+    total.reasoning_output_tokens =
+        add_optional(total.reasoning_output_tokens, next.reasoning_output_tokens);
     total.cached_input_tokens = add_optional(total.cached_input_tokens, next.cached_input_tokens);
     total.cache_write_input_tokens = add_optional(
         total.cache_write_input_tokens,
@@ -2260,7 +2572,21 @@ fn is_receipt_stub_candidate(result: &ToolResult) -> bool {
     result.status == ToolStatus::Success
         && matches!(
             result.tool_name.as_str(),
-            "glob" | "grep" | "read_file" | "read_tool_output" | "webfetch" | "websearch"
+            "decl_search"
+                | "definition_search"
+                | "downstream_flow"
+                | "glob"
+                | "grep"
+                | "hierarchy"
+                | "read_file"
+                | "read_slice"
+                | "read_tool_output"
+                | "reference_search"
+                | "repo_map"
+                | "symbol_context"
+                | "upstream_flow"
+                | "webfetch"
+                | "websearch"
         )
 }
 
@@ -2442,6 +2768,7 @@ pub enum ToolApprovalDecision {
     DenyOnce,
     DenyRuleUser,
     DenyRuleProject,
+    Cancelled,
 }
 
 enum ApprovalDecision {
@@ -2474,6 +2801,10 @@ pub enum AgentEvent {
     ToolCallCompleted {
         turn_id: TurnId,
         result: ToolResult,
+    },
+    TaskStateUpdated {
+        turn_id: TurnId,
+        snapshot: TaskStateSnapshot,
     },
     ApprovalRequested {
         turn_id: TurnId,
