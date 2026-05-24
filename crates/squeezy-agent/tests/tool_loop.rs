@@ -21,13 +21,19 @@ use squeezy_tools::sha256_hex;
 use tokio_util::sync::CancellationToken;
 
 struct ScriptedProvider {
+    name: &'static str,
     responses: Mutex<VecDeque<Vec<Result<LlmEvent>>>>,
     requests: Mutex<Vec<LlmRequest>>,
 }
 
 impl ScriptedProvider {
     fn new(responses: Vec<Vec<Result<LlmEvent>>>) -> Self {
+        Self::named("scripted", responses)
+    }
+
+    fn named(name: &'static str, responses: Vec<Vec<Result<LlmEvent>>>) -> Self {
         Self {
+            name,
             responses: Mutex::new(responses.into()),
             requests: Mutex::new(Vec::new()),
         }
@@ -40,7 +46,7 @@ impl ScriptedProvider {
 
 impl LlmProvider for ScriptedProvider {
     fn name(&self) -> &'static str {
-        "scripted"
+        self.name
     }
 
     fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
@@ -1624,6 +1630,31 @@ async fn resumed_session_preserves_cumulative_cost_and_metrics() {
 }
 
 #[tokio::test]
+async fn empty_session_accounting_snapshot_reports_zero_completed_state() {
+    let root = temp_workspace("empty_accounting");
+    let provider = Arc::new(ScriptedProvider::named("openai", Vec::new()));
+    let mut config = config_for(root.clone());
+    config.model = squeezy_core::DEFAULT_OPENAI_MODEL.to_string();
+    let agent = Agent::new(config, provider);
+
+    let snapshot = agent.session_accounting_snapshot().await;
+
+    assert_eq!(snapshot.provider, "openai");
+    assert_eq!(snapshot.metrics.turns, 0);
+    assert_eq!(snapshot.cost.input_tokens, None);
+    assert_eq!(snapshot.transcript.items, 0);
+    assert_eq!(snapshot.conversation.items, 0);
+    assert_eq!(
+        snapshot.transmitted_request.context_window_tokens,
+        Some(400_000)
+    );
+    assert!(snapshot.transmitted_request.input_tokens > 0);
+    assert!(!snapshot.provider_stored_context_active());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn automatic_context_compaction_replaces_old_raw_history() {
     let root = temp_workspace("auto_context_compaction");
     let provider = Arc::new(ScriptedProvider::new(vec![
@@ -1691,6 +1722,54 @@ async fn automatic_context_compaction_replaces_old_raw_history() {
 }
 
 #[tokio::test]
+async fn store_responses_accounting_marks_provider_stored_context_gap() {
+    let root = temp_workspace("store_response_accounting");
+    let provider = Arc::new(ScriptedProvider::named(
+        "openai",
+        vec![vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("stored answer".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_stored".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(100),
+                    output_tokens: Some(25),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ]],
+    ));
+    let mut config = config_for(root.clone());
+    config.model = squeezy_core::DEFAULT_OPENAI_MODEL.to_string();
+    config.store_responses = true;
+    let agent = Agent::new(config, provider);
+
+    drain_turn(agent.start_turn("first prompt".to_string(), CancellationToken::new())).await;
+    let snapshot = agent.session_accounting_snapshot().await;
+
+    assert!(snapshot.provider_stored_context_active());
+    assert_eq!(
+        snapshot.previous_response_id.as_deref(),
+        Some("resp_stored")
+    );
+    assert_eq!(snapshot.metrics.turns, 1);
+    assert_eq!(snapshot.cost.input_tokens, Some(100));
+    assert!(snapshot.full_history_request.input_tokens > snapshot.transmitted_request.input_tokens);
+    assert_eq!(
+        snapshot.transmitted_request.context_window_tokens,
+        Some(400_000)
+    );
+    assert!(
+        snapshot
+            .transmitted_request
+            .used_input_percent_x100
+            .is_some()
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn manual_context_compaction_preserves_pins_in_resume_state() {
     let root = temp_workspace("manual_context_compaction");
     let provider = Arc::new(ScriptedProvider::new(vec![vec![
@@ -1748,10 +1827,6 @@ async fn auto_compaction_does_not_orphan_function_call_output() {
     let root = temp_workspace("auto_compaction_pair");
     fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
     let provider = Arc::new(ScriptedProvider::new(vec![
-        // First turn: a single tool round (read_file) + a heavy assistant
-        // reply so the next turn crosses the compaction threshold. The
-        // resulting persisted conversation pattern is:
-        //   [UserText, FunctionCall(read_call), FunctionCallOutput(read_call), AssistantText]
         vec![
             Ok(LlmEvent::Started),
             Ok(LlmEvent::ToolCall(LlmToolCall {
@@ -1775,9 +1850,6 @@ async fn auto_compaction_does_not_orphan_function_call_output() {
                 cost: CostSnapshot::default(),
             }),
         ],
-        // Second turn: a small text completion. The pre-turn compaction
-        // must not split between the FunctionCall and its
-        // FunctionCallOutput.
         vec![
             Ok(LlmEvent::Started),
             Ok(LlmEvent::TextDelta("second answer".to_string())),
@@ -1851,8 +1923,6 @@ async fn pinned_context_is_visible_to_model_before_compaction() {
         ],
     ]));
     let mut config = config_for(root.clone());
-    // Set thresholds high enough that compaction never auto-fires; the
-    // pin must still reach the model.
     config.context_compaction = ContextCompactionConfig {
         enabled: true,
         estimated_tokens: 1_000_000,
