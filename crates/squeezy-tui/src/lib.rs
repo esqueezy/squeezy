@@ -59,8 +59,150 @@ const QUIET: Color = Color::DarkGray;
 const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
 const PROMPT_MIN_HEIGHT: u16 = 3;
 const PROMPT_MAX_HEIGHT: u16 = 8;
+const SLASH_MENU_MAX_ITEMS: usize = 5;
 const ENABLE_ALTERNATE_SCROLL: &str = "\x1b[?1007h";
 const DISABLE_ALTERNATE_SCROLL: &str = "\x1b[?1007l";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlashCommand {
+    name: &'static str,
+    description: &'static str,
+}
+
+const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "/help",
+        description: "show local Squeezy help topics",
+    },
+    SlashCommand {
+        name: "/model",
+        description: "show current provider and model",
+    },
+    SlashCommand {
+        name: "/permissions",
+        description: "show current permission policy",
+    },
+    SlashCommand {
+        name: "/plan",
+        description: "switch to Plan mode",
+    },
+    SlashCommand {
+        name: "/build",
+        description: "switch to Build mode",
+    },
+    SlashCommand {
+        name: "/cost",
+        description: "show token and cost accounting",
+    },
+    SlashCommand {
+        name: "/context",
+        description: "show context budget and compaction state",
+    },
+    SlashCommand {
+        name: "/attach",
+        description: "attach a file as prompt context",
+    },
+    SlashCommand {
+        name: "/attachments",
+        description: "list attached context",
+    },
+    SlashCommand {
+        name: "/copy",
+        description: "copy last answer or transcript",
+    },
+    SlashCommand {
+        name: "/compact",
+        description: "compact conversation context now",
+    },
+    SlashCommand {
+        name: "/collapse",
+        description: "collapse transcript entries",
+    },
+    SlashCommand {
+        name: "/expand",
+        description: "expand transcript entries",
+    },
+    SlashCommand {
+        name: "/jobs",
+        description: "list background jobs",
+    },
+    SlashCommand {
+        name: "/job",
+        description: "show a background job",
+    },
+    SlashCommand {
+        name: "/job-cancel",
+        description: "cancel a background job",
+    },
+    SlashCommand {
+        name: "/pin",
+        description: "pin transcript context",
+    },
+    SlashCommand {
+        name: "/pins",
+        description: "list pinned context",
+    },
+    SlashCommand {
+        name: "/unpin",
+        description: "remove pinned context",
+    },
+    SlashCommand {
+        name: "/feedback",
+        description: "preview or send product feedback",
+    },
+    SlashCommand {
+        name: "/report",
+        description: "preview or send a bug report",
+    },
+    SlashCommand {
+        name: "/sessions",
+        description: "list recent sessions",
+    },
+    SlashCommand {
+        name: "/session",
+        description: "show a saved session",
+    },
+    SlashCommand {
+        name: "/resume",
+        description: "resume a saved session",
+    },
+    SlashCommand {
+        name: "/session-export",
+        description: "export a saved session",
+    },
+    SlashCommand {
+        name: "/session-cleanup",
+        description: "remove old sessions",
+    },
+    SlashCommand {
+        name: "/checkpoints",
+        description: "list local checkpoints",
+    },
+    SlashCommand {
+        name: "/checkpoint",
+        description: "show a local checkpoint",
+    },
+    SlashCommand {
+        name: "/undo",
+        description: "undo the latest checkpoint",
+    },
+    SlashCommand {
+        name: "/revert-turn",
+        description: "revert a turn checkpoint",
+    },
+    SlashCommand {
+        name: "/verbosity",
+        description: "set answer verbosity",
+    },
+    SlashCommand {
+        name: "/tool-verbosity",
+        description: "set tool output verbosity",
+    },
+    SlashCommand {
+        name: "/detach",
+        description: "remove attached context",
+    },
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StartupProfile {
@@ -415,6 +557,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         && (key.code == KeyCode::Char('j') || key.code == KeyCode::Enter)
     {
         app.input.push('\n');
+        note_input_edited(app);
         return Ok(false);
     }
 
@@ -479,11 +622,25 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             Ok(false)
         }
         KeyCode::Up => {
-            select_previous_transcript_entry(app);
+            if move_slash_menu_selection(app, SelectionDirection::Previous) {
+                return Ok(false);
+            }
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                select_previous_transcript_entry(app);
+            } else {
+                recall_prompt_history(app, HistoryDirection::Previous);
+            }
             Ok(false)
         }
         KeyCode::Down => {
-            select_next_transcript_entry(app);
+            if move_slash_menu_selection(app, SelectionDirection::Next) {
+                return Ok(false);
+            }
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                select_next_transcript_entry(app);
+            } else {
+                recall_prompt_history(app, HistoryDirection::Next);
+            }
             Ok(false)
         }
         KeyCode::Enter => {
@@ -491,9 +648,13 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
                 app.status = "turn already running; press Ctrl-C to cancel".to_string();
                 return Ok(false);
             }
+            if complete_selected_slash_command(app) {
+                return Ok(false);
+            }
             if app.input.ends_with('\\') {
                 app.input.pop();
                 app.input.push('\n');
+                note_input_edited(app);
                 return Ok(false);
             }
             let input = app.input.trim().to_string();
@@ -501,10 +662,19 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
                 app.status = "enter a prompt first".to_string();
                 return Ok(false);
             }
-            app.input.clear();
             if handle_slash_command(app, agent, &input).await {
+                app.input.clear();
+                app.input_history_index = None;
+                app.input_history_draft.clear();
+                app.slash_menu_index = 0;
                 return Ok(false);
             }
+            if input.starts_with('/') {
+                app.status = "unknown command; use Up/Down to choose a / command".to_string();
+                return Ok(false);
+            }
+            app.input.clear();
+            push_input_history(app, input.clone());
             let cancel = CancellationToken::new();
             app.task_state = None;
             app.task_panel_collapsed = false;
@@ -520,11 +690,13 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         }
         KeyCode::Backspace => {
             app.input.pop();
+            note_input_edited(app);
             Ok(false)
         }
         KeyCode::Char(ch) => {
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
                 app.input.push(ch);
+                note_input_edited(app);
             }
             Ok(false)
         }
@@ -539,6 +711,7 @@ async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Resu
     }
     if is_inline_paste(&text) {
         app.input.push_str(&text);
+        note_input_edited(app);
         return Ok(());
     }
     match agent.attach_pasted_context(text).await {
@@ -553,6 +726,133 @@ async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Resu
 
 fn is_inline_paste(text: &str) -> bool {
     text.len() <= INLINE_PASTE_MAX_BYTES && !text.contains('\n') && !text.contains('\r')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionDirection {
+    Previous,
+    Next,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryDirection {
+    Previous,
+    Next,
+}
+
+fn note_input_edited(app: &mut TuiApp) {
+    app.input_history_index = None;
+    app.input_history_draft.clear();
+    clamp_slash_menu_index(app);
+}
+
+fn push_input_history(app: &mut TuiApp, input: String) {
+    if input.trim().is_empty() || input.starts_with('/') {
+        return;
+    }
+    if app.input_history.last().is_some_and(|last| last == &input) {
+        return;
+    }
+    app.input_history.push(input);
+    if app.input_history.len() > 100 {
+        app.input_history.remove(0);
+    }
+}
+
+fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirection) {
+    if app.input_history.is_empty() {
+        app.status = "no prompt history".to_string();
+        return;
+    }
+    if app.input_history_index.is_none() && !app.input.trim().is_empty() {
+        return;
+    }
+    let last = app.input_history.len() - 1;
+    let next = match (app.input_history_index, direction) {
+        (None, HistoryDirection::Previous) => {
+            app.input_history_draft = app.input.clone();
+            Some(last)
+        }
+        (None, HistoryDirection::Next) => return,
+        (Some(0), HistoryDirection::Previous) => Some(0),
+        (Some(index), HistoryDirection::Previous) => Some(index - 1),
+        (Some(index), HistoryDirection::Next) if index >= last => {
+            app.input = app.input_history_draft.clone();
+            app.input_history_draft.clear();
+            app.input_history_index = None;
+            app.slash_menu_index = 0;
+            return;
+        }
+        (Some(index), HistoryDirection::Next) => Some(index + 1),
+    };
+    if let Some(index) = next {
+        app.input = app.input_history[index].clone();
+        app.input_history_index = Some(index);
+        app.selected_entry = None;
+        app.slash_menu_index = 0;
+    }
+}
+
+fn slash_suggestions(input: &str) -> Vec<SlashCommand> {
+    if !is_slash_completion_input(input) {
+        return Vec::new();
+    }
+    let prefix = input.trim();
+    SLASH_COMMANDS
+        .iter()
+        .copied()
+        .filter(|command| command.name.starts_with(prefix))
+        .take(SLASH_MENU_MAX_ITEMS)
+        .collect()
+}
+
+fn is_slash_completion_input(input: &str) -> bool {
+    let trimmed = input.trim();
+    trimmed.starts_with('/')
+        && !trimmed[1..].contains(char::is_whitespace)
+        && !trimmed.contains('\n')
+}
+
+fn clamp_slash_menu_index(app: &mut TuiApp) {
+    let count = slash_suggestions(&app.input).len();
+    if count == 0 {
+        app.slash_menu_index = 0;
+    } else if app.slash_menu_index >= count {
+        app.slash_menu_index = count - 1;
+    }
+}
+
+fn move_slash_menu_selection(app: &mut TuiApp, direction: SelectionDirection) -> bool {
+    let count = slash_suggestions(&app.input).len();
+    if count == 0 {
+        return false;
+    }
+    app.slash_menu_index = match direction {
+        SelectionDirection::Previous => {
+            if app.slash_menu_index == 0 {
+                count - 1
+            } else {
+                app.slash_menu_index - 1
+            }
+        }
+        SelectionDirection::Next => (app.slash_menu_index + 1) % count,
+    };
+    true
+}
+
+fn complete_selected_slash_command(app: &mut TuiApp) -> bool {
+    let suggestions = slash_suggestions(&app.input);
+    if suggestions.is_empty() {
+        return false;
+    }
+    let selected = suggestions[app.slash_menu_index.min(suggestions.len() - 1)];
+    if app.input.trim() == selected.name {
+        return false;
+    }
+    app.input = format!("{} ", selected.name);
+    app.slash_menu_index = 0;
+    app.status = format!("selected {}", selected.name);
+    true
 }
 
 fn cancel_active_turn(app: &mut TuiApp) -> bool {
@@ -591,6 +891,23 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         }
         "/help" => {
             handle_help_command(app, rest);
+            return true;
+        }
+        "/model" => {
+            app.status = "model settings".to_string();
+            app.push_transcript_item(TranscriptItem::system(format!(
+                "Model\nprovider={}\nmodel={}\nchange=exit and run `squeezy --no-default`, or start with `--provider <id> --model <id>`",
+                app.provider_name, app.model
+            )));
+            return true;
+        }
+        "/permissions" => {
+            app.status = "permission settings".to_string();
+            app.push_transcript_item(TranscriptItem::system(format!(
+                "Permissions\n{}\nsandbox={}",
+                app.permissions.compact(),
+                app.permissions.sandbox
+            )));
             return true;
         }
         "/feedback" => {
@@ -2472,6 +2789,7 @@ fn short_hash(hash: &str) -> &str {
 fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
     prompt_visual_line_count(&app.input, width)
         .saturating_add(2)
+        .saturating_add(slash_suggestions(&app.input).len())
         .clamp(PROMPT_MIN_HEIGHT as usize, PROMPT_MAX_HEIGHT as usize) as u16
 }
 
@@ -2545,8 +2863,46 @@ fn prompt_input_lines(app: &TuiApp, height: u16) -> Vec<Line<'static>> {
     lines
 }
 
+fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
+    let suggestions = slash_suggestions(&app.input);
+    let command_width = suggestions
+        .iter()
+        .map(|command| command.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(12);
+    suggestions
+        .iter()
+        .enumerate()
+        .map(|(index, command)| {
+            let selected = index
+                == app
+                    .slash_menu_index
+                    .min(suggestions.len().saturating_sub(1));
+            let marker = if selected { "› " } else { "  " };
+            let command_padding =
+                " ".repeat(command_width.saturating_sub(command.name.chars().count()) + 2);
+            Line::from(vec![
+                Span::styled(
+                    marker,
+                    Style::default().fg(if selected { GOLD } else { QUIET }),
+                ),
+                Span::styled(
+                    command.name,
+                    Style::default().fg(if selected { GOLD } else { AMBER }),
+                ),
+                Span::styled(command_padding, Style::default().fg(QUIET)),
+                Span::styled(command.description, Style::default().fg(QUIET)),
+            ])
+        })
+        .collect()
+}
+
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let lines = prompt_input_lines(app, area.height);
+    let suggestion_lines = slash_suggestion_lines(app);
+    let prompt_height = area.height.saturating_sub(suggestion_lines.len() as u16);
+    let mut lines = prompt_input_lines(app, prompt_height);
+    lines.extend(suggestion_lines);
     let scroll = lines.len().saturating_sub(area.height as usize) as u16;
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(Color::White).bg(PROMPT_BG))
@@ -2670,7 +3026,7 @@ fn format_status_hints(app: &TuiApp) -> &'static str {
     } else if app.exit_armed {
         "Esc again to exit · Enter send · Ctrl+J newline · Ctrl-P task · Ctrl-E fold · /help"
     } else {
-        "Enter send · Ctrl+J newline · \\+Enter newline · Ctrl-P task · Ctrl-E fold · /help · Esc quit"
+        "Enter send · Up/Down history or / menu · Ctrl+J newline · Shift+Up/Down transcript · /help · Esc quit"
     }
 }
 
@@ -2931,6 +3287,10 @@ struct TuiApp {
     permissions: PermissionStatus,
     telemetry: TelemetryStatus,
     input: String,
+    input_history: Vec<String>,
+    input_history_index: Option<usize>,
+    input_history_draft: String,
+    slash_menu_index: usize,
     attachments: Vec<ContextAttachment>,
     context_compaction: ContextCompactionState,
     context_estimate: ContextEstimate,
@@ -3027,6 +3387,10 @@ impl TuiApp {
             permissions: PermissionStatus::from_policy(&config.permissions),
             telemetry: TelemetryStatus::from_config(&config.telemetry),
             input: String::new(),
+            input_history: Vec::new(),
+            input_history_index: None,
+            input_history_draft: String::new(),
+            slash_menu_index: 0,
             attachments: Vec::new(),
             context_compaction: ContextCompactionState::default(),
             context_estimate: ContextEstimate::default(),

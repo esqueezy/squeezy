@@ -72,7 +72,7 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
         "missing toggle hint: {status}",
     );
     assert!(
-        status.contains("Ctrl-E fold"),
+        status.contains("Up/Down history or / menu"),
         "missing collapse hint: {status}"
     );
 }
@@ -147,6 +147,98 @@ async fn slash_plan_and_build_force_modes() {
 }
 
 #[tokio::test]
+async fn prompt_history_uses_plain_up_down_when_prompt_is_empty() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    push_input_history(&mut app, "first prompt".to_string());
+    push_input_history(&mut app, "second prompt".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("history up");
+    assert_eq!(app.input, "second prompt");
+    assert!(app.selected_entry.is_none());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("history up");
+    assert_eq!(app.input, "first prompt");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("history down");
+    assert_eq!(app.input, "second prompt");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("history down");
+    assert!(app.input.is_empty());
+}
+
+#[tokio::test]
+async fn slash_menu_renders_and_completes_selected_command() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.input = "/p".to_string();
+
+    let output = render_to_string(&app, 100, 16);
+    assert!(output.contains("/permissions"), "{output}");
+    assert!(output.contains("/plan"), "{output}");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("menu down");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("complete command");
+    assert_eq!(app.input, "/plan ");
+    assert_eq!(app.status, "selected /plan");
+}
+
+#[tokio::test]
+async fn unknown_slash_command_does_not_start_model_turn() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.input = "/nope".to_string();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.input, "/nope");
+    assert!(app.turn_rx.is_none());
+    assert!(app.status.contains("unknown command"), "{}", app.status);
+}
+
+#[tokio::test]
 async fn slash_cost_reports_empty_session_without_model_turn() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -157,7 +249,7 @@ async fn slash_cost_reports_empty_session_without_model_turn() {
     assert_eq!(app.status, "cost snapshot");
     assert!(output.contains("Cost accounting"), "{output}");
     assert!(
-        output.contains("provider=scripted model=gpt-5-nano"),
+        output.contains("provider=scripted model=gpt-5.5"),
         "{output}"
     );
     assert!(
@@ -705,7 +797,7 @@ fn render_uses_two_line_status_footer() {
         "{output}"
     );
     assert!(!output.contains("ready"), "{output}");
-    assert!(output.contains("Ctrl-E fold"), "{output}");
+    assert!(output.contains("Up/Down history or / menu"), "{output}");
 }
 
 #[test]
@@ -1339,14 +1431,14 @@ fn status_footer_stays_context_only_when_scrolled() {
 
     let live = format_status_tokens(&app);
     assert!(
-        !live.contains("history"),
+        !live.contains("selected transcript entry"),
         "no marker while at bottom: {live}"
     );
 
     app.transcript_scroll_from_bottom = 4;
     let scrolled = format_status_tokens(&app);
     assert!(
-        !scrolled.contains("history"),
+        !scrolled.contains("selected transcript entry"),
         "footer stays calm: {scrolled}"
     );
     assert!(scrolled.contains("Build mode"), "{scrolled}");

@@ -1100,9 +1100,10 @@ async fn run_startup_model_selector(config: &AppConfig) -> squeezy_core::Result<
     let settings_path = default_settings_path();
     let choices = detect_provider_choices(config).await;
     if choices.is_empty() {
-        return Err(SqueezyError::Config(format!(
+        return Err(SqueezyError::Config(
             "no provider credentials or local Ollama models detected; set OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY, or start Ollama, then run squeezy again"
-        )));
+                .to_string(),
+        ));
     }
 
     eprintln!(
