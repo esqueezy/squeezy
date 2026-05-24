@@ -18,6 +18,9 @@ Each session directory contains:
   summaries and pinned context entries.
 - `attachments/`: redacted attached-context metadata plus bounded redacted text
   for pasted context and attached text files.
+- `replay.jsonl`: append-only versioned redacted replay tape with model
+  requests, model stream events, tool calls/results, cost decisions, timestamps,
+  and stable hashes used to detect replay divergence.
 
 Use CLI discovery commands:
 
@@ -26,6 +29,8 @@ squeezy sessions list
 squeezy sessions list --branch main --status completed --query "refactor"
 squeezy sessions show <session_id>
 squeezy sessions resume <session_id>
+squeezy sessions replay <session_id>
+squeezy sessions replay <session_id> --json
 squeezy sessions export <session_id>
 squeezy sessions report <session_id> --preview
 squeezy sessions report <session_id> --send
@@ -69,6 +74,14 @@ shared redaction layer before persistence. Large events and sessions are
 bounded by `[session].max_event_bytes` and `[session].max_session_bytes`; when a
 session exceeds its byte budget it remains discoverable but is marked
 non-resumable.
+
+Replay uses the redacted tape by default. `squeezy sessions replay <id>` feeds
+the recorded user turns back through the agent with a replay provider and
+recorded tool results instead of live model or tool execution. Replay validates
+the normalized model-request hash and tool-call hash; drift in instructions,
+tool schemas, prompt shaping, or tool arguments fails the replay with a
+divergence error. The replay report prints turn count, replayed event count,
+request count, tool-result count, and final assistant text.
 
 Attached context stores the original-content hash locally for dedupe, but the
 stored body, preview, session events, model references, and session export use
