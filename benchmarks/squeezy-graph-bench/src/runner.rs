@@ -34,7 +34,10 @@ pub fn main() -> Result<()> {
             time_clang_syntax(&args.fixture, "clang++", LanguageKind::Cpp)?,
             "clang++ -fsyntax-only".to_string(),
         ),
-        BenchmarkLanguage::CSharp => (time_dotnet_build(&args.fixture)?, "dotnet build".to_string()),
+        BenchmarkLanguage::CSharp => (
+            time_dotnet_build(&args.fixture)?,
+            "dotnet build".to_string(),
+        ),
         BenchmarkLanguage::Java => time_java_oracle_optional(&args.fixture),
         BenchmarkLanguage::Rust => (time_cargo_check(&args.fixture)?, "cargo check".to_string()),
         BenchmarkLanguage::Python => (
@@ -169,7 +172,3 @@ pub fn main() -> Result<()> {
     print_summary(&report);
     enforce_gates(&report, args.no_speed_gate)
 }
-
-#[cfg(test)]
-#[path = "runner_tests.rs"]
-mod tests;

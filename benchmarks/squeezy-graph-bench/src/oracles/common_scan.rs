@@ -328,3 +328,7 @@ for path in sorted(root.rglob("*.py")):
 
 print(json.dumps({"rows": rows, "unparseable_files": unparseable_files}))
 "#;
+
+#[cfg(test)]
+#[path = "common_scan_tests.rs"]
+mod tests;

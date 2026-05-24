@@ -8,9 +8,7 @@ use crate::{
     accuracy::{compare_symbol_sets, increment_symbol, ratio, symbol_count},
     oracles::common_scan::collect_squeezy_symbol_scan,
     oracles::rust_analyzer::normalize_symbol_name,
-    report::{
-        JavaOracleReport, QueryOracleReport, QueryReport, SymbolKey, SymbolScan,
-    },
+    report::{JavaOracleReport, QueryOracleReport, QueryReport, SymbolKey, SymbolScan},
     util::{command_exists, temp_dir},
 };
 

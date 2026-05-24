@@ -1,10 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::Path,
-    process::Command,
-    time::Instant,
-};
+use std::{collections::BTreeSet, fs, path::Path, process::Command, time::Instant};
 
 use squeezy_core::{Result, SqueezyError};
 use squeezy_graph::SemanticGraph;
@@ -13,7 +7,7 @@ use crate::{
     accuracy::{compare_symbol_sets, increment_symbol},
     cli::BenchmarkLanguage,
     oracles::common_scan::{
-        collect_squeezy_symbol_scan_excluding_files, GoAstOracleOutput, GoAstSymbolScan,
+        GoAstOracleOutput, GoAstSymbolScan, collect_squeezy_symbol_scan_excluding_files,
     },
     oracles::rust_analyzer::normalize_symbol_name,
     report::{
@@ -23,7 +17,10 @@ use crate::{
     util::temp_dir,
 };
 
-pub(crate) fn collect_go_oracle_accuracy(root: &Path, graph: &SemanticGraph) -> Result<GoOracleReport> {
+pub(crate) fn collect_go_oracle_accuracy(
+    root: &Path,
+    graph: &SemanticGraph,
+) -> Result<GoOracleReport> {
     let started = Instant::now();
     let oracle = collect_go_ast_symbol_scan(root)?;
     let oracle_ms = started.elapsed().as_millis();

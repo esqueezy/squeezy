@@ -8,7 +8,7 @@ use std::{
 };
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use squeezy_core::{EdgeKind, LanguageKind, Result, SqueezyError, SymbolId, SymbolKind};
 use squeezy_graph::SemanticGraph;
 
@@ -36,7 +36,10 @@ pub(crate) struct JsTsOracleSymbol {
     name: String,
 }
 
-pub(crate) fn collect_js_ts_oracle_accuracy(root: &Path, graph: &SemanticGraph) -> JsTsOracleReport {
+pub(crate) fn collect_js_ts_oracle_accuracy(
+    root: &Path,
+    graph: &SemanticGraph,
+) -> JsTsOracleReport {
     let started = Instant::now();
     match collect_js_ts_symbol_scan(root) {
         Ok(oracle) => JsTsOracleReport {
@@ -861,7 +864,11 @@ pub(crate) fn collect_js_ts_navigation_accuracy(
     }
 }
 
-pub(crate) fn nav_report_error(msg: &str, limit: usize, limitations: Vec<String>) -> NavigationAccuracyReport {
+pub(crate) fn nav_report_error(
+    msg: &str,
+    limit: usize,
+    limitations: Vec<String>,
+) -> NavigationAccuracyReport {
     NavigationAccuracyReport {
         rust_analyzer_lsp_ms: None,
         rust_analyzer_lsp_status: msg.to_string(),

@@ -7,7 +7,7 @@ use std::{
     time::Instant,
 };
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use squeezy_core::{LanguageKind, Result, SqueezyError, SymbolKind};
 use squeezy_graph::SemanticGraph;
 
@@ -122,7 +122,10 @@ pub(crate) fn rust_analyzer_symbols_for_file(
     Ok(Some(scan))
 }
 
-pub(crate) fn parse_rust_analyzer_symbol_line(line: &str, file: &str) -> Option<(String, Option<SymbolKey>)> {
+pub(crate) fn parse_rust_analyzer_symbol_line(
+    line: &str,
+    file: &str,
+) -> Option<(String, Option<SymbolKey>)> {
     let label = extract_quoted_field(line, "label")?;
     let raw_kind = extract_symbol_kind(line)?;
     let key = normalize_rust_analyzer_kind(&raw_kind).map(|kind| SymbolKey {
@@ -617,9 +620,11 @@ pub(crate) fn percent_decode(value: &str) -> Result<String> {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
             let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
                 .map_err(|err| SqueezyError::Graph(format!("invalid URI escape: {err}")))?;
-            out.push(u8::from_str_radix(hex, 16).map_err(|err| {
-                SqueezyError::Graph(format!("invalid URI escape %{hex}: {err}"))
-            })?);
+            out.push(
+                u8::from_str_radix(hex, 16).map_err(|err| {
+                    SqueezyError::Graph(format!("invalid URI escape %{hex}: {err}"))
+                })?,
+            );
             index += 3;
         } else {
             out.push(bytes[index]);
@@ -715,3 +720,7 @@ pub(crate) fn rust_analyzer_program() -> Option<String> {
         Some(path.to_string())
     }
 }
+
+#[cfg(test)]
+#[path = "rust_analyzer_tests.rs"]
+mod tests;

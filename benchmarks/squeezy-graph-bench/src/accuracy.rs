@@ -10,12 +10,20 @@ use squeezy_graph::SemanticGraph;
 
 use crate::{
     mixed::select_scenarios,
-    oracles::{collect_rust_analyzer_symbol_scan, collect_squeezy_symbol_scan},
-    oracles::rust_analyzer::{RustAnalyzerLsp, byte_to_lsp_position, line_char_to_byte, path_to_file_uri},
+    oracles::{
+        collect_rust_analyzer_symbol_scan, collect_squeezy_symbol_scan,
+        rust_analyzer::{
+            RustAnalyzerLsp, byte_to_lsp_position, line_char_to_byte, path_to_file_uri,
+        },
+    },
     report::*,
 };
 
-pub(crate) fn collect_accuracy(root: &Path, graph: &SemanticGraph, ra_lsp_probes: usize) -> AccuracyReport {
+pub(crate) fn collect_accuracy(
+    root: &Path,
+    graph: &SemanticGraph,
+    ra_lsp_probes: usize,
+) -> AccuracyReport {
     let squeezy_symbols = collect_squeezy_symbol_scan(graph);
     let started = Instant::now();
     let (rust_analyzer_symbols, status) = collect_rust_analyzer_symbol_scan(graph);
@@ -57,7 +65,10 @@ pub(crate) fn empty_accuracy(status: &str) -> AccuracyReport {
     }
 }
 
-pub(crate) fn compare_symbol_sets(squeezy: &SymbolScan, rust_analyzer: &SymbolScan) -> AccuracySetReport {
+pub(crate) fn compare_symbol_sets(
+    squeezy: &SymbolScan,
+    rust_analyzer: &SymbolScan,
+) -> AccuracySetReport {
     let true_positive = squeezy
         .counts
         .iter()
@@ -478,7 +489,12 @@ pub(crate) fn location_key_for_reference_hit(
     })
 }
 
-pub(crate) fn probe_byte_for_edge(source: &str, start: usize, end: usize, target_text: &str) -> usize {
+pub(crate) fn probe_byte_for_edge(
+    source: &str,
+    start: usize,
+    end: usize,
+    target_text: &str,
+) -> usize {
     let end = end.min(source.len());
     let start = start.min(end);
     let slice = source.get(start..end).unwrap_or_default();

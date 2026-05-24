@@ -6,9 +6,7 @@ use std::{
 };
 
 use squeezy_core::{EdgeKind, LanguageKind, Result, SymbolId, SymbolKind};
-use squeezy_graph::{
-    BodySearchQuery, GraphManager, RefreshConfig, SemanticGraph, SignatureQuery,
-};
+use squeezy_graph::{BodySearchQuery, GraphManager, RefreshConfig, SemanticGraph, SignatureQuery};
 use squeezy_parse::BodyHitKind;
 use squeezy_workspace::{CrawlOptions, WorkspaceCrawler};
 
@@ -25,7 +23,7 @@ use crate::{
         time_js_ts_oracle, time_rust_analyzer,
     },
     report::{MixedWorkloadReport, RefreshProbeReport},
-    util::{increment, temp_dir, DeterministicRng},
+    util::{DeterministicRng, increment, temp_dir},
 };
 
 pub(crate) fn run_mixed_workload(
@@ -186,9 +184,7 @@ pub(crate) enum MixedScenario {
 impl MixedScenario {
     pub(crate) fn tool(&self) -> &'static str {
         match self {
-            MixedScenario::HierarchyAll { .. } | MixedScenario::HierarchyRoot { .. } => {
-                "hierarchy"
-            }
+            MixedScenario::HierarchyAll { .. } | MixedScenario::HierarchyRoot { .. } => "hierarchy",
             MixedScenario::SymbolLookup { .. } => "symbol_lookup",
             MixedScenario::SignatureSearch { .. } => "signature_search",
             MixedScenario::BodySearch { .. } => "body_search",
@@ -403,3 +399,7 @@ pub(crate) fn run_refresh_probe(
         budget_exhausted: report.budget_exhausted,
     })
 }
+
+#[cfg(test)]
+#[path = "mixed_tests.rs"]
+mod tests;

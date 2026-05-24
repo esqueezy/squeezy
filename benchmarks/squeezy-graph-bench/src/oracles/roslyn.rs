@@ -141,14 +141,7 @@ pub(crate) fn collect_csharp_oracle_symbol_scan(root: &Path) -> Result<CsharpOra
     let mut scan = SymbolScan::default();
     for [file, kind, name] in output.rows {
         scan.raw_total += 1;
-        increment_symbol(
-            &mut scan.counts,
-            SymbolKey {
-                file,
-                kind,
-                name,
-            },
-        );
+        increment_symbol(&mut scan.counts, SymbolKey { file, kind, name });
     }
     let mut edges = SymbolScan::default();
     for [file, kind, name] in output.edges {
@@ -245,3 +238,7 @@ pub(crate) fn csharp_oracle_project_dir() -> Result<PathBuf> {
         "could not locate benchmarks/oracle/csharp; set SQUEEZY_CSHARP_ORACLE_DIR".to_string(),
     ))
 }
+
+#[cfg(test)]
+#[path = "roslyn_tests.rs"]
+mod tests;

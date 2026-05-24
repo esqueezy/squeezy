@@ -56,3 +56,7 @@ pub(crate) fn time_python_ast_oracle(fixture: &Path) -> Result<u128> {
     let _ = collect_python_ast_symbol_scan(fixture)?;
     Ok(started.elapsed().as_millis())
 }
+
+#[cfg(test)]
+#[path = "cpython_ast_tests.rs"]
+mod tests;

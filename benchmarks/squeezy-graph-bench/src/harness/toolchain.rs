@@ -213,3 +213,7 @@ pub(crate) fn time_clang_syntax_optional(
         Err(err) => (None, format!("{compiler} -fsyntax-only failed: {err}")),
     }
 }
+
+#[cfg(test)]
+#[path = "toolchain_tests.rs"]
+mod tests;

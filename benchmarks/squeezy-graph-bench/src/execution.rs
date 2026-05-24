@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    path::Path,
-    time::Instant,
-};
+use std::{collections::BTreeSet, path::Path, time::Instant};
 
 use squeezy_core::{Result, SqueezyError, SymbolKind};
 use squeezy_graph::{BodySearchQuery, SemanticGraph, SignatureQuery};
