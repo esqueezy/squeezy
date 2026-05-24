@@ -3118,10 +3118,10 @@ impl ToolRegistry {
         let diagnostics_stdout = diagnostics_result.as_ref().map(shell_stdout);
 
         let cargo_version = self
-            .compiler_version("cargo --version", cancel.clone(), group_id)
+            .compiler_version("cargo", "cargo --version", cancel.clone(), group_id)
             .await;
         let rustc_version = self
-            .compiler_version("rustc --version", cancel.clone(), group_id)
+            .compiler_version("rustc", "rustc --version", cancel.clone(), group_id)
             .await;
         let command = if include_diagnostics {
             "cargo metadata --format-version=1 --no-deps; cargo check --message-format=json"
@@ -3165,9 +3165,13 @@ impl ToolRegistry {
             }
         };
 
-        let diagnostics_exit_code = diagnostics_result
-            .as_ref()
-            .and_then(|result| result.content.get("exit_code").and_then(Value::as_i64));
+        let diagnostics_exit_code = if report.diagnostics_loaded {
+            diagnostics_result
+                .as_ref()
+                .and_then(|result| result.content.get("exit_code").and_then(Value::as_i64))
+        } else {
+            None
+        };
         let metadata_bytes =
             shell_stdout(&metadata_result).len() + shell_stderr(&metadata_result).len();
         let diagnostics_bytes = diagnostics_result.as_ref().map_or(0, |result| {
@@ -3222,12 +3226,13 @@ impl ToolRegistry {
 
     async fn compiler_version(
         &self,
+        tool: &str,
         command: &str,
         cancel: CancellationToken,
         group_id: &str,
     ) -> Option<String> {
         let call = ToolCall {
-            call_id: format!("compiler-version-{command}"),
+            call_id: format!("compiler-version-{tool}"),
             name: "shell".to_string(),
             arguments: json!({
                 "command": command,
@@ -6461,6 +6466,7 @@ fn symbol_context_json(
     let diagnostics = graph
         .cargo_diagnostics_for_symbol(symbol)
         .into_iter()
+        .take(max_references)
         .map(|hit| cargo_diagnostic_hit_json(&hit))
         .collect::<Vec<_>>();
     json!({
@@ -6920,6 +6926,7 @@ fn symbol_context_packet(
                 graph
                     .cargo_diagnostics_for_symbol(symbol)
                     .into_iter()
+                    .take(max_references)
                     .map(|hit| cargo_diagnostic_hit_json(&hit))
                     .collect::<Vec<_>>()
             ),

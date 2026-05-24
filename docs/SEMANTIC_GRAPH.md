@@ -143,8 +143,10 @@ The cargo fact cache records workspace, package, target, and feature nodes from
 metadata, plus compiler diagnostics from JSON check output. Each batch stores
 command provenance, cargo/rustc versions when available, capture time, and an
 input fingerprint derived from Cargo manifests, lock/config files visible to the
-graph, and Rust source hashes. If those inputs change after refresh,
-`symbol_context` still surfaces the cached diagnostics but marks them stale.
+graph, toolchain files such as `rust-toolchain.toml`, `build.rs` scripts, and
+Rust source hashes. If those inputs change after refresh, the
+`symbol_context.diagnostics` field still surfaces the cached diagnostics but
+marks them stale via the per-hit freshness verdict.
 
 ## Traversal Surface
 

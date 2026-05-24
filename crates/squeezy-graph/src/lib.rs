@@ -110,6 +110,11 @@ pub struct GraphEdge {
     pub provenance: Provenance,
 }
 
+/// Provenance metadata for a batch of cargo-derived facts.
+///
+/// Captured once per `refresh_compiler_facts` run so downstream consumers can
+/// tell which exact shell invocation produced the metadata and diagnostics,
+/// along with the cargo/rustc versions seen at capture time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CargoFactProvenance {
     pub command: String,
@@ -118,6 +123,9 @@ pub struct CargoFactProvenance {
     pub captured_unix_millis: u64,
 }
 
+/// Kind of cargo-derived node stored in the compiler fact cache.
+///
+/// Sourced from `cargo metadata --format-version=1 --no-deps`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CargoFactNodeKind {
     Workspace,
@@ -126,6 +134,8 @@ pub enum CargoFactNodeKind {
     Feature,
 }
 
+/// A single node in the cargo compiler-fact cache (workspace, package, target,
+/// or feature) sourced from `cargo metadata`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CargoFactNode {
     pub id: String,
@@ -138,6 +148,8 @@ pub struct CargoFactNode {
     pub provenance: Provenance,
 }
 
+/// A single compiler diagnostic surfaced from
+/// `cargo check --message-format=json` and aligned to a file/span in the graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CargoDiagnostic {
     pub level: String,
@@ -151,6 +163,12 @@ pub struct CargoDiagnostic {
     pub provenance: Provenance,
 }
 
+/// Freshness verdict for the cached cargo compiler facts.
+///
+/// `Fresh` means the inputs that drive cargo's output (manifests, lockfile,
+/// configs, toolchain files, and Rust sources) have not changed since the
+/// facts were captured. `Stale` records the hashes plus a short reason list
+/// so callers can decide whether to refresh.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CargoFactFreshness {
     pub status: Freshness,
@@ -159,12 +177,15 @@ pub struct CargoFactFreshness {
     pub stale_reasons: Vec<String>,
 }
 
+/// One diagnostic plus the freshness verdict for the batch it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CargoDiagnosticHit {
     pub diagnostic: CargoDiagnostic,
     pub freshness: CargoFactFreshness,
 }
 
+/// Counts plus freshness for the cargo compiler-fact cache, intended for
+/// concise summary output.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CargoFactsSummary {
     pub workspaces: usize,
@@ -175,12 +196,21 @@ pub struct CargoFactsSummary {
     pub freshness: Option<CargoFactFreshness>,
 }
 
+/// Result of a `refresh_compiler_facts` call: the summary plus whether the
+/// caller asked for (and successfully loaded) `cargo check` diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CargoFactRefreshReport {
     pub summary: CargoFactsSummary,
     pub diagnostics_loaded: bool,
 }
 
+/// Aggregate cargo compiler facts held on the in-memory semantic graph.
+///
+/// Produced by `cargo metadata --format-version=1 --no-deps` and optionally
+/// `cargo check --message-format=json`. `input_fingerprint` is hashed from the
+/// graph's view of Rust sources, manifests, lockfile, cargo config files, and
+/// toolchain files at capture time, so later edits can be detected without
+/// re-running cargo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CargoCompilerFacts {
     pub workspace_root: Option<String>,
@@ -2036,10 +2066,27 @@ fn spans_intersect(left: SourceSpan, right: SourceSpan) -> bool {
 }
 
 fn is_cargo_fact_input_path(relative_path: &str) -> bool {
-    relative_path.ends_with("Cargo.toml")
-        || relative_path == "Cargo.lock"
-        || relative_path == ".cargo/config"
-        || relative_path == ".cargo/config.toml"
+    // Files whose basename matters anywhere in the workspace tree. This is a
+    // basename match (not `ends_with`) so `foo/NotCargo.toml` does not get
+    // mistaken for a Cargo manifest.
+    const BASENAME_INPUTS: &[&str] = &[
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.rs",
+        "rust-toolchain",
+        "rust-toolchain.toml",
+    ];
+    // Trailing path segments that indicate a cargo config file. Cargo honors
+    // these at the workspace root and inside any ancestor of a target, so we
+    // accept them at arbitrary depth (notably nested in member crates).
+    const SUFFIX_INPUTS: &[&str] = &[".cargo/config", ".cargo/config.toml"];
+    let basename = relative_path.rsplit('/').next().unwrap_or(relative_path);
+    if BASENAME_INPUTS.contains(&basename) {
+        return true;
+    }
+    SUFFIX_INPUTS
+        .iter()
+        .any(|suffix| relative_path == *suffix || relative_path.ends_with(&format!("/{suffix}")))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2133,6 +2180,9 @@ fn parse_cargo_metadata(
         .into_iter()
         .collect::<HashSet<_>>();
     for package in metadata.packages {
+        // Defensive: cargo always emits `workspace_members` in practice, even
+        // for single-package crates. Treat an empty set as "no filtering"
+        // rather than dropping every package on the floor.
         if !workspace_members.is_empty() && !workspace_members.contains(&package.id) {
             continue;
         }
@@ -2220,6 +2270,13 @@ fn parse_cargo_diagnostics(
             continue;
         }
         for span in spans {
+            // Rustc reports lines and columns as 1-indexed; the rest of the
+            // graph stores 0-indexed tree-sitter coordinates. Normalize here so
+            // diagnostic spans line up with the owning symbol's span convention.
+            let line_start = span.line_start.saturating_sub(1);
+            let line_end = span.line_end.saturating_sub(1);
+            let column_start = span.column_start.saturating_sub(1);
+            let column_end = span.column_end.saturating_sub(1);
             diagnostics.push(CargoDiagnostic {
                 level: message.level.clone(),
                 message: message.message.clone(),
@@ -2228,8 +2285,8 @@ fn parse_cargo_diagnostics(
                 span: Some(SourceSpan::new(
                     span.byte_start,
                     span.byte_end,
-                    squeezy_core::SourcePoint::new(span.line_start, span.column_start),
-                    squeezy_core::SourcePoint::new(span.line_end, span.column_end),
+                    squeezy_core::SourcePoint::new(line_start, column_start),
+                    squeezy_core::SourcePoint::new(line_end, column_end),
                 )),
                 label: span.label.clone(),
                 package_id: event.package_id.clone(),
