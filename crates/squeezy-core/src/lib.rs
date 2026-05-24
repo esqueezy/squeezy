@@ -42,6 +42,7 @@ pub const DEFAULT_SQUEEZY_SKILLS_DIR: &str = ".squeezy/skills";
 pub const DEFAULT_SESSION_LOG_RETENTION_DAYS: u64 = 30;
 pub const DEFAULT_SESSION_MAX_EVENT_BYTES: usize = 65_536;
 pub const DEFAULT_SESSION_MAX_SESSION_BYTES: usize = 52_428_800;
+pub const DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES: usize = 1_048_576;
 pub const DEFAULT_AGENT_COMPAT_SKILLS_DIR: &str = ".agents/skills";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4285,6 +4286,286 @@ impl TranscriptItem {
             content: content.into(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextAttachmentSource {
+    Paste,
+    File,
+}
+
+impl ContextAttachmentSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Paste => "paste",
+            Self::File => "file",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextAttachmentKind {
+    Log,
+    StackTrace,
+    Config,
+    Text,
+    UnsupportedBinary,
+    UnsupportedImage,
+}
+
+impl ContextAttachmentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Log => "log",
+            Self::StackTrace => "stack_trace",
+            Self::Config => "config",
+            Self::Text => "text",
+            Self::UnsupportedBinary => "unsupported_binary",
+            Self::UnsupportedImage => "unsupported_image",
+        }
+    }
+
+    pub fn is_supported_text(self) -> bool {
+        !matches!(self, Self::UnsupportedBinary | Self::UnsupportedImage)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextAttachmentStatus {
+    Attached,
+    Removed,
+    Unsupported,
+}
+
+impl ContextAttachmentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attached => "attached",
+            Self::Removed => "removed",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextAttachment {
+    pub id: String,
+    pub source: ContextAttachmentSource,
+    pub kind: ContextAttachmentKind,
+    pub status: ContextAttachmentStatus,
+    pub label: String,
+    pub path: Option<String>,
+    pub original_sha256: String,
+    pub redacted_sha256: Option<String>,
+    pub original_bytes: usize,
+    pub stored_bytes: usize,
+    pub preview_bytes: usize,
+    pub redactions: u64,
+    pub preview: String,
+    pub truncated: bool,
+}
+
+impl ContextAttachment {
+    pub fn is_active(&self) -> bool {
+        self.status == ContextAttachmentStatus::Attached
+    }
+
+    pub fn reference(&self) -> String {
+        format!("attachment://{}", self.id)
+    }
+}
+
+pub fn detect_context_attachment_kind(
+    label: Option<&str>,
+    bytes: &[u8],
+    text: Option<&str>,
+) -> ContextAttachmentKind {
+    if looks_like_image(label, bytes) {
+        return ContextAttachmentKind::UnsupportedImage;
+    }
+    let Some(text) = text else {
+        return ContextAttachmentKind::UnsupportedBinary;
+    };
+    if looks_like_binary(bytes) {
+        return ContextAttachmentKind::UnsupportedBinary;
+    }
+    if looks_like_stack_trace(text) {
+        return ContextAttachmentKind::StackTrace;
+    }
+    if looks_like_log(text) {
+        return ContextAttachmentKind::Log;
+    }
+    if looks_like_config(label, text) {
+        return ContextAttachmentKind::Config;
+    }
+    ContextAttachmentKind::Text
+}
+
+pub fn context_attachment_preview(text: &str, max_bytes: usize) -> (String, bool) {
+    truncate_utf8(text, max_bytes)
+}
+
+pub fn context_attachment_storage_text(text: &str, max_bytes: usize) -> (String, bool) {
+    truncate_utf8(text, max_bytes)
+}
+
+fn truncate_utf8(text: &str, max_bytes: usize) -> (String, bool) {
+    if max_bytes == 0 {
+        return (String::new(), !text.is_empty());
+    }
+    if text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_string(), true)
+}
+
+fn looks_like_image(label: Option<&str>, bytes: &[u8]) -> bool {
+    let lower_label = label.unwrap_or_default().to_ascii_lowercase();
+    if matches!(
+        lower_label.rsplit('.').next(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "heic")
+    ) {
+        return true;
+    }
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(b"\xff\xd8\xff")
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP")
+}
+
+fn looks_like_binary(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let sample = &bytes[..bytes.len().min(4096)];
+    if sample.contains(&0) {
+        return true;
+    }
+    let control = sample
+        .iter()
+        .filter(|byte| {
+            let byte = **byte;
+            byte < 0x09 || (byte > 0x0d && byte < 0x20)
+        })
+        .count();
+    control.saturating_mul(100) > sample.len().saturating_mul(10)
+}
+
+fn looks_like_stack_trace(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("traceback (most recent call last)")
+        || lower.contains("stack backtrace:")
+        || lower.contains("caused by:")
+        || lower.contains("thread '")
+        || lower.contains("panic")
+        || lower.contains("exception in thread")
+    {
+        return true;
+    }
+    let stackish_lines = text
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("at ")
+                || trimmed.starts_with("File \"")
+                || trimmed.starts_with("from ")
+                || trimmed.starts_with("error[E")
+                || trimmed.starts_with("#")
+        })
+        .take(3)
+        .count();
+    stackish_lines >= 2
+}
+
+fn looks_like_log(text: &str) -> bool {
+    let mut logish = 0usize;
+    let mut lines = 0usize;
+    for line in text.lines().take(20) {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        lines += 1;
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("error")
+            || lower.starts_with("warn")
+            || lower.starts_with("info")
+            || lower.starts_with("debug")
+            || lower.starts_with("trace")
+            || lower.contains(" error ")
+            || lower.contains(" warn ")
+            || lower.contains(" failed")
+            || starts_with_timestamp(trimmed)
+        {
+            logish += 1;
+        }
+    }
+    lines >= 2 && logish >= 2
+}
+
+fn starts_with_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 10
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+    {
+        return true;
+    }
+    bytes.len() >= 8
+        && bytes[0..2].iter().all(u8::is_ascii_digit)
+        && bytes[2] == b':'
+        && bytes[3..5].iter().all(u8::is_ascii_digit)
+        && bytes[5] == b':'
+        && bytes[6..8].iter().all(u8::is_ascii_digit)
+}
+
+fn looks_like_config(label: Option<&str>, text: &str) -> bool {
+    let lower_label = label.unwrap_or_default().to_ascii_lowercase();
+    if matches!(
+        lower_label.rsplit('.').next(),
+        Some(
+            "toml"
+                | "yaml"
+                | "yml"
+                | "json"
+                | "jsonl"
+                | "env"
+                | "ini"
+                | "properties"
+                | "conf"
+                | "config"
+        )
+    ) {
+        return true;
+    }
+    let mut configish = 0usize;
+    let mut lines = 0usize;
+    for line in text.lines().take(20) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+        lines += 1;
+        if trimmed.starts_with('{')
+            || trimmed.starts_with('[')
+            || trimmed.contains('=')
+            || trimmed.contains(": ")
+        {
+            configish += 1;
+        }
+    }
+    lines > 0 && configish.saturating_mul(100) >= lines.saturating_mul(60)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

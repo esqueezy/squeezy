@@ -17,6 +17,54 @@ fn transcript_constructors_set_roles() {
 }
 
 #[test]
+fn context_attachment_detection_handles_common_text_artifacts() {
+    assert_eq!(
+        detect_context_attachment_kind(
+            Some("panic.txt"),
+            b"thread 'main' panicked\nstack backtrace:\n 0: foo\n",
+            Some("thread 'main' panicked\nstack backtrace:\n 0: foo\n")
+        ),
+        ContextAttachmentKind::StackTrace
+    );
+    assert_eq!(
+        detect_context_attachment_kind(
+            Some("server.log"),
+            b"2026-05-24 ERROR failed\n2026-05-24 WARN retry\n",
+            Some("2026-05-24 ERROR failed\n2026-05-24 WARN retry\n")
+        ),
+        ContextAttachmentKind::Log
+    );
+    assert_eq!(
+        detect_context_attachment_kind(
+            Some("settings.toml"),
+            b"provider = \"openai\"\nmodel = \"gpt-test\"\n",
+            Some("provider = \"openai\"\nmodel = \"gpt-test\"\n")
+        ),
+        ContextAttachmentKind::Config
+    );
+}
+
+#[test]
+fn context_attachment_detection_rejects_binary_and_images() {
+    assert_eq!(
+        detect_context_attachment_kind(Some("screenshot.png"), b"\x89PNG\r\n\x1a\nbytes", None),
+        ContextAttachmentKind::UnsupportedImage
+    );
+    assert_eq!(
+        detect_context_attachment_kind(Some("blob.bin"), b"abc\0def", Some("abc\0def")),
+        ContextAttachmentKind::UnsupportedBinary
+    );
+}
+
+#[test]
+fn context_attachment_preview_respects_utf8_boundary() {
+    let (preview, truncated) = context_attachment_preview("abécd", 4);
+
+    assert_eq!(preview, "abé");
+    assert!(truncated);
+}
+
+#[test]
 fn source_span_contains_byte_inclusively() {
     let span = SourceSpan::new(10, 20, SourcePoint::new(1, 0), SourcePoint::new(1, 10));
 

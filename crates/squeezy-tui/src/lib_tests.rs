@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::backend::TestBackend;
 use squeezy_agent::{JobKind, JobStatus};
@@ -146,6 +149,94 @@ async fn slash_plan_and_build_force_modes() {
     assert_eq!(app.mode, SessionMode::Build);
     assert_eq!(agent.session_mode(), SessionMode::Build);
     assert_eq!(app.status, "mode switched to build");
+}
+
+#[tokio::test]
+async fn multiline_paste_becomes_attached_context() {
+    let root = temp_workspace("tui_paste");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    handle_paste(
+        &mut app,
+        &mut agent,
+        "2026-05-24 ERROR failed\nOPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\n".to_string(),
+    )
+    .await
+    .expect("handle paste");
+
+    assert_eq!(app.attachments.len(), 1);
+    assert!(app.status.contains("attached paste"), "{}", app.status);
+    assert!(
+        !app.attachments[0]
+            .preview
+            .contains("sk-abcdefghijklmnopqrstuvwxyz")
+    );
+    let rendered = render_to_string(&app, 100, 20);
+    assert!(
+        rendered.contains(&app.attachments[0].id),
+        "attachment should render: {rendered}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn small_single_line_paste_stays_in_prompt() {
+    let root = temp_workspace("tui_inline_paste");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, "small paste".to_string())
+        .await
+        .expect("handle paste");
+
+    assert_eq!(app.input, "small paste");
+    assert!(app.attachments.is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn slash_attach_and_detach_update_active_context() {
+    let root = temp_workspace("tui_attach");
+    fs::write(
+        root.join("error.log"),
+        "2026-05-24 ERROR failed\n2026-05-24 WARN retry\n",
+    )
+    .expect("write log");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/attach error.log").await);
+    assert_eq!(app.attachments.len(), 1);
+    assert!(app.status.contains("attached file"), "{}", app.status);
+
+    let id = app.attachments[0].id.clone();
+    let command = format!("/detach {id}");
+    assert!(handle_slash_command(&mut app, &mut agent, &command).await);
+    assert!(app.attachments.is_empty());
+    assert_eq!(app.status, format!("detached {id}"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn slash_attach_surfaces_unsupported_images() {
+    let root = temp_workspace("tui_attach_image");
+    fs::write(root.join("shot.png"), b"\x89PNG\r\n\x1a\nimage").expect("write image");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/attach shot.png").await);
+    assert!(app.attachments.is_empty());
+    assert!(app.status.contains("unsupported file"), "{}", app.status);
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -985,6 +1076,10 @@ fn test_app_with_clipboard(mode: SessionMode, clipboard: Box<dyn Clipboard>) -> 
     TuiApp::new_with_clipboard("scripted", &config, mode, None, clipboard)
 }
 
+fn test_app_with_config(config: &AppConfig, mode: SessionMode) -> TuiApp {
+    TuiApp::new_with_clipboard("scripted", config, mode, None, Box::new(NoopClipboard))
+}
+
 fn test_config(mode: SessionMode) -> AppConfig {
     AppConfig {
         model: "gpt-test".to_string(),
@@ -998,6 +1093,13 @@ fn test_config(mode: SessionMode) -> AppConfig {
         },
         config_sources: vec!["defaults".to_string()],
         ..Default::default()
+    }
+}
+
+fn test_config_with_root(mode: SessionMode, root: PathBuf) -> AppConfig {
+    AppConfig {
+        workspace_root: root,
+        ..test_config(mode)
     }
 }
 
@@ -1090,13 +1192,27 @@ impl Clipboard for RecordingClipboard {
 }
 
 fn test_agent(mode: SessionMode) -> Agent {
+    test_agent_with_config(AppConfig {
+        session_mode: mode,
+        ..Default::default()
+    })
+}
+
+fn test_agent_with_config(config: AppConfig) -> Agent {
     Agent::new(
-        AppConfig {
-            session_mode: mode,
-            ..Default::default()
-        },
+        config,
         Arc::new(UnavailableProvider::new("scripted", "test provider")),
     )
+}
+
+fn temp_workspace(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("squeezy_tui_{name}_{nonce}"));
+    fs::create_dir_all(&root).expect("create temp workspace");
+    root
 }
 
 fn sample_tool_result(name: &str, output: &str) -> ToolResult {

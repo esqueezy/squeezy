@@ -13,7 +13,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use squeezy_core::{
-    AppConfig, CostSnapshot, Result, SessionMetrics, SessionMode, SqueezyError, TranscriptItem,
+    AppConfig, ContextAttachment, CostSnapshot, Result, SessionMetrics, SessionMode, SqueezyError,
+    TranscriptItem,
 };
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -117,11 +118,13 @@ impl SessionStore {
         let metadata = read_json(&dir.join("metadata.json"))?;
         let (events, event_warnings) = read_jsonl(&dir.join("events.jsonl"))?;
         let resume_state = read_json(&dir.join("resume_state.json")).ok();
+        let attachments = read_context_attachments(&dir.join("attachments"))?;
         Ok(SessionRecord {
             metadata,
             events,
             event_warnings,
             resume_state,
+            attachments,
         })
     }
 
@@ -131,6 +134,7 @@ impl SessionStore {
             "metadata": record.metadata,
             "events": record.events,
             "event_warnings": record.event_warnings,
+            "attachments": record.attachments,
             "resume_available": record
                 .resume_state
                 .as_ref()
@@ -301,6 +305,25 @@ impl SessionHandle {
         read_json(&self.dir().join("resume_state.json"))
     }
 
+    pub fn write_context_attachment(
+        &self,
+        attachment: &ContextAttachment,
+        redacted_text: Option<&str>,
+    ) -> Result<()> {
+        let dir = self.dir().join("attachments");
+        fs::create_dir_all(&dir)?;
+        let stem = attachment_file_stem(&attachment.id)?;
+        write_json(&dir.join(format!("{stem}.json")), attachment)?;
+        if let Some(redacted_text) = redacted_text {
+            fs::write(dir.join(format!("{stem}.txt")), redacted_text)?;
+        }
+        Ok(())
+    }
+
+    pub fn context_attachments(&self) -> Result<Vec<ContextAttachment>> {
+        read_context_attachments(&self.dir().join("attachments"))
+    }
+
     pub fn finish(
         &self,
         status: SessionStatus,
@@ -426,6 +449,8 @@ pub struct SessionResumeState {
     pub previous_response_id: Option<String>,
     pub conversation: Vec<ResumeItem>,
     pub transcript: Vec<TranscriptItem>,
+    #[serde(default)]
+    pub context_attachments: Vec<ContextAttachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,6 +541,7 @@ pub struct SessionRecord {
     pub events: Vec<SessionEvent>,
     pub event_warnings: u64,
     pub resume_state: Option<SessionResumeState>,
+    pub attachments: Vec<ContextAttachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -553,6 +579,41 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let text = fs::read_to_string(path)?;
     serde_json::from_str(&text).map_err(json_error)
+}
+
+fn read_context_attachments(dir: &Path) -> Result<Vec<ContextAttachment>> {
+    let mut attachments = Vec::new();
+    if !dir.exists() {
+        return Ok(attachments);
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(attachment) = read_json::<ContextAttachment>(&path) {
+            attachments.push(attachment);
+        }
+    }
+    attachments.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(attachments)
+}
+
+fn attachment_file_stem(id: &str) -> Result<&str> {
+    if !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Ok(id);
+    }
+    Err(SqueezyError::Agent(format!(
+        "invalid context attachment id {id:?}"
+    )))
 }
 
 fn read_jsonl(path: &Path) -> Result<(Vec<SessionEvent>, u64)> {
