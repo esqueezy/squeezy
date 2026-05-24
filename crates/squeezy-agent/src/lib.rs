@@ -1978,6 +1978,7 @@ impl TurnRuntime {
             }
         }
 
+        let mut last_tool_round_summary = None;
         for _round in 0..MAX_TOOL_ROUNDS {
             let active_mode = load_session_mode(&self.session_mode);
             let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();
@@ -2202,6 +2203,7 @@ impl TurnRuntime {
                 &mut broker,
             )
             .await;
+            last_tool_round_summary = tool_round_failure_summary(&results);
             let results = seen_tool_outputs.prepare_results(results);
             let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
             for pending in &results {
@@ -2244,8 +2246,11 @@ impl TurnRuntime {
             }
         }
 
+        let suffix = last_tool_round_summary
+            .map(|summary| format!(" · {summary}"))
+            .unwrap_or_default();
         Err(SqueezyError::Agent(format!(
-            "stopped after {MAX_TOOL_ROUNDS} tool rounds"
+            "stopped after {MAX_TOOL_ROUNDS} tool rounds{suffix}"
         )))
     }
 
@@ -2678,6 +2683,38 @@ fn invalid_tool_arguments_result(call: &ToolCall) -> ToolResult {
             "retry": "call the same tool again with complete valid JSON arguments",
         }),
     )
+}
+
+fn tool_round_failure_summary(results: &[ToolResult]) -> Option<String> {
+    let mut invalid_counts = BTreeMap::<String, usize>::new();
+    let mut last_error = None;
+    for result in results {
+        if result.status != ToolStatus::Error && result.status != ToolStatus::Stale {
+            continue;
+        }
+        let error = result
+            .content
+            .get("error")
+            .and_then(Value::as_str)
+            .or_else(|| result.content.get("parse_error").and_then(Value::as_str))
+            .unwrap_or("tool failed")
+            .trim();
+        if error.contains("invalid tool arguments") {
+            *invalid_counts.entry(result.tool_name.clone()).or_default() += 1;
+        }
+        last_error = Some(format!("last {} failure: {error}", result.tool_name));
+    }
+    invalid_counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(tool, count)| {
+            if count > 1 {
+                format!("repeated invalid {tool} arguments ({count}x)")
+            } else {
+                format!("invalid {tool} arguments")
+            }
+        })
+        .or(last_error)
 }
 
 async fn execute_tool_calls(

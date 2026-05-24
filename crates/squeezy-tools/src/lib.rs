@@ -2296,11 +2296,23 @@ impl ToolRegistry {
         refresh: &squeezy_graph::RefreshReport,
     ) -> ToolResult {
         let graph = manager.graph();
+        if !decl_search_has_query_or_filter(&args) {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({
+                    "error": "decl_search requires a query or at least one filter",
+                    "retry": "provide query, kind, language, path, visibility, or attribute",
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
         let max_results = graph_limit(args.max_results);
         let offset = args.offset.unwrap_or(0);
         let symbols = graph_symbol_search(
             graph,
-            &args.query,
+            args.query.as_deref(),
             args.kind.as_deref(),
             args.path.as_deref(),
             args.language.as_deref(),
@@ -2320,12 +2332,21 @@ impl ToolRegistry {
             .collect::<Vec<_>>();
         let mut payload = graph_payload("decl_search", manager, refresh);
         payload.insert("query".to_string(), json!(args.query));
+        payload.insert("kind".to_string(), json!(args.kind));
+        payload.insert("language".to_string(), json!(args.language));
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
             "fallback".to_string(),
-            unsupported_fallback_for_path(graph, args.path.as_deref(), Some(&args.query)),
+            unsupported_fallback_for_path(graph, args.path.as_deref(), args.query.as_deref()),
         );
         payload.insert("offset".to_string(), json!(offset));
+        payload.insert("total_matches".to_string(), json!(symbols.len()));
+        payload.insert("returned_matches".to_string(), json!(selected.len()));
+        payload.insert(
+            "counts_by_language".to_string(),
+            decl_counts_by_language(graph, &symbols),
+        );
+        payload.insert("counts_by_kind".to_string(), decl_counts_by_kind(&symbols));
         payload.insert("truncated".to_string(), json!(truncated));
         make_result(
             call,
@@ -2605,14 +2626,21 @@ impl ToolRegistry {
         let max_results = graph_limit(args.max_results);
         let path_filter = args.path.as_deref();
         let diff_only = args.diff_only.unwrap_or(false);
-        let mut symbols =
-            graph_symbol_search(graph, &args.query, None, path_filter, None, None, None)
-                .into_iter()
-                .filter(|symbol| {
-                    !diff_only || symbol.dirty.is_some() || dirty_paths.contains(&symbol.file_id.0)
-                })
-                .take(max_results)
-                .collect::<Vec<_>>();
+        let mut symbols = graph_symbol_search(
+            graph,
+            Some(&args.query),
+            None,
+            path_filter,
+            None,
+            None,
+            None,
+        )
+        .into_iter()
+        .filter(|symbol| {
+            !diff_only || symbol.dirty.is_some() || dirty_paths.contains(&symbol.file_id.0)
+        })
+        .take(max_results)
+        .collect::<Vec<_>>();
         if symbols.is_empty() && diff_only {
             symbols = graph
                 .dirty_symbols()
@@ -7495,7 +7523,7 @@ struct RepoMapArgs {
 
 #[derive(Debug, Deserialize)]
 struct DeclSearchArgs {
-    query: String,
+    query: Option<String>,
     kind: Option<String>,
     path: Option<String>,
     language: Option<String>,
@@ -8824,37 +8852,141 @@ fn graph_limit(limit: Option<usize>) -> usize {
         .clamp(1, MAX_GRAPH_MAX_RESULTS)
 }
 
+fn decl_search_has_query_or_filter(args: &DeclSearchArgs) -> bool {
+    [
+        args.query.as_deref(),
+        args.kind.as_deref(),
+        args.path.as_deref(),
+        args.language.as_deref(),
+        args.visibility.as_deref(),
+        args.attribute.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| !value.trim().is_empty())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolKindFilter {
+    Single(SymbolKind),
+    Callable,
+}
+
+fn parse_symbol_kind_filter(value: &str) -> Option<SymbolKindFilter> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "callable" | "callables" | "function_like" | "function-like" | "functions"
+    ) {
+        return Some(SymbolKindFilter::Callable);
+    }
+    parse_symbol_kind(value).map(SymbolKindFilter::Single)
+}
+
+fn single_symbol_kind(filter: Option<SymbolKindFilter>) -> Option<SymbolKind> {
+    match filter {
+        Some(SymbolKindFilter::Single(kind)) => Some(kind),
+        _ => None,
+    }
+}
+
+fn symbol_matches_kind_filter(kind: SymbolKind, filter: Option<SymbolKindFilter>) -> bool {
+    match filter {
+        None => true,
+        Some(SymbolKindFilter::Single(expected)) => kind == expected,
+        Some(SymbolKindFilter::Callable) => matches!(
+            kind,
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+        ),
+    }
+}
+
+fn symbol_matches_visibility_filter(symbol: &GraphSymbol, visibility: Option<&str>) -> bool {
+    let Some(visibility) = visibility.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    symbol
+        .visibility
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case(visibility))
+}
+
+fn symbol_matches_attribute_filter(symbol: &GraphSymbol, attribute: Option<&str>) -> bool {
+    let Some(attribute) = attribute.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    symbol
+        .attributes
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(attribute) || value.contains(attribute))
+}
+
 fn graph_symbol_search(
     graph: &squeezy_graph::SemanticGraph,
-    query: &str,
+    query: Option<&str>,
     kind: Option<&str>,
     path: Option<&str>,
     language: Option<&str>,
     visibility: Option<&str>,
     attribute: Option<&str>,
 ) -> Vec<GraphSymbol> {
-    let kind = kind.and_then(parse_symbol_kind);
+    let query = query.map(str::trim).filter(|value| !value.is_empty());
+    let kind_filter = kind.and_then(parse_symbol_kind_filter);
     let mut seen = HashSet::new();
-    let mut symbols = graph
-        .signature_search(&SignatureQuery {
-            text: query.to_string(),
-            kind,
-            visibility: visibility.map(str::to_string),
-            attribute: attribute.map(str::to_string),
-        })
+    let candidates = if let Some(query) = query {
+        graph
+            .signature_search(&SignatureQuery {
+                text: query.to_string(),
+                kind: single_symbol_kind(kind_filter),
+                visibility: visibility.map(str::to_string),
+                attribute: attribute.map(str::to_string),
+            })
+            .into_iter()
+            .chain(graph.find_symbol_by_name(query))
+            .collect::<Vec<_>>()
+    } else {
+        graph.symbols.values().cloned().collect::<Vec<_>>()
+    };
+    let mut symbols = candidates
         .into_iter()
-        .chain(graph.find_symbol_by_name(query))
         .filter(|symbol| seen.insert(symbol.id.clone()))
+        .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
+        .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
+        .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
         .filter(|symbol| symbol_matches_path_filter(symbol, path))
         .filter(|symbol| language_matches(graph, symbol, language))
         .collect::<Vec<_>>();
     symbols.sort_by(|left, right| {
-        symbol_rank(left, query)
-            .cmp(&symbol_rank(right, query))
+        query
+            .map(|query| symbol_rank(left, query).cmp(&symbol_rank(right, query)))
+            .unwrap_or(std::cmp::Ordering::Equal)
             .then(left.file_id.0.cmp(&right.file_id.0))
             .then(left.span.start_byte.cmp(&right.span.start_byte))
     });
     symbols
+}
+
+fn decl_counts_by_language(graph: &squeezy_graph::SemanticGraph, symbols: &[GraphSymbol]) -> Value {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for symbol in symbols {
+        let label = graph
+            .files
+            .get(&symbol.file_id)
+            .map(|file| file.language.display_name())
+            .unwrap_or("unknown");
+        *counts.entry(label.to_string()).or_default() += 1;
+    }
+    json!(counts)
+}
+
+fn decl_counts_by_kind(symbols: &[GraphSymbol]) -> Value {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for symbol in symbols {
+        *counts
+            .entry(symbol_kind_label(symbol.kind).to_string())
+            .or_default() += 1;
+    }
+    json!(counts)
 }
 
 fn resolve_definition_candidates(
@@ -8876,7 +9008,7 @@ fn resolve_definition_candidates(
     let Some(query) = query else {
         return Vec::new();
     };
-    graph_symbol_search(graph, query, kind, path, language, None, None)
+    graph_symbol_search(graph, Some(query), kind, path, language, None, None)
 }
 
 fn symbol_rank(symbol: &GraphSymbol, query: &str) -> usize {
@@ -8914,6 +9046,31 @@ fn parse_symbol_kind(value: &str) -> Option<SymbolKind> {
         "test" => Some(SymbolKind::Test),
         "unknown" => Some(SymbolKind::Unknown),
         _ => None,
+    }
+}
+
+fn symbol_kind_label(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Class => "class",
+        SymbolKind::Crate => "crate",
+        SymbolKind::File => "file",
+        SymbolKind::Interface => "interface",
+        SymbolKind::Module => "module",
+        SymbolKind::Struct => "struct",
+        SymbolKind::Enum => "enum",
+        SymbolKind::Union => "union",
+        SymbolKind::Trait => "trait",
+        SymbolKind::Impl => "impl",
+        SymbolKind::Function => "function",
+        SymbolKind::Method => "method",
+        SymbolKind::Const => "const",
+        SymbolKind::Static => "static",
+        SymbolKind::TypeAlias => "type_alias",
+        SymbolKind::Field => "field",
+        SymbolKind::Variant => "variant",
+        SymbolKind::Macro => "macro",
+        SymbolKind::Test => "test",
+        SymbolKind::Unknown => "unknown",
     }
 }
 
@@ -9578,7 +9735,7 @@ fn resolve_single_symbol(
     let query = args.query.as_deref()?;
     graph_symbol_search(
         graph,
-        query,
+        Some(query),
         args.kind.as_deref(),
         args.path.as_deref(),
         None,
@@ -9597,7 +9754,7 @@ fn resolve_flow_target(
         return graph.symbols.get(&SymbolId::new(symbol_id)).cloned();
     }
     let query = args.target_query.as_deref()?;
-    graph_symbol_search(graph, query, None, None, None, None, None)
+    graph_symbol_search(graph, Some(query), None, None, None, None, None)
         .into_iter()
         .next()
 }
@@ -9616,7 +9773,7 @@ fn unresolved_symbol_result(
     } else {
         graph_symbol_search(
             graph,
-            query,
+            Some(query),
             args.kind.as_deref(),
             args.path.as_deref(),
             None,
@@ -9665,7 +9822,7 @@ fn resolve_hierarchy_root(
     let query = args.query.as_deref()?;
     graph_symbol_search(
         graph,
-        query,
+        Some(query),
         args.kind.as_deref(),
         args.path.as_deref(),
         None,
@@ -9689,7 +9846,7 @@ fn unresolved_hierarchy_result(
     } else {
         graph_symbol_search(
             graph,
-            query,
+            Some(query),
             args.kind.as_deref(),
             args.path.as_deref(),
             None,
@@ -11283,22 +11440,21 @@ fn repo_map_spec() -> ToolSpec {
 fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search graph-backed declarations by signature/name with optional kind, language, path, visibility, and attribute filters. Returns uniform evidence packets.".to_string(),
+        description: "Search or count graph-backed declarations by signature/name or filters such as kind, language, path, visibility, and attribute. Use filter-only queries for questions like counting Java callables. Returns evidence packets plus total/facet counts.".to_string(),
         capability: PermissionCapability::Search,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "query": {"type": "string", "description": "Text to match against indexed declaration names and signatures."},
-                "kind": {"type": "string", "description": "Optional symbol kind such as function, method, struct, module, trait, class."},
+                "query": {"type": "string", "description": "Optional text to match against indexed declaration names and signatures. Omit it when using filters for counts."},
+                "kind": {"type": "string", "description": "Optional symbol kind such as callable, function, method, struct, module, trait, class."},
                 "path": {"type": "string", "description": "Optional workspace-relative path suffix filter."},
                 "language": {"type": "string", "description": "Optional language or language family filter such as Rust, Python, js-ts."},
                 "visibility": {"type": "string"},
                 "attribute": {"type": "string"},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
                 "offset": {"type": "integer", "minimum": 0}
-            },
-            "required": ["query"]
+            }
         }),
     }
 }

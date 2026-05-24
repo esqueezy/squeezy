@@ -19,7 +19,7 @@ use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
 };
-use squeezy_tools::{ToolStatus, sha256_hex};
+use squeezy_tools::{ToolCall, ToolStatus, sha256_hex};
 use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
@@ -1906,6 +1906,35 @@ fn redact_json_payload_walks_nested_string_values_and_preserves_structure() {
         .as_str()
         .expect("snippet remains a string");
     assert!(!snippet.contains(synthetic_aws_access_key), "{snippet}");
+}
+
+#[test]
+fn tool_round_failure_summary_names_repeated_invalid_tool_arguments() {
+    let results = vec![
+        control_tool_result(
+            &ToolCall {
+                call_id: "call-1".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({}),
+            },
+            ToolStatus::Error,
+            json!({"error": "invalid tool arguments: missing field `query`"}),
+        ),
+        control_tool_result(
+            &ToolCall {
+                call_id: "call-2".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({}),
+            },
+            ToolStatus::Error,
+            json!({"error": "invalid tool arguments: missing field `query`"}),
+        ),
+    ];
+
+    assert_eq!(
+        tool_round_failure_summary(&results).as_deref(),
+        Some("repeated invalid decl_search arguments (2x)")
+    );
 }
 
 struct SharedLogWrite {

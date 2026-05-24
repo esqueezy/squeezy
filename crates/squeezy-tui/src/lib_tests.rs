@@ -7,7 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ratatui::backend::TestBackend;
 use squeezy_agent::{JobKind, JobStatus};
 use squeezy_core::{
-    AppConfig, CostSnapshot, PermissionCapability, PermissionMode, PermissionPolicy,
+    AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
+    ContextAttachmentStatus, CostSnapshot, PermissionCapability, PermissionMode, PermissionPolicy,
     PermissionRequest, PermissionRisk, PermissionScope, SessionMode, StatusVerbosity,
     TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus, TaskVerificationState,
     ToolOutputVerbosity, TuiAlternateScreen, TuiConfig, TurnId, TurnMetrics,
@@ -605,7 +606,7 @@ fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
 
     assert!(app.transcript[0].collapsed);
     let collapsed = render_to_string(&app, 100, 12);
-    assert!(collapsed.contains("✔ Ran"), "{collapsed}");
+    assert!(collapsed.contains("✔ Explored"), "{collapsed}");
     assert!(collapsed.contains("grep"), "{collapsed}");
     assert!(!collapsed.contains("receipt="), "{collapsed}");
     assert!(!collapsed.contains("B receipt"), "{collapsed}");
@@ -662,8 +663,218 @@ fn failed_tool_rows_show_actionable_error_detail() {
 
     let output = render_to_string(&app, 120, 12);
 
-    assert!(output.contains("✖ Failed shell · exit 101"), "{output}");
+    assert!(
+        output.contains("✖ Failed cargo build --workspace · exit 101"),
+        "{output}"
+    );
     assert!(!output.contains("shell · error"), "{output}");
+}
+
+#[test]
+fn shell_tool_rows_show_command_and_highlight_output() {
+    let mut app = test_app(SessionMode::Build);
+    let call = ToolCall {
+        call_id: "shell-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": "cargo test -p squeezy-tui"}),
+    };
+    let mut result = sample_tool_result("shell", "");
+    result.call_id = "shell-1".to_string();
+    result.content = serde_json::json!({
+        "command": "cargo test -p squeezy-tui",
+        "workdir": ".",
+        "exit_code": 0,
+        "stdout": "\u{1b}[32mok\u{1b}[0m",
+        "stderr": "",
+    });
+    app.push_tool_result_with_call(result, Some(call));
+    select_previous_transcript_entry(&mut app);
+    toggle_selected_transcript_entry(&mut app);
+
+    let output = render_to_string(&app, 140, 18);
+
+    assert!(
+        output.contains("✔ Ran cargo test -p squeezy-tui"),
+        "{output}"
+    );
+    assert!(
+        output.contains("command cargo test -p squeezy-tui"),
+        "{output}"
+    );
+    assert!(output.contains("stdout"), "{output}");
+    assert!(output.contains("ok"), "{output}");
+    assert!(!output.contains("\\u001b"), "{output}");
+}
+
+#[test]
+fn decl_search_row_summarizes_count_query_without_raw_json() {
+    let mut app = test_app(SessionMode::Build);
+    let call = ToolCall {
+        call_id: "decl-1".to_string(),
+        name: "decl_search".to_string(),
+        arguments: serde_json::json!({"language": "Java", "kind": "callable"}),
+    };
+    let mut result = sample_tool_result("decl_search", "");
+    result.call_id = "decl-1".to_string();
+    result.content = serde_json::json!({
+        "query": null,
+        "language": "Java",
+        "kind": "callable",
+        "total_matches": 42,
+        "returned_matches": 10,
+        "counts_by_language": {"Java": 42},
+        "counts_by_kind": {"method": 42},
+        "packets": [],
+        "truncated": true
+    });
+    app.push_tool_result_with_call(result, Some(call));
+
+    let output = render_to_string(&app, 140, 14);
+
+    assert!(
+        output.contains("✔ Explored Java callable declarations · 42 matches"),
+        "{output}"
+    );
+    assert!(!output.contains("receipt"), "{output}");
+    assert!(!output.contains("\"packets\""), "{output}");
+}
+
+#[test]
+fn tool_rows_summarize_diff_glob_read_and_plan_outputs() {
+    let mut app = test_app(SessionMode::Build);
+
+    let mut diff = sample_tool_result("diff_context", "");
+    diff.call_id = "diff-1".to_string();
+    diff.content = serde_json::json!({
+        "mode": "worktree",
+        "summary": {"files_changed": 2, "additions": 3, "deletions": 1},
+        "files": [{"path": "src/lib.rs"}, {"path": "tests/ui.rs"}],
+        "truncated": false,
+    });
+    app.push_tool_result_with_call(
+        diff,
+        Some(ToolCall {
+            call_id: "diff-1".to_string(),
+            name: "diff_context".to_string(),
+            arguments: serde_json::json!({}),
+        }),
+    );
+
+    let mut glob = sample_tool_result("glob", "");
+    glob.call_id = "glob-1".to_string();
+    glob.content = serde_json::json!({
+        "paths": ["src/lib.rs", "src/main.rs"],
+        "metadata": {"pattern": "**/*.rs", "path": "."},
+    });
+    app.push_tool_result_with_call(
+        glob,
+        Some(ToolCall {
+            call_id: "glob-1".to_string(),
+            name: "glob".to_string(),
+            arguments: serde_json::json!({"pattern": "**/*.rs"}),
+        }),
+    );
+
+    let mut read = sample_tool_result("read_file", "");
+    read.call_id = "read-1".to_string();
+    read.content = serde_json::json!({
+        "path": "src/lib.rs",
+        "bytes_returned": 128,
+        "total_bytes": 1024,
+        "content": "fn main() {}",
+        "truncated": true,
+    });
+    app.push_tool_result_with_call(
+        read,
+        Some(ToolCall {
+            call_id: "read-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+        }),
+    );
+
+    let mut plan = sample_tool_result("plan_patch", "");
+    plan.call_id = "plan-1".to_string();
+    plan.content = serde_json::json!({
+        "objective": "modify one file",
+        "plan_id": "patch-1",
+        "symbols": [{"name": "foo"}],
+        "impact": {"neighborhood_paths": ["src/lib.rs", "src/main.rs"]},
+        "graph_available": true,
+    });
+    app.push_tool_result_with_call(
+        plan,
+        Some(ToolCall {
+            call_id: "plan-1".to_string(),
+            name: "plan_patch".to_string(),
+            arguments: serde_json::json!({"objective": "modify one file"}),
+        }),
+    );
+
+    let output = render_to_string(&app, 180, 18);
+
+    assert!(
+        output.contains("✔ Explored diff context (worktree) · 2 files · +3 -1"),
+        "{output}"
+    );
+    assert!(
+        output.contains("✔ Explored list files matching **/*.rs · 2 paths"),
+        "{output}"
+    );
+    assert!(
+        output.contains("✔ Explored read src/lib.rs · 128B · more available"),
+        "{output}"
+    );
+    assert!(
+        output.contains("✔ Planned plan patch for modify one file · 1 symbols · 2 paths"),
+        "{output}"
+    );
+    assert!(!output.contains("output shortened"), "{output}");
+    assert!(!output.contains("\"paths\""), "{output}");
+}
+
+#[test]
+fn repeated_invalid_tool_arguments_are_coalesced() {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..2 {
+        let mut result = sample_tool_result("decl_search", "");
+        result.call_id = format!("decl-{index}");
+        result.status = ToolStatus::Error;
+        result.content = serde_json::json!({
+            "error": "invalid tool arguments: missing field `query`"
+        });
+        app.push_tool_result(result);
+    }
+
+    let output = render_to_string(&app, 140, 14);
+
+    assert!(output.contains("⚠ Retried decl_search"), "{output}");
+    assert!(output.contains("missing field `query`"), "{output}");
+    assert!(output.contains("(2x)"), "{output}");
+    assert_eq!(app.transcript.len(), 1);
+}
+
+#[test]
+fn command_and_output_highlighters_style_key_parts() {
+    let command = command_spans("cargo test -p squeezy-tui");
+    assert_eq!(command[0].style.fg, Some(GOLD));
+    assert!(
+        command
+            .iter()
+            .any(|span| span.content.as_ref() == "-p" && span.style.fg == Some(AMBER)),
+        "{command:?}"
+    );
+
+    let ansi = ansi_spans("\u{1b}[32mok\u{1b}[0m error");
+    assert_eq!(ansi[0].style.fg, Some(Color::Green));
+
+    let keyword = keyword_spans("public class Foo { return ok; }");
+    assert!(
+        keyword
+            .iter()
+            .any(|span| span.content.as_ref() == "class" && span.style.fg == Some(GOLD)),
+        "{keyword:?}"
+    );
 }
 
 #[test]
@@ -682,7 +893,10 @@ fn failed_tool_rows_fall_back_to_no_output_when_empty() {
 
     let output = render_to_string(&app, 120, 12);
 
-    assert!(output.contains("✖ Failed shell · no output"), "{output}");
+    assert!(
+        output.contains("✖ Failed cargo build --workspace · no output"),
+        "{output}"
+    );
     assert!(!output.contains("shell · error"), "{output}");
 }
 
@@ -704,7 +918,9 @@ fn failed_tool_rows_show_missing_exit_status_reason() {
     let output = render_to_string(&app, 140, 18);
 
     assert!(
-        output.contains("✖ Failed shell · shell command ended without an exit code"),
+        output.contains(
+            "✖ Failed cargo build --workspace · shell command ended without an exit code"
+        ),
         "{output}"
     );
 }
@@ -1080,6 +1296,21 @@ fn startup_card_scrolls_with_transcript_history() {
     app.transcript_scroll_from_bottom = u16::MAX;
     let at_top = render_to_string(&app, 120, 20);
     assert!(at_top.contains(">_ Squeezy v"), "{at_top}");
+}
+
+#[test]
+fn compact_viewport_hides_attachment_panel_before_prompt_footer() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("modify one file in the codebase"));
+    app.push_tool_result(sample_tool_result("diff_context", ""));
+    app.attachments = vec![sample_attachment("att-0001"), sample_attachment("att-0002")];
+
+    let output = render_to_string(&app, 120, 8);
+
+    assert!(output.contains("diff context"), "{output}");
+    assert!(output.contains('┃'), "{output}");
+    assert!(output.contains("Enter send"), "{output}");
+    assert!(!output.contains("att-0001"), "{output}");
 }
 
 #[test]
@@ -1528,22 +1759,29 @@ fn failure_log_renders_as_detail_under_user_turn() {
 }
 
 #[test]
-fn active_tool_does_not_clutter_working_line() {
+fn active_tool_surfaces_current_work_in_working_line() {
     let mut app = test_app(SessionMode::Build);
     let (_tx, rx) = mpsc::channel(1);
     app.turn_rx = Some(rx);
-    app.active_tool = Some("definition_search".to_string());
+    app.remember_active_tool_call(ToolCall {
+        call_id: "call-active".to_string(),
+        name: "definition_search".to_string(),
+        arguments: serde_json::json!({"query": "getFoo"}),
+    });
 
     let output = render_to_string(&app, 120, 16);
 
     assert!(output.contains("• Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
-    assert!(!output.contains("definition_search"), "{output}");
+    assert!(
+        output.contains("Exploring definition search for getFoo"),
+        "{output}"
+    );
     assert!(!output.contains("Queued"), "{output}");
 }
 
 #[tokio::test]
-async fn queued_tool_event_updates_working_status_without_transcript_row() {
+async fn queued_tool_event_updates_visible_working_status_without_transcript_row() {
     let mut app = test_app(SessionMode::Build);
     let (tx, rx) = mpsc::channel(4);
     app.turn_rx = Some(rx);
@@ -1566,7 +1804,7 @@ async fn queued_tool_event_updates_working_status_without_transcript_row() {
     let output = render_to_string(&app, 120, 16);
     assert!(output.contains("• Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
-    assert!(!output.contains("grep"), "{output}");
+    assert!(output.contains("Exploring grep getFoo"), "{output}");
     assert!(!output.contains("Queued"), "{output}");
     assert!(!output.contains("args="), "{output}");
 }
@@ -2449,5 +2687,25 @@ fn sample_tool_result(name: &str, output: &str) -> ToolResult {
             content_sha256: Some("0123456789abcdef".to_string()),
         },
         spill_model_output: None,
+    }
+}
+
+fn sample_attachment(id: &str) -> ContextAttachment {
+    ContextAttachment {
+        id: id.to_string(),
+        source: ContextAttachmentSource::Paste,
+        kind: ContextAttachmentKind::Config,
+        status: ContextAttachmentStatus::Attached,
+        label: "paste".to_string(),
+        path: None,
+        original_sha256: "original".to_string(),
+        redacted_sha256: Some("redacted".to_string()),
+        original_bytes: 319,
+        stored_bytes: 300,
+        preview_bytes: 120,
+        redactions: 0,
+        preview: "map · output shortened  ✖ Failed decl_search · invalid tool arguments"
+            .to_string(),
+        truncated: true,
     }
 }

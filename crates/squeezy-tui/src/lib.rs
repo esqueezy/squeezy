@@ -380,12 +380,12 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     // resets) brings them back to live view.
                 }
                 AgentEvent::ToolCallQueued { call, .. } => {
-                    app.status = format!("queued {}", call.name);
-                    app.active_tool = Some(call.name);
+                    app.status = format!("queued {}", tool_call_label(&call));
+                    app.remember_active_tool_call(call);
                 }
                 AgentEvent::ToolCallStarted { call, .. } => {
-                    app.status = format!("running {}", call.name);
-                    app.active_tool = Some(call.name);
+                    app.status = format!("running {}", tool_call_label(&call));
+                    app.remember_active_tool_call(call);
                 }
                 AgentEvent::ToolCallCompleted { result, .. } => {
                     app.status = format!(
@@ -403,8 +403,9 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         app.status
                             .push_str(&format!(" redacted={}", result.cost_hint.redactions));
                     }
-                    app.active_tool = None;
-                    app.push_tool_result(result);
+                    let call = app.active_tool_calls.remove(&result.call_id);
+                    app.refresh_active_tool_name();
+                    app.push_tool_result_with_call(result, call);
                 }
                 AgentEvent::TaskStateUpdated { snapshot, .. } => {
                     app.task_state = Some(snapshot);
@@ -457,7 +458,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.metrics = metrics;
                     app.status = "ready".to_string();
                     app.turn_visual = TurnVisualState::Succeeded;
-                    app.active_tool = None;
+                    app.clear_active_tools();
                     app.note_turn_finished();
                     // Preserve the user's scroll position; if they paged up
                     // mid-turn we shouldn't snap them down on completion.
@@ -470,7 +471,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.turn_visual = TurnVisualState::Failed;
                     app.push_log("turn cancelled".to_string());
                     app.pending_assistant.clear();
-                    app.active_tool = None;
+                    app.clear_active_tools();
                     app.note_turn_finished();
                     app.cancel = None;
                     keep_rx = false;
@@ -481,7 +482,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.turn_visual = TurnVisualState::Failed;
                     app.push_log(format!("turn failed: {}", app.status));
                     app.pending_assistant.clear();
-                    app.active_tool = None;
+                    app.clear_active_tools();
                     app.note_turn_finished();
                     app.cancel = None;
                     keep_rx = false;
@@ -2178,9 +2179,7 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
     let include_startup_card = area.height >= 16;
     let input_height = input_panel_height(app, area.width);
-    let attachment_height = attachment_panel_height(app);
     let approval_height = approval_menu_height(app);
-    let requested_transcript_gap_height = transcript_prompt_gap_height(app);
     let task_height = if should_show_task_panel(app) {
         let h = if approval_height > 0 {
             task_panel_height(app).min(5)
@@ -2191,12 +2190,15 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     } else {
         None
     };
-    let reserved_height = task_height
+    let required_height = task_height
         .unwrap_or(0)
         .saturating_add(approval_height)
-        .saturating_add(attachment_height)
         .saturating_add(input_height)
         .saturating_add(2);
+    let optional_height = area.height.saturating_sub(required_height);
+    let attachment_height = attachment_panel_height(app, optional_height);
+    let requested_transcript_gap_height = transcript_prompt_gap_height(app);
+    let reserved_height = required_height.saturating_add(attachment_height);
     let transcript_visual_height =
         transcript_visual_line_count(app, area.width, include_startup_card);
     let available_without_gap = area.height.saturating_sub(reserved_height);
@@ -2265,20 +2267,21 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
 fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
     let input_height = input_panel_height(app, area.width);
-    let attachment_height = attachment_panel_height(app);
     let approval_height = approval_menu_height(app);
     let task_height = should_show_task_panel(app).then_some(task_panel_height(app));
     let status_height = 2;
     let live_lines = pending_assistant_lines(app);
     let live_visual_height = visual_line_count(&live_lines, area.width);
     let live_gap = if live_visual_height > 0 { 1 } else { 0 };
-    let reserved_height = task_height
+    let required_height = task_height
         .unwrap_or(0)
-        .saturating_add(attachment_height)
         .saturating_add(input_height)
         .saturating_add(approval_height)
         .saturating_add(status_height)
         .saturating_add(live_gap);
+    let attachment_height =
+        attachment_panel_height(app, area.height.saturating_sub(required_height));
+    let reserved_height = required_height.saturating_add(attachment_height);
     let live_height = live_visual_height.min(area.height.saturating_sub(reserved_height));
 
     let mut constraints = Vec::new();
@@ -2397,6 +2400,10 @@ fn working_line(app: &TuiApp) -> Line<'static> {
         ),
         Style::default().fg(QUIET),
     ));
+    if let Some(call) = app.active_tool_calls.values().next() {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.extend(active_tool_spans(call));
+    }
     Line::from(spans)
 }
 
@@ -2693,20 +2700,36 @@ fn startup_card_row(
     ])
 }
 
-fn attachment_panel_height(app: &TuiApp) -> u16 {
+fn attachment_panel_height(app: &TuiApp, optional_height: u16) -> u16 {
     if app.attachments.is_empty() {
         0
     } else {
-        (app.attachments.len() as u16).clamp(1, 4)
+        // Attachments are composer metadata, not transcript content. Keep at
+        // least a small transcript viewport before spending rows on them.
+        let max_attachment_rows = optional_height.saturating_sub(3);
+        (app.attachments.len() as u16)
+            .clamp(1, 2)
+            .min(max_attachment_rows)
     }
 }
 
 fn render_attachments(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let lines = app
+    let max_rows = area.height as usize;
+    let mut lines = app
         .attachments
         .iter()
+        .take(max_rows)
         .map(|attachment| Line::from(format_attachment_line(attachment)))
         .collect::<Vec<_>>();
+    if app.attachments.len() > max_rows && max_rows > 0 {
+        let hidden = app.attachments.len() - max_rows;
+        if let Some(last) = lines.last_mut() {
+            last.spans.push(Span::styled(
+                format!(" · +{hidden} more (/attachments)"),
+                Style::default().fg(QUIET),
+            ));
+        }
+    }
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(QUIET))
         .wrap(Wrap { trim: false });
@@ -2779,8 +2802,8 @@ fn format_transcript_entry_with_width(
         TranscriptEntryKind::Message(item) => {
             format_message_entry_with_width(item, entry.collapsed, selected, outcome, width)
         }
-        TranscriptEntryKind::ToolResult(result) => {
-            format_tool_result_entry(result, entry.collapsed, selected, tool_output_verbosity)
+        TranscriptEntryKind::ToolResult(tool) => {
+            format_tool_result_entry(tool, entry.collapsed, selected, tool_output_verbosity)
         }
         TranscriptEntryKind::Log(message) => format_log_entry(message, entry.collapsed, selected),
     }
@@ -2856,11 +2879,7 @@ fn format_message_entry_with_width(
             label_color,
             action,
             action_color,
-            format!(
-                "… {} chars  {}",
-                item.content.chars().count(),
-                compact_text(&item.content, 140)
-            ),
+            collapsed_content_summary(&item.content),
             content_style,
         )];
     }
@@ -2947,11 +2966,7 @@ fn format_assistant_message_entry(
         vec![assistant_line(
             selected,
             assistant_static_span(color),
-            format!(
-                "… {} chars  {}",
-                item.content.chars().count(),
-                compact_text(&item.content, 140)
-            ),
+            collapsed_content_summary(&item.content),
             Style::default(),
         )]
     } else {
@@ -2966,40 +2981,44 @@ fn format_assistant_message_entry(
     lines
 }
 
+fn collapsed_content_summary(content: &str) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    if lines.len() > 1 {
+        let first = compact_text(lines.first().copied().unwrap_or_default(), 120);
+        format!("{first} … +{} lines (Ctrl-E to expand)", lines.len() - 1)
+    } else {
+        compact_text(content, 160)
+    }
+}
+
 fn format_tool_result_entry(
-    result: &ToolResult,
+    tool: &ToolTranscript,
     collapsed: bool,
     selected: bool,
     tool_output_verbosity: ToolOutputVerbosity,
 ) -> Vec<Line<'static>> {
-    let summary = tool_result_summary(result);
-    let (marker, action) = tool_result_action(result.status);
+    let result = &tool.result;
+    let (marker, action) = tool_result_action(tool);
+    let summary_spans = tool_result_summary_spans(tool);
     if collapsed {
-        return vec![action_line(
+        return vec![action_line_spans(
             selected,
             marker,
             status_color(result.status),
             action,
             status_color(result.status),
-            summary,
+            summary_spans,
         )];
     }
-    let mut lines = vec![action_line(
+    let mut lines = vec![action_line_spans(
         selected,
         marker,
         status_color(result.status),
         action,
         status_color(result.status),
-        summary,
+        summary_spans,
     )];
-    if result.cost_hint.truncated {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled("output shortened for display", Style::default().fg(QUIET)),
-        ]));
-    }
-    let preview = preview_tool_result(result, tool_output_verbosity);
-    lines.extend(indented_text_lines(&preview));
+    lines.extend(expanded_tool_detail_lines(tool, tool_output_verbosity));
     lines
 }
 
@@ -3035,25 +3054,6 @@ fn log_color(message: &str) -> Color {
     }
 }
 
-fn action_line(
-    selected: bool,
-    label: &'static str,
-    label_color: Color,
-    action: &'static str,
-    action_color: Color,
-    content: impl Into<String>,
-) -> Line<'static> {
-    action_line_styled(
-        selected,
-        label,
-        label_color,
-        action,
-        action_color,
-        content,
-        Style::default(),
-    )
-}
-
 fn action_line_styled(
     selected: bool,
     label: &'static str,
@@ -3083,6 +3083,37 @@ fn action_line_styled(
         Span::raw(spacer),
         Span::styled(content, content_style),
     ])
+}
+
+fn action_line_spans(
+    selected: bool,
+    label: &'static str,
+    label_color: Color,
+    action: &'static str,
+    action_color: Color,
+    content: Vec<Span<'static>>,
+) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let mut spans = vec![
+        Span::raw(marker),
+        Span::styled(
+            label,
+            Style::default()
+                .fg(label_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            action,
+            Style::default()
+                .fg(action_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !content.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.extend(content);
+    }
+    Line::from(spans)
 }
 
 fn detail_line(selected: bool, color: Color, content: impl Into<String>) -> Line<'static> {
@@ -3200,33 +3231,1107 @@ fn detail_text_lines(selected: bool, color: Color, content: &str) -> Vec<Line<'s
         .collect()
 }
 
-fn indented_text_lines(content: &str) -> Vec<Line<'static>> {
-    content
-        .lines()
-        .map(|line| Line::from(format!("  {line}")))
+fn tool_result_summary(tool: &ToolTranscript) -> String {
+    spans_plain_text(&tool_result_summary_spans(tool))
+}
+
+fn tool_result_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let result = &tool.result;
+    if is_invalid_argument_result(result) {
+        let mut spans = vec![Span::styled(
+            result.tool_name.clone(),
+            Style::default().fg(Color::White),
+        )];
+        if let Some(call) = tool.call.as_ref() {
+            let label = tool_call_label(call);
+            if label != result.tool_name {
+                spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+                spans.push(Span::styled(label, Style::default().fg(QUIET)));
+            }
+        }
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            tool_result_error_detail(result),
+            Style::default().fg(QUIET),
+        ));
+        if tool.repeat_count > 1 {
+            spans.push(Span::styled(
+                format!(" ({}x)", tool.repeat_count),
+                Style::default().fg(QUIET),
+            ));
+        }
+        return spans;
+    }
+    let mut spans = match result.tool_name.as_str() {
+        "shell" | "verify" => shell_tool_summary_spans(tool),
+        "decl_search" => decl_search_summary_spans(tool),
+        "definition_search" | "reference_search" | "symbol_context" | "hierarchy"
+        | "upstream_flow" | "downstream_flow" => semantic_tool_summary_spans(tool),
+        "repo_map" => repo_map_summary_spans(tool),
+        "grep" | "glob" | "read_file" | "read_slice" | "read_tool_output" => {
+            read_search_summary_spans(tool)
+        }
+        "diff_context" => diff_context_summary_spans(tool),
+        "plan_patch" => plan_patch_summary_spans(tool),
+        "apply_patch" | "write_file" => edit_summary_spans(tool),
+        "webfetch" | "websearch" => web_summary_spans(tool),
+        _ => vec![Span::styled(
+            result.tool_name.clone(),
+            Style::default().fg(Color::White),
+        )],
+    };
+    match result.status {
+        ToolStatus::Error | ToolStatus::Stale => {
+            spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+            spans.push(Span::styled(
+                tool_result_error_detail(result),
+                Style::default().fg(QUIET),
+            ));
+        }
+        ToolStatus::Denied => {
+            spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+            spans.push(Span::styled(
+                tool_result_denied_detail(result),
+                Style::default().fg(QUIET),
+            ));
+        }
+        ToolStatus::Cancelled => {
+            spans.push(Span::styled(" · cancelled", Style::default().fg(QUIET)));
+        }
+        ToolStatus::Success => {}
+    }
+    if tool.repeat_count > 1 {
+        spans.push(Span::styled(
+            format!(" ({}x)", tool.repeat_count),
+            Style::default().fg(QUIET),
+        ));
+    }
+    spans
+}
+
+fn spans_plain_text(spans: &[Span<'_>]) -> String {
+    spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+}
+
+fn shell_tool_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let command = tool
+        .call
+        .as_ref()
+        .and_then(|call| string_arg(&call.arguments, "command"))
+        .or_else(|| string_arg(&tool.result.content, "command"))
+        .unwrap_or_else(|| tool.result.tool_name.clone());
+    command_spans(&command)
+}
+
+fn decl_search_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let query = tool
+        .call
+        .as_ref()
+        .and_then(|call| string_arg(&call.arguments, "query"))
+        .or_else(|| string_arg(&tool.result.content, "query"));
+    let language = tool
+        .call
+        .as_ref()
+        .and_then(|call| string_arg(&call.arguments, "language"))
+        .or_else(|| string_arg(&tool.result.content, "language"));
+    let kind = tool
+        .call
+        .as_ref()
+        .and_then(|call| string_arg(&call.arguments, "kind"))
+        .or_else(|| string_arg(&tool.result.content, "kind"));
+    let mut label = String::new();
+    if let Some(language) = language {
+        label.push_str(&language);
+        label.push(' ');
+    }
+    if let Some(kind) = kind {
+        label.push_str(&kind_label(&kind));
+        label.push(' ');
+    }
+    label.push_str("declarations");
+    if let Some(query) = query {
+        label.push_str(" for ");
+        label.push_str(&query);
+    }
+    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    if let Some(total) = number_field(&tool.result.content, "total_matches")
+        .or_else(|| number_field(&tool.result.content, "returned_matches"))
+    {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            format!("{total} matches"),
+            Style::default().fg(GOLD),
+        ));
+    }
+    if tool.result.content["truncated"].as_bool().unwrap_or(false) {
+        spans.push(Span::styled(
+            " · more available",
+            Style::default().fg(QUIET),
+        ));
+    }
+    spans
+}
+
+fn semantic_tool_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let label = tool_call_label_or_name(tool);
+    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    if let Some(matches) = number_field(&tool.result.content, "total_matches")
+        .or_else(|| number_field(&tool.result.content, "returned_matches"))
+        .or_else(|| {
+            tool.result.content["packets"]
+                .as_array()
+                .map(|items| items.len() as u64)
+        })
+    {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            format!("{matches} matches"),
+            Style::default().fg(GOLD),
+        ));
+    }
+    spans
+}
+
+fn repo_map_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled("repo map", Style::default().fg(Color::White))];
+    if let Some(files) = tool.result.content["stats"]["files"].as_u64() {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            format!("{files} files"),
+            Style::default().fg(GOLD),
+        ));
+    }
+    if let Some(symbols) = tool.result.content["stats"]["symbols"].as_u64() {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            format!("{symbols} symbols"),
+            Style::default().fg(GOLD),
+        ));
+    }
+    append_truncation_hint(&mut spans, tool);
+    spans
+}
+
+fn read_search_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    match tool.result.tool_name.as_str() {
+        "glob" => glob_summary_spans(tool),
+        "read_file" | "read_slice" => read_file_summary_spans(tool),
+        "read_tool_output" => read_tool_output_summary_spans(tool),
+        _ => grep_summary_spans(tool),
+    }
+}
+
+fn grep_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let label = tool_call_label_or_name(tool);
+    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    if let Some(matches) = number_field(&tool.result.content, "matches_returned")
+        .or_else(|| number_field(&tool.result.content, "count"))
+        .or_else(|| {
+            tool.result.content["matches"]
+                .as_array()
+                .map(|items| items.len() as u64)
+        })
+        .or_else(|| {
+            tool.result.content["paths"]
+                .as_array()
+                .map(|items| items.len() as u64)
+        })
+    {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            format!("{matches} matches"),
+            Style::default().fg(GOLD),
+        ));
+    }
+    append_truncation_hint(&mut spans, tool);
+    spans
+}
+
+fn glob_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let pattern = tool
+        .call
+        .as_ref()
+        .and_then(|call| string_arg(&call.arguments, "pattern"))
+        .or_else(|| string_arg(&tool.result.content["metadata"], "pattern"));
+    let label = pattern
+        .map(|pattern| format!("list files matching {pattern}"))
+        .unwrap_or_else(|| "list files".to_string());
+    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    if let Some(paths) = tool.result.content["paths"]
+        .as_array()
+        .map(|items| items.len() as u64)
+    {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            format!("{paths} paths"),
+            Style::default().fg(GOLD),
+        ));
+    }
+    append_truncation_hint(&mut spans, tool);
+    spans
+}
+
+fn read_file_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let label = tool_call_label_or_name(tool);
+    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(format_bytes(bytes), Style::default().fg(GOLD)));
+    } else if let Some(ranges) = tool.result.content["ranges"]
+        .as_array()
+        .map(|items| items.len() as u64)
+    {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            format!("{ranges} ranges"),
+            Style::default().fg(GOLD),
+        ));
+    }
+    append_truncation_hint(&mut spans, tool);
+    spans
+}
+
+fn read_tool_output_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        "expand saved tool output",
+        Style::default().fg(Color::White),
+    )];
+    if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(format_bytes(bytes), Style::default().fg(GOLD)));
+    }
+    append_truncation_hint(&mut spans, tool);
+    spans
+}
+
+fn edit_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    vec![Span::styled(
+        tool_call_label_or_name(tool),
+        Style::default().fg(Color::White),
+    )]
+}
+
+fn diff_context_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let mode = string_arg(&tool.result.content, "mode")
+        .map(|mode| format!("diff context ({mode})"))
+        .unwrap_or_else(|| "diff context".to_string());
+    let mut spans = vec![Span::styled(mode, Style::default().fg(Color::White))];
+    let files = tool.result.content["summary"]["files_changed"]
+        .as_u64()
+        .or_else(|| {
+            tool.result.content["files"]
+                .as_array()
+                .map(|items| items.len() as u64)
+        });
+    if let Some(files) = files {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            format!("{files} files"),
+            Style::default().fg(GOLD),
+        ));
+    }
+    let additions = tool.result.content["summary"]["additions"].as_u64();
+    let deletions = tool.result.content["summary"]["deletions"].as_u64();
+    if additions.unwrap_or(0) > 0 || deletions.unwrap_or(0) > 0 {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            format!("+{} -{}", additions.unwrap_or(0), deletions.unwrap_or(0)),
+            Style::default().fg(QUIET),
+        ));
+    }
+    append_truncation_hint(&mut spans, tool);
+    spans
+}
+
+fn plan_patch_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let objective = tool
+        .call
+        .as_ref()
+        .and_then(|call| string_arg(&call.arguments, "objective"))
+        .or_else(|| string_arg(&tool.result.content, "objective"));
+    let label = objective
+        .map(|objective| format!("plan patch for {}", compact_text(&objective, 64)))
+        .unwrap_or_else(|| "plan patch".to_string());
+    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    if let Some(symbols) = tool.result.content["symbols"]
+        .as_array()
+        .map(|items| items.len() as u64)
+        .filter(|count| *count > 0)
+    {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            format!("{symbols} symbols"),
+            Style::default().fg(GOLD),
+        ));
+    }
+    if let Some(paths) = tool.result.content["impact"]["neighborhood_paths"]
+        .as_array()
+        .map(|items| items.len() as u64)
+        .filter(|count| *count > 0)
+    {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            format!("{paths} paths"),
+            Style::default().fg(GOLD),
+        ));
+    }
+    if tool.result.content["graph_available"].as_bool() == Some(false) {
+        spans.push(Span::styled(
+            " · graph unavailable",
+            Style::default().fg(QUIET),
+        ));
+    }
+    append_truncation_hint(&mut spans, tool);
+    spans
+}
+
+fn web_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    vec![Span::styled(
+        tool_call_label_or_name(tool),
+        Style::default().fg(Color::White),
+    )]
+}
+
+fn tool_call_label_or_name(tool: &ToolTranscript) -> String {
+    tool.call
+        .as_ref()
+        .map(tool_call_label)
+        .unwrap_or_else(|| tool.result.tool_name.clone())
+}
+
+fn tool_call_label(call: &ToolCall) -> String {
+    match call.name.as_str() {
+        "shell" | "verify" => string_arg(&call.arguments, "command")
+            .or_else(|| string_arg(&call.arguments, "description"))
+            .unwrap_or_else(|| call.name.clone()),
+        "decl_search" => {
+            let language = string_arg(&call.arguments, "language");
+            let kind = string_arg(&call.arguments, "kind").map(|value| kind_label(&value));
+            let query = string_arg(&call.arguments, "query");
+            let mut label = String::new();
+            if let Some(language) = language {
+                label.push_str(&language);
+                label.push(' ');
+            }
+            if let Some(kind) = kind {
+                label.push_str(&kind);
+                label.push(' ');
+            }
+            label.push_str("declarations");
+            if let Some(query) = query {
+                label.push_str(" for ");
+                label.push_str(&query);
+            }
+            label
+        }
+        "repo_map" => "repo map".to_string(),
+        "definition_search" => string_arg(&call.arguments, "query")
+            .map(|query| format!("definition search for {query}"))
+            .unwrap_or_else(|| "definition search".to_string()),
+        "reference_search" => string_arg(&call.arguments, "query")
+            .or_else(|| string_arg(&call.arguments, "symbol_id"))
+            .map(|query| format!("reference search for {query}"))
+            .unwrap_or_else(|| "reference search".to_string()),
+        "symbol_context" => string_arg(&call.arguments, "query")
+            .map(|query| format!("symbol context for {query}"))
+            .unwrap_or_else(|| "symbol context".to_string()),
+        "grep" => string_arg(&call.arguments, "query")
+            .or_else(|| string_arg(&call.arguments, "pattern"))
+            .map(|query| format!("grep {query}"))
+            .unwrap_or_else(|| "grep".to_string()),
+        "glob" => string_arg(&call.arguments, "pattern")
+            .map(|pattern| format!("glob {pattern}"))
+            .unwrap_or_else(|| "glob".to_string()),
+        "read_file" | "read_slice" => string_arg(&call.arguments, "path")
+            .map(|path| format!("read {path}"))
+            .unwrap_or_else(|| call.name.clone()),
+        "read_tool_output" => "expand previous tool output".to_string(),
+        "diff_context" => "diff context".to_string(),
+        "plan_patch" => string_arg(&call.arguments, "objective")
+            .map(|objective| format!("plan patch for {}", compact_text(&objective, 64)))
+            .unwrap_or_else(|| "plan patch".to_string()),
+        "apply_patch" => "apply patch".to_string(),
+        "write_file" => string_arg(&call.arguments, "path")
+            .map(|path| format!("write {path}"))
+            .unwrap_or_else(|| "write file".to_string()),
+        "webfetch" => string_arg(&call.arguments, "url")
+            .map(|url| format!("fetch {url}"))
+            .unwrap_or_else(|| "web fetch".to_string()),
+        "websearch" => string_arg(&call.arguments, "query")
+            .map(|query| format!("web search {query}"))
+            .unwrap_or_else(|| "web search".to_string()),
+        _ => call.name.clone(),
+    }
+}
+
+fn active_tool_spans(call: &ToolCall) -> Vec<Span<'static>> {
+    let action = active_tool_action(&call.name);
+    let mut spans = vec![Span::styled(
+        action,
+        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+    )];
+    if matches!(call.name.as_str(), "shell" | "verify")
+        && let Some(command) = string_arg(&call.arguments, "command")
+    {
+        spans.extend(command_spans(&command));
+    } else {
+        spans.push(Span::styled(
+            tool_call_label(call),
+            Style::default().fg(Color::White),
+        ));
+    }
+    spans
+}
+
+fn active_tool_action(tool_name: &str) -> &'static str {
+    match tool_name {
+        "plan_patch" => "Planning ",
+        "apply_patch" | "write_file" => "Editing ",
+        name if is_exploration_tool(name) => "Exploring ",
+        _ => "Running ",
+    }
+}
+
+fn expanded_tool_detail_lines(
+    tool: &ToolTranscript,
+    verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    match tool.result.tool_name.as_str() {
+        "shell" | "verify" => expanded_shell_detail_lines(tool, verbosity),
+        "decl_search" => expanded_decl_search_detail_lines(tool, verbosity),
+        "repo_map" => expanded_repo_map_detail_lines(tool),
+        "diff_context" => expanded_diff_context_detail_lines(tool),
+        "plan_patch" => expanded_plan_patch_detail_lines(tool),
+        "grep" | "glob" | "read_file" | "read_slice" | "read_tool_output" => {
+            expanded_read_search_detail_lines(tool, verbosity)
+        }
+        _ => expanded_generic_tool_detail_lines(tool, verbosity),
+    }
+}
+
+fn expanded_shell_detail_lines(
+    tool: &ToolTranscript,
+    verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(command) = tool
+        .call
+        .as_ref()
+        .and_then(|call| string_arg(&call.arguments, "command"))
+        .or_else(|| string_arg(&tool.result.content, "command"))
+    {
+        lines.push(detail_spans_line(
+            vec![Span::styled("command ", Style::default().fg(QUIET))]
+                .into_iter()
+                .chain(command_spans(&command))
+                .collect(),
+        ));
+    }
+    if let Some(workdir) = string_arg(&tool.result.content, "workdir") {
+        lines.push(detail_line(false, QUIET, format!("cwd {workdir}")));
+    }
+    if let Some(exit_code) = tool
+        .result
+        .content
+        .get("exit_code")
+        .and_then(|value| value.as_i64())
+    {
+        lines.push(detail_line(false, QUIET, format!("exit {exit_code}")));
+    }
+    lines.extend(output_block_lines(
+        "stdout",
+        string_arg(&tool.result.content, "stdout")
+            .as_deref()
+            .unwrap_or(""),
+        verbosity,
+    ));
+    lines.extend(output_block_lines(
+        "stderr",
+        string_arg(&tool.result.content, "stderr")
+            .as_deref()
+            .unwrap_or(""),
+        verbosity,
+    ));
+    if lines.is_empty() {
+        lines.extend(expanded_generic_tool_detail_lines(tool, verbosity));
+    }
+    lines
+}
+
+fn expanded_decl_search_detail_lines(
+    tool: &ToolTranscript,
+    _verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(total) = number_field(&tool.result.content, "total_matches") {
+        lines.push(detail_line(false, QUIET, format!("total matches {total}")));
+    }
+    if let Some(returned) = number_field(&tool.result.content, "returned_matches") {
+        lines.push(detail_line(
+            false,
+            QUIET,
+            format!("shown matches {returned}"),
+        ));
+    }
+    if let Some(languages) = compact_json_object(&tool.result.content["counts_by_language"]) {
+        lines.push(detail_line(false, QUIET, format!("languages {languages}")));
+    }
+    if let Some(kinds) = compact_json_object(&tool.result.content["counts_by_kind"]) {
+        lines.push(detail_line(false, QUIET, format!("kinds {kinds}")));
+    }
+    lines
+}
+
+fn expanded_repo_map_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(files) = tool.result.content["stats"]["files"].as_u64() {
+        lines.push(detail_line(false, QUIET, format!("files {files}")));
+    }
+    if let Some(symbols) = tool.result.content["stats"]["symbols"].as_u64() {
+        lines.push(detail_line(false, QUIET, format!("symbols {symbols}")));
+    }
+    if let Some(languages) = compact_json_object(&tool.result.content["languages"]) {
+        lines.push(detail_line(false, QUIET, format!("languages {languages}")));
+    }
+    lines
+}
+
+fn expanded_diff_context_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(mode) = string_arg(&tool.result.content, "mode") {
+        lines.push(detail_line(false, QUIET, format!("mode {mode}")));
+    }
+    let summary = &tool.result.content["summary"];
+    if let Some(files) = summary["files_changed"].as_u64() {
+        let additions = summary["additions"].as_u64().unwrap_or(0);
+        let deletions = summary["deletions"].as_u64().unwrap_or(0);
+        lines.push(detail_line(
+            false,
+            QUIET,
+            format!("changed {files} files, +{additions} -{deletions}"),
+        ));
+    }
+    lines.extend(path_detail_lines(&tool.result.content["files"], "path", 6));
+    lines
+}
+
+fn expanded_plan_patch_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(objective) = string_arg(&tool.result.content, "objective") {
+        lines.push(detail_line(false, QUIET, format!("objective {objective}")));
+    }
+    if let Some(plan_id) = string_arg(&tool.result.content, "plan_id") {
+        lines.push(detail_line(false, QUIET, format!("plan {plan_id}")));
+    }
+    if let Some(symbols) = tool.result.content["symbols"].as_array() {
+        lines.push(detail_line(
+            false,
+            QUIET,
+            format!("symbols {}", symbols.len()),
+        ));
+    }
+    if let Some(paths) = tool.result.content["impact"]["neighborhood_paths"].as_array() {
+        lines.push(detail_line(false, QUIET, format!("paths {}", paths.len())));
+        lines.extend(paths.iter().take(5).filter_map(|path| {
+            path.as_str()
+                .map(|path| detail_line(false, QUIET, format!("path {path}")))
+        }));
+    }
+    if let Some(next) = tool.result.content["next_action"]["reason"].as_str() {
+        lines.push(detail_line(false, QUIET, format!("next {next}")));
+    }
+    lines
+}
+
+fn expanded_read_search_detail_lines(
+    tool: &ToolTranscript,
+    verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    let lines = match tool.result.tool_name.as_str() {
+        "glob" => expanded_glob_detail_lines(tool),
+        "grep" => expanded_grep_detail_lines(tool),
+        "read_file" | "read_slice" => expanded_read_file_detail_lines(tool, verbosity),
+        "read_tool_output" => expanded_read_tool_output_detail_lines(tool, verbosity),
+        _ => expanded_generic_tool_detail_lines(tool, verbosity),
+    };
+    if lines.is_empty() {
+        expanded_generic_tool_detail_lines(tool, verbosity)
+    } else {
+        lines
+    }
+}
+
+fn expanded_glob_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(pattern) = string_arg(&tool.result.content["metadata"], "pattern") {
+        lines.push(detail_line(false, QUIET, format!("pattern {pattern}")));
+    }
+    if let Some(path) = string_arg(&tool.result.content["metadata"], "path") {
+        lines.push(detail_line(false, QUIET, format!("root {path}")));
+    }
+    if let Some(paths) = tool.result.content["paths"].as_array() {
+        lines.push(detail_line(false, QUIET, format!("paths {}", paths.len())));
+        lines.extend(paths.iter().take(8).filter_map(|path| {
+            path.as_str()
+                .map(|path| detail_line(false, QUIET, format!("path {path}")))
+        }));
+    }
+    lines
+}
+
+fn expanded_grep_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(pattern) = string_arg(&tool.result.content["metadata"], "pattern") {
+        lines.push(detail_line(false, QUIET, format!("pattern {pattern}")));
+    }
+    if let Some(path) = string_arg(&tool.result.content["metadata"], "path") {
+        lines.push(detail_line(false, QUIET, format!("root {path}")));
+    }
+    if let Some(count) = number_field(&tool.result.content, "count") {
+        lines.push(detail_line(false, QUIET, format!("matches {count}")));
+    }
+    lines.extend(path_detail_lines(&tool.result.content["paths"], "", 8));
+    if let Some(matches) = tool.result.content["matches"].as_array() {
+        for item in matches.iter().take(6) {
+            let path = item["path"].as_str().unwrap_or("?");
+            let line = item["line"].as_u64().unwrap_or(0);
+            let text = item["text"].as_str().unwrap_or_default();
+            lines.push(detail_line(
+                false,
+                QUIET,
+                format!("{path}:{line} {}", compact_text(text, 100)),
+            ));
+        }
+    }
+    lines
+}
+
+fn expanded_read_file_detail_lines(
+    tool: &ToolTranscript,
+    verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(path) = string_arg(&tool.result.content, "path") {
+        lines.push(detail_line(false, QUIET, format!("path {path}")));
+    }
+    if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
+        let total = number_field(&tool.result.content, "total_bytes").unwrap_or(bytes);
+        lines.push(detail_line(
+            false,
+            QUIET,
+            format!("bytes {} of {}", format_bytes(bytes), format_bytes(total)),
+        ));
+    }
+    if let Some(ranges) = tool.result.content["ranges"].as_array() {
+        lines.push(detail_line(
+            false,
+            QUIET,
+            format!("ranges {}", ranges.len()),
+        ));
+    }
+    if let Some(content) = string_arg(&tool.result.content, "content") {
+        lines.extend(output_block_lines("content", &content, verbosity));
+    }
+    lines
+}
+
+fn expanded_read_tool_output_detail_lines(
+    tool: &ToolTranscript,
+    verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(handle) = string_arg(&tool.result.content, "handle") {
+        lines.push(detail_line(false, QUIET, format!("handle {handle}")));
+    }
+    if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
+        let total = number_field(&tool.result.content, "total_bytes").unwrap_or(bytes);
+        lines.push(detail_line(
+            false,
+            QUIET,
+            format!("bytes {} of {}", format_bytes(bytes), format_bytes(total)),
+        ));
+    }
+    if let Some(content) = string_arg(&tool.result.content, "content") {
+        lines.extend(output_block_lines("content", &content, verbosity));
+    }
+    lines
+}
+
+fn expanded_generic_tool_detail_lines(
+    tool: &ToolTranscript,
+    verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    let preview = preview_tool_result(&tool.result, verbosity);
+    output_block_lines("details", &preview, verbosity)
+}
+
+fn output_block_lines(
+    label: &'static str,
+    content: &str,
+    verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    if content.trim().is_empty() {
+        return Vec::new();
+    }
+    let limit = match verbosity {
+        ToolOutputVerbosity::Compact => 8,
+        ToolOutputVerbosity::Normal => 18,
+        ToolOutputVerbosity::Verbose => 60,
+    };
+    let lines = head_tail_lines(content, limit);
+    let mut rendered = vec![detail_line(false, QUIET, label)];
+    rendered.extend(lines.into_iter().map(|line| {
+        if line.truncated_marker {
+            detail_line(false, QUIET, line.text)
+        } else {
+            detail_spans_line(styled_output_spans(&line.text))
+        }
+    }));
+    rendered
+}
+
+#[derive(Debug, Clone)]
+struct PreviewLine {
+    text: String,
+    truncated_marker: bool,
+}
+
+fn head_tail_lines(content: &str, limit: usize) -> Vec<PreviewLine> {
+    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(content.to_string());
+    }
+    if lines.len() <= limit {
+        return lines
+            .into_iter()
+            .map(|text| PreviewLine {
+                text,
+                truncated_marker: false,
+            })
+            .collect();
+    }
+    let head = limit / 2;
+    let tail = limit.saturating_sub(head).saturating_sub(1);
+    let omitted = lines.len().saturating_sub(head + tail);
+    let mut preview = lines
+        .iter()
+        .take(head)
+        .cloned()
+        .map(|text| PreviewLine {
+            text,
+            truncated_marker: false,
+        })
+        .collect::<Vec<_>>();
+    preview.push(PreviewLine {
+        text: format!("… +{omitted} lines (Ctrl-E to expand)"),
+        truncated_marker: true,
+    });
+    preview.extend(
+        lines
+            .into_iter()
+            .rev()
+            .take(tail)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|text| PreviewLine {
+                text,
+                truncated_marker: false,
+            }),
+    );
+    preview
+}
+
+fn detail_spans_line(content: Vec<Span<'static>>) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            "└ ",
+            Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    spans.extend(content);
+    Line::from(spans)
+}
+
+fn command_spans(command: &str) -> Vec<Span<'static>> {
+    let tokens = command
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return vec![Span::styled(
+            command.to_string(),
+            Style::default().fg(Color::White),
+        )];
+    }
+    let mut command_seen = false;
+    let mut spans = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let style = if !command_seen && !looks_like_env_assignment(token) {
+            command_seen = true;
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+        } else if token.starts_with('-') {
+            Style::default().fg(AMBER)
+        } else if token.starts_with('"') || token.starts_with('\'') {
+            Style::default().fg(Color::LightGreen)
+        } else if token.contains('/') || token.contains('.') {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(QUIET)
+        };
+        spans.push(Span::styled(token.clone(), style));
+    }
+    spans
+}
+
+fn looks_like_env_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn styled_output_spans(line: &str) -> Vec<Span<'static>> {
+    if line.contains("\x1b[") {
+        ansi_spans(line)
+    } else {
+        keyword_spans(line)
+    }
+}
+
+fn ansi_spans(line: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut style = Style::default();
+    let mut buffer = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            let mut code = String::new();
+            for next in chars.by_ref() {
+                if next == 'm' {
+                    break;
+                }
+                code.push(next);
+            }
+            if !buffer.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut buffer), style));
+            }
+            apply_sgr_codes(&mut style, &code);
+        } else {
+            buffer.push(ch);
+        }
+    }
+    if !buffer.is_empty() {
+        spans.push(Span::styled(buffer, style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw(""));
+    }
+    spans
+}
+
+fn apply_sgr_codes(style: &mut Style, code: &str) {
+    let codes = if code.is_empty() { "0" } else { code };
+    for part in codes.split(';') {
+        let Ok(value) = part.parse::<u16>() else {
+            continue;
+        };
+        match value {
+            0 => *style = Style::default(),
+            1 => *style = style.add_modifier(Modifier::BOLD),
+            30 => *style = style.fg(Color::Black),
+            31 => *style = style.fg(Color::Red),
+            32 => *style = style.fg(Color::Green),
+            33 => *style = style.fg(Color::Yellow),
+            34 => *style = style.fg(Color::Blue),
+            35 => *style = style.fg(Color::Magenta),
+            36 => *style = style.fg(Color::Cyan),
+            37 => *style = style.fg(Color::White),
+            90 => *style = style.fg(Color::DarkGray),
+            91 => *style = style.fg(Color::LightRed),
+            92 => *style = style.fg(Color::LightGreen),
+            93 => *style = style.fg(Color::LightYellow),
+            94 => *style = style.fg(Color::LightBlue),
+            95 => *style = style.fg(Color::LightMagenta),
+            96 => *style = style.fg(Color::LightCyan),
+            97 => *style = style.fg(Color::White),
+            _ => {}
+        }
+    }
+}
+
+fn keyword_spans(line: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut token = String::new();
+    for ch in line.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            token.push(ch);
+        } else {
+            push_keyword_token(&mut spans, &mut token);
+            spans.push(Span::styled(ch.to_string(), Style::default().fg(QUIET)));
+        }
+    }
+    push_keyword_token(&mut spans, &mut token);
+    if spans.is_empty() {
+        spans.push(Span::raw(""));
+    }
+    spans
+}
+
+fn push_keyword_token(spans: &mut Vec<Span<'static>>, token: &mut String) {
+    if token.is_empty() {
+        return;
+    }
+    let lower = token.to_ascii_lowercase();
+    let style = if matches!(
+        lower.as_str(),
+        "error" | "failed" | "failure" | "panic" | "fatal"
+    ) {
+        Style::default().fg(ERROR_RED).add_modifier(Modifier::BOLD)
+    } else if matches!(lower.as_str(), "warning" | "warn") {
+        Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+    } else if matches!(lower.as_str(), "ok" | "passed" | "success" | "done") {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else if matches!(
+        lower.as_str(),
+        "fn" | "class"
+            | "interface"
+            | "public"
+            | "private"
+            | "protected"
+            | "return"
+            | "async"
+            | "await"
+            | "let"
+            | "const"
+            | "struct"
+            | "enum"
+            | "impl"
+    ) {
+        Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    spans.push(Span::styled(std::mem::take(token), style));
+}
+
+fn string_arg(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn number_field(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(|value| value.as_u64())
+}
+
+fn compact_json_object(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    if object.is_empty() {
+        return None;
+    }
+    Some(
+        object
+            .iter()
+            .map(|(key, value)| format!("{key} {}", value.as_u64().unwrap_or_default()))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+fn path_detail_lines(
+    value: &serde_json::Value,
+    object_key: &str,
+    limit: usize,
+) -> Vec<Line<'static>> {
+    value
+        .as_array()
+        .into_iter()
+        .flat_map(|items| items.iter().take(limit))
+        .filter_map(|item| {
+            if object_key.is_empty() {
+                item.as_str()
+            } else {
+                item[object_key].as_str()
+            }
+        })
+        .map(|path| detail_line(false, QUIET, format!("path {path}")))
         .collect()
 }
 
-fn tool_result_summary(result: &ToolResult) -> String {
-    let mut summary = result.tool_name.clone();
-    match result.status {
-        ToolStatus::Success => {
-            if result.cost_hint.truncated {
-                summary.push_str(" · output shortened");
-            }
-        }
-        ToolStatus::Error => {
-            summary.push_str(" · ");
-            summary.push_str(&tool_result_error_detail(result));
-        }
-        ToolStatus::Denied => {
-            summary.push_str(" · ");
-            summary.push_str(&tool_result_denied_detail(result));
-        }
-        ToolStatus::Stale => summary.push_str(" · stale"),
-        ToolStatus::Cancelled => summary.push_str(" · cancelled"),
+fn append_truncation_hint(spans: &mut Vec<Span<'static>>, tool: &ToolTranscript) {
+    if tool.result.cost_hint.truncated
+        || tool.result.content["truncated"].as_bool().unwrap_or(false)
+    {
+        spans.push(Span::styled(
+            " · more available",
+            Style::default().fg(QUIET),
+        ));
     }
-    summary
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+fn kind_label(kind: &str) -> String {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "callable" | "callables" | "function_like" | "function-like" | "functions" => {
+            "callable".to_string()
+        }
+        other => other.replace('_', " "),
+    }
+}
+
+fn is_exploration_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "repo_map"
+            | "diff_context"
+            | "decl_search"
+            | "definition_search"
+            | "reference_search"
+            | "symbol_context"
+            | "hierarchy"
+            | "upstream_flow"
+            | "downstream_flow"
+            | "grep"
+            | "glob"
+            | "read_file"
+            | "read_slice"
+            | "read_tool_output"
+    )
+}
+
+fn is_invalid_argument_result(result: &ToolResult) -> bool {
+    result.status == ToolStatus::Error
+        && result
+            .content
+            .get("error")
+            .and_then(|value| value.as_str())
+            .is_some_and(|error| error.contains("invalid tool arguments"))
 }
 
 fn tool_result_error_detail(result: &ToolResult) -> String {
@@ -3237,6 +4342,16 @@ fn tool_result_error_detail(result: &ToolResult) -> String {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
+        if error == "invalid tool arguments from model"
+            && let Some(parse_error) = result
+                .content
+                .get("parse_error")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        {
+            return compact_text(parse_error, 140);
+        }
         return compact_text(error, 140);
     }
     if let Some(code) = result
@@ -3298,9 +4413,19 @@ fn status_color(status: ToolStatus) -> Color {
     }
 }
 
-fn tool_result_action(status: ToolStatus) -> (&'static str, &'static str) {
-    match status {
+fn tool_result_action(tool: &ToolTranscript) -> (&'static str, &'static str) {
+    match tool.result.status {
+        ToolStatus::Success if tool.result.tool_name == "plan_patch" => ("✔ ", "Planned"),
+        ToolStatus::Success
+            if matches!(tool.result.tool_name.as_str(), "apply_patch" | "write_file") =>
+        {
+            ("✔ ", "Edited")
+        }
+        ToolStatus::Success if is_exploration_tool(&tool.result.tool_name) => ("✔ ", "Explored"),
         ToolStatus::Success => ("✔ ", "Ran"),
+        ToolStatus::Error | ToolStatus::Stale if is_invalid_argument_result(&tool.result) => {
+            ("⚠ ", "Retried")
+        }
         ToolStatus::Error | ToolStatus::Stale => ("✖ ", "Failed"),
         ToolStatus::Denied => ("⚠ ", "Denied"),
         ToolStatus::Cancelled => ("⚠ ", "Cancelled"),
@@ -3962,6 +5087,7 @@ struct TuiApp {
     animation_tick: u64,
     animation_tick_rate: Duration,
     exit_armed: bool,
+    active_tool_calls: BTreeMap<String, ToolCall>,
     cost: squeezy_core::CostSnapshot,
     metrics: squeezy_core::TurnMetrics,
     turn_rx: Option<mpsc::Receiver<AgentEvent>>,
@@ -4068,6 +5194,7 @@ impl TuiApp {
             animation_tick: 0,
             animation_tick_rate: config.tick_rate,
             exit_armed: false,
+            active_tool_calls: BTreeMap::new(),
             cost: squeezy_core::CostSnapshot::default(),
             metrics: squeezy_core::TurnMetrics::default(),
             turn_rx: None,
@@ -4101,13 +5228,20 @@ impl TuiApp {
         self.push_entry(TranscriptEntry::message(id, item, self.transcript_default));
     }
 
+    #[cfg(test)]
     fn push_tool_result(&mut self, result: ToolResult) {
+        self.push_tool_result_with_call(result, None);
+    }
+
+    fn push_tool_result_with_call(&mut self, result: ToolResult, call: Option<ToolCall>) {
         let id = self.next_id();
-        self.push_entry(TranscriptEntry::tool_result(
-            id,
-            result,
-            self.transcript_default,
-        ));
+        let entry = TranscriptEntry::tool_result(id, result, call, self.transcript_default);
+        if let Some(last) = self.transcript.last_mut()
+            && coalesce_tool_transcript_entry(last, &entry)
+        {
+            return;
+        }
+        self.push_entry(entry);
     }
 
     fn push_log(&mut self, message: String) {
@@ -4117,6 +5251,24 @@ impl TuiApp {
 
     fn push_entry(&mut self, entry: TranscriptEntry) {
         self.transcript.push(entry);
+    }
+
+    fn remember_active_tool_call(&mut self, call: ToolCall) {
+        self.active_tool = Some(call.name.clone());
+        self.active_tool_calls.insert(call.call_id.clone(), call);
+    }
+
+    fn refresh_active_tool_name(&mut self) {
+        self.active_tool = self
+            .active_tool_calls
+            .values()
+            .next()
+            .map(|call| call.name.clone());
+    }
+
+    fn clear_active_tools(&mut self) {
+        self.active_tool = None;
+        self.active_tool_calls.clear();
     }
 
     fn next_id(&mut self) -> u64 {
@@ -4136,7 +5288,7 @@ struct TranscriptEntry {
 impl TranscriptEntry {
     fn message(id: u64, item: TranscriptItem, transcript_default: TranscriptDefault) -> Self {
         let collapsed = transcript_default == TranscriptDefault::Compact
-            && item.role == Role::Assistant
+            && item.role != Role::Assistant
             && item.content.chars().count() > LONG_ASSISTANT_CHARS;
         Self {
             id,
@@ -4145,10 +5297,19 @@ impl TranscriptEntry {
         }
     }
 
-    fn tool_result(id: u64, result: ToolResult, transcript_default: TranscriptDefault) -> Self {
+    fn tool_result(
+        id: u64,
+        result: ToolResult,
+        call: Option<ToolCall>,
+        transcript_default: TranscriptDefault,
+    ) -> Self {
         Self {
             id,
-            kind: TranscriptEntryKind::ToolResult(result),
+            kind: TranscriptEntryKind::ToolResult(Box::new(ToolTranscript {
+                call,
+                result,
+                repeat_count: 1,
+            })),
             collapsed: transcript_default == TranscriptDefault::Compact,
         }
     }
@@ -4171,11 +5332,13 @@ impl TranscriptEntry {
                 _ => false,
             },
             TranscriptCategory::Diffs => match &self.kind {
-                TranscriptEntryKind::ToolResult(result) => result.tool_name.contains("diff"),
+                TranscriptEntryKind::ToolResult(tool) => tool.result.tool_name.contains("diff"),
                 _ => false,
             },
             TranscriptCategory::Receipts => match &self.kind {
-                TranscriptEntryKind::ToolResult(result) => !result.receipt.output_sha256.is_empty(),
+                TranscriptEntryKind::ToolResult(tool) => {
+                    !tool.result.receipt.output_sha256.is_empty()
+                }
                 _ => false,
             },
             TranscriptCategory::Assistant => match &self.kind {
@@ -4190,8 +5353,8 @@ impl TranscriptEntry {
             TranscriptEntryKind::Message(item) => {
                 vec![format!("{}: {}", role_label(&item.role), item.content)]
             }
-            TranscriptEntryKind::ToolResult(result) => {
-                vec![format!("tool result: {}", tool_result_summary(result))]
+            TranscriptEntryKind::ToolResult(tool) => {
+                vec![format!("tool result: {}", tool_result_summary(tool))]
             }
             TranscriptEntryKind::Log(message) => vec![format!("log: {message}")],
         }
@@ -4215,9 +5378,9 @@ impl TranscriptEntry {
                 item.content.clone(),
                 format!("transcript:{}", self.id),
             ),
-            TranscriptEntryKind::ToolResult(result) => (
-                format!("tool result {}", result.tool_name),
-                tool_result_summary(result),
+            TranscriptEntryKind::ToolResult(tool) => (
+                format!("tool result {}", tool.result.tool_name),
+                tool_result_summary(tool),
                 format!("transcript:{}", self.id),
             ),
             TranscriptEntryKind::Log(message) => (
@@ -4232,8 +5395,45 @@ impl TranscriptEntry {
 #[derive(Debug, Clone)]
 enum TranscriptEntryKind {
     Message(TranscriptItem),
-    ToolResult(ToolResult),
+    ToolResult(Box<ToolTranscript>),
     Log(String),
+}
+
+#[derive(Debug, Clone)]
+struct ToolTranscript {
+    call: Option<ToolCall>,
+    result: ToolResult,
+    repeat_count: u32,
+}
+
+fn coalesce_tool_transcript_entry(existing: &mut TranscriptEntry, next: &TranscriptEntry) -> bool {
+    let TranscriptEntryKind::ToolResult(existing_tool) = &mut existing.kind else {
+        return false;
+    };
+    let TranscriptEntryKind::ToolResult(next_tool) = &next.kind else {
+        return false;
+    };
+    if tool_retry_key(existing_tool.as_ref()).is_some()
+        && tool_retry_key(existing_tool.as_ref()) == tool_retry_key(next_tool.as_ref())
+    {
+        existing_tool.repeat_count += next_tool.repeat_count;
+        existing_tool.result = next_tool.result.clone();
+        existing_tool.call = next_tool.call.clone();
+        true
+    } else {
+        false
+    }
+}
+
+fn tool_retry_key(tool: &ToolTranscript) -> Option<String> {
+    if !is_invalid_argument_result(&tool.result) {
+        return None;
+    }
+    Some(format!(
+        "{}:{}",
+        tool.result.tool_name,
+        tool_result_error_detail(&tool.result)
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

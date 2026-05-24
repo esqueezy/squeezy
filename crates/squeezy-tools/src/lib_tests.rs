@@ -4021,6 +4021,80 @@ pub fn bad() -> i32 {
 }
 
 #[tokio::test]
+async fn decl_search_accepts_filter_only_callable_java_query() {
+    let root = temp_workspace("decl_search_java_callable_count");
+    fs::write(
+        root.join("Foo.java"),
+        r#"
+class Foo {
+    void alpha() {}
+    int beta() { return 1; }
+    static void gamma() {}
+}
+"#,
+    )
+    .expect("write java source");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_filter".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({
+                    "language": "Java",
+                    "kind": "callable",
+                    "max_results": 10
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(result.content["total_matches"].as_u64(), Some(3));
+    assert_eq!(result.content["returned_matches"].as_u64(), Some(3));
+    assert_eq!(
+        result.content["counts_by_language"]["Java"].as_u64(),
+        Some(3)
+    );
+    assert_eq!(result.content["counts_by_kind"]["method"].as_u64(), Some(3));
+    assert_eq!(result.content["packets"].as_array().unwrap().len(), 3);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_rejects_empty_unfiltered_query() {
+    let root = temp_workspace("decl_search_empty_unfiltered");
+    write_rust_crate(&root, "pub fn marker() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_empty".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("requires a query or at least one filter"),
+        "{}",
+        result.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn graph_navigation_tools_return_unsupported_language_fallback() {
     let root = temp_workspace("graph_unsupported_fallback");
     write_rust_crate(&root, "pub fn marker() {}\n");
