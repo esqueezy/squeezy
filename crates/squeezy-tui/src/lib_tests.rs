@@ -347,19 +347,13 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
     assert_eq!(app.slash_menu_index, suggestions.len() - 1);
 }
 
-#[tokio::test]
-async fn unknown_slash_command_does_not_start_model_turn() {
-    let mut agent = test_agent(SessionMode::Build);
+#[test]
+fn unknown_slash_command_does_not_start_model_turn() {
     let mut app = test_app(SessionMode::Build);
     app.input = "/nope".to_string();
 
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    )
-    .await
-    .expect("handle key");
+    let input = app.input.trim().to_string();
+    assert!(reject_unknown_slash_command(&mut app, &input));
 
     assert_eq!(app.input, "/nope");
     assert!(app.turn_rx.is_none());

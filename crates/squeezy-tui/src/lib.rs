@@ -754,8 +754,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
                 app.slash_menu_index = 0;
                 return Ok(false);
             }
-            if input.starts_with('/') {
-                app.status = "unknown command; use Up/Down to choose a / command".to_string();
+            if reject_unknown_slash_command(app, &input) {
                 return Ok(false);
             }
             app.input.clear();
@@ -851,6 +850,14 @@ fn push_input_history(app: &mut TuiApp, input: String) {
     if app.input_history.len() > 100 {
         app.input_history.remove(0);
     }
+}
+
+fn reject_unknown_slash_command(app: &mut TuiApp, input: &str) -> bool {
+    if !input.starts_with('/') {
+        return false;
+    }
+    app.status = "unknown command; use Up/Down to choose a / command".to_string();
+    true
 }
 
 fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirection) {
