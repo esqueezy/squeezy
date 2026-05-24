@@ -341,8 +341,18 @@ impl AppConfig {
             &mut get_var,
         );
         let redaction = RedactionConfig::from_settings(settings.redaction.unwrap_or_default())?;
+        let mcp_servers = settings.mcp.map(|mcp| mcp.servers).unwrap_or_default();
+        let mut permission_settings = settings.permissions.unwrap_or_default();
+        // Insert MCP-derived rules *before* the user's explicit
+        // `[[permissions.rules]]`. Permission matching is "last rule wins",
+        // so this keeps any deliberate user deny/allow as the final word
+        // and prevents an MCP server's own permission block from silently
+        // overriding admin policy.
+        let mut combined_rules = mcp_permission_rules(&mcp_servers);
+        combined_rules.append(&mut permission_settings.rules);
+        permission_settings.rules = combined_rules;
         let permissions = PermissionPolicy::from_settings_and_env(
-            settings.permissions.unwrap_or_default(),
+            permission_settings,
             &sources.join(","),
             &mut get_var,
         )?;
@@ -393,7 +403,7 @@ impl AppConfig {
             graph,
             cache,
             tui,
-            mcp_servers: settings.mcp.map(|mcp| mcp.servers).unwrap_or_default(),
+            mcp_servers,
             config_sources: sources,
         })
     }
@@ -521,6 +531,10 @@ impl AppConfig {
         output.push_str(&format!(
             "web = {}\n",
             toml_string(self.permissions.web.as_str())
+        ));
+        output.push_str(&format!(
+            "mcp = {}\n",
+            toml_string(self.permissions.mcp.as_str())
         ));
         output.push_str(&format!(
             "shell_classifier = {}\n\n",
@@ -683,7 +697,44 @@ impl AppConfig {
                 output.push_str(&format!("timeout_ms = {timeout_ms}\n"));
             }
             if !server.env.is_empty() {
-                output.push_str("env = \"<redacted>\"\n");
+                let entries = server
+                    .env
+                    .keys()
+                    .map(|key| {
+                        format!(
+                            "{} = {}",
+                            toml_bare_or_quoted_key(key),
+                            toml_string("<redacted>")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                output.push_str(&format!("env = {{ {entries} }}\n"));
+            }
+            if let Some(default) = server.permissions.default {
+                output.push('\n');
+                output.push_str(&format!(
+                    "[mcp.servers.{}.permissions]\n",
+                    toml_bare_or_quoted_key(name)
+                ));
+                output.push_str(&format!("default = {}\n", toml_string(default.as_str())));
+            }
+            for rule in &server.permissions.rules {
+                output.push('\n');
+                output.push_str(&format!(
+                    "[[mcp.servers.{}.permissions.rules]]\n",
+                    toml_bare_or_quoted_key(name)
+                ));
+                let target = rule
+                    .target
+                    .strip_prefix(&format!("{name}/"))
+                    .unwrap_or(&rule.target);
+                output.push_str(&format!("target = {}\n", toml_string(target)));
+                output.push_str(&format!("action = {}\n", toml_string(rule.action.as_str())));
+                output.push_str(&format!("source = {}\n", toml_string(rule.source.as_str())));
+                if let Some(reason) = &rule.reason {
+                    output.push_str(&format!("reason = {}\n", toml_string(reason)));
+                }
             }
             output.push('\n');
         }
@@ -1544,6 +1595,7 @@ pub struct PermissionSettings {
     pub shell: Option<PermissionMode>,
     pub ignored_search: Option<PermissionMode>,
     pub web: Option<PermissionMode>,
+    pub mcp: Option<PermissionMode>,
     pub shell_classifier: Option<bool>,
     pub shell_sandbox: Option<ShellSandboxSettings>,
     pub rules: Vec<PermissionRule>,
@@ -1559,6 +1611,7 @@ impl PermissionSettings {
                 "shell",
                 "ignored_search",
                 "web",
+                "mcp",
                 "shell_classifier",
                 "shell_sandbox",
                 "rules",
@@ -1577,6 +1630,7 @@ impl PermissionSettings {
                 &field(path, "ignored_search"),
             )?,
             web: permission_value(table, "web", source, &field(path, "web"))?,
+            mcp: permission_value(table, "mcp", source, &field(path, "mcp"))?,
             shell_classifier: bool_value(
                 table,
                 "shell_classifier",
@@ -1598,6 +1652,7 @@ impl PermissionSettings {
         replace_if_some(&mut self.shell, next.shell);
         replace_if_some(&mut self.ignored_search, next.ignored_search);
         replace_if_some(&mut self.web, next.web);
+        replace_if_some(&mut self.mcp, next.mcp);
         replace_if_some(&mut self.shell_classifier, next.shell_classifier);
         merge_option(
             &mut self.shell_sandbox,
@@ -1944,6 +1999,10 @@ pub enum PermissionScope {
     Shell,
     IgnoredSearch,
     Web,
+    /// External MCP tools. Treated as its own scope so the shell sandbox
+    /// gating (network policy, plan-mode shell denial) does not accidentally
+    /// extend to MCP calls without explicit opt-in.
+    Mcp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1953,6 +2012,7 @@ pub struct PermissionPolicy {
     pub shell: PermissionMode,
     pub ignored_search: PermissionMode,
     pub web: PermissionMode,
+    pub mcp: PermissionMode,
     pub shell_classifier: bool,
     pub shell_sandbox: ShellSandboxConfig,
     pub rules: Vec<PermissionRule>,
@@ -1990,6 +2050,10 @@ impl PermissionPolicy {
                 var("SQUEEZY_WEB_PERMISSION"),
                 settings.web.unwrap_or(PermissionMode::Ask),
             ),
+            mcp: parse_permission(
+                var("SQUEEZY_MCP_PERMISSION"),
+                settings.mcp.unwrap_or(PermissionMode::Ask),
+            ),
             shell_classifier: parse_bool(
                 var("SQUEEZY_SHELL_PERMISSION_CLASSIFIER"),
                 settings.shell_classifier.unwrap_or(false),
@@ -2006,6 +2070,7 @@ impl PermissionPolicy {
             PermissionScope::Shell => self.shell,
             PermissionScope::IgnoredSearch => self.ignored_search,
             PermissionScope::Web => self.web,
+            PermissionScope::Mcp => self.mcp,
         }
     }
 
@@ -2113,6 +2178,7 @@ impl Default for PermissionPolicy {
             shell: PermissionMode::Ask,
             ignored_search: PermissionMode::Allow,
             web: PermissionMode::Ask,
+            mcp: PermissionMode::Ask,
             shell_classifier: false,
             shell_sandbox: ShellSandboxConfig::default(),
             rules: Vec::new(),
@@ -2153,7 +2219,7 @@ fn legacy_scope_for_capability(capability: PermissionCapability) -> PermissionSc
         PermissionCapability::Edit => PermissionScope::Edit,
         PermissionCapability::Shell => PermissionScope::Shell,
         PermissionCapability::Network => PermissionScope::Web,
-        PermissionCapability::Mcp => PermissionScope::Shell,
+        PermissionCapability::Mcp => PermissionScope::Mcp,
         PermissionCapability::Git => PermissionScope::Shell,
         PermissionCapability::Compiler => PermissionScope::Shell,
         PermissionCapability::Destructive => PermissionScope::Shell,
@@ -3041,6 +3107,7 @@ pub fn user_settings_template() -> &'static str {
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
+# mcp = "ask"
 # shell_classifier = false       # narrow LLM fallback for ambiguous shell commands (extra LLM call)
 #
 # Rule targets use prefix-tagged strings so different scopes don't collide.
@@ -3094,6 +3161,15 @@ pub fn user_settings_template() -> &'static str {
 # [skills]
 # user_dir = "~/.squeezy/skills"
 # compat_user_dir = "~/.agents/skills"
+
+# [mcp.servers.docs]
+# enabled = true
+# transport = "stdio"       # stdio | http | sse
+# command = "docs-mcp"
+# args = []
+#
+# [mcp.servers.docs.permissions]
+# default = "ask"
 "#
 }
 
@@ -3126,6 +3202,7 @@ pub fn project_settings_template() -> &'static str {
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
+# mcp = "ask"
 #
 # [[permissions.rules]]
 # capability = "compiler"
@@ -3133,8 +3210,8 @@ pub fn project_settings_template() -> &'static str {
 # action = "allow"
 # source = "project"
 
-# `[graph]` controls workspace indexing. `[mcp.servers.*]` is parsed and
-# round-trips through `squeezy config inspect` but is still a v0 reservation.
+# `[graph]` controls workspace indexing. `[mcp.servers.*]` configures
+# external MCP tools that are discovered before each agent turn.
 
 # [graph]
 # languages = ["rust", "python"]
@@ -3154,6 +3231,15 @@ pub fn project_settings_template() -> &'static str {
 [tui]
 # tick_rate_ms = 50
 # status_verbosity = "compact"   # compact | verbose
+
+# [mcp.servers.docs]
+# enabled = true
+# transport = "stdio"       # stdio | http | sse
+# command = "docs-mcp"
+# args = []
+#
+# [mcp.servers.docs.permissions]
+# default = "ask"
 "#
 }
 
@@ -3229,6 +3315,7 @@ impl McpSettings {
             result.insert(
                 name.clone(),
                 McpServerConfig::from_table(
+                    name,
                     server_table,
                     source,
                     &field(&field(path, "servers"), name),
@@ -3274,10 +3361,16 @@ pub struct McpServerConfig {
     pub url: Option<String>,
     pub timeout_ms: Option<u64>,
     pub env: BTreeMap<String, String>,
+    pub permissions: McpPermissionConfig,
 }
 
 impl McpServerConfig {
-    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+    fn from_table(
+        name: &str,
+        table: &toml::value::Table,
+        source: &str,
+        path: &str,
+    ) -> Result<Self> {
         reject_unknown_keys(
             table,
             &[
@@ -3288,6 +3381,7 @@ impl McpServerConfig {
                 "url",
                 "timeout_ms",
                 "env",
+                "permissions",
             ],
             source,
             path,
@@ -3295,6 +3389,12 @@ impl McpServerConfig {
         let transport = mcp_transport_value(table, "transport", source, &field(path, "transport"))?
             .unwrap_or(McpTransport::Stdio);
         let env = string_map_value(table, "env", source, &field(path, "env"))?.unwrap_or_default();
+        let permissions = optional_table(table, "permissions", source)?
+            .map(|table| {
+                McpPermissionConfig::from_table(name, table, source, &field(path, "permissions"))
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             enabled: bool_value(table, "enabled", source, &field(path, "enabled"))?.unwrap_or(true),
             transport,
@@ -3304,6 +3404,7 @@ impl McpServerConfig {
             url: string_value(table, "url", source, &field(path, "url"))?,
             timeout_ms: u64_value(table, "timeout_ms", source, &field(path, "timeout_ms"))?,
             env,
+            permissions,
         })
     }
 
@@ -3319,7 +3420,63 @@ impl McpServerConfig {
         if !next.env.is_empty() {
             self.env.extend(next.env);
         }
+        self.permissions.merge(next.permissions);
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpPermissionConfig {
+    pub default: Option<PermissionMode>,
+    #[serde(default, skip)]
+    pub default_source: Option<PermissionRuleSource>,
+    pub rules: Vec<PermissionRule>,
+}
+
+impl McpPermissionConfig {
+    fn from_table(
+        server_name: &str,
+        table: &toml::value::Table,
+        source: &str,
+        path: &str,
+    ) -> Result<Self> {
+        reject_unknown_keys(table, &["default", "rules"], source, path)?;
+        let default = permission_value(table, "default", source, &field(path, "default"))?;
+        let default_source = default.map(|_| default_permission_rule_source(source));
+        let rules = mcp_permission_rules_value(server_name, table, source, &field(path, "rules"))?;
+        Ok(Self {
+            default,
+            default_source,
+            rules,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        if next.default.is_some() {
+            self.default = next.default;
+            self.default_source = next.default_source;
+        }
+        self.rules.extend(next.rules);
+    }
+}
+
+fn mcp_permission_rules(servers: &BTreeMap<String, McpServerConfig>) -> Vec<PermissionRule> {
+    let mut rules = Vec::new();
+    for (server_name, server) in servers {
+        if let Some(default) = server.permissions.default {
+            rules.push(PermissionRule::new(
+                "mcp",
+                format!("{server_name}/*"),
+                default,
+                server
+                    .permissions
+                    .default_source
+                    .unwrap_or(PermissionRuleSource::Project),
+                Some(format!("default MCP policy for server {server_name}")),
+            ));
+        }
+        rules.extend(server.permissions.rules.clone());
+    }
+    rules
 }
 
 fn providers_settings(
@@ -3607,6 +3764,68 @@ fn permission_rules_value(
             let reason = string_value(table, "reason", source, &field(&rule_path, "reason"))?;
             Ok(PermissionRule::new(
                 capability,
+                target,
+                action,
+                source_value,
+                reason,
+            ))
+        })
+        .collect()
+}
+
+fn mcp_permission_rules_value(
+    server_name: &str,
+    table: &toml::value::Table,
+    source: &str,
+    path: &str,
+) -> Result<Vec<PermissionRule>> {
+    let Some(value) = table.get("rules") else {
+        return Ok(Vec::new());
+    };
+    let rules = value
+        .as_array()
+        .ok_or_else(|| type_error(source, path, "array of tables"))?;
+    rules
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let rule_path = format!("{path}[{index}]");
+            let table = value
+                .as_table()
+                .ok_or_else(|| type_error(source, &rule_path, "table"))?;
+            reject_unknown_keys(
+                table,
+                &["target", "action", "source", "reason"],
+                source,
+                &rule_path,
+            )?;
+            let target =
+                required_string_value(table, "target", source, &field(&rule_path, "target"))?;
+            let target = if target.starts_with(&format!("{server_name}/")) {
+                target
+            } else {
+                format!("{server_name}/{target}")
+            };
+            let action = permission_value(table, "action", source, &field(&rule_path, "action"))?
+                .ok_or_else(|| {
+                    SqueezyError::Config(format!(
+                        "{source}: {} missing required permission action",
+                        field(&rule_path, "action")
+                    ))
+                })?;
+            if action == PermissionAction::Allow && target_is_effectively_wildcard(&target) {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {rule_path}: refuse to load Allow rule with bare wildcard target {target:?}; \
+                     narrow the target to a specific MCP server/tool"
+                )));
+            }
+            let source_value = string_value(table, "source", source, &field(&rule_path, "source"))?
+                .as_deref()
+                .and_then(PermissionRuleSource::parse)
+                .unwrap_or_else(|| default_permission_rule_source(source));
+            let reason = string_value(table, "reason", source, &field(&rule_path, "reason"))?;
+            Ok(PermissionRule::new(
+                "mcp",
                 target,
                 action,
                 source_value,
