@@ -1036,6 +1036,7 @@ async fn run_prompt(
                             squeezy_core::TranscriptItem::user(redacted_prompt.clone()),
                             squeezy_core::TranscriptItem::assistant(redacted_assistant.clone()),
                         ],
+                        context_attachments: Vec::new(),
                     });
                     let metrics = squeezy_core::SessionMetrics {
                         turns: 1,

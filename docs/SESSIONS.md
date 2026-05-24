@@ -15,6 +15,8 @@ Each session directory contains:
   approvals, errors, and lifecycle events.
 - `resume_state.json`: redacted model-visible conversation state used by
   `squeezy sessions resume <id>` and `/resume <id>`.
+- `attachments/`: redacted attached-context metadata plus bounded redacted text
+  for pasted context and attached text files.
 
 Use CLI discovery commands:
 
@@ -32,6 +34,9 @@ squeezy sessions cleanup
 The TUI also supports `/sessions`, `/session <session_id>`, `/resume
 <session_id>`, `/session-export <session_id>`, `/report [session_id]`, and
 `/session-cleanup`.
+Attached context is managed with `/attach <path>`, `/attachments`, and
+`/detach <attachment_id>`. Multi-line or large bracketed paste input is stored
+as attached context; small single-line paste input stays in the prompt editor.
 
 Session logs are local files. Prompt text, tool arguments, tool outputs,
 approval metadata, provider errors, and assistant text are passed through the
@@ -39,6 +44,13 @@ shared redaction layer before persistence. Large events and sessions are
 bounded by `[session].max_event_bytes` and `[session].max_session_bytes`; when a
 session exceeds its byte budget it remains discoverable but is marked
 non-resumable.
+
+Attached context stores the original-content hash locally for dedupe, but the
+stored body, preview, session events, model references, and session export use
+redacted text only. The model receives compact `attachment://...` references
+with metadata and a bounded redacted preview rather than full pasted/file
+content. Binary files and images are recorded as unsupported and are not made
+active context.
 
 Cancelling a single turn is recorded as a `cancelled` event in `events.jsonl`
 but leaves the surrounding session live so the next prompt continues to
