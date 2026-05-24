@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::{self, Write},
     path::PathBuf,
     sync::Arc,
@@ -31,7 +31,8 @@ use squeezy_core::{
     TranscriptDefault, TranscriptItem,
 };
 use squeezy_llm::LlmProvider;
-use squeezy_store::SessionQuery;
+use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery, parse_bug_report_section};
+use squeezy_telemetry::PreparedFeedback;
 use squeezy_tools::{ToolCall, ToolResult, ToolStatus};
 use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -482,7 +483,19 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
     let Some(command) = parts.next() else {
         return false;
     };
+    let rest = input
+        .strip_prefix(command)
+        .map(str::trim)
+        .unwrap_or_default();
     match command {
+        "/feedback" => {
+            handle_feedback_command(app, agent, rest).await;
+            return true;
+        }
+        "/report" => {
+            handle_report_command(app, agent, rest).await;
+            return true;
+        }
         "/attach" => {
             let path = input.trim_start_matches("/attach").trim();
             if path.is_empty() {
@@ -767,6 +780,133 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
     app.jobs.insert(job.id, job.clone());
     app.status = format!("started job {} {}", job.id, job.title);
     true
+}
+
+async fn handle_feedback_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
+    match rest {
+        "send" => {
+            let Some(feedback) = app.pending_feedback.take() else {
+                app.status = "no feedback pending".to_string();
+                return;
+            };
+            match agent.submit_feedback(&feedback).await {
+                Ok(result) => {
+                    app.status = format!("feedback sent {}", result.id);
+                    app.push_transcript_item(TranscriptItem::system(format!(
+                        "feedback sent\nfeedback_id={}",
+                        result.id
+                    )));
+                }
+                Err(error) => {
+                    app.pending_feedback = Some(feedback);
+                    app.status = format!("feedback send failed: {error}");
+                }
+            }
+        }
+        "cancel" => {
+            app.pending_feedback = None;
+            app.status = "feedback cancelled".to_string();
+        }
+        "" => {
+            app.status =
+                "usage: /feedback <what happened> | /feedback send | /feedback cancel".to_string();
+        }
+        message => match agent.prepare_feedback(message) {
+            Ok(feedback) => {
+                let preview = format!(
+                    "feedback preview\nfeedback_id={}\nbytes={} redactions={}\n\n{}\n\nRun /feedback send to submit or /feedback cancel.",
+                    feedback.feedback_id,
+                    feedback.message_bytes,
+                    feedback.redactions,
+                    feedback.message
+                );
+                app.pending_feedback = Some(feedback);
+                app.status = "feedback preview ready".to_string();
+                app.push_transcript_item(TranscriptItem::system(preview));
+            }
+            Err(error) => app.status = format!("feedback preview failed: {error}"),
+        },
+    }
+}
+
+async fn handle_report_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
+    match rest {
+        "send" => {
+            let Some(report) = app.pending_report.take() else {
+                app.status = "no report pending".to_string();
+                return;
+            };
+            match agent.submit_bug_report(&report).await {
+                Ok(result) => {
+                    app.status = format!("report sent {}", result.id);
+                    app.push_transcript_item(TranscriptItem::system(format!(
+                        "report sent\nreport_id={}",
+                        result.id
+                    )));
+                }
+                Err(error) => {
+                    app.pending_report = Some(report);
+                    app.status = format!("report send failed: {error}");
+                }
+            }
+        }
+        "cancel" => {
+            app.pending_report = None;
+            app.status = "report cancelled".to_string();
+        }
+        _ => {
+            let (session_id, excluded_sections) = match parse_report_preview_args(agent, rest) {
+                Ok(value) => value,
+                Err(error) => {
+                    app.status = error;
+                    return;
+                }
+            };
+            let options = BugReportOptions {
+                excluded_sections,
+                ..BugReportOptions::default()
+            };
+            match agent.build_bug_report(&session_id, options) {
+                Ok(report) => {
+                    let mut preview = report.preview_text();
+                    preview.push_str("\nRun /report send to upload or /report cancel.");
+                    app.pending_report = Some(report);
+                    app.status = "report preview ready".to_string();
+                    app.push_transcript_item(TranscriptItem::system(preview));
+                }
+                Err(error) => app.status = format!("report preview failed: {error}"),
+            }
+        }
+    }
+}
+
+fn parse_report_preview_args(
+    agent: &Agent,
+    rest: &str,
+) -> std::result::Result<(String, BTreeSet<String>), String> {
+    let mut session_id = None;
+    let mut excluded_sections = BTreeSet::new();
+    for part in rest.split_whitespace() {
+        if let Some(raw) = part.strip_prefix("exclude=") {
+            for section in raw.split(',').filter(|section| !section.trim().is_empty()) {
+                let Some(parsed) = parse_bug_report_section(section) else {
+                    return Err(format!("unknown report section {section:?}"));
+                };
+                excluded_sections.insert(parsed.to_string());
+            }
+        } else if session_id.is_none() {
+            session_id = Some(part.to_string());
+        } else {
+            return Err(
+                "usage: /report [session_id] [exclude=a,b] | /report send | /report cancel"
+                    .to_string(),
+            );
+        }
+    }
+    let session_id = session_id
+        .or_else(|| agent.session_id())
+        .ok_or_else(|| "usage: /report <session_id> [exclude=a,b]".to_string())?;
+    Ok((session_id, excluded_sections))
 }
 
 fn attachment_update_status(
@@ -1725,7 +1865,7 @@ fn format_status_tokens(app: &TuiApp) -> String {
     } else if app.cancel.is_some() {
         "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | Ctrl-P task | /copy | /sessions /resume | Ctrl-C/Esc cancel"
     } else {
-        "Enter send | Shift-Tab mode | Up/Down select | Ctrl-E collapse | Ctrl-P task | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy /attach /attachments /detach /sessions /resume /collapse /expand /verbosity /tool-verbosity /jobs | Esc quit"
+        "Enter send | Shift-Tab mode | Up/Down select | Ctrl-E collapse | Ctrl-P task | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy /attach /attachments /detach /sessions /resume /feedback /report /collapse /expand /verbosity /tool-verbosity /jobs | Esc quit"
     };
     match app.status_verbosity {
         StatusVerbosity::Compact => format!("{context}  {spend}\n{hints}"),
@@ -1983,6 +2123,8 @@ struct TuiApp {
     notifications: VecDeque<JobNotification>,
     cancel: Option<CancellationToken>,
     pending_approval: Option<PendingApproval>,
+    pending_feedback: Option<PreparedFeedback>,
+    pending_report: Option<BugReportBundle>,
     clipboard: Box<dyn Clipboard>,
 }
 
@@ -2060,6 +2202,8 @@ impl TuiApp {
             notifications: VecDeque::new(),
             cancel: None,
             pending_approval: None,
+            pending_feedback: None,
+            pending_report: None,
             clipboard,
         }
     }

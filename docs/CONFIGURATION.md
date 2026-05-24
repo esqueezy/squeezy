@@ -289,6 +289,12 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   `[permissions]` so MCP tool execution does not inherit the shell-sandbox
   policy. Override via TOML or `SQUEEZY_MCP_PERMISSION`.
 - `[telemetry]`: `enabled` and `endpoint`.
+- `[feedback]`: `enabled`, `feedback_endpoint`, `report_endpoint`,
+  `max_feedback_bytes`, and `max_report_bytes` for consented maintainer
+  feedback and private bug-report upload. This is separate from anonymous
+  telemetry: `/feedback` sends short redacted text, while `/report` uploads a
+  redacted archive to private report storage and stores only metadata in
+  PostHog.
 - `[redaction]`: `custom_patterns`, an optional list of Rust regex patterns
   that extend Squeezy's built-in secret redaction.
 - `[web]`: `exa_mcp_url` and `exa_api_key_env`.
@@ -343,6 +349,7 @@ Existing environment overrides remain supported, including:
   `SQUEEZY_SHELL_PERMISSION`, `SQUEEZY_IGNORED_SEARCH_PERMISSION`,
   `SQUEEZY_WEB_PERMISSION`
 - `SQUEEZY_TELEMETRY`, `SQUEEZY_TELEMETRY_ENDPOINT`
+- `SQUEEZY_FEEDBACK`, `SQUEEZY_FEEDBACK_ENDPOINT`, `SQUEEZY_REPORT_ENDPOINT`
 - Provider-specific API key environment variable names and base URLs
 
 Unknown fields, invalid enum values, and invalid numeric limits are reported as

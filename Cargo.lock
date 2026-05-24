@@ -2200,6 +2200,7 @@ dependencies = [
  "squeezy-core",
  "squeezy-llm",
  "squeezy-store",
+ "squeezy-telemetry",
  "squeezy-tools",
  "squeezy-vcs",
  "tokio",

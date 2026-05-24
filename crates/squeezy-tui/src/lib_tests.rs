@@ -715,6 +715,32 @@ async fn slash_copy_transcript_copies_plain_text_transcript() {
 }
 
 #[tokio::test]
+async fn slash_feedback_previews_redacted_message_before_send() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(
+        handle_slash_command(
+            &mut app,
+            &mut agent,
+            "/feedback OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456 broke"
+        )
+        .await
+    );
+
+    assert_eq!(app.status, "feedback preview ready");
+    assert!(app.pending_feedback.is_some());
+    let TranscriptEntryKind::Message(item) = &app.transcript.last().expect("preview").kind else {
+        panic!("feedback preview should be a message entry");
+    };
+    let preview = item.content.clone();
+    assert!(preview.contains("feedback preview"), "{preview}");
+    assert!(preview.contains("<redacted:"), "{preview}");
+    assert!(!preview.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
+    assert!(preview.contains("/feedback send"));
+}
+
+#[tokio::test]
 async fn slash_jobs_lists_and_shows_jobs() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
