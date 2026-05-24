@@ -1076,12 +1076,16 @@ fn format_tool_result_entry(
 }
 
 fn format_log_entry(message: &str, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
-    let text = if collapsed {
-        compact_text(message, 140)
-    } else {
-        message.to_string()
-    };
-    text_lines(selected, "log ", Color::Yellow, &text)
+    if collapsed {
+        let preview = compact_text(message, 140);
+        return vec![line_with_label(
+            selected,
+            "log ",
+            Color::Yellow,
+            format!("[collapsed {} chars] {}", message.chars().count(), preview),
+        )];
+    }
+    text_lines(selected, "log ", Color::Yellow, message)
 }
 
 fn role_style(role: &Role) -> (&'static str, Color) {
@@ -1237,7 +1241,7 @@ fn format_status_tokens(app: &TuiApp) -> String {
     let hints = if app.pending_approval.is_some() {
         "Y allow once | A user | P project | N deny | U/D deny rule | Ctrl-C cancel"
     } else {
-        "Enter send | Shift-Tab mode | Up/Down select | Ctrl-E collapse | PgUp/PgDn/Home/End scroll | /collapse /expand /verbosity | Ctrl-C cancel | Esc quit"
+        "Enter send | Shift-Tab mode | Up/Down select | Ctrl-E collapse | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy /sessions /resume /collapse /expand /verbosity | Ctrl-C cancel | Esc quit"
     };
     match app.status_verbosity {
         StatusVerbosity::Compact => format!("{context}  {spend}\n{hints}"),

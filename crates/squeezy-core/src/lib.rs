@@ -2951,6 +2951,7 @@ impl StatusVerbosity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResponseVerbosity {
     Concise,
     Normal,
@@ -2968,6 +2969,7 @@ impl ResponseVerbosity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolOutputVerbosity {
     Compact,
     Normal,
@@ -2985,6 +2987,7 @@ impl ToolOutputVerbosity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TranscriptDefault {
     Compact,
     Expanded,

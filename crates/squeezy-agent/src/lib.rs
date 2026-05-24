@@ -478,17 +478,23 @@ fn request_reasoning_effort(
 fn instructions_with_response_verbosity(
     instructions: &str,
     verbosity: ResponseVerbosity,
+    native_text_verbosity: bool,
 ) -> String {
+    // Cost-first: skip the prompt-side hint when the model already
+    // accepts the `text.verbosity` API parameter (one signal is enough)
+    // and when the value is the implicit default (Normal). This keeps
+    // the system prompt lean on the common path.
+    if native_text_verbosity || verbosity == ResponseVerbosity::Normal {
+        return instructions.to_string();
+    }
     let guidance = match verbosity {
         ResponseVerbosity::Concise => {
             "Response verbosity: concise. Prefer short, direct answers unless the task requires detail."
         }
-        ResponseVerbosity::Normal => {
-            "Response verbosity: normal. Use enough detail to be clear without unnecessary expansion."
-        }
         ResponseVerbosity::Verbose => {
             "Response verbosity: verbose. Include fuller rationale, context, and verification details when useful."
         }
+        ResponseVerbosity::Normal => unreachable!("handled above"),
     };
     format!("{instructions}\n\n{guidance}")
 }
@@ -501,9 +507,12 @@ impl TurnRuntime {
             Some(skills) => format!("{}\n\n{}", self.config.instructions, skills),
             None => self.config.instructions.clone(),
         };
+        let native_text_verbosity = capabilities_for(self.provider.name(), &self.config.model)
+            .is_some_and(|capabilities| capabilities.text_verbosity);
         let raw_instructions = instructions_with_response_verbosity(
             &base_instructions,
             self.config.tui.response_verbosity,
+            native_text_verbosity,
         );
         let user_item = LlmInputItem::UserText(activation.task_input);
         let mut prior_state = self.conversation_state.lock().await.clone();

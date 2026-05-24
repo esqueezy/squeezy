@@ -307,6 +307,36 @@ fn provider_capability_gate_controls_native_reasoning_and_verbosity_fields() {
     assert_eq!(request_reasoning_effort(&config, "anthropic"), None);
 }
 
+#[test]
+fn instructions_skip_prompt_hint_on_default_and_native_capable_models() {
+    use squeezy_core::ResponseVerbosity;
+
+    let base = "system rules";
+
+    // Normal verbosity is the implicit default; never burn tokens
+    // re-stating it in the prompt.
+    assert_eq!(
+        instructions_with_response_verbosity(base, ResponseVerbosity::Normal, false),
+        base,
+    );
+
+    // Native-capable providers receive verbosity via the API
+    // parameter; do not pay for a redundant prompt-side hint.
+    assert_eq!(
+        instructions_with_response_verbosity(base, ResponseVerbosity::Concise, true),
+        base,
+    );
+
+    // For non-native providers, surface the hint so the model still
+    // gets the signal.
+    let concise = instructions_with_response_verbosity(base, ResponseVerbosity::Concise, false);
+    assert!(concise.starts_with(base), "{concise}");
+    assert!(concise.contains("Response verbosity: concise"), "{concise}");
+
+    let verbose = instructions_with_response_verbosity(base, ResponseVerbosity::Verbose, false);
+    assert!(verbose.contains("Response verbosity: verbose"), "{verbose}");
+}
+
 #[tokio::test]
 async fn tool_loop_executes_fallback_tool_and_returns_observation() {
     let root = temp_workspace("agent_tool_loop");
