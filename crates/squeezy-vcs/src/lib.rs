@@ -60,6 +60,12 @@ pub enum DiffMode {
     #[default]
     Worktree,
     Branch,
+    /// Alias for [`DiffMode::Branch`] kept so the read-side baseline names
+    /// (`worktree`/`branch_base`/`index`/`last_receipt`) line up one-to-one
+    /// with `read_slice` arguments. Every dispatch in this crate treats it
+    /// identically to `Branch`; if a real distinction is ever needed (for
+    /// example diffing the merge base against the branch tip with a different
+    /// `refish`), update both call sites in `snapshot` at the same time.
     BranchBase,
     Index,
 }

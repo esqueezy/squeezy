@@ -124,10 +124,18 @@ model-facing tool output compact enough to be useful.
   supports `read_mode="diff"` for source bytes changed against `worktree`
   (staged, unstaged, and untracked changes vs `HEAD`), `branch_base` (the
   default-branch merge base), `index` (staged changes), or `last_receipt`.
-  `last_receipt` compares with the latest model-visible read snapshot for the
-  same path, returns a receipt stub when the file hash is unchanged, and falls
-  back to `worktree` with a `baseline_fallback` label when no compatible
-  snapshot is available.
+  Ranges today are line/byte hunks derived from git, not symbol spans; a
+  graph-driven structural variant that returns enclosing symbol spans is a
+  follow-up.
+- **Last-receipt fallback semantics.** `last_receipt` compares the requested
+  window against the most recent model-visible read snapshot for that exact
+  `(path, start_byte, end_byte)` tuple, returns a receipt stub when the file
+  hash is unchanged, and otherwise falls back to `worktree` with a
+  `baseline_fallback` label (`last_receipt_store_unavailable`,
+  `last_receipt_snapshot_missing`, `last_receipt_window_mismatch`,
+  `last_receipt_current_file_unavailable`, or `last_receipt_store_error`) so
+  the model can tell apart "no snapshot" from "snapshot for a different
+  window" from "transient IO error".
 - **Deferred tool loading.** Long-tail tools, including MCP tools, should load
   schemas only when the model actually needs them.
 - **Provider cache controls.** Provider-specific cache keys and cache-friendly

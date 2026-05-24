@@ -446,6 +446,15 @@ pub struct ToolRegistry {
     http: Arc<dyn WebHttpClient>,
     graph: Arc<StdMutex<Option<GraphManager>>>,
     vcs: Arc<GitVcs>,
+    /// Shared persistent state store. When `None`, `read_mode=diff` with
+    /// `diff_baseline=last_receipt` cannot reach any stored read snapshots and
+    /// silently falls back to the `worktree` baseline (with a
+    /// `baseline_fallback.reason = "last_receipt_store_unavailable"` label on
+    /// the result). Several test-only registry constructors leave this as
+    /// `None` on purpose — integration tests that need the receipt-stub path
+    /// should build the registry through `new_with_configs_and_skills`
+    /// (or `new_with_configs_skills_and_mcp`) with a populated
+    /// [`ToolRegistryRuntime`].
     state_store: Option<Arc<SqueezyStore>>,
     checkpoints: Arc<CheckpointStore>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
@@ -2369,17 +2378,19 @@ impl ToolRegistry {
             );
         }
         if diff_mode {
-            return self.execute_read_slice_diff_blocking(
+            let rel_str = rel.to_string_lossy().to_string();
+            let ctx = ReadSliceDiffCtx {
                 call,
-                &args,
-                &path,
-                &rel,
-                graph.is_some(),
+                args: &args,
+                path: &path,
+                rel: rel_str.as_str(),
+                graph_available: graph.is_some(),
                 graph_status,
                 confidence,
                 provenance,
                 span,
-            );
+            };
+            return self.execute_read_slice_diff_blocking(&ctx);
         }
         let path = match path.canonicalize() {
             Ok(path) => path,
@@ -2456,7 +2467,7 @@ impl ToolRegistry {
         payload.insert("offset".to_string(), json!(offset));
         payload.insert("bytes_returned".to_string(), json!(bytes.len()));
         payload.insert("total_bytes".to_string(), json!(total_bytes));
-        payload.insert("sha256".to_string(), json!(content_sha256.clone()));
+        payload.insert("sha256".to_string(), json!(&content_sha256));
         payload.insert("truncated".to_string(), json!(truncated));
         if let Some(reason) = ignored_reason {
             payload.insert("ignored".to_string(), json!(true));
@@ -2473,43 +2484,14 @@ impl ToolRegistry {
         )
     }
 
-    fn execute_read_slice_diff_blocking(
-        &self,
-        call: &ToolCall,
-        args: &ReadSliceArgs,
-        path: &Path,
-        rel: &Path,
-        graph_available: bool,
-        graph_status: &'static str,
-        confidence: Confidence,
-        provenance: Vec<Provenance>,
-        span: Option<SourceSpan>,
-    ) -> ToolResult {
-        let rel_str = rel.to_string_lossy().to_string();
-        let baseline_requested = args.diff_baseline.unwrap_or_default();
+    fn execute_read_slice_diff_blocking(&self, ctx: &ReadSliceDiffCtx<'_>) -> ToolResult {
+        let baseline_requested = ctx.args.diff_baseline.unwrap_or_default();
         if baseline_requested == DiffReadBaseline::LastReceipt {
-            match self.read_slice_last_receipt_diff(
-                call,
-                args,
-                path,
-                &rel_str,
-                graph_available,
-                graph_status,
-                confidence,
-                provenance.clone(),
-                span,
-            ) {
+            match self.read_slice_last_receipt_diff(ctx) {
                 LastReceiptDiffOutcome::Result(result) => return result,
                 LastReceiptDiffOutcome::Fallback(reason) => {
                     return self.read_slice_git_diff(
-                        call,
-                        args,
-                        path,
-                        &rel_str,
-                        graph_available,
-                        graph_status,
-                        confidence,
-                        provenance,
+                        ctx,
                         DiffReadBaseline::Worktree,
                         Some(json!({
                             "requested": diff_read_baseline_str(baseline_requested),
@@ -2520,39 +2502,78 @@ impl ToolRegistry {
                 }
             }
         }
-        self.read_slice_git_diff(
-            call,
-            args,
-            path,
-            &rel_str,
-            graph_available,
-            graph_status,
-            confidence,
-            provenance,
-            baseline_requested,
-            None,
-        )
+        self.read_slice_git_diff(ctx, baseline_requested, None)
     }
 
     fn read_slice_git_diff(
         &self,
-        call: &ToolCall,
-        args: &ReadSliceArgs,
-        path: &Path,
-        rel: &str,
-        graph_available: bool,
-        graph_status: &'static str,
-        confidence: Confidence,
-        provenance: Vec<Provenance>,
+        ctx: &ReadSliceDiffCtx<'_>,
         baseline: DiffReadBaseline,
         baseline_fallback: Option<Value>,
     ) -> ToolResult {
+        let ReadSliceDiffCtx {
+            call,
+            args,
+            path,
+            rel,
+            graph_available,
+            graph_status,
+            confidence,
+            provenance,
+            ..
+        } = ctx;
+        let rel = *rel;
         let snapshot_mode = match baseline {
             DiffReadBaseline::Worktree | DiffReadBaseline::LastReceipt => DiffMode::Worktree,
             DiffReadBaseline::BranchBase => DiffMode::BranchBase,
             DiffReadBaseline::Index => DiffMode::Index,
         };
         let max_ranges = args.max_ranges.unwrap_or(20).clamp(1, 100);
+        // Cap diff reads at the same per-file budget the crawler uses to skip
+        // oversized files. A multi-hundred-MB modified file would otherwise be
+        // fully slurped before any per-range cap applies; the slice mode
+        // already pages through `read_slice_byte_window`, but the diff path
+        // needs the whole current file to attribute hunks to byte ranges.
+        if let Ok(size) = file_len(path) {
+            let limit = self.crawl_options.max_file_bytes;
+            if limit > 0 && size > limit {
+                let mut payload = serde_json::Map::new();
+                payload.insert("tool".to_string(), json!("read_slice"));
+                payload.insert("read_mode".to_string(), json!("diff"));
+                payload.insert("status".to_string(), json!("file_too_large"));
+                payload.insert("graph_available".to_string(), json!(*graph_available));
+                payload.insert("graph_status".to_string(), json!(*graph_status));
+                payload.insert(
+                    "baseline_requested".to_string(),
+                    json!(diff_read_baseline_str(
+                        args.diff_baseline.unwrap_or_default()
+                    )),
+                );
+                payload.insert(
+                    "baseline_used".to_string(),
+                    json!(diff_read_baseline_str(baseline)),
+                );
+                if let Some(fallback) = baseline_fallback {
+                    payload.insert("baseline_fallback".to_string(), fallback);
+                }
+                payload.insert("path".to_string(), json!(rel));
+                payload.insert("total_bytes".to_string(), json!(size));
+                payload.insert("max_file_bytes".to_string(), json!(limit));
+                payload.insert("ranges".to_string(), json!([]));
+                payload.insert("packets".to_string(), json!([]));
+                payload.insert("truncated".to_string(), json!(true));
+                return make_result(
+                    call,
+                    ToolStatus::Denied,
+                    Value::Object(payload),
+                    ToolCostHint {
+                        truncated: true,
+                        ..ToolCostHint::default()
+                    },
+                    None,
+                );
+            }
+        }
         let snapshot = self.diff_snapshot(
             snapshot_mode,
             DiffOptions {
@@ -2578,9 +2599,10 @@ impl ToolRegistry {
                     rel,
                     None,
                     "read_slice diff found a changed binary file; source bytes were omitted",
-                    confidence,
-                    &provenance,
+                    *confidence,
+                    provenance,
                     ToolCostHint::default(),
+                    DiffNextActionKind::ReadSlice,
                 ));
                 ranges.push(json!({
                     "status": diff_status_str(file.status),
@@ -2592,9 +2614,10 @@ impl ToolRegistry {
                     rel,
                     None,
                     "read_slice diff found a deleted file; current source bytes are unavailable",
-                    confidence,
-                    &provenance,
+                    *confidence,
+                    provenance,
                     ToolCostHint::default(),
+                    DiffNextActionKind::ReadSlice,
                 ));
                 ranges.push(json!({
                     "status": "deleted",
@@ -2644,9 +2667,15 @@ impl ToolRegistry {
                         rel,
                         Some(span),
                         "read_slice diff returned changed source bytes",
-                        confidence,
-                        &provenance,
+                        *confidence,
+                        provenance,
                         range_cost,
+                        // Range carries `content` inline, so steer the model to
+                        // graph-backed context for the enclosing symbol rather
+                        // than re-fetching the same bytes via slice mode.
+                        DiffNextActionKind::SymbolContextOrSlice {
+                            rust_graph: *graph_available && *graph_status == "rust",
+                        },
                     ));
                     ranges.push(json!({
                         "status": range.status,
@@ -2660,7 +2689,7 @@ impl ToolRegistry {
                     }));
                 }
                 truncated |= file.patch_truncated
-                    || ranges.len() >= max_ranges && file.hunks.len() > max_ranges;
+                    || (ranges.len() >= max_ranges && file.hunks.len() > max_ranges);
             }
         }
 
@@ -2669,9 +2698,10 @@ impl ToolRegistry {
                 rel,
                 None,
                 "read_slice diff found no changed source ranges for this path",
-                confidence,
-                &provenance,
+                *confidence,
+                provenance,
                 ToolCostHint::default(),
+                DiffNextActionKind::ReadSlice,
             ));
         }
 
@@ -2680,8 +2710,8 @@ impl ToolRegistry {
         let mut payload = serde_json::Map::new();
         payload.insert("tool".to_string(), json!("read_slice"));
         payload.insert("read_mode".to_string(), json!("diff"));
-        payload.insert("graph_available".to_string(), json!(graph_available));
-        payload.insert("graph_status".to_string(), json!(graph_status));
+        payload.insert("graph_available".to_string(), json!(*graph_available));
+        payload.insert("graph_status".to_string(), json!(*graph_status));
         payload.insert(
             "baseline_requested".to_string(),
             json!(diff_read_baseline_str(
@@ -2696,8 +2726,21 @@ impl ToolRegistry {
             payload.insert("baseline_fallback".to_string(), fallback);
         }
         payload.insert("path".to_string(), json!(rel));
-        payload.insert("sha256".to_string(), json!(content_sha256.clone()));
-        payload.insert("unchanged".to_string(), json!(file.is_none()));
+        payload.insert("sha256".to_string(), json!(&content_sha256));
+        // `path_in_diff` is the literal "git reports a diff for this path"
+        // signal: it stays true even when no source ranges survive (e.g.
+        // binary/deleted files) so callers can distinguish "clean file" from
+        // "changed file with no readable content".
+        let path_in_diff = file.is_some();
+        payload.insert("path_in_diff".to_string(), json!(path_in_diff));
+        // Back-compat alias: pre-fix consumers read `unchanged` to mean "git
+        // reports no diff for this path". Keep the same wire shape but only
+        // claim "unchanged" when both git is clean *and* we produced no
+        // packets, so binary/deleted entries no longer masquerade as clean.
+        payload.insert(
+            "unchanged".to_string(),
+            json!(!path_in_diff && ranges.is_empty()),
+        );
         payload.insert("ranges".to_string(), json!(ranges));
         payload.insert("packets".to_string(), json!(packets));
         payload.insert("truncated".to_string(), json!(cost.truncated));
@@ -2712,44 +2755,76 @@ impl ToolRegistry {
         )
     }
 
-    fn read_slice_last_receipt_diff(
-        &self,
-        call: &ToolCall,
-        args: &ReadSliceArgs,
-        path: &Path,
-        rel: &str,
-        graph_available: bool,
-        graph_status: &'static str,
-        confidence: Confidence,
-        provenance: Vec<Provenance>,
-        span: Option<SourceSpan>,
-    ) -> LastReceiptDiffOutcome {
+    fn read_slice_last_receipt_diff(&self, ctx: &ReadSliceDiffCtx<'_>) -> LastReceiptDiffOutcome {
+        let ReadSliceDiffCtx {
+            call,
+            args,
+            path,
+            rel,
+            graph_available,
+            graph_status,
+            confidence,
+            provenance,
+            span,
+        } = ctx;
+        let rel = *rel;
         let Some(store) = self.state_store.as_deref() else {
             return LastReceiptDiffOutcome::Fallback("last_receipt_store_unavailable");
         };
-        let snapshot = match store.read_snapshot(rel) {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => return LastReceiptDiffOutcome::Fallback("last_receipt_snapshot_missing"),
+        let snapshots = match store.read_snapshots_for_path(rel) {
+            Ok(snapshots) => snapshots,
             Err(_) => return LastReceiptDiffOutcome::Fallback("last_receipt_store_error"),
         };
+        if snapshots.is_empty() {
+            return LastReceiptDiffOutcome::Fallback("last_receipt_snapshot_missing");
+        }
         let content_sha256 = match sha256_file(path) {
             Ok(hash) => hash,
             Err(_) => {
                 return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
             }
         };
+        let total_bytes = match file_len(path) {
+            Ok(len) => len,
+            Err(_) => {
+                return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
+            }
+        };
+        let (offset, limit, _) = match read_slice_byte_window(path, total_bytes, args, *span) {
+            Ok(window) => window,
+            Err(_) => return LastReceiptDiffOutcome::Fallback("last_receipt_window_unavailable"),
+        };
+        let end = offset.saturating_add(limit).min(total_bytes as usize);
+        // Pick the most recent snapshot whose stored window exactly matches the
+        // requested `[offset, end)`. Storage is keyed by
+        // `(path, start_byte, end_byte)`, so distinct windows of the same file
+        // do not overwrite each other and the requested window is found even
+        // if a subsequent unrelated read landed for the same path.
+        let snapshot = snapshots
+            .iter()
+            .filter(|snapshot| {
+                snapshot.start_byte == offset as u64 && snapshot.end_byte == end as u64
+            })
+            .max_by_key(|snapshot| snapshot.created_unix_millis);
+        let snapshot = match snapshot {
+            Some(snapshot) => snapshot.clone(),
+            None => return LastReceiptDiffOutcome::Fallback("last_receipt_window_mismatch"),
+        };
         if snapshot.content_sha256.as_deref() == Some(content_sha256.as_str()) {
-            let cost = ToolCostHint {
-                truncated: true,
-                ..ToolCostHint::default()
-            };
+            // `cost_hint.truncated` semantically means "we omitted bytes the
+            // caller would have got". The unchanged stub omits bytes by design
+            // because they were unchanged, so report it as a dedup save rather
+            // than a truncation — the latter biases the budget broker against
+            // the receipt-stub path.
+            let cost = ToolCostHint::default();
             let packet = read_diff_packet(
                 rel,
                 None,
                 "read_slice diff found no changes since the last receipt",
-                confidence,
-                &provenance,
+                *confidence,
+                provenance,
                 cost.clone(),
+                DiffNextActionKind::ReadSlice,
             );
             return LastReceiptDiffOutcome::Result(make_result(
                 call,
@@ -2757,12 +2832,15 @@ impl ToolRegistry {
                 json!({
                     "tool": "read_slice",
                     "read_mode": "diff",
+                    "graph_available": *graph_available,
+                    "graph_status": *graph_status,
                     "baseline_requested": "last_receipt",
                     "baseline_used": "last_receipt",
                     "path": rel,
-                    "sha256": content_sha256.clone(),
+                    "sha256": &content_sha256,
                     "unchanged": true,
                     "receipt_stub": true,
+                    "dedup": true,
                     "same_as_call_id": snapshot.call_id,
                     "same_as_tool_name": snapshot.tool_name,
                     "original_output_sha256": snapshot.stable_output_sha256,
@@ -2770,27 +2848,13 @@ impl ToolRegistry {
                     "original_model_output_bytes": snapshot.model_output_bytes,
                     "ranges": [],
                     "packets": [packet],
-                    "truncated": true,
+                    "truncated": false,
                 }),
                 cost,
                 Some(content_sha256.clone()),
             ));
         }
 
-        let total_bytes = match file_len(path) {
-            Ok(len) => len,
-            Err(_) => {
-                return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
-            }
-        };
-        let (offset, limit, _) = match read_slice_byte_window(path, total_bytes, args, span) {
-            Ok(window) => window,
-            Err(_) => return LastReceiptDiffOutcome::Fallback("last_receipt_window_unavailable"),
-        };
-        let end = offset.saturating_add(limit).min(total_bytes as usize);
-        if snapshot.start_byte != offset as u64 || snapshot.end_byte != end as u64 {
-            return LastReceiptDiffOutcome::Fallback("last_receipt_window_mismatch");
-        }
         let bytes = match read_range(path, offset as u64, limit) {
             Ok(bytes) => bytes,
             Err(_) => {
@@ -2798,6 +2862,16 @@ impl ToolRegistry {
             }
         };
         let current = String::from_utf8_lossy(&bytes).to_string();
+        // Line numbers must be reported against the full file, not against the
+        // window. `current` covers `[offset, offset+limit)` only, so count the
+        // newlines that precede `offset` once and apply that offset to each
+        // window-local line number.
+        let line_offset_before_window = match window_line_offset(path, offset) {
+            Ok(value) => value,
+            Err(_) => {
+                return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
+            }
+        };
         let local_ranges = byte_diff_ranges(snapshot.content.as_bytes(), current.as_bytes());
         let mut cost = ToolCostHint::default();
         let mut ranges = Vec::new();
@@ -2807,17 +2881,19 @@ impl ToolRegistry {
             .take(args.max_ranges.unwrap_or(20).clamp(1, 100))
         {
             let start = offset.saturating_add(range.start);
-            let end = offset.saturating_add(range.end);
+            let end_bytes = offset.saturating_add(range.end);
             let capped_end = range.end.min(range.start.saturating_add(MAX_READ_LIMIT));
             let content =
                 String::from_utf8_lossy(&current.as_bytes()[range.start..capped_end]).to_string();
             let range_truncated = capped_end < range.end;
-            let start_line = line_number_for_byte(&current, range.start);
+            let start_line = line_number_for_byte(&current, range.start)
+                .saturating_add(line_offset_before_window);
             let end_line =
-                line_number_for_byte(&current, range.end.saturating_sub(1).max(range.start));
+                line_number_for_byte(&current, range.end.saturating_sub(1).max(range.start))
+                    .saturating_add(line_offset_before_window);
             let span = SourceSpan::new(
                 start.min(u32::MAX as usize) as u32,
-                end.min(u32::MAX as usize) as u32,
+                end_bytes.min(u32::MAX as usize) as u32,
                 squeezy_core::SourcePoint::new(start_line.saturating_sub(1), 0),
                 squeezy_core::SourcePoint::new(end_line.saturating_sub(1), 0),
             );
@@ -2833,14 +2909,17 @@ impl ToolRegistry {
                 rel,
                 Some(span),
                 "read_slice diff returned source bytes changed since the last receipt",
-                confidence,
-                &provenance,
+                *confidence,
+                provenance,
                 range_cost,
+                DiffNextActionKind::SymbolContextOrSlice {
+                    rust_graph: *graph_available && *graph_status == "rust",
+                },
             ));
             ranges.push(json!({
                 "status": "modified",
                 "start_byte": start,
-                "end_byte": end,
+                "end_byte": end_bytes,
                 "start_line": start_line,
                 "end_line": end_line,
                 "bytes_returned": content.len(),
@@ -2853,9 +2932,10 @@ impl ToolRegistry {
                 rel,
                 None,
                 "read_slice diff found no changes in the last receipt window",
-                confidence,
-                &provenance,
+                *confidence,
+                provenance,
                 ToolCostHint::default(),
+                DiffNextActionKind::ReadSlice,
             ));
         }
         cost.matches_returned = ranges.len() as u64;
@@ -2865,12 +2945,12 @@ impl ToolRegistry {
             json!({
                 "tool": "read_slice",
                 "read_mode": "diff",
-                "graph_available": graph_available,
-                "graph_status": graph_status,
+                "graph_available": *graph_available,
+                "graph_status": *graph_status,
                 "baseline_requested": "last_receipt",
                 "baseline_used": "last_receipt",
                 "path": rel,
-                "sha256": content_sha256.clone(),
+                "sha256": &content_sha256,
                 "unchanged": false,
                 "ranges": ranges,
                 "packets": packets,
@@ -6496,6 +6576,23 @@ enum LastReceiptDiffOutcome {
     Fallback(&'static str),
 }
 
+/// Bundle of arguments shared by the three `read_mode=diff` helpers. Grouping
+/// them keeps each helper under `clippy::too_many_arguments` and removes the
+/// duplicated argument forwarding between `execute_read_slice_diff_blocking`
+/// → `read_slice_git_diff` / `read_slice_last_receipt_diff` plus the
+/// `LastReceipt` → `Worktree` fallback re-call.
+struct ReadSliceDiffCtx<'a> {
+    call: &'a ToolCall,
+    args: &'a ReadSliceArgs,
+    path: &'a Path,
+    rel: &'a str,
+    graph_available: bool,
+    graph_status: &'static str,
+    confidence: Confidence,
+    provenance: Vec<Provenance>,
+    span: Option<SourceSpan>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChangedByteRange {
     start: usize,
@@ -6517,6 +6614,52 @@ impl ChangedByteRange {
     }
 }
 
+/// Next-action recommendation for a diff packet. Diff ranges that already
+/// carry the changed bytes inline should not steer the model back to
+/// `read_slice` in slice mode for the same path — that just re-fetches the
+/// same content. Prefer `symbol_context` (Rust graph available) so the model
+/// can pull the enclosing symbol's callers/callees instead.
+#[derive(Debug, Clone, Copy)]
+enum DiffNextActionKind {
+    /// Recommend the slice mode of `read_slice` for cases that did not
+    /// already include source bytes (binary files, deleted files, empty
+    /// range lists). Surrounding context still needs a real fetch.
+    ReadSlice,
+    /// Recommend either `symbol_context` (when the Rust semantic graph is
+    /// available for this path) or the slice mode of `read_slice` (as a
+    /// language-agnostic fallback). Used when the diff range already includes
+    /// `content` inline.
+    SymbolContextOrSlice { rust_graph: bool },
+}
+
+fn read_diff_next_action(path: &str, kind: DiffNextActionKind) -> Value {
+    match kind {
+        DiffNextActionKind::ReadSlice => json!({
+            "tool": "read_slice",
+            "arguments": {
+                "path": path,
+                "read_mode": "slice"
+            },
+            "reason": "read the exact current source slice if surrounding context is needed"
+        }),
+        DiffNextActionKind::SymbolContextOrSlice { rust_graph: true } => json!({
+            "tool": "symbol_context",
+            "arguments": {
+                "path": path
+            },
+            "reason": "look up the enclosing symbol's callers and callees instead of refetching the same diff bytes"
+        }),
+        DiffNextActionKind::SymbolContextOrSlice { rust_graph: false } => json!({
+            "tool": "read_slice",
+            "arguments": {
+                "path": path,
+                "read_mode": "slice"
+            },
+            "reason": "read additional surrounding source if context beyond the diff bytes is needed"
+        }),
+    }
+}
+
 fn read_diff_packet(
     path: &str,
     span: Option<SourceSpan>,
@@ -6524,6 +6667,7 @@ fn read_diff_packet(
     confidence: Confidence,
     provenance: &[Provenance],
     cost_hint: ToolCostHint,
+    next_action_kind: DiffNextActionKind,
 ) -> Value {
     evidence_packet(
         claim,
@@ -6532,14 +6676,7 @@ fn read_diff_packet(
         Freshness::Fresh,
         provenance.to_vec(),
         cost_hint,
-        json!({
-            "tool": "read_slice",
-            "arguments": {
-                "path": path,
-                "read_mode": "slice"
-            },
-            "reason": "read the exact current source slice if surrounding context is needed"
-        }),
+        read_diff_next_action(path, next_action_kind),
     )
 }
 
@@ -6689,16 +6826,56 @@ fn byte_diff_ranges(old: &[u8], new: &[u8]) -> Vec<ChangedByteRange> {
     while end < new.len() && new[end.saturating_sub(1)] != b'\n' {
         end += 1;
     }
-    vec![ChangedByteRange::new(start, end, 1, 1, "modified")]
+    // Compute line numbers honestly so the resulting range stands on its own
+    // (callers can still overwrite, but the type no longer lies about being
+    // line-aware). `new` here is the window-local current bytes; the caller
+    // is responsible for offsetting to file-absolute lines if needed.
+    let start_line = line_number_for_byte_bytes(new, start);
+    let end_line =
+        line_number_for_byte_bytes(new, end.saturating_sub(1).max(start)).max(start_line);
+    vec![ChangedByteRange::new(
+        start, end, start_line, end_line, "modified",
+    )]
 }
 
 fn line_number_for_byte(text: &str, byte: usize) -> u32 {
-    let clamped = byte.min(text.len());
-    text.as_bytes()[..clamped]
+    line_number_for_byte_bytes(text.as_bytes(), byte)
+}
+
+fn line_number_for_byte_bytes(bytes: &[u8], byte: usize) -> u32 {
+    let clamped = byte.min(bytes.len());
+    bytes[..clamped]
         .iter()
         .filter(|byte| **byte == b'\n')
         .count()
         .saturating_add(1) as u32
+}
+
+/// Count the number of newlines strictly before `offset` in `path`. Used to
+/// promote window-local line numbers to file-absolute ones in
+/// `read_slice_last_receipt_diff` without slurping the full file into memory
+/// twice. Returns the count of `\n` bytes in `[0, offset)`.
+fn window_line_offset(path: &Path, offset: usize) -> std::result::Result<u32, std::io::Error> {
+    if offset == 0 {
+        return Ok(0);
+    }
+    use std::io::{BufReader, Read};
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut remaining = offset;
+    let mut buf = [0u8; 8192];
+    let mut newlines: u32 = 0;
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len());
+        let read = reader.read(&mut buf[..to_read])?;
+        if read == 0 {
+            break;
+        }
+        newlines = newlines
+            .saturating_add(buf[..read].iter().filter(|byte| **byte == b'\n').count() as u32);
+        remaining -= read;
+    }
+    Ok(newlines)
 }
 
 fn verify_scope_str(scope: VerifyScope) -> &'static str {

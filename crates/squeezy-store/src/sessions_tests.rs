@@ -473,6 +473,55 @@ fn state_store_round_trips_graph_receipts_and_observations() {
         read_snapshot
     );
 
+    // A second snapshot for a non-overlapping window must coexist with the
+    // first rather than overwriting it: read_snapshots are keyed by
+    // `(path, start_byte, end_byte)` so distinct windows of the same file
+    // remain independently retrievable.
+    let second_window = StoredReadSnapshot {
+        path: "src/lib.rs".to_string(),
+        tool_name: "read_slice".to_string(),
+        call_id: "read_2".to_string(),
+        stable_output_sha256: "read-out-2".to_string(),
+        content_sha256: Some("read-content".to_string()),
+        start_byte: 64,
+        end_byte: 96,
+        content: "    println!(\"hello\");          ".to_string(),
+        model_output_bytes: 256,
+        created_unix_millis: 3,
+    };
+    store
+        .put_read_snapshot(&second_window)
+        .expect("put second window snapshot");
+    let mut snapshots = store
+        .read_snapshots_for_path("src/lib.rs")
+        .expect("snapshots for path");
+    snapshots.sort_by_key(|snapshot| snapshot.start_byte);
+    assert_eq!(
+        snapshots,
+        vec![read_snapshot.clone(), second_window.clone()]
+    );
+    assert_eq!(
+        store
+            .read_snapshot_for_window("src/lib.rs", 0, 12)
+            .expect("first window")
+            .expect("first window stored"),
+        read_snapshot
+    );
+    assert_eq!(
+        store
+            .read_snapshot_for_window("src/lib.rs", 64, 96)
+            .expect("second window")
+            .expect("second window stored"),
+        second_window
+    );
+    assert!(
+        store
+            .read_snapshot_for_window("src/lib.rs", 0, 64)
+            .expect("missing window")
+            .is_none(),
+        "windows that were never stored must not match a stale snapshot"
+    );
+
     let mut observation = Observation::new(
         ObservationKind::Decision,
         "Use redb for graph persistence",
