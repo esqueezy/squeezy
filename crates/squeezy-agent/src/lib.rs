@@ -14,10 +14,12 @@ use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, CostSnapshot, PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability,
     PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict,
-    Redactor, SessionMetrics, SessionMode, SqueezyError, StreamRedactor, TranscriptItem, TurnId,
-    TurnMetrics, default_settings_path, escape_toml_basic_string,
+    Redactor, ResponseVerbosity, SessionMetrics, SessionMode, SqueezyError, StreamRedactor,
+    TranscriptItem, TurnId, TurnMetrics, default_settings_path, escape_toml_basic_string,
 };
-use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, estimate_cost};
+use squeezy_llm::{
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, capabilities_for, estimate_cost,
+};
 use squeezy_store::{
     CleanupReport, ResumeItem, SessionEvent, SessionHandle, SessionMetadata, SessionQuery,
     SessionRecord, SessionResumeState, SessionStatus, SessionStore, SqueezyStore,
@@ -346,9 +348,19 @@ impl Agent {
         input: String,
         cancel: CancellationToken,
     ) -> mpsc::Receiver<AgentEvent> {
+        self.start_turn_with_response_verbosity(input, cancel, self.config.tui.response_verbosity)
+    }
+
+    pub fn start_turn_with_response_verbosity(
+        &self,
+        input: String,
+        cancel: CancellationToken,
+        response_verbosity: ResponseVerbosity,
+    ) -> mpsc::Receiver<AgentEvent> {
         let (tx, rx) = mpsc::channel(128);
         let provider = self.provider.clone();
-        let config = self.config.clone();
+        let mut config = self.config.clone();
+        config.tui.response_verbosity = response_verbosity;
         let tools = self.tools.clone();
         let telemetry = self.telemetry.clone();
         let redactor = self.redactor.clone();
@@ -444,14 +456,55 @@ struct TurnRuntime {
     store: Option<Arc<SqueezyStore>>,
 }
 
+fn request_response_verbosity(
+    config: &AppConfig,
+    provider_name: &str,
+) -> Option<ResponseVerbosity> {
+    capabilities_for(provider_name, &config.model)
+        .filter(|capabilities| capabilities.text_verbosity)
+        .map(|_| config.tui.response_verbosity)
+}
+
+fn request_reasoning_effort(
+    config: &AppConfig,
+    provider_name: &str,
+) -> Option<squeezy_core::ReasoningEffort> {
+    let effort = config.reasoning_effort?;
+    capabilities_for(provider_name, &config.model)
+        .filter(|capabilities| capabilities.reasoning_effort)
+        .map(|_| effort)
+}
+
+fn instructions_with_response_verbosity(
+    instructions: &str,
+    verbosity: ResponseVerbosity,
+) -> String {
+    let guidance = match verbosity {
+        ResponseVerbosity::Concise => {
+            "Response verbosity: concise. Prefer short, direct answers unless the task requires detail."
+        }
+        ResponseVerbosity::Normal => {
+            "Response verbosity: normal. Use enough detail to be clear without unnecessary expansion."
+        }
+        ResponseVerbosity::Verbose => {
+            "Response verbosity: verbose. Include fuller rationale, context, and verification details when useful."
+        }
+    };
+    format!("{instructions}\n\n{guidance}")
+}
+
 impl TurnRuntime {
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
         let user_transcript = TranscriptItem::user(input.clone());
         let activation = self.tools.activate_skills_for_input(&input)?;
-        let raw_instructions = match self.tools.format_active_skills(&activation.skills) {
+        let base_instructions = match self.tools.format_active_skills(&activation.skills) {
             Some(skills) => format!("{}\n\n{}", self.config.instructions, skills),
             None => self.config.instructions.clone(),
         };
+        let raw_instructions = instructions_with_response_verbosity(
+            &base_instructions,
+            self.config.tui.response_verbosity,
+        );
         let user_item = LlmInputItem::UserText(activation.task_input);
         let mut prior_state = self.conversation_state.lock().await.clone();
         let mut conversation = prior_state.conversation.clone();
@@ -499,6 +552,8 @@ impl TurnRuntime {
                 instructions: request_instructions.clone(),
                 input: redact_llm_input_items(&next_input, &self.redactor),
                 max_output_tokens: self.config.max_output_tokens,
+                response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
+                reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
                 previous_response_id: previous_response_id.clone(),
                 tools: advertised_tool_specs(&self.all_tool_specs, active_mode),
                 store: self.config.store_responses,
@@ -1560,6 +1615,8 @@ Working target: {:?}",
             .to_string(),
         input: vec![LlmInputItem::UserText(prompt)],
         max_output_tokens: Some(80),
+        response_verbosity: None,
+        reasoning_effort: None,
         previous_response_id: None,
         tools: Vec::new(),
         store: false,
@@ -1934,6 +1991,8 @@ fn redact_error(error: SqueezyError, redactor: &Redactor) -> SqueezyError {
 fn merge_cost(total: &mut CostSnapshot, next: &CostSnapshot) {
     total.input_tokens = add_optional(total.input_tokens, next.input_tokens);
     total.output_tokens = add_optional(total.output_tokens, next.output_tokens);
+    total.reasoning_output_tokens =
+        add_optional(total.reasoning_output_tokens, next.reasoning_output_tokens);
     total.cached_input_tokens = add_optional(total.cached_input_tokens, next.cached_input_tokens);
     total.cache_write_input_tokens = add_optional(
         total.cache_write_input_tokens,
