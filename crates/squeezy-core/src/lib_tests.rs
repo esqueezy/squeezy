@@ -82,6 +82,7 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert_eq!(config.permissions, PermissionPolicy::default());
     assert_eq!(config.session_mode, SessionMode::Build);
     assert!(!config.store_responses);
+    assert!(config.exploration_compiler);
     assert_eq!(config.max_parallel_tools, 8);
     assert_eq!(config.exa_mcp_url, DEFAULT_EXA_MCP_URL);
     assert_eq!(config.exa_api_key_env, DEFAULT_EXA_API_KEY_ENV);
@@ -356,6 +357,36 @@ fn config_can_select_anthropic_provider_defaults() {
             assert_eq!(anthropic.base_url, DEFAULT_ANTHROPIC_BASE_URL);
         }
         _ => panic!("expected Anthropic provider"),
+    }
+}
+
+#[test]
+fn config_disables_exploration_compiler_via_env_var() {
+    for value in ["off", "false", "0", "no", "disabled"] {
+        let config = AppConfig::from_env_vars(None, |name| match name {
+            "SQUEEZY_EXPLORATION_COMPILER" => Some(value.to_string()),
+            _ => None,
+        });
+        assert!(
+            !config.exploration_compiler,
+            "SQUEEZY_EXPLORATION_COMPILER={value:?} must disable the planner",
+        );
+    }
+}
+
+#[test]
+fn config_keeps_exploration_compiler_default_on_for_unknown_env_values() {
+    // The planner defaults to on, so non-disabling env-var values (typos, empty
+    // strings, or aliases like `enabled`) must not silently flip the default.
+    for value in ["", "enabled", "on", "yes", "true", "1", "garbage"] {
+        let config = AppConfig::from_env_vars(None, |name| match name {
+            "SQUEEZY_EXPLORATION_COMPILER" => Some(value.to_string()),
+            _ => None,
+        });
+        assert!(
+            config.exploration_compiler,
+            "SQUEEZY_EXPLORATION_COMPILER={value:?} should not silently disable the planner",
+        );
     }
 }
 
@@ -952,6 +983,9 @@ reasoning_effort = "high"
 max_output_tokens = 512
 store_responses = true
 
+[agent]
+exploration_compiler = false
+
 [budgets]
 max_parallel_tools = 3
 tool_spill_threshold_bytes = 1000
@@ -1028,6 +1062,7 @@ reason = "docs lookups are safe"
     assert_eq!(config.reasoning_effort, Some(ReasoningEffort::High));
     assert_eq!(config.max_output_tokens, Some(512));
     assert!(config.store_responses);
+    assert!(!config.exploration_compiler);
     assert_eq!(config.session_mode, SessionMode::Plan);
     assert_eq!(config.max_parallel_tools, 3);
     assert_eq!(config.tool_spill_threshold_bytes, 1000);

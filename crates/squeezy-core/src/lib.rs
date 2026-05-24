@@ -70,6 +70,7 @@ pub struct AppConfig {
     pub session_logs: SessionLogConfig,
     pub context_compaction: ContextCompactionConfig,
     pub store_responses: bool,
+    pub exploration_compiler: bool,
     pub max_parallel_tools: usize,
     pub tool_spill_threshold_bytes: usize,
     pub tool_preview_bytes: usize,
@@ -305,6 +306,20 @@ impl AppConfig {
                 provider,
                 ProviderConfig::OpenAi(_) | ProviderConfig::AzureOpenAi(_)
             );
+        let agent_settings = settings.agent.unwrap_or_default();
+        // The exploration compiler defaults to on, and the documented env-var
+        // override is `SQUEEZY_EXPLORATION_COMPILER=off|false|...`. Treating
+        // the variable as a disable-only override keeps the documented values
+        // working without silently flipping the default off on typos or empty
+        // strings, matching how `SQUEEZY_TELEMETRY` and `SQUEEZY_FEEDBACK`
+        // handle their own default-on flags.
+        let settings_exploration_compiler = agent_settings.exploration_compiler.unwrap_or(true);
+        let exploration_compiler_var = get_var("SQUEEZY_EXPLORATION_COMPILER");
+        let exploration_compiler = if parse_disabled_bool(exploration_compiler_var.as_deref()) {
+            false
+        } else {
+            settings_exploration_compiler
+        };
         let budgets = settings.budgets.unwrap_or_default();
         let max_parallel_tools = get_var("SQUEEZY_MAX_PARALLEL_TOOLS")
             .and_then(|value| value.parse::<usize>().ok())
@@ -414,6 +429,7 @@ impl AppConfig {
             session_logs,
             context_compaction,
             store_responses,
+            exploration_compiler,
             max_parallel_tools,
             tool_spill_threshold_bytes,
             tool_preview_bytes,
@@ -498,6 +514,12 @@ impl AppConfig {
             self.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
         ));
         output.push_str(&format!("store_responses = {}\n\n", self.store_responses));
+
+        output.push_str("[agent]\n");
+        output.push_str(&format!(
+            "exploration_compiler = {}\n\n",
+            self.exploration_compiler
+        ));
 
         output.push_str("[session]\n");
         output.push_str(&format!(
@@ -1023,6 +1045,7 @@ pub struct SettingsFile {
     pub model: Option<String>,
     pub model_settings: Option<ModelSettings>,
     pub providers: Option<BTreeMap<String, ProviderSettings>>,
+    pub agent: Option<AgentSettings>,
     pub session: Option<SessionSettings>,
     pub context: Option<ContextCompactionSettings>,
     pub budgets: Option<BudgetSettings>,
@@ -1081,6 +1104,7 @@ impl SettingsFile {
                 "profile",
                 "model",
                 "providers",
+                "agent",
                 "session",
                 "context",
                 "budgets",
@@ -1115,6 +1139,9 @@ impl SettingsFile {
             }
         }
         settings.providers = providers_settings(table, source)?;
+        settings.agent = optional_table(table, "agent", source)?
+            .map(|table| AgentSettings::from_table(table, source, "agent"))
+            .transpose()?;
         settings.session = optional_table(table, "session", source)?
             .map(|table| SessionSettings::from_table(table, source, "session"))
             .transpose()?;
@@ -1167,6 +1194,7 @@ impl SettingsFile {
             ModelSettings::merge,
         );
         merge_provider_maps(&mut self.providers, next.providers);
+        merge_option(&mut self.agent, next.agent, AgentSettings::merge);
         merge_option(&mut self.session, next.session, SessionSettings::merge);
         merge_option(
             &mut self.context,
@@ -1312,6 +1340,29 @@ impl ModelSettings {
         replace_if_some(&mut self.reasoning_effort, next.reasoning_effort);
         replace_if_some(&mut self.max_output_tokens, next.max_output_tokens);
         replace_if_some(&mut self.store_responses, next.store_responses);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AgentSettings {
+    pub exploration_compiler: Option<bool>,
+}
+
+impl AgentSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(table, &["exploration_compiler"], source, path)?;
+        Ok(Self {
+            exploration_compiler: bool_value(
+                table,
+                "exploration_compiler",
+                source,
+                &field(path, "exploration_compiler"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.exploration_compiler, next.exploration_compiler);
     }
 }
 
@@ -3827,6 +3878,9 @@ pub fn user_settings_template() -> &'static str {
 # max_output_tokens = 128
 # store_responses = false      # only honored by openai/azure_openai
 
+[agent]
+# exploration_compiler = true  # graph-first planner for common navigation prompts
+
 [session]
 # mode = "build"              # build | plan
 # log_dir = ".squeezy/sessions"
@@ -3950,6 +4004,9 @@ pub fn project_settings_template() -> &'static str {
 # max_tool_bytes_read_per_turn = 20000000
 # max_search_files_per_turn = 50000
 # max_tool_result_bytes_per_round = 50000
+
+[agent]
+# exploration_compiler = true  # graph-first planner for common navigation prompts
 
 [session]
 # mode = "build"              # build | plan
@@ -5283,6 +5340,9 @@ pub struct SessionMetrics {
     pub spill_writes: u64,
     pub spill_reads: u64,
     pub budget_denials: u64,
+    pub planner_turns: u64,
+    pub planner_tool_calls: u64,
+    pub planner_refusals: u64,
     pub redactions: u64,
     pub provider: CostSnapshot,
 }
@@ -5304,6 +5364,9 @@ impl SessionMetrics {
         self.spill_writes += turn.spill_writes;
         self.spill_reads += turn.spill_reads;
         self.budget_denials += turn.budget_denials;
+        self.planner_turns += turn.planner_turns;
+        self.planner_tool_calls += turn.planner_tool_calls;
+        self.planner_refusals += turn.planner_refusals;
         self.redactions += turn.redactions;
         merge_cost_snapshot(&mut self.provider, &turn.provider);
     }
@@ -5325,6 +5388,9 @@ pub struct TurnMetrics {
     pub spill_writes: u64,
     pub spill_reads: u64,
     pub budget_denials: u64,
+    pub planner_turns: u64,
+    pub planner_tool_calls: u64,
+    pub planner_refusals: u64,
     pub redactions: u64,
     pub provider: CostSnapshot,
 }
