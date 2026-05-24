@@ -840,6 +840,15 @@ transport = "http"
 url = "https://docs.example/mcp"
 timeout_ms = 5000
 env = { TOKEN = "secret" }
+
+[mcp.servers.docs.permissions]
+default = "ask"
+
+[[mcp.servers.docs.permissions.rules]]
+target = "lookup:*"
+action = "allow"
+source = "project"
+reason = "docs lookups are safe"
 "#,
         "test",
     )
@@ -868,6 +877,19 @@ env = { TOKEN = "secret" }
     assert_eq!(config.tui.tick_rate_ms, 75);
     assert_eq!(config.tui.status_verbosity, StatusVerbosity::Verbose);
     assert_eq!(config.mcp_servers["docs"].transport, McpTransport::Http);
+    assert_eq!(
+        config.mcp_servers["docs"].permissions.default,
+        Some(PermissionMode::Ask)
+    );
+    assert!(
+        config
+            .permissions
+            .rules
+            .iter()
+            .any(|rule| rule.capability == "mcp"
+                && rule.target == "docs/lookup:*"
+                && rule.action == PermissionMode::Allow)
+    );
 }
 
 #[test]
@@ -966,6 +988,7 @@ env = { TOKEN = "secret-value" }
     assert!(!inspect.contains("CUSTOM_EXA_KEY"));
     assert!(!inspect.contains("internal-[a-z0-9]+"));
     assert!(!inspect.contains("secret-value"));
+    SettingsFile::from_toml_str(&inspect, "inspect").expect("redacted inspect output parses");
 }
 
 #[test]

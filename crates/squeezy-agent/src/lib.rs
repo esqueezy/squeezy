@@ -27,8 +27,8 @@ use squeezy_telemetry::{
     ToolStatusKind as TelemetryToolStatusKind, ToolTelemetryReport,
 };
 use squeezy_tools::{
-    ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolResult, ToolSpec,
-    ToolStatus, WebToolConfig, sha256_hex,
+    ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolResult,
+    ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig, sha256_hex,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -162,13 +162,16 @@ impl Agent {
                 .redactor()
                 .expect("validated redaction config must compile"),
         );
-        let tools = ToolRegistry::new_with_configs_and_skills(
+        let tools = ToolRegistry::new_with_configs_skills_and_mcp(
             config.workspace_root.clone(),
-            output_config.clone(),
-            web_config.clone(),
+            ToolRuntimeConfig {
+                output: output_config.clone(),
+                web: web_config.clone(),
+                shell_sandbox: config.permissions.shell_sandbox.clone(),
+                mcp_servers: config.mcp_servers.clone(),
+            },
             config.skills.clone(),
             &config.graph,
-            config.permissions.shell_sandbox.clone(),
             redactor.clone(),
         )
         .unwrap_or_else(|_| {
@@ -176,13 +179,16 @@ impl Agent {
             // directory but keep the configured redactor and graph
             // policy so the agent never silently downgrades to
             // default patterns or default crawl options.
-            ToolRegistry::new_with_configs_and_skills(
+            ToolRegistry::new_with_configs_skills_and_mcp(
                 ".",
-                output_config,
-                web_config,
+                ToolRuntimeConfig {
+                    output: output_config,
+                    web: web_config,
+                    shell_sandbox: config.permissions.shell_sandbox.clone(),
+                    mcp_servers: config.mcp_servers.clone(),
+                },
                 config.skills.clone(),
                 &config.graph,
-                config.permissions.shell_sandbox.clone(),
                 redactor.clone(),
             )
             .expect("current directory must be a valid tool root")
@@ -340,7 +346,6 @@ impl Agent {
         let telemetry = self.telemetry.clone();
         let redactor = self.redactor.clone();
         let session_metrics = self.session_metrics.clone();
-        let all_tool_specs = tools.specs().into_iter().map(advertised_tool).collect();
         let turn_id = TurnId::new(self.next_turn_id.fetch_add(1, Ordering::Relaxed));
         let approval_ids = self.next_approval_id.clone();
         let session_rules = self.session_rules.clone();
@@ -350,6 +355,18 @@ impl Agent {
 
         tokio::spawn(async move {
             let redacted_input = redactor.redact(&input);
+            let mcp_errors = tools.refresh_mcp_tools(cancel.clone()).await;
+            for error in mcp_errors {
+                log_session_event(
+                    session_log.as_ref(),
+                    &redactor,
+                    "mcp_discovery_error",
+                    Some(turn_id),
+                    Some(error.clone()),
+                    json!({ "error": error }),
+                );
+            }
+            let all_tool_specs = tools.specs().into_iter().map(advertised_tool).collect();
             let failure_session_log = session_log.clone();
             if tx
                 .send(AgentEvent::UserMessage {

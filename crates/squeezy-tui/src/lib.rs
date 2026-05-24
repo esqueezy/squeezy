@@ -638,6 +638,11 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
 /// future field becomes visible by adding it here AND in the tool
 /// registry; the doc in `docs/CONFIGURATION.md` references this contract.
 pub(crate) const APPROVAL_PROMPT_KEYS: &[&str] = &[
+    "server",
+    "tool",
+    "transport",
+    "target",
+    "arguments",
     "command",
     "cwd",
     "description",
