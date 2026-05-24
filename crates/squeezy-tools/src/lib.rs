@@ -40,7 +40,7 @@ use squeezy_mcp::{ExternalMcpTool, McpClientRegistry};
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog};
 use squeezy_store::SqueezyStore;
 use squeezy_vcs::{
-    CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions,
+    CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffHunk, DiffMode, DiffOptions,
     DiffSnapshot, GitVcs, RollbackMode, RollbackTarget, WorkspaceSnapshot,
 };
 use squeezy_workspace::{
@@ -446,6 +446,7 @@ pub struct ToolRegistry {
     http: Arc<dyn WebHttpClient>,
     graph: Arc<StdMutex<Option<GraphManager>>>,
     vcs: Arc<GitVcs>,
+    state_store: Option<Arc<SqueezyStore>>,
     checkpoints: Arc<CheckpointStore>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
     skills: Arc<SkillCatalog>,
@@ -773,7 +774,7 @@ impl ToolRegistry {
             &root,
             Default::default(),
             crawl_options.clone(),
-            state_store,
+            state_store.clone(),
         )
         .ok();
         let vcs = GitVcs::open(&root)?;
@@ -786,6 +787,7 @@ impl ToolRegistry {
             http,
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
+            state_store,
             checkpoints: Arc::new(checkpoints),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(skills),
@@ -825,6 +827,7 @@ impl ToolRegistry {
             http,
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
+            state_store: None,
             checkpoints: Arc::new(checkpoints),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(SkillCatalog::empty()),
@@ -2330,12 +2333,20 @@ impl ToolRegistry {
                 Ok(target) => target,
                 Err(err) => return tool_error(call, err),
             };
-        let path = match self.resolve_existing(&path_arg) {
-            Ok(path) => path,
-            Err(err) => return tool_error(call, err),
+        let diff_mode = args.read_mode.unwrap_or_default() == ReadSliceReadMode::Diff;
+        let path = if diff_mode {
+            match self.join_workspace(&path_arg) {
+                Ok(path) => path,
+                Err(err) => return tool_error(call, err),
+            }
+        } else {
+            match self.resolve_existing(&path_arg) {
+                Ok(path) => path,
+                Err(err) => return tool_error(call, err),
+            }
         };
         let rel = self.relative(&path);
-        if args.diff_only.unwrap_or(false) {
+        if !diff_mode && args.diff_only.unwrap_or(false) {
             let diff_paths =
                 diff_path_set(&self.diff_snapshot(DiffMode::Worktree, DiffOptions::default()));
             if !diff_paths.contains(rel.to_string_lossy().as_ref()) {
@@ -2357,6 +2368,28 @@ impl ToolRegistry {
                 None,
             );
         }
+        if diff_mode {
+            return self.execute_read_slice_diff_blocking(
+                call,
+                &args,
+                &path,
+                &rel,
+                graph.is_some(),
+                graph_status,
+                confidence,
+                provenance,
+                span,
+            );
+        }
+        let path = match path.canonicalize() {
+            Ok(path) => path,
+            Err(err) => {
+                return tool_error(
+                    call,
+                    format!("path does not exist or is inaccessible: {err}"),
+                );
+            }
+        };
 
         let total_bytes = match file_len(&path) {
             Ok(len) => len,
@@ -2423,7 +2456,7 @@ impl ToolRegistry {
         payload.insert("offset".to_string(), json!(offset));
         payload.insert("bytes_returned".to_string(), json!(bytes.len()));
         payload.insert("total_bytes".to_string(), json!(total_bytes));
-        payload.insert("sha256".to_string(), json!(content_sha256));
+        payload.insert("sha256".to_string(), json!(content_sha256.clone()));
         payload.insert("truncated".to_string(), json!(truncated));
         if let Some(reason) = ignored_reason {
             payload.insert("ignored".to_string(), json!(true));
@@ -2438,6 +2471,415 @@ impl ToolRegistry {
             cost,
             Some(content_sha256),
         )
+    }
+
+    fn execute_read_slice_diff_blocking(
+        &self,
+        call: &ToolCall,
+        args: &ReadSliceArgs,
+        path: &Path,
+        rel: &Path,
+        graph_available: bool,
+        graph_status: &'static str,
+        confidence: Confidence,
+        provenance: Vec<Provenance>,
+        span: Option<SourceSpan>,
+    ) -> ToolResult {
+        let rel_str = rel.to_string_lossy().to_string();
+        let baseline_requested = args.diff_baseline.unwrap_or_default();
+        if baseline_requested == DiffReadBaseline::LastReceipt {
+            match self.read_slice_last_receipt_diff(
+                call,
+                args,
+                path,
+                &rel_str,
+                graph_available,
+                graph_status,
+                confidence,
+                provenance.clone(),
+                span,
+            ) {
+                LastReceiptDiffOutcome::Result(result) => return result,
+                LastReceiptDiffOutcome::Fallback(reason) => {
+                    return self.read_slice_git_diff(
+                        call,
+                        args,
+                        path,
+                        &rel_str,
+                        graph_available,
+                        graph_status,
+                        confidence,
+                        provenance,
+                        DiffReadBaseline::Worktree,
+                        Some(json!({
+                            "requested": diff_read_baseline_str(baseline_requested),
+                            "used": diff_read_baseline_str(DiffReadBaseline::Worktree),
+                            "reason": reason,
+                        })),
+                    );
+                }
+            }
+        }
+        self.read_slice_git_diff(
+            call,
+            args,
+            path,
+            &rel_str,
+            graph_available,
+            graph_status,
+            confidence,
+            provenance,
+            baseline_requested,
+            None,
+        )
+    }
+
+    fn read_slice_git_diff(
+        &self,
+        call: &ToolCall,
+        args: &ReadSliceArgs,
+        path: &Path,
+        rel: &str,
+        graph_available: bool,
+        graph_status: &'static str,
+        confidence: Confidence,
+        provenance: Vec<Provenance>,
+        baseline: DiffReadBaseline,
+        baseline_fallback: Option<Value>,
+    ) -> ToolResult {
+        let snapshot_mode = match baseline {
+            DiffReadBaseline::Worktree | DiffReadBaseline::LastReceipt => DiffMode::Worktree,
+            DiffReadBaseline::BranchBase => DiffMode::BranchBase,
+            DiffReadBaseline::Index => DiffMode::Index,
+        };
+        let max_ranges = args.max_ranges.unwrap_or(20).clamp(1, 100);
+        let snapshot = self.diff_snapshot(
+            snapshot_mode,
+            DiffOptions {
+                include_patch: true,
+                max_patch_bytes: 5_000_000,
+            },
+        );
+        let file = snapshot.files.iter().find(|file| file.path == rel);
+        let content_sha256 = path.exists().then(|| sha256_file(path).ok()).flatten();
+        let current_text = path
+            .exists()
+            .then(|| fs::read(path).ok())
+            .flatten()
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
+        let mut cost = ToolCostHint::default();
+        let mut truncated = snapshot.truncated;
+        let mut ranges = Vec::new();
+        let mut packets = Vec::new();
+
+        if let Some(file) = file {
+            if file.binary {
+                packets.push(read_diff_packet(
+                    rel,
+                    None,
+                    "read_slice diff found a changed binary file; source bytes were omitted",
+                    confidence,
+                    &provenance,
+                    ToolCostHint::default(),
+                ));
+                ranges.push(json!({
+                    "status": diff_status_str(file.status),
+                    "binary": true,
+                    "content_omitted": "binary_file",
+                }));
+            } else if file.status == DiffFileStatus::Deleted {
+                packets.push(read_diff_packet(
+                    rel,
+                    None,
+                    "read_slice diff found a deleted file; current source bytes are unavailable",
+                    confidence,
+                    &provenance,
+                    ToolCostHint::default(),
+                ));
+                ranges.push(json!({
+                    "status": "deleted",
+                    "content_omitted": "deleted_file",
+                }));
+            } else if let Some(text) = current_text.as_deref() {
+                let changed_ranges = file
+                    .patch
+                    .as_deref()
+                    .map(|patch| changed_byte_ranges_from_patch(patch, text))
+                    .filter(|ranges| !ranges.is_empty())
+                    .unwrap_or_else(|| {
+                        if file.status == DiffFileStatus::Added {
+                            vec![ChangedByteRange::new(
+                                0,
+                                text.len(),
+                                1,
+                                text.lines().count().max(1) as u32,
+                                "added",
+                            )]
+                        } else {
+                            diff_hunks_to_byte_ranges(&file.hunks, text)
+                        }
+                    });
+                for range in changed_ranges.into_iter().take(max_ranges) {
+                    let bytes = text.as_bytes();
+                    let capped_end = range.end.min(range.start.saturating_add(MAX_READ_LIMIT));
+                    let content =
+                        String::from_utf8_lossy(&bytes[range.start..capped_end]).to_string();
+                    let range_truncated = capped_end < range.end;
+                    truncated |= range_truncated;
+                    let range_cost = ToolCostHint {
+                        bytes_read: content.len() as u64,
+                        output_bytes: content.len() as u64,
+                        truncated: range_truncated,
+                        ..ToolCostHint::default()
+                    };
+                    cost.bytes_read += range_cost.bytes_read;
+                    cost.truncated |= range_truncated;
+                    let span = SourceSpan::new(
+                        range.start.min(u32::MAX as usize) as u32,
+                        range.end.min(u32::MAX as usize) as u32,
+                        squeezy_core::SourcePoint::new(range.start_line.saturating_sub(1), 0),
+                        squeezy_core::SourcePoint::new(range.end_line.saturating_sub(1), 0),
+                    );
+                    packets.push(read_diff_packet(
+                        rel,
+                        Some(span),
+                        "read_slice diff returned changed source bytes",
+                        confidence,
+                        &provenance,
+                        range_cost,
+                    ));
+                    ranges.push(json!({
+                        "status": range.status,
+                        "start_byte": range.start,
+                        "end_byte": range.end,
+                        "start_line": range.start_line,
+                        "end_line": range.end_line,
+                        "bytes_returned": content.len(),
+                        "truncated": range_truncated,
+                        "content": content,
+                    }));
+                }
+                truncated |= file.patch_truncated
+                    || ranges.len() >= max_ranges && file.hunks.len() > max_ranges;
+            }
+        }
+
+        if ranges.is_empty() {
+            packets.push(read_diff_packet(
+                rel,
+                None,
+                "read_slice diff found no changed source ranges for this path",
+                confidence,
+                &provenance,
+                ToolCostHint::default(),
+            ));
+        }
+
+        cost.matches_returned = ranges.len() as u64;
+        cost.truncated |= truncated;
+        let mut payload = serde_json::Map::new();
+        payload.insert("tool".to_string(), json!("read_slice"));
+        payload.insert("read_mode".to_string(), json!("diff"));
+        payload.insert("graph_available".to_string(), json!(graph_available));
+        payload.insert("graph_status".to_string(), json!(graph_status));
+        payload.insert(
+            "baseline_requested".to_string(),
+            json!(diff_read_baseline_str(
+                args.diff_baseline.unwrap_or_default()
+            )),
+        );
+        payload.insert(
+            "baseline_used".to_string(),
+            json!(diff_read_baseline_str(baseline)),
+        );
+        if let Some(fallback) = baseline_fallback {
+            payload.insert("baseline_fallback".to_string(), fallback);
+        }
+        payload.insert("path".to_string(), json!(rel));
+        payload.insert("sha256".to_string(), json!(content_sha256.clone()));
+        payload.insert("unchanged".to_string(), json!(file.is_none()));
+        payload.insert("ranges".to_string(), json!(ranges));
+        payload.insert("packets".to_string(), json!(packets));
+        payload.insert("truncated".to_string(), json!(cost.truncated));
+        payload.insert("vcs".to_string(), json!(snapshot.vcs));
+        payload.insert("errors".to_string(), json!(snapshot.errors));
+        make_result(
+            call,
+            ToolStatus::Success,
+            Value::Object(payload),
+            cost,
+            content_sha256,
+        )
+    }
+
+    fn read_slice_last_receipt_diff(
+        &self,
+        call: &ToolCall,
+        args: &ReadSliceArgs,
+        path: &Path,
+        rel: &str,
+        graph_available: bool,
+        graph_status: &'static str,
+        confidence: Confidence,
+        provenance: Vec<Provenance>,
+        span: Option<SourceSpan>,
+    ) -> LastReceiptDiffOutcome {
+        let Some(store) = self.state_store.as_deref() else {
+            return LastReceiptDiffOutcome::Fallback("last_receipt_store_unavailable");
+        };
+        let snapshot = match store.read_snapshot(rel) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return LastReceiptDiffOutcome::Fallback("last_receipt_snapshot_missing"),
+            Err(_) => return LastReceiptDiffOutcome::Fallback("last_receipt_store_error"),
+        };
+        let content_sha256 = match sha256_file(path) {
+            Ok(hash) => hash,
+            Err(_) => {
+                return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
+            }
+        };
+        if snapshot.content_sha256.as_deref() == Some(content_sha256.as_str()) {
+            let cost = ToolCostHint {
+                truncated: true,
+                ..ToolCostHint::default()
+            };
+            let packet = read_diff_packet(
+                rel,
+                None,
+                "read_slice diff found no changes since the last receipt",
+                confidence,
+                &provenance,
+                cost.clone(),
+            );
+            return LastReceiptDiffOutcome::Result(make_result(
+                call,
+                ToolStatus::Success,
+                json!({
+                    "tool": "read_slice",
+                    "read_mode": "diff",
+                    "baseline_requested": "last_receipt",
+                    "baseline_used": "last_receipt",
+                    "path": rel,
+                    "sha256": content_sha256.clone(),
+                    "unchanged": true,
+                    "receipt_stub": true,
+                    "same_as_call_id": snapshot.call_id,
+                    "same_as_tool_name": snapshot.tool_name,
+                    "original_output_sha256": snapshot.stable_output_sha256,
+                    "original_content_sha256": snapshot.content_sha256,
+                    "original_model_output_bytes": snapshot.model_output_bytes,
+                    "ranges": [],
+                    "packets": [packet],
+                    "truncated": true,
+                }),
+                cost,
+                Some(content_sha256.clone()),
+            ));
+        }
+
+        let total_bytes = match file_len(path) {
+            Ok(len) => len,
+            Err(_) => {
+                return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
+            }
+        };
+        let (offset, limit, _) = match read_slice_byte_window(path, total_bytes, args, span) {
+            Ok(window) => window,
+            Err(_) => return LastReceiptDiffOutcome::Fallback("last_receipt_window_unavailable"),
+        };
+        let end = offset.saturating_add(limit).min(total_bytes as usize);
+        if snapshot.start_byte != offset as u64 || snapshot.end_byte != end as u64 {
+            return LastReceiptDiffOutcome::Fallback("last_receipt_window_mismatch");
+        }
+        let bytes = match read_range(path, offset as u64, limit) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
+            }
+        };
+        let current = String::from_utf8_lossy(&bytes).to_string();
+        let local_ranges = byte_diff_ranges(snapshot.content.as_bytes(), current.as_bytes());
+        let mut cost = ToolCostHint::default();
+        let mut ranges = Vec::new();
+        let mut packets = Vec::new();
+        for range in local_ranges
+            .into_iter()
+            .take(args.max_ranges.unwrap_or(20).clamp(1, 100))
+        {
+            let start = offset.saturating_add(range.start);
+            let end = offset.saturating_add(range.end);
+            let capped_end = range.end.min(range.start.saturating_add(MAX_READ_LIMIT));
+            let content =
+                String::from_utf8_lossy(&current.as_bytes()[range.start..capped_end]).to_string();
+            let range_truncated = capped_end < range.end;
+            let start_line = line_number_for_byte(&current, range.start);
+            let end_line =
+                line_number_for_byte(&current, range.end.saturating_sub(1).max(range.start));
+            let span = SourceSpan::new(
+                start.min(u32::MAX as usize) as u32,
+                end.min(u32::MAX as usize) as u32,
+                squeezy_core::SourcePoint::new(start_line.saturating_sub(1), 0),
+                squeezy_core::SourcePoint::new(end_line.saturating_sub(1), 0),
+            );
+            let range_cost = ToolCostHint {
+                bytes_read: content.len() as u64,
+                output_bytes: content.len() as u64,
+                truncated: range_truncated,
+                ..ToolCostHint::default()
+            };
+            cost.bytes_read += range_cost.bytes_read;
+            cost.truncated |= range_truncated;
+            packets.push(read_diff_packet(
+                rel,
+                Some(span),
+                "read_slice diff returned source bytes changed since the last receipt",
+                confidence,
+                &provenance,
+                range_cost,
+            ));
+            ranges.push(json!({
+                "status": "modified",
+                "start_byte": start,
+                "end_byte": end,
+                "start_line": start_line,
+                "end_line": end_line,
+                "bytes_returned": content.len(),
+                "truncated": range_truncated,
+                "content": content,
+            }));
+        }
+        if ranges.is_empty() {
+            packets.push(read_diff_packet(
+                rel,
+                None,
+                "read_slice diff found no changes in the last receipt window",
+                confidence,
+                &provenance,
+                ToolCostHint::default(),
+            ));
+        }
+        cost.matches_returned = ranges.len() as u64;
+        let result = make_result(
+            call,
+            ToolStatus::Success,
+            json!({
+                "tool": "read_slice",
+                "read_mode": "diff",
+                "graph_available": graph_available,
+                "graph_status": graph_status,
+                "baseline_requested": "last_receipt",
+                "baseline_used": "last_receipt",
+                "path": rel,
+                "sha256": content_sha256.clone(),
+                "unchanged": false,
+                "ranges": ranges,
+                "packets": packets,
+                "truncated": cost.truncated,
+            }),
+            cost,
+            Some(content_sha256.clone()),
+        );
+        LastReceiptDiffOutcome::Result(result)
     }
 
     fn graph_context_for_snapshot(
@@ -5738,6 +6180,9 @@ struct ReadSliceArgs {
     path: Option<String>,
     symbol_id: Option<String>,
     span_kind: Option<ReadSliceSpanKind>,
+    read_mode: Option<ReadSliceReadMode>,
+    diff_baseline: Option<DiffReadBaseline>,
+    max_ranges: Option<usize>,
     start_byte: Option<usize>,
     end_byte: Option<usize>,
     start_line: Option<u32>,
@@ -5746,6 +6191,25 @@ struct ReadSliceArgs {
     offset: Option<usize>,
     limit: Option<usize>,
     diff_only: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReadSliceReadMode {
+    #[default]
+    Slice,
+    Diff,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiffReadBaseline {
+    #[default]
+    Worktree,
+    #[serde(alias = "branch")]
+    BranchBase,
+    Index,
+    LastReceipt,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -5975,6 +6439,8 @@ fn diff_mode_str(mode: DiffMode) -> &'static str {
     match mode {
         DiffMode::Worktree => "worktree",
         DiffMode::Branch => "branch",
+        DiffMode::BranchBase => "branch_base",
+        DiffMode::Index => "index",
     }
 }
 
@@ -6014,6 +6480,225 @@ fn diff_status_str(status: DiffFileStatus) -> &'static str {
         DiffFileStatus::Deleted => "deleted",
         DiffFileStatus::Modified => "modified",
     }
+}
+
+fn diff_read_baseline_str(baseline: DiffReadBaseline) -> &'static str {
+    match baseline {
+        DiffReadBaseline::Worktree => "worktree",
+        DiffReadBaseline::BranchBase => "branch_base",
+        DiffReadBaseline::Index => "index",
+        DiffReadBaseline::LastReceipt => "last_receipt",
+    }
+}
+
+enum LastReceiptDiffOutcome {
+    Result(ToolResult),
+    Fallback(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChangedByteRange {
+    start: usize,
+    end: usize,
+    start_line: u32,
+    end_line: u32,
+    status: &'static str,
+}
+
+impl ChangedByteRange {
+    fn new(start: usize, end: usize, start_line: u32, end_line: u32, status: &'static str) -> Self {
+        Self {
+            start,
+            end,
+            start_line,
+            end_line,
+            status,
+        }
+    }
+}
+
+fn read_diff_packet(
+    path: &str,
+    span: Option<SourceSpan>,
+    claim: &'static str,
+    confidence: Confidence,
+    provenance: &[Provenance],
+    cost_hint: ToolCostHint,
+) -> Value {
+    evidence_packet(
+        claim,
+        vec![span_for_path_json(path, span)],
+        confidence,
+        Freshness::Fresh,
+        provenance.to_vec(),
+        cost_hint,
+        json!({
+            "tool": "read_slice",
+            "arguments": {
+                "path": path,
+                "read_mode": "slice"
+            },
+            "reason": "read the exact current source slice if surrounding context is needed"
+        }),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChangedLineRange {
+    start_line: u32,
+    end_line: u32,
+    status: &'static str,
+}
+
+fn changed_byte_ranges_from_patch(patch: &str, text: &str) -> Vec<ChangedByteRange> {
+    let mut line_ranges = Vec::<ChangedLineRange>::new();
+    let mut new_line = 0u32;
+    for line in patch.lines() {
+        if line.starts_with("@@") {
+            new_line = parse_hunk_new_start(line).unwrap_or(1);
+            continue;
+        }
+        if new_line == 0 || line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            push_changed_line(&mut line_ranges, new_line, "modified");
+            new_line = new_line.saturating_add(1);
+        } else if line.starts_with('-') {
+            push_changed_line(&mut line_ranges, new_line.max(1), "deleted");
+        } else if line.starts_with(' ') {
+            new_line = new_line.saturating_add(1);
+        }
+    }
+    let modified_ranges = line_ranges
+        .iter()
+        .filter(|range| range.status == "modified")
+        .cloned()
+        .collect::<Vec<_>>();
+    line_ranges
+        .into_iter()
+        .filter(|range| {
+            range.status != "deleted"
+                || !modified_ranges.iter().any(|modified| {
+                    range.start_line <= modified.end_line && range.end_line >= modified.start_line
+                })
+        })
+        .map(|range| line_range_to_byte_range(text, range))
+        .collect()
+}
+
+fn push_changed_line(ranges: &mut Vec<ChangedLineRange>, line: u32, status: &'static str) {
+    if let Some(last) = ranges.last_mut()
+        && last.status == status
+        && line <= last.end_line.saturating_add(1)
+    {
+        last.end_line = last.end_line.max(line);
+        return;
+    }
+    ranges.push(ChangedLineRange {
+        start_line: line,
+        end_line: line,
+        status,
+    });
+}
+
+fn parse_hunk_new_start(line: &str) -> Option<u32> {
+    let plus = line.find('+')?;
+    let rest = line.get(plus + 1..)?;
+    let end = rest
+        .find(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .unwrap_or(rest.len());
+    rest.get(..end)?.parse().ok()
+}
+
+fn diff_hunks_to_byte_ranges(hunks: &[DiffHunk], text: &str) -> Vec<ChangedByteRange> {
+    hunks
+        .iter()
+        .map(|hunk| {
+            let start_line = hunk.start_line.saturating_add(1).max(1);
+            let end_line = hunk.end_line.saturating_add(1).max(start_line);
+            line_range_to_byte_range(
+                text,
+                ChangedLineRange {
+                    start_line,
+                    end_line,
+                    status: "modified",
+                },
+            )
+        })
+        .collect()
+}
+
+fn line_range_to_byte_range(text: &str, range: ChangedLineRange) -> ChangedByteRange {
+    let offsets = line_start_offsets(text);
+    let start = byte_for_line(&offsets, text.len(), range.start_line);
+    let end = if range.status == "deleted" {
+        start
+    } else {
+        byte_after_line(&offsets, text.len(), range.end_line)
+    };
+    ChangedByteRange::new(
+        start,
+        end.max(start),
+        range.start_line,
+        range.end_line,
+        range.status,
+    )
+}
+
+fn line_start_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = vec![0usize];
+    for (index, byte) in text.bytes().enumerate() {
+        if byte == b'\n' && index + 1 < text.len() {
+            offsets.push(index + 1);
+        }
+    }
+    offsets
+}
+
+fn byte_for_line(offsets: &[usize], text_len: usize, line: u32) -> usize {
+    offsets
+        .get(line.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or(text_len)
+}
+
+fn byte_after_line(offsets: &[usize], text_len: usize, line: u32) -> usize {
+    offsets.get(line as usize).copied().unwrap_or(text_len)
+}
+
+fn byte_diff_ranges(old: &[u8], new: &[u8]) -> Vec<ChangedByteRange> {
+    if old == new {
+        return Vec::new();
+    }
+    let mut prefix = 0usize;
+    while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
+        prefix += 1;
+    }
+    let mut old_suffix = old.len();
+    let mut new_suffix = new.len();
+    while old_suffix > prefix && new_suffix > prefix && old[old_suffix - 1] == new[new_suffix - 1] {
+        old_suffix -= 1;
+        new_suffix -= 1;
+    }
+    let mut start = prefix;
+    while start > 0 && new[start - 1] != b'\n' {
+        start -= 1;
+    }
+    let mut end = new_suffix.max(start);
+    while end < new.len() && new[end.saturating_sub(1)] != b'\n' {
+        end += 1;
+    }
+    vec![ChangedByteRange::new(start, end, 1, 1, "modified")]
+}
+
+fn line_number_for_byte(text: &str, byte: usize) -> u32 {
+    let clamped = byte.min(text.len());
+    text.as_bytes()[..clamped]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        .saturating_add(1) as u32
 }
 
 fn verify_scope_str(scope: VerifyScope) -> &'static str {
@@ -8528,7 +9213,7 @@ fn diff_context_spec() -> ToolSpec {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "mode": {"type": "string", "enum": ["worktree", "branch"], "description": "worktree compares current staged/unstaged/untracked changes to HEAD; branch compares the current branch to the default-branch merge base. Default worktree."},
+                "mode": {"type": "string", "enum": ["worktree", "branch", "branch_base", "index"], "description": "worktree compares current staged/unstaged/untracked changes to HEAD; branch and branch_base compare the current branch to the default-branch merge base; index compares staged changes to HEAD. Default worktree."},
                 "include_patch": {"type": "boolean", "description": "Include unified patch text. Default false to keep output compact."},
                 "max_files": {"type": "integer", "minimum": 1, "maximum": 500},
                 "max_symbols_per_file": {"type": "integer", "minimum": 1, "maximum": 100},
@@ -8769,7 +9454,7 @@ fn hierarchy_spec() -> ToolSpec {
 fn read_slice_spec() -> ToolSpec {
     ToolSpec {
         name: "read_slice".to_string(),
-        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Prefer spans returned by graph evidence packets.".to_string(),
+        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Set read_mode=diff to return only changed ranges against a baseline. Prefer spans returned by graph evidence packets.".to_string(),
         capability: PermissionCapability::Read,
         parameters: json!({
             "type": "object",
@@ -8778,6 +9463,9 @@ fn read_slice_spec() -> ToolSpec {
                 "path": {"type": "string"},
                 "symbol_id": {"type": "string"},
                 "span_kind": {"type": "string", "enum": ["signature", "body"]},
+                "read_mode": {"type": "string", "enum": ["slice", "diff"], "description": "slice returns the requested exact range; diff returns only changed ranges for the same path or symbol. Default slice."},
+                "diff_baseline": {"type": "string", "enum": ["worktree", "branch_base", "index", "last_receipt"], "description": "Baseline for read_mode=diff. worktree compares against HEAD including staged, unstaged, and untracked changes; branch_base compares against the default-branch merge base; index compares staged changes; last_receipt compares against the most recent model-visible read snapshot for this path and falls back to worktree if unavailable."},
+                "max_ranges": {"type": "integer", "minimum": 1, "maximum": 100},
                 "start_byte": {"type": "integer", "minimum": 0},
                 "end_byte": {"type": "integer", "minimum": 0},
                 "start_line": {"type": "integer", "minimum": 1},

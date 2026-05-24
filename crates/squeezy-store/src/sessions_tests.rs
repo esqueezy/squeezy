@@ -9,7 +9,7 @@ use squeezy_core::{
 
 use crate::{
     BugReportOptions, GraphStoreMetadata, Observation, ObservationKind, SqueezyStore,
-    StoredToolReceipt,
+    StoredReadSnapshot, StoredToolReceipt,
 };
 
 use super::*;
@@ -449,6 +449,29 @@ fn state_store_round_trips_graph_receipts_and_observations() {
         })
         .expect("put receipt");
     assert_eq!(store.tool_receipts().expect("receipts").len(), 1);
+
+    let read_snapshot = StoredReadSnapshot {
+        path: "src/lib.rs".to_string(),
+        tool_name: "read_slice".to_string(),
+        call_id: "read_1".to_string(),
+        stable_output_sha256: "read-out".to_string(),
+        content_sha256: Some("read-content".to_string()),
+        start_byte: 0,
+        end_byte: 12,
+        content: "fn main() {}".to_string(),
+        model_output_bytes: 128,
+        created_unix_millis: 2,
+    };
+    store
+        .put_read_snapshot(&read_snapshot)
+        .expect("put read snapshot");
+    assert_eq!(
+        store
+            .read_snapshot("src/lib.rs")
+            .expect("read snapshot")
+            .expect("snapshot exists"),
+        read_snapshot
+    );
 
     let mut observation = Observation::new(
         ObservationKind::Decision,

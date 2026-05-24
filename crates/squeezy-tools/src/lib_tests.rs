@@ -12,6 +12,7 @@ use std::{
 
 use serde_json::{Value, json};
 use squeezy_core::{GraphConfig, SkillsConfig};
+use squeezy_store::{SqueezyStore, StoredReadSnapshot};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -38,6 +39,19 @@ fn registry_with_shell_sandbox_off_and_output_config(
         SkillCatalog::empty(),
         CrawlOptions::default(),
         ToolRegistryRuntime::default(),
+    )
+    .expect("registry")
+}
+
+fn registry_with_state_store(root: &Path, store: Arc<SqueezyStore>) -> ToolRegistry {
+    ToolRegistry::new_inner(
+        root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        squeezy_core::ShellSandboxConfig::default(),
+        SkillCatalog::empty(),
+        CrawlOptions::default(),
+        ToolRegistryRuntime::new(Some(store), Arc::new(Redactor::default())),
     )
     .expect("registry")
 }
@@ -609,6 +623,156 @@ async fn diff_only_filters_glob_grep_and_read_file() {
         )
         .await;
     assert_eq!(changed_read.status, ToolStatus::Success);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_mode_returns_only_changed_worktree_ranges() {
+    let root = temp_workspace("read_slice_diff_worktree");
+    write_rust_crate(
+        &root,
+        "pub fn changed() -> usize { 1 }\npub fn same() -> usize { 1 }\n",
+    );
+    git_init_commit(&root);
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn changed() -> usize { 2 }\npub fn same() -> usize { 1 }\n",
+    )
+    .expect("modify source");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "src/lib.rs",
+                    "read_mode": "diff",
+                    "diff_baseline": "worktree"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["read_mode"], "diff");
+    assert_eq!(result.content["baseline_used"], "worktree");
+    let ranges = result.content["ranges"].as_array().expect("ranges");
+    assert_eq!(ranges.len(), 1);
+    assert!(
+        ranges[0]["content"]
+            .as_str()
+            .expect("range content")
+            .contains("changed() -> usize { 2 }")
+    );
+    assert!(
+        !ranges[0]["content"]
+            .as_str()
+            .expect("range content")
+            .contains("same()")
+    );
+    assert_uniform_evidence_packet(&result.content["packets"][0]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_last_receipt_returns_stub_when_file_is_unchanged() {
+    let root = temp_workspace("read_slice_last_receipt_unchanged");
+    fs::write(root.join("sample.txt"), "alpha\nbeta\n").expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex("alpha\nbeta\n".as_bytes())),
+            start_byte: 0,
+            end_byte: 11,
+            content: "alpha\nbeta\n".to_string(),
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "read_mode": "diff",
+                    "diff_baseline": "last_receipt",
+                    "limit": 11
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["receipt_stub"], true);
+    assert_eq!(result.content["same_as_call_id"], "prior_read");
+    assert!(
+        result.content["ranges"]
+            .as_array()
+            .expect("ranges")
+            .is_empty()
+    );
+    assert_uniform_evidence_packet(&result.content["packets"][0]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_last_receipt_returns_changed_window() {
+    let root = temp_workspace("read_slice_last_receipt_changed");
+    fs::write(root.join("sample.txt"), "alpha\nzeta\n").expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex("alpha\nbeta\n".as_bytes())),
+            start_byte: 0,
+            end_byte: 11,
+            content: "alpha\nbeta\n".to_string(),
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "read_mode": "diff",
+                    "diff_baseline": "last_receipt",
+                    "limit": 11
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["baseline_used"], "last_receipt");
+    let ranges = result.content["ranges"].as_array().expect("ranges");
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0]["content"], "zeta\n");
+    assert_uniform_evidence_packet(&result.content["packets"][0]);
 
     let _ = fs::remove_dir_all(root);
 }
