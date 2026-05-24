@@ -26,9 +26,9 @@ use squeezy_agent::{
     MAX_JOBS_RETAINED, ToolApprovalDecision, ToolApprovalRequest,
 };
 use squeezy_core::{
-    AppConfig, ContextAttachment, ContextCompactionState, ContextEstimate, PermissionPolicy,
-    ResponseVerbosity, Result, Role, SessionMode, SqueezyError, StatusVerbosity, TaskStateSnapshot,
-    TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem,
+    AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
+    PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode, SqueezyError, StatusVerbosity,
+    TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem,
 };
 use squeezy_llm::LlmProvider;
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery, parse_bug_report_section};
@@ -181,10 +181,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.context_compaction.summary = Some(report.summary.clone());
                     app.context_compaction.history.push(report.record.clone());
                     app.context_estimate = report.record.after.clone();
-                    app.status = format!(
-                        "compacted context {}->{} tok",
-                        report.record.before.estimated_tokens, report.record.after.estimated_tokens
-                    );
+                    app.status = compaction_status_line(&report.record);
                     app.push_log(format!(
                         "context compacted gen={} trigger={} items={} tok {}->{}",
                         report.record.generation,
@@ -563,10 +560,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 Ok(report) => {
                     app.context_compaction = agent.context_compaction_snapshot().await;
                     app.context_estimate = report.record.after.clone();
-                    app.status = format!(
-                        "compacted context {}->{} tok",
-                        report.record.before.estimated_tokens, report.record.after.estimated_tokens
-                    );
+                    app.status = compaction_status_line(&report.record);
                     app.push_log(format!(
                         "context compacted gen={} items={} tok {}->{}",
                         report.record.generation,
@@ -596,21 +590,28 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         }
         "/pin" => {
             let target = parts.next().unwrap_or("selected");
-            let Some((label, summary, source)) = pin_source(app, target) else {
-                app.status = "usage: /pin selected|last".to_string();
-                return true;
-            };
-            match agent.pin_context_entry(label, summary, source).await {
-                Ok(pin) => {
-                    app.context_compaction = agent.context_compaction_snapshot().await;
-                    app.status = format!("pinned {}", pin.id);
+            match pin_source(app, target) {
+                PinSourceResult::Found(label, summary, source) => {
+                    match agent.pin_context_entry(label, summary, source).await {
+                        Ok(pin) => {
+                            app.context_compaction = agent.context_compaction_snapshot().await;
+                            app.status = format!("pinned {}", pin.id);
+                        }
+                        Err(error) => app.status = format!("pin failed: {error}"),
+                    }
                 }
-                Err(error) => app.status = format!("pin failed: {error}"),
+                PinSourceResult::NoEntry => {
+                    app.status = "no transcript entry to pin".to_string();
+                }
+                PinSourceResult::UnknownTarget => {
+                    app.status = "usage: /pin selected|last".to_string();
+                }
             }
             return true;
         }
         "/unpin" => {
-            let Some(id) = parts.next() else {
+            let id = parts.next().map(str::trim).filter(|raw| !raw.is_empty());
+            let Some(id) = id else {
                 app.status = "usage: /unpin <pin_id>".to_string();
                 return true;
             };
@@ -1063,16 +1064,35 @@ fn format_pin_list(context: &ContextCompactionState) -> String {
         .join("\n")
 }
 
-fn pin_source(app: &TuiApp, target: &str) -> Option<(String, String, String)> {
+fn compaction_status_line(record: &ContextCompactionRecord) -> String {
+    format!(
+        "compacted context {}->{} tok",
+        record.before.estimated_tokens, record.after.estimated_tokens
+    )
+}
+
+enum PinSourceResult {
+    Found(String, String, String),
+    NoEntry,
+    UnknownTarget,
+}
+
+fn pin_source(app: &TuiApp, target: &str) -> PinSourceResult {
     let entry = match target {
         "selected" => app
             .selected_entry
             .and_then(|index| app.transcript.get(index))
             .or_else(|| app.transcript.last()),
         "last" => app.transcript.last(),
-        _ => None,
-    }?;
-    Some(entry.pin_payload())
+        _ => return PinSourceResult::UnknownTarget,
+    };
+    match entry {
+        Some(entry) => {
+            let (label, summary, source) = entry.pin_payload();
+            PinSourceResult::Found(label, summary, source)
+        }
+        None => PinSourceResult::NoEntry,
+    }
 }
 
 fn sync_jobs_from_agent(app: &mut TuiApp, agent: &Agent) {

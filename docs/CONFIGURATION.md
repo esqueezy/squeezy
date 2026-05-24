@@ -194,7 +194,12 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   model-visible prompt tokens locally and, when enabled, replaces stale raw
   conversation/tool output with a compact summary while preserving recent
   turns, pinned context, active attachments, and seen-output receipts. The TUI
-  also supports `/compact`, `/pin`, `/pins`, and `/unpin`.
+  also supports `/compact`, `/pin`, `/pins`, and `/unpin`. The
+  `compaction_estimated_tokens` threshold is a local heuristic — Squeezy
+  counts byte length of redacted prompt items and divides by 4 to estimate
+  tokens, so pick a value that maps to your provider's real prompt budget
+  (e.g. set it well below the provider's context window since the heuristic
+  is a lower bound).
 - `[budgets]`: per-turn and per-tool output limits.
 - `[permissions]`: compatibility defaults `read`, `edit`, `shell`,
   `ignored_search`, and `web`, each set to `allow`, `ask`, or `deny`.

@@ -1610,7 +1610,7 @@ impl Default for SessionLogConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCompactionSettings {
     pub compaction_enabled: Option<bool>,
     pub compaction_estimated_tokens: Option<u64>,
