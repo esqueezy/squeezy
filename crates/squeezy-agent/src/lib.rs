@@ -49,7 +49,7 @@ mod exploration_compiler;
 
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
 
-const MAX_TOOL_ROUNDS: usize = 8;
+const MAX_TOOL_ROUNDS: usize = 32;
 const TASK_STATE_TOOL_NAME: &str = "update_task_state";
 const LOAD_TOOL_SCHEMA_TOOL_NAME: &str = "load_tool_schema";
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
@@ -2692,13 +2692,7 @@ fn tool_round_failure_summary(results: &[ToolResult]) -> Option<String> {
         if result.status != ToolStatus::Error && result.status != ToolStatus::Stale {
             continue;
         }
-        let error = result
-            .content
-            .get("error")
-            .and_then(Value::as_str)
-            .or_else(|| result.content.get("parse_error").and_then(Value::as_str))
-            .unwrap_or("tool failed")
-            .trim();
+        let error = tool_failure_detail(result);
         if error.contains("invalid tool arguments") {
             *invalid_counts.entry(result.tool_name.clone()).or_default() += 1;
         }
@@ -2715,6 +2709,36 @@ fn tool_round_failure_summary(results: &[ToolResult]) -> Option<String> {
             }
         })
         .or(last_error)
+}
+
+fn tool_failure_detail(result: &ToolResult) -> String {
+    if let Some(error) = result
+        .content
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| result.content.get("parse_error").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return compact_text(error, 180);
+    }
+    if let Some(code) = result.content.get("exit_code").and_then(Value::as_i64) {
+        return format!("exit {code}");
+    }
+    if let Some(signal) = result.content.get("signal").and_then(Value::as_i64) {
+        return format!("signal {signal}");
+    }
+    for key in ["stderr", "stdout"] {
+        if let Some(line) = result
+            .content
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+        {
+            return compact_text(line, 180);
+        }
+    }
+    "tool failed".to_string()
 }
 
 async fn execute_tool_calls(

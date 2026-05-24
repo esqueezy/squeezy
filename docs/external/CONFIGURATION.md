@@ -102,7 +102,7 @@ commented examples so that built-in defaults can evolve over time:
 
 [permissions]
 # read = "allow"
-# edit = "ask"
+# edit = "allow"
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
@@ -240,6 +240,9 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 - `[budgets]`: per-turn and per-tool output limits.
 - `[permissions]`: compatibility defaults `read`, `edit`, `shell`,
   `ignored_search`, and `web`, each set to `allow`, `ask`, or `deny`.
+  Build mode defaults to allowing workspace edits, while shell, network, MCP,
+  and compiler actions still ask unless rules or environment overrides allow
+  them.
   `shell_classifier` (default `false`) enables a narrow LLM fallback that
   can only downgrade an `Ask` shell verdict to `Deny`; it spends one extra
   LLM round-trip per ambiguous shell call, so leave it off unless that cost

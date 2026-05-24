@@ -80,6 +80,7 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert_eq!(config.model, DEFAULT_OPENAI_MODEL);
     assert_eq!(config.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
     assert_eq!(config.permissions, PermissionPolicy::default());
+    assert_eq!(config.permissions.edit, PermissionMode::Allow);
     assert_eq!(config.session_mode, SessionMode::Build);
     assert!(!config.store_responses);
     assert!(config.exploration_compiler);

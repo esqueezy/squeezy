@@ -2725,7 +2725,7 @@ impl PermissionPolicy {
             ),
             edit: parse_permission(
                 var("SQUEEZY_EDIT_PERMISSION"),
-                settings.edit.unwrap_or(PermissionMode::Ask),
+                settings.edit.unwrap_or(PermissionMode::Allow),
             ),
             shell: parse_permission(
                 var("SQUEEZY_SHELL_PERMISSION"),
@@ -2867,7 +2867,7 @@ impl Default for PermissionPolicy {
     fn default() -> Self {
         Self {
             read: PermissionMode::Allow,
-            edit: PermissionMode::Ask,
+            edit: PermissionMode::Allow,
             shell: PermissionMode::Ask,
             ignored_search: PermissionMode::Allow,
             web: PermissionMode::Ask,
@@ -4119,7 +4119,7 @@ pub fn user_settings_template() -> &'static str {
 
 [permissions]
 # read = "allow"
-# edit = "ask"
+# edit = "allow"
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
@@ -4250,7 +4250,7 @@ pub fn project_settings_template() -> &'static str {
 
 [permissions]
 # read = "allow"
-# edit = "ask"
+# edit = "allow"
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"

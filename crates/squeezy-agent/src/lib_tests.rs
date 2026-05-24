@@ -1937,6 +1937,30 @@ fn tool_round_failure_summary_names_repeated_invalid_tool_arguments() {
     );
 }
 
+#[test]
+fn tool_round_failure_summary_uses_shell_exit_details() {
+    let results = vec![control_tool_result(
+        &ToolCall {
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({"command": "cargo check --bin sonar-arch-graph"}),
+        },
+        ToolStatus::Error,
+        json!({
+            "command": "cargo check --bin sonar-arch-graph",
+            "exit_code": 101,
+            "stdout": "",
+            "stderr": "",
+            "error": null,
+        }),
+    )];
+
+    assert_eq!(
+        tool_round_failure_summary(&results).as_deref(),
+        Some("last shell failure: exit 101")
+    );
+}
+
 struct SharedLogWrite {
     buffer: Arc<Mutex<Vec<u8>>>,
 }
