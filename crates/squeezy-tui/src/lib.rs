@@ -798,12 +798,13 @@ fn slash_suggestions(input: &str) -> Vec<SlashCommand> {
         return Vec::new();
     }
     let prefix = input.trim();
-    SLASH_COMMANDS
+    let mut suggestions = SLASH_COMMANDS
         .iter()
         .copied()
         .filter(|command| command.name.starts_with(prefix))
-        .take(SLASH_MENU_MAX_ITEMS)
-        .collect()
+        .collect::<Vec<_>>();
+    suggestions.sort_by(|left, right| left.name.cmp(right.name));
+    suggestions
 }
 
 fn is_slash_completion_input(input: &str) -> bool {
@@ -828,14 +829,8 @@ fn move_slash_menu_selection(app: &mut TuiApp, direction: SelectionDirection) ->
         return false;
     }
     app.slash_menu_index = match direction {
-        SelectionDirection::Previous => {
-            if app.slash_menu_index == 0 {
-                count - 1
-            } else {
-                app.slash_menu_index - 1
-            }
-        }
-        SelectionDirection::Next => (app.slash_menu_index + 1) % count,
+        SelectionDirection::Previous => app.slash_menu_index.saturating_sub(1),
+        SelectionDirection::Next => (app.slash_menu_index + 1).min(count - 1),
     };
     true
 }
@@ -2901,17 +2896,20 @@ fn prompt_input_lines(app: &TuiApp, height: u16) -> Vec<Line<'static>> {
 
 fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
     let suggestions = slash_suggestions(&app.input);
-    let command_width = suggestions
+    let visible = visible_slash_suggestions(&suggestions, app.slash_menu_index);
+    let command_width = visible
         .iter()
         .map(|command| command.name.chars().count())
         .max()
         .unwrap_or(0)
         .max(12);
-    suggestions
+    visible
         .iter()
         .enumerate()
         .map(|(index, command)| {
-            let selected = index
+            let absolute_index = slash_menu_window_start(suggestions.len(), app.slash_menu_index)
+                .saturating_add(index);
+            let selected = absolute_index
                 == app
                     .slash_menu_index
                     .min(suggestions.len().saturating_sub(1));
@@ -2932,6 +2930,24 @@ fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
             ])
         })
         .collect()
+}
+
+fn slash_menu_window_start(total: usize, selected: usize) -> usize {
+    if total <= SLASH_MENU_MAX_ITEMS {
+        return 0;
+    }
+    selected
+        .saturating_add(1)
+        .saturating_sub(SLASH_MENU_MAX_ITEMS)
+        .min(total - SLASH_MENU_MAX_ITEMS)
+}
+
+fn visible_slash_suggestions(suggestions: &[SlashCommand], selected: usize) -> &[SlashCommand] {
+    let start = slash_menu_window_start(suggestions.len(), selected);
+    let end = start
+        .saturating_add(SLASH_MENU_MAX_ITEMS)
+        .min(suggestions.len());
+    &suggestions[start..end]
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {

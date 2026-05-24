@@ -201,13 +201,15 @@ async fn slash_menu_renders_and_completes_selected_command() {
     assert!(output.contains("/permissions"), "{output}");
     assert!(output.contains("/plan"), "{output}");
 
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-    )
-    .await
-    .expect("menu down");
+    for _ in 0..3 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .await
+        .expect("menu down");
+    }
     handle_key(
         &mut app,
         &mut agent,
@@ -217,6 +219,76 @@ async fn slash_menu_renders_and_completes_selected_command() {
     .expect("complete command");
     assert_eq!(app.input, "/plan ");
     assert_eq!(app.status, "selected /plan");
+}
+
+#[tokio::test]
+async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.input = "/".to_string();
+
+    let suggestions = slash_suggestions(&app.input);
+    let names = suggestions
+        .iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
+    assert!(names.len() > SLASH_MENU_MAX_ITEMS);
+    assert_eq!(
+        &names[..SLASH_MENU_MAX_ITEMS],
+        [
+            "/attach",
+            "/attachments",
+            "/build",
+            "/checkpoint",
+            "/checkpoints"
+        ]
+    );
+    assert_eq!(slash_suggestion_lines(&app).len(), SLASH_MENU_MAX_ITEMS);
+
+    for _ in 0..5 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .await
+        .expect("menu down");
+    }
+
+    let visible = visible_slash_suggestions(&suggestions, app.slash_menu_index)
+        .iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        visible,
+        vec![
+            "/attachments",
+            "/build",
+            "/checkpoint",
+            "/checkpoints",
+            "/collapse"
+        ]
+    );
+
+    for _ in 0..100 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .await
+        .expect("menu down");
+    }
+    assert_eq!(app.slash_menu_index, suggestions.len() - 1);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("menu down at end");
+    assert_eq!(app.slash_menu_index, suggestions.len() - 1);
 }
 
 #[tokio::test]

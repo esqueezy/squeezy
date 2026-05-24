@@ -78,7 +78,7 @@ fn source_span_contains_byte_inclusively() {
 fn config_without_env_uses_openai_provider_defaults() {
     let config = AppConfig::from_env_vars(None, |_| None);
     assert_eq!(config.model, DEFAULT_OPENAI_MODEL);
-    assert_eq!(config.max_output_tokens, Some(DEFAULT_MAX_OUTPUT_TOKENS));
+    assert_eq!(config.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
     assert_eq!(config.permissions, PermissionPolicy::default());
     assert_eq!(config.session_mode, SessionMode::Build);
     assert!(!config.store_responses);
@@ -254,6 +254,7 @@ fn config_reads_supported_env_overrides() {
         "SQUEEZY_EDIT_PERMISSION" => Some("allow".to_string()),
         "SQUEEZY_SHELL_PERMISSION" => Some("deny".to_string()),
         "SQUEEZY_STORE_RESPONSES" => Some("true".to_string()),
+        "SQUEEZY_MAX_OUTPUT_TOKENS" => Some("64000".to_string()),
         "SQUEEZY_MAX_PARALLEL_TOOLS" => Some("3".to_string()),
         "SQUEEZY_WEB_PERMISSION" => Some("allow".to_string()),
         "SQUEEZY_EXA_MCP_URL" => Some("https://search.example/mcp".to_string()),
@@ -279,6 +280,7 @@ fn config_reads_supported_env_overrides() {
     assert_eq!(config.permissions.web, PermissionMode::Allow);
     assert_eq!(config.session_mode, SessionMode::Plan);
     assert!(config.store_responses);
+    assert_eq!(config.max_output_tokens, Some(64_000));
     assert_eq!(config.max_parallel_tools, 3);
     assert_eq!(config.exa_mcp_url, "https://search.example/mcp");
     assert_eq!(config.exa_api_key_env, "CUSTOM_EXA_KEY");
@@ -1653,6 +1655,7 @@ url = "https://docs.example/mcp"
 
     assert!(inspect.contains("profile = \"strong\""));
     assert!(inspect.contains("provider = \"anthropic\""));
+    assert!(inspect.contains("# max_output_tokens = unset"));
     assert!(inspect.contains("read = \"deny\""));
     assert!(inspect.contains("status_verbosity = \"compact\""));
     assert!(inspect.contains("response_verbosity = \"normal\""));

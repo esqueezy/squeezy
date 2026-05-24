@@ -153,6 +153,7 @@ fn request_body_preserves_function_tool_order() {
 
     let body = OpenAiProvider::request_body(&request);
 
+    assert!(body.get("max_output_tokens").is_none());
     assert_eq!(body["tools"][0]["name"], "write_file");
     assert_eq!(body["tools"][1]["name"], "grep");
 }

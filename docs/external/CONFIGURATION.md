@@ -74,7 +74,7 @@ commented examples so that built-in defaults can evolve over time:
 # profile = "balanced"
 # model = "gpt-5.5"
 # reasoning_effort = "medium"
-# max_output_tokens = 4096
+# max_output_tokens = 64000    # optional output cap; unset means provider/model limit
 # store_responses = false
 # selection_version = 1
 
@@ -210,9 +210,11 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 
 - `[model]`: `provider`, `model`, `profile`, `reasoning_effort`,
   `max_output_tokens`, `store_responses`, and startup selector
-  `selection_version`. `reasoning_effort` accepts `low`, `medium`, `high`, or
-  `xhigh` and is only sent to providers whose model registry entry marks native
-  reasoning controls as supported.
+  `selection_version`. `max_output_tokens` is optional; when unset, Squeezy does
+  not impose its own output cap and lets the provider/model limit apply.
+  `reasoning_effort` accepts `low`, `medium`, `high`, or `xhigh` and is only
+  sent to providers whose model registry entry marks native reasoning controls
+  as supported.
 - `[providers.<id>]`: provider defaults such as `api_key_env`, `base_url`,
   `default_model`, `api_version`, and `region`.
 - `[session]`: `mode`, either `build` (default) or `plan`. Build mode preserves

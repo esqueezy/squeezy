@@ -26,7 +26,7 @@ pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
 pub const MODEL_SELECTION_VERSION: u32 = 1;
 pub const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 pub const DEFAULT_EXA_API_KEY_ENV: &str = "EXA_API_KEY";
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
+pub const DEFAULT_MAX_OUTPUT_TOKENS: Option<u32> = None;
 pub const DEFAULT_TOOL_SPILL_THRESHOLD_BYTES: usize = 25_000;
 pub const DEFAULT_TOOL_PREVIEW_BYTES: usize = 2_000;
 pub const DEFAULT_MAX_TOOL_RESULT_BYTES_PER_ROUND: usize = 50_000;
@@ -326,7 +326,7 @@ impl AppConfig {
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| *value > 0)
             .or(model_settings.max_output_tokens)
-            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+            .or(DEFAULT_MAX_OUTPUT_TOKENS);
         let web = settings.web.unwrap_or_default();
         let exa_mcp_url = get_var("SQUEEZY_EXA_MCP_URL")
             .or(web.exa_mcp_url)
@@ -459,7 +459,7 @@ impl AppConfig {
             profile,
             reasoning_effort,
             instructions: DEFAULT_INSTRUCTIONS.to_string(),
-            max_output_tokens: Some(max_output_tokens),
+            max_output_tokens,
             tick_rate: Duration::from_millis(tui.tick_rate_ms),
             workspace_root,
             permissions,
@@ -548,10 +548,13 @@ impl AppConfig {
                 toml_string(reasoning_effort.as_str())
             ));
         }
-        output.push_str(&format!(
-            "max_output_tokens = {}\n",
-            self.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
-        ));
+        if let Some(max_output_tokens) = self.max_output_tokens {
+            output.push_str(&format!("max_output_tokens = {max_output_tokens}\n"));
+        } else {
+            output.push_str(
+                "# max_output_tokens = unset  # no Squeezy cap; provider/model limit applies\n",
+            );
+        }
         output.push_str(&format!("store_responses = {}\n\n", self.store_responses));
 
         output.push_str("[agent]\n");
@@ -4041,15 +4044,14 @@ pub fn find_project_settings_path(start: impl AsRef<Path>) -> Option<PathBuf> {
 
 pub fn user_settings_template() -> &'static str {
     r#"# User-level Squeezy settings. Uncomment any key you want to override.
-# Values shown after `=` are the built-in defaults that apply when the
-# key is absent or commented out.
+# Commented values are examples or defaults that apply when the key is absent.
 
 [model]
 # provider = "openai"          # openai | anthropic | google | azure_openai | bedrock | ollama
 # profile = "balanced"         # cheap | balanced | strong
 # model = "gpt-5.5"            # provider-specific model id; leave unset to use the provider default
 # reasoning_effort = "medium"  # low | medium | high | xhigh; only sent to capable providers
-# max_output_tokens = 4096
+# max_output_tokens = 64000    # optional output cap; unset means provider/model limit
 # store_responses = false      # only honored by openai/azure_openai
 # selection_version = 1        # maintained by the startup provider/model selector
 
