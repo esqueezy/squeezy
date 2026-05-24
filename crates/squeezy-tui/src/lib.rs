@@ -2039,7 +2039,7 @@ pub(crate) fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
 
 fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
-    let header_height = if area.height >= 12 { 6 } else { 0 };
+    let header_height: u16 = if area.height >= 12 { 6 } else { 0 };
     let input_height = input_panel_height(app, area.width);
     let attachment_height = attachment_panel_height(app);
     let approval_prompt = app.pending_approval.as_ref().map(|pending| {
@@ -2060,12 +2060,27 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     } else {
         None
     };
-    let transcript_min = if approval_prompt.is_some() { 3 } else { 5 };
+    let reserved_height = header_height
+        .saturating_add(task_height.unwrap_or(0))
+        .saturating_add(
+            approval_prompt
+                .as_ref()
+                .map(|(_, height)| *height)
+                .unwrap_or(0),
+        )
+        .saturating_add(attachment_height)
+        .saturating_add(input_height)
+        .saturating_add(2);
+    let available_transcript_height = area.height.saturating_sub(reserved_height);
+    let transcript_height =
+        transcript_visual_line_count(app, area.width).min(available_transcript_height);
     let mut constraints = Vec::new();
     if header_height > 0 {
         constraints.push(Constraint::Length(header_height));
     }
-    constraints.push(Constraint::Min(transcript_min));
+    if transcript_height > 0 {
+        constraints.push(Constraint::Length(transcript_height));
+    }
     if let Some(h) = task_height {
         constraints.push(Constraint::Length(h));
     }
@@ -2076,6 +2091,7 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         constraints.push(Constraint::Length(attachment_height));
     }
     constraints.push(Constraint::Length(input_height));
+    constraints.push(Constraint::Min(0));
     constraints.push(Constraint::Length(2));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2086,8 +2102,10 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         render_startup_header(frame, chunks[index], app);
         index += 1;
     }
-    render_transcript(frame, chunks[index], app);
-    index += 1;
+    if transcript_height > 0 {
+        render_transcript(frame, chunks[index], app);
+        index += 1;
+    }
     if task_height.is_some() {
         render_task_state(frame, chunks[index], app);
         index += 1;
@@ -2102,6 +2120,9 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     }
     render_input(frame, chunks[index], app);
     index += 1;
+    // Flexible filler keeps the prompt attached to the transcript instead of
+    // pinning it to the footer.
+    index += 1;
     render_status(frame, chunks[index], app);
 }
 
@@ -2111,11 +2132,14 @@ fn render_startup_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn should_show_task_panel(app: &TuiApp) -> bool {
-    app.task_state.is_some()
+    app.task_state.is_some() || app.turn_rx.is_some()
 }
 
 fn task_panel_height(app: &TuiApp) -> u16 {
     if app.task_panel_collapsed {
+        return 1;
+    }
+    if app.task_state.is_none() {
         return 1;
     }
     let line_count = app
@@ -2123,14 +2147,15 @@ fn task_panel_height(app: &TuiApp) -> u16 {
         .as_ref()
         .map(|snapshot| format_task_state_lines(snapshot, false).len() as u16)
         .unwrap_or(1);
-    line_count.clamp(2, 7)
+    line_count.clamp(1, 7)
 }
 
 fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let Some(snapshot) = app.task_state.as_ref() else {
-        return;
+    let lines = if let Some(snapshot) = app.task_state.as_ref() {
+        format_task_state_lines(snapshot, app.task_panel_collapsed)
+    } else {
+        vec![turn_state_line("Working", None, AMBER)]
     };
-    let lines = format_task_state_lines(snapshot, app.task_panel_collapsed);
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(QUIET))
         .wrap(Wrap { trim: false });
@@ -2138,31 +2163,25 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn format_task_state_lines(snapshot: &TaskStateSnapshot, collapsed: bool) -> Vec<Line<'static>> {
+    let (label, color) = task_status_label_color(snapshot.status);
     if collapsed {
-        return vec![Line::from(format!(
-            "◆ {} · active {} · blocker {} · next {} · verify {}",
-            task_title(snapshot),
+        let detail = format!(
+            "active {} · blocker {} · next {} · verify {}",
             snapshot.active_step_title().unwrap_or("-"),
             snapshot.blocker.as_deref().unwrap_or("-"),
             snapshot.next_action.as_deref().unwrap_or("-"),
             snapshot.verification.as_str(),
-        ))];
+        );
+        return vec![turn_state_line(label, Some(detail), color)];
     }
 
     let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled("◆ ", Style::default().fg(AMBER)),
-        Span::styled(
-            task_title(snapshot).to_string(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" · {}", snapshot.status.as_str()),
-            Style::default().fg(QUIET),
-        ),
-    ]));
+    let title = if task_title(snapshot) == "current turn" {
+        None
+    } else {
+        Some(task_title(snapshot).to_string())
+    };
+    lines.push(turn_state_line(label, title, color));
     if let Some(summary) = &snapshot.summary {
         lines.push(Line::from(format!("  {summary}")));
     }
@@ -2208,6 +2227,35 @@ fn format_task_state_lines(snapshot: &TaskStateSnapshot, collapsed: bool) -> Vec
     lines
 }
 
+fn task_status_label_color(status: squeezy_core::TaskStateStatus) -> (&'static str, Color) {
+    match status {
+        squeezy_core::TaskStateStatus::Running => ("Working", AMBER),
+        squeezy_core::TaskStateStatus::Blocked => ("Blocked", GOLD),
+        squeezy_core::TaskStateStatus::Completed => ("Done", Color::Green),
+        squeezy_core::TaskStateStatus::Cancelled => ("Cancelled", ERROR_RED),
+        squeezy_core::TaskStateStatus::Failed => ("Failed", ERROR_RED),
+    }
+}
+
+fn turn_state_line(label: &'static str, detail: Option<String>, color: Color) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            "• ",
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(detail) = detail.filter(|value| !value.trim().is_empty()) {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(detail, Style::default().fg(QUIET)));
+    }
+    Line::from(spans)
+}
+
 fn task_title(snapshot: &TaskStateSnapshot) -> &str {
     if snapshot.task.is_empty() {
         "current turn"
@@ -2228,6 +2276,16 @@ fn render_approval(frame: &mut Frame<'_>, area: Rect, prompt: &str) {
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let lines = transcript_lines(app);
+    let scroll =
+        transcript_scroll_offset(lines.len(), area.height, app.transcript_scroll_from_bottom);
+    let paragraph = Paragraph::new(lines)
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn transcript_lines(app: &TuiApp) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (index, item) in app.transcript.iter().enumerate() {
         lines.extend(format_transcript_entry(
@@ -2241,16 +2299,10 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         lines.push(Line::from(vec![
             turn_dot_span(app),
             Span::raw(" "),
-            Span::raw(&app.pending_assistant),
+            Span::raw(app.pending_assistant.clone()),
         ]));
     }
-
-    let scroll =
-        transcript_scroll_offset(lines.len(), area.height, app.transcript_scroll_from_bottom);
-    let paragraph = Paragraph::new(lines)
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    lines
 }
 
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
@@ -2350,10 +2402,29 @@ fn transcript_scroll_offset(line_count: usize, area_height: u16, from_bottom: u1
     max_scroll.saturating_sub(from_bottom as usize) as u16
 }
 
+fn transcript_visual_line_count(app: &TuiApp, width: u16) -> u16 {
+    let content_width = width.max(1) as usize;
+    transcript_lines(app)
+        .iter()
+        .map(|line| {
+            let chars = line
+                .spans
+                .iter()
+                .map(|span| span.content.chars().count())
+                .sum::<usize>()
+                .max(1);
+            chars.div_ceil(content_width)
+        })
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16
+}
+
 #[cfg(test)]
 fn format_transcript_item(item: &TranscriptItem) -> Line<'_> {
-    let (action, color) = role_action(&item.role);
-    action_line(false, "• ", GOLD, action, color, item.content.as_str())
+    format_message_entry(item, false, false, MessageOutcome::Normal)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| Line::from(""))
 }
 
 fn format_transcript_entry(
@@ -2417,6 +2488,9 @@ fn format_message_entry(
     selected: bool,
     outcome: MessageOutcome,
 ) -> Vec<Line<'static>> {
+    if item.role == Role::User {
+        return format_user_prompt_entry(item, selected);
+    }
     let (action, color) = role_action(&item.role);
     let failed = outcome == MessageOutcome::Failed;
     let label_color = if failed { ERROR_RED } else { GOLD };
@@ -2446,6 +2520,28 @@ fn format_message_entry(
         &item.content,
         content_style,
     )
+}
+
+fn format_user_prompt_entry(item: &TranscriptItem, selected: bool) -> Vec<Line<'static>> {
+    let mut content = item.content.lines().collect::<Vec<_>>();
+    if content.is_empty() {
+        content.push("");
+    }
+    content
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let marker = if selected && index == 0 { "> " } else { "  " };
+            Line::from(vec![
+                Span::raw(marker),
+                Span::styled("    ", Style::default().bg(PROMPT_BG)),
+                Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::White).bg(PROMPT_BG),
+                ),
+            ])
+        })
+        .collect()
 }
 
 fn format_tool_call_entry(call: &ToolCall, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
@@ -2885,10 +2981,8 @@ fn prompt_blank_line() -> Line<'static> {
 fn prompt_input_lines(app: &TuiApp, height: u16) -> Vec<Line<'static>> {
     let content = prompt_input_content_lines(app);
     let spare = (height as usize).saturating_sub(content.len());
-    let top_padding = spare / 2;
-    let bottom_padding = spare.saturating_sub(top_padding);
-    let mut lines = Vec::with_capacity(top_padding + content.len() + bottom_padding);
-    lines.extend((0..top_padding).map(|_| prompt_blank_line()));
+    let bottom_padding = spare;
+    let mut lines = Vec::with_capacity(content.len() + bottom_padding);
     lines.extend(content);
     lines.extend((0..bottom_padding).map(|_| prompt_blank_line()));
     lines

@@ -542,7 +542,7 @@ fn transcript_item_formats_role_label() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(text, "  • Asked hello");
+    assert_eq!(text, "      hello");
 }
 
 #[test]
@@ -563,7 +563,7 @@ fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
     toggle_selected_transcript_entry(&mut app);
 
     assert!(!app.transcript[0].collapsed);
-    let expanded = render_to_string(&app, 100, 12);
+    let expanded = render_to_string(&app, 100, 18);
     assert!(expanded.contains("needle found"), "{expanded}");
 }
 
@@ -881,7 +881,7 @@ fn render_keeps_header_when_transcript_has_content() {
     let output = render_to_string(&app, 120, 16);
     assert!(output.contains(">_ Squeezy v"), "{output}");
     assert!(output.contains("scripted:gpt-test"), "{output}");
-    assert!(output.contains("• Asked hello"), "{output}");
+    assert!(output.contains("      hello"), "{output}");
     assert!(output.contains("• Answered answer"), "{output}");
 }
 
@@ -896,13 +896,61 @@ fn render_prompt_uses_rotating_coin_and_cursor() {
 }
 
 #[test]
+fn active_prompt_starts_directly_below_header() {
+    let app = test_app(SessionMode::Build);
+
+    let output = render_to_string(&app, 100, 16);
+    let lines = output.lines().collect::<Vec<_>>();
+    let header_bottom = lines
+        .iter()
+        .position(|line| line.contains('╯'))
+        .expect("header bottom");
+
+    assert!(
+        lines
+            .get(header_bottom + 1)
+            .is_some_and(|line| line.contains('┃')),
+        "{output}"
+    );
+}
+
+#[test]
+fn submitted_prompt_keeps_prompt_surface_and_working_line() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("ship it"));
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+
+    let output = render_to_string(&app, 100, 18);
+    let lines = output.lines().collect::<Vec<_>>();
+    let prompt_line = lines
+        .iter()
+        .position(|line| line.contains("ship it"))
+        .expect("submitted prompt");
+    let working_line = lines
+        .iter()
+        .position(|line| line.contains("• Working"))
+        .expect("working line");
+
+    assert!(!output.contains("Asked ship it"), "{output}");
+    assert!(working_line > prompt_line, "{output}");
+    assert!(
+        lines
+            .iter()
+            .skip(working_line + 1)
+            .any(|line| line.contains('┃')),
+        "{output}"
+    );
+}
+
+#[test]
 fn failure_log_renders_as_detail_under_user_turn() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("hi"));
     app.push_log("turn failed: provider stream failed".to_string());
 
     let output = render_to_string(&app, 120, 16);
-    assert!(output.contains("• Asked hi"), "{output}");
+    assert!(output.contains("      hi"), "{output}");
     assert!(
         output.contains("└ turn failed: provider stream failed"),
         "{output}"
@@ -922,11 +970,10 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         app.tool_output_verbosity,
         message_outcome(&app.transcript, 0),
     );
-    assert_eq!(user_lines[0].spans[1].style.fg, Some(ERROR_RED));
-    assert_eq!(user_lines[0].spans[2].style.fg, Some(ERROR_RED));
-    assert_eq!(user_lines[0].spans[4].content.as_ref(), "hi");
-    assert_eq!(user_lines[0].spans[4].style.fg, Some(Color::White));
-    assert_eq!(user_lines[0].spans[4].style.bg, Some(PROMPT_BG));
+    assert_eq!(user_lines[0].spans[1].style.bg, Some(PROMPT_BG));
+    assert_eq!(user_lines[0].spans[2].content.as_ref(), "hi");
+    assert_eq!(user_lines[0].spans[2].style.fg, Some(Color::White));
+    assert_eq!(user_lines[0].spans[2].style.bg, Some(PROMPT_BG));
 
     let log_lines = format_transcript_entry(
         &app.transcript[1],
@@ -949,9 +996,9 @@ fn user_prompt_text_is_highlighted_in_transcript() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(lines[0].spans[4].content.as_ref(), "find getFoo");
-    assert_eq!(lines[0].spans[4].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[0].spans[4].style.fg, Some(Color::White));
+    assert_eq!(lines[0].spans[2].content.as_ref(), "find getFoo");
+    assert_eq!(lines[0].spans[2].style.bg, Some(PROMPT_BG));
+    assert_eq!(lines[0].spans[2].style.fg, Some(Color::White));
     assert!(!text.contains("◐"), "{text}");
 }
 
@@ -976,7 +1023,7 @@ fn task_panel_renders_progress_blocker_next_action_and_verification() {
     app.task_state = Some(sample_task_state());
 
     let output = render_to_string(&app, 120, 24);
-    assert!(output.contains("◆"), "{output}");
+    assert!(output.contains("• Blocked Implement task UX"), "{output}");
     assert!(output.contains("Implement task UX"), "{output}");
     assert!(!output.contains("completed Inspect TUI"), "{output}");
     assert!(output.contains("active Wire task panel"), "{output}");
@@ -1004,7 +1051,7 @@ async fn ctrl_p_collapses_and_expands_task_panel() {
     .expect("collapse task panel");
     assert!(app.task_panel_collapsed);
     let collapsed = render_to_string(&app, 120, 16);
-    assert!(collapsed.contains("◆ Implement task UX"), "{collapsed}");
+    assert!(collapsed.contains("• Blocked"), "{collapsed}");
     assert!(collapsed.contains("active Wire task panel"), "{collapsed}");
 
     handle_key(
