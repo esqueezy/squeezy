@@ -13,7 +13,7 @@ use serde_json::json;
 use squeezy_core::{
     AppConfig, ContextAttachmentKind, PermissionAction, PermissionCapability, PermissionMode,
     PermissionPolicy, PermissionRequest, PermissionRisk, PermissionRuleSource, Result,
-    SessionLogConfig, SessionMode, ShellSandboxMode, SkillsConfig, TaskStateStatus,
+    SessionLogConfig, SessionMode, ShellSandboxMode, SkillsConfig, SubagentConfig, TaskStateStatus,
 };
 use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
@@ -1466,16 +1466,51 @@ fn advertised_tool_specs_are_mode_aware() {
 }
 
 #[test]
-fn task_state_tool_is_advertised_in_build_and_plan_modes() {
-    let tools = [task_state_advertised_tool()];
+fn control_tools_are_advertised_in_build_and_plan_modes() {
+    let tools = core_control_tools(&SubagentConfig::default());
 
     let build_specs = advertised_tool_specs(&tools, SessionMode::Build);
     let build_names = advertised_tool_names(&build_specs);
-    assert_eq!(build_names, vec![TASK_STATE_TOOL_NAME]);
+    assert_eq!(
+        build_names,
+        vec![TASK_STATE_TOOL_NAME, DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]
+    );
 
     let plan_specs = advertised_tool_specs(&tools, SessionMode::Plan);
     let plan_names = advertised_tool_names(&plan_specs);
-    assert_eq!(plan_names, vec![TASK_STATE_TOOL_NAME]);
+    assert_eq!(
+        plan_names,
+        vec![TASK_STATE_TOOL_NAME, DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]
+    );
+}
+
+#[test]
+fn core_control_tools_filter_subagents_when_disabled() {
+    let subagents = SubagentConfig {
+        enabled: false,
+        ..SubagentConfig::default()
+    };
+    let names: Vec<_> = core_control_tools(&subagents)
+        .into_iter()
+        .map(|tool| tool.spec.name)
+        .collect();
+    assert_eq!(names, vec![TASK_STATE_TOOL_NAME.to_string()]);
+
+    let explore_only_off = SubagentConfig {
+        explore_enabled: false,
+        ..SubagentConfig::default()
+    };
+    let names: Vec<_> = core_control_tools(&explore_only_off)
+        .into_iter()
+        .map(|tool| tool.spec.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            TASK_STATE_TOOL_NAME.to_string(),
+            DELEGATE_TOOL_NAME.to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -1498,6 +1533,8 @@ fn warn_unknown_tool_schema_names_emits_warning_for_typo_and_skips_known() {
             "grep".to_string(),
             "webfectch".to_string(), // intentional typo
             "load_tool_schema".to_string(),
+            "delegate".to_string(),
+            "explore".to_string(),
         ],
         discoverable: vec!["totally_made_up".to_string()],
     };
@@ -1523,23 +1560,33 @@ fn warn_unknown_tool_schema_names_emits_warning_for_typo_and_skips_known() {
         !logs.contains("load_tool_schema"),
         "synthetic always-core names must not trigger a warning: {logs}"
     );
+    assert!(
+        !logs.contains("delegate") && !logs.contains("explore"),
+        "subagent control tools must not trigger a warning: {logs}"
+    );
 }
 
 #[test]
 fn lazy_request_tool_specs_keep_core_first_and_mcp_discoverable_by_default() {
-    let tools = [
-        task_state_advertised_tool(),
+    let mut tools = core_control_tools(&SubagentConfig::default());
+    tools.extend([
         test_advertised_tool("grep", PermissionCapability::Search),
         test_advertised_tool("webfetch", PermissionCapability::Network),
         test_advertised_tool("mcp__docs__lookup", PermissionCapability::Mcp),
-    ];
+    ]);
     let config = ToolSchemaConfig::default();
 
     let initial_specs = request_tool_specs(&tools, SessionMode::Build, &config, &[]);
     let initial_names = advertised_tool_names(&initial_specs);
     assert_eq!(
         initial_names,
-        vec![TASK_STATE_TOOL_NAME, LOAD_TOOL_SCHEMA_TOOL_NAME, "grep"]
+        vec![
+            TASK_STATE_TOOL_NAME,
+            DELEGATE_TOOL_NAME,
+            EXPLORE_TOOL_NAME,
+            LOAD_TOOL_SCHEMA_TOOL_NAME,
+            "grep"
+        ]
     );
 
     let loaded_specs = request_tool_specs(
@@ -1557,11 +1604,51 @@ fn lazy_request_tool_specs_keep_core_first_and_mcp_discoverable_by_default() {
         loaded_names,
         vec![
             TASK_STATE_TOOL_NAME,
+            DELEGATE_TOOL_NAME,
+            EXPLORE_TOOL_NAME,
             LOAD_TOOL_SCHEMA_TOOL_NAME,
             "grep",
             "mcp__docs__lookup",
             "webfetch",
         ]
+    );
+}
+
+#[test]
+fn request_tool_specs_skips_disabled_subagent_control_tools() {
+    let subagents = SubagentConfig {
+        enabled: false,
+        ..SubagentConfig::default()
+    };
+    let mut tools = core_control_tools(&subagents);
+    tools.push(test_advertised_tool("grep", PermissionCapability::Search));
+    let config = ToolSchemaConfig::default();
+
+    let specs = request_tool_specs(&tools, SessionMode::Build, &config, &[]);
+    let names = advertised_tool_names(&specs);
+    assert!(
+        !names.contains(&DELEGATE_TOOL_NAME),
+        "delegate must not be advertised when subagents.enabled=false: {names:?}"
+    );
+    assert!(
+        !names.contains(&EXPLORE_TOOL_NAME),
+        "explore must not be advertised when subagents.enabled=false: {names:?}"
+    );
+    assert!(names.contains(&TASK_STATE_TOOL_NAME));
+    assert!(names.contains(&"grep"));
+
+    let explore_only = SubagentConfig {
+        explore_enabled: false,
+        ..SubagentConfig::default()
+    };
+    let mut tools = core_control_tools(&explore_only);
+    tools.push(test_advertised_tool("grep", PermissionCapability::Search));
+    let specs = request_tool_specs(&tools, SessionMode::Build, &config, &[]);
+    let names = advertised_tool_names(&specs);
+    assert!(names.contains(&DELEGATE_TOOL_NAME));
+    assert!(
+        !names.contains(&EXPLORE_TOOL_NAME),
+        "explore must not be advertised when explore_enabled=false: {names:?}"
     );
 }
 
