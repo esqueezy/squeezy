@@ -817,72 +817,42 @@ pub(crate) fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
 fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
     let attachment_height = attachment_panel_height(app);
-    if let Some(pending) = app.pending_approval.as_ref() {
+    let approval_prompt = app.pending_approval.as_ref().map(|pending| {
         // When an approval is pending, reserve a dedicated panel large
         // enough to show every metadata line of `format_approval_prompt`.
         let prompt = format_approval_prompt(&pending.request);
         let line_count = prompt.matches('\n').count() as u16 + 1;
         let approval_height = line_count.saturating_add(2).clamp(6, 18);
-        if attachment_height > 0 {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(3),
-                    Constraint::Length(approval_height),
-                    Constraint::Length(attachment_height),
-                    Constraint::Length(3),
-                    Constraint::Length(2),
-                ])
-                .split(area);
-            render_transcript(frame, chunks[0], app);
-            render_approval(frame, chunks[1], &prompt);
-            render_attachments(frame, chunks[2], app);
-            render_input(frame, chunks[3], app);
-            render_status(frame, chunks[4], app);
-        } else {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(3),
-                    Constraint::Length(approval_height),
-                    Constraint::Length(3),
-                    Constraint::Length(2),
-                ])
-                .split(area);
-            render_transcript(frame, chunks[0], app);
-            render_approval(frame, chunks[1], &prompt);
-            render_input(frame, chunks[2], app);
-            render_status(frame, chunks[3], app);
-        }
-    } else {
-        if attachment_height > 0 {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(5),
-                    Constraint::Length(attachment_height),
-                    Constraint::Length(3),
-                    Constraint::Length(2),
-                ])
-                .split(area);
-            render_transcript(frame, chunks[0], app);
-            render_attachments(frame, chunks[1], app);
-            render_input(frame, chunks[2], app);
-            render_status(frame, chunks[3], app);
-        } else {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(5),
-                    Constraint::Length(3),
-                    Constraint::Length(2),
-                ])
-                .split(area);
-            render_transcript(frame, chunks[0], app);
-            render_input(frame, chunks[1], app);
-            render_status(frame, chunks[2], app);
-        }
+        (prompt, approval_height)
+    });
+    let transcript_min = if approval_prompt.is_some() { 3 } else { 5 };
+    let mut constraints = vec![Constraint::Min(transcript_min)];
+    if let Some((_, approval_height)) = &approval_prompt {
+        constraints.push(Constraint::Length(*approval_height));
     }
+    if attachment_height > 0 {
+        constraints.push(Constraint::Length(attachment_height));
+    }
+    constraints.push(Constraint::Length(3));
+    constraints.push(Constraint::Length(2));
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    let mut index = 0;
+    render_transcript(frame, chunks[index], app);
+    index += 1;
+    if let Some((prompt, _)) = approval_prompt.as_ref() {
+        render_approval(frame, chunks[index], prompt);
+        index += 1;
+    }
+    if attachment_height > 0 {
+        render_attachments(frame, chunks[index], app);
+        index += 1;
+    }
+    render_input(frame, chunks[index], app);
+    index += 1;
+    render_status(frame, chunks[index], app);
 }
 
 fn render_approval(frame: &mut Frame<'_>, area: Rect, prompt: &str) {
