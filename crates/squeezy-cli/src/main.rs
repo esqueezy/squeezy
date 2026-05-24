@@ -784,7 +784,8 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
                     })?
                 );
             } else {
-                println!("session_id={}", report.session_id);
+                let id = report.session_id.as_str();
+                println!("id={id}");
                 println!("turns={}", report.turns);
                 println!("events_replayed={}", report.events_replayed);
                 println!("requests={}", report.request_count);
