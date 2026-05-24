@@ -1072,16 +1072,58 @@ fn submitted_prompt_surface_extends_to_render_width() {
 
     let lines =
         format_message_entry_with_width(&item, false, false, MessageOutcome::Normal, Some(40));
-    let rendered = lines[0]
+    let rendered = lines[1]
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
+    assert_eq!(lines.len(), PROMPT_MIN_HEIGHT as usize);
+    assert_eq!(
+        lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .chars()
+            .count(),
+        40
+    );
     assert_eq!(rendered.chars().count(), 40);
-    assert_eq!(lines[0].spans[1].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[0].spans[2].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[0].spans[3].style.bg, Some(PROMPT_BG));
+    assert_eq!(lines[1].spans[1].style.bg, Some(PROMPT_BG));
+    assert_eq!(lines[1].spans[2].style.bg, Some(PROMPT_BG));
+    assert_eq!(lines[1].spans[3].style.bg, Some(PROMPT_BG));
+    assert_eq!(lines[2].spans[1].style.bg, Some(PROMPT_BG));
+}
+
+#[test]
+fn submitted_prompt_preserves_empty_lines() {
+    let item = TranscriptItem::user("one\n\nthree\n");
+
+    let lines =
+        format_message_entry_with_width(&item, false, false, MessageOutcome::Normal, Some(30));
+    let rendered = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(lines.len(), 6);
+    assert!(rendered[1].contains("one"), "{rendered:?}");
+    assert_eq!(rendered[2].trim(), "");
+    assert!(rendered[3].contains("three"), "{rendered:?}");
+    assert_eq!(rendered[4].trim(), "");
+    assert!(lines.iter().all(|line| {
+        line.spans
+            .iter()
+            .filter(|span| !span.content.is_empty())
+            .skip(1)
+            .all(|span| span.style.bg == Some(PROMPT_BG))
+    }));
 }
 
 #[test]
@@ -1154,10 +1196,10 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         app.tool_output_verbosity,
         message_outcome(&app.transcript, 0),
     );
-    assert_eq!(user_lines[0].spans[1].style.bg, Some(PROMPT_BG));
-    assert_eq!(user_lines[0].spans[2].content.as_ref(), "hi");
-    assert_eq!(user_lines[0].spans[2].style.fg, Some(Color::White));
-    assert_eq!(user_lines[0].spans[2].style.bg, Some(PROMPT_BG));
+    assert_eq!(user_lines[1].spans[1].style.bg, Some(PROMPT_BG));
+    assert_eq!(user_lines[1].spans[2].content.as_ref(), "hi");
+    assert_eq!(user_lines[1].spans[2].style.fg, Some(Color::White));
+    assert_eq!(user_lines[1].spans[2].style.bg, Some(PROMPT_BG));
 
     let log_lines = format_transcript_entry(
         &app.transcript[1],
@@ -1174,15 +1216,15 @@ fn user_prompt_text_is_highlighted_in_transcript() {
     let item = TranscriptItem::user("find getFoo");
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
-    let text = lines[0]
+    let text = lines[1]
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(lines[0].spans[2].content.as_ref(), "find getFoo");
-    assert_eq!(lines[0].spans[2].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[0].spans[2].style.fg, Some(Color::White));
+    assert_eq!(lines[1].spans[2].content.as_ref(), "find getFoo");
+    assert_eq!(lines[1].spans[2].style.bg, Some(PROMPT_BG));
+    assert_eq!(lines[1].spans[2].style.fg, Some(Color::White));
     assert!(!text.contains("◐"), "{text}");
 }
 

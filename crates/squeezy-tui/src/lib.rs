@@ -2469,9 +2469,16 @@ fn transcript_visual_line_count(app: &TuiApp, width: u16) -> u16 {
 
 #[cfg(test)]
 fn format_transcript_item(item: &TranscriptItem) -> Line<'_> {
-    format_message_entry(item, false, false, MessageOutcome::Normal)
+    let lines = format_message_entry(item, false, false, MessageOutcome::Normal);
+    let fallback = lines.first().cloned();
+    lines
         .into_iter()
-        .next()
+        .find(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref() == item.content.as_str())
+        })
+        .or(fallback)
         .unwrap_or_else(|| Line::from(""))
 }
 
@@ -2594,36 +2601,48 @@ fn format_user_prompt_entry(
     selected: bool,
     width: Option<u16>,
 ) -> Vec<Line<'static>> {
-    let mut content = item.content.lines().collect::<Vec<_>>();
+    let mut content = item.content.split('\n').collect::<Vec<_>>();
     if content.is_empty() {
         content.push("");
     }
-    content
-        .into_iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let marker = if selected && index == 0 { "> " } else { "  " };
-            let prompt_prefix = "    ";
-            let text_width = prompt_prefix.chars().count() + line.chars().count();
-            let surface_width = width
-                .map(|width| (width as usize).saturating_sub(marker.chars().count()))
-                .unwrap_or(0);
-            let padding = if surface_width > 0 {
-                " ".repeat(surface_width.saturating_sub(text_width))
-            } else {
-                String::new()
-            };
-            Line::from(vec![
-                Span::raw(marker),
-                Span::styled(prompt_prefix, Style::default().bg(PROMPT_BG)),
-                Span::styled(
-                    line.to_string(),
-                    Style::default().fg(Color::White).bg(PROMPT_BG),
-                ),
-                Span::styled(padding, Style::default().bg(PROMPT_BG)),
-            ])
-        })
-        .collect()
+    let mut lines = Vec::with_capacity(content.len() + 2);
+    lines.push(user_prompt_blank_line(width));
+    lines.extend(content.into_iter().enumerate().map(|(index, line)| {
+        let marker = if selected && index == 0 { "> " } else { "  " };
+        user_prompt_content_line(marker, line, width)
+    }));
+    lines.push(user_prompt_blank_line(width));
+    lines
+}
+
+fn user_prompt_blank_line(width: Option<u16>) -> Line<'static> {
+    let marker = "  ";
+    let surface_width = user_prompt_surface_width(marker, width).unwrap_or(1);
+    Line::from(vec![
+        Span::raw(marker),
+        Span::styled(" ".repeat(surface_width), Style::default().bg(PROMPT_BG)),
+    ])
+}
+
+fn user_prompt_content_line(marker: &'static str, line: &str, width: Option<u16>) -> Line<'static> {
+    let prompt_prefix = "    ";
+    let text_width = prompt_prefix.chars().count() + line.chars().count();
+    let padding = user_prompt_surface_width(marker, width)
+        .map(|surface_width| " ".repeat(surface_width.saturating_sub(text_width)))
+        .unwrap_or_default();
+    Line::from(vec![
+        Span::raw(marker),
+        Span::styled(prompt_prefix, Style::default().bg(PROMPT_BG)),
+        Span::styled(
+            line.to_string(),
+            Style::default().fg(Color::White).bg(PROMPT_BG),
+        ),
+        Span::styled(padding, Style::default().bg(PROMPT_BG)),
+    ])
+}
+
+fn user_prompt_surface_width(marker: &str, width: Option<u16>) -> Option<usize> {
+    width.map(|width| (width as usize).saturating_sub(marker.chars().count()))
 }
 
 fn format_tool_result_entry(
