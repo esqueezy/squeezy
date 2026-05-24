@@ -846,6 +846,10 @@ impl AppConfig {
             toml_string(self.tui.transcript_default.as_str())
         ));
         output.push_str(&format!(
+            "alternate_screen = {}\n",
+            toml_string(self.tui.alternate_screen.as_str())
+        ));
+        output.push_str(&format!(
             "show_reasoning_usage = {}\n\n",
             self.tui.show_reasoning_usage
         ));
@@ -3814,12 +3818,29 @@ impl TranscriptDefault {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiAlternateScreen {
+    Never,
+    Always,
+}
+
+impl TuiAlternateScreen {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Always => "always",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiConfig {
     pub tick_rate_ms: u64,
     pub status_verbosity: StatusVerbosity,
     pub response_verbosity: ResponseVerbosity,
     pub tool_output_verbosity: ToolOutputVerbosity,
     pub transcript_default: TranscriptDefault,
+    pub alternate_screen: TuiAlternateScreen,
     pub show_reasoning_usage: bool,
 }
 
@@ -3839,6 +3860,9 @@ impl TuiConfig {
             transcript_default: settings
                 .transcript_default
                 .unwrap_or(TranscriptDefault::Compact),
+            alternate_screen: settings
+                .alternate_screen
+                .unwrap_or(TuiAlternateScreen::Never),
             show_reasoning_usage: settings.show_reasoning_usage.unwrap_or(true),
         }
     }
@@ -3857,6 +3881,7 @@ pub struct TuiSettings {
     pub response_verbosity: Option<ResponseVerbosity>,
     pub tool_output_verbosity: Option<ToolOutputVerbosity>,
     pub transcript_default: Option<TranscriptDefault>,
+    pub alternate_screen: Option<TuiAlternateScreen>,
     pub show_reasoning_usage: Option<bool>,
 }
 
@@ -3870,6 +3895,7 @@ impl TuiSettings {
                 "response_verbosity",
                 "tool_output_verbosity",
                 "transcript_default",
+                "alternate_screen",
                 "show_reasoning_usage",
             ],
             source,
@@ -3901,6 +3927,12 @@ impl TuiSettings {
                 source,
                 &field(path, "transcript_default"),
             )?,
+            alternate_screen: tui_alternate_screen_value(
+                table,
+                "alternate_screen",
+                source,
+                &field(path, "alternate_screen"),
+            )?,
             show_reasoning_usage: bool_value(
                 table,
                 "show_reasoning_usage",
@@ -3916,6 +3948,7 @@ impl TuiSettings {
         replace_if_some(&mut self.response_verbosity, next.response_verbosity);
         replace_if_some(&mut self.tool_output_verbosity, next.tool_output_verbosity);
         replace_if_some(&mut self.transcript_default, next.transcript_default);
+        replace_if_some(&mut self.alternate_screen, next.alternate_screen);
         replace_if_some(&mut self.show_reasoning_usage, next.show_reasoning_usage);
     }
 }
@@ -4166,6 +4199,7 @@ pub fn user_settings_template() -> &'static str {
 # response_verbosity = "normal"  # concise | normal | verbose
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
+# alternate_screen = "never"    # never | always
 # show_reasoning_usage = true
 
 # [mcp.servers.docs]
@@ -4262,6 +4296,7 @@ pub fn project_settings_template() -> &'static str {
 # response_verbosity = "normal"  # concise | normal | verbose
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
+# alternate_screen = "never"    # never | always
 # show_reasoning_usage = true
 
 # [mcp.servers.docs]
@@ -5017,6 +5052,24 @@ fn transcript_default_value(
         "expanded" => Ok(Some(TranscriptDefault::Expanded)),
         _ => Err(SqueezyError::Config(format!(
             "{source}: {path}: invalid transcript default {value:?}; expected compact or expanded"
+        ))),
+    }
+}
+
+fn tui_alternate_screen_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<TuiAlternateScreen>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "never" => Ok(Some(TuiAlternateScreen::Never)),
+        "always" => Ok(Some(TuiAlternateScreen::Always)),
+        _ => Err(SqueezyError::Config(format!(
+            "{source}: {path}: invalid TUI alternate screen {value:?}; expected never or always"
         ))),
     }
 }

@@ -10,7 +10,7 @@ use squeezy_core::{
     AppConfig, CostSnapshot, PermissionCapability, PermissionMode, PermissionPolicy,
     PermissionRequest, PermissionRisk, PermissionScope, SessionMode, StatusVerbosity,
     TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus, TaskVerificationState,
-    ToolOutputVerbosity, TuiConfig, TurnId, TurnMetrics,
+    ToolOutputVerbosity, TuiAlternateScreen, TuiConfig, TurnId, TurnMetrics,
 };
 use squeezy_llm::UnavailableProvider;
 use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus};
@@ -1052,6 +1052,53 @@ fn startup_card_scrolls_with_transcript_history() {
 }
 
 #[test]
+fn inline_mode_is_default_terminal_model() {
+    let config = test_config(SessionMode::Build);
+
+    assert_eq!(config.tui.alternate_screen, TuiAlternateScreen::Never);
+    assert_eq!(
+        TerminalMode::from(config.tui.alternate_screen),
+        TerminalMode::Inline
+    );
+    assert_eq!(
+        TerminalMode::from(TuiAlternateScreen::Always),
+        TerminalMode::AlternateScreen
+    );
+}
+
+#[test]
+fn inline_history_flush_contains_startup_and_new_transcript() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("find getFoo"));
+    app.push_transcript_item(TranscriptItem::assistant("No definition found."));
+
+    let first = inline_history_lines_for_flush(&app, 100, true, 0);
+    let rendered = lines_to_plain_text(&first);
+
+    assert!(rendered.contains(">_ Squeezy v0.1.0"), "{rendered}");
+    assert!(rendered.contains("> find getFoo"), "{rendered}");
+    assert!(rendered.contains("● No definition found."), "{rendered}");
+
+    let next = inline_history_lines_for_flush(&app, 100, false, app.transcript.len());
+    assert!(next.is_empty());
+}
+
+#[test]
+fn inline_live_viewport_excludes_flushed_history() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("old prompt"));
+    app.push_transcript_item(TranscriptItem::assistant("old answer"));
+    app.input = "new prompt".to_string();
+
+    let output = render_inline_to_string(&app, 100, 12);
+
+    assert!(!output.contains(">_ Squeezy v"), "{output}");
+    assert!(!output.contains("old prompt"), "{output}");
+    assert!(!output.contains("old answer"), "{output}");
+    assert!(output.contains("new prompt┃"), "{output}");
+}
+
+#[test]
 fn exit_hint_points_to_session_resume_command() {
     assert_eq!(
         exit_hint(Some("session-123")).as_deref(),
@@ -1243,18 +1290,20 @@ fn working_shimmer_sweeps_left_to_right() {
     let left = shimmer_word_spans("Working", 1_200);
     let right = shimmer_word_spans("Working", 2_200);
     let repeated_left = shimmer_word_spans("Working", 4_600);
-    let left_backgrounds = left.iter().map(|span| span.style.bg).collect::<Vec<_>>();
-    let right_backgrounds = right.iter().map(|span| span.style.bg).collect::<Vec<_>>();
+    let left_foregrounds = left.iter().map(|span| span.style.fg).collect::<Vec<_>>();
+    let right_foregrounds = right.iter().map(|span| span.style.fg).collect::<Vec<_>>();
 
     assert!(
-        left_backgrounds.contains(&Some(WORKING_HIGHLIGHT_BG)),
-        "{left_backgrounds:?}"
+        left_foregrounds.contains(&Some(WORKING_SHIMMER_HIGHLIGHT)),
+        "{left_foregrounds:?}"
     );
     assert!(
-        right_backgrounds.contains(&Some(WORKING_HIGHLIGHT_BG)),
-        "{right_backgrounds:?}"
+        right_foregrounds.contains(&Some(WORKING_SHIMMER_HIGHLIGHT)),
+        "{right_foregrounds:?}"
     );
-    assert_ne!(left_backgrounds, right_backgrounds);
+    assert!(left.iter().all(|span| span.style.bg.is_none()));
+    assert!(right.iter().all(|span| span.style.bg.is_none()));
+    assert_ne!(left_foregrounds, right_foregrounds);
     assert_eq!(
         left.iter().map(|span| span.style).collect::<Vec<_>>(),
         repeated_left
@@ -1281,11 +1330,15 @@ fn working_shimmer_changes_rendered_cells_across_ticks() {
     let second = rendered_word_styles(&app, "Working");
 
     assert!(
-        first.iter().any(|(_, bg, _)| *bg == WORKING_HIGHLIGHT_BG),
+        first
+            .iter()
+            .any(|(fg, bg, _)| *fg != AMBER && *bg == Color::Reset),
         "{first:?}"
     );
     assert!(
-        second.iter().any(|(_, bg, _)| *bg == WORKING_HIGHLIGHT_BG),
+        second
+            .iter()
+            .any(|(fg, bg, _)| *fg != AMBER && *bg == Color::Reset),
         "{second:?}"
     );
     assert_ne!(
@@ -2225,6 +2278,34 @@ fn render_to_string(app: &TuiApp, width: u16, height: u16) -> String {
     for y in 0..height {
         for x in 0..width {
             output.push_str(buffer[(x, y)].symbol());
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn render_inline_to_string(app: &TuiApp, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_inline(frame, app))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let mut output = String::new();
+    for y in 0..height {
+        for x in 0..width {
+            output.push_str(buffer[(x, y)].symbol());
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn lines_to_plain_text(lines: &[Line<'_>]) -> String {
+    let mut output = String::new();
+    for line in lines {
+        for span in &line.spans {
+            output.push_str(&span.content);
         }
         output.push('\n');
     }

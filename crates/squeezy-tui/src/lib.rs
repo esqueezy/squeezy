@@ -20,12 +20,13 @@ use crossterm::{
     },
 };
 use ratatui::{
-    Frame, Terminal,
+    Frame, Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::{Paragraph, Widget, Wrap},
 };
 use squeezy_agent::{
     Agent, AgentEvent, JobEvent, JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS,
@@ -35,6 +36,7 @@ use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
     PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode, SqueezyError, StatusVerbosity,
     TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem,
+    TuiAlternateScreen,
 };
 use squeezy_llm::{LlmProvider, RequestTokenEstimate};
 use squeezy_skills::{HelpStatus, SqueezyHelp};
@@ -57,10 +59,10 @@ const MODE_BUILD_GREEN: Color = Color::Rgb(187, 247, 208);
 const ERROR_RED: Color = Color::Rgb(248, 113, 113);
 const QUIET: Color = Color::DarkGray;
 const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
-const WORKING_HIGHLIGHT_BG: Color = Color::Rgb(254, 240, 138);
-const WORKING_HIGHLIGHT_FG: Color = Color::Rgb(17, 24, 39);
+const WORKING_SHIMMER_HIGHLIGHT: Color = Color::Rgb(255, 251, 235);
 const PROMPT_MIN_HEIGHT: u16 = 3;
 const PROMPT_MAX_HEIGHT: u16 = 8;
+const INLINE_VIEWPORT_HEIGHT: u16 = 18;
 const SLASH_MENU_MAX_ITEMS: usize = 5;
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 
@@ -262,7 +264,7 @@ async fn run_inner(
     resume_session_id: Option<String>,
     startup: StartupProfile,
 ) -> Result<()> {
-    let mut terminal = TerminalGuard::enter()?;
+    let mut terminal = TerminalGuard::enter(config.tui.alternate_screen)?;
     let (mut agent, initial_transcript) = if let Some(session_id) = resume_session_id {
         Agent::resume(config.clone(), provider, &session_id)?
     } else {
@@ -294,7 +296,7 @@ async fn run_inner(
 
     loop {
         app.animation_tick = app.animation_tick.wrapping_add(1);
-        terminal.draw(|frame| render(frame, &app))?;
+        terminal.draw_app(&app)?;
 
         drain_job_events(&mut app);
         drain_agent_events(&mut app).await;
@@ -2209,6 +2211,78 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let _ = chunks[index];
 }
 
+fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
+    let area = frame.area();
+    let input_height = input_panel_height(app, area.width);
+    let attachment_height = attachment_panel_height(app);
+    let approval_height = approval_menu_height(app);
+    let task_height = should_show_task_panel(app).then_some(task_panel_height(app));
+    let status_height = 2;
+    let live_lines = pending_assistant_lines(app);
+    let live_visual_height = visual_line_count(&live_lines, area.width);
+    let live_gap = if live_visual_height > 0 { 1 } else { 0 };
+    let reserved_height = task_height
+        .unwrap_or(0)
+        .saturating_add(attachment_height)
+        .saturating_add(input_height)
+        .saturating_add(approval_height)
+        .saturating_add(status_height)
+        .saturating_add(live_gap);
+    let live_height = live_visual_height.min(area.height.saturating_sub(reserved_height));
+
+    let mut constraints = Vec::new();
+    if live_height > 0 {
+        constraints.push(Constraint::Length(live_height));
+    }
+    if live_gap > 0 && live_height > 0 {
+        constraints.push(Constraint::Length(live_gap));
+    }
+    if let Some(h) = task_height {
+        constraints.push(Constraint::Length(h));
+    }
+    if attachment_height > 0 {
+        constraints.push(Constraint::Length(attachment_height));
+    }
+    constraints.push(Constraint::Length(input_height));
+    if approval_height > 0 {
+        constraints.push(Constraint::Length(approval_height));
+    }
+    constraints.push(Constraint::Length(status_height));
+    constraints.push(Constraint::Min(0));
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    let mut index = 0;
+    if live_height > 0 {
+        let scroll = transcript_scroll_offset(live_lines.len(), live_height, 0);
+        let paragraph = Paragraph::new(live_lines)
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, chunks[index]);
+        index += 1;
+    }
+    if live_gap > 0 && live_height > 0 {
+        index += 1;
+    }
+    if task_height.is_some() {
+        render_task_state(frame, chunks[index], app);
+        index += 1;
+    }
+    if attachment_height > 0 {
+        render_attachments(frame, chunks[index], app);
+        index += 1;
+    }
+    render_input(frame, chunks[index], app);
+    index += 1;
+    if approval_height > 0 {
+        render_approval(frame, chunks[index], app);
+        index += 1;
+    }
+    render_status(frame, chunks[index], app);
+}
+
 fn transcript_prompt_gap_height(app: &TuiApp) -> u16 {
     if app.transcript.is_empty() && app.pending_assistant.is_empty() {
         0
@@ -2302,14 +2376,9 @@ fn shimmer_word_spans(text: &'static str, elapsed_ms: u64) -> Vec<Span<'static>>
             } else {
                 0.0
             };
-            let style = if intensity >= 0.38 {
-                Style::default()
-                    .fg(WORKING_HIGHLIGHT_FG)
-                    .bg(WORKING_HIGHLIGHT_BG)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(blend_color(AMBER, GOLD, intensity * 0.8))
-            };
+            let style = Style::default()
+                .fg(blend_color(AMBER, WORKING_SHIMMER_HIGHLIGHT, intensity))
+                .add_modifier(Modifier::BOLD);
             Span::styled(ch.to_string(), style)
         })
         .collect()
@@ -2489,6 +2558,19 @@ fn transcript_lines_for_render(
     lines
 }
 
+fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
+    if app.pending_assistant.is_empty() {
+        Vec::new()
+    } else {
+        assistant_text_lines(
+            false,
+            turn_coin_span(app),
+            &app.pending_assistant,
+            Style::default(),
+        )
+    }
+}
+
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     let card_width = width.clamp(36, 64) as usize;
     let inner = card_width.saturating_sub(2);
@@ -2587,8 +2669,15 @@ fn transcript_scroll_offset(line_count: usize, area_height: u16, from_bottom: u1
 }
 
 fn transcript_visual_line_count(app: &TuiApp, width: u16, include_startup_card: bool) -> u16 {
+    visual_line_count(
+        &transcript_lines_for_render(app, Some(width), include_startup_card),
+        width,
+    )
+}
+
+fn visual_line_count(lines: &[Line<'_>], width: u16) -> u16 {
     let content_width = width.max(1) as usize;
-    transcript_lines_for_render(app, Some(width), include_startup_card)
+    lines
         .iter()
         .map(|line| {
             let chars = line
@@ -4106,28 +4195,68 @@ fn exit_hint(session_id: Option<&str>) -> Option<String> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalMode {
+    Inline,
+    AlternateScreen,
+}
+
+impl From<TuiAlternateScreen> for TerminalMode {
+    fn from(value: TuiAlternateScreen) -> Self {
+        match value {
+            TuiAlternateScreen::Never => Self::Inline,
+            TuiAlternateScreen::Always => Self::AlternateScreen,
+        }
+    }
+}
+
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    mode: TerminalMode,
     exit_hint: Option<String>,
+    startup_flushed: bool,
+    transcript_flushed_len: usize,
 }
 
 impl TerminalGuard {
-    fn enter() -> Result<Self> {
+    fn enter(alternate_screen: TuiAlternateScreen) -> Result<Self> {
+        let mode = TerminalMode::from(alternate_screen);
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            Clear(ClearType::All),
-            MoveTo(0, 0),
-            EnableBracketedPaste
-        )
+        match mode {
+            TerminalMode::Inline => {
+                execute!(stdout, Print(DISABLE_MOUSE_MODES), EnableBracketedPaste)
+                    .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+            }
+            TerminalMode::AlternateScreen => {
+                execute!(
+                    stdout,
+                    EnterAlternateScreen,
+                    Clear(ClearType::All),
+                    MoveTo(0, 0),
+                    Print(DISABLE_MOUSE_MODES),
+                    EnableBracketedPaste
+                )
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+            }
+        }
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = match mode {
+            TerminalMode::Inline => Terminal::with_options(
+                backend,
+                TerminalOptions {
+                    viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+                },
+            ),
+            TerminalMode::AlternateScreen => Terminal::new(backend),
+        }
         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         Ok(Self {
             terminal,
+            mode,
             exit_hint: None,
+            startup_flushed: false,
+            transcript_flushed_len: 0,
         })
     }
 
@@ -4135,13 +4264,45 @@ impl TerminalGuard {
         self.exit_hint = exit_hint;
     }
 
-    fn draw<F>(&mut self, f: F) -> Result<()>
-    where
-        F: FnOnce(&mut Frame<'_>),
-    {
+    fn draw_app(&mut self, app: &TuiApp) -> Result<()> {
+        match self.mode {
+            TerminalMode::Inline => {
+                self.flush_history(app)?;
+                self.terminal.draw(|frame| render_inline(frame, app))
+            }
+            TerminalMode::AlternateScreen => self.terminal.draw(|frame| render(frame, app)),
+        }
+        .map(|_| ())
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))
+    }
+
+    fn flush_history(&mut self, app: &TuiApp) -> Result<()> {
+        if self.mode != TerminalMode::Inline {
+            return Ok(());
+        }
+        let width = self
+            .terminal
+            .size()
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?
+            .width;
+        let lines = inline_history_lines_for_flush(
+            app,
+            width,
+            !self.startup_flushed,
+            self.transcript_flushed_len,
+        );
+        self.startup_flushed = true;
+        self.transcript_flushed_len = app.transcript.len();
+        self.insert_before(lines, width)
+    }
+
+    fn insert_before(&mut self, lines: Vec<Line<'static>>, width: u16) -> Result<()> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let height = visual_line_count(&lines, width);
         self.terminal
-            .draw(f)
-            .map(|_| ())
+            .insert_before(height, |buffer| render_lines_to_buffer(buffer, lines))
             .map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
 }
@@ -4149,19 +4310,60 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            DisableBracketedPaste,
-            Print(DISABLE_MOUSE_MODES),
-            Clear(ClearType::All),
-            MoveTo(0, 0),
-            LeaveAlternateScreen
-        );
+        match self.mode {
+            TerminalMode::Inline => {
+                let _ = execute!(
+                    self.terminal.backend_mut(),
+                    DisableBracketedPaste,
+                    Print(DISABLE_MOUSE_MODES)
+                );
+                let _ = self.terminal.clear();
+            }
+            TerminalMode::AlternateScreen => {
+                let _ = execute!(
+                    self.terminal.backend_mut(),
+                    DisableBracketedPaste,
+                    Print(DISABLE_MOUSE_MODES),
+                    Clear(ClearType::All),
+                    MoveTo(0, 0),
+                    LeaveAlternateScreen
+                );
+            }
+        }
         let _ = self.terminal.show_cursor();
         if let Some(hint) = &self.exit_hint {
             let _ = writeln!(self.terminal.backend_mut(), "{hint}");
         }
     }
+}
+
+fn render_lines_to_buffer(buffer: &mut Buffer, lines: Vec<Line<'static>>) {
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(buffer.area, buffer);
+}
+
+fn inline_history_lines_for_flush(
+    app: &TuiApp,
+    width: u16,
+    include_startup_card: bool,
+    transcript_from: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if include_startup_card {
+        lines.extend(startup_card_lines(app, width));
+        lines.push(Line::from(""));
+    }
+    for (index, item) in app.transcript.iter().enumerate().skip(transcript_from) {
+        lines.extend(format_transcript_entry_with_width(
+            item,
+            false,
+            app.tool_output_verbosity,
+            message_outcome(&app.transcript, index),
+            Some(width),
+        ));
+    }
+    lines
 }
 
 #[cfg(test)]

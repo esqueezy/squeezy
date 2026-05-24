@@ -1063,6 +1063,7 @@ status_verbosity = "verbose"
 response_verbosity = "concise"
 tool_output_verbosity = "normal"
 transcript_default = "expanded"
+alternate_screen = "always"
 show_reasoning_usage = false
 
 [mcp.servers.docs]
@@ -1119,6 +1120,7 @@ reason = "docs lookups are safe"
         ToolOutputVerbosity::Normal
     );
     assert_eq!(config.tui.transcript_default, TranscriptDefault::Expanded);
+    assert_eq!(config.tui.alternate_screen, TuiAlternateScreen::Always);
     assert!(!config.tui.show_reasoning_usage);
     assert_eq!(config.mcp_servers["docs"].transport, McpTransport::Http);
     assert_eq!(
@@ -1671,6 +1673,7 @@ url = "https://docs.example/mcp"
     assert!(inspect.contains("response_verbosity = \"normal\""));
     assert!(inspect.contains("tool_output_verbosity = \"compact\""));
     assert!(inspect.contains("transcript_default = \"compact\""));
+    assert!(inspect.contains("alternate_screen = \"never\""));
     assert!(inspect.contains("show_reasoning_usage = true"));
     assert!(inspect.contains("transport = \"http\""));
     assert!(!inspect.contains("Balanced"));
