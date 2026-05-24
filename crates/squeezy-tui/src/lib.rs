@@ -10,8 +10,7 @@ use std::{
 use crossterm::{
     cursor::MoveTo,
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
     },
     execute,
     style::Print,
@@ -58,6 +57,8 @@ const MODE_BUILD_GREEN: Color = Color::Rgb(187, 247, 208);
 const ERROR_RED: Color = Color::Rgb(248, 113, 113);
 const QUIET: Color = Color::DarkGray;
 const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
+const WORKING_HIGHLIGHT_BG: Color = Color::Rgb(254, 240, 138);
+const WORKING_HIGHLIGHT_FG: Color = Color::Rgb(17, 24, 39);
 const PROMPT_MIN_HEIGHT: u16 = 3;
 const PROMPT_MAX_HEIGHT: u16 = 8;
 const SLASH_MENU_MAX_ITEMS: usize = 5;
@@ -522,29 +523,11 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
 
     match event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))? {
         Event::Key(key) => handle_key(app, agent, key).await,
-        Event::Mouse(mouse) => {
-            handle_mouse(app, mouse);
-            Ok(false)
-        }
         Event::Paste(text) => {
             handle_paste(app, agent, text).await?;
             Ok(false)
         }
         _ => Ok(false),
-    }
-}
-
-fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent) {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            app.exit_armed = false;
-            scroll_transcript_up(app, 4);
-        }
-        MouseEventKind::ScrollDown => {
-            app.exit_armed = false;
-            scroll_transcript_down(app, 4);
-        }
-        _ => {}
     }
 }
 
@@ -2319,11 +2302,15 @@ fn shimmer_word_spans(text: &'static str, elapsed_ms: u64) -> Vec<Span<'static>>
             } else {
                 0.0
             };
-            let color = blend_color(AMBER, GOLD, intensity * 0.9);
-            Span::styled(
-                ch.to_string(),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )
+            let style = if intensity >= 0.38 {
+                Style::default()
+                    .fg(WORKING_HIGHLIGHT_FG)
+                    .bg(WORKING_HIGHLIGHT_BG)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(blend_color(AMBER, GOLD, intensity * 0.8))
+            };
+            Span::styled(ch.to_string(), style)
         })
         .collect()
 }
@@ -4133,7 +4120,6 @@ impl TerminalGuard {
             EnterAlternateScreen,
             Clear(ClearType::All),
             MoveTo(0, 0),
-            EnableMouseCapture,
             EnableBracketedPaste
         )
         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
@@ -4166,7 +4152,6 @@ impl Drop for TerminalGuard {
         let _ = execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
-            DisableMouseCapture,
             Print(DISABLE_MOUSE_MODES),
             Clear(ClearType::All),
             MoveTo(0, 0),

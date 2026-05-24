@@ -1243,17 +1243,54 @@ fn working_shimmer_sweeps_left_to_right() {
     let left = shimmer_word_spans("Working", 1_200);
     let right = shimmer_word_spans("Working", 2_200);
     let repeated_left = shimmer_word_spans("Working", 4_600);
+    let left_backgrounds = left.iter().map(|span| span.style.bg).collect::<Vec<_>>();
+    let right_backgrounds = right.iter().map(|span| span.style.bg).collect::<Vec<_>>();
 
-    assert_ne!(left[0].style.fg, Some(AMBER));
-    assert_eq!(left.last().expect("last").style.fg, Some(AMBER));
-    assert_eq!(right[0].style.fg, Some(AMBER));
-    assert_ne!(right.last().expect("last").style.fg, Some(AMBER));
+    assert!(
+        left_backgrounds.contains(&Some(WORKING_HIGHLIGHT_BG)),
+        "{left_backgrounds:?}"
+    );
+    assert!(
+        right_backgrounds.contains(&Some(WORKING_HIGHLIGHT_BG)),
+        "{right_backgrounds:?}"
+    );
+    assert_ne!(left_backgrounds, right_backgrounds);
     assert_eq!(
         left.iter().map(|span| span.style).collect::<Vec<_>>(),
         repeated_left
             .iter()
             .map(|span| span.style)
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn working_shimmer_changes_rendered_cells_across_ticks() {
+    let mut app = test_app(SessionMode::Build);
+    app.task_state = Some(TaskStateSnapshot {
+        task: "build".to_string(),
+        status: TaskStateStatus::Running,
+        ..TaskStateSnapshot::default()
+    });
+    app.turn_visual = TurnVisualState::Running;
+    app.animation_tick_rate = Duration::from_millis(100);
+
+    app.animation_tick = 12;
+    let first = rendered_word_styles(&app, "Working");
+    app.animation_tick = 22;
+    let second = rendered_word_styles(&app, "Working");
+
+    assert!(
+        first.iter().any(|(_, bg, _)| *bg == WORKING_HIGHLIGHT_BG),
+        "{first:?}"
+    );
+    assert!(
+        second.iter().any(|(_, bg, _)| *bg == WORKING_HIGHLIGHT_BG),
+        "{second:?}"
+    );
+    assert_ne!(
+        first, second,
+        "the rendered Working cells must animate between repaint ticks"
     );
 }
 
@@ -1861,42 +1898,6 @@ async fn transcript_navigation_keys_update_scroll_state() {
 }
 
 #[test]
-fn mouse_wheel_scrolls_transcript_not_prompt_history() {
-    let mut app = test_app(SessionMode::Build);
-    app.input_history.push("previous prompt".to_string());
-    app.input.clear();
-
-    handle_mouse(
-        &mut app,
-        MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 10,
-            row: 5,
-            modifiers: KeyModifiers::NONE,
-        },
-    );
-
-    assert_eq!(app.transcript_scroll_from_bottom, 4);
-    assert!(
-        app.input.is_empty(),
-        "mouse wheel must not recall prompt history"
-    );
-
-    handle_mouse(
-        &mut app,
-        MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 10,
-            row: 5,
-            modifiers: KeyModifiers::NONE,
-        },
-    );
-
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
-    assert!(app.input.is_empty());
-}
-
-#[test]
 fn transcript_scroll_offset_defaults_to_bottom() {
     assert_eq!(transcript_scroll_offset(20, 10, 0), 10);
     assert_eq!(transcript_scroll_offset(20, 10, 8), 2);
@@ -2228,6 +2229,31 @@ fn render_to_string(app: &TuiApp, width: u16, height: u16) -> String {
         output.push('\n');
     }
     output
+}
+
+fn rendered_word_styles(app: &TuiApp, word: &str) -> Vec<(Color, Color, Modifier)> {
+    let width = 120;
+    let height = 18;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| render(frame, app)).expect("draw");
+    let buffer = terminal.backend().buffer();
+    for y in 0..height {
+        let mut line = String::new();
+        for x in 0..width {
+            line.push_str(buffer[(x, y)].symbol());
+        }
+        if let Some(start) = line.find(word) {
+            let start = start as u16;
+            return (0..word.len() as u16)
+                .map(|offset| {
+                    let cell = &buffer[(start + offset, y)];
+                    (cell.fg, cell.bg, cell.modifier)
+                })
+                .collect();
+        }
+    }
+    panic!("word {word:?} not rendered");
 }
 
 struct NoopClipboard;
