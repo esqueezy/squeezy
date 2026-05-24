@@ -4943,6 +4943,29 @@ fn shell_sandbox_plan_network_posture_denied_non_network() {
 }
 
 #[test]
+#[cfg(unix)]
+fn shell_best_effort_falls_back_when_sandbox_dies_without_output() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let plan = fake_sandbox_plan("macos-sandbox-exec", false);
+    let run = ShellRunOutcome {
+        exit_status: Some(std::process::ExitStatus::from_raw(6)),
+        timed_out: false,
+        stdout_bytes: Vec::new(),
+        stdout_truncated: false,
+        stderr_bytes: Vec::new(),
+        stderr_truncated: false,
+        preserved_env: Vec::new(),
+    };
+
+    let reason =
+        shell_sandbox_direct_fallback_reason(&plan, &run).expect("best effort fallback reason");
+
+    assert!(reason.contains("signal 6"), "{reason}");
+    assert!(reason.contains("best_effort"), "{reason}");
+}
+
+#[test]
 fn shell_sandbox_runtime_unavailable_detects_macos_exit_71_with_sandbox_apply() {
     let plan = fake_sandbox_plan("macos-sandbox-exec", true);
 

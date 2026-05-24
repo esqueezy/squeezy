@@ -2109,10 +2109,11 @@ fn format_approval_menu_lines(
 
 fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
-    let header_height: u16 = if area.height >= 16 { 7 } else { 0 };
+    let include_startup_card = area.height >= 16;
     let input_height = input_panel_height(app, area.width);
     let attachment_height = attachment_panel_height(app);
     let approval_height = approval_menu_height(app);
+    let requested_transcript_gap_height = transcript_prompt_gap_height(app);
     let task_height = if should_show_task_panel(app) {
         let h = if approval_height > 0 {
             task_panel_height(app).min(5)
@@ -2123,21 +2124,31 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     } else {
         None
     };
-    let reserved_height = header_height
-        .saturating_add(task_height.unwrap_or(0))
+    let reserved_height = task_height
+        .unwrap_or(0)
         .saturating_add(approval_height)
         .saturating_add(attachment_height)
         .saturating_add(input_height)
         .saturating_add(2);
-    let available_transcript_height = area.height.saturating_sub(reserved_height);
-    let transcript_height =
-        transcript_visual_line_count(app, area.width).min(available_transcript_height);
+    let transcript_visual_height =
+        transcript_visual_line_count(app, area.width, include_startup_card);
+    let available_without_gap = area.height.saturating_sub(reserved_height);
+    let transcript_prompt_gap_height = if requested_transcript_gap_height > 0
+        && transcript_visual_height < available_without_gap
+    {
+        requested_transcript_gap_height
+    } else {
+        0
+    };
+    let available_transcript_height =
+        available_without_gap.saturating_sub(transcript_prompt_gap_height);
+    let transcript_height = transcript_visual_height.min(available_transcript_height);
     let mut constraints = Vec::new();
-    if header_height > 0 {
-        constraints.push(Constraint::Length(header_height));
-    }
     if transcript_height > 0 {
         constraints.push(Constraint::Length(transcript_height));
+    }
+    if transcript_prompt_gap_height > 0 {
+        constraints.push(Constraint::Length(transcript_prompt_gap_height));
     }
     if let Some(h) = task_height {
         constraints.push(Constraint::Length(h));
@@ -2156,12 +2167,11 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         .constraints(constraints)
         .split(area);
     let mut index = 0;
-    if header_height > 0 {
-        render_startup_header(frame, chunks[index], app);
+    if transcript_height > 0 {
+        render_transcript(frame, chunks[index], app, include_startup_card);
         index += 1;
     }
-    if transcript_height > 0 {
-        render_transcript(frame, chunks[index], app);
+    if transcript_prompt_gap_height > 0 {
         index += 1;
     }
     if task_height.is_some() {
@@ -2185,9 +2195,12 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let _ = chunks[index];
 }
 
-fn render_startup_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let paragraph = Paragraph::new(startup_card_lines(app, area.width));
-    frame.render_widget(paragraph, area);
+fn transcript_prompt_gap_height(app: &TuiApp) -> u16 {
+    if app.transcript.is_empty() && app.pending_assistant.is_empty() {
+        0
+    } else {
+        1
+    }
 }
 
 fn should_show_task_panel(app: &TuiApp) -> bool {
@@ -2382,8 +2395,8 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .unwrap_or_default()
 }
 
-fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let lines = transcript_lines(app, Some(area.width));
+fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_startup_card: bool) {
+    let lines = transcript_lines_for_render(app, Some(area.width), include_startup_card);
     let scroll =
         transcript_scroll_offset(lines.len(), area.height, app.transcript_scroll_from_bottom);
     let paragraph = Paragraph::new(lines)
@@ -2392,8 +2405,17 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(paragraph, area);
 }
 
-fn transcript_lines(app: &TuiApp, width: Option<u16>) -> Vec<Line<'static>> {
+fn transcript_lines_for_render(
+    app: &TuiApp,
+    width: Option<u16>,
+    include_startup_card: bool,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    if include_startup_card {
+        let card_width = width.unwrap_or(64);
+        lines.extend(startup_card_lines(app, card_width));
+        lines.push(Line::from(""));
+    }
     for (index, item) in app.transcript.iter().enumerate() {
         lines.extend(format_transcript_entry_with_width(
             item,
@@ -2512,9 +2534,9 @@ fn transcript_scroll_offset(line_count: usize, area_height: u16, from_bottom: u1
     max_scroll.saturating_sub(from_bottom as usize) as u16
 }
 
-fn transcript_visual_line_count(app: &TuiApp, width: u16) -> u16 {
+fn transcript_visual_line_count(app: &TuiApp, width: u16, include_startup_card: bool) -> u16 {
     let content_width = width.max(1) as usize;
-    transcript_lines(app, Some(width))
+    transcript_lines_for_render(app, Some(width), include_startup_card)
         .iter()
         .map(|line| {
             let chars = line

@@ -585,6 +585,22 @@ struct ShellSandboxPlan {
     fallback_reason: Option<String>,
 }
 
+struct ShellRunOutcome {
+    exit_status: Option<std::process::ExitStatus>,
+    timed_out: bool,
+    stdout_bytes: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_bytes: Vec<u8>,
+    stderr_truncated: bool,
+    preserved_env: Vec<String>,
+}
+
+enum ShellRunError {
+    Cancelled,
+    SandboxStartDenied(String),
+    Io(std::io::Error),
+}
+
 impl ShellSandboxPlan {
     fn direct(command: &str, mode: ShellSandboxMode, config: &ShellSandboxConfig) -> Self {
         Self::direct_with_fallback(command, mode, config, None)
@@ -4614,7 +4630,7 @@ impl ToolRegistry {
             return shell_policy_denied(call, &analysis, reason);
         }
 
-        let sandbox_plan = match self.prepare_shell_sandbox(&args.command, &analysis) {
+        let mut sandbox_plan = match self.prepare_shell_sandbox(&args.command, &analysis) {
             Ok(plan) => plan,
             Err(reason) => {
                 self.audit_shell(
@@ -4635,57 +4651,12 @@ impl ToolRegistry {
             }
         };
 
-        let mut command = Command::new(&sandbox_plan.program);
-        command
-            .args(&sandbox_plan.args)
-            .current_dir(&workdir)
-            .kill_on_drop(true)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        configure_shell_process_group(&mut command);
-        configure_linux_shell_sandbox(&mut command, &sandbox_plan);
-        let preserved_env = apply_shell_environment_policy(&mut command, &self.shell_sandbox);
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(err) if sandbox_plan.required => {
-                let reason = format!(
-                    "shell sandbox backend {} failed to start: {err}",
-                    sandbox_plan.backend
-                );
-                self.audit_shell(
-                    call,
-                    &args,
-                    &workdir,
-                    &analysis,
-                    sandbox_plan.metadata(),
-                    timeout_ms,
-                    output_cap,
-                    "denied",
-                    Some(&reason),
-                    None,
-                    &[],
-                    &[],
-                );
-                return shell_policy_denied(call, &analysis, reason);
-            }
-            Err(err) => return tool_error(call, err),
-        };
-
-        let remaining_output_bytes = Arc::new(Mutex::new(output_cap));
-        let stdout_task = tokio::spawn(read_limited_pipe(
-            child.stdout.take(),
-            remaining_output_bytes.clone(),
-        ));
-        let stderr_task = tokio::spawn(read_limited_pipe(
-            child.stderr.take(),
-            remaining_output_bytes,
-        ));
-
-        let status = tokio::select! {
-            _ = cancel.cancelled() => {
-                terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
-                stdout_task.abort();
-                stderr_task.abort();
+        let mut run = match self
+            .run_shell_plan(&sandbox_plan, &workdir, timeout_ms, output_cap, &cancel)
+            .await
+        {
+            Ok(run) => run,
+            Err(ShellRunError::Cancelled) => {
                 self.audit_shell(
                     call,
                     &args,
@@ -4702,27 +4673,99 @@ impl ToolRegistry {
                 );
                 return ToolResult::cancelled(call);
             }
-            result = time::timeout(Duration::from_millis(timeout_ms), child.wait()) => result,
-        };
-
-        let timed_out = status.is_err();
-        let exit_status = match status {
-            Ok(Ok(status)) => Some(status),
-            Err(_) => {
-                terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
-                None
+            Err(ShellRunError::SandboxStartDenied(reason)) => {
+                self.audit_shell(
+                    call,
+                    &args,
+                    &workdir,
+                    &analysis,
+                    sandbox_plan.metadata(),
+                    timeout_ms,
+                    output_cap,
+                    "denied",
+                    Some(&reason),
+                    None,
+                    &[],
+                    &[],
+                );
+                return shell_policy_denied(call, &analysis, reason);
             }
-            Ok(Err(err)) => return tool_error(call, err),
+            Err(ShellRunError::Io(err)) => return tool_error(call, err),
         };
+        if let Some(reason) = shell_sandbox_direct_fallback_reason(&sandbox_plan, &run) {
+            let exit_code = run.exit_status.as_ref().and_then(|status| status.code());
+            self.audit_shell(
+                call,
+                &args,
+                &workdir,
+                &analysis,
+                sandbox_plan.metadata(),
+                timeout_ms,
+                output_cap,
+                "fallback",
+                Some(&reason),
+                exit_code,
+                &run.stdout_bytes,
+                &run.stderr_bytes,
+            );
+            sandbox_plan = ShellSandboxPlan::direct_with_fallback(
+                &args.command,
+                self.shell_sandbox.mode,
+                &self.shell_sandbox,
+                Some(reason),
+            );
+            run = match self
+                .run_shell_plan(&sandbox_plan, &workdir, timeout_ms, output_cap, &cancel)
+                .await
+            {
+                Ok(run) => run,
+                Err(ShellRunError::Cancelled) => {
+                    self.audit_shell(
+                        call,
+                        &args,
+                        &workdir,
+                        &analysis,
+                        sandbox_plan.metadata(),
+                        timeout_ms,
+                        output_cap,
+                        "cancelled",
+                        Some("shell command cancelled"),
+                        None,
+                        &[],
+                        &[],
+                    );
+                    return ToolResult::cancelled(call);
+                }
+                Err(ShellRunError::SandboxStartDenied(reason)) => {
+                    self.audit_shell(
+                        call,
+                        &args,
+                        &workdir,
+                        &analysis,
+                        sandbox_plan.metadata(),
+                        timeout_ms,
+                        output_cap,
+                        "denied",
+                        Some(&reason),
+                        None,
+                        &[],
+                        &[],
+                    );
+                    return shell_policy_denied(call, &analysis, reason);
+                }
+                Err(ShellRunError::Io(err)) => return tool_error(call, err),
+            };
+        }
 
-        let (stdout_bytes, stdout_truncated) = match join_limited_pipe(stdout_task).await {
-            Ok(output) => output,
-            Err(err) => return tool_error(call, err),
-        };
-        let (stderr_bytes, stderr_truncated) = match join_limited_pipe(stderr_task).await {
-            Ok(output) => output,
-            Err(err) => return tool_error(call, err),
-        };
+        let ShellRunOutcome {
+            exit_status,
+            timed_out,
+            stdout_bytes,
+            stdout_truncated,
+            stderr_bytes,
+            stderr_truncated,
+            preserved_env,
+        } = run;
 
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
         let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
@@ -4857,6 +4900,83 @@ impl ToolRegistry {
         let mut shaped_result = make_result(call, status, content, cost, None);
         shaped_result.receipt.output_sha256 = raw_output_sha256;
         shaped_result.with_spill_model_output(raw_output)
+    }
+
+    async fn run_shell_plan(
+        &self,
+        sandbox_plan: &ShellSandboxPlan,
+        workdir: &Path,
+        timeout_ms: u64,
+        output_cap: usize,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<ShellRunOutcome, ShellRunError> {
+        let mut command = Command::new(&sandbox_plan.program);
+        command
+            .args(&sandbox_plan.args)
+            .current_dir(workdir)
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_shell_process_group(&mut command);
+        configure_linux_shell_sandbox(&mut command, sandbox_plan);
+        let preserved_env = apply_shell_environment_policy(&mut command, &self.shell_sandbox);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) if sandbox_plan.required => {
+                return Err(ShellRunError::SandboxStartDenied(format!(
+                    "shell sandbox backend {} failed to start: {err}",
+                    sandbox_plan.backend
+                )));
+            }
+            Err(err) => return Err(ShellRunError::Io(err)),
+        };
+
+        let remaining_output_bytes = Arc::new(Mutex::new(output_cap));
+        let stdout_task = tokio::spawn(read_limited_pipe(
+            child.stdout.take(),
+            remaining_output_bytes.clone(),
+        ));
+        let stderr_task = tokio::spawn(read_limited_pipe(
+            child.stderr.take(),
+            remaining_output_bytes,
+        ));
+
+        let status = tokio::select! {
+            _ = cancel.cancelled() => {
+                terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                stdout_task.abort();
+                stderr_task.abort();
+                return Err(ShellRunError::Cancelled);
+            }
+            result = time::timeout(Duration::from_millis(timeout_ms), child.wait()) => result,
+        };
+
+        let timed_out = status.is_err();
+        let exit_status = match status {
+            Ok(Ok(status)) => Some(status),
+            Err(_) => {
+                terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                None
+            }
+            Ok(Err(err)) => return Err(ShellRunError::Io(err)),
+        };
+
+        let (stdout_bytes, stdout_truncated) = join_limited_pipe(stdout_task)
+            .await
+            .map_err(ShellRunError::Io)?;
+        let (stderr_bytes, stderr_truncated) = join_limited_pipe(stderr_task)
+            .await
+            .map_err(ShellRunError::Io)?;
+
+        Ok(ShellRunOutcome {
+            exit_status,
+            timed_out,
+            stdout_bytes,
+            stdout_truncated,
+            stderr_bytes,
+            stderr_truncated,
+            preserved_env,
+        })
     }
 
     async fn execute_websearch(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
@@ -9813,6 +9933,27 @@ fn shell_termination_reason(
     exit_signal
         .map(|signal| format!("shell command terminated by signal {signal}"))
         .or_else(|| Some("shell command ended without an exit code".to_string()))
+}
+
+fn shell_sandbox_direct_fallback_reason(
+    sandbox_plan: &ShellSandboxPlan,
+    run: &ShellRunOutcome,
+) -> Option<String> {
+    if sandbox_plan.required || sandbox_plan.backend == "none" || run.timed_out {
+        return None;
+    }
+    if !run.stdout_bytes.is_empty() || !run.stderr_bytes.is_empty() {
+        return None;
+    }
+    let exit_code = run.exit_status.as_ref().and_then(|status| status.code());
+    if exit_code.is_some() {
+        return None;
+    }
+    let signal = shell_exit_signal(run.exit_status.as_ref())?;
+    Some(format!(
+        "shell sandbox backend {} terminated by signal {signal} with no output; retried without OS sandbox because mode is best_effort",
+        sandbox_plan.backend
+    ))
 }
 
 fn tool_arg_error(call: &ToolCall, err: serde_json::Error) -> ToolResult {

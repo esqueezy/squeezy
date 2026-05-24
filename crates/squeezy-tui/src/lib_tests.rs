@@ -1006,6 +1006,48 @@ fn render_keeps_header_when_transcript_has_content() {
 }
 
 #[test]
+fn active_prompt_keeps_blank_space_after_last_answer() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("l"));
+    app.push_transcript_item(TranscriptItem::assistant(
+        "I am not sure what you want with l.",
+    ));
+
+    let output = render_to_string(&app, 100, 20);
+    let lines = output.lines().collect::<Vec<_>>();
+    let answer_line = lines
+        .iter()
+        .position(|line| line.contains("I am not sure"))
+        .expect("answer line");
+    let prompt_line = lines
+        .iter()
+        .position(|line| line.contains('┃'))
+        .expect("prompt cursor");
+    let blank_rows = lines[answer_line + 1..prompt_line]
+        .iter()
+        .filter(|line| line.trim().is_empty())
+        .count();
+
+    assert!(blank_rows >= 2, "{output}");
+}
+
+#[test]
+fn startup_card_scrolls_with_transcript_history() {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..16 {
+        app.push_transcript_item(TranscriptItem::user(format!("prompt {index}")));
+        app.push_transcript_item(TranscriptItem::assistant(format!("answer {index}")));
+    }
+
+    let at_bottom = render_to_string(&app, 120, 20);
+    assert!(!at_bottom.contains(">_ Squeezy v"), "{at_bottom}");
+
+    app.transcript_scroll_from_bottom = u16::MAX;
+    let at_top = render_to_string(&app, 120, 20);
+    assert!(at_top.contains(">_ Squeezy v"), "{at_top}");
+}
+
+#[test]
 fn render_prompt_uses_rotating_coin_and_cursor() {
     let mut app = test_app(SessionMode::Build);
     app.input = "ship it".to_string();
@@ -1105,7 +1147,7 @@ fn pending_assistant_uses_rotating_coin_marker() {
     app.turn_visual = TurnVisualState::Running;
     app.animation_tick = 4;
 
-    let lines = transcript_lines(&app, Some(80));
+    let lines = transcript_lines_for_render(&app, Some(80), false);
 
     assert_eq!(lines[0].spans[1].content.as_ref(), prompt_coin_frame(&app));
     assert_eq!(
