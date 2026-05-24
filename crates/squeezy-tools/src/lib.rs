@@ -8,7 +8,7 @@ use std::{
     path::{Component, Path, PathBuf},
     pin::Pin,
     process::Stdio,
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -10182,7 +10182,7 @@ fn shell_policy_denied(
 fn macos_sandbox_exec_supported() -> bool {
     #[cfg(target_os = "macos")]
     {
-        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *SUPPORTED.get_or_init(|| {
             let path = Path::new("/usr/bin/sandbox-exec");
             path.exists()
