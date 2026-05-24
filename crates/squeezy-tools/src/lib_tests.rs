@@ -2045,6 +2045,81 @@ async fn shell_created_file_is_checkpointed_and_deleted_on_undo() {
 }
 
 #[tokio::test]
+async fn direct_user_shell_skips_checkpoint_and_sandbox() {
+    let root = temp_workspace("direct_user_shell_fast_path");
+    let shell_sandbox = squeezy_core::ShellSandboxConfig {
+        mode: squeezy_core::ShellSandboxMode::Required,
+        ..squeezy_core::ShellSandboxConfig::default()
+    };
+    let registry = ToolRegistry::new_inner(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        shell_sandbox,
+        SkillCatalog::empty(),
+        CrawlOptions::default(),
+        ToolRegistryRuntime::default(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "local-shell-test".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf direct > direct.txt",
+                    "description": "run an explicit user shell command",
+                    "direct_user_shell": true
+                }),
+            },
+            CancellationToken::new(),
+            "turn-direct".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(result.content["sandbox"]["backend"], "none");
+    assert_eq!(result.content["sandbox"]["mode"], "off");
+    assert_eq!(result.content["policy"]["direct_user_shell"], true);
+    assert!(result.content.get("checkpoint").is_none());
+    assert_eq!(
+        fs::read_to_string(root.join("direct.txt")).unwrap(),
+        "direct"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn model_shell_cannot_request_direct_user_shell_fast_path() {
+    let root = temp_workspace("direct_user_shell_model_guard");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "model-call".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf guarded > guarded.txt",
+                    "description": "attempt to set hidden direct shell flag",
+                    "direct_user_shell": true
+                }),
+            },
+            CancellationToken::new(),
+            "turn-model".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(result.content["policy"]["direct_user_shell"], false);
+    assert_eq!(result.content["checkpoint"]["group_id"], "turn-model");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn shell_checkpoint_ignores_gitignored_target_outputs() {
     let root = temp_workspace("checkpoint_shell_ignored_target");
     fs::write(root.join(".gitignore"), "target\n").expect("write gitignore");

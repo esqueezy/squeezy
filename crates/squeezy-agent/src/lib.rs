@@ -2133,8 +2133,7 @@ async fn complete_local_tool_turn(
         })
         .await;
 
-    let mut all_tool_specs = core_control_tools(&config.subagents);
-    all_tool_specs.extend(tools.specs().into_iter().map(advertised_tool));
+    let all_tool_specs = Vec::new();
     let exploration_state = Arc::new(Mutex::new(ExplorationTurnState::from_plan(None)));
     let mut broker = CostBroker::new(&config);
     let results = execute_tool_calls(
@@ -2302,6 +2301,7 @@ fn local_shell_command_call(input: &str) -> Option<ToolCall> {
             "timeout_ms": LOCAL_SHELL_TIMEOUT_MS,
             "output_byte_cap": LOCAL_SHELL_OUTPUT_BYTE_CAP,
             "output_mode": "raw",
+            "direct_user_shell": true,
         }),
     })
 }
@@ -4954,6 +4954,9 @@ async fn permission_decision(
     call: &ToolCall,
     context: &ToolExecutionContext<'_>,
 ) -> ApprovalDecision {
+    if is_direct_user_shell_call(call) {
+        return ApprovalDecision::Approved;
+    }
     let request = context.tools.permission_request(call);
     let active_mode = load_session_mode(&context.session_mode);
     if let Some(verdict) = mode_permission_verdict(active_mode, &request) {
@@ -5109,6 +5112,16 @@ async fn permission_decision(
             }
         }
     }
+}
+
+fn is_direct_user_shell_call(call: &ToolCall) -> bool {
+    call.name == "shell"
+        && call.call_id.starts_with("local-shell-")
+        && call
+            .arguments
+            .get("direct_user_shell")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// Lock-free read of the active session mode. Defaults to `Build` if the

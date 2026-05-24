@@ -73,11 +73,11 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
         "missing toggle hint: {status}",
     );
     assert!(
-        status.contains("PgUp/PgDn scroll"),
+        status.contains("Wheel/PgUp/PgDn scroll"),
         "missing scroll hint: {status}"
     );
     assert!(
-        status.contains("Up/Down menu/history"),
+        status.contains("Alt+Up/Down history"),
         "missing menu/history hint: {status}"
     );
 }
@@ -217,10 +217,10 @@ async fn prompt_history_uses_plain_up_down_when_prompt_is_empty() {
 }
 
 #[tokio::test]
-async fn alternate_screen_arrows_recall_prompt_history_when_trimmed_empty() {
+async fn alternate_screen_arrows_recall_history_when_prompt_is_empty() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    app.input = " \n ".to_string();
+    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
     push_input_history(&mut app, "first prompt".to_string());
     push_input_history(&mut app, "second prompt".to_string());
 
@@ -234,6 +234,26 @@ async fn alternate_screen_arrows_recall_prompt_history_when_trimmed_empty() {
 
     assert_eq!(app.input, "second prompt");
     assert_eq!(app.transcript_scroll_from_bottom, 0);
+}
+
+#[tokio::test]
+async fn alternate_screen_arrows_scroll_transcript_when_draft_is_not_empty() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.input = "hi".to_string();
+    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
+    push_input_history(&mut app, "previous prompt".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("scroll up");
+
+    assert_eq!(app.input, "hi");
+    assert_eq!(app.transcript_scroll_from_bottom, 3);
 
     handle_key(
         &mut app,
@@ -241,10 +261,57 @@ async fn alternate_screen_arrows_recall_prompt_history_when_trimmed_empty() {
         KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
     )
     .await
-    .expect("history down");
+    .expect("scroll down");
+
+    assert_eq!(app.input, "hi");
+    assert_eq!(app.transcript_scroll_from_bottom, 0);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+    )
+    .await
+    .expect("history up keeps draft");
+
+    assert_eq!(app.input, "hi");
+}
+
+#[tokio::test]
+async fn alternate_screen_arrows_keep_scrolling_when_transcript_is_already_scrolled() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
+    push_input_history(&mut app, "previous prompt".to_string());
+    app.transcript_scroll_from_bottom = 3;
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("scroll down");
 
     assert!(app.input.is_empty());
     assert_eq!(app.transcript_scroll_from_bottom, 0);
+}
+
+#[test]
+fn mouse_wheel_scrolls_transcript_without_prompt_history() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
+    push_input_history(&mut app, "previous prompt".to_string());
+
+    handle_mouse(&mut app, MouseEventKind::ScrollUp);
+
+    assert_eq!(app.transcript_scroll_from_bottom, 3);
+    assert!(app.input.is_empty());
+
+    handle_mouse(&mut app, MouseEventKind::ScrollDown);
+
+    assert_eq!(app.transcript_scroll_from_bottom, 0);
+    assert!(app.input.is_empty());
 }
 
 #[tokio::test]
@@ -933,6 +1000,49 @@ fn expanded_edit_diff_does_not_claim_ctrl_e_can_expand_further() {
 
     assert!(output.contains("+line 20"), "{output}");
     assert!(!output.contains("Ctrl-E to expand"), "{output}");
+}
+
+#[test]
+fn collapsed_edit_row_shows_diff_preview() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("apply_patch", "");
+    result.content = serde_json::json!({
+        "checkpoint": {
+            "files": [{
+                "path": "src/lib.rs",
+                "additions": 1,
+                "deletions": 1,
+                "patch": "@@ -1 +1 @@\n-old\n+new\n",
+                "patch_truncated": false
+            }]
+        }
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 120, 14);
+
+    assert!(output.contains("✔ Edited src/lib.rs · +1 -1"), "{output}");
+    assert!(output.contains("diff src/lib.rs"), "{output}");
+    assert!(output.contains("-old"), "{output}");
+    assert!(output.contains("+new"), "{output}");
+}
+
+#[test]
+fn retryable_apply_patch_failure_is_not_rendered_as_final_failure() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("apply_patch", "");
+    result.status = ToolStatus::Stale;
+    result.content = serde_json::json!({
+        "error": "search text matched more than once; narrow the search text or set allow_multiple=true to replace all matches",
+        "path": "src/lib.rs",
+        "matches": 2
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 140, 12);
+
+    assert!(output.contains("⚠ Retried src/lib.rs"), "{output}");
+    assert!(!output.contains("✖ Failed apply patch"), "{output}");
 }
 
 #[test]

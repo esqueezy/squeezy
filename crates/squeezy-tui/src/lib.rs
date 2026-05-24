@@ -12,6 +12,7 @@ use crossterm::{
     cursor::MoveTo,
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseEventKind,
     },
     execute,
     style::Print,
@@ -597,11 +598,23 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
 
     match event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))? {
         Event::Key(key) => handle_key(app, agent, key).await,
+        Event::Mouse(mouse) => {
+            handle_mouse(app, mouse.kind);
+            Ok(false)
+        }
         Event::Paste(text) => {
             handle_paste(app, agent, text).await?;
             Ok(false)
         }
         _ => Ok(false),
+    }
+}
+
+fn handle_mouse(app: &mut TuiApp, kind: MouseEventKind) {
+    match kind {
+        MouseEventKind::ScrollUp => scroll_transcript_up(app, 3),
+        MouseEventKind::ScrollDown => scroll_transcript_down(app, 3),
+        _ => {}
     }
 }
 
@@ -712,6 +725,10 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             }
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 select_previous_transcript_entry(app);
+            } else if key.modifiers.contains(KeyModifiers::ALT) {
+                recall_prompt_history(app, HistoryDirection::Previous);
+            } else if should_route_plain_arrow_to_scroll(app) {
+                scroll_transcript_up(app, 3);
             } else {
                 recall_prompt_history(app, HistoryDirection::Previous);
             }
@@ -723,6 +740,10 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             }
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 select_next_transcript_entry(app);
+            } else if key.modifiers.contains(KeyModifiers::ALT) {
+                recall_prompt_history(app, HistoryDirection::Next);
+            } else if should_route_plain_arrow_to_scroll(app) {
+                scroll_transcript_down(app, 3);
             } else {
                 recall_prompt_history(app, HistoryDirection::Next);
             }
@@ -837,6 +858,13 @@ fn scroll_transcript_up(app: &mut TuiApp, lines: u16) {
 
 fn scroll_transcript_down(app: &mut TuiApp, lines: u16) {
     app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_sub(lines);
+}
+
+fn should_route_plain_arrow_to_scroll(app: &TuiApp) -> bool {
+    app.alternate_scroll_enabled
+        && app.input_history_index.is_none()
+        && !app.transcript.is_empty()
+        && (app.transcript_scroll_from_bottom > 0 || !app.input.trim().is_empty())
 }
 
 fn push_input_history(app: &mut TuiApp, input: String) {
@@ -3073,7 +3101,7 @@ fn format_tool_result_entry(
     let color = tool_result_display_color(tool);
     let summary_spans = tool_result_summary_spans(tool);
     if collapsed {
-        return vec![action_line_spans(
+        let mut lines = vec![action_line_spans(
             selected,
             marker,
             color,
@@ -3081,6 +3109,8 @@ fn format_tool_result_entry(
             color,
             summary_spans,
         )];
+        lines.extend(collapsed_tool_preview_lines(tool));
+        return lines;
     }
     let mut lines = vec![action_line_spans(
         selected,
@@ -3091,6 +3121,33 @@ fn format_tool_result_entry(
         summary_spans,
     )];
     lines.extend(expanded_tool_detail_lines(tool, tool_output_verbosity));
+    lines
+}
+
+fn collapsed_tool_preview_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
+    if !matches!(tool.result.status, ToolStatus::Success)
+        || !matches!(tool.result.tool_name.as_str(), "apply_patch" | "write_file")
+    {
+        return Vec::new();
+    }
+    let Some(file) = edit_changed_files(tool).into_iter().find(|file| {
+        file.patch
+            .as_ref()
+            .is_some_and(|patch| !patch.trim().is_empty())
+    }) else {
+        return Vec::new();
+    };
+    let Some(patch) = file.patch.as_deref() else {
+        return Vec::new();
+    };
+    let mut lines = vec![detail_line(false, QUIET, format!("diff {}", file.path))];
+    lines.extend(head_tail_lines(patch, 10).into_iter().map(|line| {
+        if line.truncated_marker {
+            detail_line(false, QUIET, line.text)
+        } else {
+            detail_spans_line(styled_output_spans(&line.text))
+        }
+    }));
     lines
 }
 
@@ -4610,6 +4667,13 @@ fn tool_result_status_text(result: &ToolResult) -> String {
     if cargo_manifest_missing_result(result) {
         return format!("{} not run: no Cargo.toml found", result.tool_name);
     }
+    if is_retryable_tool_result(result) {
+        return format!(
+            "{} retrying: {}",
+            result.tool_name,
+            tool_result_error_detail(result)
+        );
+    }
     let status = match result.status {
         ToolStatus::Success => "completed",
         ToolStatus::Error | ToolStatus::Stale => "failed",
@@ -4667,7 +4731,7 @@ fn status_color(status: ToolStatus) -> Color {
 }
 
 fn tool_result_display_color(tool: &ToolTranscript) -> Color {
-    if tool_result_not_run(tool) {
+    if tool_result_not_run(tool) || is_retryable_tool_result(&tool.result) {
         GOLD
     } else {
         status_color(tool.result.status)
@@ -4677,6 +4741,9 @@ fn tool_result_display_color(tool: &ToolTranscript) -> Color {
 fn tool_result_action(tool: &ToolTranscript) -> (&'static str, &'static str) {
     if tool_result_not_run(tool) {
         return ("⚠ ", "Not run");
+    }
+    if is_retryable_tool_result(&tool.result) {
+        return ("⚠ ", "Retried");
     }
     match tool.result.status {
         ToolStatus::Success if tool.result.tool_name == "plan_patch" => ("✔ ", "Planned"),
@@ -4703,6 +4770,23 @@ fn tool_result_not_run(tool: &ToolTranscript) -> bool {
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
         || cargo_manifest_missing_result(&tool.result)
+}
+
+fn is_retryable_tool_result(result: &ToolResult) -> bool {
+    if is_invalid_argument_result(result) {
+        return true;
+    }
+    matches!(result.tool_name.as_str(), "apply_patch" | "write_file")
+        && matches!(result.status, ToolStatus::Error | ToolStatus::Stale)
+        && result
+            .content
+            .get("error")
+            .and_then(|value| value.as_str())
+            .is_some_and(|error| {
+                error.contains("search text matched more than once")
+                    || error.contains("search text not found")
+                    || error.contains("expected_sha256")
+            })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5072,7 +5156,7 @@ fn format_status_hints(app: &TuiApp) -> String {
             .to_string();
     }
     if app.alternate_scroll_enabled {
-        "Enter send · PgUp/PgDn scroll · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
+        "Enter send · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
             .to_string()
     } else {
         "Enter send · Up/Down menu/history · Ctrl+J newline · PgUp/PgDn scroll · Ctrl-E expand/collapse · /help"
@@ -5713,7 +5797,7 @@ fn tool_result_hidden_by_default(result: &ToolResult) -> bool {
 }
 
 fn tool_retry_key(tool: &ToolTranscript) -> Option<String> {
-    if !is_invalid_argument_result(&tool.result) {
+    if !is_retryable_tool_result(&tool.result) {
         return None;
     }
     Some(format!(

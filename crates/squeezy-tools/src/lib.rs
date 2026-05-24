@@ -4629,6 +4629,7 @@ impl ToolRegistry {
                 "shell output_byte_cap must be at least 1",
             );
         }
+        let direct_user_shell = args.direct_user_shell && call.call_id.starts_with("local-shell-");
         let workdir = match self.resolve_shell_workdir(args.workdir.as_deref().unwrap_or(".")) {
             Ok(path) => path,
             Err(err) => {
@@ -4647,9 +4648,13 @@ impl ToolRegistry {
             .output_byte_cap
             .unwrap_or(DEFAULT_SHELL_OUTPUT_BYTE_CAP)
             .min(MAX_SHELL_OUTPUT_BYTE_CAP);
-        let checkpoint_before = match self.checkpoints.track_tree() {
-            Ok(snapshot) => snapshot,
-            Err(err) => return tool_error(call, err),
+        let checkpoint_before = if direct_user_shell {
+            None
+        } else {
+            match self.checkpoints.track_tree() {
+                Ok(snapshot) => Some(snapshot),
+                Err(err) => return tool_error(call, err),
+            }
         };
         let coverage_warnings = shell_coverage_warnings(&args.command);
 
@@ -4675,24 +4680,28 @@ impl ToolRegistry {
             return shell_policy_denied(call, &analysis, reason);
         }
 
-        let mut sandbox_plan = match self.prepare_shell_sandbox(&args.command, &analysis) {
-            Ok(plan) => plan,
-            Err(reason) => {
-                self.audit_shell(
-                    call,
-                    &args,
-                    &workdir,
-                    &analysis,
-                    shell_sandbox_status_metadata(&self.shell_sandbox, "unavailable"),
-                    timeout_ms,
-                    output_cap,
-                    "denied",
-                    Some(&reason),
-                    None,
-                    &[],
-                    &[],
-                );
-                return shell_policy_denied(call, &analysis, reason);
+        let mut sandbox_plan = if direct_user_shell {
+            ShellSandboxPlan::direct(&args.command, ShellSandboxMode::Off, &self.shell_sandbox)
+        } else {
+            match self.prepare_shell_sandbox(&args.command, &analysis) {
+                Ok(plan) => plan,
+                Err(reason) => {
+                    self.audit_shell(
+                        call,
+                        &args,
+                        &workdir,
+                        &analysis,
+                        shell_sandbox_status_metadata(&self.shell_sandbox, "unavailable"),
+                        timeout_ms,
+                        output_cap,
+                        "denied",
+                        Some(&reason),
+                        None,
+                        &[],
+                        &[],
+                    );
+                    return shell_policy_denied(call, &analysis, reason);
+                }
             }
         };
 
@@ -4897,6 +4906,7 @@ impl ToolRegistry {
                 "destructive": analysis.destructive,
                 "parser_backed": analysis.parser_backed,
                 "dynamic": analysis.dynamic,
+                "direct_user_shell": direct_user_shell,
                 "timeout_ms": timeout_ms,
                 "output_byte_cap": output_cap,
             },
@@ -4907,14 +4917,16 @@ impl ToolRegistry {
                 "preserved": preserved_env,
             },
         });
-        self.append_checkpoint_to_content(
-            &mut raw_content,
-            &checkpoint_before,
-            call,
-            group_id,
-            status,
-            coverage_warnings,
-        );
+        if let Some(checkpoint_before) = checkpoint_before.as_ref() {
+            self.append_checkpoint_to_content(
+                &mut raw_content,
+                checkpoint_before,
+                call,
+                group_id,
+                status,
+                coverage_warnings,
+            );
+        }
         let raw_result = make_result(call, status, raw_content.clone(), cost.clone(), None);
         let raw_output = raw_result.model_output();
         let raw_output_sha256 = raw_result.receipt.output_sha256.clone();
@@ -7753,6 +7765,8 @@ struct ShellArgs {
     output_byte_cap: Option<usize>,
     output_mode: Option<OutputMode>,
     description: Option<String>,
+    #[serde(default)]
+    direct_user_shell: bool,
 }
 
 #[derive(Debug, Deserialize)]

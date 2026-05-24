@@ -1167,6 +1167,8 @@ async fn simple_ls_completes_locally_without_provider_request() {
     let tool_result = tool_result.expect("ls should run through the shell tool");
     assert_eq!(tool_result.tool_name, "shell");
     assert_eq!(tool_result.status, ToolStatus::Success);
+    assert_eq!(tool_result.content["policy"]["direct_user_shell"], true);
+    assert_eq!(tool_result.content["sandbox"]["backend"], "none");
     let completed = completed.expect("ls turn should complete");
     assert!(completed.contains("Cargo.toml"), "{completed}");
     assert!(completed.contains("src"), "{completed}");
@@ -1195,14 +1197,16 @@ async fn run_ls_phrase_uses_local_tool_path_without_provider_request() {
     let mut queued_tools = Vec::new();
     while let Some(event) = rx.recv().await {
         match event {
-            AgentEvent::ToolCallQueued { call, .. } => queued_tools.push(call.name),
+            AgentEvent::ToolCallQueued { call, .. } => queued_tools.push(call),
             AgentEvent::Completed { message, .. } => completed = Some(message.content),
             _ => {}
         }
     }
 
     assert!(provider.requests().is_empty());
-    assert_eq!(queued_tools, vec!["shell".to_string()]);
+    assert_eq!(queued_tools.len(), 1);
+    assert_eq!(queued_tools[0].name, "shell");
+    assert_eq!(queued_tools[0].arguments["direct_user_shell"], true);
     let completed = completed.expect("local run turn should complete");
     assert!(completed.contains("Cargo.toml"), "{completed}");
 
