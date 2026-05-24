@@ -908,7 +908,8 @@ fn render_keeps_header_when_transcript_has_content() {
     assert!(output.contains(">_ Squeezy v"), "{output}");
     assert!(output.contains("scripted:gpt-test"), "{output}");
     assert!(output.contains("      hello"), "{output}");
-    assert!(output.contains("• Answered answer"), "{output}");
+    assert!(output.contains("● answer"), "{output}");
+    assert!(!output.contains("Answered"), "{output}");
 }
 
 #[test]
@@ -963,8 +964,52 @@ fn assistant_marker_uses_answer_color() {
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
 
+    assert_eq!(lines[0].spans[1].content.as_ref(), "●");
     assert_eq!(lines[0].spans[1].style.fg, Some(Color::Green));
-    assert_eq!(lines[0].spans[2].style.fg, Some(Color::Green));
+    assert_eq!(lines[0].spans[3].content.as_ref(), "done");
+    assert_eq!(
+        lines.last().expect("trailing blank").spans.len(),
+        0,
+        "{lines:?}"
+    );
+    let text = lines[0]
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(!text.contains("Answered"), "{text}");
+}
+
+#[test]
+fn failed_assistant_marker_uses_error_color() {
+    let item = TranscriptItem::assistant("partial answer");
+
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Failed);
+
+    assert_eq!(lines[0].spans[1].content.as_ref(), "●");
+    assert_eq!(lines[0].spans[1].style.fg, Some(ERROR_RED));
+}
+
+#[test]
+fn pending_assistant_uses_rotating_coin_marker() {
+    let mut app = test_app(SessionMode::Build);
+    app.pending_assistant = "streaming".to_string();
+    app.turn_visual = TurnVisualState::Running;
+    app.animation_tick = 4;
+
+    let lines = transcript_lines(&app, Some(80));
+
+    assert_eq!(lines[0].spans[1].content.as_ref(), prompt_coin_frame(&app));
+    assert_eq!(
+        lines[0].spans[1].style.fg,
+        Some(app.turn_visual.color(app.animation_tick))
+    );
+    assert_eq!(lines[0].spans[3].content.as_ref(), "streaming");
+    assert_eq!(
+        lines.last().expect("trailing blank").spans.len(),
+        0,
+        "{lines:?}"
+    );
 }
 
 #[test]
@@ -978,7 +1023,8 @@ fn completed_task_panel_is_hidden_after_answer() {
 
     let output = render_to_string(&app, 120, 18);
 
-    assert!(output.contains("• Answered Because."), "{output}");
+    assert!(output.contains("● Because."), "{output}");
+    assert!(!output.contains("Answered"), "{output}");
     assert!(
         !output.contains("• Done"),
         "completed task panel should not duplicate the answer: {output}"
@@ -1078,7 +1124,7 @@ fn submitted_prompt_surface_extends_to_render_width() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(lines.len(), PROMPT_MIN_HEIGHT as usize);
+    assert_eq!(lines.len(), PROMPT_MIN_HEIGHT as usize + 1);
     assert_eq!(
         lines[0]
             .spans
@@ -1090,10 +1136,12 @@ fn submitted_prompt_surface_extends_to_render_width() {
         40
     );
     assert_eq!(rendered.chars().count(), 40);
+    assert_eq!(lines[0].spans[0].style.bg, Some(PROMPT_BG));
     assert_eq!(lines[1].spans[1].style.bg, Some(PROMPT_BG));
     assert_eq!(lines[1].spans[2].style.bg, Some(PROMPT_BG));
     assert_eq!(lines[1].spans[3].style.bg, Some(PROMPT_BG));
     assert_eq!(lines[2].spans[1].style.bg, Some(PROMPT_BG));
+    assert_eq!(lines.last().expect("separator").spans.len(), 0);
 }
 
 #[test]
@@ -1112,16 +1160,16 @@ fn submitted_prompt_preserves_empty_lines() {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(lines.len(), 6);
+    assert_eq!(lines.len(), 7);
     assert!(rendered[1].contains("one"), "{rendered:?}");
     assert_eq!(rendered[2].trim(), "");
     assert!(rendered[3].contains("three"), "{rendered:?}");
     assert_eq!(rendered[4].trim(), "");
-    assert!(lines.iter().all(|line| {
+    assert_eq!(rendered[6], "");
+    assert!(lines[..6].iter().all(|line| {
         line.spans
             .iter()
             .filter(|span| !span.content.is_empty())
-            .skip(1)
             .all(|span| span.style.bg == Some(PROMPT_BG))
     }));
 }
@@ -1196,6 +1244,7 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         app.tool_output_verbosity,
         message_outcome(&app.transcript, 0),
     );
+    assert_eq!(user_lines[1].spans[0].style.bg, Some(PROMPT_BG));
     assert_eq!(user_lines[1].spans[1].style.bg, Some(PROMPT_BG));
     assert_eq!(user_lines[1].spans[2].content.as_ref(), "hi");
     assert_eq!(user_lines[1].spans[2].style.fg, Some(Color::White));
@@ -1223,6 +1272,7 @@ fn user_prompt_text_is_highlighted_in_transcript() {
         .collect::<String>();
 
     assert_eq!(lines[1].spans[2].content.as_ref(), "find getFoo");
+    assert_eq!(lines[1].spans[0].style.bg, Some(PROMPT_BG));
     assert_eq!(lines[1].spans[2].style.bg, Some(PROMPT_BG));
     assert_eq!(lines[1].spans[2].style.fg, Some(Color::White));
     assert!(!text.contains("◐"), "{text}");

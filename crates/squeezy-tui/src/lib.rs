@@ -2344,11 +2344,13 @@ fn transcript_lines(app: &TuiApp, width: Option<u16>) -> Vec<Line<'static>> {
         ));
     }
     if !app.pending_assistant.is_empty() {
-        lines.push(Line::from(vec![
-            turn_dot_span(app),
-            Span::raw(" "),
-            Span::raw(app.pending_assistant.clone()),
-        ]));
+        lines.extend(assistant_text_lines(
+            false,
+            turn_coin_span(app),
+            &app.pending_assistant,
+            Style::default(),
+        ));
+        lines.push(Line::from(""));
     }
     lines
 }
@@ -2524,7 +2526,7 @@ fn message_outcome(entries: &[TranscriptEntry], index: usize) -> MessageOutcome 
     else {
         return MessageOutcome::Normal;
     };
-    if item.role != Role::User {
+    if item.role != Role::User && item.role != Role::Assistant {
         return MessageOutcome::Normal;
     }
 
@@ -2564,6 +2566,9 @@ fn format_message_entry_with_width(
 ) -> Vec<Line<'static>> {
     if item.role == Role::User {
         return format_user_prompt_entry(item, selected, width);
+    }
+    if item.role == Role::Assistant {
+        return format_assistant_message_entry(item, collapsed, selected, outcome);
     }
     let (action, color) = role_action(&item.role);
     let failed = outcome == MessageOutcome::Failed;
@@ -2605,13 +2610,14 @@ fn format_user_prompt_entry(
     if content.is_empty() {
         content.push("");
     }
-    let mut lines = Vec::with_capacity(content.len() + 2);
+    let mut lines = Vec::with_capacity(content.len() + 3);
     lines.push(user_prompt_blank_line(width));
     lines.extend(content.into_iter().enumerate().map(|(index, line)| {
         let marker = if selected && index == 0 { "> " } else { "  " };
         user_prompt_content_line(marker, line, width)
     }));
     lines.push(user_prompt_blank_line(width));
+    lines.push(Line::from(""));
     lines
 }
 
@@ -2619,7 +2625,7 @@ fn user_prompt_blank_line(width: Option<u16>) -> Line<'static> {
     let marker = "  ";
     let surface_width = user_prompt_surface_width(marker, width).unwrap_or(1);
     Line::from(vec![
-        Span::raw(marker),
+        user_prompt_marker_span(marker),
         Span::styled(" ".repeat(surface_width), Style::default().bg(PROMPT_BG)),
     ])
 }
@@ -2631,7 +2637,7 @@ fn user_prompt_content_line(marker: &'static str, line: &str, width: Option<u16>
         .map(|surface_width| " ".repeat(surface_width.saturating_sub(text_width)))
         .unwrap_or_default();
     Line::from(vec![
-        Span::raw(marker),
+        user_prompt_marker_span(marker),
         Span::styled(prompt_prefix, Style::default().bg(PROMPT_BG)),
         Span::styled(
             line.to_string(),
@@ -2643,6 +2649,49 @@ fn user_prompt_content_line(marker: &'static str, line: &str, width: Option<u16>
 
 fn user_prompt_surface_width(marker: &str, width: Option<u16>) -> Option<usize> {
     width.map(|width| (width as usize).saturating_sub(marker.chars().count()))
+}
+
+fn user_prompt_marker_span(marker: &'static str) -> Span<'static> {
+    let style = if marker.trim().is_empty() {
+        Style::default().bg(PROMPT_BG)
+    } else {
+        Style::default().fg(GOLD).bg(PROMPT_BG)
+    };
+    Span::styled(marker, style)
+}
+
+fn format_assistant_message_entry(
+    item: &TranscriptItem,
+    collapsed: bool,
+    selected: bool,
+    outcome: MessageOutcome,
+) -> Vec<Line<'static>> {
+    let color = if outcome == MessageOutcome::Failed {
+        ERROR_RED
+    } else {
+        Color::Green
+    };
+    let mut lines = if collapsed {
+        vec![assistant_line(
+            selected,
+            assistant_static_span(color),
+            format!(
+                "… {} chars  {}",
+                item.content.chars().count(),
+                compact_text(&item.content, 140)
+            ),
+            Style::default(),
+        )]
+    } else {
+        assistant_text_lines(
+            selected,
+            assistant_static_span(color),
+            &item.content,
+            Style::default(),
+        )
+    };
+    lines.push(Line::from(""));
+    lines
 }
 
 fn format_tool_result_entry(
@@ -2824,6 +2873,48 @@ fn action_text_lines_styled(
         .collect()
 }
 
+fn assistant_line(
+    selected: bool,
+    status: Span<'static>,
+    content: impl Into<String>,
+    content_style: Style,
+) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let content = content.into();
+    let spacer = if content.is_empty() { "" } else { " " };
+    Line::from(vec![
+        Span::raw(marker),
+        status,
+        Span::raw(spacer),
+        Span::styled(content, content_style),
+    ])
+}
+
+fn assistant_text_lines(
+    selected: bool,
+    status: Span<'static>,
+    content: &str,
+    content_style: Style,
+) -> Vec<Line<'static>> {
+    if content.is_empty() {
+        return vec![assistant_line(selected, status, "", content_style)];
+    }
+    content
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 {
+                assistant_line(selected, status.clone(), line.to_string(), content_style)
+            } else {
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(line.to_string(), content_style),
+                ])
+            }
+        })
+        .collect()
+}
+
 fn detail_text_lines(selected: bool, color: Color, content: &str) -> Vec<Line<'static>> {
     if content.is_empty() {
         return vec![detail_line(selected, color, "")];
@@ -2926,32 +3017,43 @@ impl TurnVisualState {
     }
 }
 
-fn turn_dot_span(app: &TuiApp) -> Span<'static> {
+fn turn_coin_span(app: &TuiApp) -> Span<'static> {
     Span::styled(
-        "•",
+        prompt_coin_frame(app),
         Style::default()
             .fg(app.turn_visual.color(app.animation_tick))
             .add_modifier(Modifier::BOLD),
     )
 }
 
+fn assistant_static_span(color: Color) -> Span<'static> {
+    Span::styled("●", Style::default().fg(color).add_modifier(Modifier::BOLD))
+}
+
 fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
-    const FRAMES: [&str; 8] = ["●", "◕", "◐", "◔", "○", "◔", "◑", "◕"];
-    let tick_ms = app.animation_tick_rate.as_millis().max(1) as u64;
-    let elapsed_ms = app.animation_tick.saturating_mul(tick_ms);
-    let direction_reversed = (elapsed_ms / 60_000) % 2 == 1;
-    let frame_index = ((elapsed_ms / 320) as usize) % FRAMES.len();
-    let frame = if direction_reversed {
-        FRAMES[FRAMES.len() - 1 - frame_index]
-    } else {
-        FRAMES[frame_index]
-    };
-    let color = if (elapsed_ms / 800).is_multiple_of(2) {
+    let color = if (prompt_elapsed_ms(app) / 800).is_multiple_of(2) {
         GOLD
     } else {
         AMBER
     };
-    Span::styled(frame, Style::default().fg(color))
+    Span::styled(prompt_coin_frame(app), Style::default().fg(color))
+}
+
+fn prompt_coin_frame(app: &TuiApp) -> &'static str {
+    const FRAMES: [&str; 8] = ["●", "◕", "◐", "◔", "○", "◔", "◑", "◕"];
+    let elapsed_ms = prompt_elapsed_ms(app);
+    let direction_reversed = (elapsed_ms / 60_000) % 2 == 1;
+    let frame_index = ((elapsed_ms / 320) as usize) % FRAMES.len();
+    if direction_reversed {
+        FRAMES[FRAMES.len() - 1 - frame_index]
+    } else {
+        FRAMES[frame_index]
+    }
+}
+
+fn prompt_elapsed_ms(app: &TuiApp) -> u64 {
+    let tick_ms = app.animation_tick_rate.as_millis().max(1) as u64;
+    app.animation_tick.saturating_mul(tick_ms)
 }
 
 fn prompt_cursor_span() -> Span<'static> {
