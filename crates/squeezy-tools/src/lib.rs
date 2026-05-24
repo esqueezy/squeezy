@@ -1353,15 +1353,13 @@ impl ToolRegistry {
             "checkpoint_undo" => self.execute_checkpoint_undo(&call).await,
             "checkpoint_revert" => self.execute_checkpoint_revert(&call).await,
             "repo_map" | "decl_search" | "definition_search" | "reference_search"
-            | "upstream_flow" | "downstream_flow" | "hierarchy" | "read_slice" => {
-                self.execute_graph_tool(&call).await
-            }
+            | "upstream_flow" | "downstream_flow" | "hierarchy" | "read_slice"
+            | "symbol_context" => self.execute_graph_tool(&call).await,
             "diff_context" => self.execute_diff_context(&call).await,
             "glob" => self.execute_glob(&call, cancel).await,
             "grep" => self.execute_grep(&call, cancel).await,
             "read_file" => self.execute_read_file(&call).await,
             "read_tool_output" => self.execute_read_tool_output(&call).await,
-            "symbol_context" => self.execute_graph_tool(&call).await,
             "verify" => self.execute_verify(&call, cancel, &group_id).await,
             "write_file" => self.execute_write_file(&call, &group_id).await,
             "shell" => self.execute_shell(&call, cancel, &group_id).await,
@@ -1585,15 +1583,16 @@ impl ToolRegistry {
     async fn execute_graph_tool(&self, call: &ToolCall) -> ToolResult {
         let registry = self.clone();
         let call = call.clone();
+        // Preserve the original `call_id` and tool name so the agent loop can
+        // still match a join failure back to the model's tool call and so
+        // telemetry classifies it under the right tool family instead of a
+        // generic `graph_tool` bucket.
+        let fallback_call = call.clone();
         tokio::task::spawn_blocking(move || registry.execute_graph_tool_blocking(&call))
             .await
             .unwrap_or_else(|err| {
                 make_result(
-                    &ToolCall {
-                        call_id: String::new(),
-                        name: "graph_tool".to_string(),
-                        arguments: Value::Null,
-                    },
+                    &fallback_call,
                     ToolStatus::Error,
                     json!({ "error": format!("graph tool join failed: {err}") }),
                     ToolCostHint::default(),
@@ -1920,31 +1919,39 @@ impl ToolRegistry {
             .max_depth
             .unwrap_or(DEFAULT_GRAPH_MAX_DEPTH)
             .clamp(1, MAX_GRAPH_MAX_DEPTH);
-        let mut packets = Vec::new();
-        for hit in graph.callers(&symbol.id).into_iter().take(max_results) {
-            packets.push(call_edge_packet(&hit, "upstream_flow", true));
-        }
+        let traversal = bfs_call_packets(
+            graph,
+            &symbol,
+            max_depth,
+            max_results,
+            CallDirection::Upstream,
+        );
+        let mut packets = traversal.packets;
+        let mut overflowed = traversal.overflowed;
         if packets.len() < max_results {
-            for hit in graph
-                .references_to_symbol(&symbol.id)
-                .into_iter()
-                .take(max_results - packets.len())
-            {
+            let inbound = graph.references_to_symbol(&symbol.id);
+            let remaining = max_results - packets.len();
+            if inbound.len() > remaining {
+                overflowed = true;
+            }
+            for hit in inbound.into_iter().take(remaining) {
                 packets.push(reference_packet(&hit));
             }
         }
+        let truncated = overflowed;
         let mut payload = graph_payload("upstream_flow", manager, refresh);
         payload.insert("symbol".to_string(), symbol_json(graph, &symbol));
         payload.insert("max_depth".to_string(), json!(max_depth));
         let packet_count = packets.len();
         payload.insert("packets".to_string(), json!(packets));
-        payload.insert("truncated".to_string(), json!(false));
+        payload.insert("truncated".to_string(), json!(truncated));
         make_result(
             call,
             ToolStatus::Success,
             Value::Object(payload),
             ToolCostHint {
                 matches_returned: packet_count as u64,
+                truncated,
                 ..ToolCostHint::default()
             },
             None,
@@ -1968,20 +1975,25 @@ impl ToolRegistry {
             .unwrap_or(DEFAULT_GRAPH_MAX_DEPTH)
             .clamp(1, MAX_GRAPH_MAX_DEPTH);
         let mut packets = Vec::new();
+        // Explicit call_chain ("does source eventually reach target?") goes
+        // first so the model sees the directed answer before the broader BFS
+        // listing of callees.
         if let Some(target) = resolve_flow_target(graph, &args)
             && let Some(chain) = graph.call_chain(&symbol.id, &target.id, max_depth)
         {
             packets.push(call_chain_packet(graph, &chain, &symbol, &target));
         }
-        for hit in graph
-            .callees(&symbol.id)
-            .into_iter()
-            .take(max_results.saturating_sub(packets.len()))
-        {
-            packets.push(call_edge_packet(&hit, "downstream_flow", false));
-        }
+        let traversal = bfs_call_packets(
+            graph,
+            &symbol,
+            max_depth,
+            max_results.saturating_sub(packets.len()),
+            CallDirection::Downstream,
+        );
+        let mut overflowed = traversal.overflowed;
+        packets.extend(traversal.packets);
         if packets.len() < max_results {
-            for edge in graph
+            let outgoing = graph
                 .edges()
                 .iter()
                 .filter(|edge| edge.from == symbol.id)
@@ -1991,12 +2003,16 @@ impl ToolRegistry {
                         EdgeKind::Imports | EdgeKind::Reexports | EdgeKind::References
                     )
                 })
-                .take(max_results - packets.len())
-            {
+                .collect::<Vec<_>>();
+            let remaining = max_results - packets.len();
+            if outgoing.len() > remaining {
+                overflowed = true;
+            }
+            for edge in outgoing.into_iter().take(remaining) {
                 packets.push(edge_packet(graph, edge, "downstream_flow"));
             }
         }
-        let truncated = graph.callees(&symbol.id).len() > max_results;
+        let truncated = overflowed;
         let mut payload = graph_payload("downstream_flow", manager, refresh);
         payload.insert("symbol".to_string(), symbol_json(graph, &symbol));
         payload.insert("max_depth".to_string(), json!(max_depth));
@@ -6003,6 +6019,9 @@ fn graph_payload(
 }
 
 fn refresh_report_json(report: &squeezy_graph::RefreshReport) -> Value {
+    // Intentionally omits `duration_ms`: that field changes between otherwise
+    // identical calls and breaks the receipt-stub layer for graph tools.
+    // Telemetry still records wall-clock timing via the typed graph event.
     json!({
         "refreshed": report.refreshed,
         "changed_files": report.changed_files.iter().map(|id| id.0.clone()).collect::<Vec<_>>(),
@@ -6012,7 +6031,6 @@ fn refresh_report_json(report: &squeezy_graph::RefreshReport) -> Value {
         "excluded_dirs": report.excluded_dirs,
         "excluded_bytes": report.excluded_bytes,
         "bytes_reparsed": report.bytes_reparsed,
-        "duration_ms": report.duration_ms,
         "skipped_due_to_interval": report.skipped_due_to_interval,
         "budget_exhausted": report.budget_exhausted,
     })
@@ -6454,6 +6472,106 @@ fn call_edge_packet(hit: &CallEdgeHit, tool: &str, upstream: bool) -> Value {
     packet
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CallDirection {
+    Upstream,
+    Downstream,
+}
+
+impl CallDirection {
+    fn tool(self) -> &'static str {
+        match self {
+            CallDirection::Upstream => "upstream_flow",
+            CallDirection::Downstream => "downstream_flow",
+        }
+    }
+
+    fn is_upstream(self) -> bool {
+        matches!(self, CallDirection::Upstream)
+    }
+
+    fn neighbors(
+        self,
+        graph: &squeezy_graph::SemanticGraph,
+        symbol_id: &SymbolId,
+    ) -> Vec<CallEdgeHit> {
+        match self {
+            CallDirection::Upstream => graph.callers(symbol_id),
+            CallDirection::Downstream => graph.callees(symbol_id),
+        }
+    }
+
+    fn next_id(self, hit: &CallEdgeHit) -> Option<SymbolId> {
+        match self {
+            CallDirection::Upstream => hit.caller.as_ref().map(|symbol| symbol.id.clone()),
+            CallDirection::Downstream => hit.callee.as_ref().map(|symbol| symbol.id.clone()),
+        }
+    }
+}
+
+struct CallTraversal {
+    packets: Vec<Value>,
+    overflowed: bool,
+}
+
+/// Bounded BFS over `callers`/`callees`. Each emitted packet carries the
+/// hop distance from `root` (1-indexed) so the model can interpret a flat
+/// list of edges as a graph. Recursion is gated by `visited` to keep cyclic
+/// call graphs from looping; every edge still emits a packet on first
+/// encounter so the model sees the relationship even when expansion is
+/// blocked. `overflowed` is true when the traversal had to stop before
+/// reaching all in-budget neighbors (either we hit `max_results`, or we hit
+/// `max_depth` with more frontier nodes still expandable).
+fn bfs_call_packets(
+    graph: &squeezy_graph::SemanticGraph,
+    root: &GraphSymbol,
+    max_depth: usize,
+    max_results: usize,
+    direction: CallDirection,
+) -> CallTraversal {
+    let mut packets = Vec::new();
+    if max_results == 0 || max_depth == 0 {
+        let overflowed = !direction.neighbors(graph, &root.id).is_empty();
+        return CallTraversal {
+            packets,
+            overflowed,
+        };
+    }
+    let mut visited: HashSet<SymbolId> = HashSet::from([root.id.clone()]);
+    let mut frontier: VecDeque<(SymbolId, usize)> = VecDeque::from([(root.id.clone(), 0usize)]);
+    let mut overflowed = false;
+    while let Some((current_id, depth)) = frontier.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        let next_depth = depth + 1;
+        for hit in direction.neighbors(graph, &current_id) {
+            if packets.len() >= max_results {
+                overflowed = true;
+                return CallTraversal {
+                    packets,
+                    overflowed,
+                };
+            }
+            let mut packet = call_edge_packet(&hit, direction.tool(), direction.is_upstream());
+            if let Some(object) = packet.as_object_mut() {
+                object.insert("depth".to_string(), json!(next_depth));
+            }
+            packets.push(packet);
+            if next_depth < max_depth
+                && let Some(next_id) = direction.next_id(&hit)
+                && visited.insert(next_id.clone())
+            {
+                frontier.push_back((next_id, next_depth));
+            }
+        }
+    }
+    CallTraversal {
+        packets,
+        overflowed,
+    }
+}
+
 fn edge_packet(graph: &squeezy_graph::SemanticGraph, edge: &GraphEdge, tool: &str) -> Value {
     let from = graph.symbols.get(&edge.from);
     let to = edge.to.as_ref().and_then(|id| graph.symbols.get(id));
@@ -6876,7 +6994,11 @@ fn read_slice_target(
         path,
         None,
         status,
-        Confidence::ExactSyntax,
+        // Path-only reads pick bytes the caller asked for, not bytes that came
+        // from a tree-sitter span. Don't claim `ExactSyntax` confidence here:
+        // the bytes are exactly what was requested, but their relationship to
+        // the surrounding syntax is the caller's assertion, not the graph's.
+        Confidence::Heuristic,
         vec![Provenance::new(
             "squeezy-tools",
             "explicit bounded file slice",
@@ -8084,7 +8206,7 @@ fn reference_search_spec() -> ToolSpec {
 fn upstream_flow_spec() -> ToolSpec {
     ToolSpec {
         name: "upstream_flow".to_string(),
-        description: "Return compact callers and inbound references for a resolved symbol. Use for questions like 'who calls X?'.".to_string(),
+        description: "Return compact callers (bounded BFS up to max_depth, each packet tagged with `depth`) and direct inbound references for a resolved symbol. Use for questions like 'who calls X?' or 'who calls X within N hops?'.".to_string(),
         capability: PermissionCapability::Read,
         parameters: json!({
             "type": "object",
@@ -8104,7 +8226,7 @@ fn upstream_flow_spec() -> ToolSpec {
 fn downstream_flow_spec() -> ToolSpec {
     ToolSpec {
         name: "downstream_flow".to_string(),
-        description: "Return compact callees, outgoing reference/import edges, and optional bounded call chains for a resolved symbol.".to_string(),
+        description: "Return compact callees (bounded BFS up to max_depth, each packet tagged with `depth`), outgoing reference/import edges, and an explicit call chain when target_symbol_id or target_query is supplied.".to_string(),
         capability: PermissionCapability::Read,
         parameters: json!({
             "type": "object",

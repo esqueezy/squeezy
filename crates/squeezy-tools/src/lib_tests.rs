@@ -2879,6 +2879,207 @@ async fn graph_navigation_tools_return_unsupported_language_fallback() {
 }
 
 #[tokio::test]
+async fn definition_search_reference_search_and_downstream_flow_resolve_targets() {
+    let root = temp_workspace("graph_definition_reference_downstream");
+    write_rust_crate(
+        &root,
+        r#"
+pub mod service {
+    pub fn entry() {
+        crate::pipeline::stage_one();
+    }
+}
+
+pub mod pipeline {
+    pub fn stage_one() {
+        stage_two();
+    }
+
+    pub fn stage_two() {
+        complete();
+    }
+
+    pub fn complete() {}
+}
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let definition = registry
+        .execute(
+            ToolCall {
+                call_id: "definition".to_string(),
+                name: "definition_search".to_string(),
+                arguments: json!({"query": "stage_one"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(definition.status, ToolStatus::Success);
+    let first_definition = &definition.content["packets"][0];
+    assert_uniform_evidence_packet(first_definition);
+    let stage_one_id = first_definition["symbol"]["id"]
+        .as_str()
+        .expect("definition packet carries a symbol id")
+        .to_string();
+    assert_eq!(
+        first_definition["next_action"]["tool"].as_str(),
+        Some("read_slice"),
+        "definition_search must point at read_slice for the exact declaration"
+    );
+
+    let reference_by_text = registry
+        .execute(
+            ToolCall {
+                call_id: "reference_text".to_string(),
+                name: "reference_search".to_string(),
+                arguments: json!({"text": "stage_one"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(reference_by_text.status, ToolStatus::Success);
+    let text_packets = reference_by_text.content["packets"]
+        .as_array()
+        .expect("reference_search packets");
+    assert!(
+        text_packets
+            .iter()
+            .any(|packet| packet["reference"]["text"].as_str() == Some("stage_one")),
+        "text-mode reference_search must surface lexical hits, got {text_packets:?}"
+    );
+
+    let reference_by_symbol = registry
+        .execute(
+            ToolCall {
+                call_id: "reference_symbol".to_string(),
+                name: "reference_search".to_string(),
+                arguments: json!({"symbol_id": stage_one_id}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(reference_by_symbol.status, ToolStatus::Success);
+    let symbol_packets = reference_by_symbol.content["packets"]
+        .as_array()
+        .expect("reference_search packets");
+    assert!(
+        !symbol_packets.is_empty(),
+        "symbol-bound reference_search must return at least one reference for stage_one"
+    );
+    for packet in symbol_packets {
+        assert_uniform_evidence_packet(packet);
+    }
+
+    let downstream_bfs = registry
+        .execute(
+            ToolCall {
+                call_id: "downstream_bfs".to_string(),
+                name: "downstream_flow".to_string(),
+                arguments: json!({"query": "stage_one", "max_depth": 2}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(downstream_bfs.status, ToolStatus::Success);
+    let bfs_packets = downstream_bfs.content["packets"]
+        .as_array()
+        .expect("downstream_flow packets");
+    let depths = bfs_packets
+        .iter()
+        .filter_map(|packet| packet["depth"].as_u64())
+        .collect::<Vec<_>>();
+    assert!(
+        depths.contains(&1) && depths.contains(&2),
+        "BFS at max_depth=2 must surface both depth 1 (stage_one→stage_two) and depth 2 (stage_two→complete), got depths {depths:?}"
+    );
+
+    let entry_definition = registry
+        .execute(
+            ToolCall {
+                call_id: "entry_def".to_string(),
+                name: "definition_search".to_string(),
+                arguments: json!({"query": "entry"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    let entry_id = entry_definition.content["packets"][0]["symbol"]["id"]
+        .as_str()
+        .expect("entry symbol id")
+        .to_string();
+
+    let downstream_chain = registry
+        .execute(
+            ToolCall {
+                call_id: "downstream_chain".to_string(),
+                name: "downstream_flow".to_string(),
+                arguments: json!({
+                    "symbol_id": entry_id,
+                    "target_query": "complete",
+                    "max_depth": 5,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(downstream_chain.status, ToolStatus::Success);
+    let chain_packets = downstream_chain.content["packets"]
+        .as_array()
+        .expect("downstream_flow chain packets");
+    assert!(
+        chain_packets.iter().any(|packet| packet["claim"]
+            .as_str()
+            .unwrap_or("")
+            .contains("call chain found")),
+        "downstream_flow with target_query must emit a call_chain packet, got {chain_packets:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn upstream_flow_truncates_when_callers_exceed_max_results() {
+    let root = temp_workspace("graph_upstream_truncation");
+    write_rust_crate(
+        &root,
+        r#"
+pub fn target() {}
+
+pub fn caller_a() { target(); }
+pub fn caller_b() { target(); }
+pub fn caller_c() { target(); }
+pub fn caller_d() { target(); }
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let upstream = registry
+        .execute(
+            ToolCall {
+                call_id: "upstream_truncated".to_string(),
+                name: "upstream_flow".to_string(),
+                arguments: json!({"query": "target", "kind": "function", "max_results": 2}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(upstream.status, ToolStatus::Success);
+    assert_eq!(
+        upstream.content["truncated"].as_bool(),
+        Some(true),
+        "upstream_flow must report truncated=true when callers exceed max_results"
+    );
+    assert_eq!(
+        upstream.content["packets"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert!(upstream.cost_hint.truncated);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn skill_tools_list_metadata_and_load_body() {
     let root = temp_workspace("skill_tools");
     write_skill(&root.join(".agents/skills/rust-nav"), "rust-nav");
