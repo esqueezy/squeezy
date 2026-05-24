@@ -932,6 +932,132 @@ async fn apply_patch_warns_for_paths_outside_impact_neighborhood() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn apply_patch_partial_failure_records_checkpoint_for_undo() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_workspace("apply_patch_partial_failure");
+    fs::write(root.join("first.txt"), "first-before\n").expect("write first");
+    fs::write(root.join("second.txt"), "second-before\n").expect("write second");
+    let read_only = root.join("second.txt");
+    let mut perms = fs::metadata(&read_only).expect("read meta").permissions();
+    perms.set_mode(0o444);
+    fs::set_permissions(&read_only, perms).expect("set readonly");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_partial".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [
+                        {
+                            "path": "first.txt",
+                            "search": "first-before\n",
+                            "replace": "first-after\n",
+                            "expected_sha256": sha256_hex("first-before\n".as_bytes())
+                        },
+                        {
+                            "path": "second.txt",
+                            "search": "second-before\n",
+                            "replace": "second-after\n",
+                            "expected_sha256": sha256_hex("second-before\n".as_bytes())
+                        }
+                    ]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-partial".to_string(),
+        )
+        .await;
+
+    // Restore writable perms so cleanup works regardless of how the platform
+    // reacts to the read-only target.
+    if let Ok(meta) = fs::metadata(&read_only) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o644);
+        let _ = fs::set_permissions(&read_only, perms);
+    }
+
+    if result.status == ToolStatus::Error {
+        assert!(
+            result.content.get("checkpoint").is_some(),
+            "expected partial-failure result to carry a checkpoint, got: {}",
+            result.content
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("first.txt")).unwrap(),
+            "first-after\n",
+            "first file should have been written before the second failed"
+        );
+        let undo = registry
+            .execute(
+                ToolCall {
+                    call_id: "undo_partial".to_string(),
+                    name: "checkpoint_undo".to_string(),
+                    arguments: json!({}),
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(undo.status, ToolStatus::Success);
+        assert_eq!(
+            fs::read_to_string(root.join("first.txt")).unwrap(),
+            "first-before\n",
+            "checkpoint_undo should restore the partial mutation"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("second.txt")).unwrap(),
+            "second-before\n",
+            "second file should be unchanged after partial failure"
+        );
+    } else {
+        // Some sandboxes (e.g. CI running as root) ignore 0o444, in which case
+        // both writes succeed and the assertion above does not apply.
+        assert_eq!(result.status, ToolStatus::Success);
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_denies_secret_paths() {
+    let root = temp_workspace("apply_patch_secret");
+    fs::write(root.join(".env"), "KEY=val\n").expect("write env");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "patch_secret".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": ".env",
+                        "search": "KEY=val\n",
+                        "replace": "KEY=new\n",
+                        "expected_sha256": sha256_hex("KEY=val\n".as_bytes())
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Denied);
+    assert_eq!(result.content["path"], ".env");
+    assert_eq!(result.content["permission_denied"], true);
+    assert_eq!(
+        fs::read_to_string(root.join(".env")).unwrap(),
+        "KEY=val\n",
+        ".env must not be modified by a denied patch"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn secret_name_checks_use_workspace_relative_paths() {
     let root = temp_workspace("secret_parent");

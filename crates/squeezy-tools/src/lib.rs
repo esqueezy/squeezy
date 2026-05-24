@@ -1823,22 +1823,21 @@ impl ToolRegistry {
             Err(err) => return tool_arg_error(call, err),
         };
         let registry = self.clone();
-        let call = call.clone();
-        tokio::task::spawn_blocking(move || registry.execute_plan_patch_blocking(&call, args))
-            .await
-            .unwrap_or_else(|err| {
-                make_result(
-                    &ToolCall {
-                        call_id: String::new(),
-                        name: "plan_patch".to_string(),
-                        arguments: Value::Null,
-                    },
-                    ToolStatus::Error,
-                    json!({ "error": format!("plan_patch join failed: {err}") }),
-                    ToolCostHint::default(),
-                    None,
-                )
-            })
+        let call_for_error = call.clone();
+        let call_for_blocking = call.clone();
+        tokio::task::spawn_blocking(move || {
+            registry.execute_plan_patch_blocking(&call_for_blocking, args)
+        })
+        .await
+        .unwrap_or_else(|err| {
+            make_result(
+                &call_for_error,
+                ToolStatus::Error,
+                json!({ "error": format!("plan_patch join failed: {err}") }),
+                ToolCostHint::default(),
+                None,
+            )
+        })
     }
 
     fn execute_plan_patch_blocking(&self, call: &ToolCall, args: PlanPatchArgs) -> ToolResult {
@@ -1865,28 +1864,42 @@ impl ToolRegistry {
         };
         let Some(manager) = graph.as_mut() else {
             let locality = patch_locality_json(&candidate_paths, &BTreeSet::new());
+            let plan_id = patch_plan_id(&call.arguments, &candidate_paths);
+            let next_action = if candidate_paths.is_empty() {
+                json!({
+                    "tool": "decl_search",
+                    "arguments_template": {
+                        "query": args.query.as_deref().unwrap_or("<symbol or text>")
+                    },
+                    "reason": "semantic graph is unavailable; widen the search with decl_search or grep before patching",
+                    "fallback_tools": ["decl_search", "grep"]
+                })
+            } else {
+                patch_next_action(&candidate_paths, plan_id.clone())
+            };
             return make_result(
                 call,
                 ToolStatus::Success,
                 json!({
                     "tool": "plan_patch",
+                    "status": "graph_unavailable",
                     "graph_available": false,
                     "reason": "semantic graph is unavailable for this workspace",
                     "objective": args.objective,
                     "patch_format": "search_replace",
-                    "plan_id": patch_plan_id(&call.arguments, &candidate_paths),
+                    "plan_id": plan_id,
                     "impact": {
                         "neighborhood_paths": candidate_paths.iter().cloned().collect::<Vec<_>>(),
                         "fallback": {
                             "status": "graph_unavailable",
                             "suggested_tools": [
-                                {"tool": "grep", "arguments": {"pattern": args.query.as_deref().unwrap_or("<query>"), "output_mode": "files_with_matches"}},
-                                {"tool": "read_file", "arguments": {"path": "<candidate-path>"}}
+                                {"tool": "grep", "arguments_template": {"pattern": args.query.as_deref().unwrap_or("<query>"), "output_mode": "files_with_matches"}},
+                                {"tool": "read_file", "arguments_template": {"path": "<candidate-path>"}}
                             ]
                         }
                     },
                     "locality": locality,
-                    "next_action": patch_next_action(&candidate_paths, patch_plan_id(&call.arguments, &candidate_paths)),
+                    "next_action": next_action,
                 }),
                 ToolCostHint::default(),
                 None,
@@ -1897,17 +1910,16 @@ impl ToolRegistry {
             Err(err) => return tool_error(call, err),
         };
         let graph = manager.graph();
-        let symbols = resolve_definition_candidates(
+        let mut symbols = resolve_definition_candidates(
             graph,
             args.symbol_id.as_deref(),
             args.query.as_deref(),
             args.kind.as_deref(),
             args.path.as_deref(),
             None,
-        )
-        .into_iter()
-        .take(max_symbols)
-        .collect::<Vec<_>>();
+        );
+        let symbols_truncated = symbols.len() > max_symbols;
+        symbols.truncate(max_symbols);
 
         let mut direct_paths = BTreeSet::new();
         let mut reference_paths = BTreeSet::new();
@@ -1994,10 +2006,19 @@ impl ToolRegistry {
             }),
         );
         payload.insert("locality".to_string(), locality);
-        payload.insert(
-            "next_action".to_string(),
-            patch_next_action(&neighborhood, plan_id),
-        );
+        let next_action = if symbols.is_empty() && neighborhood.is_empty() {
+            json!({
+                "tool": "decl_search",
+                "arguments_template": {
+                    "query": args.query.as_deref().unwrap_or("<symbol or text>")
+                },
+                "reason": "plan_patch found no graph evidence; widen the search with decl_search or fall back to grep before patching",
+                "fallback_tools": ["decl_search", "grep"]
+            })
+        } else {
+            patch_next_action(&neighborhood, plan_id)
+        };
+        payload.insert("next_action".to_string(), next_action);
 
         make_result(
             call,
@@ -2005,7 +2026,7 @@ impl ToolRegistry {
             Value::Object(payload),
             ToolCostHint {
                 matches_returned: symbols.len() as u64,
-                truncated: symbols.len() >= max_symbols,
+                truncated: symbols_truncated,
                 ..ToolCostHint::default()
             },
             None,
@@ -3307,28 +3328,32 @@ impl ToolRegistry {
                     None,
                 );
             }
-            let path = match self.resolve_for_write(&patch.path) {
+            let path = match self.resolve_existing(&patch.path) {
                 Ok(path) => path,
-                Err(err) => return tool_error(call, err),
+                Err(err) => {
+                    return make_result(
+                        call,
+                        ToolStatus::Error,
+                        json!({
+                            "error": format!("search-replace patches require an existing file: {err}"),
+                            "path": patch.path,
+                        }),
+                        ToolCostHint::default(),
+                        None,
+                    );
+                }
             };
-            if !path.exists() {
-                return make_result(
-                    call,
-                    ToolStatus::Error,
-                    json!({
-                        "error": "search-replace patches require an existing file",
-                        "path": patch.path,
-                    }),
-                    ToolCostHint::default(),
-                    None,
-                );
-            }
             let rel = self.relative(&path).to_string_lossy().replace('\\', "/");
             if is_secret_path(Path::new(&rel)) {
                 return make_result(
                     call,
                     ToolStatus::Denied,
-                    json!({ "error": "refusing to patch a likely secret file", "path": rel }),
+                    json!({
+                        "error": "refusing to patch a likely secret file",
+                        "path": rel,
+                        "permission_denied": true,
+                        "policy_denied": true,
+                    }),
                     ToolCostHint::default(),
                     None,
                 );
@@ -3450,16 +3475,16 @@ impl ToolRegistry {
             }));
         }
 
-        let mut content = json!({
-            "dry_run": dry_run,
-            "plan_id": args.plan_id,
-            "patch_format": "search_replace",
-            "operations": operations,
-            "files": changed_files,
-            "locality": locality,
-            "warnings": warnings,
-        });
         if dry_run {
+            let content = json!({
+                "dry_run": true,
+                "plan_id": args.plan_id,
+                "patch_format": "search_replace",
+                "operations": operations,
+                "files": changed_files,
+                "locality": locality,
+                "warnings": warnings,
+            });
             return make_result(
                 call,
                 ToolStatus::Success,
@@ -3477,14 +3502,61 @@ impl ToolRegistry {
             Ok(snapshot) => snapshot,
             Err(err) => return tool_error(call, err),
         };
+        let mut write_failure: Option<(String, String)> = None;
         for state in files.values() {
-            if state.before != state.current
-                && let Err(err) = fs::write(&state.path, state.current.as_bytes())
-            {
-                return tool_error(call, err);
+            if state.before == state.current {
+                continue;
+            }
+            if let Err(err) = fs::write(&state.path, state.current.as_bytes()) {
+                let rel = self
+                    .relative(&state.path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                write_failure = Some((rel, err.to_string()));
+                break;
             }
         }
         self.invalidate_diff_cache();
+        if let Some((failed_path, error)) = write_failure {
+            let mut error_content = json!({
+                "error": format!("failed to write {failed_path}: {error}"),
+                "failed_path": failed_path,
+                "plan_id": args.plan_id,
+                "patch_format": "search_replace",
+                "operations": operations,
+                "files": changed_files,
+                "locality": locality,
+                "warnings": warnings,
+            });
+            self.append_checkpoint_to_content(
+                &mut error_content,
+                &checkpoint_before,
+                call,
+                group_id,
+                ToolStatus::Error,
+                Vec::new(),
+            );
+            return make_result(
+                call,
+                ToolStatus::Error,
+                error_content,
+                ToolCostHint {
+                    bytes_read,
+                    output_bytes: bytes_written,
+                    ..ToolCostHint::default()
+                },
+                None,
+            );
+        }
+        let mut content = json!({
+            "dry_run": false,
+            "plan_id": args.plan_id,
+            "patch_format": "search_replace",
+            "operations": operations,
+            "files": changed_files,
+            "locality": locality,
+            "warnings": warnings,
+        });
         self.append_checkpoint_to_content(
             &mut content,
             &checkpoint_before,
@@ -6778,12 +6850,67 @@ fn codeowner_matches(root: &Path, paths: &BTreeSet<String>) -> Vec<Value> {
 }
 
 fn codeowner_pattern_matches(pattern: &str, path: &str) -> bool {
-    pattern == "*"
-        || path == pattern.trim_start_matches('/')
-        || path.ends_with(pattern.trim_start_matches('/'))
-        || pattern
-            .strip_suffix('*')
-            .is_some_and(|prefix| path.starts_with(prefix.trim_start_matches('/')))
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern == "*" {
+        return true;
+    }
+    let anchored = pattern.starts_with('/');
+    let bare = pattern.trim_start_matches('/');
+    let bare = bare.trim_end_matches('/');
+    if bare.is_empty() {
+        return false;
+    }
+    let has_glob_meta = bare.contains(['*', '?', '[']);
+    if !has_glob_meta {
+        if anchored {
+            return path == bare || path.starts_with(&format!("{bare}/"));
+        }
+        if path == bare {
+            return true;
+        }
+        for (idx, _) in path.match_indices(bare) {
+            let before_ok = idx == 0 || path.as_bytes().get(idx - 1) == Some(&b'/');
+            let after = &path[idx + bare.len()..];
+            let after_ok = after.is_empty() || after.starts_with('/');
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        return false;
+    }
+    let mut builder = GlobSetBuilder::new();
+    let primary = if anchored {
+        bare.to_string()
+    } else {
+        format!("**/{bare}")
+    };
+    let Ok(primary_glob) = Glob::new(&primary) else {
+        return false;
+    };
+    builder.add(primary_glob);
+    if !anchored
+        && !bare.contains('/')
+        && let Ok(extra) = Glob::new(bare)
+    {
+        builder.add(extra);
+    }
+    if !bare.ends_with("/**") {
+        let trailing = if anchored {
+            format!("{bare}/**")
+        } else {
+            format!("**/{bare}/**")
+        };
+        if let Ok(glob) = Glob::new(&trailing) {
+            builder.add(glob);
+        }
+    }
+    builder
+        .build()
+        .map(|set| set.is_match(path))
+        .unwrap_or(false)
 }
 
 fn verify_scope_str(scope: VerifyScope) -> &'static str {
@@ -9652,8 +9779,8 @@ fn apply_patch_spec() -> ToolSpec {
                         "properties": {
                             "path": {"type": "string", "description": "Workspace-relative path to an existing file."},
                             "search": {"type": "string", "description": "Exact current text to replace."},
-                            "replace": {"type": "string", "description": "Replacement text."},
-                            "expected_sha256": {"type": "string", "description": "sha256 of the current file content from read_file/read_slice context."},
+                            "replace": {"type": "string", "description": "Replacement text. Pass an empty string to delete the matched range."},
+                            "expected_sha256": {"type": "string", "description": "sha256 of the file as currently on disk (from read_file/read_slice). The same on-disk hash is used for every patch block that targets the file in a single call; do not pass the post-patch hash for later blocks."},
                             "allow_multiple": {"type": "boolean", "description": "When true, replace every occurrence of search. Default false requires exactly one match."}
                         },
                         "required": ["path", "search", "replace", "expected_sha256"]
