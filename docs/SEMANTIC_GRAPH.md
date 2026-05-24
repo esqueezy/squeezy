@@ -130,6 +130,24 @@ can be benchmarked without sending paths or source text. Telemetry callers use
 these reports for one-shot graph build events and repeated graph refresh events
 without sending paths or source text.
 
+## Compiler Facts
+
+Cargo is an explicit fact-refresh source, not a navigation dependency. The
+`refresh_compiler_facts` tool is permission-scoped as `compiler` and runs
+`cargo metadata --format-version=1 --no-deps`; when requested, it also runs
+`cargo check --message-format=json` to cache diagnostics. Navigation tools do
+not invoke cargo. They only read the cached compiler facts already attached to
+the in-memory graph.
+
+The cargo fact cache records workspace, package, target, and feature nodes from
+metadata, plus compiler diagnostics from JSON check output. Each batch stores
+command provenance, cargo/rustc versions when available, capture time, and an
+input fingerprint derived from Cargo manifests, lock/config files visible to the
+graph, toolchain files such as `rust-toolchain.toml`, `build.rs` scripts, and
+Rust source hashes. If those inputs change after refresh, the
+`symbol_context.diagnostics` field still surfaces the cached diagnostics but
+marks them stale via the per-hit freshness verdict.
+
 ## Traversal Surface
 
 The in-memory graph supports:
