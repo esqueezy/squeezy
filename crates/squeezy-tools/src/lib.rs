@@ -4933,11 +4933,11 @@ impl ToolRegistry {
         let redacted = self.redactor.redact(&result);
         let (quote, output_truncated) = truncate_to_bytes(&redacted.text, output_byte_cap);
         let quote_sha256 = sha256_hex(quote.as_bytes());
-        let stable_output_sha256 = web_search_stable_output_sha256(
+        let stable_output_sha256 = web_stable_output_sha256(
+            "websearch",
             &request_sha256,
             &response_sha256,
             &quote_sha256,
-            &source_urls,
         );
         let quote_bytes = quote.len();
         let citations = web_citations_json(
@@ -5117,9 +5117,9 @@ impl ToolRegistry {
                 let quote_sha256 = sha256_hex(content.as_bytes());
                 let request_sha256 =
                     web_fetch_request_sha256(&requested_url, format.as_str(), max_response_bytes);
-                let stable_output_sha256 = web_fetch_stable_output_sha256(
-                    &final_url,
-                    format.as_str(),
+                let stable_output_sha256 = web_stable_output_sha256(
+                    "webfetch",
+                    &request_sha256,
                     &content_sha256,
                     &quote_sha256,
                 );
@@ -5877,6 +5877,7 @@ fn enforce_web_quote_limit(mut result: ToolResult) -> ToolResult {
     let quote_truncated = was_truncated || limit_truncated;
     let quote_bytes = quote.len();
     let quote_sha256 = sha256_hex(quote.as_bytes());
+    let tool_name = result.tool_name.clone();
 
     let Some(object) = result.content.as_object_mut() else {
         return result;
@@ -5901,11 +5902,10 @@ fn enforce_web_quote_limit(mut result: ToolResult) -> ToolResult {
         .get_mut("cache_receipt")
         .and_then(Value::as_object_mut)
     {
-        cache_receipt.insert("quote_sha256".to_string(), json!(quote_sha256.clone()));
         let kind = cache_receipt
             .get("kind")
             .and_then(Value::as_str)
-            .unwrap_or(result.tool_name.as_str())
+            .unwrap_or(tool_name.as_str())
             .to_string();
         let request_sha256 = cache_receipt
             .get("request_sha256")
@@ -5917,14 +5917,19 @@ fn enforce_web_quote_limit(mut result: ToolResult) -> ToolResult {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        cache_receipt.insert("quote_sha256".to_string(), json!(quote_sha256.clone()));
         cache_receipt.insert(
             "stable_output_sha256".to_string(),
-            json!(sha256_hex(format!(
-                "{kind}\0{request_sha256}\0{content_sha256}\0{quote_sha256}"
-            ))),
+            json!(web_stable_output_sha256(
+                &kind,
+                &request_sha256,
+                &content_sha256,
+                &quote_sha256,
+            )),
         );
     }
 
+    result.cost_hint.truncated = result.cost_hint.truncated || quote_truncated;
     let output = serde_json::to_vec(&result.content).unwrap_or_default();
     result.cost_hint.output_bytes = output.len() as u64;
     result.receipt.output_sha256 = sha256_hex(&output);
@@ -6147,26 +6152,14 @@ fn web_fetch_request_sha256(
     )
 }
 
-fn web_fetch_stable_output_sha256(
-    final_url: &str,
-    format: &str,
+fn web_stable_output_sha256(
+    kind: &str,
+    request_sha256: &str,
     content_sha256: &str,
     quote_sha256: &str,
 ) -> String {
     sha256_hex(format!(
-        "webfetch\0{final_url}\0{format}\0{content_sha256}\0{quote_sha256}"
-    ))
-}
-
-fn web_search_stable_output_sha256(
-    request_sha256: &str,
-    response_sha256: &str,
-    quote_sha256: &str,
-    source_urls: &[String],
-) -> String {
-    sha256_hex(format!(
-        "websearch\0{request_sha256}\0{response_sha256}\0{quote_sha256}\0{}",
-        source_urls.join("\0")
+        "{kind}\0{request_sha256}\0{content_sha256}\0{quote_sha256}"
     ))
 }
 

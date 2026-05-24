@@ -2877,6 +2877,29 @@ fn web_cache_receipt_status_marks_stale_entries() {
 }
 
 #[test]
+fn web_stable_output_sha256_is_deterministic_and_kind_scoped() {
+    let request = "request-hash";
+    let content = "content-hash";
+    let quote = "quote-hash";
+
+    let webfetch = web_stable_output_sha256("webfetch", request, content, quote);
+    let websearch = web_stable_output_sha256("websearch", request, content, quote);
+    let webfetch_again = web_stable_output_sha256("webfetch", request, content, quote);
+
+    assert_eq!(webfetch, webfetch_again);
+    assert_ne!(webfetch, websearch);
+    assert_eq!(webfetch.len(), 64);
+    assert_eq!(
+        web_stable_output_sha256("webfetch", request, "different-content", quote),
+        web_stable_output_sha256("webfetch", request, "different-content", quote)
+    );
+    assert_ne!(
+        webfetch,
+        web_stable_output_sha256("webfetch", request, "different-content", quote)
+    );
+}
+
+#[test]
 fn web_call_descriptions_include_host_and_query() {
     let root = temp_workspace("web_descriptions");
     let registry = ToolRegistry::new(&root).expect("registry");
@@ -3325,6 +3348,25 @@ async fn webfetch_quote_limit_is_enforced_after_redaction() {
     assert_eq!(result.content["quote_limit_bytes"], 64);
     assert!(result.content["quote_truncated"].as_bool().unwrap_or(false));
     assert!(result.cost_hint.redactions > 0);
+    assert!(
+        result.cost_hint.truncated,
+        "cost_hint.truncated must mirror quote_truncated"
+    );
+
+    let cache_receipt = result.content["cache_receipt"]
+        .as_object()
+        .expect("cache_receipt");
+    let request_sha = cache_receipt["request_sha256"]
+        .as_str()
+        .expect("request_sha256");
+    let content_sha = cache_receipt["content_sha256"]
+        .as_str()
+        .expect("content_sha256");
+    let quote_sha = cache_receipt["quote_sha256"]
+        .as_str()
+        .expect("quote_sha256");
+    let expected_stable = web_stable_output_sha256("webfetch", request_sha, content_sha, quote_sha);
+    assert_eq!(cache_receipt["stable_output_sha256"], expected_stable);
 
     let _ = fs::remove_dir_all(root);
 }
