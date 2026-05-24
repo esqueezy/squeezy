@@ -4183,7 +4183,7 @@ impl SeenToolOutputs {
                         content_sha256: seen.content_sha256.clone(),
                         model_output_bytes: seen.model_output_bytes,
                         created_unix_millis: unix_millis(),
-                        summary: seen.summary,
+                        summary: seen.summary.clone(),
                     });
                     if let Some(snapshot) = read_snapshot_from_result(&result.result, &seen) {
                         let _ = store.put_read_snapshot(&snapshot);
