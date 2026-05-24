@@ -239,7 +239,25 @@ async fn planner_probe_compares_enabled_and_disabled_runs() {
     assert_eq!(enabled.metrics.planner_turns, 1);
     assert!(enabled.metrics.planner_tool_calls > 0);
     assert_eq!(disabled.metrics.planner_turns, 0);
-    assert!(enabled.metrics.bytes_read < disabled.metrics.bytes_read);
+    // Compare a planner-specific invariant: when the planner is enabled the
+    // preflight block carries the deterministic navigation work, so the
+    // model itself should issue strictly fewer tool calls than the
+    // planner-off baseline. This avoids coupling the assertion to
+    // graph-tool byte counts, which would drift whenever the graph payload
+    // shape changes.
+    let enabled_model_calls = enabled
+        .metrics
+        .tool_calls
+        .saturating_sub(enabled.metrics.planner_tool_calls);
+    let disabled_model_calls = disabled
+        .metrics
+        .tool_calls
+        .saturating_sub(disabled.metrics.planner_tool_calls);
+    assert!(
+        enabled_model_calls < disabled_model_calls,
+        "planner-on should leave fewer model-issued tool calls than planner-off; \
+         enabled_model_calls={enabled_model_calls}, disabled_model_calls={disabled_model_calls}",
+    );
 }
 
 #[derive(Debug)]

@@ -31,7 +31,12 @@ model-facing tool output compact enough to be useful.
   first model request and routed through deterministic graph-first tool plans.
   The resulting evidence packets are inserted into the model input as ordinary
   tool results, and confident navigation turns refuse premature `read_file`
-  calls until graph context has been gathered.
+  calls until the planner's preflight block has executed (the planner is
+  advisory; the guard is lifted after preflight even if individual graph
+  tools returned non-`Success` statuses). The test-pairing plan's filesystem
+  glob (`**/*test*.rs`) is currently Rust-specific, in line with Squeezy's
+  Rust-first navigation scope; on non-Rust workspaces it produces an empty
+  result and is otherwise inert.
 - **Output spill previews.** Large tool outputs are written to a local
   content-addressed store. The model receives a compact preview plus a handle
   for fetching exact ranges. Spill previews also carry the original output

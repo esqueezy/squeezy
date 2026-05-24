@@ -740,17 +740,32 @@ impl LlmProvider for PlannerProbeProvider {
 fn first_expected_source_path(task: &TaskSpec) -> Option<String> {
     task.expect.contains.iter().find_map(|expected| {
         let value = expected.trim();
-        if value.ends_with(".rs")
-            || value.contains(".rs:")
-            || value.contains(".py")
-            || value.contains(".js")
-            || value.contains(".ts")
-        {
+        if looks_like_source_path(value) {
             Some(value.trim_end_matches(':').to_string())
         } else {
             None
         }
     })
+}
+
+/// Returns true when `value` looks like a path to a source file the
+/// planner-probe provider should ask `read_file` for. Matching is anchored
+/// at the trailing path segment so strings like `docs/typescript.md` or
+/// `copy.py-file` are not mistaken for `.ts` / `.py` paths.
+fn looks_like_source_path(value: &str) -> bool {
+    const SOURCE_EXTENSIONS: &[&str] = &["rs", "py", "js", "ts"];
+    let path_segment = match value.rsplit_once(['/', '\\']) {
+        Some((_, tail)) => tail,
+        None => value,
+    };
+    // Strip an optional `:line[:col]` suffix that some `expect.contains`
+    // entries use to point at a specific location (e.g. `src/lib.rs:42`).
+    let without_loc = path_segment.split(':').next().unwrap_or(path_segment);
+    let extension = match without_loc.rsplit_once('.') {
+        Some((_, ext)) => ext,
+        None => return false,
+    };
+    SOURCE_EXTENSIONS.contains(&extension)
 }
 
 fn trace_to_llm_event(event: TraceEvent) -> Result<LlmEvent> {

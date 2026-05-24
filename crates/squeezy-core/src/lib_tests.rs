@@ -329,6 +329,36 @@ fn config_can_select_anthropic_provider_defaults() {
 }
 
 #[test]
+fn config_disables_exploration_compiler_via_env_var() {
+    for value in ["off", "false", "0", "no", "disabled"] {
+        let config = AppConfig::from_env_vars(None, |name| match name {
+            "SQUEEZY_EXPLORATION_COMPILER" => Some(value.to_string()),
+            _ => None,
+        });
+        assert!(
+            !config.exploration_compiler,
+            "SQUEEZY_EXPLORATION_COMPILER={value:?} must disable the planner",
+        );
+    }
+}
+
+#[test]
+fn config_keeps_exploration_compiler_default_on_for_unknown_env_values() {
+    // The planner defaults to on, so non-disabling env-var values (typos, empty
+    // strings, or aliases like `enabled`) must not silently flip the default.
+    for value in ["", "enabled", "on", "yes", "true", "1", "garbage"] {
+        let config = AppConfig::from_env_vars(None, |name| match name {
+            "SQUEEZY_EXPLORATION_COMPILER" => Some(value.to_string()),
+            _ => None,
+        });
+        assert!(
+            config.exploration_compiler,
+            "SQUEEZY_EXPLORATION_COMPILER={value:?} should not silently disable the planner",
+        );
+    }
+}
+
+#[test]
 fn config_reads_anthropic_env_overrides() {
     let config = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_PROVIDER" => Some("claude".to_string()),

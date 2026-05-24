@@ -1330,7 +1330,7 @@ impl TurnRuntime {
         if let Some(plan) = exploration_plan.clone()
             && !plan.calls.is_empty()
         {
-            broker.metrics.planner_turns = 1;
+            broker.metrics.planner_turns += 1;
             broker.metrics.planner_tool_calls += plan.calls.len() as u64;
             self.log_event(
                 "exploration_plan",
@@ -1347,8 +1347,13 @@ impl TurnRuntime {
                 }),
             );
             let planned_calls = plan.calls;
+            let mut planner_items = planned_calls
+                .iter()
+                .cloned()
+                .map(|call| llm_function_call_item(call, &self.redactor))
+                .collect::<Vec<_>>();
             let results = execute_tool_calls(
-                planned_calls.clone(),
+                planned_calls,
                 ToolExecutionContext {
                     turn_id: self.turn_id,
                     provider: self.provider.clone(),
@@ -1369,6 +1374,11 @@ impl TurnRuntime {
                 &mut broker,
             )
             .await;
+            // The planner is advisory: once the preflight block has executed,
+            // the model has the planner outputs (success or not) in context, so
+            // we lift the raw-read guard to avoid locking the turn on misfires
+            // or non-`Success` graph results.
+            exploration_state.lock().await.mark_preflight_complete();
             let results = seen_tool_outputs.prepare_results(results);
             let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
             for pending in &results {
@@ -1385,11 +1395,6 @@ impl TurnRuntime {
                         output,
                     }
                 })
-                .collect::<Vec<_>>();
-            let mut planner_items = planned_calls
-                .iter()
-                .cloned()
-                .map(|call| llm_function_call_item(call, &self.redactor))
                 .collect::<Vec<_>>();
             planner_items.extend(outputs.clone());
             conversation.extend(planner_items.clone());
@@ -1851,7 +1856,7 @@ async fn handle_task_state_call(context: &ToolExecutionContext<'_>, call: &ToolC
 async fn exploration_read_denial_reason(
     context: &ToolExecutionContext<'_>,
     call: &ToolCall,
-) -> Option<String> {
+) -> Option<&'static str> {
     context
         .exploration_state
         .lock()

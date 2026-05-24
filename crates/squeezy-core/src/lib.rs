@@ -302,10 +302,19 @@ impl AppConfig {
                 ProviderConfig::OpenAi(_) | ProviderConfig::AzureOpenAi(_)
             );
         let agent_settings = settings.agent.unwrap_or_default();
-        let exploration_compiler = get_var("SQUEEZY_EXPLORATION_COMPILER")
-            .as_deref()
-            .map(parse_enabled_bool)
-            .unwrap_or(agent_settings.exploration_compiler.unwrap_or(true));
+        // The exploration compiler defaults to on, and the documented env-var
+        // override is `SQUEEZY_EXPLORATION_COMPILER=off|false|...`. Treating
+        // the variable as a disable-only override keeps the documented values
+        // working without silently flipping the default off on typos or empty
+        // strings, matching how `SQUEEZY_TELEMETRY` and `SQUEEZY_FEEDBACK`
+        // handle their own default-on flags.
+        let settings_exploration_compiler = agent_settings.exploration_compiler.unwrap_or(true);
+        let exploration_compiler_var = get_var("SQUEEZY_EXPLORATION_COMPILER");
+        let exploration_compiler = if parse_disabled_bool(exploration_compiler_var.as_deref()) {
+            false
+        } else {
+            settings_exploration_compiler
+        };
         let budgets = settings.budgets.unwrap_or_default();
         let max_parallel_tools = get_var("SQUEEZY_MAX_PARALLEL_TOOLS")
             .and_then(|value| value.parse::<usize>().ok())
