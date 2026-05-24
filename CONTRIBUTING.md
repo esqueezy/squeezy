@@ -128,7 +128,21 @@ For an HTML report:
 cargo llvm-cov --workspace --all-targets --html
 ```
 
-CI runs secret scanning, workflow linting, dependency policy checks, docs text linting, formatting, test-layout checks, clippy, tests, deterministic validation harness runners, coverage checks, and debug artifact builds on every pull request and every push to `main`. The dependency policy in `deny.toml` covers RustSec advisories, duplicate dependencies, license allow-lists, and registry/git source policy for the macOS targets and the Linux musl release target. The Linux job runs clippy, tests, harness validation, coverage, and artifact packaging against `x86_64-unknown-linux-musl`. The coverage step writes its text summary to the GitHub job summary.
+On every pull request and every push to `main`, CI runs:
+
+- secret scanning (`gitleaks`)
+- workflow linting (`actionlint`)
+- dependency policy (`cargo deny check --all-features`)
+- docs text linting (`typos`)
+- formatting (`cargo fmt --all -- --check`)
+- unit test layout (`scripts/check_test_layout.py`)
+- clippy (`cargo clippy --workspace --all-targets -- -D warnings`)
+- tests (`cargo test --workspace --all-targets`)
+- deterministic validation harness runners (`squeezy-harness`)
+- coverage summary (push-to-main and manual dispatch only)
+- debug artifact build and smoke-test
+
+The dependency policy in `deny.toml` covers RustSec advisories, duplicate dependencies, license allow-lists, and registry/git source policy for the macOS targets and the Linux musl release target. The Linux job runs clippy, tests, harness validation, coverage, and artifact packaging against `x86_64-unknown-linux-musl`. The coverage step writes its text summary to the GitHub job summary.
 
 Pushing a `v*` tag runs the release workflow. It builds and smoke-tests downloadable archives for `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-unknown-linux-musl`, uploads checksum files, and publishes a GitHub Release with generated notes. Dependabot tracks Cargo workspace dependencies, benchmark harness dependencies, and GitHub Actions updates weekly.
 

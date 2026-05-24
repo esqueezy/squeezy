@@ -12,11 +12,15 @@ on:
         type: string
 
 permissions:
-  actions: read
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
@@ -44,13 +48,10 @@ jobs:
       - name: Validate release tag
         shell: bash
         run: |
-          case "$RELEASE_TAG" in
-            v*) ;;
-            *)
-              echo "release tag must start with v: $RELEASE_TAG" >&2
-              exit 1
-              ;;
-          esac
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.+-]+)?$ ]]; then
+            echo "release tag must match vMAJOR.MINOR.PATCH[-PRERELEASE]: $RELEASE_TAG" >&2
+            exit 1
+          fi
 
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -75,6 +76,13 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Check dependency policy
+        uses: EmbarkStudios/cargo-deny-action@091bd13faf7e96935df105635d17ce9a607bc99d # v2
+        with:
+          rust-version: "1.93.1"
+          command: check
+          arguments: --all-features
 
       - name: Build release binary
         shell: bash
@@ -130,6 +138,8 @@ jobs:
     name: Publish GitHub Release
     needs: build-assets
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
 
     steps:
       - name: Download release archives
