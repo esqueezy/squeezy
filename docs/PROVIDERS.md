@@ -78,7 +78,7 @@ estimate assembled-request size without starting a model turn:
 | `azure_openai` | `gpt-5-nano` | 400,000 | 128,000 |
 | `anthropic` | `claude-haiku-4-5-20251001` | 200,000 | 64,000 |
 | `bedrock` | `anthropic.claude-haiku-4-5-20251001-v1:0` | 200,000 | 64,000 |
-| `google` | `gemini-2.5-flash-lite` | 1,048,576 | 65,535 |
+| `google` | `gemini-2.5-flash-lite` | 1,048,576 | 65,536 |
 | `ollama` | `qwen3` | Runtime | Runtime |
 
 Ollama limits are local model metadata. Squeezy tries `/api/show` and uses

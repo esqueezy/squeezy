@@ -165,11 +165,11 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
         }),
         limits: Some(ModelLimits {
             context_window_tokens: 1_048_576,
-            max_output_tokens: 65_535,
+            max_output_tokens: 65_536,
         }),
         tokenizer: TokenizerKind::Google,
         lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/2-5-flash-lite",
+        metadata_source: "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-lite",
     },
     ModelInfo {
         provider: "azure_openai",
