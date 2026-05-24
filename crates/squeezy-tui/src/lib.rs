@@ -1593,7 +1593,7 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
 /// Keys we surface in the approval prompt, in display order. The list
 /// matches the metadata emitted by `ToolRegistry::permission_request` so a
 /// future field becomes visible by adding it here AND in the tool
-/// registry; the doc in `docs/CONFIGURATION.md` references this contract.
+/// registry; the doc in `docs/external/CONFIGURATION.md` references this contract.
 pub(crate) const APPROVAL_PROMPT_KEYS: &[&str] = &[
     "server",
     "tool",

@@ -328,7 +328,7 @@ async fn slash_help_config_renders_citations_and_config() {
 
     assert_eq!(app.status, "help providers");
     let content = last_message_content(&app).expect("help transcript");
-    assert!(content.contains("docs/PROVIDERS.md"), "{content}");
+    assert!(content.contains("docs/external/PROVIDERS.md"), "{content}");
     assert!(content.contains("[model]"), "{content}");
     assert!(!content.contains("--api-key"), "{content}");
 }

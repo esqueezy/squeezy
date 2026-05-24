@@ -1008,7 +1008,10 @@ async fn squeezy_help_self_question_completes_without_provider_request() {
     assert!(provider.requests().is_empty());
     let completed = completed.expect("help turn should complete");
     assert!(completed.contains("Squeezy help"), "{completed}");
-    assert!(completed.contains("docs/PROVIDERS.md"), "{completed}");
+    assert!(
+        completed.contains("docs/external/PROVIDERS.md"),
+        "{completed}"
+    );
     assert!(completed.contains("[model]"), "{completed}");
 }
 

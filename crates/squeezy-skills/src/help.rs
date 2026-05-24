@@ -83,8 +83,8 @@ impl SqueezyHelp {
                 "Squeezy help is the first-line support path for questions about Squeezy itself. It answers from bundled docs and this run's redacted `config inspect` output before any model or network lookup.\n\nSupported topics:\n{topics}\n\nUse `/help <topic>` for a local answer. For broader or current public information, use {SQUEEZY_WEBSITE_URL} or {SQUEEZY_REPO_URL}; if external lookup tools are enabled, ask Squeezy to search public docs or the repo."
             ),
             citations: vec![
-                HelpCitation::DocsPath("docs/README.md".to_string()),
-                HelpCitation::DocsPath("docs/SKILLS.md".to_string()),
+                HelpCitation::DocsPath("docs/external/README.md".to_string()),
+                HelpCitation::DocsPath("docs/external/SKILLS.md".to_string()),
             ],
             config_sections: Vec::new(),
         }
@@ -193,6 +193,33 @@ struct ConfigSection {
 
 const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
+        id: "agent",
+        title: "agent approach, modes, tools, and local-first workflow",
+        aliases: &[
+            "agent",
+            "approach",
+            "how does squeezy work",
+            "how squeezy works",
+            "how it works",
+            "tool",
+            "tools",
+            "slash command",
+            "slash commands",
+            "plan mode",
+            "build mode",
+            "mode",
+            "/plan",
+            "/build",
+        ],
+        summary: "Squeezy is local-first: product-help questions are answered from bundled docs and redacted config, code-navigation questions prefer graph-backed tools before raw file reads, mutating work is gated by plan/build mode and permissions, and large tool outputs are compacted or spilled behind receipts.",
+        docs: &[
+            "docs/external/AGENT_APPROACH.md",
+            "docs/external/TOOLS.md",
+            "docs/external/CONFIGURATION.md",
+        ],
+        config: &["agent", "session", "tools", "budgets", "tui"],
+    },
+    TopicDefinition {
         id: "config",
         title: "configuration and source precedence",
         aliases: &[
@@ -204,7 +231,10 @@ const TOPICS: &[TopicDefinition] = &[
             "settings.toml",
         ],
         summary: "Squeezy merges built-in defaults, user settings, project `squeezy.toml`, per-repo user settings, environment variables, and CLI flags. `squeezy config inspect` prints the effective merged configuration with sensitive values redacted, and `squeezy --health` validates the configuration and prints the source chain.",
-        docs: &["docs/CONFIGURATION.md", "docs/REPO_PROFILE.md"],
+        docs: &[
+            "docs/external/CONFIGURATION.md",
+            "docs/external/REPO_PROFILE.md",
+        ],
         config: &[
             "model",
             "session",
@@ -238,7 +268,10 @@ const TOPICS: &[TopicDefinition] = &[
             "api-key",
         ],
         summary: "Provider selection is configuration-driven. Squeezy supports built-in OpenAI, Anthropic, Google Gemini, Azure OpenAI, Ollama, and Bedrock provider metadata. API key settings name environment variables; `config inspect` redacts secret-looking values and provider key names where appropriate.",
-        docs: &["docs/PROVIDERS.md", "docs/CONFIGURATION.md"],
+        docs: &[
+            "docs/external/PROVIDERS.md",
+            "docs/external/CONFIGURATION.md",
+        ],
         config: &["model", "providers.*"],
     },
     TopicDefinition {
@@ -257,7 +290,10 @@ const TOPICS: &[TopicDefinition] = &[
             "deny",
         ],
         summary: "Squeezy separates permission policy from OS shell sandboxing. Permissions decide whether read, edit, shell, web, and MCP operations may start. The shell sandbox is defense in depth for approved commands and can run in required, best-effort, or off modes.",
-        docs: &["docs/SHELL_SANDBOXING.md", "docs/CONFIGURATION.md"],
+        docs: &[
+            "docs/external/SHELL_SANDBOXING.md",
+            "docs/external/CONFIGURATION.md",
+        ],
         config: &["permissions", "permissions.shell_sandbox"],
     },
     TopicDefinition {
@@ -274,7 +310,7 @@ const TOPICS: &[TopicDefinition] = &[
             "squeezy help",
         ],
         summary: "User and project skills are local `SKILL.md` directories that inject specialized instructions only when activated. Built-in Squeezy help is separate: `/help <topic>` answers product questions from the bundled docs and config inspect output without granting tools or changing permissions.",
-        docs: &["docs/SKILLS.md"],
+        docs: &["docs/external/SKILLS.md"],
         config: &["skills"],
     },
     TopicDefinition {
@@ -290,7 +326,7 @@ const TOPICS: &[TopicDefinition] = &[
             "session-export",
         ],
         summary: "Squeezy stores local session logs when configured, including resumable conversation state, redacted events, cost metrics, and session metadata. The TUI has slash commands for listing, showing, resuming, exporting, reporting, and cleaning up sessions.",
-        docs: &["docs/SESSIONS.md"],
+        docs: &["docs/external/SESSIONS.md"],
         config: &["session"],
     },
     TopicDefinition {
@@ -308,7 +344,10 @@ const TOPICS: &[TopicDefinition] = &[
             "secrets",
         ],
         summary: "Feedback and bug reports are consented support paths. Squeezy prepares redacted previews before sending, keeps report archives bounded, and uses the redaction policy to scrub known secret formats and configured custom patterns.",
-        docs: &["docs/FEEDBACK.md", "docs/CONFIGURATION.md"],
+        docs: &[
+            "docs/external/FEEDBACK.md",
+            "docs/external/CONFIGURATION.md",
+        ],
         config: &["feedback", "redaction"],
     },
     TopicDefinition {
@@ -322,7 +361,10 @@ const TOPICS: &[TopicDefinition] = &[
             "product observability",
         ],
         summary: "Squeezy telemetry is anonymous product observability. It records runtime-level events and aggregate metrics, not prompts, completions, file contents, commands, URLs, repository names, paths, or environment values. It can be disabled in configuration.",
-        docs: &["docs/TELEMETRY.md", "docs/CONFIGURATION.md"],
+        docs: &[
+            "docs/external/TELEMETRY.md",
+            "docs/external/CONFIGURATION.md",
+        ],
         config: &["telemetry"],
     },
     TopicDefinition {
@@ -349,9 +391,9 @@ const TOPICS: &[TopicDefinition] = &[
         ],
         summary: "Squeezy uses tree-sitter backed semantic graph operations for declarations, references, hierarchy, flow, dependency paths, impact, and exact read slices. Unsupported languages fall back to ordinary bounded tools and must not fabricate graph confidence.",
         docs: &[
-            "docs/SEMANTIC_GRAPH.md",
-            "docs/LANGUAGES.md",
-            "docs/README.md",
+            "docs/external/AGENT_APPROACH.md",
+            "docs/external/TOOLS.md",
+            "docs/external/LANGUAGES.md",
         ],
         config: &["graph"],
     },
@@ -360,7 +402,7 @@ const TOPICS: &[TopicDefinition] = &[
         title: "checkpoints, undo, and revert",
         aliases: &["checkpoint", "checkpoints", "undo", "revert", "revert-turn"],
         summary: "Checkpoints preserve local before and after trees for agent edits. TUI commands expose checkpoint listing, checkpoint detail, undo of the latest checkpoint, and turn-level revert through the checkpoint tools.",
-        docs: &["docs/CHECKPOINTS.md"],
+        docs: &["docs/external/CHECKPOINTS.md"],
         config: &[],
     },
     TopicDefinition {
@@ -381,7 +423,11 @@ const TOPICS: &[TopicDefinition] = &[
             "dedupe",
         ],
         summary: "Squeezy treats model context as a budgeted resource. The runtime uses capped search/read tools, compact previews for large outputs, receipt stubs for repeated reads, aggregate result budgets, and prompt/cache accounting to reduce repeated context spend.",
-        docs: &["docs/tool-call-saving-strategy.md", "docs/CONFIGURATION.md"],
+        docs: &[
+            "docs/external/tool-call-saving-strategy.md",
+            "docs/external/AGENT_APPROACH.md",
+            "docs/external/CONFIGURATION.md",
+        ],
         config: &["budgets", "cache"],
     },
     TopicDefinition {
@@ -398,7 +444,10 @@ const TOPICS: &[TopicDefinition] = &[
             "lookup",
         ],
         summary: "Squeezy can configure MCP servers and permission-gated web tools, but built-in Squeezy help does not fetch the network automatically. External lookup belongs to explicit web or docs tooling when current public information is needed.",
-        docs: &["docs/CONFIGURATION.md", "README.md"],
+        docs: &[
+            "docs/external/MCP_AND_WEB.md",
+            "docs/external/CONFIGURATION.md",
+        ],
         config: &["web", "mcp.servers.*"],
     },
     TopicDefinition {
@@ -413,38 +462,97 @@ const TOPICS: &[TopicDefinition] = &[
             "linux",
             "install",
             "startup",
-            "mode",
-            "/plan",
-            "/build",
+            "troubleshooting",
+            "troubleshoot",
         ],
-        summary: "`squeezy --health` validates configuration without opening the TUI. The first supported platforms are macOS and Linux, and the TUI can start in build or plan mode through config or `--mode plan|build`; inside the TUI, `/plan` and `/build` switch session mode.",
-        docs: &["docs/PLATFORMS.md", "docs/CONFIGURATION.md"],
+        summary: "`squeezy --health` validates configuration without opening the TUI. The first supported platforms are macOS and Linux. For startup, provider, permission, graph, or local-help issues, run health and config inspection first.",
+        docs: &[
+            "docs/external/PLATFORMS.md",
+            "docs/external/TROUBLESHOOTING.md",
+            "docs/external/CONFIGURATION.md",
+        ],
         config: &["session", "tui"],
     },
 ];
 
-// Documentation paths cited in help answers. These are intentionally *not*
-// embedded into the binary via `include_str!`; the topic bodies use curated
-// `summary` strings and the renderer only emits the path as a citation, so
-// shipping the full corpus would add ~95 KB of unused bytes per CLI build.
-// Presence of each file is verified by a unit test in `lib_tests.rs` so a
-// renamed or deleted doc still fails CI.
-const BUNDLED_DOC_PATHS: &[&str] = &[
-    "README.md",
-    "docs/CHECKPOINTS.md",
-    "docs/CONFIGURATION.md",
-    "docs/FEEDBACK.md",
-    "docs/LANGUAGES.md",
-    "docs/PLATFORMS.md",
-    "docs/PROVIDERS.md",
-    "docs/REPO_PROFILE.md",
-    "docs/README.md",
-    "docs/SEMANTIC_GRAPH.md",
-    "docs/SESSIONS.md",
-    "docs/SHELL_SANDBOXING.md",
-    "docs/SKILLS.md",
-    "docs/TELEMETRY.md",
-    "docs/tool-call-saving-strategy.md",
+#[derive(Debug, Clone, Copy)]
+pub struct BundledDoc {
+    pub path: &'static str,
+    pub content: &'static str,
+}
+
+// The in-product help corpus is intentionally the external docs directory only.
+// Internal implementation, benchmark, and deployment notes stay out of normal
+// user help so answers remain user-focused.
+const BUNDLED_DOCS: &[BundledDoc] = &[
+    BundledDoc {
+        path: "docs/external/README.md",
+        content: include_str!("../../../docs/external/README.md"),
+    },
+    BundledDoc {
+        path: "docs/external/AGENT_APPROACH.md",
+        content: include_str!("../../../docs/external/AGENT_APPROACH.md"),
+    },
+    BundledDoc {
+        path: "docs/external/CHECKPOINTS.md",
+        content: include_str!("../../../docs/external/CHECKPOINTS.md"),
+    },
+    BundledDoc {
+        path: "docs/external/CONFIGURATION.md",
+        content: include_str!("../../../docs/external/CONFIGURATION.md"),
+    },
+    BundledDoc {
+        path: "docs/external/FEEDBACK.md",
+        content: include_str!("../../../docs/external/FEEDBACK.md"),
+    },
+    BundledDoc {
+        path: "docs/external/LANGUAGES.md",
+        content: include_str!("../../../docs/external/LANGUAGES.md"),
+    },
+    BundledDoc {
+        path: "docs/external/MCP_AND_WEB.md",
+        content: include_str!("../../../docs/external/MCP_AND_WEB.md"),
+    },
+    BundledDoc {
+        path: "docs/external/PLATFORMS.md",
+        content: include_str!("../../../docs/external/PLATFORMS.md"),
+    },
+    BundledDoc {
+        path: "docs/external/PROVIDERS.md",
+        content: include_str!("../../../docs/external/PROVIDERS.md"),
+    },
+    BundledDoc {
+        path: "docs/external/REPO_PROFILE.md",
+        content: include_str!("../../../docs/external/REPO_PROFILE.md"),
+    },
+    BundledDoc {
+        path: "docs/external/SESSIONS.md",
+        content: include_str!("../../../docs/external/SESSIONS.md"),
+    },
+    BundledDoc {
+        path: "docs/external/SHELL_SANDBOXING.md",
+        content: include_str!("../../../docs/external/SHELL_SANDBOXING.md"),
+    },
+    BundledDoc {
+        path: "docs/external/SKILLS.md",
+        content: include_str!("../../../docs/external/SKILLS.md"),
+    },
+    BundledDoc {
+        path: "docs/external/TELEMETRY.md",
+        content: include_str!("../../../docs/external/TELEMETRY.md"),
+    },
+    BundledDoc {
+        path: "docs/external/TOOLS.md",
+        content: include_str!("../../../docs/external/TOOLS.md"),
+    },
+    BundledDoc {
+        path: "docs/external/TROUBLESHOOTING.md",
+        content: include_str!("../../../docs/external/TROUBLESHOOTING.md"),
+    },
+    BundledDoc {
+        path: "docs/external/tool-call-saving-strategy.md",
+        content: include_str!("../../../docs/external/tool-call-saving-strategy.md"),
+    },
 ];
 
 fn parse_help_command(input: &str) -> Option<&str> {
@@ -687,7 +795,11 @@ fn starts_with_any(haystack: &str, prefixes: &[&str]) -> bool {
 }
 
 pub fn bundled_doc_paths() -> Vec<&'static str> {
-    BUNDLED_DOC_PATHS.to_vec()
+    BUNDLED_DOCS.iter().map(|doc| doc.path).collect()
+}
+
+pub fn bundled_docs() -> Vec<BundledDoc> {
+    BUNDLED_DOCS.to_vec()
 }
 
 /// Cheap predicate that returns true when [`SqueezyHelp::answer_for_input`] would

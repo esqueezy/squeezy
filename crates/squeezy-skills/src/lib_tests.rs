@@ -287,11 +287,9 @@ compat_user_dir = "/tmp/agent-skills"
             .config_sections
             .contains(&"providers.openai".to_string())
     );
-    assert!(
-        answer
-            .citations
-            .contains(&HelpCitation::DocsPath("docs/PROVIDERS.md".to_string()))
-    );
+    assert!(answer.citations.contains(&HelpCitation::DocsPath(
+        "docs/external/PROVIDERS.md".to_string()
+    )));
     assert!(
         answer
             .citations
@@ -402,6 +400,29 @@ fn squeezy_help_alias_routes_to_providers_topic() {
 }
 
 #[test]
+fn squeezy_help_routes_agent_approach_and_tool_questions() {
+    let help = SqueezyHelp::new("");
+
+    let approach = help
+        .answer_for_input("How does Squeezy work?")
+        .expect("approach answer");
+    assert_eq!(approach.status, HelpStatus::Answered);
+    assert_eq!(approach.topic, "agent");
+    assert!(approach.citations.contains(&HelpCitation::DocsPath(
+        "docs/external/AGENT_APPROACH.md".to_string()
+    )));
+
+    let tools = help
+        .answer_for_input("What tools does Squeezy have?")
+        .expect("tools answer");
+    assert_eq!(tools.status, HelpStatus::Answered);
+    assert_eq!(tools.topic, "agent");
+    assert!(tools.citations.contains(&HelpCitation::DocsPath(
+        "docs/external/TOOLS.md".to_string()
+    )));
+}
+
+#[test]
 fn extract_config_sections_wildcard_does_not_match_unrelated_prefix() {
     let inspect = r#"[providers.openai]
 api_key_env = "<redacted>"
@@ -494,16 +515,75 @@ fn bundled_doc_paths_exist_on_disk() {
 }
 
 #[test]
+fn bundled_docs_are_complete_external_corpus() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let bundled = help::bundled_docs();
+    let bundled_paths = bundled.iter().map(|doc| doc.path).collect::<BTreeSet<_>>();
+
+    for doc in &bundled {
+        assert!(
+            doc.path.starts_with("docs/external/"),
+            "bundled help doc must be external: {}",
+            doc.path
+        );
+        assert!(
+            !doc.content.trim().is_empty(),
+            "bundled help doc should embed content: {}",
+            doc.path
+        );
+    }
+
+    let external_docs = workspace_root.join("docs/external");
+    for entry in fs::read_dir(&external_docs).expect("read docs/external") {
+        let entry = entry.expect("external doc entry");
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(workspace_root)
+            .expect("relative doc")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            bundled_paths.contains(relative.as_str()),
+            "external doc should be bundled for help: {relative}"
+        );
+    }
+}
+
+#[test]
 fn squeezy_help_doc_citations_are_bundled_paths() {
     let bundled = help::bundled_doc_paths()
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let topics = [
+        "agent",
+        "config",
+        "providers",
+        "permissions",
+        "skills",
+        "sessions",
+        "feedback",
+        "telemetry",
+        "navigation",
+        "checkpoints",
+        "cost",
+        "mcp-web",
+        "health",
+    ];
     let help = SqueezyHelp::new("");
-    let answer = help.answer_topic("permissions");
 
-    for citation in answer.citations {
-        if let HelpCitation::DocsPath(path) = citation {
-            assert!(bundled.contains(path.as_str()), "missing {path}");
+    for topic in topics {
+        let answer = help.answer_topic(topic);
+        for citation in answer.citations {
+            if let HelpCitation::DocsPath(path) = citation {
+                assert!(bundled.contains(path.as_str()), "missing {path}");
+            }
         }
     }
 }

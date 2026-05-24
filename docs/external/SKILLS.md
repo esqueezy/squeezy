@@ -82,8 +82,9 @@ Squeezy also ships a built-in help surface for questions about Squeezy itself.
 This is separate from user and project `SKILL.md` directories.
 
 - Use `/help` in the TUI to list covered Squeezy help topics.
-- Use `/help <topic>` for a local answer grounded in bundled `docs/` files and
-  the current run's redacted `config inspect` output.
+- Use `/help <topic>` for a local answer grounded in bundled
+  `docs/external/` files and the current run's redacted `config inspect`
+  output.
 - Natural-language questions that clearly ask about Squeezy itself can be
   answered by the same local help path before model or MCP calls.
 - If the local corpus does not cover the topic, Squeezy refuses to guess and
