@@ -2109,7 +2109,7 @@ fn format_approval_menu_lines(
 
 fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
-    let header_height: u16 = if area.height >= 12 { 6 } else { 0 };
+    let header_height: u16 = if area.height >= 16 { 7 } else { 0 };
     let input_height = input_panel_height(app, area.width);
     let attachment_height = attachment_panel_height(app);
     let approval_height = approval_menu_height(app);
@@ -3452,11 +3452,11 @@ fn format_status_hints(app: &TuiApp) -> &'static str {
     if app.pending_approval.is_some() {
         "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Ctrl-C cancel"
     } else if app.cancel.is_some() {
-        "Ctrl-C/Esc cancel · Ctrl+J newline · Ctrl-P task · Ctrl-Y copy · /help"
+        "Ctrl-C/Esc cancel · Ctrl+J newline · Ctrl-P task · Ctrl-E expand/collapse · Ctrl-Y copy · /help"
     } else if app.exit_armed {
-        "Esc again to exit · Enter send · Ctrl+J newline · Ctrl-P task · Ctrl-E fold · /help"
+        "Esc again to exit · Enter send · Ctrl+J newline · Ctrl-P task · Ctrl-E expand/collapse · /help"
     } else {
-        "Enter send · Up/Down history or / menu · Ctrl+J newline · Shift+Up/Down transcript · /help · Esc quit"
+        "Enter send · Up/Down history/menu · Ctrl+J newline · Shift+Up/Down select · Ctrl-E expand/collapse · /help · Esc quit"
     }
 }
 

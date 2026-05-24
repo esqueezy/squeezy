@@ -2346,7 +2346,7 @@ pub struct ShellSandboxConfig {
 impl Default for ShellSandboxConfig {
     fn default() -> Self {
         Self {
-            mode: ShellSandboxMode::Required,
+            mode: ShellSandboxMode::BestEffort,
             network: ShellSandboxNetworkPolicy::DenyByDefault,
             audit: true,
             kill_grace_ms: 250,
@@ -4122,7 +4122,7 @@ pub fn user_settings_template() -> &'static str {
 # source = "project"
 
 # [permissions.shell_sandbox]
-# mode = "required"                 # required | best_effort | off
+# mode = "best_effort"              # best_effort | required | off
 # network = "deny_by_default"       # deny_by_default | allow_when_approved
 # audit = true
 # kill_grace_ms = 250

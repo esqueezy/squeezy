@@ -121,7 +121,7 @@ commented examples so that built-in defaults can evolve over time:
 # source = "project"
 
 # [permissions.shell_sandbox]
-# mode = "required"
+# mode = "best_effort"
 # network = "deny_by_default"
 # audit = true
 # kill_grace_ms = 250                          # bounded to 10..=60000
@@ -244,12 +244,15 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   LLM round-trip per ambiguous shell call, so leave it off unless that cost
   is acceptable.
 - `[permissions.shell_sandbox]`: OS sandbox settings for the local shell tool.
-  The default `mode = "required"` fails closed when a supported sandbox backend
-  is unavailable. macOS launches through `sandbox-exec` with a `(deny default)`
-  profile that re-allows reads under system prefixes and reads+writes inside
-  the workspace, tmp dirs, and toolchain caches (`$CARGO_HOME`, `$RUSTUP_HOME`,
-  `$HOME/.cargo`, `$HOME/.rustup`). `read_roots` and `write_roots` are
-  opt-in absolute directories layered on top of those defaults. `write_roots`
+  The default `mode = "best_effort"` uses a supported sandbox backend when one
+  can be applied, then falls back to the permission-gated direct runner when the
+  host blocks nested sandboxing. Set `mode = "required"` when an unavailable
+  backend should deny shell execution. macOS launches through `sandbox-exec`
+  with a `(deny default)` profile that re-allows reads under system prefixes and
+  reads+writes inside the workspace, tmp dirs, and toolchain caches
+  (`$CARGO_HOME`, `$RUSTUP_HOME`, `$HOME/.cargo`, `$HOME/.rustup`).
+  `read_roots` and `write_roots` are opt-in absolute directories layered on top
+  of those defaults. `write_roots`
   imply read access. Put shared project roots in `squeezy.toml`; put
   machine-specific roots in `~/.squeezy/projects/<repo-id>/settings.toml`.
   Linux probes

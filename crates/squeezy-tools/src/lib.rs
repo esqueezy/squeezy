@@ -8,7 +8,7 @@ use std::{
     path::{Component, Path, PathBuf},
     pin::Pin,
     process::Stdio,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -582,10 +582,20 @@ struct ShellSandboxPlan {
     filesystem_read_roots: Vec<PathBuf>,
     #[allow(dead_code)]
     filesystem_write_roots: Vec<PathBuf>,
+    fallback_reason: Option<String>,
 }
 
 impl ShellSandboxPlan {
     fn direct(command: &str, mode: ShellSandboxMode, config: &ShellSandboxConfig) -> Self {
+        Self::direct_with_fallback(command, mode, config, None)
+    }
+
+    fn direct_with_fallback(
+        command: &str,
+        mode: ShellSandboxMode,
+        config: &ShellSandboxConfig,
+        fallback_reason: Option<String>,
+    ) -> Self {
         Self {
             program: "sh".to_string(),
             args: vec!["-lc".to_string(), command.to_string()],
@@ -598,6 +608,7 @@ impl ShellSandboxPlan {
             configured_write_roots: config.write_roots.clone(),
             filesystem_read_roots: Vec::new(),
             filesystem_write_roots: Vec::new(),
+            fallback_reason,
         }
     }
 
@@ -610,6 +621,7 @@ impl ShellSandboxPlan {
             "required": self.required,
             "read_roots": path_list_json(&self.configured_read_roots),
             "write_roots": path_list_json(&self.configured_write_roots),
+            "fallback_reason": self.fallback_reason,
         })
     }
 }
@@ -4726,6 +4738,7 @@ impl ToolRegistry {
             ..ToolCostHint::default()
         };
         let exit_code = exit_status.as_ref().and_then(|status| status.code());
+        let exit_signal = shell_exit_signal(exit_status.as_ref());
         if sandbox_plan.required
             && shell_sandbox_runtime_unavailable(&sandbox_plan, exit_code, &stderr)
         {
@@ -4754,7 +4767,8 @@ impl ToolRegistry {
         } else {
             ToolStatus::Error
         };
-        let error = timed_out.then(|| format!("shell command timed out after {timeout_ms} ms"));
+        let termination = shell_termination_reason(timed_out, timeout_ms, exit_code, exit_signal);
+        let error = termination.clone();
         self.audit_shell(
             call,
             &args,
@@ -4781,6 +4795,8 @@ impl ToolRegistry {
             "command": args.command,
             "workdir": self.relative(&workdir).to_string_lossy(),
             "exit_code": exit_code,
+            "signal": exit_signal,
+            "termination": termination,
             "stdout": stdout,
             "stderr": stderr,
             "error": error,
@@ -9769,6 +9785,36 @@ fn make_result(
     }
 }
 
+fn shell_exit_signal(status: Option<&std::process::ExitStatus>) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.and_then(|status| status.signal())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+fn shell_termination_reason(
+    timed_out: bool,
+    timeout_ms: u64,
+    exit_code: Option<i32>,
+    exit_signal: Option<i32>,
+) -> Option<String> {
+    if timed_out {
+        return Some(format!("shell command timed out after {timeout_ms} ms"));
+    }
+    if exit_code.is_some() {
+        return None;
+    }
+    exit_signal
+        .map(|signal| format!("shell command terminated by signal {signal}"))
+        .or_else(|| Some("shell command ended without an exit code".to_string()))
+}
+
 fn tool_arg_error(call: &ToolCall, err: serde_json::Error) -> ToolResult {
     make_result(
         call,
@@ -9814,6 +9860,27 @@ fn shell_policy_denied(
     )
 }
 
+fn macos_sandbox_exec_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let path = Path::new("/usr/bin/sandbox-exec");
+            path.exists()
+                && std::process::Command::new(path)
+                    .args(["-p", "(version 1) (allow default)", "sh", "-lc", "true"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 fn prepare_shell_sandbox_plan(
     command: &str,
     analysis: &ShellPermissionAnalysis,
@@ -9825,7 +9892,7 @@ fn prepare_shell_sandbox_plan(
         analysis,
         root,
         config,
-        Path::new("/usr/bin/sandbox-exec").exists(),
+        macos_sandbox_exec_supported(),
         linux_unshare_supported(),
         linux_landlock_supported(),
     )
@@ -9864,6 +9931,10 @@ fn prepare_shell_sandbox_plan_with_probe(
         (ShellSandboxNetworkPolicy::DenyByDefault, true) => "denied_classified",
         _ => "denied",
     };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let fallback_reason: Option<String>;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let fallback_reason: Option<String> = None;
 
     #[cfg(target_os = "macos")]
     {
@@ -9886,13 +9957,14 @@ fn prepare_shell_sandbox_plan_with_probe(
                 configured_write_roots: config.write_roots.clone(),
                 filesystem_read_roots: Vec::new(),
                 filesystem_write_roots: Vec::new(),
+                fallback_reason: None,
             });
         }
+        let reason = "required shell sandbox unavailable: /usr/bin/sandbox-exec not found or cannot apply profiles";
         if required {
-            return Err(
-                "required shell sandbox unavailable: /usr/bin/sandbox-exec not found".to_string(),
-            );
+            return Err(reason.to_string());
         }
+        fallback_reason = Some(reason.to_string());
     }
 
     #[cfg(target_os = "linux")]
@@ -9913,7 +9985,8 @@ fn prepare_shell_sandbox_plan_with_probe(
                     }
                 ));
             }
-            // best_effort: fall through to a direct ShellSandboxPlan below.
+            fallback_reason =
+                Some("required shell sandbox unavailable: linux unshare failed".to_string());
         } else {
             let filesystem = if linux_landlock_available {
                 "enforced"
@@ -9942,6 +10015,7 @@ fn prepare_shell_sandbox_plan_with_probe(
                 } else {
                     Vec::new()
                 },
+                fallback_reason: None,
             });
         }
     }
@@ -9956,7 +10030,12 @@ fn prepare_shell_sandbox_plan_with_probe(
         }
     }
 
-    Ok(ShellSandboxPlan::direct(command, config.mode, config))
+    Ok(ShellSandboxPlan::direct_with_fallback(
+        command,
+        config.mode,
+        config,
+        fallback_reason,
+    ))
 }
 
 #[cfg(target_os = "macos")]

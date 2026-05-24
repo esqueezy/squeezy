@@ -72,7 +72,7 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
         "missing toggle hint: {status}",
     );
     assert!(
-        status.contains("Up/Down history or / menu"),
+        status.contains("Up/Down history/menu"),
         "missing collapse hint: {status}"
     );
 }
@@ -652,6 +652,29 @@ fn failed_tool_rows_fall_back_to_no_output_when_empty() {
 }
 
 #[test]
+fn failed_tool_rows_show_missing_exit_status_reason() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("shell", "");
+    result.status = ToolStatus::Error;
+    result.content = serde_json::json!({
+        "command": "cargo build --workspace",
+        "exit_code": null,
+        "signal": null,
+        "stdout": "",
+        "stderr": "",
+        "error": "shell command ended without an exit code",
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 140, 18);
+
+    assert!(
+        output.contains("✖ Failed shell · shell command ended without an exit code"),
+        "{output}"
+    );
+}
+
+#[test]
 fn denied_tool_rows_show_denial_reason() {
     let mut app = test_app(SessionMode::Build);
     let mut result = sample_tool_result("shell", "");
@@ -929,7 +952,7 @@ fn render_uses_two_line_status_footer() {
         available: true,
     };
 
-    let output = render_to_string(&app, 140, 14);
+    let output = render_to_string(&app, 140, 18);
     assert!(output.contains(">_ Squeezy v"), "{output}");
     assert!(output.contains("openai:gpt-test"), "{output}");
     assert!(output.contains("dir "), "{output}");
@@ -939,7 +962,7 @@ fn render_uses_two_line_status_footer() {
         "{output}"
     );
     assert!(!output.contains("ready"), "{output}");
-    assert!(output.contains("Up/Down history or / menu"), "{output}");
+    assert!(output.contains("Up/Down history/menu"), "{output}");
 }
 
 #[test]
@@ -974,7 +997,7 @@ fn render_keeps_header_when_transcript_has_content() {
     app.push_transcript_item(TranscriptItem::user("hello"));
     app.push_transcript_item(TranscriptItem::assistant("answer"));
 
-    let output = render_to_string(&app, 120, 16);
+    let output = render_to_string(&app, 120, 18);
     assert!(output.contains(">_ Squeezy v"), "{output}");
     assert!(output.contains("scripted:gpt-test"), "{output}");
     assert!(output.contains("> hello"), "{output}");
@@ -993,7 +1016,7 @@ fn render_prompt_uses_rotating_coin_and_cursor() {
 }
 
 #[test]
-fn active_prompt_starts_directly_below_header() {
+fn active_prompt_keeps_one_blank_line_after_header() {
     let app = test_app(SessionMode::Build);
 
     let output = render_to_string(&app, 100, 16);
@@ -1005,12 +1028,27 @@ fn active_prompt_starts_directly_below_header() {
 
     assert!(
         lines
+            .get(header_bottom + 1)
+            .is_some_and(|line| line.trim().is_empty()),
+        "{output}"
+    );
+    assert!(
+        lines
             .iter()
-            .skip(header_bottom + 1)
+            .skip(header_bottom + 2)
             .take(2)
             .any(|line| line.contains('┃')),
         "{output}"
     );
+}
+
+#[test]
+fn footer_mentions_expand_collapse_shortcut() {
+    let app = test_app(SessionMode::Build);
+
+    let output = render_to_string(&app, 120, 16);
+
+    assert!(output.contains("Ctrl-E expand/collapse"), "{output}");
 }
 
 #[test]

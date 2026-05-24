@@ -247,6 +247,16 @@ replace_sensitive_path_patterns = true
 }
 
 #[test]
+fn shell_sandbox_defaults_to_best_effort() {
+    let config = AppConfig::from_settings_and_env_vars(SettingsFile::default(), |_| None);
+
+    assert_eq!(
+        config.permissions.shell_sandbox.mode,
+        ShellSandboxMode::BestEffort
+    );
+}
+
+#[test]
 fn config_reads_supported_env_overrides() {
     let config = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_MODEL" => Some("custom-model".to_string()),

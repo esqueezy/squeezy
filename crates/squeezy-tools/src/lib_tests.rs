@@ -2272,6 +2272,32 @@ async fn shell_returns_bounded_output_and_exit_code() {
 }
 
 #[tokio::test]
+async fn shell_default_sandbox_runs_benign_command() {
+    let root = temp_workspace("shell_default_sandbox");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_default_shell".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf ok",
+                    "description": "check default shell sandbox posture"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["stdout"], "ok");
+    assert_eq!(result.content["sandbox"]["mode"], "best_effort");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn shell_workdir_accepts_configured_extra_root() {
     let root = temp_workspace("shell_extra_workdir");
     let extra = temp_workspace("shell_extra_root");
@@ -4724,6 +4750,7 @@ fn fake_sandbox_plan(backend: &'static str, required: bool) -> ShellSandboxPlan 
         configured_write_roots: Vec::new(),
         filesystem_read_roots: Vec::new(),
         filesystem_write_roots: Vec::new(),
+        fallback_reason: None,
     }
 }
 
@@ -4797,6 +4824,13 @@ fn shell_sandbox_plan_best_effort_when_sandbox_exec_absent() {
 
     assert_eq!(plan.backend, "none");
     assert_eq!(plan.mode, "best_effort");
+    assert!(
+        plan.fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("sandbox unavailable")),
+        "{:?}",
+        plan.fallback_reason
+    );
 }
 
 #[test]
@@ -4832,6 +4866,29 @@ fn shell_sandbox_plan_best_effort_when_userns_unavailable() {
 
     assert_eq!(plan.backend, "none");
     assert_eq!(plan.mode, "best_effort");
+    assert!(
+        plan.fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("linux unshare")),
+        "{:?}",
+        plan.fallback_reason
+    );
+}
+
+#[test]
+fn shell_termination_reason_reports_missing_exit_status() {
+    assert_eq!(
+        shell_termination_reason(false, 120_000, None, None).as_deref(),
+        Some("shell command ended without an exit code")
+    );
+    assert_eq!(
+        shell_termination_reason(false, 120_000, None, Some(9)).as_deref(),
+        Some("shell command terminated by signal 9")
+    );
+    assert_eq!(
+        shell_termination_reason(false, 120_000, Some(1), None),
+        None
+    );
 }
 
 #[test]
