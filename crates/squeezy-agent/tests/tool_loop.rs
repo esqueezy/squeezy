@@ -131,20 +131,17 @@ async fn plan_mode_advertises_only_read_only_tools() {
         tool_names,
         vec![
             "update_task_state",
-            "checkpoint_list",
-            "checkpoint_show",
+            "load_tool_schema",
+            "glob",
+            "grep",
+            "read_file",
+            "read_tool_output",
             "decl_search",
             "definition_search",
             "diff_context",
             "downstream_flow",
-            "glob",
-            "grep",
             "hierarchy",
-            "list_skills",
-            "load_skill",
-            "read_file",
             "read_slice",
-            "read_tool_output",
             "reference_search",
             "repo_map",
             "symbol_context",
@@ -156,7 +153,7 @@ async fn plan_mode_advertises_only_read_only_tools() {
 }
 
 #[tokio::test]
-async fn build_mode_advertises_full_tool_set() {
+async fn build_mode_advertises_core_tool_set_and_compact_index() {
     let root = temp_workspace("build_tools");
     let provider = Arc::new(ScriptedProvider::new(vec![vec![
         Ok(LlmEvent::Started),
@@ -172,12 +169,125 @@ async fn build_mode_advertises_full_tool_set() {
 
     let requests = provider.requests();
     let tool_names = tool_names(&requests[0]);
-    for expected in ["write_file", "shell", "verify", "webfetch", "websearch"] {
+    for expected in ["load_tool_schema", "write_file", "shell"] {
         assert!(
             tool_names.contains(&expected),
             "build mode should advertise {expected}: {tool_names:?}"
         );
     }
+    for hidden in ["verify", "webfetch", "websearch"] {
+        assert!(
+            !tool_names.contains(&hidden),
+            "build mode should leave {hidden} in the compact index: {tool_names:?}"
+        );
+    }
+    assert!(requests[0].instructions.contains("<tools_index>"));
+    assert!(requests[0].instructions.contains("webfetch"));
+    assert!(requests[0].instructions.contains("verify"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn discoverable_tool_schema_load_appends_full_schema_for_later_rounds() {
+    let root = temp_workspace("lazy_schema_load");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "load_websearch".to_string(),
+                name: "load_tool_schema".to_string(),
+                arguments: serde_json::json!({"name": "websearch"}),
+            })),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "load_webfetch".to_string(),
+                name: "load_tool_schema".to_string(),
+                arguments: serde_json::json!({"name": "webfetch"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_load".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("schemas loaded".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.web = PermissionMode::Allow;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("load web tools".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let first_names = tool_names(&requests[0]);
+    assert!(first_names.contains(&"load_tool_schema"));
+    assert!(!first_names.contains(&"websearch"));
+    assert!(!first_names.contains(&"webfetch"));
+    assert!(requests[0].instructions.contains("websearch"));
+    assert!(requests[0].instructions.contains("webfetch"));
+
+    let second_names = tool_names(&requests[1]);
+    assert!(
+        second_names.starts_with(&first_names),
+        "second request should append schemas without reordering: first={first_names:?} second={second_names:?}"
+    );
+    assert_eq!(
+        &second_names[second_names.len() - 2..],
+        &["websearch", "webfetch"]
+    );
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0].1["content"]["status"], "attached");
+    assert_eq!(outputs[1].1["content"]["status"], "attached");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_mode_refuses_disallowed_discoverable_schema_loads() {
+    let root = temp_workspace("lazy_schema_plan_refusal");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "load_webfetch".to_string(),
+                name: "load_tool_schema".to_string(),
+                arguments: serde_json::json!({"name": "webfetch"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_load".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("refused".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.session_mode = SessionMode::Plan;
+    config.permissions.web = PermissionMode::Allow;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("load webfetch".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(!tool_names(&requests[1]).contains(&"webfetch"));
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].1["status"], "Denied");
+    assert_eq!(outputs[0].1["content"]["status"], "refused");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1124,7 +1234,7 @@ async fn denied_webfetch_is_reported_and_does_not_open_network_connection() {
 }
 
 #[tokio::test]
-async fn approved_webfetch_validation_error_returns_to_model_and_web_tools_are_advertised() {
+async fn approved_webfetch_validation_error_returns_to_model_and_web_tools_are_indexed() {
     let root = temp_workspace("approved_webfetch_validation");
     let provider = Arc::new(ScriptedProvider::new(vec![
         vec![
@@ -1164,8 +1274,10 @@ async fn approved_webfetch_validation_error_returns_to_model_and_web_tools_are_a
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&"webfetch"));
-    assert!(tool_names.contains(&"websearch"));
+    assert!(!tool_names.contains(&"webfetch"));
+    assert!(!tool_names.contains(&"websearch"));
+    assert!(requests[0].instructions.contains("webfetch"));
+    assert!(requests[0].instructions.contains("websearch"));
     let outputs = function_outputs(&requests[1]);
     assert_eq!(outputs[0].0, "web_call");
     assert_eq!(outputs[0].1["status"], "Error");
