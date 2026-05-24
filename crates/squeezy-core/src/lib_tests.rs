@@ -82,6 +82,7 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert_eq!(config.permissions, PermissionPolicy::default());
     assert_eq!(config.session_mode, SessionMode::Build);
     assert!(!config.store_responses);
+    assert!(config.exploration_compiler);
     assert_eq!(config.max_parallel_tools, 8);
     assert_eq!(config.exa_mcp_url, DEFAULT_EXA_MCP_URL);
     assert_eq!(config.exa_api_key_env, DEFAULT_EXA_API_KEY_ENV);
@@ -110,6 +111,10 @@ fn config_without_env_uses_openai_provider_defaults() {
         config.max_search_files_per_turn,
         DEFAULT_MAX_SEARCH_FILES_PER_TURN
     );
+    assert_eq!(
+        config.context_compaction,
+        ContextCompactionConfig::default()
+    );
     assert_eq!(config.telemetry, TelemetryConfig::default());
     assert!(config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR));
     assert!(
@@ -125,6 +130,34 @@ fn config_without_env_uses_openai_provider_defaults() {
         }
         _ => panic!("expected OpenAI provider"),
     }
+}
+
+#[test]
+fn context_compaction_config_reads_settings_and_env() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[context]
+compaction_enabled = false
+compaction_estimated_tokens = 1234
+compaction_min_items = 7
+compaction_recent_items = 3
+compaction_max_summary_bytes = 4096
+"#,
+        "test",
+    )
+    .expect("settings");
+    let config = AppConfig::from_settings_and_env_vars(settings, |name| match name {
+        "SQUEEZY_CONTEXT_COMPACTION_ENABLED" => Some("true".to_string()),
+        "SQUEEZY_CONTEXT_COMPACTION_ESTIMATED_TOKENS" => Some("2048".to_string()),
+        _ => None,
+    });
+
+    assert!(config.context_compaction.enabled);
+    assert_eq!(config.context_compaction.estimated_tokens, 2048);
+    assert_eq!(config.context_compaction.min_items, 7);
+    assert_eq!(config.context_compaction.recent_items, 3);
+    assert_eq!(config.context_compaction.max_summary_bytes, 4096);
+    assert!(config.inspect_redacted().contains("[context]"));
 }
 
 #[test]
@@ -324,6 +357,36 @@ fn config_can_select_anthropic_provider_defaults() {
             assert_eq!(anthropic.base_url, DEFAULT_ANTHROPIC_BASE_URL);
         }
         _ => panic!("expected Anthropic provider"),
+    }
+}
+
+#[test]
+fn config_disables_exploration_compiler_via_env_var() {
+    for value in ["off", "false", "0", "no", "disabled"] {
+        let config = AppConfig::from_env_vars(None, |name| match name {
+            "SQUEEZY_EXPLORATION_COMPILER" => Some(value.to_string()),
+            _ => None,
+        });
+        assert!(
+            !config.exploration_compiler,
+            "SQUEEZY_EXPLORATION_COMPILER={value:?} must disable the planner",
+        );
+    }
+}
+
+#[test]
+fn config_keeps_exploration_compiler_default_on_for_unknown_env_values() {
+    // The planner defaults to on, so non-disabling env-var values (typos, empty
+    // strings, or aliases like `enabled`) must not silently flip the default.
+    for value in ["", "enabled", "on", "yes", "true", "1", "garbage"] {
+        let config = AppConfig::from_env_vars(None, |name| match name {
+            "SQUEEZY_EXPLORATION_COMPILER" => Some(value.to_string()),
+            _ => None,
+        });
+        assert!(
+            config.exploration_compiler,
+            "SQUEEZY_EXPLORATION_COMPILER={value:?} should not silently disable the planner",
+        );
     }
 }
 
@@ -920,6 +983,9 @@ reasoning_effort = "high"
 max_output_tokens = 512
 store_responses = true
 
+[agent]
+exploration_compiler = false
+
 [budgets]
 max_parallel_tools = 3
 tool_spill_threshold_bytes = 1000
@@ -996,6 +1062,7 @@ reason = "docs lookups are safe"
     assert_eq!(config.reasoning_effort, Some(ReasoningEffort::High));
     assert_eq!(config.max_output_tokens, Some(512));
     assert!(config.store_responses);
+    assert!(!config.exploration_compiler);
     assert_eq!(config.session_mode, SessionMode::Plan);
     assert_eq!(config.max_parallel_tools, 3);
     assert_eq!(config.tool_spill_threshold_bytes, 1000);
