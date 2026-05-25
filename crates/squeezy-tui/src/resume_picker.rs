@@ -42,6 +42,10 @@ pub(crate) struct SessionSummary {
     pub(crate) started_at_ms: u64,
     pub(crate) first_user_task: Option<String>,
     pub(crate) latest_summary: Option<String>,
+    /// User-turn count for the row's "(N prompts)" indicator. Sourced from
+    /// `SessionMetrics::turns` — when 0 we render "new session" so the row
+    /// reads naturally for sessions that recorded nothing.
+    pub(crate) turn_count: u64,
 }
 
 impl SessionSummary {
@@ -51,6 +55,17 @@ impl SessionSummary {
             started_at_ms: metadata.started_at_ms,
             first_user_task: metadata.first_user_task.clone(),
             latest_summary: metadata.latest_summary.clone(),
+            turn_count: metadata.metrics.turns,
+        }
+    }
+
+    /// Compact "(N prompt[s])" indicator. Returns an empty string for
+    /// sessions that recorded no turns so the row stays uncluttered.
+    pub(crate) fn turn_indicator(&self) -> String {
+        match self.turn_count {
+            0 => "new".to_string(),
+            1 => "1 prompt".to_string(),
+            n => format!("{n} prompts"),
         }
     }
 
@@ -121,15 +136,16 @@ impl ResumePickerState {
         }
     }
 
-    /// Number of selectable rows in the list — the candidates plus the
-    /// trailing "Start fresh" row.
+    /// Number of selectable rows in the list — the leading "Start fresh"
+    /// row plus every candidate.
     fn row_count(&self) -> usize {
         self.candidates.len() + 1
     }
 
-    /// Index of the "Start fresh" row.
-    fn start_fresh_index(&self) -> usize {
-        self.candidates.len()
+    /// Index of the "Start fresh" row — always 0 so the safe default is
+    /// pre-selected when the picker opens.
+    pub(crate) const fn start_fresh_index(&self) -> usize {
+        0
     }
 
     pub(crate) fn dispatch(&mut self, key: KeyEvent) -> Option<ResumeChoice> {
@@ -153,8 +169,9 @@ impl ResumePickerState {
                 if self.cursor == self.start_fresh_index() {
                     Some(ResumeChoice::StartFresh)
                 } else {
+                    // candidate rows live at indices 1..=N.
                     self.candidates
-                        .get(self.cursor)
+                        .get(self.cursor - 1)
                         .map(|summary| ResumeChoice::Resume(summary.session_id.clone()))
                 }
             }
@@ -229,10 +246,7 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
             Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" · ", Style::default().fg(QUIET)),
-        Span::styled(
-            "resume a recent session",
-            Style::default().fg(Color::White),
-        ),
+        Span::styled("resume a recent session", Style::default().fg(Color::White)),
         Span::raw(" "),
     ]);
     let block = Block::default()
@@ -272,13 +286,17 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     .alignment(Alignment::Left);
     frame.render_widget(intro, layout[0]);
 
-    let mut rows: Vec<Line<'_>> = state
-        .candidates
-        .iter()
-        .enumerate()
-        .map(|(idx, summary)| render_candidate_row(idx, summary, idx == state.cursor))
-        .collect();
-    rows.push(render_start_fresh_row(state.cursor == state.start_fresh_index()));
+    // Start fresh leads the list as the safe default (cursor opens on it),
+    // followed by each candidate session at index 1..=N.
+    let mut rows: Vec<Line<'_>> = Vec::with_capacity(state.candidates.len() + 1);
+    rows.push(render_start_fresh_row(
+        state.cursor == state.start_fresh_index(),
+    ));
+    rows.extend(state.candidates.iter().enumerate().map(|(idx, summary)| {
+        // candidates start at row 1; active row uses the cursor offset.
+        let row_idx = idx + 1;
+        render_candidate_row(idx, summary, row_idx == state.cursor)
+    }));
 
     let body = Paragraph::new(rows);
     frame.render_widget(body, layout[2]);
@@ -297,13 +315,12 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     frame.render_widget(footer, layout[4]);
 }
 
-fn render_candidate_row(
-    _idx: usize,
-    summary: &SessionSummary,
-    active: bool,
-) -> Line<'static> {
+fn render_candidate_row(_idx: usize, summary: &SessionSummary, active: bool) -> Line<'static> {
     let (prefix_color, label_style) = if active {
-        (AMBER, Style::default().fg(GOLD).add_modifier(Modifier::BOLD))
+        (
+            AMBER,
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        )
     } else {
         (QUIET, Style::default().fg(Color::White))
     };
@@ -317,6 +334,8 @@ fn render_candidate_row(
         Span::styled(prefix, Style::default().fg(prefix_color)),
         Span::styled(format_started_at(summary.started_at_ms), timestamp_style),
         Span::styled("  ", Style::default()),
+        Span::styled(format!("{:>10}", summary.turn_indicator()), timestamp_style),
+        Span::styled("  ", Style::default()),
         Span::styled(summary.label(), label_style),
     ])
 }
@@ -325,7 +344,9 @@ fn render_start_fresh_row(active: bool) -> Line<'static> {
     let (prefix_color, label_style, hint_style) = if active {
         (
             MODE_PURPLE,
-            Style::default().fg(MODE_PURPLE).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(MODE_PURPLE)
+                .add_modifier(Modifier::BOLD),
             Style::default().fg(QUIET),
         )
     } else {
