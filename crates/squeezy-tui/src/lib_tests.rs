@@ -3289,6 +3289,70 @@ fn base64_encoder_supports_osc52_payloads() {
     assert_eq!(base64_encode(b"abc"), "YWJj");
 }
 
+#[tokio::test]
+async fn cancel_preserves_pending_prompt_for_ctrl_r() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancelled_prompt = Some("write the README".to_string());
+
+    let hint = format_status_hints(&app);
+    assert!(
+        hint.contains("Ctrl-R"),
+        "idle hint must advertise Ctrl-R when a cancelled prompt is stashed; got: {hint}"
+    );
+    assert!(restore_cancelled_prompt(&mut app), "restore must succeed");
+    assert_eq!(app.input, "write the README");
+    assert!(app.cancelled_prompt.is_none());
+    assert_eq!(app.input_cursor, app.input.len());
+}
+
+#[test]
+fn restore_is_noop_when_no_cancelled_prompt() {
+    let mut app = test_app(SessionMode::Build);
+    assert!(
+        !restore_cancelled_prompt(&mut app),
+        "restore must report no-op when nothing is stashed"
+    );
+    assert!(app.input.is_empty());
+}
+
+#[test]
+fn restore_does_not_overwrite_in_progress_input() {
+    let mut app = test_app(SessionMode::Build);
+    app.input = "draft".to_string();
+    app.input_cursor = app.input.len();
+    app.cancelled_prompt = Some("previous".to_string());
+    assert!(
+        !restore_cancelled_prompt(&mut app),
+        "restore must refuse when composer is non-empty"
+    );
+    assert_eq!(app.input, "draft");
+    assert_eq!(app.cancelled_prompt.as_deref(), Some("previous"));
+}
+
+#[tokio::test]
+async fn completion_clears_cancelled_prompt() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancelled_prompt = Some("hello".to_string());
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+    assert!(
+        app.cancelled_prompt.is_none(),
+        "successful completion must clear the cancelled-prompt slot",
+    );
+}
+
 #[test]
 fn context_budget_renders_percent_and_threshold() {
     let mut app = test_app(SessionMode::Build);

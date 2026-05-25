@@ -552,6 +552,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.pending_assistant.clear();
                     finalize_proposed_plan(app);
                     app.context_estimate = context_estimate;
+                    app.cancelled_prompt = None;
                     maybe_push_context_compaction_nudge(app);
                     app.cost = cost;
                     app.metrics = metrics;
@@ -636,6 +637,25 @@ fn maybe_pick_resume_session(
         resume_picker::ResumeChoice::Resume(id) => Ok(ResumeStartup::Use(id)),
         resume_picker::ResumeChoice::Quit => Ok(ResumeStartup::Quit),
     }
+}
+
+/// Restore the most recently cancelled prompt into the composer. Only
+/// fires when no turn is running and the composer is empty, so the user
+/// cannot lose in-progress text. Returns `true` when it acted.
+fn restore_cancelled_prompt(app: &mut TuiApp) -> bool {
+    if app.turn_rx.is_some() {
+        return false;
+    }
+    if !app.input.is_empty() {
+        return false;
+    }
+    let Some(text) = app.cancelled_prompt.take() else {
+        return false;
+    };
+    app.input = text;
+    app.input_cursor = app.input.len();
+    app.status = "restored last prompt — edit and Enter to retry".to_string();
+    true
 }
 
 fn cancel_pending_request_user_input(app: &mut TuiApp) {
@@ -975,6 +995,12 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+        if restore_cancelled_prompt(app) {
+            return Ok(false);
+        }
+    }
+
     if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('b') {
         move_input_cursor_word_left(app);
         return Ok(false);
@@ -1143,6 +1169,10 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             if reject_unknown_slash_command(app, &input) {
                 return Ok(false);
             }
+            // Stash the typed prompt before clearing so that a Ctrl-C/Esc
+            // during the turn can restore it via Ctrl-R. Completion clears
+            // this field; only Cancelled/Failed leave it set.
+            app.cancelled_prompt = Some(input.clone());
             clear_input(app);
             push_input_history(app, input.clone());
             let cancel = CancellationToken::new();
@@ -6807,6 +6837,11 @@ fn format_status_hints(app: &TuiApp) -> String {
     } else if app.exit_confirm_armed {
         return "Ctrl+C or Y to exit · any other key to cancel".to_string();
     }
+    if app.cancelled_prompt.is_some() && app.turn_rx.is_none() && app.input.is_empty() {
+        // We're idle right after a cancelled/failed turn — surface the
+        // recovery affordance before the regular hint set.
+        return "Ctrl-R restore last prompt · Enter send · Ctrl+J newline · /help".to_string();
+    }
     let mut base = if app.alternate_scroll_enabled {
         "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
             .to_string()
@@ -7180,6 +7215,10 @@ struct TuiApp {
     approval_selection_index: usize,
     pending_mcp_elicitation: Option<PendingMcpElicitation>,
     pending_request_user_input: Option<PendingRequestUserInput>,
+    /// Prompt that was in flight when the most recent turn was cancelled
+    /// or failed. Surfaced via Ctrl-R so the user can recover from a
+    /// typo without retyping. Cleared on successful completion.
+    cancelled_prompt: Option<String>,
     mcp_elicitation_selection_index: usize,
     pending_feedback: Option<PreparedFeedback>,
     pending_report: Option<BugReportBundle>,
@@ -7299,6 +7338,7 @@ impl TuiApp {
             approval_selection_index: 0,
             pending_mcp_elicitation: None,
             pending_request_user_input: None,
+            cancelled_prompt: None,
             mcp_elicitation_selection_index: 0,
             pending_feedback: None,
             pending_report: None,
