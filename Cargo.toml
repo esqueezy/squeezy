@@ -60,8 +60,18 @@ toml_edit = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.26"
-aws-config = "1"
-aws-sdk-bedrockruntime = "1"
+aws-config = { version = "1", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "rt-tokio",
+    "credentials-process",
+    "sso",
+] }
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-smithy-types = "1"
 keyring = { version = "3.6", default-features = false }
 tree-sitter-bash = "0.25.1"

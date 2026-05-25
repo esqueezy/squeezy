@@ -32,7 +32,11 @@ tokio.workspace = true
 tokio-util.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { workspace = true, features = ["linux-native-async-persistent"] }
+keyring = { workspace = true, features = [
+    "linux-native-async-persistent",
+    "tokio",
+    "crypto-rust",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }
