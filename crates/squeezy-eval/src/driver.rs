@@ -993,6 +993,22 @@ impl Driver {
                         },
                     )?;
                 }
+                AgentEvent::ToolProgress {
+                    turn_id,
+                    call_id,
+                    tool_name,
+                    elapsed_ms,
+                } => {
+                    let turn_str = format!("{turn_id:?}");
+                    self.capture.record(
+                        Some(turn_str),
+                        EvalEventKind::ToolProgress {
+                            call_id,
+                            tool_name,
+                            elapsed_ms,
+                        },
+                    )?;
+                }
                 AgentEvent::Completed {
                     turn_id,
                     cost,

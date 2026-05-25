@@ -196,6 +196,19 @@ impl LivePrinter {
                 );
                 let _ = g.writer.flush();
             }
+            EvalEventKind::ToolProgress {
+                tool_name,
+                elapsed_ms,
+                ..
+            } => {
+                g.finish_assistant_chunk_inplace();
+                let _ = writeln!(
+                    g.writer,
+                    "     ⌛ {tool_name} still running ({elapsed:.1}s)",
+                    elapsed = *elapsed_ms as f64 / 1000.0
+                );
+                let _ = g.writer.flush();
+            }
             EvalEventKind::CostUpdate {
                 tool_count,
                 input_tokens,

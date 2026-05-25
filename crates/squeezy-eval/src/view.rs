@@ -275,6 +275,10 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
                 );
                 let _ = writeln!(out);
             }
+            EvalEventKind::ToolProgress { .. } => {
+                // Heartbeats are noise in a post-run timeline; the
+                // ToolCallCompleted event carries the final duration.
+            }
             EvalEventKind::TaskStateUpdated { .. }
             | EvalEventKind::SubagentEvent { .. }
             | EvalEventKind::Snapshot { .. }

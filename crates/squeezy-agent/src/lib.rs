@@ -6299,18 +6299,38 @@ async fn run_one_tool(
     // tool registry, so paired-SHA telemetry (F06) can hash its arguments
     // when emitting the completion event.
     let call_for_telemetry = call.clone();
-    let result = context
-        .tools
-        .execute_for_group_with_options(
-            call,
-            tracked_job
-                .as_ref()
-                .map(|(_, cancel)| cancel.clone())
-                .unwrap_or_else(|| context.cancel.clone()),
-            context.turn_id.to_string(),
-            ToolExecutionOptions { shell_ask_approver },
-        )
-        .await;
+    let progress_call_id = call_for_telemetry.call_id.clone();
+    let progress_tool_name = call_for_telemetry.name.clone();
+    let exec_future = context.tools.execute_for_group_with_options(
+        call,
+        tracked_job
+            .as_ref()
+            .map(|(_, cancel)| cancel.clone())
+            .unwrap_or_else(|| context.cancel.clone()),
+        context.turn_id.to_string(),
+        ToolExecutionOptions { shell_ask_approver },
+    );
+    tokio::pin!(exec_future);
+    let mut progress_ticker = tokio::time::interval(TOOL_PROGRESS_INTERVAL);
+    // `interval` fires immediately on first poll; skip that tick so the
+    // heartbeat only fires once the tool has actually been running.
+    progress_ticker.tick().await;
+    let result = loop {
+        tokio::select! {
+            r = &mut exec_future => break r,
+            _ = progress_ticker.tick() => {
+                let _ = context
+                    .tx
+                    .send(AgentEvent::ToolProgress {
+                        turn_id: context.turn_id,
+                        call_id: progress_call_id.clone(),
+                        tool_name: progress_tool_name.clone(),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    })
+                    .await;
+            }
+        }
+    };
     record_exploration_tool_result(&context, &result).await;
     if let Some((job_id, _)) = tracked_job {
         let status = job_status_for_tool_status(result.status);
@@ -6386,6 +6406,12 @@ struct CostProgressSnapshot {
 /// Number of *completed* tool calls between successive
 /// `AgentEvent::CostUpdate` emissions within a single turn.
 const COST_UPDATE_STRIDE: u64 = 3;
+
+/// How often a still-running tool call emits an
+/// `AgentEvent::ToolProgress` heartbeat. A user staring at a
+/// terminal needs feedback within roughly a second to feel the
+/// agent is alive but stable.
+const TOOL_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Emit an `AgentEvent::CostUpdate` if the broker has just crossed a
 /// `COST_UPDATE_STRIDE`-sized boundary. Call this immediately after
@@ -9692,6 +9718,15 @@ pub enum AgentEvent {
         tool_count: u64,
         input_tokens: u64,
         micro_usd: u64,
+    },
+    /// Periodic heartbeat while a single tool call is still running.
+    /// Emitted on a fixed interval (see `TOOL_PROGRESS_INTERVAL`) so a
+    /// watcher can tell a long-running tool apart from a hung one.
+    ToolProgress {
+        turn_id: TurnId,
+        call_id: String,
+        tool_name: String,
+        elapsed_ms: u64,
     },
     Cancelled {
         turn_id: TurnId,
