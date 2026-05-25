@@ -36,12 +36,15 @@ kind = "action"
 action = "approve"
 
 [steps.match]
-tool = "fs.write"
+tool = "write_file"
 "#;
     let scenario: Scenario = toml::from_str(toml).unwrap();
     match &scenario.steps[0] {
         Step::Action(Action::Approve { r#match, .. }) => {
-            assert_eq!(r#match.as_ref().unwrap().tool.as_deref(), Some("fs.write"));
+            assert_eq!(
+                r#match.as_ref().unwrap().tool.as_deref(),
+                Some("write_file")
+            );
         }
         other => panic!("expected approve action, got {other:?}"),
     }

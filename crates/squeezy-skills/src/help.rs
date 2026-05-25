@@ -560,6 +560,13 @@ fn looks_like_squeezy_help_question(input: &str) -> bool {
     if contains_implementation_verb(&lowered) {
         return false;
     }
+    // Code-navigation prompts that name a specific symbol, file, or path are
+    // model questions even when they mention "squeezy" (e.g. "where does
+    // Agent::start_turn live in squeezy?"). The canned topic summary would
+    // hijack a navigation answer.
+    if contains_code_navigation_indicator(input) {
+        return false;
+    }
     lowered.ends_with('?')
         || starts_with_any(
             &lowered,
@@ -628,6 +635,49 @@ fn contains_implementation_verb(lowered: &str) -> bool {
         let trimmed = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
         VERB_WORDS.contains(&trimmed)
     })
+}
+
+// Returns true when the user input names a specific code symbol, file path,
+// or source token that a navigation answer would be expected to ground on.
+// Operates on the raw input (case preserved) so CamelCase detection still works.
+fn contains_code_navigation_indicator(input: &str) -> bool {
+    const SOURCE_EXTENSIONS: &[&str] = &[
+        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".kt", ".cs", ".cpp", ".cc",
+        ".hpp", ".hh", ".c", ".h", ".rb", ".swift", ".scala", ".m", ".mm", ".php", ".sh", ".toml",
+        ".yaml", ".yml", ".json", ".sql",
+    ];
+    let lowered = input.to_ascii_lowercase();
+    if input.contains("::") || input.contains("->") || input.contains('`') {
+        return true;
+    }
+    if SOURCE_EXTENSIONS.iter().any(|ext| lowered.contains(ext)) {
+        return true;
+    }
+    for word in input.split_whitespace() {
+        let trimmed = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+        if trimmed.len() < 3 {
+            continue;
+        }
+        let all_ident_chars = trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !all_ident_chars {
+            continue;
+        }
+        // CamelCase / PascalCase: at least one uppercase AND one lowercase AND
+        // more than one uppercase character. Excludes plain acronyms like
+        // "API", "MCP", "TUI" while still catching "FooBar", "StartTurn", etc.
+        let upper_count = trimmed.chars().filter(|c| c.is_ascii_uppercase()).count();
+        let has_lower = trimmed.chars().any(|c| c.is_ascii_lowercase());
+        if upper_count >= 2 && has_lower {
+            return true;
+        }
+        // snake_case identifier: at least one underscore between alphanumerics.
+        if trimmed.contains('_') {
+            return true;
+        }
+    }
+    false
 }
 
 fn find_topic(input: &str) -> Option<&'static TopicDefinition> {
