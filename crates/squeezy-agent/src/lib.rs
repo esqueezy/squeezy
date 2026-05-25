@@ -2841,6 +2841,7 @@ async fn complete_local_tool_turn(
         vec![call],
         ToolExecutionContext {
             turn_id,
+            origin: ToolOrigin::Model,
             provider,
             tools: &tools,
             jobs: &jobs,
@@ -3492,6 +3493,7 @@ impl TurnRuntime {
                     planned_calls.clone(),
                     ToolExecutionContext {
                         turn_id: self.turn_id,
+                        origin: ToolOrigin::Planner,
                         provider: self.provider.clone(),
                         tools: &self.tools,
                         jobs: &self.jobs,
@@ -3853,6 +3855,7 @@ impl TurnRuntime {
                     tool_calls.clone(),
                     ToolExecutionContext {
                         turn_id: self.turn_id,
+                        origin: ToolOrigin::Model,
                         provider: self.provider.clone(),
                         tools: &self.tools,
                         jobs: &self.jobs,
@@ -4378,9 +4381,30 @@ fn merge_concurrent_pins(compaction: &mut ContextCompactionState, latest_pins: &
     }
 }
 
+/// Who initiated a tool call. Surfaced on `AgentEvent::ToolCallStarted`
+/// so the TUI and `squeezy-eval` can render distinct icons (planner
+/// preflight vs. the model's own dispatch) and so legibility rules
+/// like `redundant_graph_lookup` can attribute hits correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOrigin {
+    /// Pre-LLM exploration plan executed before the model sees the
+    /// prompt. The user never asked for these directly; we ran them to
+    /// seed receipts.
+    Planner,
+    /// Tools the model itself requested during its response.
+    #[default]
+    Model,
+    /// Tools executed inside a subagent. Currently emitted only for
+    /// completeness — the parent surfaces a `SubagentStarted` event for
+    /// the actual dispatch.
+    Subagent,
+}
+
 #[derive(Clone)]
 struct ToolExecutionContext<'a> {
     turn_id: TurnId,
+    origin: ToolOrigin,
     provider: Arc<dyn LlmProvider>,
     tools: &'a ToolRegistry,
     jobs: &'a JobRegistry,
@@ -5202,6 +5226,7 @@ async fn run_subagent_loop(
                     approved,
                     ToolExecutionContext {
                         turn_id: parent.turn_id,
+                        origin: ToolOrigin::Subagent,
                         provider: parent.provider.clone(),
                         tools: parent.tools,
                         jobs: local_jobs,
@@ -6087,6 +6112,7 @@ async fn replay_tool_calls(
             .send(AgentEvent::ToolCallStarted {
                 turn_id,
                 call: call.clone(),
+                origin: ToolOrigin::Model,
             })
             .await;
         record_and_emit_progress(broker, result, &tx, turn_id).await;
@@ -6260,6 +6286,7 @@ async fn run_one_tool(
         .send(AgentEvent::ToolCallStarted {
             turn_id: context.turn_id,
             call: redact_tool_call(call.clone(), &context.redactor),
+            origin: context.origin,
         })
         .await;
     let started = Instant::now();
@@ -9573,6 +9600,10 @@ pub enum AgentEvent {
     ToolCallStarted {
         turn_id: TurnId,
         call: ToolCall,
+        /// Whether the call comes from the planner preflight, the model
+        /// itself, or a subagent. Lets transcript renderers swap icons
+        /// (🧭 / 🔧 / 🤖) and lets findings attribute hits correctly.
+        origin: ToolOrigin,
     },
     ToolCallCompleted {
         turn_id: TurnId,

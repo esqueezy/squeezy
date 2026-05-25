@@ -49,6 +49,7 @@ fn announces_tool_call_started_and_completed() {
         p.event(
             &EvalEventKind::ToolCallStarted {
                 call: serde_json::json!({"name": "grep", "arguments": {"pattern": "X"}}),
+                origin: "model".to_string(),
             },
             Some("T(1)"),
         );

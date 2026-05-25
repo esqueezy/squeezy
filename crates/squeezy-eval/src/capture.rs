@@ -50,6 +50,11 @@ pub enum EvalEventKind {
     },
     ToolCallStarted {
         call: Value,
+        /// `"planner"`, `"model"`, or `"subagent"` — set from
+        /// `squeezy_agent::ToolOrigin`. Defaults to `"model"` when
+        /// reading older traces written before the field existed.
+        #[serde(default = "default_tool_origin")]
+        origin: String,
     },
     ToolCallCompleted {
         result: Value,
@@ -97,6 +102,10 @@ pub enum EvalEventKind {
 }
 
 pub const EVAL_TRACE_SCHEMA_VERSION: u32 = 2;
+
+fn default_tool_origin() -> String {
+    "model".to_string()
+}
 
 /// Append-only JSONL trace writer.
 pub struct Capture {

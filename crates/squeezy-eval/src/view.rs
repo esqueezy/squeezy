@@ -187,7 +187,7 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
                 let _ = writeln!(out, "_(turn cancelled)_");
                 let _ = writeln!(out);
             }
-            EvalEventKind::ToolCallStarted { call } => {
+            EvalEventKind::ToolCallStarted { call, origin } => {
                 let name = call.get("name").and_then(Value::as_str).unwrap_or("?");
                 let label = call
                     .get("arguments")
@@ -195,7 +195,8 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
                     .unwrap_or_else(|| name.to_string());
                 let _ = writeln!(
                     out,
-                    "🔧 **{label}**",
+                    "{icon} **{label}**",
+                    icon = icon_for_origin(origin),
                     label = trim_oneline(&label, TOOL_ARG_PREVIEW_CHARS).replace('`', "ʼ")
                 );
             }
@@ -372,6 +373,14 @@ fn short_turn(t: &str) -> String {
         return rest.to_string();
     }
     t.to_string()
+}
+
+fn icon_for_origin(origin: &str) -> &'static str {
+    match origin {
+        "planner" => "🧭",
+        "subagent" => "🤖",
+        _ => "🔧",
+    }
 }
 
 fn format_token_count(tokens: u64) -> String {

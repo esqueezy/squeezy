@@ -101,7 +101,7 @@ impl LivePrinter {
                 let _ = g.writer.write_all(delta.as_bytes());
                 let _ = g.writer.flush();
             }
-            EvalEventKind::ToolCallStarted { call } => {
+            EvalEventKind::ToolCallStarted { call, origin } => {
                 g.finish_assistant_chunk_inplace();
                 let name = call.get("name").and_then(Value::as_str).unwrap_or("?");
                 let label = call
@@ -110,7 +110,8 @@ impl LivePrinter {
                     .unwrap_or_else(|| name.to_string());
                 let _ = writeln!(
                     g.writer,
-                    "  🔧 {label}",
+                    "  {icon} {label}",
+                    icon = icon_for_origin(origin),
                     label = trim_oneline(&label, TOOL_ARG_PREVIEW_CHARS)
                 );
                 let _ = g.writer.flush();
@@ -261,6 +262,18 @@ fn describe_action(action: &Action) -> String {
         Action::InjectUserText { text, .. } => {
             format!("inject_user_text: {}", trim_oneline(text, 80))
         }
+    }
+}
+
+/// Pick the leading icon for a tool-call line based on who initiated it.
+/// Planner preflight runs before the model sees the prompt, so a compass
+/// fits; subagent calls travel through a different dispatch and use the
+/// robot face the TUI already associates with them.
+fn icon_for_origin(origin: &str) -> &'static str {
+    match origin {
+        "planner" => "🧭",
+        "subagent" => "🤖",
+        _ => "🔧",
     }
 }
 

@@ -2507,6 +2507,7 @@ async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy(
     };
     let context = ToolExecutionContext {
         turn_id: TurnId::new(1),
+        origin: ToolOrigin::Model,
         provider,
         tools: &tools,
         jobs: &jobs,
