@@ -15,8 +15,8 @@ fn default_instructions_do_not_reference_hidden_task_state_tool() {
 }
 
 #[test]
-fn default_instructions_avoid_repeating_ui_rendered_tool_output() {
-    assert!(DEFAULT_INSTRUCTIONS.contains("Do not repeat raw tool output already shown by the UI"));
+fn default_instructions_keep_ui_rendering_contract_out_of_prompt() {
+    assert!(!DEFAULT_INSTRUCTIONS.contains("Do not repeat raw tool output"));
     assert!(!DEFAULT_INSTRUCTIONS.contains("command in cwd"));
     assert!(!DEFAULT_INSTRUCTIONS.contains("Markdown fences"));
 }

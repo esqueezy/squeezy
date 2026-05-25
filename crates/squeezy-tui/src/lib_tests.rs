@@ -944,7 +944,11 @@ fn shell_tool_rows_show_command_and_highlight_output() {
         "{output}"
     );
     assert!(
-        output.contains("• cargo test -p squeezy-tui in .:"),
+        output.contains("└ cargo test -p squeezy-tui in .:"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("• cargo test -p squeezy-tui in .:"),
         "{output}"
     );
     assert!(output.contains("ok"), "{output}");
@@ -957,12 +961,12 @@ fn read_only_shell_rows_render_codex_style_output_block() {
     let call = ToolCall {
         call_id: "shell-1".to_string(),
         name: "shell".to_string(),
-        arguments: serde_json::json!({"command": "ls -la"}),
+        arguments: serde_json::json!({"command": "inspect workspace --details"}),
     };
     let mut result = sample_tool_result("shell", "");
     result.call_id = "shell-1".to_string();
     result.content = serde_json::json!({
-        "command": "ls -la",
+        "command": "inspect workspace --details",
         "workdir": "/tmp/project",
         "exit_code": 0,
         "stdout": "total 8\ndrwxr-xr-x  3 user  staff  96 .\n-rw-r--r--  1 user  staff  10 README.md",
@@ -975,8 +979,18 @@ fn read_only_shell_rows_render_codex_style_output_block() {
 
     let output = render_to_string(&app, 140, 18);
 
-    assert!(output.contains("✔ Explored List ls -la"), "{output}");
-    assert!(output.contains("• ls -la in /tmp/project:"), "{output}");
+    assert!(
+        output.contains("✔ Explored inspect workspace --details"),
+        "{output}"
+    );
+    assert!(
+        output.contains("└ inspect workspace --details in /tmp/project:"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("• inspect workspace --details in /tmp/project:"),
+        "{output}"
+    );
     assert!(output.contains("total 8"), "{output}");
     assert!(output.contains("README.md"), "{output}");
     assert!(!output.contains("stdout"), "{output}");
@@ -2906,6 +2920,62 @@ async fn completed_event_suppresses_assistant_duplicate_shell_output_fence() {
 
     drain_agent_events(&mut app).await;
 
+    let assistant = app.transcript.iter().find_map(|entry| match &entry.kind {
+        TranscriptEntryKind::Message(item) if item.role == Role::Assistant => {
+            Some(item.content.as_str())
+        }
+        _ => None,
+    });
+    assert!(
+        assistant.is_none(),
+        "filler-only assistant message should be dropped: {assistant:?}",
+    );
+
+    let rendered = render_to_string(&app, 140, 24);
+    assert_eq!(rendered.matches("section alpha").count(), 1, "{rendered}");
+}
+
+#[tokio::test]
+async fn completed_event_keeps_substantive_assistant_summary_after_tool_output() {
+    let mut app = test_app(SessionMode::Build);
+    let stdout = [
+        "section alpha status ready score 42 owner team-one",
+        "section beta status ready score 84 owner team-two",
+        "section gamma status stale score 21 owner team-three",
+        "section delta status ready score 63 owner team-four",
+    ]
+    .join("\n");
+    let call = ToolCall {
+        call_id: "shell-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": "inspect workspace summary"}),
+    };
+    let mut result = sample_tool_result("shell", "");
+    result.call_id = "shell-1".to_string();
+    result.content = serde_json::json!({
+        "command": "inspect workspace summary",
+        "workdir": ".",
+        "exit_code": 0,
+        "stdout": stdout,
+        "stderr": "",
+    });
+    app.push_tool_result_with_call(result, Some(call));
+
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("Gamma is stale; the other sections are ready."),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+
+    drain_agent_events(&mut app).await;
+
     let assistant = app
         .transcript
         .iter()
@@ -2916,12 +2986,10 @@ async fn completed_event_suppresses_assistant_duplicate_shell_output_fence() {
             _ => None,
         })
         .expect("assistant message");
-    assert!(assistant.contains("Here is the summary"), "{assistant}");
-    assert!(!assistant.contains("```"), "{assistant}");
-    assert!(!assistant.contains("section alpha"), "{assistant}");
-
-    let rendered = render_to_string(&app, 140, 24);
-    assert_eq!(rendered.matches("section alpha").count(), 1, "{rendered}");
+    assert_eq!(
+        assistant, "Gamma is stale; the other sections are ready.",
+        "{assistant}",
+    );
 }
 
 #[tokio::test]
@@ -3018,7 +3086,7 @@ async fn pending_assistant_suppresses_streaming_duplicate_shell_output_fence() {
 
     let rendered = render_to_string(&app, 140, 24);
 
-    assert!(rendered.contains("Here is the report"), "{rendered}");
+    assert!(!rendered.contains("Here is the report"), "{rendered}");
     assert_eq!(rendered.matches("component-alpha").count(), 1, "{rendered}");
 }
 
