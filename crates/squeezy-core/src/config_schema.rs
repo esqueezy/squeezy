@@ -583,21 +583,25 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
     cfg.provider = match s {
         "openai" => ProviderConfig::OpenAi(OpenAiConfig {
             api_key_env: "OPENAI_API_KEY".to_string(),
+            api_key_keychain: None,
             base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
             transport,
         }),
         "anthropic" => ProviderConfig::Anthropic(AnthropicConfig {
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            api_key_keychain: None,
             base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
             transport,
         }),
         "google" => ProviderConfig::Google(GoogleConfig {
             api_key_env: "GOOGLE_API_KEY".to_string(),
+            api_key_keychain: None,
             base_url: DEFAULT_GOOGLE_BASE_URL.to_string(),
             transport,
         }),
         "azure_openai" => ProviderConfig::AzureOpenAi(AzureOpenAiConfig {
             api_key_env: "AZURE_OPENAI_API_KEY".to_string(),
+            api_key_keychain: None,
             base_url: DEFAULT_AZURE_OPENAI_BASE_URL.to_string(),
             api_version: DEFAULT_AZURE_OPENAI_API_VERSION.to_string(),
             transport,

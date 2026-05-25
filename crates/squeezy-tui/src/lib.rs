@@ -33,7 +33,8 @@ use ratatui::{
 };
 use squeezy_agent::{
     Agent, AgentEvent, JobEvent, JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS,
-    MAX_JOBS_RETAINED, SessionAccountingSnapshot, ToolApprovalDecision, ToolApprovalRequest,
+    MAX_JOBS_RETAINED, RequestUserInputRequest, RequestUserInputResponse,
+    SessionAccountingSnapshot, ToolApprovalDecision, ToolApprovalRequest,
 };
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
@@ -53,9 +54,19 @@ use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+mod approval;
 mod config_screen;
+mod history;
+mod mention;
 mod notification;
+mod overlay;
+mod proposed_plan;
 mod render;
+mod resume_picker;
+mod status;
+mod streaming;
+mod streaming_patch;
+pub use streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
 
 use notification::{NotificationQueue, Severity as NotifySeverity};
 use render::palette::{
@@ -153,151 +164,117 @@ impl Command for DisableModifyOtherKeys {
 struct SlashCommand {
     name: &'static str,
     description: &'static str,
+    available_during_task: bool,
+    parameter_hint: Option<&'static str>,
+}
+
+const fn slash(name: &'static str, description: &'static str) -> SlashCommand {
+    SlashCommand {
+        name,
+        description,
+        available_during_task: true,
+        parameter_hint: None,
+    }
+}
+
+const fn slash_locked(name: &'static str, description: &'static str) -> SlashCommand {
+    SlashCommand {
+        name,
+        description,
+        available_during_task: false,
+        parameter_hint: None,
+    }
+}
+
+const fn slash_args(
+    name: &'static str,
+    description: &'static str,
+    available_during_task: bool,
+    parameter_hint: &'static str,
+) -> SlashCommand {
+    SlashCommand {
+        name,
+        description,
+        available_during_task,
+        parameter_hint: Some(parameter_hint),
+    }
 }
 
 const SLASH_COMMANDS: &[SlashCommand] = &[
-    SlashCommand {
-        name: "/help",
-        description: "show local Squeezy help topics",
-    },
-    SlashCommand {
-        name: "/config",
-        description: "open the config screen (or pass a section name)",
-    },
-    SlashCommand {
-        name: "/model",
-        description: "open config focused on provider and model",
-    },
-    SlashCommand {
-        name: "/permissions",
-        description: "open config focused on permissions",
-    },
-    SlashCommand {
-        name: "/plan",
-        description: "switch to Plan mode",
-    },
-    SlashCommand {
-        name: "/build",
-        description: "switch to Build mode",
-    },
-    SlashCommand {
-        name: "/cost",
-        description: "show token and cost accounting",
-    },
-    SlashCommand {
-        name: "/context",
-        description: "show context budget and compaction state",
-    },
-    SlashCommand {
-        name: "/attach",
-        description: "attach a file as prompt context",
-    },
-    SlashCommand {
-        name: "/attachments",
-        description: "list attached context",
-    },
-    SlashCommand {
-        name: "/copy",
-        description: "copy last answer or transcript",
-    },
-    SlashCommand {
-        name: "/compact",
-        description: "compact conversation context now",
-    },
-    SlashCommand {
-        name: "/collapse",
-        description: "collapse transcript entries",
-    },
-    SlashCommand {
-        name: "/expand",
-        description: "expand transcript entries",
-    },
-    SlashCommand {
-        name: "/jobs",
-        description: "list background jobs",
-    },
-    SlashCommand {
-        name: "/job",
-        description: "show a background job",
-    },
-    SlashCommand {
-        name: "/job-cancel",
-        description: "cancel a background job",
-    },
-    SlashCommand {
-        name: "/pin",
-        description: "pin transcript context",
-    },
-    SlashCommand {
-        name: "/pins",
-        description: "list pinned context",
-    },
-    SlashCommand {
-        name: "/unpin",
-        description: "remove pinned context",
-    },
-    SlashCommand {
-        name: "/feedback",
-        description: "preview or send product feedback",
-    },
-    SlashCommand {
-        name: "/report",
-        description: "preview or send a bug report",
-    },
-    SlashCommand {
-        name: "/sessions",
-        description: "list recent sessions",
-    },
-    SlashCommand {
-        name: "/session",
-        description: "show a saved session",
-    },
-    SlashCommand {
-        name: "/resume",
-        description: "resume a saved session",
-    },
-    SlashCommand {
-        name: "/session-export",
-        description: "export a saved session",
-    },
-    SlashCommand {
-        name: "/session-cleanup",
-        description: "remove old sessions",
-    },
-    SlashCommand {
-        name: "/checkpoints",
-        description: "list local checkpoints",
-    },
-    SlashCommand {
-        name: "/checkpoint",
-        description: "show a local checkpoint",
-    },
-    SlashCommand {
-        name: "/undo",
-        description: "undo the latest checkpoint",
-    },
-    SlashCommand {
-        name: "/revert-turn",
-        description: "revert a turn checkpoint",
-    },
-    SlashCommand {
-        name: "/verbosity",
-        description: "set answer verbosity",
-    },
-    SlashCommand {
-        name: "/tool-verbosity",
-        description: "set tool output verbosity",
-    },
-    SlashCommand {
-        name: "/detach",
-        description: "remove attached context",
-    },
+    slash("/help", "show local Squeezy help topics"),
+    slash_args(
+        "/config",
+        "open the config screen (or pass a section name)",
+        true,
+        "[section]",
+    ),
+    slash("/model", "open config focused on provider and model"),
+    slash("/permissions", "open config focused on permissions"),
+    slash_locked("/plan", "switch to Plan mode"),
+    slash_locked("/build", "switch to Build mode"),
+    slash("/cost", "show token and cost accounting"),
+    slash("/context", "show context budget and compaction state"),
+    slash_args(
+        "/attach",
+        "attach a file as prompt context",
+        false,
+        "<path>",
+    ),
+    slash("/attachments", "list attached context"),
+    slash("/copy", "copy last answer or transcript"),
+    slash_locked(
+        "/compact",
+        "compact conversation context now (use '/compact undo' to restore)",
+    ),
+    slash("/collapse", "collapse transcript entries"),
+    slash("/expand", "expand transcript entries"),
+    slash("/jobs", "list background jobs"),
+    slash_args("/job", "show a background job", true, "<id>"),
+    slash_args("/job-cancel", "cancel a background job", true, "<id>"),
+    slash_args("/pin", "pin transcript context", false, "<id>"),
+    slash("/pins", "list pinned context"),
+    slash_args("/unpin", "remove pinned context", false, "<id>"),
+    slash("/feedback", "preview or send product feedback"),
+    slash("/report", "preview or send a bug report"),
+    slash("/sessions", "list recent sessions"),
+    slash_args("/session", "show a saved session", true, "<id>"),
+    slash_args("/resume", "resume a saved session", false, "<id>"),
+    slash_args("/session-export", "export a saved session", false, "<id>"),
+    slash_locked("/session-cleanup", "remove old sessions"),
+    slash("/checkpoints", "list local checkpoints"),
+    slash_args("/checkpoint", "show a local checkpoint", true, "<id>"),
+    slash_locked("/undo", "undo the latest checkpoint"),
+    slash_locked("/revert-turn", "revert a turn checkpoint"),
+    slash_args(
+        "/verbosity",
+        "open config focused on response verbosity (or set inline)",
+        false,
+        "[quiet|normal|verbose]",
+    ),
+    slash_args(
+        "/tool-verbosity",
+        "open config focused on tool output verbosity (or set inline)",
+        false,
+        "[quiet|normal|verbose]",
+    ),
+    slash_args("/detach", "remove attached context", false, "<id>"),
 ];
+
+impl SlashCommand {
+    fn is_dimmed(&self, task_in_progress: bool) -> bool {
+        task_in_progress && !self.available_during_task
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StartupProfile {
     pub onboarding_summary: Option<String>,
     pub languages: String,
+    /// When true, the startup resume picker is bypassed and a fresh
+    /// agent is created immediately (or the explicit `--resume` id, if
+    /// any, is honoured). The CLI flips this on via `--no-resume-picker`
+    /// for non-interactive flows (CI, scripts).
+    pub skip_resume_picker: bool,
 }
 
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
@@ -316,6 +293,7 @@ pub async fn run_with_onboarding(
         StartupProfile {
             onboarding_summary,
             languages: String::new(),
+            skip_resume_picker: false,
         },
     )
     .await
@@ -352,6 +330,12 @@ async fn run_inner(
     startup: StartupProfile,
 ) -> Result<()> {
     let mut terminal = TerminalGuard::enter(config.tui.alternate_screen)?;
+    let resume_session_id =
+        match maybe_pick_resume_session(&mut terminal, &config, resume_session_id, &startup)? {
+            ResumeStartup::Use(id) => Some(id),
+            ResumeStartup::Fresh => None,
+            ResumeStartup::Quit => return Ok(()),
+        };
     let (mut agent, initial_transcript) = if let Some(session_id) = resume_session_id {
         Agent::resume(config.clone(), provider, &session_id)?
     } else {
@@ -417,7 +401,13 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.note_turn_started();
                 }
                 AgentEvent::AssistantDelta { delta, .. } => {
-                    app.pending_assistant.push_str(&delta);
+                    let extracted = app.proposed_plan.feed(&delta);
+                    if !extracted.passthrough.is_empty() {
+                        app.pending_assistant.push_delta(&extracted.passthrough);
+                    }
+                    for plan_body in extracted.completed {
+                        app.push_log(format!("proposed plan:\n{plan_body}"));
+                    }
                     // Intentionally preserve `transcript_scroll_from_bottom`
                     // here: if the user paged up to read history we would
                     // otherwise yank them back to the bottom on every delta.
@@ -442,6 +432,11 @@ async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::ToolCallCompleted { result, .. } => {
                     app.status = tool_result_status_text(&result);
+                    if result.status == ToolStatus::Success
+                        && matches!(result.tool_name.as_str(), "apply_patch" | "write_file")
+                    {
+                        app.last_turn_had_edits = true;
+                    }
                     let call = app.active_tool_calls.remove(&result.call_id);
                     app.refresh_active_tool_name();
                     app.push_tool_result_with_call(result, call);
@@ -470,6 +465,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.context_compaction.summary = Some(report.summary.clone());
                     app.context_compaction.history.push(report.record.clone());
                     app.context_estimate = report.record.after.clone();
+                    app.context_compaction_nudge_shown = false;
                     app.status = compaction_status_line(&report.record);
                     app.push_log(format!(
                         "context compacted gen={} trigger={} items={} tok {}->{}",
@@ -512,6 +508,10 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         compact_text(&error, 180)
                     ));
                 }
+                AgentEvent::AiReviewerTripped { reason, .. } => {
+                    app.status = "approval review paused".to_string();
+                    app.push_log(format!("AI approval reviewer paused: {reason}"));
+                }
                 AgentEvent::ApprovalRequested {
                     request,
                     decision_tx,
@@ -541,22 +541,53 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     });
                     break;
                 }
+                AgentEvent::RequestUserInputRequested {
+                    request,
+                    response_tx,
+                    ..
+                } => {
+                    if let Some(previous) = app.pending_request_user_input.take() {
+                        let _ = previous
+                            .response_tx
+                            .send(RequestUserInputResponse::cancelled());
+                    }
+                    app.status = format!("plan-mode question: {}", request.question);
+                    app.pending_request_user_input = Some(PendingRequestUserInput {
+                        request,
+                        response_tx,
+                        selection_index: 0,
+                    });
+                    break;
+                }
                 AgentEvent::Completed {
                     message,
                     cost,
                     metrics,
+                    context_estimate,
                     ..
                 } => {
                     if let Some(message) = dedupe_assistant_repeated_tool_output(app, message) {
                         app.push_transcript_item(message);
                     }
                     app.pending_assistant.clear();
+                    finalize_proposed_plan(app);
+                    app.context_estimate = context_estimate;
+                    app.cancelled_prompt = None;
+                    if app.last_turn_had_edits {
+                        app.push_log(
+                            "turn complete · /diff to inspect changes · /undo to revert this turn"
+                                .to_string(),
+                        );
+                        app.last_turn_had_edits = false;
+                    }
+                    maybe_push_context_compaction_nudge(app);
                     app.cost = cost;
                     app.metrics = metrics;
                     app.status = "ready".to_string();
                     app.turn_visual = TurnVisualState::Succeeded;
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
+                    cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     // Preserve the user's scroll position; if they paged up
                     // mid-turn we shouldn't snap them down on completion.
@@ -564,25 +595,56 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     keep_rx = false;
                     break;
                 }
+                AgentEvent::CostWarning { status, .. } => {
+                    let notice = format!(
+                        "session cost crossed warning threshold: spent ${:.4} of ${:.2} cap ({}%)",
+                        status.spent_usd_micros as f64 / 1_000_000.0,
+                        status.cap_usd_micros as f64 / 1_000_000.0,
+                        status.percent
+                    );
+                    app.push_transcript_item(TranscriptItem::system(notice.clone()));
+                    app.push_log(notice);
+                }
                 AgentEvent::Cancelled { .. } => {
-                    app.status = "cancelled; edit prompt or retry".to_string();
+                    let mut message = "cancelled; edit prompt or retry".to_string();
+                    if app.last_turn_had_edits {
+                        message.push_str(" · /undo to revert this turn's edits");
+                    }
+                    app.status = message;
                     app.turn_visual = TurnVisualState::Failed;
                     app.push_log("turn cancelled".to_string());
+                    if app.last_turn_had_edits {
+                        app.push_log(
+                            "/diff to inspect changes · /undo to revert this turn".to_string(),
+                        );
+                        app.last_turn_had_edits = false;
+                    }
                     app.pending_assistant.clear();
+                    finalize_proposed_plan(app);
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
+                    cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     app.cancel = None;
                     keep_rx = false;
                     break;
                 }
                 AgentEvent::Failed { error, .. } => {
-                    app.status = format_error_status(&error);
+                    let mut status = format_error_status(&error);
+                    if app.last_turn_had_edits {
+                        status.push_str(" · /undo to revert this turn's edits");
+                    }
+                    app.status = status;
                     app.turn_visual = TurnVisualState::Failed;
                     app.push_log(format!("turn failed: {}", app.status));
+                    if app.last_turn_had_edits {
+                        app.last_turn_had_edits = false;
+                    }
                     app.pending_assistant.clear();
+                    finalize_proposed_plan(app);
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
+                    cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     app.cancel = None;
                     keep_rx = false;
@@ -594,6 +656,189 @@ async fn drain_agent_events(app: &mut TuiApp) {
             app.turn_rx = Some(rx);
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResumeStartup {
+    Use(String),
+    Fresh,
+    Quit,
+}
+
+/// Decide whether to show the startup resume picker, and resolve the
+/// session-id (if any) the TUI should resume into.
+fn maybe_pick_resume_session(
+    terminal: &mut TerminalGuard,
+    config: &AppConfig,
+    resume_session_id: Option<String>,
+    startup: &StartupProfile,
+) -> Result<ResumeStartup> {
+    if let Some(id) = resume_session_id {
+        // Explicit `--resume <id>` bypasses the picker entirely.
+        return Ok(ResumeStartup::Use(id));
+    }
+    if startup.skip_resume_picker {
+        return Ok(ResumeStartup::Fresh);
+    }
+    let candidates = resume_picker::load_candidates(config);
+    if candidates.is_empty() {
+        return Ok(ResumeStartup::Fresh);
+    }
+    let choice = resume_picker::run_picker(&mut terminal.terminal, candidates)
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+    match choice {
+        resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
+        resume_picker::ResumeChoice::Resume(id) => Ok(ResumeStartup::Use(id)),
+        resume_picker::ResumeChoice::Quit => Ok(ResumeStartup::Quit),
+    }
+}
+
+/// Restore the most recently cancelled prompt into the composer. Only
+/// fires when no turn is running and the composer is empty, so the user
+/// cannot lose in-progress text. Returns `true` when it acted.
+fn restore_cancelled_prompt(app: &mut TuiApp) -> bool {
+    if app.turn_rx.is_some() {
+        return false;
+    }
+    if !app.input.is_empty() {
+        return false;
+    }
+    let Some(text) = app.cancelled_prompt.take() else {
+        return false;
+    };
+    app.input = text;
+    app.input_cursor = app.input.len();
+    app.status = "restored last prompt — edit and Enter to retry".to_string();
+    true
+}
+
+fn cancel_pending_request_user_input(app: &mut TuiApp) {
+    if let Some(pending) = app.pending_request_user_input.take() {
+        let _ = pending
+            .response_tx
+            .send(RequestUserInputResponse::cancelled());
+    }
+}
+
+fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    let Some(mut pending) = app.pending_request_user_input.take() else {
+        return false;
+    };
+    let choice_count = pending.request.choices.len();
+    match key.code {
+        KeyCode::Up => {
+            if choice_count > 0 {
+                pending.selection_index = pending.selection_index.saturating_sub(1);
+            }
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        KeyCode::Down => {
+            if choice_count > 0 {
+                pending.selection_index =
+                    (pending.selection_index + 1).min(choice_count.saturating_sub(1));
+            }
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        KeyCode::Enter => {
+            if choice_count > 0
+                && let Some(choice) = pending.request.choices.get(pending.selection_index)
+            {
+                let response = RequestUserInputResponse::choice(choice.value.clone());
+                let _ = pending.response_tx.send(response);
+                app.status = format!("answered: {}", choice.label);
+                return true;
+            }
+            if pending.request.allow_freeform && !app.input.trim().is_empty() {
+                let text = std::mem::take(&mut app.input);
+                app.input_cursor = 0;
+                let _ = pending
+                    .response_tx
+                    .send(RequestUserInputResponse::freeform(text));
+                app.status = "answered with free-form text".to_string();
+                return true;
+            }
+            // Nothing to send yet — keep the modal up.
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        KeyCode::Esc => {
+            let _ = pending
+                .response_tx
+                .send(RequestUserInputResponse::cancelled());
+            app.status = "plan-mode question cancelled".to_string();
+            true
+        }
+        KeyCode::Backspace if pending.request.allow_freeform => {
+            delete_before_cursor(app);
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        KeyCode::Delete if pending.request.allow_freeform => {
+            delete_at_cursor(app);
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        KeyCode::Left if pending.request.allow_freeform => {
+            move_input_cursor_left(app);
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        KeyCode::Right if pending.request.allow_freeform => {
+            move_input_cursor_right(app);
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        KeyCode::Char(ch)
+            if pending.request.allow_freeform
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+        {
+            insert_input_char(app, ch);
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        _ => {
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+    }
+}
+
+/// Push a one-shot system transcript advisory when the post-turn context
+/// estimate is closing in on the auto-compaction threshold. We surface
+/// this *before* the next turn so the user has a chance to `/pin` or
+/// `/compact` deliberately rather than discovering after the fact that
+/// the conversation has been rewritten.
+fn maybe_push_context_compaction_nudge(app: &mut TuiApp) {
+    if app.context_compaction_threshold == 0 || app.context_compaction_nudge_shown {
+        return;
+    }
+    let pct = context_window_pct(
+        app.context_estimate.estimated_tokens,
+        app.context_compaction_threshold,
+    );
+    if pct < CONTEXT_NUDGE_PCT {
+        return;
+    }
+    app.context_compaction_nudge_shown = true;
+    app.push_log(format!(
+        "context window {pct}% full ({used}/{threshold} tok) — /pin to keep important context · /compact to summarize before the next turn",
+        used = app.context_estimate.estimated_tokens,
+        threshold = app.context_compaction_threshold,
+    ));
+}
+
+/// Flush any straggler bytes held by the `<proposed_plan>` extractor at
+/// turn boundaries. Unterminated blocks are folded back into the
+/// transcript so the user can see what the model attempted; the extractor
+/// itself is rebuilt fresh for the next turn.
+fn finalize_proposed_plan(app: &mut TuiApp) {
+    let leftover = app.proposed_plan.finalize();
+    if !leftover.is_empty() {
+        app.pending_assistant.push_delta(&leftover);
+    }
+    app.proposed_plan = proposed_plan::ProposedPlanExtractor::new();
 }
 
 fn drain_job_events(app: &mut TuiApp) {
@@ -770,6 +1015,10 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
+    if handle_request_user_input_key(app, key) {
+        return Ok(false);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && (key.code == KeyCode::Char('j') || key.code == KeyCode::Enter)
     {
@@ -817,6 +1066,13 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('r')
+        && restore_cancelled_prompt(app)
+    {
+        return Ok(false);
+    }
+
     if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('b') {
         move_input_cursor_word_left(app);
         return Ok(false);
@@ -847,6 +1103,14 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
     }
 
     if handle_approval_key(app, key) {
+        return Ok(false);
+    }
+
+    if app.overlay.is_some() && handle_overlay_key(app, key) {
+        return Ok(false);
+    }
+
+    if app.mention_popup.is_some() && handle_mention_popup_key(app, key) {
         return Ok(false);
     }
 
@@ -963,6 +1227,10 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             if reject_unknown_slash_command(app, &input) {
                 return Ok(false);
             }
+            // Stash the typed prompt before clearing so that a Ctrl-C/Esc
+            // during the turn can restore it via Ctrl-R. Completion clears
+            // this field; only Cancelled/Failed leave it set.
+            app.cancelled_prompt = Some(input.clone());
             clear_input(app);
             push_input_history(app, input.clone());
             // Apply any pending config swap before the request goes out so
@@ -1089,6 +1357,131 @@ fn note_input_edited(app: &mut TuiApp) {
     app.input_history_draft.clear();
     app.selected_entry = None;
     clamp_slash_menu_index(app);
+    refresh_mention_popup(app);
+}
+
+fn refresh_mention_popup(app: &mut TuiApp) {
+    let Some(query) = mention::detect_mention(&app.input, app.input_cursor) else {
+        app.mention_popup = None;
+        return;
+    };
+    if app.workspace_files.is_none() {
+        let root = std::path::Path::new(&app.directory).to_path_buf();
+        let files = mention::load_workspace_files(&root);
+        app.workspace_files = Some(Arc::new(files));
+    }
+    let matches = app
+        .workspace_files
+        .as_ref()
+        .map(|files| mention::rank_files(&query.query, files))
+        .unwrap_or_default();
+    if matches.is_empty() {
+        app.mention_popup = None;
+        return;
+    }
+    app.mention_popup = Some(mention::MentionPopup::from_query(query, matches));
+}
+
+fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    let Some(overlay) = app.overlay.as_mut() else {
+        return false;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.overlay = None;
+            app.status = "overlay cancelled".to_string();
+            true
+        }
+        KeyCode::Up => {
+            overlay.move_up();
+            true
+        }
+        KeyCode::Down => {
+            overlay.move_down();
+            true
+        }
+        KeyCode::Enter => {
+            apply_overlay_selection(app);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn apply_overlay_selection(app: &mut TuiApp) {
+    let Some(overlay) = app.overlay.take() else {
+        return;
+    };
+    match overlay {
+        overlay::Overlay::Model(picker) => {
+            if let Some(entry) = picker.selected() {
+                let provider = entry.provider;
+                let id = entry.id;
+                app.provider_name = provider;
+                app.model = id.to_string();
+                app.status = format!("selected model {provider}:{id}");
+                app.push_transcript_item(TranscriptItem::system(format!(
+                    "Model set to {provider}:{id} (restart the session to apply)"
+                )));
+            }
+        }
+        overlay::Overlay::Verbosity(picker) => {
+            if let Some(entry) = picker.selected() {
+                app.response_verbosity = entry.0;
+                app.status = format!("response verbosity {}", entry.0.as_str());
+            }
+        }
+        overlay::Overlay::ToolVerbosity(picker) => {
+            if let Some(entry) = picker.selected() {
+                app.tool_output_verbosity = entry.0;
+                app.status = format!("tool output verbosity {}", entry.0.as_str());
+            }
+        }
+        overlay::Overlay::Permissions(_) => {
+            app.status = "permission overlay closed".to_string();
+        }
+    }
+}
+
+fn handle_mention_popup_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if app.mention_popup.is_none() {
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.mention_popup = None;
+            true
+        }
+        KeyCode::Up => {
+            if let Some(popup) = app.mention_popup.as_mut() {
+                popup.move_up();
+            }
+            true
+        }
+        KeyCode::Down => {
+            if let Some(popup) = app.mention_popup.as_mut() {
+                popup.move_down();
+            }
+            true
+        }
+        KeyCode::Tab | KeyCode::Enter => apply_mention_popup(app),
+        _ => false,
+    }
+}
+
+fn apply_mention_popup(app: &mut TuiApp) -> bool {
+    let popup = match app.mention_popup.as_ref() {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => return false,
+    };
+    if let Some((new_input, new_cursor)) = popup.apply(&app.input) {
+        app.input = new_input;
+        app.input_cursor = new_cursor;
+        app.mention_popup = None;
+        clamp_slash_menu_index(app);
+        return true;
+    }
+    false
 }
 
 fn clear_input(app: &mut TuiApp) {
@@ -1504,6 +1897,13 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         .strip_prefix(command)
         .map(str::trim)
         .unwrap_or_default();
+    if let Some(spec) = SLASH_COMMANDS.iter().find(|spec| spec.name == command)
+        && !spec.available_during_task
+        && turn_in_progress(app)
+    {
+        app.status = format!("{command} unavailable during turn");
+        return true;
+    }
     match command {
         "/config" => {
             let section = if rest.is_empty() {
@@ -1604,6 +2004,28 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             return true;
         }
         "/compact" => {
+            let subcommand = parts.next().map(str::trim).unwrap_or("");
+            if subcommand.eq_ignore_ascii_case("undo") {
+                match agent.compact_context_undo().await {
+                    Ok(Some(record)) => {
+                        app.context_compaction = agent.context_compaction_snapshot().await;
+                        app.context_estimate = agent.context_estimate_snapshot().await;
+                        app.status = format!(
+                            "undid compaction gen={} ({} item(s) restored)",
+                            record.generation, record.dropped_items,
+                        );
+                        app.push_log(format!(
+                            "context compaction undone gen={} items={}",
+                            record.generation, record.dropped_items,
+                        ));
+                    }
+                    Ok(None) => {
+                        app.status = "no compaction checkpoint to undo".to_string();
+                    }
+                    Err(error) => app.status = format!("compact undo failed: {error}"),
+                }
+                return true;
+            }
             match agent.compact_context_manual().await {
                 Ok(report) => {
                     app.context_compaction = agent.context_compaction_snapshot().await;
@@ -2446,8 +2868,8 @@ fn copy_to_clipboard(app: &mut TuiApp, target: ClipboardTarget) {
 fn clipboard_text(app: &TuiApp, target: ClipboardTarget) -> Option<String> {
     match target {
         ClipboardTarget::LastAssistant => {
-            if !app.pending_assistant.trim().is_empty() {
-                return Some(app.pending_assistant.clone());
+            if !app.pending_assistant.trim_is_empty() {
+                return Some(app.pending_assistant.text());
             }
             app.transcript
                 .iter()
@@ -2471,7 +2893,7 @@ fn transcript_plain_text(app: &TuiApp) -> String {
         lines.extend(item.plain_text_lines());
     }
     if !app.pending_assistant.is_empty() {
-        lines.push(format!("assistant: {}", app.pending_assistant));
+        lines.push(format!("assistant: {}", app.pending_assistant.text()));
     }
     lines.join("\n")
 }
@@ -2604,6 +3026,7 @@ fn switch_mode(
     if app.turn_rx.is_some()
         || app.pending_approval.is_some()
         || app.pending_mcp_elicitation.is_some()
+        || app.pending_request_user_input.is_some()
     {
         app.status = "mode switch unavailable during active turn".to_string();
         return;
@@ -2859,8 +3282,10 @@ fn send_approval_decision(
     let _ = pending.decision_tx.send(option.decision);
     app.status = match option.choice {
         ApprovalChoice::Approve => format!("approved {tool_name}"),
+        ApprovalChoice::ApproveSession => format!("saved session approval for {tool_name}"),
         ApprovalChoice::ApproveProject => format!("saved repo approval for {tool_name}"),
         ApprovalChoice::Deny => format!("denied {tool_name}"),
+        ApprovalChoice::DenySession => format!("saved session deny for {tool_name}"),
     };
     true
 }
@@ -2868,8 +3293,10 @@ fn send_approval_decision(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalChoice {
     Approve,
+    ApproveSession,
     ApproveProject,
     Deny,
+    DenySession,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2887,6 +3314,13 @@ const APPROVAL_ONCE: ApprovalOption = ApprovalOption {
     decision: ToolApprovalDecision::AllowOnce,
 };
 
+const APPROVAL_SESSION: ApprovalOption = ApprovalOption {
+    choice: ApprovalChoice::ApproveSession,
+    label: "Approve for this session",
+    hint: "save an in-memory rule",
+    decision: ToolApprovalDecision::AllowSession,
+};
+
 const APPROVAL_PROJECT: ApprovalOption = ApprovalOption {
     choice: ApprovalChoice::ApproveProject,
     label: "Always approve this command in this repo",
@@ -2901,8 +3335,21 @@ const APPROVAL_DENY: ApprovalOption = ApprovalOption {
     decision: ToolApprovalDecision::DenyOnce,
 };
 
+const APPROVAL_DENY_SESSION: ApprovalOption = ApprovalOption {
+    choice: ApprovalChoice::DenySession,
+    label: "Deny for this session",
+    hint: "save an in-memory deny rule",
+    decision: ToolApprovalDecision::DenySession,
+};
+
 fn approval_options() -> &'static [ApprovalOption] {
-    &[APPROVAL_ONCE, APPROVAL_PROJECT, APPROVAL_DENY]
+    &[
+        APPROVAL_ONCE,
+        APPROVAL_SESSION,
+        APPROVAL_PROJECT,
+        APPROVAL_DENY,
+        APPROVAL_DENY_SESSION,
+    ]
 }
 
 /// Single-line status banner shown in the 1-line status bar. Compact by
@@ -3036,34 +3483,7 @@ fn format_approval_menu_lines(
     request: &ToolApprovalRequest,
     selected: usize,
 ) -> Vec<Line<'static>> {
-    let permission = &request.permission;
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            "Approval needed",
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" · {} · {}", request.tool_name, permission.risk.as_str()),
-            Style::default().fg(QUIET),
-        ),
-    ])];
-    if let Some(command) = permission.metadata.get("command") {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(command.clone(), Style::default().fg(Color::White)),
-        ]));
-    } else {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(permission.target.clone(), Style::default().fg(Color::White)),
-        ]));
-    }
-    if let Some(cwd) = permission.metadata.get("cwd") {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("cwd {cwd}"), Style::default().fg(QUIET)),
-        ]));
-    }
+    let mut lines = approval::render_preview(request);
     for (index, option) in approval_options().iter().enumerate() {
         let is_selected = index == selected.min(approval_options().len() - 1);
         let marker = if is_selected { "› " } else { "  " };
@@ -3326,24 +3746,78 @@ fn should_show_task_panel(app: &TuiApp) -> bool {
             .is_some_and(|snapshot| snapshot.status != squeezy_core::TaskStateStatus::Completed)
 }
 
-fn task_panel_height(_app: &TuiApp) -> u16 {
-    1
+fn task_panel_height(app: &TuiApp) -> u16 {
+    if turn_in_progress(app) && working_detail_line(app).is_some() {
+        2
+    } else {
+        1
+    }
 }
 
 fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let line = if turn_in_progress(app) {
-        working_line(app)
+    let mut lines = if turn_in_progress(app) {
+        let mut rows = vec![working_line(app)];
+        if let Some(detail) = working_detail_line(app) {
+            rows.push(detail);
+        }
+        rows
     } else if let Some(duration) = app.last_turn_duration {
-        worked_divider_line(duration, area.width)
+        vec![worked_divider_line(duration, area.width)]
     } else if let Some(snapshot) = app.task_state.as_ref() {
-        compact_task_state_line(snapshot)
+        vec![compact_task_state_line(snapshot)]
     } else {
-        working_line(app)
+        vec![working_line(app)]
     };
-    let paragraph = Paragraph::new(vec![line])
+    if lines.len() < area.height as usize {
+        // Pad so the bottom row doesn't shift when the detail goes away.
+        while lines.len() < area.height as usize {
+            lines.push(Line::from(""));
+        }
+    }
+    let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(QUIET))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+/// Detail row rendered below the spinner when there is something
+/// actionable to show. Returns `None` when the spinner alone suffices —
+/// keeps the working cell single-row in the common case.
+fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
+    // Highest priority: MCP startup in progress.
+    if let Some(snapshot) = app.mcp_status.as_ref() {
+        let mut starting = 0usize;
+        let mut total = 0usize;
+        let mut ready = 0usize;
+        for status in snapshot.per_server.values() {
+            total += 1;
+            match status {
+                McpServerStatus::Starting => starting += 1,
+                McpServerStatus::Ready { .. } => ready += 1,
+                _ => {}
+            }
+        }
+        if starting > 0 && total > 0 {
+            let text = format!("    ↳ mcp: starting {ready}/{total} servers");
+            return Some(Line::from(Span::styled(text, Style::default().fg(QUIET))));
+        }
+    }
+
+    // Otherwise: count of additional queued tools beyond the visible one.
+    let visible_tools = app
+        .active_tool_calls
+        .values()
+        .filter(|call| !is_control_tool_name(&call.name))
+        .count();
+    if visible_tools > 1 {
+        let extra = visible_tools - 1;
+        let text = format!(
+            "    ↳ +{extra} more tool call{} queued",
+            if extra == 1 { "" } else { "s" }
+        );
+        return Some(Line::from(Span::styled(text, Style::default().fg(QUIET))));
+    }
+    None
 }
 
 fn turn_in_progress(app: &TuiApp) -> bool {
@@ -3506,8 +3980,8 @@ fn task_title(snapshot: &TaskStateSnapshot) -> &str {
 }
 
 fn approval_menu_height(app: &TuiApp) -> u16 {
-    if app.pending_approval.is_some() {
-        6
+    if let Some(pending) = app.pending_approval.as_ref() {
+        format_approval_menu_lines(&pending.request, app.approval_selection_index).len() as u16
     } else if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
         match pending.request.kind {
             McpElicitationKind::Form => {
@@ -3849,10 +4323,11 @@ fn assistant_content_without_repeated_tool_output(app: &TuiApp, content: &str) -
 }
 
 fn pending_assistant_display_content(app: &TuiApp) -> Option<String> {
-    if app.pending_assistant.trim().is_empty() {
+    if app.pending_assistant.trim_is_empty() {
         return None;
     }
-    let content = assistant_content_without_repeated_tool_output(app, &app.pending_assistant);
+    let text = app.pending_assistant.text();
+    let content = assistant_content_without_repeated_tool_output(app, &text);
     (!content.trim().is_empty()).then_some(content)
 }
 
@@ -6163,10 +6638,29 @@ fn truncate_bytes(text: &str, limit: usize) -> String {
 }
 
 fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
+    let overlay_lines = app
+        .overlay
+        .as_ref()
+        .map(|o| o.render_lines().len())
+        .unwrap_or(0);
+    let mention_lines = app
+        .mention_popup
+        .as_ref()
+        .map(|p| p.matches.len().min(5))
+        .unwrap_or(0);
+    let suggestion_lines = if overlay_lines == 0 && mention_lines == 0 {
+        slash_suggestions(&app.input).len()
+    } else {
+        0
+    };
+    let popup_height = overlay_lines + mention_lines;
+    let max_height = (PROMPT_MAX_HEIGHT as usize).max(popup_height + PROMPT_MIN_HEIGHT as usize);
     prompt_visual_line_count(&app.input, width)
         .saturating_add(2)
-        .saturating_add(slash_suggestions(&app.input).len())
-        .clamp(PROMPT_MIN_HEIGHT as usize, PROMPT_MAX_HEIGHT as usize) as u16
+        .saturating_add(overlay_lines)
+        .saturating_add(mention_lines)
+        .saturating_add(suggestion_lines)
+        .clamp(PROMPT_MIN_HEIGHT as usize, max_height) as u16
 }
 
 fn prompt_visual_line_count(input: &str, width: u16) -> usize {
@@ -6266,6 +6760,7 @@ fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .max()
         .unwrap_or(0)
         .max(12);
+    let task_active = turn_in_progress(app);
     visible
         .iter()
         .enumerate()
@@ -6276,21 +6771,52 @@ fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
                 == app
                     .slash_menu_index
                     .min(suggestions.len().saturating_sub(1));
+            let dimmed = command.is_dimmed(task_active);
             let marker = if selected { "› " } else { "  " };
             let command_padding =
                 " ".repeat(command_width.saturating_sub(command.name.chars().count()) + 2);
-            Line::from(vec![
+            let name_color = if dimmed {
+                QUIET
+            } else if selected {
+                GOLD
+            } else {
+                AMBER
+            };
+            let mut name_style = Style::default().fg(name_color);
+            if dimmed {
+                name_style = name_style.add_modifier(Modifier::DIM);
+            }
+            let mut description_style = Style::default().fg(QUIET);
+            if dimmed {
+                description_style = description_style.add_modifier(Modifier::DIM);
+            }
+            let mut spans = vec![
                 Span::styled(
                     marker,
                     Style::default().fg(if selected { GOLD } else { QUIET }),
                 ),
-                Span::styled(
-                    command.name,
-                    Style::default().fg(if selected { GOLD } else { AMBER }),
-                ),
+                Span::styled(command.name, name_style),
                 Span::styled(command_padding, Style::default().fg(QUIET)),
-                Span::styled(command.description, Style::default().fg(QUIET)),
-            ])
+                Span::styled(command.description, description_style),
+            ];
+            if let Some(hint) = command.parameter_hint {
+                let hint_text = format!(" {hint}");
+                spans.push(Span::styled(
+                    hint_text,
+                    Style::default()
+                        .fg(QUIET)
+                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                ));
+            }
+            if dimmed {
+                spans.push(Span::styled(
+                    "  (unavailable during turn)",
+                    Style::default()
+                        .fg(QUIET)
+                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                ));
+            }
+            Line::from(spans)
         })
         .collect()
 }
@@ -6314,9 +6840,22 @@ fn visible_slash_suggestions(suggestions: &[SlashCommand], selected: usize) -> &
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let suggestion_lines = slash_suggestion_lines(app);
-    let prompt_height = area.height.saturating_sub(suggestion_lines.len() as u16);
+    let overlay_lines = overlay_picker_lines(app);
+    let mention_lines = if overlay_lines.is_empty() {
+        mention_popup_lines(app)
+    } else {
+        Vec::new()
+    };
+    let suggestion_lines = if overlay_lines.is_empty() && mention_lines.is_empty() {
+        slash_suggestion_lines(app)
+    } else {
+        Vec::new()
+    };
+    let overlay_height = overlay_lines.len() + mention_lines.len() + suggestion_lines.len();
+    let prompt_height = area.height.saturating_sub(overlay_height as u16);
     let mut lines = prompt_input_lines(app, prompt_height);
+    lines.extend(overlay_lines);
+    lines.extend(mention_lines);
     lines.extend(suggestion_lines);
     let scroll = lines.len().saturating_sub(area.height as usize) as u16;
     let paragraph = Paragraph::new(lines)
@@ -6324,6 +6863,45 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn overlay_picker_lines(app: &TuiApp) -> Vec<Line<'static>> {
+    app.overlay
+        .as_ref()
+        .map(|o| o.render_lines())
+        .unwrap_or_default()
+}
+
+fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
+    let Some(popup) = app.mention_popup.as_ref() else {
+        return Vec::new();
+    };
+    if popup.is_empty() {
+        return Vec::new();
+    }
+    popup
+        .matches
+        .iter()
+        .take(5)
+        .enumerate()
+        .map(|(index, path)| {
+            let selected = index == popup.selected;
+            let marker = if selected { "› " } else { "  " };
+            let display = path.display().to_string();
+            let style = if selected {
+                Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(vec![
+                Span::styled(
+                    marker,
+                    Style::default().fg(if selected { GOLD } else { QUIET }),
+                ),
+                Span::styled(display, style),
+            ])
+        })
+        .collect()
 }
 
 fn format_status_overview_line(app: &TuiApp, width: u16) -> Line<'static> {
@@ -6412,36 +6990,31 @@ fn format_status_context(app: &TuiApp) -> String {
 }
 
 fn format_status_details(app: &TuiApp) -> String {
-    format!(
-        "{}  repo {}  sandbox {}  telemetry {}  mcp {}  cost {}  tok {}/{}{}  ctx {}  pins {}  compact {}  tools {}  budget {}  cfg {}  read {}B  receipts {}  redactions {}  cached {}  cache_write {}",
-        app.permissions.compact(),
-        app.repo.detail(),
-        app.permissions.sandbox,
-        app.telemetry.as_str(),
-        format_mcp_status(app),
-        format_cost(&app.cost),
-        format_optional_u64(app.cost.input_tokens),
-        format_optional_u64(app.cost.output_tokens),
-        reasoning_status_fragment(app),
-        app.context_estimate.estimated_tokens,
-        app.context_compaction.pinned.len(),
-        app.context_compaction.generation,
-        app.metrics.tool_calls,
-        if app.metrics.budget_denials == 0 {
-            "ok".to_string()
-        } else {
-            format!("denied:{}", app.metrics.budget_denials)
-        },
-        app.config_sources,
-        app.metrics.bytes_read,
-        app.metrics.receipt_stub_hits + app.metrics.negative_receipt_hits,
-        app.metrics.redactions,
-        format_optional_u64(app.cost.cached_input_tokens),
-        format_optional_u64(app.cost.cache_write_input_tokens),
-    )
+    status::render_status_details(app)
 }
 
+pub(crate) fn context_window_pct(used: u64, threshold: u64) -> u64 {
+    if threshold == 0 {
+        return 0;
+    }
+    let ratio = (used as f64 / threshold as f64) * 100.0;
+    // Saturate at 999 so the field stays compact even past the limit.
+    ratio.clamp(0.0, 999.0).round() as u64
+}
+
+const CONTEXT_BUDGET_HINT_PCT: u64 = 85;
+const CONTEXT_NUDGE_PCT: u64 = 95;
+
 fn format_status_hints(app: &TuiApp) -> String {
+    if let Some(pending) = app.pending_request_user_input.as_ref() {
+        if pending.request.choices.is_empty() && pending.request.allow_freeform {
+            return "type your answer · Enter send · Esc cancel".to_string();
+        }
+        if pending.request.allow_freeform {
+            return "Up/Down choose · type for free-form · Enter send · Esc cancel".to_string();
+        }
+        return "Up/Down choose · Enter select · Esc cancel".to_string();
+    }
     if app.pending_mcp_elicitation.is_some() {
         if app
             .pending_mcp_elicitation
@@ -6460,13 +7033,27 @@ fn format_status_hints(app: &TuiApp) -> String {
     } else if app.exit_confirm_armed {
         return "Ctrl+C or Y to exit · any other key to cancel".to_string();
     }
-    if app.alternate_scroll_enabled {
+    if app.cancelled_prompt.is_some() && app.turn_rx.is_none() && app.input.is_empty() {
+        // We're idle right after a cancelled/failed turn — surface the
+        // recovery affordance before the regular hint set.
+        return "Ctrl-R restore last prompt · Enter send · Ctrl+J newline · /help".to_string();
+    }
+    let mut base = if app.alternate_scroll_enabled {
         "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
             .to_string()
     } else {
         "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
             .to_string()
+    };
+    if app.context_compaction_threshold > 0
+        && context_window_pct(
+            app.context_estimate.estimated_tokens,
+            app.context_compaction_threshold,
+        ) >= CONTEXT_BUDGET_HINT_PCT
+    {
+        base.push_str(" · /pin to keep important context · /compact to summarize");
     }
+    base
 }
 
 fn format_mcp_status(app: &TuiApp) -> String {
@@ -6778,15 +7365,29 @@ struct TuiApp {
     input_history_index: Option<usize>,
     input_history_draft: String,
     slash_menu_index: usize,
+    mention_popup: Option<mention::MentionPopup>,
+    workspace_files: Option<Arc<Vec<PathBuf>>>,
+    overlay: Option<overlay::Overlay>,
     alternate_scroll_enabled: bool,
     attachments: Vec<ContextAttachment>,
     context_compaction: ContextCompactionState,
+    /// Token threshold above which auto-compaction triggers. Captured at
+    /// startup from `config.context_compaction.estimated_tokens` so the
+    /// status line can express usage as a percentage of the local cap
+    /// (Squeezy's cost thesis cares about the configured budget, not the
+    /// raw model window).
+    context_compaction_threshold: u64,
+    /// Whether the "compaction imminent" advisory has been pushed for the
+    /// current pre-compaction window. Reset when compaction lands so the
+    /// nudge can fire again on the next approach to the threshold.
+    context_compaction_nudge_shown: bool,
     context_estimate: ContextEstimate,
     transcript: Vec<TranscriptEntry>,
     selected_entry: Option<usize>,
     next_entry_id: u64,
     transcript_scroll_from_bottom: u16,
-    pending_assistant: String,
+    pending_assistant: streaming::StreamingController,
+    proposed_plan: proposed_plan::ProposedPlanExtractor,
     task_state: Option<TaskStateSnapshot>,
     mcp_status: Option<McpStatusSnapshot>,
     task_panel_collapsed: bool,
@@ -6800,6 +7401,11 @@ struct TuiApp {
     exit_confirm_armed: bool,
     active_tool_calls: BTreeMap<String, ToolCall>,
     cost: squeezy_core::CostSnapshot,
+    /// Session-level cap in USD micros, sourced from
+    /// `AppConfig.max_session_cost_usd_micros`. `None` (or a zero cap)
+    /// means the status bar renders the legacy `cost $X` segment
+    /// unchanged.
+    cost_cap_usd_micros: Option<u64>,
     metrics: squeezy_core::TurnMetrics,
     turn_rx: Option<mpsc::Receiver<AgentEvent>>,
     job_rx: Option<broadcast::Receiver<JobEvent>>,
@@ -6809,6 +7415,15 @@ struct TuiApp {
     pending_approval: Option<PendingApproval>,
     approval_selection_index: usize,
     pending_mcp_elicitation: Option<PendingMcpElicitation>,
+    pending_request_user_input: Option<PendingRequestUserInput>,
+    /// Prompt that was in flight when the most recent turn was cancelled
+    /// or failed. Surfaced via Ctrl-R so the user can recover from a
+    /// typo without retyping. Cleared on successful completion.
+    cancelled_prompt: Option<String>,
+    /// True when the in-flight turn has already produced a successful
+    /// edit-capable tool call (apply_patch / write_file). Used to surface
+    /// `/diff` and `/undo` hints at end-of-turn (success or failure).
+    last_turn_had_edits: bool,
     mcp_elicitation_selection_index: usize,
     pending_feedback: Option<PreparedFeedback>,
     pending_report: Option<BugReportBundle>,
@@ -6848,6 +7463,7 @@ impl TuiApp {
             StartupProfile {
                 onboarding_summary,
                 languages: String::new(),
+                skip_resume_picker: false,
             },
             clipboard,
         )
@@ -6890,16 +7506,22 @@ impl TuiApp {
             input_history_index: None,
             input_history_draft: String::new(),
             slash_menu_index: 0,
+            mention_popup: None,
+            workspace_files: None,
+            overlay: None,
             alternate_scroll_enabled: TerminalMode::from(config.tui.alternate_screen)
                 == TerminalMode::AlternateScreen,
             attachments: Vec::new(),
             context_compaction: ContextCompactionState::default(),
+            context_compaction_threshold: config.context_compaction.estimated_tokens,
+            context_compaction_nudge_shown: false,
             context_estimate: ContextEstimate::default(),
             transcript,
             selected_entry: None,
             next_entry_id,
             transcript_scroll_from_bottom: 0,
-            pending_assistant: String::new(),
+            pending_assistant: streaming::StreamingController::new(),
+            proposed_plan: proposed_plan::ProposedPlanExtractor::new(),
             task_state: None,
             mcp_status: None,
             task_panel_collapsed: false,
@@ -6913,6 +7535,7 @@ impl TuiApp {
             exit_confirm_armed: false,
             active_tool_calls: BTreeMap::new(),
             cost: squeezy_core::CostSnapshot::default(),
+            cost_cap_usd_micros: config.max_session_cost_usd_micros.filter(|cap| *cap > 0),
             metrics: squeezy_core::TurnMetrics::default(),
             turn_rx: None,
             job_rx: None,
@@ -6922,6 +7545,9 @@ impl TuiApp {
             pending_approval: None,
             approval_selection_index: 0,
             pending_mcp_elicitation: None,
+            pending_request_user_input: None,
+            cancelled_prompt: None,
+            last_turn_had_edits: false,
             mcp_elicitation_selection_index: 0,
             pending_feedback: None,
             pending_report: None,
@@ -7195,6 +7821,12 @@ struct PendingApproval {
 struct PendingMcpElicitation {
     request: McpElicitationRequest,
     response_tx: oneshot::Sender<McpElicitationResponse>,
+}
+
+struct PendingRequestUserInput {
+    request: RequestUserInputRequest,
+    response_tx: oneshot::Sender<RequestUserInputResponse>,
+    selection_index: usize,
 }
 
 fn exit_hint(session_id: Option<&str>) -> Option<String> {

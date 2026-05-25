@@ -140,6 +140,7 @@ async fn plan_mode_advertises_only_read_only_tools() {
             "delegate",
             "explore",
             "load_tool_schema",
+            "request_user_input",
             "glob",
             "grep",
             "read_file",
@@ -2117,6 +2118,7 @@ async fn automatic_context_compaction_replaces_old_raw_history() {
         min_items: 3,
         recent_items: 1,
         max_summary_bytes: 1_200,
+        ..ContextCompactionConfig::default()
     };
     let old_prompt = format!("first prompt {}", "raw-old-context ".repeat(400));
     let agent = Agent::new(config, provider.clone());
@@ -2222,6 +2224,7 @@ async fn manual_context_compaction_preserves_pins_in_resume_state() {
         min_items: 99,
         recent_items: 1,
         max_summary_bytes: 1_200,
+        ..ContextCompactionConfig::default()
     };
     let agent = Agent::new(config, provider);
 
@@ -2299,6 +2302,7 @@ async fn auto_compaction_does_not_orphan_function_call_output() {
         min_items: 3,
         recent_items: 2,
         max_summary_bytes: 1_200,
+        ..ContextCompactionConfig::default()
     };
     let agent = Agent::new(config, provider.clone());
 
@@ -2361,6 +2365,7 @@ async fn pinned_context_is_visible_to_model_before_compaction() {
         min_items: 1_000,
         recent_items: 1,
         max_summary_bytes: 1_200,
+        ..ContextCompactionConfig::default()
     };
     let agent = Agent::new(config, provider.clone());
 
@@ -2414,6 +2419,133 @@ async fn cleanup_sessions_refuses_to_remove_the_active_session() {
 
 async fn drain_turn(mut rx: tokio::sync::mpsc::Receiver<AgentEvent>) {
     while rx.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn session_cost_cap_blocks_further_calls_once_exceeded() {
+    // Cap deliberately tiny - the first round's reported cost (60 micros)
+    // already lands at the cap, so the *second* round must short-circuit
+    // into a Failed event before the provider is hit a second time.
+    let root = temp_workspace("session_cost_cap");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("first answer".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_first".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(40),
+                    output_tokens: Some(20),
+                    estimated_usd_micros: Some(60),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("should never stream".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_second".to_string()),
+                cost: CostSnapshot {
+                    estimated_usd_micros: Some(60),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.max_session_cost_usd_micros = Some(50);
+    let agent = Agent::new(config, provider.clone());
+
+    // First turn lands at $0.000060 == 120% of cap (already over) but is
+    // permitted because the cap is only checked *before* each round.
+    drain_turn(agent.start_turn("first prompt".to_string(), CancellationToken::new())).await;
+
+    let mut second_rx = agent.start_turn("second prompt".to_string(), CancellationToken::new());
+    let mut failed_with_cap = false;
+    let mut saw_provider_call = false;
+    while let Some(event) = second_rx.recv().await {
+        match event {
+            AgentEvent::Failed { error, .. } => {
+                let message = error.to_string();
+                if message.contains("cost cap") {
+                    failed_with_cap = true;
+                }
+            }
+            AgentEvent::AssistantDelta { .. } => {
+                saw_provider_call = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        failed_with_cap,
+        "the second turn must fail with a cost-cap message"
+    );
+    assert!(
+        !saw_provider_call,
+        "the cap check must short-circuit the round before any assistant delta streams"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn session_cost_warning_fires_once_at_threshold() {
+    // Cap = 100 micros, warn at 50%; the first round consumes 60 micros (60%)
+    // and must emit exactly one CostWarning. The second round consumes
+    // another 30 (cumulative 90, 90%) and must *not* re-fire.
+    let root = temp_workspace("session_cost_warning");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("first".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_first".to_string()),
+                cost: CostSnapshot {
+                    estimated_usd_micros: Some(60),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("second".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_second".to_string()),
+                cost: CostSnapshot {
+                    estimated_usd_micros: Some(30),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.max_session_cost_usd_micros = Some(100);
+    config.cost_warn_percent = 50;
+    let agent = Agent::new(config, provider);
+
+    let mut warnings = 0;
+    let mut rx = agent.start_turn("first prompt".to_string(), CancellationToken::new());
+    while let Some(event) = rx.recv().await {
+        if matches!(event, AgentEvent::CostWarning { .. }) {
+            warnings += 1;
+        }
+    }
+    assert_eq!(warnings, 1, "warning must fire exactly once on first round");
+
+    let mut rx = agent.start_turn("second prompt".to_string(), CancellationToken::new());
+    while let Some(event) = rx.recv().await {
+        if matches!(event, AgentEvent::CostWarning { .. }) {
+            warnings += 1;
+        }
+    }
+    assert_eq!(
+        warnings, 1,
+        "warning must not re-fire even when the cumulative cost climbs further"
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 fn function_outputs(request: &LlmRequest) -> Vec<(&str, Value)> {

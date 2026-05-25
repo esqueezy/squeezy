@@ -180,7 +180,7 @@ fn shell_permission_metadata_detects_network_commands() {
 
     assert_eq!(request.capability, PermissionCapability::Network);
     assert_eq!(request.risk, PermissionRisk::High);
-    assert_eq!(request.target, "shell:curl:*");
+    assert_eq!(request.target, "shell:curl:example.com");
     assert_eq!(request.metadata["network"], "classified");
     assert_eq!(request.metadata["cwd"], "src");
     assert_eq!(request.metadata["timeout_ms"], "1000");
@@ -196,7 +196,7 @@ fn shell_permission_metadata_detects_network_commands() {
         }),
     });
     assert_eq!(git_clone.capability, PermissionCapability::Network);
-    assert_eq!(git_clone.target, "shell:git clone:*");
+    assert_eq!(git_clone.target, "shell:git clone:example.com");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -618,6 +618,163 @@ async fn read_file_returns_bounded_content_and_hash() {
         result.receipt.content_sha256,
         Some(sha256_hex("abcdef".as_bytes()))
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_returns_dedup_stub_when_unchanged_since_last_receipt() {
+    let root = temp_workspace("read_file_dedup_unchanged");
+    // Use a multi-KB body so the audit's "stub output < full output / 10"
+    // ratio is meaningful — the stub is a small fixed-size JSON object.
+    let body = "x".repeat(20_000);
+    fs::write(root.join("sample.txt"), &body).expect("write sample");
+
+    // First call: no snapshot exists, full payload returned.
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    let registry = registry_with_state_store(&root, Arc::clone(&store));
+    let first = registry
+        .execute(
+            ToolCall {
+                call_id: "first_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "limit": body.len()}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(first.status, ToolStatus::Success);
+    assert!(first.content.get("dedup").is_none());
+    assert!(first.cost_hint.output_bytes >= body.len() as u64);
+
+    // Manually persist the snapshot the agent normally would after a read.
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: first.call_id.clone(),
+            stable_output_sha256: first.receipt.output_sha256.clone(),
+            content_sha256: first.receipt.content_sha256.clone(),
+            start_byte: 0,
+            end_byte: body.len() as u64,
+            content: body.clone(),
+            model_output_bytes: first.cost_hint.output_bytes as usize,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+
+    // Second call with same args: dedup stub.
+    let second = registry
+        .execute(
+            ToolCall {
+                call_id: "second_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "limit": body.len()}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(second.status, ToolStatus::Success);
+    assert_eq!(second.content["dedup"], true);
+    assert_eq!(second.content["receipt_stub"], true);
+    assert_eq!(second.content["unchanged"], true);
+    assert_eq!(second.content["same_as_call_id"], "first_read");
+    assert_eq!(second.content["bytes_returned"], 0);
+    assert!(
+        second.cost_hint.output_bytes * 10 < first.cost_hint.output_bytes,
+        "dedup stub output_bytes {} not <10x smaller than full payload {}",
+        second.cost_hint.output_bytes,
+        first.cost_hint.output_bytes
+    );
+    assert_eq!(second.receipt.content_sha256, first.receipt.content_sha256);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_does_not_dedup_when_content_changed() {
+    let root = temp_workspace("read_file_dedup_changed");
+    let prior = "alpha\nbeta\ngamma\n";
+    let current = "alpha\nDELTA\ngamma\n";
+    fs::write(root.join("sample.txt"), current).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex(prior.as_bytes())),
+            start_byte: 0,
+            end_byte: prior.len() as u64,
+            content: prior.to_string(),
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "second_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "limit": current.len()}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.content.get("dedup").is_none());
+    assert_eq!(result.content["content"], current);
+    assert_eq!(
+        result.receipt.content_sha256,
+        Some(sha256_hex(current.as_bytes()))
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_does_not_dedup_when_window_differs() {
+    let root = temp_workspace("read_file_dedup_window");
+    let body = "alpha\nbeta\ngamma\n";
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    // Prior snapshot covered bytes [0, 5) only ("alpha").
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex(body.as_bytes())),
+            start_byte: 0,
+            end_byte: 5,
+            content: "alpha".to_string(),
+            model_output_bytes: 64,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    // Request a different window: bytes [6, 10) ("beta").
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "second_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "offset": 6, "limit": 4}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.content.get("dedup").is_none());
+    assert_eq!(result.content["content"], "beta");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1567,6 +1724,38 @@ async fn apply_patch_partial_failure_records_checkpoint_for_undo() {
             "expected partial-failure result to carry a checkpoint, got: {}",
             result.content
         );
+        let applied_delta = result
+            .content
+            .get("applied_delta")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let ops = applied_delta
+            .get("operations")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            ops.len(),
+            2,
+            "applied_delta must contain one entry per requested op, got: {applied_delta}"
+        );
+        assert_eq!(
+            ops[0].get("status").and_then(|v| v.as_str()),
+            Some("applied"),
+            "first op should be applied, got: {}",
+            ops[0]
+        );
+        assert_eq!(
+            ops[1].get("status").and_then(|v| v.as_str()),
+            Some("failed"),
+            "second op should be failed, got: {}",
+            ops[1]
+        );
+        assert_eq!(
+            applied_delta.get("exact").and_then(|v| v.as_bool()),
+            Some(false),
+            "applied_delta.exact must be false when any op failed"
+        );
         assert_eq!(
             fs::read_to_string(root.join("first.txt")).unwrap(),
             "first-after\n",
@@ -1633,6 +1822,484 @@ async fn apply_patch_denies_secret_paths() {
         fs::read_to_string(root.join(".env")).unwrap(),
         "KEY=val\n",
         ".env must not be modified by a denied patch"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_denies_protected_metadata_paths_before_mutation() {
+    let root = temp_workspace("apply_patch_metadata");
+    fs::create_dir_all(root.join(".git")).expect("mkdir git");
+    fs::write(root.join(".git/config"), "before\n").expect("write git config");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "patch_metadata".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": ".git/config",
+                        "search": "before\n",
+                        "replace": "after\n",
+                        "expected_sha256": sha256_hex("before\n".as_bytes())
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Denied);
+    assert_eq!(result.content["reason"], "protected_metadata_path");
+    assert_eq!(result.content["permission_denied"], true);
+    assert_eq!(
+        fs::read_to_string(root.join(".git/config")).unwrap(),
+        "before\n",
+        "protected metadata must not be modified by a denied patch",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_move_collapses_to_single_checkpoint_entry() {
+    let root = temp_workspace("apply_patch_move");
+    fs::write(root.join("alpha.txt"), "alpha\n").expect("seed alpha");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_move".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "move_file",
+                        "from": "alpha.txt",
+                        "to": "beta.txt",
+                        "expected_sha256": sha256_hex("alpha\n".as_bytes()),
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-move".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert!(!root.join("alpha.txt").exists(), "source should be removed");
+    assert_eq!(
+        fs::read_to_string(root.join("beta.txt")).unwrap(),
+        "alpha\n",
+        "destination should hold the source content"
+    );
+    let checkpoint = result
+        .content
+        .get("checkpoint")
+        .expect("checkpoint emitted");
+    let files = checkpoint
+        .get("files")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        files.len(),
+        1,
+        "rename should collapse to a single checkpoint entry, got {files:?}"
+    );
+    assert_eq!(files[0]["status"], "renamed");
+    assert_eq!(files[0]["path"], "beta.txt");
+    assert_eq!(files[0]["from_path"], "alpha.txt");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_create_and_delete_in_one_call() {
+    let root = temp_workspace("apply_patch_create_delete");
+    fs::write(root.join("doomed.txt"), "bye\n").expect("seed doomed");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_create_delete".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [
+                        {
+                            "kind": "create_file",
+                            "path": "fresh.txt",
+                            "contents": "hello\n",
+                        },
+                        {
+                            "kind": "delete_file",
+                            "path": "doomed.txt",
+                            "expected_sha256": sha256_hex("bye\n".as_bytes()),
+                        }
+                    ]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-create-delete".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(
+        fs::read_to_string(root.join("fresh.txt")).unwrap(),
+        "hello\n"
+    );
+    assert!(!root.join("doomed.txt").exists());
+    let delta = result
+        .content
+        .get("applied_delta")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let ops = delta
+        .get("operations")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(ops.len(), 2);
+    assert_eq!(ops[0]["status"], "applied");
+    assert_eq!(ops[0]["kind"], "create_file");
+    assert_eq!(ops[1]["status"], "applied");
+    assert_eq!(ops[1]["kind"], "delete_file");
+    assert_eq!(delta["exact"], true);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_create_file_rejects_existing_target() {
+    let root = temp_workspace("apply_patch_create_existing");
+    fs::write(root.join("there.txt"), "stay\n").expect("seed there");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_create_existing".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "create_file",
+                        "path": "there.txt",
+                        "contents": "stomp\n",
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-create-existing".to_string(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Stale);
+    assert_eq!(
+        fs::read_to_string(root.join("there.txt")).unwrap(),
+        "stay\n",
+        "existing file must not be clobbered by create_file"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn write_file_denies_protected_metadata_paths_before_mutation() {
+    let root = temp_workspace("write_metadata");
+    fs::create_dir_all(root.join(".squeezy")).expect("mkdir metadata");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "write_metadata".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": ".squeezy/state.toml",
+                    "content": "after\n",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Denied);
+    assert_eq!(result.content["reason"], "protected_metadata_path");
+    assert_eq!(result.content["permission_denied"], true);
+    assert!(!root.join(".squeezy/state.toml").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_unified_diff_fallback_applies_via_git_apply_3way() {
+    // The fallback's job is to honour a unified-diff body the model places in
+    // `search` (e.g. when its literal search string drifted or it knows the
+    // change as a hunk, not a contiguous substring). On a clean worktree
+    // `git apply --3way` lands the diff and the resulting file lives at the
+    // diff's `+` lines.
+    let root = temp_workspace("apply_patch_unified_diff");
+    let initial = "line one\nline two\nline three\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    git_init_commit(&root);
+
+    let diff = "--- a/doc.txt\n+++ b/doc.txt\n@@ -1,3 +1,3 @@\n line one\n-line two\n+LINE TWO\n line three\n";
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_fallback".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "search_replace",
+                        "path": "doc.txt",
+                        // `search` here is the unified diff body — the literal
+                        // string won't be found in the file, so the fallback
+                        // path is the only way this could succeed.
+                        "search": diff,
+                        "replace": "",
+                        "expected_sha256": on_disk_hash,
+                        "fallback": "unified_diff",
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-fallback".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let final_doc = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert!(
+        final_doc.contains("LINE TWO"),
+        "fallback should replace via git apply, got: {final_doc:?}"
+    );
+    let checkpoint = result
+        .content
+        .get("checkpoint")
+        .expect("fallback should emit checkpoint");
+    let files = checkpoint
+        .get("files")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        files.iter().any(|f| f["path"] == "doc.txt"),
+        "checkpoint should record the touched file"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_patch_binding_succeeds_inside_neighborhood() {
+    let root = temp_workspace("plan_binding_inside");
+    write_rust_crate(
+        &root,
+        "pub fn target() -> usize { 1 }\nfn caller() -> usize { target() }\n",
+    );
+    let registry = registry_with_checkpoints(&root);
+
+    let plan = registry
+        .execute(
+            ToolCall {
+                call_id: "plan".to_string(),
+                name: "plan_patch".to_string(),
+                arguments: json!({
+                    "objective": "tweak target",
+                    "query": "target",
+                    "kind": "function",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(plan.status, ToolStatus::Success, "{:?}", plan.content);
+    let plan_id = plan.content["plan_id"]
+        .as_str()
+        .expect("plan_id returned")
+        .to_string();
+
+    let actual_hash = sha256_hex(
+        fs::read(root.join("src/lib.rs"))
+            .expect("read src/lib.rs")
+            .as_slice(),
+    );
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "apply_inside".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "plan_id": plan_id,
+                    "patches": [{
+                        "path": "src/lib.rs",
+                        "search": "pub fn target() -> usize { 1 }\n",
+                        "replace": "pub fn target() -> usize { 2 }\n",
+                        "expected_sha256": actual_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-plan-inside".to_string(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert!(
+        fs::read_to_string(root.join("src/lib.rs"))
+            .unwrap()
+            .contains("pub fn target() -> usize { 2 }")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_patch_binding_rejects_outside_neighborhood() {
+    let root = temp_workspace("plan_binding_outside");
+    write_rust_crate(
+        &root,
+        "pub fn target() -> usize { 1 }\nfn caller() -> usize { target() }\n",
+    );
+    fs::write(root.join("stranger.txt"), "out\n").expect("write stranger");
+    let registry = registry_with_checkpoints(&root);
+
+    let plan = registry
+        .execute(
+            ToolCall {
+                call_id: "plan_out".to_string(),
+                name: "plan_patch".to_string(),
+                arguments: json!({
+                    "objective": "tweak target",
+                    "query": "target",
+                    "kind": "function",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(plan.status, ToolStatus::Success);
+    let plan_id = plan.content["plan_id"]
+        .as_str()
+        .expect("plan_id")
+        .to_string();
+    if plan
+        .content
+        .get("graph_available")
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        // Without the semantic graph the neighborhood is empty and the plan
+        // would not bind any path, so the binding check is a no-op. Skip.
+        let _ = fs::remove_dir_all(root);
+        return;
+    }
+
+    let actual_hash = sha256_hex(
+        fs::read(root.join("stranger.txt"))
+            .expect("read stranger")
+            .as_slice(),
+    );
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "apply_outside".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "plan_id": plan_id,
+                    "patches": [{
+                        "path": "stranger.txt",
+                        "search": "out\n",
+                        "replace": "in\n",
+                        "expected_sha256": actual_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-plan-outside".to_string(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Stale, "{:?}", result.content);
+    let err = result.content["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("plan_id"),
+        "rejection should mention plan_id, got: {err}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("stranger.txt")).unwrap(),
+        "out\n",
+        "out-of-neighborhood file must not be written"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_patch_binding_can_be_bypassed_with_confirm_outside_plan() {
+    let root = temp_workspace("plan_binding_confirm");
+    write_rust_crate(
+        &root,
+        "pub fn target() -> usize { 1 }\nfn caller() -> usize { target() }\n",
+    );
+    fs::write(root.join("stranger.txt"), "out\n").expect("write stranger");
+    let registry = registry_with_checkpoints(&root);
+
+    let plan = registry
+        .execute(
+            ToolCall {
+                call_id: "plan_confirm".to_string(),
+                name: "plan_patch".to_string(),
+                arguments: json!({
+                    "objective": "tweak target",
+                    "query": "target",
+                    "kind": "function",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(plan.status, ToolStatus::Success);
+    let plan_id = plan.content["plan_id"]
+        .as_str()
+        .expect("plan_id")
+        .to_string();
+
+    let actual_hash = sha256_hex(
+        fs::read(root.join("stranger.txt"))
+            .expect("read stranger")
+            .as_slice(),
+    );
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "apply_confirm".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "plan_id": plan_id,
+                    "confirm_outside_plan": true,
+                    "patches": [{
+                        "path": "stranger.txt",
+                        "search": "out\n",
+                        "replace": "in\n",
+                        "expected_sha256": actual_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-plan-confirm".to_string(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(
+        fs::read_to_string(root.join("stranger.txt")).unwrap(),
+        "in\n"
     );
 
     let _ = fs::remove_dir_all(root);
@@ -2690,6 +3357,78 @@ async fn shell_default_sandbox_runs_benign_command() {
 }
 
 #[tokio::test]
+async fn shell_external_sandbox_mode_preserves_policy_metadata() {
+    let root = temp_workspace("shell_external_sandbox");
+    let registry = registry_with_runtime_config(
+        &root,
+        ToolRuntimeConfig {
+            shell_sandbox: squeezy_core::ShellSandboxConfig {
+                mode: squeezy_core::ShellSandboxMode::External,
+                ..squeezy_core::ShellSandboxConfig::default()
+            },
+            ..ToolRuntimeConfig::default()
+        },
+    );
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_external_shell".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf ok",
+                    "description": "outer sandbox handles isolation"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["stdout"], "ok");
+    assert_eq!(result.content["sandbox"]["backend"], "external");
+    assert_eq!(result.content["sandbox"]["mode"], "external");
+    assert_eq!(result.content["sandbox"]["network"], "external");
+    assert_eq!(result.content["env"]["policy"], "allowlist");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_denies_protected_metadata_write_before_spawn() {
+    let root = temp_workspace("shell_metadata_write");
+    fs::create_dir_all(root.join(".git")).expect("mkdir git");
+    fs::write(root.join(".git/config"), "secret-ish").expect("write git config");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_metadata_shell".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "touch .git/config",
+                    "description": "try metadata write"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Denied);
+    assert_eq!(result.content["permission_denied"], true);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("protected metadata directory")),
+        "{:?}",
+        result.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn shell_workdir_accepts_configured_extra_root() {
     let root = temp_workspace("shell_extra_workdir");
     let extra = temp_workspace("shell_extra_root");
@@ -3201,7 +3940,11 @@ async fn shaped_shell_spill_handle_reads_raw_unshaped_output() {
         &root,
         ToolOutputConfig {
             spill_threshold_bytes: 100,
-            preview_bytes: 512,
+            // Preview cap large enough to fit the full shaped-shell JSON
+            // wrapper so this test exercises the spill+rehydrate roundtrip
+            // rather than preview-truncation behavior (covered separately in
+            // truncate tests).
+            preview_bytes: 2_048,
             retention_days: 1,
             output_dir: None,
         },
@@ -3626,7 +4369,10 @@ async fn websearch_returns_citations_cache_receipt_and_redacted_quote() {
             ToolCall {
                 call_id: "call_1".to_string(),
                 name: "websearch".to_string(),
-                arguments: json!({"query": "rust book", "output_byte_cap": 90}),
+                // Cap large enough to fit the full redacted text so this test
+                // verifies redaction behavior without depending on whether the
+                // marker survives middle-truncation.
+                arguments: json!({"query": "rust book", "output_byte_cap": 200}),
             },
             CancellationToken::new(),
         )
@@ -3991,6 +4737,64 @@ async fn webfetch_quote_limit_is_enforced_after_redaction() {
 }
 
 #[tokio::test]
+async fn webfetch_quote_keeps_tail_under_byte_cap() {
+    // F02 acceptance: middle-truncate preserves tail signal so the model can
+    // still see the end of a fetched document (article summary, error footer,
+    // last paragraph) even after a small byte cap.
+    let root = temp_workspace("webfetch_keeps_tail");
+    let mut body = String::with_capacity(100_000);
+    body.push_str("[[HEAD_SIGNAL]] ");
+    for _ in 0..2_000 {
+        body.push_str("filler ");
+    }
+    body.push_str(" [[TAIL_SIGNAL]]");
+    assert!(body.len() >= 100_000 / 8); // confirm sufficiently large
+
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(ok_response("text/plain", body.as_bytes()));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_tail".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({
+                    "url": "https://example.com/article",
+                    "output_byte_cap": 1_024,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let content = result.content["content"].as_str().expect("content");
+    assert!(
+        content.len() <= 1_024,
+        "content len {} > cap",
+        content.len()
+    );
+    assert!(
+        content.contains("[[TAIL_SIGNAL]]"),
+        "tail signal missing from middle-truncated content: {content:?}"
+    );
+    assert!(
+        content.contains("[[HEAD_SIGNAL]]"),
+        "head signal missing from middle-truncated content: {content:?}"
+    );
+    assert!(result.content["quote_truncated"].as_bool().unwrap_or(false));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn webfetch_html_format_returns_raw_html() {
     let root = temp_workspace("webfetch_html_format");
     let html = "<html><body>Hello <b>world</b></body></html>";
@@ -4349,8 +5153,8 @@ fn tool_specs_are_sorted_by_name() {
 
     let names = registry
         .specs()
-        .into_iter()
-        .map(|spec| spec.name)
+        .iter()
+        .map(|spec| spec.name.clone())
         .collect::<Vec<_>>();
 
     assert_eq!(
@@ -4366,6 +5170,8 @@ fn tool_specs_are_sorted_by_name() {
             "hierarchy",
             "list_skills",
             "load_skill",
+            "notes_recall",
+            "notes_remember",
             "plan_patch",
             "read_file",
             "read_slice",
@@ -4385,9 +5191,9 @@ fn tool_specs_are_sorted_by_name() {
 
     let checkpoint_names = registry_with_checkpoints(&root)
         .specs()
-        .into_iter()
+        .iter()
         .filter(|spec| spec.name.starts_with("checkpoint_"))
-        .map(|spec| spec.name)
+        .map(|spec| spec.name.clone())
         .collect::<Vec<_>>();
     assert_eq!(
         checkpoint_names,
@@ -4397,6 +5203,33 @@ fn tool_specs_are_sorted_by_name() {
             "checkpoint_show",
             "checkpoint_undo"
         ]
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn tool_registry_specs_returns_same_arc_until_refresh() {
+    // F04: per-turn `specs()` must reuse the same allocation across calls
+    // and only rebuild when MCP refresh invalidates the cache.
+    let root = temp_workspace("specs_arc_cache");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let first = registry.specs();
+    let second = registry.specs();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "specs() did not reuse the cached Arc across consecutive calls"
+    );
+
+    // Refreshing MCP (no servers configured here, so this is a no-op refresh)
+    // should invalidate the cache so the next call returns a freshly-built
+    // Arc.
+    let _ = registry.refresh_mcp_tools(CancellationToken::new()).await;
+    let third = registry.specs();
+    assert!(
+        !Arc::ptr_eq(&first, &third),
+        "specs() reused stale Arc after refresh_mcp_tools"
     );
 
     let _ = fs::remove_dir_all(root);
@@ -4687,7 +5520,11 @@ async fn graph_navigation_tools_return_unsupported_language_fallback() {
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(
         result.content["fallback"]["status"].as_str(),
-        Some("unsupported_language")
+        Some("no_graph_evidence")
+    );
+    assert_eq!(
+        result.content["fallback"]["reason"].as_str(),
+        Some("path_unsupported")
     );
     assert_eq!(
         result.content["fallback"]["suggested_tools"][0]["tool"].as_str(),
@@ -4895,6 +5732,347 @@ pub fn caller_d() { target(); }
         Some(2)
     );
     assert!(upstream.cost_hint.truncated);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_emits_confidence_distribution() {
+    let root = temp_workspace("graph_confidence_distribution");
+    write_rust_crate(
+        &root,
+        r#"
+pub fn alpha() {}
+pub fn beta() {}
+pub fn gamma() {}
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_distribution".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "alpha"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let distribution = &result.cost_hint.confidence_distribution;
+    assert!(
+        !distribution.is_empty(),
+        "decl_search must populate confidence_distribution"
+    );
+    let total: u32 = distribution.values().copied().sum();
+    let returned = result.content["returned_matches"].as_u64().unwrap();
+    assert_eq!(
+        total as u64, returned,
+        "distribution counts must sum to returned_matches"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_resolves_fuzzy_symbol_query() {
+    let root = temp_workspace("graph_fuzzy_symbol");
+    write_rust_crate(
+        &root,
+        r#"
+pub struct GraphManager;
+pub struct PageRenderer;
+pub fn unrelated() {}
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "fuzzy_symbol".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "graphmgr"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let packets = result.content["packets"]
+        .as_array()
+        .expect("decl_search packets array");
+    assert!(
+        packets
+            .iter()
+            .any(|packet| packet["symbol"]["name"].as_str() == Some("GraphManager")),
+        "fuzzy `graphmgr` query must resolve to `GraphManager`, got {packets:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_path_filter_accepts_fuzzy_path_token() {
+    let root = temp_workspace("graph_fuzzy_path");
+    write_rust_crate(&root, "pub fn entry() {}\n");
+    fs::create_dir_all(root.join("crates/squeezy-graph/src")).expect("create graph dirs");
+    fs::write(
+        root.join("crates/squeezy-graph/src/lib.rs"),
+        "pub fn open() {}\n",
+    )
+    .expect("graph src");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "fuzzy_path".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "open", "path": "squeezy_graph"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let packets = result.content["packets"]
+        .as_array()
+        .expect("decl_search packets array");
+    assert!(
+        packets.iter().any(|packet| packet["symbol"]["path"]
+            .as_str()
+            .map(|p| p.contains("squeezy-graph"))
+            .unwrap_or(false)),
+        "fuzzy `path: squeezy_graph` must match `squeezy-graph`, got {packets:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_zero_hit_emits_grep_fallback_for_supported_path() {
+    let root = temp_workspace("graph_zero_hit_supported");
+    write_rust_crate(
+        &root,
+        r#"
+pub fn alpha() {}
+pub fn beta() {}
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "zero_supported".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({
+                    "query": "no_such_symbol",
+                    "path": "src/lib.rs",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let fallback = &result.content["fallback"];
+    assert_eq!(fallback["status"].as_str(), Some("no_graph_evidence"));
+    assert_eq!(
+        fallback["reason"].as_str(),
+        Some("supported_language_no_match")
+    );
+    assert_eq!(fallback["path"].as_str(), Some("src/lib.rs"));
+    let tools = fallback["suggested_tools"]
+        .as_array()
+        .expect("suggested_tools array");
+    let grep = tools
+        .iter()
+        .find(|tool| tool["tool"].as_str() == Some("grep"))
+        .expect("grep entry");
+    assert_eq!(grep["arguments"]["path"].as_str(), Some("src/lib.rs"));
+    assert_eq!(
+        grep["arguments"]["pattern"].as_str(),
+        Some("no_such_symbol")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_zero_hit_no_path_scope() {
+    let root = temp_workspace("graph_zero_hit_no_path");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "zero_no_path".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "no_such_symbol_unique_xyzzy"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let fallback = &result.content["fallback"];
+    assert_eq!(fallback["reason"].as_str(), Some("no_path_scope"));
+    assert!(fallback["path"].is_null());
+    let tools = fallback["suggested_tools"]
+        .as_array()
+        .expect("suggested_tools array");
+    let grep = tools
+        .iter()
+        .find(|tool| tool["tool"].as_str() == Some("grep"))
+        .expect("grep entry");
+    assert_eq!(grep["arguments"]["path"].as_str(), Some("."));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_zero_hit_regex_escapes_query() {
+    let root = temp_workspace("graph_zero_hit_regex");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "zero_regex".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "foo.bar()"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let pattern = result.content["fallback"]["suggested_tools"][0]["arguments"]["pattern"]
+        .as_str()
+        .expect("pattern string");
+    assert!(
+        pattern.contains(r"\."),
+        "regex metacharacters must be escaped; got {pattern:?}"
+    );
+    assert!(
+        pattern.contains(r"\(") && pattern.contains(r"\)"),
+        "parentheses must be escaped; got {pattern:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_non_empty_packets_keeps_null_fallback() {
+    let root = temp_workspace("graph_fallback_null_when_hits");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "non_empty".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "alpha"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(
+        result.content["fallback"].is_null(),
+        "fallback must be null when graph returned packets, got {}",
+        result.content["fallback"]
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_distribution_absent_when_no_matches() {
+    let root = temp_workspace("graph_confidence_distribution_empty");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_distribution_empty".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "no_such_symbol_xyzzy"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.cost_hint.confidence_distribution.is_empty());
+    let cost_hint_json = serde_json::to_value(&result.cost_hint).expect("cost_hint serialises");
+    assert!(
+        cost_hint_json.get("confidence_distribution").is_none(),
+        "empty distribution must be skipped in serialised cost_hint, got {cost_hint_json}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn downstream_flow_surfaces_candidate_set_on_ambiguous_call() {
+    let root = temp_workspace("graph_candidate_set_packet");
+    fs::write(
+        root.join("dispatch.py"),
+        r#"class Alpha:
+    def do_thing(self):
+        return 1
+
+class Beta:
+    def do_thing(self):
+        return 2
+
+def caller(obj):
+    return obj.do_thing()
+"#,
+    )
+    .expect("write python source");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let downstream = registry
+        .execute(
+            ToolCall {
+                call_id: "candidate_downstream".to_string(),
+                name: "downstream_flow".to_string(),
+                arguments: json!({"query": "caller", "max_depth": 1}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(downstream.status, ToolStatus::Success);
+    let packets = downstream.content["packets"]
+        .as_array()
+        .expect("downstream packets");
+    let candidate_packet = packets
+        .iter()
+        .find(|packet| packet["edge"]["confidence"].as_str() == Some("CandidateSet"))
+        .unwrap_or_else(|| panic!("expected at least one CandidateSet packet: {packets:?}"));
+    let candidates = candidate_packet["candidates"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("CandidateSet packet must include candidates: {candidate_packet}")
+        });
+    assert_eq!(candidates.len(), 2);
+    for entry in candidates {
+        assert_eq!(entry["name"].as_str(), Some("do_thing"));
+    }
+    let fanout = candidate_packet["next_action"]["fanout"]
+        .as_array()
+        .expect("candidate set packet must carry a read_slice fanout");
+    assert!(
+        !fanout.is_empty(),
+        "fanout must contain at least one read_slice candidate"
+    );
+    for entry in fanout {
+        assert_eq!(entry["tool"].as_str(), Some("read_slice"));
+        assert!(entry["arguments"]["path"].as_str().is_some());
+    }
 
     let _ = fs::remove_dir_all(root);
 }
@@ -5582,6 +6760,39 @@ fn shell_sandbox_plan_mode_off_returns_direct() {
 }
 
 #[test]
+fn shell_sandbox_plan_external_skips_inner_backend() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::External,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        true,
+        true,
+    )
+    .expect("external plan");
+
+    assert_eq!(plan.backend, "external");
+    assert_eq!(plan.mode, "external");
+    assert_eq!(plan.network, "external");
+    assert_eq!(plan.filesystem, "external");
+    assert!(!plan.required);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn macos_sandbox_profile_deny_lists_protected_metadata_under_write_roots() {
+    let root = temp_workspace("macos_profile_metadata");
+    let profile = macos_shell_sandbox_profile(&root, &ShellSandboxConfig::default(), false);
+    let git_path = root.join(".git").display().to_string();
+
+    assert!(profile.contains("require-not"), "{profile}");
+    assert!(profile.contains(&git_path), "{profile}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 #[cfg(target_os = "macos")]
 fn shell_sandbox_plan_required_when_sandbox_exec_absent() {
     let err = prepare_sandbox_plan_with_probes(
@@ -5957,4 +7168,138 @@ fn shell_sandbox_runtime_unavailable_ignores_direct_backend() {
         "",
         false,
     ));
+}
+
+#[test]
+fn grep_spec_promotes_graph_first() {
+    let description = grep_spec().description;
+    for marker in [
+        "decl_search",
+        "reference_search",
+        "symbol_context",
+        "graph returned zero packets",
+    ] {
+        assert!(
+            description.contains(marker),
+            "grep_spec must mention `{marker}`; got: {description}"
+        );
+    }
+    for family in squeezy_core::LanguageFamily::all() {
+        assert!(
+            description.contains(family.display_name()),
+            "grep_spec must name `{}` from LanguageFamily::all(); got: {description}",
+            family.display_name(),
+        );
+    }
+    let golden =
+        include_str!("../tests/artifacts/tool-spec-descriptions/grep_spec_description.txt").trim();
+    assert_eq!(description.trim(), golden);
+}
+
+#[test]
+fn glob_spec_promotes_graph_first() {
+    let description = glob_spec().description;
+    assert!(description.contains("decl_search"));
+    assert!(description.contains("graph returned zero packets"));
+    let golden =
+        include_str!("../tests/artifacts/tool-spec-descriptions/glob_spec_description.txt").trim();
+    assert_eq!(description.trim(), golden);
+}
+
+#[test]
+fn read_file_spec_promotes_graph_first() {
+    let description = read_file_spec().description;
+    assert!(description.contains("decl_search"));
+    assert!(description.contains("symbol_context"));
+    let golden =
+        include_str!("../tests/artifacts/tool-spec-descriptions/read_file_spec_description.txt")
+            .trim();
+    assert_eq!(description.trim(), golden);
+}
+
+#[tokio::test]
+async fn notes_remember_then_recall_round_trip() {
+    let root = temp_workspace("notes_round_trip");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("open store"));
+    let registry = registry_with_state_store(&root, store.clone());
+
+    let remember_result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_remember".to_string(),
+                name: "notes_remember".to_string(),
+                arguments: json!({
+                    "kind": "decision",
+                    "text": "Prefer rg over grep for workspace search.",
+                    "tags": ["search", "tooling"],
+                    "source": "test-suite"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(remember_result.status, ToolStatus::Success);
+
+    let recall_result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_recall".to_string(),
+                name: "notes_recall".to_string(),
+                arguments: json!({ "query": "search" }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(recall_result.status, ToolStatus::Success);
+    let matches = recall_result.content["matches"]
+        .as_array()
+        .expect("matches array");
+    assert!(
+        matches
+            .iter()
+            .any(|item| item["text"].as_str().unwrap_or("").contains("Prefer rg")),
+        "recall should return the persisted decision: {recall_result:?}",
+    );
+}
+
+#[tokio::test]
+async fn notes_remember_rejects_unknown_kind() {
+    let root = temp_workspace("notes_invalid_kind");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("open store"));
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_invalid".to_string(),
+                name: "notes_remember".to_string(),
+                arguments: json!({
+                    "kind": "unsupported_kind",
+                    "text": "this should be rejected"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Error);
+}
+
+#[tokio::test]
+async fn notes_tools_fail_when_no_store_handle_available() {
+    let root = temp_workspace("notes_no_store");
+    let registry = registry_with_runtime_config(&root, ToolRuntimeConfig::default());
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_remember".to_string(),
+                name: "notes_remember".to_string(),
+                arguments: json!({
+                    "kind": "note",
+                    "text": "no store available"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Error);
 }

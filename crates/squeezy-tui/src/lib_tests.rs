@@ -8,10 +8,10 @@ use ratatui::backend::TestBackend;
 use squeezy_agent::{JobKind, JobStatus};
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
-    ContextAttachmentStatus, CostSnapshot, PermissionCapability, PermissionMode, PermissionPolicy,
-    PermissionRequest, PermissionRisk, PermissionScope, SessionMode, StatusVerbosity,
-    TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus, TaskVerificationState,
-    ToolOutputVerbosity, TuiAlternateScreen, TuiConfig, TurnId, TurnMetrics,
+    ContextAttachmentStatus, ContextEstimate, CostSnapshot, PermissionCapability, PermissionMode,
+    PermissionPolicy, PermissionRequest, PermissionRisk, PermissionScope, SessionMode,
+    StatusVerbosity, TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus,
+    TaskVerificationState, ToolOutputVerbosity, TuiAlternateScreen, TuiConfig, TurnId, TurnMetrics,
 };
 use squeezy_llm::UnavailableProvider;
 use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus};
@@ -1931,6 +1931,11 @@ async fn approval_menu_uses_arrows_and_enter_for_repo_rule() {
     assert_eq!(app.approval_selection_index, 1);
     assert!(handle_approval_key(
         &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.approval_selection_index, 2);
+    assert!(handle_approval_key(
+        &mut app,
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     ));
 
@@ -1966,10 +1971,12 @@ fn approval_menu_renders_below_prompt_without_border_box() {
 
     assert!(approval > prompt, "{output}");
     assert!(output.contains("› Approve"), "{output}");
+    assert!(output.contains("Approve for this session"), "{output}");
     assert!(
         output.contains("Always approve this command in this repo"),
         "{output}"
     );
+    assert!(output.contains("Deny for this session"), "{output}");
     assert!(!output.contains("Approval required"), "{output}");
     assert!(!output.contains('┌'), "{output}");
 }
@@ -2401,7 +2408,7 @@ fn failed_assistant_marker_uses_error_color() {
 #[test]
 fn pending_assistant_uses_rotating_coin_marker() {
     let mut app = test_app(SessionMode::Build);
-    app.pending_assistant = "streaming".to_string();
+    app.pending_assistant.push_delta("streaming");
     app.turn_visual = TurnVisualState::Running;
     app.animation_tick = 4;
 
@@ -3379,6 +3386,330 @@ fn base64_encoder_supports_osc52_payloads() {
 }
 
 #[tokio::test]
+async fn successful_edit_turn_pushes_diff_undo_hint() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let edit_result = sample_tool_result("apply_patch", "patched ok");
+    tx.send(AgentEvent::ToolCallCompleted {
+        turn_id: TurnId::new(1),
+        result: edit_result,
+    })
+    .await
+    .expect("send tool result");
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let hint = app.transcript.iter().find_map(|entry| match &entry.kind {
+        TranscriptEntryKind::Log(message)
+            if message.contains("/diff") && message.contains("/undo") =>
+        {
+            Some(message.clone())
+        }
+        _ => None,
+    });
+    assert!(
+        hint.is_some(),
+        "successful edit turn must push a /diff /undo hint; transcript: {:?}",
+        app.transcript
+    );
+    assert!(
+        !app.last_turn_had_edits,
+        "flag must reset after the hint fires"
+    );
+}
+
+#[tokio::test]
+async fn readonly_turn_does_not_push_undo_hint() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let read_result = sample_tool_result("read_file", "file body");
+    tx.send(AgentEvent::ToolCallCompleted {
+        turn_id: TurnId::new(1),
+        result: read_result,
+    })
+    .await
+    .expect("send tool result");
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let hint_count = app
+        .transcript
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.kind, TranscriptEntryKind::Log(message)
+                if message.contains("/diff") && message.contains("/undo"))
+        })
+        .count();
+    assert_eq!(hint_count, 0, "read-only turn must not produce /undo hint");
+}
+
+#[tokio::test]
+async fn failed_edit_turn_error_status_mentions_undo() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let edit_result = sample_tool_result("write_file", "wrote ok");
+    tx.send(AgentEvent::ToolCallCompleted {
+        turn_id: TurnId::new(1),
+        result: edit_result,
+    })
+    .await
+    .expect("send tool result");
+    tx.send(AgentEvent::Failed {
+        turn_id: TurnId::new(1),
+        error: SqueezyError::Permission("denied".to_string()),
+    })
+    .await
+    .expect("send failed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert!(
+        app.status.contains("/undo"),
+        "failed turn after an edit must surface /undo in status; got: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn cancel_preserves_pending_prompt_for_ctrl_r() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancelled_prompt = Some("write the README".to_string());
+
+    let hint = format_status_hints(&app);
+    assert!(
+        hint.contains("Ctrl-R"),
+        "idle hint must advertise Ctrl-R when a cancelled prompt is stashed; got: {hint}"
+    );
+    assert!(restore_cancelled_prompt(&mut app), "restore must succeed");
+    assert_eq!(app.input, "write the README");
+    assert!(app.cancelled_prompt.is_none());
+    assert_eq!(app.input_cursor, app.input.len());
+}
+
+#[test]
+fn restore_is_noop_when_no_cancelled_prompt() {
+    let mut app = test_app(SessionMode::Build);
+    assert!(
+        !restore_cancelled_prompt(&mut app),
+        "restore must report no-op when nothing is stashed"
+    );
+    assert!(app.input.is_empty());
+}
+
+#[test]
+fn restore_does_not_overwrite_in_progress_input() {
+    let mut app = test_app(SessionMode::Build);
+    app.input = "draft".to_string();
+    app.input_cursor = app.input.len();
+    app.cancelled_prompt = Some("previous".to_string());
+    assert!(
+        !restore_cancelled_prompt(&mut app),
+        "restore must refuse when composer is non-empty"
+    );
+    assert_eq!(app.input, "draft");
+    assert_eq!(app.cancelled_prompt.as_deref(), Some("previous"));
+}
+
+#[tokio::test]
+async fn completion_clears_cancelled_prompt() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancelled_prompt = Some("hello".to_string());
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+    assert!(
+        app.cancelled_prompt.is_none(),
+        "successful completion must clear the cancelled-prompt slot",
+    );
+}
+
+#[test]
+fn context_budget_renders_percent_and_threshold() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_compaction_threshold = 6_000;
+    app.context_estimate = ContextEstimate {
+        estimated_tokens: 4_500,
+        ..ContextEstimate::default()
+    };
+    let details = format_status_details(&app);
+    assert!(
+        details.contains("ctx 4500/6000 (75%)"),
+        "expected context cell with percent; got: {details}"
+    );
+}
+
+#[test]
+fn context_budget_hint_at_high_usage() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_compaction_threshold = 6_000;
+    app.context_estimate = ContextEstimate {
+        estimated_tokens: 5_800,
+        ..ContextEstimate::default()
+    };
+    let hint = format_status_hints(&app);
+    assert!(
+        hint.contains("/pin") && hint.contains("/compact"),
+        "expected /pin and /compact hints when near threshold; got: {hint}"
+    );
+}
+
+#[test]
+fn context_budget_hint_omitted_below_threshold() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_compaction_threshold = 6_000;
+    app.context_estimate = ContextEstimate {
+        estimated_tokens: 2_000,
+        ..ContextEstimate::default()
+    };
+    let hint = format_status_hints(&app);
+    assert!(
+        !hint.contains("/pin to keep"),
+        "low usage must not surface /pin hint; got: {hint}"
+    );
+}
+
+#[tokio::test]
+async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_compaction_threshold = 6_000;
+
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("ok"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate {
+            estimated_tokens: 5_800,
+            ..ContextEstimate::default()
+        },
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let nudges = app
+        .transcript
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.kind, TranscriptEntryKind::Log(message)
+                if message.contains("context window") && message.contains("full"))
+        })
+        .count();
+    assert_eq!(nudges, 1, "nudge must fire exactly once on first crossing");
+
+    // A second high-usage turn must not fire the nudge again until
+    // compaction resets the latch.
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(2),
+        message: TranscriptItem::assistant("ok"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate {
+            estimated_tokens: 5_900,
+            ..ContextEstimate::default()
+        },
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let nudges = app
+        .transcript
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.kind, TranscriptEntryKind::Log(message)
+                if message.contains("context window") && message.contains("full"))
+        })
+        .count();
+    assert_eq!(nudges, 1, "nudge must not fire again until compaction");
+}
+
+#[tokio::test]
+async fn proposed_plan_block_renders_as_log_entry() {
+    let mut app = test_app(SessionMode::Plan);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    for delta in [
+        "intro <propos",
+        "ed_plan>\nstep 1\nstep 2\n</propos",
+        "ed_plan>\ntrailing\n",
+    ] {
+        tx.send(AgentEvent::AssistantDelta {
+            turn_id: TurnId::new(1),
+            delta: delta.to_string(),
+        })
+        .await
+        .expect("send delta");
+    }
+    drop(tx);
+
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        app.pending_assistant.text(),
+        "intro \ntrailing\n",
+        "proposed plan markers must not appear in the live assistant pane",
+    );
+    let plan_log = app.transcript.iter().find_map(|entry| match &entry.kind {
+        TranscriptEntryKind::Log(message) if message.starts_with("proposed plan:") => {
+            Some(message.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(
+        plan_log,
+        Some("proposed plan:\nstep 1\nstep 2".to_string()),
+        "expected exactly one proposed-plan log entry; transcript={:?}",
+        app.transcript
+    );
+}
+
+#[tokio::test]
 async fn assistant_delta_preserves_scroll_offset_in_history() {
     let mut app = test_app(SessionMode::Build);
     app.transcript_scroll_from_bottom = 8;
@@ -3398,7 +3729,7 @@ async fn assistant_delta_preserves_scroll_offset_in_history() {
         app.transcript_scroll_from_bottom, 8,
         "history scroll must survive incoming deltas",
     );
-    assert_eq!(app.pending_assistant, "streamed");
+    assert_eq!(app.pending_assistant.text(), "streamed");
 }
 
 #[tokio::test]
@@ -3413,6 +3744,7 @@ async fn completed_event_preserves_scroll_offset_in_history() {
         response_id: None,
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
     })
     .await
     .expect("send completed");
@@ -3464,6 +3796,7 @@ async fn completed_event_suppresses_assistant_duplicate_shell_output_fence() {
         response_id: None,
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
     })
     .await
     .expect("send completed");
@@ -3520,6 +3853,7 @@ async fn completed_event_keeps_substantive_assistant_summary_after_tool_output()
         response_id: None,
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
     })
     .await
     .expect("send completed");
@@ -3586,6 +3920,7 @@ async fn completed_event_suppresses_materially_repeated_shell_output_fence() {
         response_id: None,
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
     })
     .await
     .expect("send completed");
@@ -3633,7 +3968,8 @@ async fn pending_assistant_suppresses_streaming_duplicate_shell_output_fence() {
         "stderr": "",
     });
     app.push_tool_result_with_call(result, Some(call));
-    app.pending_assistant = format!("Here is the report:\n\n```text\n{stdout}");
+    app.pending_assistant
+        .push_delta(&format!("Here is the report:\n\n```text\n{stdout}"));
 
     let rendered = render_to_string(&app, 140, 24);
 
@@ -4022,4 +4358,411 @@ fn sample_attachment(id: &str) -> ContextAttachment {
             .to_string(),
         truncated: true,
     }
+}
+
+// ---- /verbosity inline back-compat ----
+//
+// `/model`, `/permissions`, `/verbosity`, and `/tool-verbosity` open the
+// `/config` screen focused on the matching section; the original overlay
+// flow was replaced by the full editor. Section-routing coverage lives in
+// `slash_model_opens_config_at_models_section` and friends below.
+
+#[tokio::test]
+async fn slash_verbosity_with_inline_arg_applies_immediately() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.response_verbosity = ResponseVerbosity::Normal;
+    let ran = handle_slash_command(&mut app, &mut agent, "/verbosity verbose").await;
+    assert!(ran);
+    assert!(
+        app.config_screen.is_none(),
+        "inline form should not open the screen"
+    );
+    assert_eq!(app.response_verbosity, ResponseVerbosity::Verbose);
+    assert_eq!(
+        agent.config_snapshot().tui.response_verbosity,
+        ResponseVerbosity::Verbose
+    );
+}
+
+#[tokio::test]
+async fn slash_verbosity_opens_config_when_called_without_arg() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let ran = handle_slash_command(&mut app, &mut agent, "/verbosity").await;
+    assert!(ran);
+    let state = app
+        .config_screen
+        .as_ref()
+        .expect("config screen should be open");
+    assert_eq!(
+        state.current_section().id,
+        squeezy_core::config_schema::SectionId::Verbosity
+    );
+}
+
+// ---- F37: @-mention composer ----
+
+#[test]
+fn mention_popup_opens_after_typing_at_word() {
+    let mut app = test_app(SessionMode::Build);
+    // Seed workspace files so the popup doesn't trigger a real crawl.
+    app.workspace_files = Some(Arc::new(vec![
+        PathBuf::from("crates/squeezy-graph/src/lib.rs"),
+        PathBuf::from("docs/readme.md"),
+    ]));
+
+    insert_input_text(&mut app, "@graph");
+    let popup = app
+        .mention_popup
+        .as_ref()
+        .expect("popup should open after @graph");
+    assert_eq!(popup.query, "graph");
+    assert!(!popup.is_empty());
+    assert!(popup.matches[0].to_string_lossy().contains("squeezy-graph"),);
+}
+
+#[tokio::test]
+async fn mention_popup_inserts_path_on_enter() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.workspace_files = Some(Arc::new(vec![PathBuf::from(
+        "crates/squeezy-graph/src/lib.rs",
+    )]));
+
+    insert_input_text(&mut app, "@graph");
+    assert!(app.mention_popup.is_some());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter");
+
+    assert!(app.mention_popup.is_none());
+    assert_eq!(app.input, "crates/squeezy-graph/src/lib.rs ");
+}
+
+#[tokio::test]
+async fn mention_popup_escapes_on_esc() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.workspace_files = Some(Arc::new(vec![PathBuf::from(
+        "crates/squeezy-graph/src/lib.rs",
+    )]));
+
+    insert_input_text(&mut app, "@graph");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+    assert!(app.mention_popup.is_none());
+    assert_eq!(app.input, "@graph");
+}
+
+// ---- F40: working row details ----
+
+#[test]
+fn working_panel_height_is_one_without_detail() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new()); // turn in progress
+    assert!(turn_in_progress(&app));
+    assert_eq!(task_panel_height(&app), 1);
+    assert!(working_detail_line(&app).is_none());
+}
+
+#[test]
+fn working_panel_grows_to_two_rows_when_mcp_starting() {
+    // McpStatusSnapshot/McpServerStatus are re-exported from squeezy_tools.
+    let mut per_server = std::collections::BTreeMap::new();
+    per_server.insert("alpha".to_string(), McpServerStatus::Starting);
+    per_server.insert(
+        "beta".to_string(),
+        McpServerStatus::Ready {
+            tools_count: 3,
+            cached: false,
+        },
+    );
+
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new());
+    app.mcp_status = Some(McpStatusSnapshot {
+        per_server,
+        generated_unix_millis: 0,
+    });
+
+    assert_eq!(task_panel_height(&app), 2);
+    let detail = working_detail_line(&app).expect("expected mcp detail line");
+    let text: String = detail.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(text.contains("starting"), "got: {text}");
+    assert!(text.contains("/2"), "got: {text}");
+}
+
+#[test]
+fn working_detail_summarises_extra_queued_tools() {
+    use squeezy_tools::ToolCall;
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new());
+    app.active_tool_calls.insert(
+        "a".to_string(),
+        ToolCall {
+            call_id: "a".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({"command": "ls"}),
+        },
+    );
+    app.active_tool_calls.insert(
+        "b".to_string(),
+        ToolCall {
+            call_id: "b".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({"command": "pwd"}),
+        },
+    );
+
+    let detail = working_detail_line(&app).expect("queued summary");
+    let text: String = detail.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(text.contains("+1 more tool call queued"), "got: {text}");
+}
+
+// ---- F38: status segment composition ----
+
+#[test]
+fn status_details_render_via_segments_match_legacy_format() {
+    let app = test_app(SessionMode::Build);
+    let details = format_status_details(&app);
+    // Each segment must appear with its label so downstream consumers
+    // (CLI status verbose, logs) keep parsing.
+    for needle in [
+        "repo ",
+        "sandbox ",
+        "telemetry ",
+        "mcp ",
+        "cost ",
+        "tok ",
+        "ctx ",
+        "pins ",
+        "compact ",
+        "tools ",
+        "budget ",
+        "cfg ",
+        "read ",
+        "receipts ",
+        "redactions ",
+        "cached ",
+        "cache_write ",
+    ] {
+        assert!(
+            details.contains(needle),
+            "missing segment label {needle:?} in: {details}"
+        );
+    }
+}
+
+#[test]
+fn cost_segment_renders_cap_and_percent_when_configured() {
+    // When `max_session_cost_usd_micros` is set, the cost segment must show
+    // the spend, the cap, and the integer percent so the user can see where
+    // they stand without opening the /cost overlay.
+    let mut config = test_config(SessionMode::Build);
+    config.max_session_cost_usd_micros = Some(500_000); // $0.50 cap
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.cost.estimated_usd_micros = Some(125_000); // $0.125 spent => 25%
+
+    let details = format_status_details(&app);
+    assert!(
+        details.contains("cost $0.125000 / $0.50 (25%)"),
+        "unexpected status: {details}"
+    );
+}
+
+#[test]
+fn cost_segment_renders_without_cap_when_unset() {
+    // When no cap is configured the segment must fall back to the legacy
+    // single-value format so existing log scrapers keep working.
+    let mut config = test_config(SessionMode::Build);
+    config.max_session_cost_usd_micros = None;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.cost.estimated_usd_micros = Some(42);
+
+    let details = format_status_details(&app);
+    assert!(details.contains("cost $0.000042"), "{details}");
+    assert!(!details.contains(" / $"), "cap separator leaked: {details}");
+}
+
+#[test]
+fn status_segment_individually_returns_expected_text() {
+    let app = test_app(SessionMode::Build);
+    assert_eq!(
+        super::status::segments::sandbox(&app),
+        Some(format!("sandbox {}", app.permissions.sandbox))
+    );
+    assert!(
+        super::status::segments::tools(&app)
+            .as_deref()
+            .map(|s| s.starts_with("tools "))
+            .unwrap_or(false)
+    );
+}
+
+// ---- F39: slash command capabilities ----
+
+#[test]
+fn slash_commands_have_documented_capability_for_every_entry() {
+    // Sanity-check that every slash command has been classified.
+    let mutating = [
+        "/plan",
+        "/build",
+        "/compact",
+        "/attach",
+        "/detach",
+        "/pin",
+        "/unpin",
+        "/resume",
+        "/session-export",
+        "/session-cleanup",
+        "/undo",
+        "/revert-turn",
+        "/verbosity",
+        "/tool-verbosity",
+    ];
+    for command in SLASH_COMMANDS {
+        let expected_dim = mutating.contains(&command.name);
+        assert_eq!(
+            command.available_during_task, !expected_dim,
+            "{} availability mismatch",
+            command.name
+        );
+    }
+}
+
+#[test]
+fn slash_compact_unavailable_during_turn_renders_dim_hint() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new());
+    set_input(&mut app, "/compact".to_string());
+
+    let output = render_to_string(&app, 120, 16);
+    assert!(
+        output.contains("/compact"),
+        "expected /compact in output: {output}"
+    );
+    assert!(
+        output.contains("unavailable during turn"),
+        "expected unavailable hint: {output}"
+    );
+}
+
+#[tokio::test]
+async fn slash_compact_during_turn_short_circuits_dispatcher() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new());
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/compact").await;
+    assert!(ran, "command should be recognised");
+    assert!(
+        app.status.contains("unavailable during turn"),
+        "status should reflect block: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn slash_help_is_allowed_during_turn() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new());
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/help").await;
+    assert!(ran, "help should execute");
+    assert!(
+        !app.status.contains("unavailable during turn"),
+        "help should be allowed: {}",
+        app.status
+    );
+}
+
+#[test]
+fn slash_parameter_hint_appears_in_render() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/verbosity".to_string());
+    let output = render_to_string(&app, 120, 16);
+    assert!(
+        output.contains("quiet|normal|verbose"),
+        "expected parameter hint to render: {output}"
+    );
+}
+
+#[test]
+fn json_patch_preview_parser_emits_events_per_patch() {
+    use super::streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
+
+    let payload = r#"{"patches":[{"path":"a.txt","search":"foo","replace":"bar","expected_sha256":"deadbeef"},{"path":"b.txt","search":"baz","replace":"qux","expected_sha256":"cafebabe"}],"plan_id":"P1"}"#;
+
+    let mut parser = JsonPatchPreviewParser::new();
+    let mut events = Vec::new();
+    // Feed byte-by-byte to mirror the worst-case streaming cadence.
+    for byte in payload.bytes() {
+        let chunk = [byte];
+        events.extend(parser.push_delta(std::str::from_utf8(&chunk).unwrap()));
+    }
+    events.extend(parser.finish());
+
+    let patch_events: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, PatchPreviewEvent::Patch { .. }))
+        .collect();
+    assert_eq!(patch_events.len(), 2, "events: {events:?}");
+    match &patch_events[0] {
+        PatchPreviewEvent::Patch {
+            index,
+            path,
+            search_hash,
+            replace_hash,
+        } => {
+            assert_eq!(*index, 0);
+            assert_eq!(path, "a.txt");
+            assert!(!search_hash.is_empty());
+            assert!(!replace_hash.is_empty());
+            assert_ne!(search_hash, replace_hash);
+        }
+        _ => panic!("expected patch event"),
+    }
+    let complete = events
+        .iter()
+        .find(|e| matches!(e, PatchPreviewEvent::Complete { .. }))
+        .expect("complete event");
+    if let PatchPreviewEvent::Complete { count } = complete {
+        assert_eq!(*count, 2);
+    }
+}
+
+#[test]
+fn json_patch_preview_parser_handles_escaped_quotes_in_search() {
+    use super::streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
+
+    // `search` contains an escaped double-quote — the parser must not let it
+    // close the surrounding string literal early.
+    let payload = r#"{"patches":[{"path":"a.rs","search":"println!(\"hi\");","replace":"println!(\"hello\");","expected_sha256":"x"}]}"#;
+
+    let mut parser = JsonPatchPreviewParser::new();
+    let events = parser.push_delta(payload);
+    let patches: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            PatchPreviewEvent::Patch { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        patches,
+        vec!["a.rs".to_string()],
+        "should emit exactly one patch, got events: {events:?}"
+    );
 }
