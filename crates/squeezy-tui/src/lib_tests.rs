@@ -129,6 +129,102 @@ async fn shift_tab_toggles_mode() {
 }
 
 #[tokio::test]
+async fn slash_plan_with_trailing_space_still_switches_mode() {
+    // Regression for the old Enter-time pre-intercept that compared the
+    // trimmed input via `mode_command` and silently dropped `/plan ` (with
+    // trailing whitespace) when the slash command flow had no `/plan` arm.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    set_input(&mut app, "/plan ".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(app.mode, SessionMode::Plan);
+    assert!(app.input.is_empty());
+}
+
+#[tokio::test]
+async fn slash_config_opens_screen() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/config".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert!(app.config_screen.is_some(), "config screen should be open");
+}
+
+#[tokio::test]
+async fn slash_model_opens_config_at_models_section() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/model".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    let state = app.config_screen.expect("config screen should be open");
+    assert_eq!(
+        state.current_section().id,
+        squeezy_core::config_schema::SectionId::Models
+    );
+}
+
+#[tokio::test]
+async fn slash_config_with_section_argument_focuses_section() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/config permissions".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    let state = app.config_screen.expect("config screen should be open");
+    assert_eq!(
+        state.current_section().id,
+        squeezy_core::config_schema::SectionId::Permissions
+    );
+}
+
+#[tokio::test]
+async fn f11_toggles_config_screen() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(app.config_screen.is_none());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert!(app.config_screen.is_some());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert!(app.config_screen.is_none());
+}
+
+#[tokio::test]
 async fn slash_plan_and_build_force_modes() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -1517,6 +1613,99 @@ fn retryable_apply_patch_failure_is_not_rendered_as_final_failure() {
 
     assert!(output.contains("⚠ Retried src/lib.rs"), "{output}");
     assert!(!output.contains("✖ Failed apply patch"), "{output}");
+}
+
+#[test]
+fn apply_patch_failures_on_different_paths_do_not_coalesce() {
+    let mut app = test_app(SessionMode::Build);
+    for (index, path) in ["src/foo.rs", "src/bar.rs"].into_iter().enumerate() {
+        let mut result = sample_tool_result("apply_patch", "");
+        result.call_id = format!("patch-{index}");
+        result.status = ToolStatus::Stale;
+        result.content = serde_json::json!({
+            "error": "search text not found",
+            "path": path,
+        });
+        app.push_tool_result(result);
+    }
+
+    let output = render_to_string(&app, 140, 14);
+
+    assert!(output.contains("src/foo.rs"), "{output}");
+    assert!(output.contains("src/bar.rs"), "{output}");
+    assert!(
+        !output.contains("(2x)"),
+        "distinct paths should not coalesce: {output}"
+    );
+    assert_eq!(app.transcript.len(), 2);
+}
+
+#[test]
+fn apply_patch_failures_on_same_path_still_coalesce() {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..2 {
+        let mut result = sample_tool_result("apply_patch", "");
+        result.call_id = format!("patch-{index}");
+        result.status = ToolStatus::Stale;
+        result.content = serde_json::json!({
+            "error": "search text not found",
+            "path": "src/lib.rs",
+        });
+        app.push_tool_result(result);
+    }
+
+    let output = render_to_string(&app, 140, 14);
+
+    assert!(output.contains("(2x)"), "{output}");
+    assert_eq!(app.transcript.len(), 1);
+}
+
+#[test]
+fn plan_mode_question_renders_with_choices_and_freeform_hint() {
+    let mut app = test_app(SessionMode::Plan);
+    let request = RequestUserInputRequest {
+        question: "How would you like to approach the refactor?".to_string(),
+        choices: vec![
+            RequestUserInputChoice {
+                label: "Split into smaller modules".to_string(),
+                value: "split".to_string(),
+            },
+            RequestUserInputChoice {
+                label: "Keep the current layout".to_string(),
+                value: "keep".to_string(),
+            },
+        ],
+        allow_freeform: true,
+    };
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 1,
+    });
+
+    let output = render_to_string(&app, 140, 24);
+
+    assert!(
+        output.contains("Plan-mode question"),
+        "title missing: {output}"
+    );
+    assert!(
+        output.contains("How would you like to approach the refactor?"),
+        "question text missing: {output}"
+    );
+    assert!(
+        output.contains("Split into smaller modules"),
+        "first choice missing: {output}"
+    );
+    assert!(
+        output.contains("› Keep the current layout"),
+        "selected marker missing on second choice: {output}"
+    );
+    assert!(
+        output.contains("freeform"),
+        "freeform hint missing: {output}"
+    );
 }
 
 #[test]
@@ -4264,84 +4453,45 @@ fn sample_attachment(id: &str) -> ContextAttachment {
     }
 }
 
-// ---- F41: model/verbosity overlay ----
+// ---- /verbosity inline back-compat ----
+//
+// `/model`, `/permissions`, `/verbosity`, and `/tool-verbosity` open the
+// `/config` screen focused on the matching section; the original overlay
+// flow was replaced by the full editor. Section-routing coverage lives in
+// `slash_model_opens_config_at_models_section` and friends below.
 
 #[tokio::test]
-async fn slash_model_opens_overlay_with_registry_entries() {
+async fn slash_verbosity_with_inline_arg_applies_immediately() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-
-    let ran = handle_slash_command(&mut app, &mut agent, "/model").await;
-    assert!(ran, "/model should execute");
-    assert!(app.overlay.is_some(), "overlay should be set");
-
-    let rendered = render_inline_to_string(&app, 120, 24);
+    app.response_verbosity = ResponseVerbosity::Normal;
+    let ran = handle_slash_command(&mut app, &mut agent, "/verbosity verbose").await;
+    assert!(ran);
     assert!(
-        rendered.contains("Select model"),
-        "header missing: {rendered}"
+        app.config_screen.is_none(),
+        "inline form should not open the screen"
     );
-    // Some registry entry's id should appear.
-    let mut found = false;
-    for model in squeezy_llm::MODEL_REGISTRY.iter() {
-        if rendered.contains(model.id) {
-            found = true;
-            break;
-        }
-    }
-    assert!(found, "no model id appeared in overlay: {rendered}");
+    assert_eq!(app.response_verbosity, ResponseVerbosity::Verbose);
+    assert_eq!(
+        agent.config_snapshot().tui.response_verbosity,
+        ResponseVerbosity::Verbose
+    );
 }
 
 #[tokio::test]
-async fn slash_verbosity_opens_overlay_without_arg() {
+async fn slash_verbosity_opens_config_when_called_without_arg() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let ran = handle_slash_command(&mut app, &mut agent, "/verbosity").await;
     assert!(ran);
-    let rendered = render_inline_to_string(&app, 120, 24);
-    assert!(rendered.contains("Select response verbosity"), "{rendered}");
-}
-
-#[tokio::test]
-async fn overlay_enter_applies_verbosity_selection() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.response_verbosity = ResponseVerbosity::Normal;
-    handle_slash_command(&mut app, &mut agent, "/verbosity").await;
-    assert!(app.overlay.is_some());
-    // The default index is "normal" — move down once to verbose.
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-    )
-    .await
-    .expect("down");
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    )
-    .await
-    .expect("enter");
-    assert!(app.overlay.is_none(), "overlay should close after Enter");
-    assert_eq!(app.response_verbosity, ResponseVerbosity::Verbose);
-}
-
-#[tokio::test]
-async fn overlay_esc_cancels_without_change() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    let original = app.response_verbosity;
-    handle_slash_command(&mut app, &mut agent, "/verbosity").await;
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-    )
-    .await
-    .expect("esc");
-    assert!(app.overlay.is_none());
-    assert_eq!(app.response_verbosity, original);
+    let state = app
+        .config_screen
+        .as_ref()
+        .expect("config screen should be open");
+    assert_eq!(
+        state.current_section().id,
+        squeezy_core::config_schema::SectionId::Verbosity
+    );
 }
 
 // ---- F37: @-mention composer ----
@@ -4505,6 +4655,37 @@ fn status_details_render_via_segments_match_legacy_format() {
             "missing segment label {needle:?} in: {details}"
         );
     }
+}
+
+#[test]
+fn cost_segment_renders_cap_and_percent_when_configured() {
+    // When `max_session_cost_usd_micros` is set, the cost segment must show
+    // the spend, the cap, and the integer percent so the user can see where
+    // they stand without opening the /cost overlay.
+    let mut config = test_config(SessionMode::Build);
+    config.max_session_cost_usd_micros = Some(500_000); // $0.50 cap
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.cost.estimated_usd_micros = Some(125_000); // $0.125 spent => 25%
+
+    let details = format_status_details(&app);
+    assert!(
+        details.contains("cost $0.125000 / $0.50 (25%)"),
+        "unexpected status: {details}"
+    );
+}
+
+#[test]
+fn cost_segment_renders_without_cap_when_unset() {
+    // When no cap is configured the segment must fall back to the legacy
+    // single-value format so existing log scrapers keep working.
+    let mut config = test_config(SessionMode::Build);
+    config.max_session_cost_usd_micros = None;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.cost.estimated_usd_micros = Some(42);
+
+    let details = format_status_details(&app);
+    assert!(details.contains("cost $0.000042"), "{details}");
+    assert!(!details.contains(" / $"), "cap separator leaked: {details}");
 }
 
 #[test]
