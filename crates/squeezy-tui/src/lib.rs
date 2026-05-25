@@ -54,6 +54,7 @@ const LONG_ASSISTANT_CHARS: usize = 1_200;
 const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
 const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
+const SHELL_COLLAPSED_OUTPUT_PREVIEW_LINES: usize = 80;
 const AMBER: Color = Color::Rgb(252, 211, 77);
 const GOLD: Color = Color::Rgb(254, 240, 138);
 const MODE_PURPLE: Color = Color::Rgb(216, 180, 254);
@@ -2919,9 +2920,13 @@ fn format_transcript_entry_with_width(
         TranscriptEntryKind::Message(item) => {
             format_message_entry_with_width(item, entry.collapsed, selected, outcome, width)
         }
-        TranscriptEntryKind::ToolResult(tool) => {
-            format_tool_result_entry(tool, entry.collapsed, selected, tool_output_verbosity)
-        }
+        TranscriptEntryKind::ToolResult(tool) => format_tool_result_entry(
+            tool,
+            entry.collapsed,
+            selected,
+            tool_output_verbosity,
+            width,
+        ),
         TranscriptEntryKind::Log(message) => format_log_entry(message, entry.collapsed, selected),
     }
 }
@@ -3113,6 +3118,7 @@ fn format_tool_result_entry(
     collapsed: bool,
     selected: bool,
     tool_output_verbosity: ToolOutputVerbosity,
+    width: Option<u16>,
 ) -> Vec<Line<'static>> {
     let (marker, action) = tool_result_action(tool);
     let color = tool_result_display_color(tool);
@@ -3126,7 +3132,7 @@ fn format_tool_result_entry(
             color,
             summary_spans,
         )];
-        lines.extend(collapsed_tool_preview_lines(tool));
+        lines.extend(collapsed_tool_preview_lines(tool, width));
         return lines;
     }
     let mut lines = vec![action_line_spans(
@@ -3141,7 +3147,10 @@ fn format_tool_result_entry(
     lines
 }
 
-fn collapsed_tool_preview_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
+fn collapsed_tool_preview_lines(tool: &ToolTranscript, width: Option<u16>) -> Vec<Line<'static>> {
+    if let Some(lines) = collapsed_shell_preview_lines(tool, width) {
+        return lines;
+    }
     if !matches!(tool.result.status, ToolStatus::Success)
         || !matches!(tool.result.tool_name.as_str(), "apply_patch" | "write_file")
     {
@@ -3477,7 +3486,40 @@ fn shell_tool_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         .and_then(|call| string_arg(&call.arguments, "command"))
         .or_else(|| string_arg(&tool.result.content, "command"))
         .unwrap_or_else(|| tool.result.tool_name.clone());
-    command_spans(&command)
+    let mut spans = Vec::new();
+    if shell_result_is_exploration(tool) {
+        spans.push(Span::styled(
+            shell_exploration_label(&command),
+            Style::default().fg(Color::White),
+        ));
+    }
+    spans.extend(command_spans(&command));
+    spans
+}
+
+fn shell_result_is_exploration(tool: &ToolTranscript) -> bool {
+    if !matches!(tool.result.tool_name.as_str(), "shell" | "verify") {
+        return false;
+    }
+    matches!(
+        tool.result.content["policy"]["capability"].as_str(),
+        Some("read" | "search")
+    )
+}
+
+fn shell_exploration_label(command: &str) -> &'static str {
+    let first = command
+        .split_whitespace()
+        .find(|token| !looks_like_env_assignment(token))
+        .unwrap_or_default();
+    match first {
+        "ls" => "List ",
+        "find" => "Find ",
+        "rg" | "grep" => "Search ",
+        "cat" | "sed" | "head" | "tail" => "Read ",
+        "pwd" => "Show ",
+        _ => "Inspect ",
+    }
 }
 
 fn decl_search_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
@@ -3947,49 +3989,127 @@ fn expanded_shell_detail_lines(
     tool: &ToolTranscript,
     verbosity: ToolOutputVerbosity,
 ) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+    let mut lines = shell_output_block_lines(tool, None);
     if let Some(command) = tool
         .call
         .as_ref()
         .and_then(|call| string_arg(&call.arguments, "command"))
         .or_else(|| string_arg(&tool.result.content, "command"))
     {
-        lines.push(detail_spans_line(
-            vec![Span::styled("command ", Style::default().fg(QUIET))]
-                .into_iter()
-                .chain(command_spans(&command))
-                .collect(),
-        ));
+        if lines.is_empty() {
+            lines.push(detail_spans_line(command_spans(&command)));
+        }
     }
-    if let Some(workdir) = string_arg(&tool.result.content, "workdir") {
+    if tool.result.status != ToolStatus::Success
+        && let Some(workdir) = string_arg(&tool.result.content, "workdir")
+    {
         lines.push(detail_line(false, QUIET, format!("cwd {workdir}")));
     }
-    if let Some(exit_code) = tool
-        .result
-        .content
-        .get("exit_code")
-        .and_then(|value| value.as_i64())
+    if tool.result.status != ToolStatus::Success
+        && let Some(exit_code) = tool
+            .result
+            .content
+            .get("exit_code")
+            .and_then(|value| value.as_i64())
     {
         lines.push(detail_line(false, QUIET, format!("exit {exit_code}")));
     }
-    lines.extend(output_block_lines(
-        "stdout",
-        string_arg(&tool.result.content, "stdout")
-            .as_deref()
-            .unwrap_or(""),
-        verbosity,
-    ));
-    lines.extend(output_block_lines(
-        "stderr",
-        string_arg(&tool.result.content, "stderr")
-            .as_deref()
-            .unwrap_or(""),
-        verbosity,
-    ));
+    if tool.result.status != ToolStatus::Success {
+        lines.extend(output_block_lines(
+            "stdout",
+            string_arg(&tool.result.content, "stdout")
+                .as_deref()
+                .unwrap_or(""),
+            verbosity,
+        ));
+        lines.extend(output_block_lines(
+            "stderr",
+            string_arg(&tool.result.content, "stderr")
+                .as_deref()
+                .unwrap_or(""),
+            verbosity,
+        ));
+    }
     if lines.is_empty() {
         lines.extend(expanded_generic_tool_detail_lines(tool, verbosity));
     }
     lines
+}
+
+fn collapsed_shell_preview_lines(
+    tool: &ToolTranscript,
+    width: Option<u16>,
+) -> Option<Vec<Line<'static>>> {
+    if !matches!(tool.result.tool_name.as_str(), "shell" | "verify")
+        || tool.result.status != ToolStatus::Success
+    {
+        return None;
+    }
+    let mut lines = shell_output_block_lines(tool, Some(SHELL_COLLAPSED_OUTPUT_PREVIEW_LINES));
+    if lines.is_empty() {
+        None
+    } else {
+        lines.insert(0, transcript_separator_line(width));
+        lines.push(transcript_separator_line(width));
+        Some(lines)
+    }
+}
+
+fn shell_output_block_lines(
+    tool: &ToolTranscript,
+    preview_limit: Option<usize>,
+) -> Vec<Line<'static>> {
+    let stdout = string_arg(&tool.result.content, "stdout").unwrap_or_default();
+    let stderr = string_arg(&tool.result.content, "stderr").unwrap_or_default();
+    let output = match (!stdout.trim().is_empty(), !stderr.trim().is_empty()) {
+        (true, true) => format!("{stdout}\n{stderr}"),
+        (true, false) => stdout,
+        (false, true) => stderr,
+        (false, false) => return Vec::new(),
+    };
+    let command = tool
+        .call
+        .as_ref()
+        .and_then(|call| string_arg(&call.arguments, "command"))
+        .or_else(|| string_arg(&tool.result.content, "command"))
+        .unwrap_or_else(|| tool.result.tool_name.clone());
+    let workdir = string_arg(&tool.result.content, "workdir").unwrap_or_else(|| ".".to_string());
+    let limit = preview_limit.unwrap_or(usize::MAX);
+    let mut lines = vec![shell_output_title_line(&command, &workdir)];
+    lines.extend(head_tail_lines(&output, limit).into_iter().map(|line| {
+        if line.truncated_marker {
+            detail_line(false, QUIET, line.text)
+        } else {
+            shell_output_line(&line.text)
+        }
+    }));
+    lines
+}
+
+fn shell_output_title_line(command: &str, workdir: &str) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled("• ", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
+    ];
+    spans.extend(command_spans(command));
+    spans.push(Span::styled(" in ", Style::default().fg(QUIET)));
+    spans.push(Span::styled(
+        workdir.to_string(),
+        Style::default().fg(Color::White),
+    ));
+    spans.push(Span::styled(":", Style::default().fg(QUIET)));
+    Line::from(spans)
+}
+
+fn shell_output_line(content: &str) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    spans.extend(styled_output_spans(content));
+    Line::from(spans)
+}
+
+fn transcript_separator_line(width: Option<u16>) -> Line<'static> {
+    let width = width.unwrap_or(96).max(8) as usize;
+    Line::from(Span::styled("─".repeat(width), Style::default().fg(QUIET)))
 }
 
 fn expanded_decl_search_detail_lines(
@@ -4828,6 +4948,7 @@ fn tool_result_action(tool: &ToolTranscript) -> (&'static str, &'static str) {
         {
             ("✔ ", "Edited")
         }
+        ToolStatus::Success if shell_result_is_exploration(tool) => ("✔ ", "Explored"),
         ToolStatus::Success if is_exploration_tool(&tool.result.tool_name) => ("✔ ", "Explored"),
         ToolStatus::Success => ("✔ ", "Ran"),
         ToolStatus::Error | ToolStatus::Stale if is_invalid_argument_result(&tool.result) => {

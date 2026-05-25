@@ -820,12 +820,42 @@ fn shell_tool_rows_show_command_and_highlight_output() {
         "{output}"
     );
     assert!(
-        output.contains("command cargo test -p squeezy-tui"),
+        output.contains("• cargo test -p squeezy-tui in .:"),
         "{output}"
     );
-    assert!(output.contains("stdout"), "{output}");
     assert!(output.contains("ok"), "{output}");
     assert!(!output.contains("\\u001b"), "{output}");
+}
+
+#[test]
+fn read_only_shell_rows_render_codex_style_output_block() {
+    let mut app = test_app(SessionMode::Build);
+    let call = ToolCall {
+        call_id: "shell-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": "ls -la"}),
+    };
+    let mut result = sample_tool_result("shell", "");
+    result.call_id = "shell-1".to_string();
+    result.content = serde_json::json!({
+        "command": "ls -la",
+        "workdir": "/tmp/project",
+        "exit_code": 0,
+        "stdout": "total 8\ndrwxr-xr-x  3 user  staff  96 .\n-rw-r--r--  1 user  staff  10 README.md",
+        "stderr": "",
+        "policy": {
+            "capability": "search"
+        }
+    });
+    app.push_tool_result_with_call(result, Some(call));
+
+    let output = render_to_string(&app, 140, 18);
+
+    assert!(output.contains("✔ Explored List ls -la"), "{output}");
+    assert!(output.contains("• ls -la in /tmp/project:"), "{output}");
+    assert!(output.contains("total 8"), "{output}");
+    assert!(output.contains("README.md"), "{output}");
+    assert!(!output.contains("stdout"), "{output}");
 }
 
 #[test]
