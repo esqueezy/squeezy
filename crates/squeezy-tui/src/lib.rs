@@ -2842,11 +2842,11 @@ fn transcript_lines_for_render(
             width,
         ));
     }
-    if !app.pending_assistant.is_empty() {
+    if let Some(pending_assistant) = pending_assistant_display_content(app) {
         lines.extend(assistant_text_lines(
             false,
             turn_coin_span(app),
-            &app.pending_assistant,
+            &pending_assistant,
             Style::default(),
         ));
         lines.push(Line::from(""));
@@ -2855,16 +2855,9 @@ fn transcript_lines_for_render(
 }
 
 fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
-    if app.pending_assistant.is_empty() {
-        Vec::new()
-    } else {
-        assistant_text_lines(
-            false,
-            turn_coin_span(app),
-            &app.pending_assistant,
-            Style::default(),
-        )
-    }
+    pending_assistant_display_content(app)
+        .map(|content| assistant_text_lines(false, turn_coin_span(app), &content, Style::default()))
+        .unwrap_or_default()
 }
 
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
@@ -3094,15 +3087,30 @@ fn dedupe_assistant_repeated_tool_output(
         return Some(message);
     }
 
-    let mut content = message.content.clone();
+    let content = assistant_content_without_repeated_tool_output(app, &message.content);
+    message.content = content;
+    (!message.content.trim().is_empty()).then_some(message)
+}
+
+fn assistant_content_without_repeated_tool_output(app: &TuiApp, content: &str) -> String {
+    let mut content = content.to_string();
     for output in recent_shell_tool_outputs(app) {
         if let Some(stripped) = strip_repeated_fenced_tool_output(&content, &output) {
             content = stripped;
         }
+        if let Some(stripped) = strip_repeated_open_fenced_tool_output(&content, &output) {
+            content = stripped;
+        }
     }
+    content
+}
 
-    message.content = content;
-    (!message.content.trim().is_empty()).then_some(message)
+fn pending_assistant_display_content(app: &TuiApp) -> Option<String> {
+    if app.pending_assistant.trim().is_empty() {
+        return None;
+    }
+    let content = assistant_content_without_repeated_tool_output(app, &app.pending_assistant);
+    (!content.trim().is_empty()).then_some(content)
 }
 
 fn recent_shell_tool_outputs(app: &TuiApp) -> Vec<String> {
@@ -3175,6 +3183,42 @@ fn strip_repeated_fenced_tool_output(content: &str, output: &str) -> Option<Stri
     changed.then(|| tidy_stripped_assistant_text(kept.join("\n")))
 }
 
+fn strip_repeated_open_fenced_tool_output(content: &str, output: &str) -> Option<String> {
+    let duplicate = normalize_duplicate_tool_output(output);
+    if duplicate.len() < 80 && duplicate.lines().count() < 4 {
+        return None;
+    }
+
+    let mut kept = Vec::new();
+    let mut fence = Vec::new();
+    let mut in_fence = false;
+
+    for line in content.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_fence {
+                fence.push(line.to_string());
+                kept.append(&mut fence);
+                in_fence = false;
+            } else {
+                in_fence = true;
+                fence.push(line.to_string());
+            }
+        } else if in_fence {
+            fence.push(line.to_string());
+        } else {
+            kept.push(line.to_string());
+        }
+    }
+
+    if !in_fence {
+        return None;
+    }
+
+    let body = fence[1..].join("\n");
+    open_fenced_block_repeats_tool_output(&body, &duplicate)
+        .then(|| tidy_stripped_assistant_text(kept.join("\n")))
+}
+
 fn fenced_block_repeats_tool_output(body: &str, duplicate: &str) -> bool {
     let body = normalize_duplicate_tool_output(body);
     !body.is_empty()
@@ -3182,6 +3226,16 @@ fn fenced_block_repeats_tool_output(body: &str, duplicate: &str) -> bool {
             || body.contains(duplicate)
             || duplicate.contains(&body)
             || tool_output_similarity_is_duplicate(&body, duplicate))
+}
+
+fn open_fenced_block_repeats_tool_output(body: &str, duplicate: &str) -> bool {
+    let body = normalize_duplicate_tool_output(body);
+    if body.len() < 40 && body.lines().count() < 2 {
+        return false;
+    }
+    duplicate.starts_with(&body)
+        || duplicate.contains(&body)
+        || tool_output_similarity_is_duplicate(&body, duplicate)
 }
 
 fn normalize_duplicate_tool_output(text: &str) -> String {

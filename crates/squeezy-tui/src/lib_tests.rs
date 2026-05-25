@@ -2990,6 +2990,39 @@ async fn completed_event_suppresses_materially_repeated_shell_output_fence() {
 }
 
 #[tokio::test]
+async fn pending_assistant_suppresses_streaming_duplicate_shell_output_fence() {
+    let mut app = test_app(SessionMode::Build);
+    let stdout = [
+        "component-alpha status ready budget 704 owner runtime",
+        "component-beta status ready budget 3488 owner platform",
+        "component-gamma status stale budget 16326 owner docs",
+        "component-delta status ready budget 1088 owner tooling",
+    ]
+    .join("\n");
+    let call = ToolCall {
+        call_id: "shell-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": "inspect component report"}),
+    };
+    let mut result = sample_tool_result("shell", "");
+    result.call_id = "shell-1".to_string();
+    result.content = serde_json::json!({
+        "command": "inspect component report",
+        "workdir": ".",
+        "exit_code": 0,
+        "stdout": stdout,
+        "stderr": "",
+    });
+    app.push_tool_result_with_call(result, Some(call));
+    app.pending_assistant = format!("Here is the report:\n\n```text\n{stdout}");
+
+    let rendered = render_to_string(&app, 140, 24);
+
+    assert!(rendered.contains("Here is the report"), "{rendered}");
+    assert_eq!(rendered.matches("component-alpha").count(), 1, "{rendered}");
+}
+
+#[tokio::test]
 async fn job_events_update_state_without_resetting_turn() {
     let mut app = test_app(SessionMode::Build);
     let (tx, rx) = mpsc::channel(4);
