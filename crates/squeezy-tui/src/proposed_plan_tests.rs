@@ -172,3 +172,175 @@ fn prune_plan_dir_noops_when_dir_missing() {
     assert_eq!(prune_plan_dir(&root), 0);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn extracts_two_blocks_in_one_turn() {
+    let mut p = ProposedPlanExtractor::new();
+    let out = p.feed(
+        "first <proposed_plan>plan A</proposed_plan> middle <proposed_plan>plan B</proposed_plan> tail",
+    );
+    assert_eq!(out.passthrough, "first  middle  tail");
+    assert_eq!(
+        out.completed,
+        vec!["plan A".to_string(), "plan B".to_string()]
+    );
+}
+
+#[test]
+fn extracts_two_blocks_split_across_deltas() {
+    let mut p = ProposedPlanExtractor::new();
+    let mut combined_passthrough = String::new();
+    let mut completed = Vec::new();
+    for delta in [
+        "intro <proposed_plan>plan ",
+        "A</proposed_plan>between<propos",
+        "ed_plan>plan B</proposed_plan>end",
+    ] {
+        let out = p.feed(delta);
+        combined_passthrough.push_str(&out.passthrough);
+        completed.extend(out.completed);
+    }
+    assert_eq!(combined_passthrough, "intro betweenend");
+    assert_eq!(completed, vec!["plan A".to_string(), "plan B".to_string()]);
+}
+
+#[test]
+fn bom_in_narration_passes_through() {
+    let mut p = ProposedPlanExtractor::new();
+    let out = p.feed("\u{feff}intro <proposed_plan>body</proposed_plan>tail");
+    assert_eq!(out.passthrough, "\u{feff}intro tail");
+    assert_eq!(out.completed, vec!["body".to_string()]);
+}
+
+#[test]
+fn crlf_inside_block_body_is_preserved() {
+    let mut p = ProposedPlanExtractor::new();
+    let out = p.feed("<proposed_plan>\r\nstep 1\r\nstep 2\r\n</proposed_plan>");
+    assert_eq!(out.passthrough, "");
+    // trim() in feed() strips the leading/trailing \r\n but keeps interior.
+    assert_eq!(out.completed, vec!["step 1\r\nstep 2".to_string()]);
+}
+
+#[test]
+fn multibyte_chars_around_tag_do_not_break_safe_emit() {
+    // Plan body contains non-ASCII; narration around tags too. Must not
+    // panic on char boundaries and must round-trip cleanly.
+    let mut p = ProposedPlanExtractor::new();
+    let out = p.feed("café <proposed_plan>étape 1\nétape 2</proposed_plan>résumé");
+    assert_eq!(out.passthrough, "café résumé");
+    assert_eq!(out.completed, vec!["étape 1\nétape 2".to_string()]);
+}
+
+/// Property: feeding the same input one byte at a time yields the same
+/// observable output as feeding it in one shot. Covers tag splits across
+/// every byte boundary in the input (open tag, body, close tag, and the
+/// surrounding narration).
+#[test]
+fn byte_at_a_time_matches_single_shot() {
+    let input = "lead-in <proposed_plan>step 1\nstep 2\nstep 3</proposed_plan> trailing narration <proposed_plan>second\nplan</proposed_plan> end";
+
+    let mut single = ProposedPlanExtractor::new();
+    let single_out = single.feed(input);
+    let single_leftover = single.finalize();
+
+    let mut streamed = ProposedPlanExtractor::new();
+    let mut passthrough = String::new();
+    let mut completed: Vec<String> = Vec::new();
+    let mut idx = 0;
+    while idx < input.len() {
+        // Step over multibyte chars one codepoint at a time.
+        let mut end = idx + 1;
+        while !input.is_char_boundary(end) {
+            end += 1;
+        }
+        let out = streamed.feed(&input[idx..end]);
+        passthrough.push_str(&out.passthrough);
+        completed.extend(out.completed);
+        idx = end;
+    }
+    let streamed_leftover = streamed.finalize();
+
+    assert_eq!(
+        passthrough, single_out.passthrough,
+        "passthrough must match"
+    );
+    assert_eq!(
+        completed, single_out.completed,
+        "completed blocks must match"
+    );
+    assert_eq!(streamed_leftover, single_leftover, "finalize must match");
+}
+
+/// Property: cutting the stream at every byte offset and calling finalize
+/// must never panic and must produce some leftover such that
+/// passthrough+leftover ⊇ all input bytes that aren't strictly inside a
+/// fully-formed block (with the partial-tag bytes preserved one way or
+/// the other). We assert the no-panic invariant strictly, and a weaker
+/// "every byte is accounted for" invariant on the reassembled output.
+#[test]
+fn cancellation_at_every_offset_is_safe() {
+    let input = "narration <proposed_plan>body of plan\nwith multiple lines</proposed_plan> tail";
+
+    for cut in 0..=input.len() {
+        if !input.is_char_boundary(cut) {
+            continue;
+        }
+        let prefix = &input[..cut];
+        let mut p = ProposedPlanExtractor::new();
+        let out = p.feed(prefix);
+        let leftover = p.finalize();
+
+        // No bytes vanish: the union of passthrough text, completed bodies
+        // (with their tags re-added so we can compare), and the leftover
+        // must contain the same character set as the prefix.
+        let mut reassembled = out.passthrough.clone();
+        for body in &out.completed {
+            reassembled.push_str("<proposed_plan>");
+            reassembled.push_str(body);
+            reassembled.push_str("</proposed_plan>");
+        }
+        reassembled.push_str(&leftover);
+
+        // Bag comparison: passthrough comes from two sides of the block in
+        // the input but reassembles in a single span, so order can differ.
+        // We do, however, require every non-whitespace character of the
+        // prefix to be present somewhere in the reassembly (trim() inside
+        // feed() can collapse whitespace, so we ignore it).
+        let bag = |s: &str| -> std::collections::BTreeMap<char, usize> {
+            let mut m = std::collections::BTreeMap::new();
+            for c in s.chars().filter(|c| !c.is_whitespace()) {
+                *m.entry(c).or_insert(0) += 1;
+            }
+            m
+        };
+        assert_eq!(
+            bag(&reassembled),
+            bag(prefix),
+            "byte-set must round-trip at cut={cut}"
+        );
+
+        // finalize() must be idempotent (calling it again is harmless).
+        let second = p.finalize();
+        assert!(
+            second.is_empty(),
+            "finalize must be idempotent at cut={cut}"
+        );
+    }
+}
+
+/// Known limitation: a `<proposed_plan>` tag inside a markdown code fence
+/// is still extracted as if it were a real plan block. The parser is
+/// byte-based and has no markdown awareness. Tracked for plan-mode v3
+/// follow-up; ignored so it documents the gap without failing CI.
+#[test]
+#[ignore = "v3 follow-up: parser is markdown-unaware; code-fenced tags currently get extracted"]
+fn code_fenced_tag_is_not_extracted() {
+    let mut p = ProposedPlanExtractor::new();
+    let out = p.feed("Example:\n```\n<proposed_plan>not a real plan</proposed_plan>\n```\n");
+    // Desired behaviour: the whole code fence flows through as narration.
+    assert!(
+        out.completed.is_empty(),
+        "tags inside code fences should not count as real plans"
+    );
+    assert!(out.passthrough.contains("<proposed_plan>"));
+}
