@@ -3,13 +3,17 @@ use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use squeezy_core::{
-    AzureOpenAiConfig, CostSnapshot, OpenAiConfig, ResponseVerbosity, Result, SqueezyError,
+    AzureOpenAiConfig, CostSnapshot, OpenAiConfig, ProviderTransportConfig, ResponseVerbosity,
+    Result, SqueezyError,
 };
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+    credentials::resolve_api_key,
+    retry::{RetryPolicy, idle_timeout, send_with_retry},
 };
 
 #[derive(Clone)]
@@ -19,6 +23,7 @@ pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     api_version: Option<String>,
+    transport: ProviderTransportConfig,
 }
 
 impl std::fmt::Debug for OpenAiProvider {
@@ -29,23 +34,25 @@ impl std::fmt::Debug for OpenAiProvider {
             .field("api_key", &"<redacted>")
             .field("base_url", &self.base_url)
             .field("api_version", &self.api_version)
+            .field("transport", &self.transport)
             .finish()
     }
 }
 
 impl OpenAiProvider {
     pub fn from_config(config: &OpenAiConfig) -> Result<Self> {
-        let api_key = crate::keychain::resolve_api_key(
-            &config.api_key_env,
-            config.api_key_keychain.as_deref(),
-            "openai",
-        )?;
+        let api_key = if let Some(service) = config.api_key_keychain.as_deref() {
+            crate::keychain::resolve_api_key(&config.api_key_env, Some(service), "openai")?
+        } else {
+            resolve_api_key(&config.api_key_env)?
+        };
         Ok(Self {
             name: "openai",
             client: reqwest::Client::new(),
             api_key,
             base_url: config.base_url.trim_end_matches('/').to_string(),
             api_version: None,
+            transport: config.transport,
         })
     }
 
@@ -55,17 +62,18 @@ impl OpenAiProvider {
                 "missing AZURE_OPENAI_BASE_URL or providers.azure_openai.base_url".to_string(),
             ));
         }
-        let api_key = crate::keychain::resolve_api_key(
-            &config.api_key_env,
-            config.api_key_keychain.as_deref(),
-            "azure_openai",
-        )?;
+        let api_key = if let Some(service) = config.api_key_keychain.as_deref() {
+            crate::keychain::resolve_api_key(&config.api_key_env, Some(service), "azure_openai")?
+        } else {
+            resolve_api_key(&config.api_key_env)?
+        };
         Ok(Self {
             name: "azure_openai",
             client: reqwest::Client::new(),
             api_key,
             base_url: config.base_url.trim_end_matches('/').to_string(),
             api_version: Some(config.api_version.clone()),
+            transport: config.transport,
         })
     }
 
@@ -79,6 +87,9 @@ impl OpenAiProvider {
         });
         if let Some(previous_response_id) = &request.previous_response_id {
             body["previous_response_id"] = json!(previous_response_id);
+        }
+        if let Some(cache_key) = &request.cache_key {
+            body["prompt_cache_key"] = json!(cache_key);
         }
         if let Some(max_output_tokens) = request.max_output_tokens {
             body["max_output_tokens"] = json!(max_output_tokens);
@@ -127,6 +138,7 @@ impl LlmProvider for OpenAiProvider {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let provider_name = self.name;
+        let transport = self.transport;
         let mut url = format!("{}/responses", self.base_url);
         if let Some(api_version) = &self.api_version {
             url.push_str("?api-version=");
@@ -135,23 +147,15 @@ impl LlmProvider for OpenAiProvider {
         let body = Self::request_body(&request);
 
         Box::pin(try_stream! {
-            let response_result = tokio::select! {
-                _ = cancel.cancelled() => {
-                    yield LlmEvent::Cancelled;
-                    return;
-                }
-                response = {
+            let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
                     let builder = client.post(&url);
                     let builder = if provider_name == "azure_openai" {
-                        builder.header("api-key", api_key)
+                        builder.header("api-key", api_key.clone())
                     } else {
-                        builder.bearer_auth(api_key)
+                        builder.bearer_auth(api_key.clone())
                     };
-                    builder.json(&body).send()
-                } => response,
-            };
-            let response = response_result
-                .map_err(|err| SqueezyError::ProviderRequest(err.to_string()))?;
+                    builder.json(&body)
+                }).await?;
 
             let status = response.status();
             let response = if status == StatusCode::OK {
@@ -170,13 +174,18 @@ impl LlmProvider for OpenAiProvider {
             let mut decoder = SseDecoder::default();
             let mut saw_completed = false;
             let mut bytes = response.bytes_stream();
-            while let Some(chunk) = tokio::select! {
-                _ = cancel.cancelled() => {
-                    yield LlmEvent::Cancelled;
-                    return;
-                }
-                chunk = bytes.next() => chunk
-            } {
+            loop {
+                let polled = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        yield LlmEvent::Cancelled;
+                        return;
+                    }
+                    next = timeout(idle_timeout(transport), bytes.next()) => next,
+                };
+                let next = polled.map_err(|_| {
+                    SqueezyError::ProviderStream("OpenAI stream idle timeout".to_string())
+                })?;
+                let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
                     if let Some(llm_event) = parse_openai_event(&event)? {

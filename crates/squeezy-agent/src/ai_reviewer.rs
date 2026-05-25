@@ -109,6 +109,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: Vec::new(),
         store: false,
     };
