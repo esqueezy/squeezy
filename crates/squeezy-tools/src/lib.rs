@@ -65,6 +65,13 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tree_sitter::{Node, Parser};
 
+mod safety;
+mod schema;
+mod truncate;
+
+use schema::compact_tool_parameters;
+use truncate::truncate_middle_bytes;
+
 const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_BYTES_PER_FILE: usize = 1_000_000;
 const CHECKPOINTS_DISABLED_MESSAGE: &str = "checkpointing is disabled by default; commit or stash with git, or set [tools].checkpoints_enabled = true to re-enable Squeezy checkpoints";
@@ -189,6 +196,15 @@ pub struct ToolSpec {
     /// shell → git via the shell classifier); session mode gating in the agent
     /// applies on top of both layers.
     pub capability: PermissionCapability,
+}
+
+impl ToolSpec {
+    /// Apply the schema-compaction pipeline to `parameters`. Idempotent — safe
+    /// to call on a spec that has already been compacted.
+    pub(crate) fn with_compacted_parameters(mut self) -> Self {
+        compact_tool_parameters(&mut self.parameters);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -535,6 +551,12 @@ pub struct ToolRegistry {
     shell_workdir_locks: Arc<StdMutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
     shell_inflight: Arc<Semaphore>,
     mcp: Arc<McpClientRegistry>,
+    /// F04: cache for the per-turn `specs()` advertisement. The agent calls
+    /// this at least once per round for cost accounting plus once more when
+    /// building the LLM request; recomputing means cloning ~30 `ToolSpec`s
+    /// with their `parameters: Value` blobs every time. The cache is
+    /// invalidated whenever MCP refresh changes the external tool set.
+    cached_specs: Arc<StdMutex<Option<Arc<Vec<ToolSpec>>>>>,
 }
 
 #[derive(Debug, Default)]
@@ -750,6 +772,23 @@ impl ShellSandboxPlan {
             filesystem_read_roots: Vec::new(),
             filesystem_write_roots: Vec::new(),
             fallback_reason,
+        }
+    }
+
+    fn external(command: &str, config: &ShellSandboxConfig) -> Self {
+        Self {
+            program: "sh".to_string(),
+            args: vec!["-lc".to_string(), command.to_string()],
+            backend: "external",
+            mode: ShellSandboxMode::External.as_str(),
+            network: "external",
+            filesystem: "external",
+            required: false,
+            configured_read_roots: config.read_roots.clone(),
+            configured_write_roots: config.write_roots.clone(),
+            filesystem_read_roots: Vec::new(),
+            filesystem_write_roots: Vec::new(),
+            fallback_reason: None,
         }
     }
 
@@ -978,6 +1017,7 @@ impl ToolRegistry {
                 config.mcp_servers,
                 state_store.clone(),
             )),
+            cached_specs: Arc::new(StdMutex::new(None)),
         })
     }
 
@@ -1020,6 +1060,7 @@ impl ToolRegistry {
             shell_workdir_locks: Arc::new(StdMutex::new(HashMap::new())),
             shell_inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_SHELLS)),
             mcp: Arc::new(McpClientRegistry::new(BTreeMap::new())),
+            cached_specs: Arc::new(StdMutex::new(None)),
         })
     }
 
@@ -1065,6 +1106,9 @@ impl ToolRegistry {
                 ShellSandboxMode::Off,
                 &self.shell_sandbox,
             )),
+            ShellSandboxMode::External => {
+                Ok(ShellSandboxPlan::external(command, &self.shell_sandbox))
+            }
             ShellSandboxMode::BestEffort | ShellSandboxMode::Required => {
                 let plan =
                     prepare_shell_sandbox_plan(command, analysis, &self.root, &self.shell_sandbox)?;
@@ -1205,7 +1249,23 @@ impl ToolRegistry {
         )
     }
 
-    pub fn specs(&self) -> Vec<ToolSpec> {
+    /// Return the advertised tool list. The result is cached behind an
+    /// `Arc<Vec<ToolSpec>>` and re-used across turns; the cache is
+    /// invalidated when [`refresh_mcp_tools`] changes the external tool set.
+    pub fn specs(&self) -> Arc<Vec<ToolSpec>> {
+        if let Ok(mut slot) = self.cached_specs.lock() {
+            if let Some(cached) = slot.as_ref() {
+                return Arc::clone(cached);
+            }
+            let built = Arc::new(self.build_specs());
+            *slot = Some(Arc::clone(&built));
+            return built;
+        }
+        // Lock poisoned — recover by rebuilding without caching.
+        Arc::new(self.build_specs())
+    }
+
+    fn build_specs(&self) -> Vec<ToolSpec> {
         let mut specs = vec![
             apply_patch_spec(),
             decl_search_spec(),
@@ -1249,13 +1309,31 @@ impl ToolRegistry {
                 checkpoint_undo_spec(),
             ]);
         }
+        // First-party specs are statically defined inline above. Funnel them
+        // through the compaction pipeline so the budget contract holds
+        // uniformly regardless of how a spec was built.
+        for spec in specs.iter_mut() {
+            compact_tool_parameters(&mut spec.parameters);
+        }
+        // `mcp_tool_spec` already compacts at construction; append after the
+        // first-party loop to avoid double work.
         specs.extend(self.mcp.tools().into_iter().map(mcp_tool_spec));
         specs.sort_by(|left, right| left.name.cmp(&right.name));
         specs
     }
 
+    fn invalidate_cached_specs(&self) {
+        if let Ok(mut slot) = self.cached_specs.lock() {
+            *slot = None;
+        }
+    }
+
     pub async fn refresh_mcp_tools(&self, cancel: CancellationToken) -> McpRefreshOutcome {
-        self.mcp.refresh_tools(cancel).await
+        let outcome = self.mcp.refresh_tools(cancel).await;
+        // Drop any cached `specs()` so the next call sees the refreshed MCP
+        // tool set.
+        self.invalidate_cached_specs();
+        outcome
     }
 
     pub fn mcp_status_snapshot(&self) -> McpStatusSnapshot {
@@ -2216,6 +2294,30 @@ impl ToolRegistry {
         let Some(checkpoints) = self.checkpoints.as_ref() else {
             return checkpoints_disabled_result(call);
         };
+        match checkpoints.rollback_paths(target) {
+            Ok(paths) => {
+                for path in paths {
+                    if let Err(err) =
+                        safety::assess_write_path(&path, &self.root, &self.shell_sandbox)
+                    {
+                        return make_result(
+                            call,
+                            ToolStatus::Denied,
+                            json!({
+                                "error": err.message(),
+                                "path": path,
+                                "reason": err.code(),
+                                "permission_denied": true,
+                                "policy_denied": true,
+                            }),
+                            ToolCostHint::default(),
+                            None,
+                        );
+                    }
+                }
+            }
+            Err(err) => return tool_error(call, err),
+        }
         match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
             Ok(result) => {
                 self.invalidate_diff_cache();
@@ -4320,16 +4422,63 @@ impl ToolRegistry {
             .map(ExclusionReason::as_str);
         let offset = args.offset.unwrap_or(0).min(total_bytes as usize);
         let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT);
+
+        // F03: dedup against the last receipt for this (path, offset, end)
+        // window. Mirror the pattern used by `read_slice_last_receipt_diff`:
+        // if the full-file hash matches what we already returned for the same
+        // window in a prior call, emit a stub instead of re-serializing
+        // identical bytes.
+        let content_sha256 = match sha256_file(&path) {
+            Ok(hash) => hash,
+            Err(err) => return tool_error(call, err),
+        };
+        let projected_end = offset.saturating_add(limit).min(total_bytes as usize);
+        if let Some(store) = self.state_store.as_deref() {
+            let rel_str = rel.to_string_lossy();
+            if let Ok(snapshots) = store.read_snapshots_for_path(rel_str.as_ref()) {
+                let prior = snapshots
+                    .iter()
+                    .filter(|snap| {
+                        snap.start_byte == offset as u64
+                            && snap.end_byte == projected_end as u64
+                            && snap.tool_name == "read_file"
+                    })
+                    .filter(|snap| snap.content_sha256.as_deref() == Some(content_sha256.as_str()))
+                    .max_by_key(|snap| snap.created_unix_millis);
+                if let Some(snap) = prior {
+                    return make_result(
+                        call,
+                        ToolStatus::Success,
+                        json!({
+                            "tool": "read_file",
+                            "path": rel_str,
+                            "offset": offset,
+                            "bytes_returned": 0,
+                            "total_bytes": total_bytes,
+                            "sha256": &content_sha256,
+                            "unchanged": true,
+                            "receipt_stub": true,
+                            "dedup": true,
+                            "same_as_call_id": snap.call_id,
+                            "same_as_tool_name": snap.tool_name,
+                            "original_output_sha256": snap.stable_output_sha256,
+                            "original_content_sha256": snap.content_sha256,
+                            "original_model_output_bytes": snap.model_output_bytes,
+                            "truncated": false,
+                        }),
+                        ToolCostHint::default(),
+                        Some(content_sha256.clone()),
+                    );
+                }
+            }
+        }
+
         let bytes = match read_range(&path, offset as u64, limit) {
             Ok(bytes) => bytes,
             Err(err) => return tool_error(call, err),
         };
         let end = offset.saturating_add(bytes.len());
         let content = String::from_utf8_lossy(&bytes).to_string();
-        let content_sha256 = match sha256_file(&path) {
-            Ok(hash) => hash,
-            Err(err) => return tool_error(call, err),
-        };
         let cost = ToolCostHint {
             bytes_read: total_bytes,
             output_bytes: content.len() as u64,
@@ -4647,6 +4796,23 @@ impl ToolRegistry {
         let mut operations = Vec::new();
 
         for (index, patch) in args.patches.iter().enumerate() {
+            if let Err(err) =
+                safety::assess_write_path(&patch.path, &self.root, &self.shell_sandbox)
+            {
+                return make_result(
+                    call,
+                    ToolStatus::Denied,
+                    json!({
+                        "error": err.message(),
+                        "path": patch.path,
+                        "reason": err.code(),
+                        "permission_denied": true,
+                        "policy_denied": true,
+                    }),
+                    ToolCostHint::default(),
+                    None,
+                );
+            }
             if patch.search.is_empty() {
                 return make_result(
                     call,
@@ -4676,12 +4842,15 @@ impl ToolRegistry {
                 }
             };
             let rel = self.relative(&path).to_string_lossy().replace('\\', "/");
-            if is_secret_path(Path::new(&rel)) {
+            if is_secret_path(Path::new(&rel))
+                || safety::path_targets_protected_metadata(&path, &self.root, &self.shell_sandbox)
+                    .is_some()
+            {
                 return make_result(
                     call,
                     ToolStatus::Denied,
                     json!({
-                        "error": "refusing to patch a likely secret file",
+                        "error": "refusing to patch a likely secret or protected metadata file",
                         "path": rel,
                         "permission_denied": true,
                         "policy_denied": true,
@@ -5018,16 +5187,34 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
+        if let Err(err) = safety::assess_write_path(&args.path, &self.root, &self.shell_sandbox) {
+            return make_result(
+                call,
+                ToolStatus::Denied,
+                json!({
+                    "error": err.message(),
+                    "path": args.path,
+                    "reason": err.code(),
+                    "permission_denied": true,
+                    "policy_denied": true,
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
         let path = match self.resolve_for_write(&args.path) {
             Ok(path) => path,
             Err(err) => return tool_error(call, err),
         };
         let rel = self.relative(&path);
-        if is_secret_path(&rel) {
+        if is_secret_path(&rel)
+            || safety::path_targets_protected_metadata(&path, &self.root, &self.shell_sandbox)
+                .is_some()
+        {
             return make_result(
                 call,
                 ToolStatus::Denied,
-                json!({ "error": "refusing to write a likely secret file" }),
+                json!({ "error": "refusing to write a likely secret or protected metadata file" }),
                 ToolCostHint::default(),
                 None,
             );
@@ -5171,6 +5358,27 @@ impl ToolRegistry {
             &self.shell_sandbox.sensitive_path_patterns,
         ) {
             let reason = format!("shell command references sensitive path pattern {pattern:?}");
+            self.audit_shell(
+                call,
+                &args,
+                &workdir,
+                &analysis,
+                shell_sandbox_status_metadata(&self.shell_sandbox, "denied"),
+                timeout_ms,
+                output_cap,
+                "denied",
+                Some(&reason),
+                None,
+                &[],
+                &[],
+            );
+            return shell_policy_denied(call, &analysis, reason);
+        }
+        if let Some(name) = shell_command_writes_protected_metadata(
+            &args.command,
+            &self.shell_sandbox.protected_metadata_names,
+        ) {
+            let reason = format!("shell command writes protected metadata directory {name:?}");
             self.audit_shell(
                 call,
                 &args,
@@ -5736,7 +5944,7 @@ impl ToolRegistry {
         let retrieved_at_unix_ms = unix_timestamp_millis(SystemTime::now());
         let source_urls = extract_http_urls(&result);
         let redacted = self.redactor.redact(&result);
-        let (quote, output_truncated) = truncate_to_bytes(&redacted.text, output_byte_cap);
+        let (quote, output_truncated) = truncate_middle_bytes(&redacted.text, output_byte_cap);
         let quote_sha256 = sha256_hex(quote.as_bytes());
         let stable_output_sha256 = web_stable_output_sha256(
             "websearch",
@@ -5917,7 +6125,7 @@ impl ToolRegistry {
                 let retrieved_at_unix_ms = unix_timestamp_millis(SystemTime::now());
                 let redacted = self.redactor.redact(&rendered);
                 let (content, output_truncated) =
-                    truncate_to_bytes(&redacted.text, output_byte_cap);
+                    truncate_middle_bytes(&redacted.text, output_byte_cap);
                 let content_sha256 = sha256_hex(&bytes);
                 let quote_sha256 = sha256_hex(content.as_bytes());
                 let request_sha256 =
@@ -6688,7 +6896,7 @@ fn enforce_web_quote_limit(mut result: ToolResult) -> ToolResult {
         .get("quote_truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let (quote, limit_truncated) = truncate_to_bytes(&text, limit);
+    let (quote, limit_truncated) = truncate_middle_bytes(&text, limit);
     let quote_truncated = was_truncated || limit_truncated;
     let quote_bytes = quote.len();
     let quote_sha256 = sha256_hex(quote.as_bytes());
@@ -6799,7 +7007,7 @@ impl ToolOutputStore {
             return result;
         }
 
-        let (preview, _) = truncate_to_bytes(&model_output, self.preview_bytes);
+        let (preview, _) = truncate_middle_bytes(&model_output, self.preview_bytes);
         let ToolResult {
             call_id,
             tool_name,
@@ -7318,10 +7526,13 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
         .iter()
         .any(|segment| is_network_shell_segment(segment))
     {
+        let target = extract_shell_network_host(&segments)
+            .map(|host| format!("shell:{first}:{host}"))
+            .unwrap_or_else(|| format!("shell:{first}:*"));
         ShellPermissionAnalysis {
             capability: PermissionCapability::Network,
             risk: PermissionRisk::High,
-            rule_target: format!("shell:{first}:*"),
+            rule_target: target,
             network: true,
             destructive: false,
             parser_backed,
@@ -8162,6 +8373,52 @@ fn is_network_shell_segment(segment: &str) -> bool {
             | "yarn install"
             | "bun install"
     )
+}
+
+fn extract_shell_network_host(segments: &[String]) -> Option<String> {
+    for segment in segments {
+        for token in tokenize_shell_segment(segment) {
+            if let Some(host) = host_from_network_token(dequote_token(&token)) {
+                return Some(host);
+            }
+        }
+    }
+    None
+}
+
+fn host_from_network_token(token: &str) -> Option<String> {
+    let token = token.trim();
+    if token.is_empty() || token.starts_with('-') {
+        return None;
+    }
+    if let Ok(url) = Url::parse(token)
+        && matches!(url.scheme(), "http" | "https" | "ssh" | "git")
+    {
+        return url.host_str().map(normalize_permission_host);
+    }
+    if let Some(rest) = token.strip_prefix("git@")
+        && let Some((host, _path)) = rest.split_once(':')
+    {
+        return Some(normalize_permission_host(host));
+    }
+    if let Some((host, _path)) = token.split_once(':')
+        && !host.is_empty()
+        && host.contains('.')
+        && !host.contains('/')
+    {
+        return Some(normalize_permission_host(host));
+    }
+    token
+        .contains('.')
+        .then(|| token.split('/').next().unwrap_or(token))
+        .filter(|host| !host.is_empty() && !host.contains('@'))
+        .map(normalize_permission_host)
+}
+
+fn normalize_permission_host(host: &str) -> String {
+    host.trim_matches(|ch| matches!(ch, '[' | ']'))
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
 fn is_compiler_shell_segment(segment: &str) -> bool {
@@ -11392,6 +11649,9 @@ fn prepare_shell_sandbox_plan_with_probe(
             config,
         ));
     }
+    if config.mode == ShellSandboxMode::External {
+        return Ok(ShellSandboxPlan::external(command, config));
+    }
 
     let required = config.mode == ShellSandboxMode::Required;
     // The sandbox-level network posture has THREE distinct states:
@@ -11552,7 +11812,18 @@ fn macos_shell_sandbox_profile(
     for path in write_roots {
         let escaped = sandbox_profile_string(&path.display().to_string());
         profile.push_str(&format!("(allow file-read* (subpath {escaped}))\n"));
-        profile.push_str(&format!("(allow file-write* (subpath {escaped}))\n"));
+        if config.protected_metadata_names.is_empty() {
+            profile.push_str(&format!("(allow file-write* (subpath {escaped}))\n"));
+        } else {
+            profile.push_str(&format!(
+                "(allow file-write* (require-all (subpath {escaped})"
+            ));
+            for name in &config.protected_metadata_names {
+                let protected = sandbox_profile_string(&path.join(name).display().to_string());
+                profile.push_str(&format!(" (require-not (subpath {protected}))"));
+            }
+            profile.push_str("))\n");
+        }
     }
     // Sensitive paths get an EXPLICIT deny on top of the default deny so
     // even if a future allow rule widens reads, these subpaths stay
@@ -11752,6 +12023,77 @@ fn shell_command_references_sensitive_path(command: &str, patterns: &[String]) -
         }
     }
     None
+}
+
+fn shell_command_references_protected_metadata(
+    command: &str,
+    protected_names: &[String],
+) -> Option<String> {
+    if protected_names.is_empty() {
+        return None;
+    }
+    let tokens = tokenize_shell_segment(command);
+    for raw in &tokens {
+        let normalized = dequote_token(raw).replace('\\', "/");
+        for part in normalized.split('/') {
+            if protected_names.iter().any(|name| name == part) {
+                return Some(part.to_string());
+            }
+        }
+    }
+    let normalized_command = command.replace('\\', "/");
+    for name in protected_names {
+        if normalized_command
+            .split_whitespace()
+            .any(|token| token.split('/').any(|part| part.trim_matches('"') == name))
+        {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+fn shell_command_writes_protected_metadata(
+    command: &str,
+    protected_names: &[String],
+) -> Option<String> {
+    let name = shell_command_references_protected_metadata(command, protected_names)?;
+    let parsed = parse_shell_command(command);
+    let raw_segments = parsed
+        .as_ref()
+        .map(|parsed| parsed.segments.clone())
+        .filter(|segments| !segments.is_empty())
+        .unwrap_or_else(|| shell_segments(command));
+    let segments = expand_wrapper_segments(raw_segments);
+    if segments
+        .iter()
+        .any(|segment| shell_segment_writes_filesystem(segment))
+    {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn shell_segment_writes_filesystem(segment: &str) -> bool {
+    if is_destructive_shell_segment(segment) {
+        return true;
+    }
+    let tokens = tokenize_shell_segment(segment)
+        .into_iter()
+        .map(|token| dequote_token(&token).to_string())
+        .collect::<Vec<_>>();
+    let first = tokens.first().map(String::as_str).unwrap_or("");
+    if matches!(
+        first,
+        "cp" | "install" | "ln" | "mkdir" | "mktemp" | "rsync" | "tee" | "touch"
+    ) {
+        return true;
+    }
+    first == "sed"
+        && tokens
+            .iter()
+            .any(|token| token == "-i" || token.starts_with("-i."))
 }
 
 /// Normalises a path-like token for sensitive-path matching:
@@ -12685,17 +13027,6 @@ fn patch_match_contexts(content: &str, search: &str, max_matches: usize) -> Vec<
         .collect()
 }
 
-fn truncate_to_bytes(value: &str, cap: usize) -> (String, bool) {
-    if value.len() <= cap {
-        return (value.to_string(), false);
-    }
-    let mut end = cap;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    (value[..end].to_string(), true)
-}
-
 pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     let digest = Sha256::digest(bytes.as_ref());
     let mut output = String::with_capacity(digest.len() * 2);
@@ -12716,6 +13047,7 @@ fn mcp_tool_spec(tool: ExternalMcpTool) -> ToolSpec {
         parameters: tool.parameters,
         capability: PermissionCapability::Mcp,
     }
+    .with_compacted_parameters()
 }
 
 fn mcp_list_resources_spec() -> ToolSpec {

@@ -663,10 +663,12 @@ async fn run_agent_with_config(
             | AgentEvent::TaskStateUpdated { .. }
             | AgentEvent::McpStatusUpdated { .. }
             | AgentEvent::McpElicitationRequested { .. }
+            | AgentEvent::RequestUserInputRequested { .. }
             | AgentEvent::ContextCompacted { .. }
             | AgentEvent::SubagentStarted { .. }
             | AgentEvent::SubagentCompleted { .. }
-            | AgentEvent::SubagentFailed { .. } => {}
+            | AgentEvent::SubagentFailed { .. }
+            | AgentEvent::AiReviewerTripped { .. } => {}
             AgentEvent::JobUpdated { .. } | AgentEvent::JobNotification { .. } => {}
         }
     }

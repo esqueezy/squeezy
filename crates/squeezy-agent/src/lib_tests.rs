@@ -1120,6 +1120,286 @@ async fn asks_for_edit_permission_before_write_tool() {
 }
 
 #[tokio::test]
+async fn session_approval_installs_in_memory_rule_without_persisting() {
+    let root = temp_workspace("agent_session_approval");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_1".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({"path": "sample.txt", "content": "hello"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            edit: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("write file".to_string(), CancellationToken::new());
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ApprovalRequested { decision_tx, .. } = event {
+            decision_tx
+                .send(ToolApprovalDecision::AllowSession)
+                .expect("send decision");
+        }
+    }
+
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "hello"
+    );
+    assert!(
+        !root.join("squeezy.toml").exists(),
+        "session approvals must not persist to project settings"
+    );
+    let session_rules = agent.session_rules_snapshot();
+    assert_eq!(session_rules.len(), 1);
+    assert_eq!(session_rules[0].source, PermissionRuleSource::Session);
+    assert_eq!(session_rules[0].action, PermissionAction::Allow);
+    assert_eq!(session_rules[0].target, "path:sample.txt");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn ai_reviewer_allows_allowlisted_read_without_user_prompt() {
+    let root = temp_workspace("agent_ai_reviewer_allow");
+    fs::write(root.join("README.md"), "hello\n").expect("write readme");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "README.md"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                r#"{"action":"allow","reason":"read is in scope"}"#.to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("reviewer".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            read: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.permissions.ai_reviewer.enabled = true;
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
+    let mut approvals_seen = 0usize;
+    let mut read_result = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ApprovalRequested { decision_tx, .. } => {
+                approvals_seen += 1;
+                let _ = decision_tx.send(ToolApprovalDecision::Denied);
+            }
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "read_1" => {
+                read_result = Some(result);
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(approvals_seen, 0);
+    assert_eq!(
+        read_result.expect("read result").status,
+        ToolStatus::Success
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        matches!(&requests[1].input[0], LlmInputItem::UserText(text) if text.contains("Approval policy") && text.contains("\"tool_name\":\"read_file\"")),
+        "reviewer prompt should carry policy and request: {:?}",
+        requests[1].input
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn ai_reviewer_denies_without_user_prompt() {
+    let root = temp_workspace("agent_ai_reviewer_deny");
+    fs::write(root.join("README.md"), "hello\n").expect("write readme");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "README.md"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                r#"{"action":"deny","reason":"too broad"}"#.to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("reviewer".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            read: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.permissions.ai_reviewer.enabled = true;
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("read everything".to_string(), CancellationToken::new());
+    let mut approvals_seen = 0usize;
+    let mut read_result = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ApprovalRequested { decision_tx, .. } => {
+                approvals_seen += 1;
+                let _ = decision_tx.send(ToolApprovalDecision::Denied);
+            }
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "read_1" => {
+                read_result = Some(result);
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(approvals_seen, 0);
+    let read_result = read_result.expect("read result");
+    assert_eq!(read_result.status, ToolStatus::Denied);
+    assert!(
+        read_result.content["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("AI reviewer denied")),
+        "{:?}",
+        read_result.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn ai_reviewer_allow_for_non_allowlisted_edit_escalates_to_user() {
+    let root = temp_workspace("agent_ai_reviewer_edit_escalates");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "write_1".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({"path": "sample.txt", "content": "hello"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                r#"{"action":"allow","reason":"looks okay"}"#.to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("reviewer".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            edit: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.permissions.ai_reviewer.enabled = true;
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("write file".to_string(), CancellationToken::new());
+    let mut approvals_seen = 0usize;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ApprovalRequested { decision_tx, .. } = event {
+            approvals_seen += 1;
+            decision_tx
+                .send(ToolApprovalDecision::Denied)
+                .expect("send decision");
+        }
+    }
+
+    assert_eq!(approvals_seen, 1);
+    assert!(!root.join("sample.txt").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn cancelling_turn_unblocks_pending_approval() {
     let root = temp_workspace("agent_cancel_approval");
     let provider = Arc::new(MockProvider::new(vec![vec![
@@ -1937,15 +2217,22 @@ fn advertised_tool_specs_are_mode_aware() {
 
 #[test]
 fn control_tools_are_advertised_in_build_and_plan_modes() {
-    let tools = core_control_tools(&SubagentConfig::default());
+    let tools = core_control_tools(&SubagentConfig::default(), SessionMode::Build);
+
+    let expected = vec![
+        DELEGATE_TOOL_NAME,
+        EXPLORE_TOOL_NAME,
+        DELEGATE_PLAN_TOOL_NAME,
+        DELEGATE_REVIEW_TOOL_NAME,
+    ];
 
     let build_specs = advertised_tool_specs(&tools, SessionMode::Build);
     let build_names = advertised_tool_names(&build_specs);
-    assert_eq!(build_names, vec![DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]);
+    assert_eq!(build_names, expected);
 
     let plan_specs = advertised_tool_specs(&tools, SessionMode::Plan);
     let plan_names = advertised_tool_names(&plan_specs);
-    assert_eq!(plan_names, vec![DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]);
+    assert_eq!(plan_names, expected);
 }
 
 #[test]
@@ -1954,7 +2241,7 @@ fn core_control_tools_filter_subagents_when_disabled() {
         enabled: false,
         ..SubagentConfig::default()
     };
-    let names: Vec<_> = core_control_tools(&subagents)
+    let names: Vec<_> = core_control_tools(&subagents, SessionMode::Build)
         .into_iter()
         .map(|tool| tool.spec.name)
         .collect();
@@ -1964,11 +2251,18 @@ fn core_control_tools_filter_subagents_when_disabled() {
         explore_enabled: false,
         ..SubagentConfig::default()
     };
-    let names: Vec<_> = core_control_tools(&explore_only_off)
+    let names: Vec<_> = core_control_tools(&explore_only_off, SessionMode::Build)
         .into_iter()
         .map(|tool| tool.spec.name)
         .collect();
-    assert_eq!(names, vec![DELEGATE_TOOL_NAME.to_string()]);
+    assert_eq!(
+        names,
+        vec![
+            DELEGATE_TOOL_NAME.to_string(),
+            DELEGATE_PLAN_TOOL_NAME.to_string(),
+            DELEGATE_REVIEW_TOOL_NAME.to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -2025,7 +2319,7 @@ fn warn_unknown_tool_schema_names_emits_warning_for_typo_and_skips_known() {
 
 #[test]
 fn lazy_request_tool_specs_keep_core_first_and_mcp_discoverable_by_default() {
-    let mut tools = core_control_tools(&SubagentConfig::default());
+    let mut tools = core_control_tools(&SubagentConfig::default(), SessionMode::Build);
     tools.extend([
         test_advertised_tool("grep", PermissionCapability::Search),
         test_advertised_tool("webfetch", PermissionCapability::Network),
@@ -2075,7 +2369,7 @@ fn request_tool_specs_skips_disabled_subagent_control_tools() {
         enabled: false,
         ..SubagentConfig::default()
     };
-    let mut tools = core_control_tools(&subagents);
+    let mut tools = core_control_tools(&subagents, SessionMode::Build);
     tools.push(test_advertised_tool("grep", PermissionCapability::Search));
     let config = ToolSchemaConfig::default();
 
@@ -2095,7 +2389,7 @@ fn request_tool_specs_skips_disabled_subagent_control_tools() {
         explore_enabled: false,
         ..SubagentConfig::default()
     };
-    let mut tools = core_control_tools(&explore_only);
+    let mut tools = core_control_tools(&explore_only, SessionMode::Build);
     tools.push(test_advertised_tool("grep", PermissionCapability::Search));
     let specs = request_tool_specs(&tools, SessionMode::Build, &config, &[]);
     let names = advertised_tool_names(&specs);
@@ -2125,7 +2419,8 @@ fn lazy_tools_index_lists_discoverable_tools_without_core_schemas() {
 #[test]
 fn registry_specs_carry_capability_aligned_with_permission_request() {
     let tools = ToolRegistry::new("/tmp").expect("registry");
-    for spec in tools.specs() {
+    let specs = tools.specs();
+    for spec in specs.iter() {
         let call = ToolCall {
             call_id: "probe".to_string(),
             name: spec.name.clone(),
@@ -2171,14 +2466,17 @@ async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy(
         cancel: CancellationToken::new(),
         approval_ids: Arc::new(AtomicU64::new(1)),
         session_rules: Arc::new(RwLock::new(Vec::new())),
+        ai_reviewer_state: Arc::new(Mutex::new(ai_reviewer::AiReviewerState::default())),
         session_mode: Arc::new(AtomicU8::new(SessionMode::Build.to_u8())),
         session_log: None,
+        conversation_state: None,
         task_state: Arc::new(tokio::sync::Mutex::new(None)),
         all_tool_specs: &advertised,
         loaded_tool_schemas: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         exploration_state: Arc::new(tokio::sync::Mutex::new(ExplorationTurnState::from_plan(
             None,
         ))),
+        subagents: SubagentRegistry::default(),
     };
 
     let approver = shell_ask_approver_for_context(&context);
@@ -2770,6 +3068,93 @@ fn compaction_strategy_default_is_extractive() {
 }
 
 #[test]
+fn subagent_registry_caps_concurrency() {
+    let registry = SubagentRegistry::default();
+    let cancel = CancellationToken::new();
+    let mut leases = Vec::new();
+    for slot in 0..SUBAGENT_MAX_CONCURRENT {
+        let lease = registry
+            .start(
+                roles::SubagentRole::Explorer,
+                cancel.child_token(),
+                SUBAGENT_MAX_CONCURRENT,
+                format!("slot {slot}"),
+            )
+            .expect("starting under the cap should succeed");
+        leases.push(lease);
+    }
+    let err = registry
+        .start(
+            roles::SubagentRole::Explorer,
+            cancel.child_token(),
+            SUBAGENT_MAX_CONCURRENT,
+            "overflow",
+        )
+        .expect_err("starting past the cap should fail");
+    assert!(
+        err.contains(&SUBAGENT_MAX_CONCURRENT.to_string()),
+        "cap error should mention the limit: {err}"
+    );
+    drop(leases.pop());
+    let lease = registry
+        .start(
+            roles::SubagentRole::Explorer,
+            cancel.child_token(),
+            SUBAGENT_MAX_CONCURRENT,
+            "after drop",
+        )
+        .expect("dropping a lease frees a slot");
+    drop(lease);
+    drop(leases);
+}
+
+#[test]
+fn core_control_tools_includes_new_delegate_planner_reviewer() {
+    let config = SubagentConfig {
+        enabled: true,
+        explore_enabled: true,
+        ..SubagentConfig::default()
+    };
+    let names: Vec<_> = core_control_tools(&config, SessionMode::Build)
+        .into_iter()
+        .map(|tool| tool.spec.name)
+        .collect();
+    assert!(names.iter().any(|n| n == DELEGATE_TOOL_NAME));
+    assert!(names.iter().any(|n| n == EXPLORE_TOOL_NAME));
+    assert!(names.iter().any(|n| n == DELEGATE_PLAN_TOOL_NAME));
+    assert!(names.iter().any(|n| n == DELEGATE_REVIEW_TOOL_NAME));
+}
+
+#[test]
+fn core_control_tools_drops_all_when_subagents_disabled() {
+    let config = SubagentConfig {
+        enabled: false,
+        ..SubagentConfig::default()
+    };
+    assert!(core_control_tools(&config, SessionMode::Build).is_empty());
+}
+
+#[test]
+fn subagent_kind_role_does_not_overlay_delegate() {
+    // Delegate's broader research tool set is intentionally not constrained
+    // by the Worker role (which is roadmap). Other kinds must map to an
+    // active role overlay.
+    assert!(SubagentKind::Delegate.role().is_none());
+    assert_eq!(
+        SubagentKind::Explore.role(),
+        Some(roles::SubagentRole::Explorer)
+    );
+    assert_eq!(
+        SubagentKind::Plan.role(),
+        Some(roles::SubagentRole::Planner)
+    );
+    assert_eq!(
+        SubagentKind::Review.role(),
+        Some(roles::SubagentRole::Reviewer)
+    );
+}
+
+#[test]
 fn compaction_strategy_parse_round_trip() {
     for variant in [
         CompactionStrategy::Extractive,
@@ -2962,5 +3347,225 @@ async fn compact_with_strategy_uses_extractive_when_no_model_configured() {
         report
             .summary
             .contains("Squeezy compacted conversation context")
+    );
+}
+
+#[test]
+fn parse_subagent_request_requires_goal_for_plan_and_allows_empty_review() {
+    let plan_call = ToolCall {
+        call_id: "c1".to_string(),
+        name: DELEGATE_PLAN_TOOL_NAME.to_string(),
+        arguments: json!({}),
+    };
+    let err = parse_subagent_request(&plan_call, SubagentKind::Plan)
+        .expect_err("plan without goal must error");
+    assert!(err.contains("goal"), "error should mention goal: {err}");
+
+    let plan_call = ToolCall {
+        call_id: "c2".to_string(),
+        name: DELEGATE_PLAN_TOOL_NAME.to_string(),
+        arguments: json!({ "goal": "add tracing to ingest pipeline" }),
+    };
+    let request = parse_subagent_request(&plan_call, SubagentKind::Plan).expect("plan args valid");
+    assert!(request.prompt.contains("ingest"));
+
+    let review_call = ToolCall {
+        call_id: "c3".to_string(),
+        name: DELEGATE_REVIEW_TOOL_NAME.to_string(),
+        arguments: json!({}),
+    };
+    let request =
+        parse_subagent_request(&review_call, SubagentKind::Review).expect("review accepts empty");
+    assert!(
+        !request.prompt.is_empty(),
+        "review should synthesize a default prompt"
+    );
+}
+
+#[tokio::test]
+async fn plan_mode_request_user_input_pauses_turn_and_resumes_with_choice() {
+    use super::{REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputResponse};
+
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "ask_1".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                arguments: json!({
+                    "question": "Which approach?",
+                    "choices": [
+                        {"label": "A", "value": "approach-a"},
+                        {"label": "B", "value": "approach-b"}
+                    ]
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        session_mode: SessionMode::Plan,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("plan it".to_string(), CancellationToken::new());
+    let mut completed = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::RequestUserInputRequested {
+                request,
+                response_tx,
+                ..
+            } => {
+                assert_eq!(request.question, "Which approach?");
+                assert_eq!(request.choices.len(), 2);
+                let _ = response_tx.send(RequestUserInputResponse::choice("approach-b"));
+            }
+            AgentEvent::Completed { .. } => {
+                completed = true;
+                break;
+            }
+            AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(completed, "turn must complete after answer is provided");
+    let requests = provider.requests();
+    assert!(
+        requests.len() >= 2,
+        "expected a follow-up round once the user answered; got {} request(s)",
+        requests.len()
+    );
+}
+
+#[tokio::test]
+async fn build_mode_refuses_request_user_input_call() {
+    use super::REQUEST_USER_INPUT_TOOL_NAME;
+
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "ask_1".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                arguments: json!({ "question": "ok?" }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("noted".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        session_mode: SessionMode::Build,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("just do it".to_string(), CancellationToken::new());
+    let mut saw_request_user_input = false;
+    let mut saw_refusal_result = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::RequestUserInputRequested { .. } => saw_request_user_input = true,
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "ask_1" => {
+                assert_eq!(result.status, squeezy_tools::ToolStatus::Denied);
+                let content = serde_json::to_string(&result.content).unwrap();
+                assert!(
+                    content.contains("Plan mode"),
+                    "refusal payload should explain the mode gating: {content}",
+                );
+                saw_refusal_result = true;
+            }
+            AgentEvent::Completed { .. } => break,
+            AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(
+        !saw_request_user_input,
+        "Build mode must not surface a RequestUserInputRequested event"
+    );
+    assert!(
+        saw_refusal_result,
+        "expected a ToolCallCompleted with the mode-refusal payload"
+    );
+}
+
+#[tokio::test]
+async fn plan_mode_instructions_are_appended_to_request() {
+    use super::plan_mode::PLAN_MODE_INSTRUCTIONS;
+
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_plan".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let config = AppConfig {
+        session_mode: SessionMode::Plan,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("draft a refactor".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "expected exactly one provider request");
+    let instructions = &requests[0].instructions;
+    assert!(
+        instructions.contains(PLAN_MODE_INSTRUCTIONS),
+        "Plan-mode instructions missing from request: {instructions}"
+    );
+}
+
+#[tokio::test]
+async fn build_mode_instructions_omit_plan_overlay() {
+    use super::plan_mode::PLAN_MODE_INSTRUCTIONS;
+
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_build".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let config = AppConfig {
+        session_mode: SessionMode::Build,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("ship a fix".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "expected exactly one provider request");
+    let instructions = &requests[0].instructions;
+    assert!(
+        !instructions.contains(PLAN_MODE_INSTRUCTIONS),
+        "Build-mode request must not include Plan overlay: {instructions}"
     );
 }

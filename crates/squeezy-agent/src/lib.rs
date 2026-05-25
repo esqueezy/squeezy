@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    env, fs, io,
+    env, fs,
     panic::AssertUnwindSafe,
     path::PathBuf,
     pin::Pin,
@@ -13,7 +13,7 @@ use std::{
 
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentSource, ContextAttachmentStatus,
@@ -26,7 +26,6 @@ use squeezy_core::{
     SessionMode, SqueezyError, StreamRedactor, SubagentConfig, TaskStateSnapshot, TaskStateStatus,
     ToolSchemaConfig, TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
     context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
-    escape_toml_basic_string,
 };
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
@@ -58,11 +57,17 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod ai_reviewer;
 mod cancel;
 mod exploration_compiler;
+mod permission_persist;
+mod plan_mode;
+mod roles;
 
 use cancel::{CancelErr, OrCancelExt};
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
+use permission_persist::persist_permission_rule;
+use roles::{RoleModelPolicy, SubagentRole, role_config};
 
 const MAX_TOOL_ROUNDS: usize = 32;
 const MAX_CONTROL_ONLY_TOOL_ROUNDS: usize = 2;
@@ -72,11 +77,19 @@ const TASK_STATE_TOOL_NAME: &str = "update_task_state";
 const LOAD_TOOL_SCHEMA_TOOL_NAME: &str = "load_tool_schema";
 const DELEGATE_TOOL_NAME: &str = "delegate";
 const EXPLORE_TOOL_NAME: &str = "explore";
+const DELEGATE_PLAN_TOOL_NAME: &str = "delegate_plan";
+const DELEGATE_REVIEW_TOOL_NAME: &str = "delegate_review";
+const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
 const JOB_SUMMARY_MAX_CHARS: usize = 320;
 const SUBAGENT_SUMMARY_CHARS_PER_TOKEN: usize = 4;
+/// Maximum number of subagents that may be active at once for a single
+/// parent Agent. The registry rejects further `start()` calls until an
+/// in-flight subagent finishes (lease drops). Keeps fanout flat and
+/// predictable rather than letting a model spawn an unbounded swarm.
+const SUBAGENT_MAX_CONCURRENT: usize = 4;
 // Compaction summary truncation budgets. These are character (not byte)
 // caps because they pass through `compact_text` → `truncate_chars`. They
 // stay collocated so a future audit can read the total summary growth
@@ -206,7 +219,7 @@ impl ReplayRuntime {
             .get("hash")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let actual = replay_hash(request);
+        let actual = replay_hash(&replay_request_view(request));
         if self.strict_requests && expected != actual {
             return Err(SqueezyError::Agent(format!(
                 "replay model request diverged: expected {expected}, got {actual}"
@@ -475,6 +488,7 @@ pub struct ContextCompactionReport {
 }
 
 pub type JobId = u64;
+pub type SubagentId = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -547,6 +561,7 @@ pub struct JobSnapshot {
     pub turn_id: Option<TurnId>,
     pub tool_name: Option<String>,
     pub call_id: Option<String>,
+    pub subagent_id: Option<SubagentId>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub ended_at_ms: Option<u64>,
@@ -653,6 +668,7 @@ impl JobRegistry {
             turn_id,
             tool_name,
             call_id,
+            subagent_id: None,
             created_at_ms: now,
             updated_at_ms: now,
             ended_at_ms: None,
@@ -862,6 +878,103 @@ impl JobRegistry {
     }
 }
 
+#[derive(Clone, Debug)]
+struct SubagentRegistry {
+    state: Arc<StdMutex<BTreeMap<SubagentId, SubagentMetadata>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl Default for SubagentRegistry {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(StdMutex::new(BTreeMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+}
+
+// `id`, `role`, `started_at_ms`, and `last_status_message` are recorded so
+// future code (UI surfaces, telemetry, /subagents introspection) can read
+// the live registry without a second source of truth. They're written by
+// `start` / `update_status` and read via `snapshot` from tests today.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct SubagentMetadata {
+    id: SubagentId,
+    role: SubagentRole,
+    started_at_ms: u64,
+    cancel: CancellationToken,
+    last_status_message: Option<String>,
+}
+
+#[derive(Debug)]
+struct SubagentLease {
+    id: SubagentId,
+    registry: SubagentRegistry,
+}
+
+impl Drop for SubagentLease {
+    fn drop(&mut self) {
+        self.registry.finish(self.id);
+    }
+}
+
+impl SubagentRegistry {
+    fn start(
+        &self,
+        role: SubagentRole,
+        cancel: CancellationToken,
+        max_concurrent: usize,
+        status: impl Into<String>,
+    ) -> Result<SubagentLease, String> {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let active = state
+            .values()
+            .filter(|metadata| !metadata.cancel.is_cancelled())
+            .count();
+        if active >= max_concurrent.max(1) {
+            return Err(format!(
+                "subagent concurrency limit reached ({})",
+                max_concurrent.max(1)
+            ));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        state.insert(
+            id,
+            SubagentMetadata {
+                id,
+                role,
+                started_at_ms: unix_timestamp_millis(),
+                cancel,
+                last_status_message: Some(status.into()),
+            },
+        );
+        Ok(SubagentLease {
+            id,
+            registry: self.clone(),
+        })
+    }
+
+    #[allow(dead_code)]
+    fn update_status(&self, id: SubagentId, status: impl Into<String>) {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(metadata) = state.get_mut(&id) {
+            metadata.last_status_message = Some(status.into());
+        }
+    }
+
+    fn finish(&self, id: SubagentId) {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        state.remove(&id);
+    }
+
+    #[allow(dead_code)]
+    fn snapshot(&self) -> Vec<SubagentMetadata> {
+        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        state.values().cloned().collect()
+    }
+}
+
 fn push_job_notification(state: &mut JobRegistryState, snapshot: &JobSnapshot) {
     let summary = snapshot
         .result_summary
@@ -936,9 +1049,11 @@ pub struct Agent {
     session_metrics: Arc<Mutex<SessionMetrics>>,
     session_log: Option<SessionHandle>,
     conversation_state: Arc<Mutex<ConversationState>>,
+    ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     next_turn_id: Arc<AtomicU64>,
     next_approval_id: Arc<AtomicU64>,
     next_attachment_id: Arc<AtomicU64>,
+    subagents: SubagentRegistry,
     /// In-memory permission rules added via "Allow user/project rule" during
     /// the current process. Persisted to disk on a best-effort basis; this
     /// vector also makes the rule take effect immediately for subsequent
@@ -1281,9 +1396,11 @@ impl Agent {
             session_metrics,
             session_log,
             conversation_state: Arc::new(Mutex::new(conversation_state)),
+            ai_reviewer_state: Arc::new(StdMutex::new(ai_reviewer::AiReviewerState::default())),
             next_turn_id: Arc::new(AtomicU64::new(1)),
             next_approval_id: Arc::new(AtomicU64::new(1)),
             next_attachment_id: Arc::new(AtomicU64::new(next_attachment_id)),
+            subagents: SubagentRegistry::default(),
             session_rules: Arc::new(RwLock::new(Vec::new())),
             session_mode: Arc::new(AtomicU8::new(initial_session_mode.to_u8())),
             loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
@@ -1427,6 +1544,10 @@ impl Agent {
             .map(|handle| handle.session_id().to_string())
     }
 
+    fn session_prompt_cache_key(&self) -> Option<String> {
+        self.session_id().map(|id| format!("squeezy::{id}"))
+    }
+
     pub async fn session_accounting_snapshot(&self) -> SessionAccountingSnapshot {
         let state = self.conversation_state.lock().await.clone();
         let mode = load_session_mode(&self.session_mode);
@@ -1504,8 +1625,8 @@ impl Agent {
             native_text_verbosity,
         );
         let request_instructions = self.redactor.redact(&raw_instructions).text;
-        let mut all_tool_specs = core_control_tools(&self.config.subagents);
-        all_tool_specs.extend(self.tools.specs().into_iter().map(advertised_tool));
+        let mut all_tool_specs = core_control_tools(&self.config.subagents, mode);
+        all_tool_specs.extend(self.tools.specs().iter().cloned().map(advertised_tool));
         LlmRequest {
             model: self.config.model.clone(),
             instructions: instructions_with_tool_index(
@@ -1523,6 +1644,7 @@ impl Agent {
             } else {
                 None
             },
+            cache_key: self.session_prompt_cache_key(),
             tools: request_tool_specs(
                 &all_tool_specs,
                 mode,
@@ -2083,10 +2205,12 @@ impl Agent {
         let session_mode = self.session_mode.clone();
         let session_log = self.session_log.clone();
         let conversation_state = self.conversation_state.clone();
+        let ai_reviewer_state = self.ai_reviewer_state.clone();
         let store = self.store.clone();
         let task_state = Arc::new(Mutex::new(None));
         let loaded_tool_schemas = self.loaded_tool_schemas.clone();
         let replay = self.replay.clone();
+        let subagents = self.subagents.clone();
 
         let turn_done = Arc::new(Notify::new());
         let panic_tx = tx.clone();
@@ -2143,7 +2267,9 @@ impl Agent {
                             cancel: cancel.clone(),
                             approval_ids: approval_ids.clone(),
                             session_rules: session_rules.clone(),
+                            ai_reviewer_state: ai_reviewer_state.clone(),
                             loaded_tool_schemas: loaded_tool_schemas.clone(),
+                            subagents: subagents.clone(),
                         },
                     )
                     .await;
@@ -2175,8 +2301,9 @@ impl Agent {
                     .await;
                     return;
                 }
-                let mut all_tool_specs = core_control_tools(&config.subagents);
-                all_tool_specs.extend(tools.specs().into_iter().map(advertised_tool));
+                let mut all_tool_specs =
+                    core_control_tools(&config.subagents, load_session_mode(&session_mode));
+                all_tool_specs.extend(tools.specs().iter().cloned().map(advertised_tool));
                 warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
                 refresh_mcp_tools_in_background(
                     tools.clone(),
@@ -2202,6 +2329,7 @@ impl Agent {
                     approval_ids,
                     seed_redactions: redacted_input.redactions,
                     session_rules,
+                    ai_reviewer_state,
                     session_mode,
                     session_log,
                     conversation_state,
@@ -2209,6 +2337,7 @@ impl Agent {
                     task_state: task_state.clone(),
                     loaded_tool_schemas,
                     replay,
+                    subagents,
                 }
                 .run(task_title.clone())
                 .await;
@@ -2365,7 +2494,9 @@ struct LocalToolTurnDeps {
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
+    subagents: SubagentRegistry,
 }
 
 async fn complete_squeezy_help_turn(
@@ -2497,6 +2628,10 @@ async fn complete_squeezy_help_turn(
         metrics.clone(),
     ));
     session_metrics.lock().await.merge_turn(&metrics);
+    let context_estimate = {
+        let state = conversation_state.lock().await;
+        estimate_context(&state.conversation)
+    };
     let _ = tx
         .send(AgentEvent::Completed {
             turn_id,
@@ -2504,6 +2639,7 @@ async fn complete_squeezy_help_turn(
             response_id: None,
             cost,
             metrics,
+            context_estimate,
         })
         .await;
 }
@@ -2531,7 +2667,9 @@ async fn complete_local_tool_turn(
         cancel,
         approval_ids,
         session_rules,
+        ai_reviewer_state,
         loaded_tool_schemas,
+        subagents,
     } = deps;
     let user_item = LlmInputItem::UserText(task_title.clone());
     let user_transcript = TranscriptItem::user(task_title.clone());
@@ -2578,12 +2716,15 @@ async fn complete_local_tool_turn(
             cancel,
             approval_ids,
             session_rules,
+            ai_reviewer_state,
             session_mode: session_mode.clone(),
             session_log: session_log.clone(),
+            conversation_state: None,
             task_state: task_state.clone(),
             all_tool_specs: &all_tool_specs,
             loaded_tool_schemas,
             exploration_state,
+            subagents,
         },
         &mut broker,
     )
@@ -2685,6 +2826,10 @@ async fn complete_local_tool_turn(
         metrics.clone(),
     ));
     session_metrics.lock().await.merge_turn(&metrics);
+    let context_estimate = {
+        let state = conversation_state.lock().await;
+        estimate_context(&state.conversation)
+    };
     let _ = tx
         .send(AgentEvent::Completed {
             turn_id,
@@ -2692,6 +2837,7 @@ async fn complete_local_tool_turn(
             response_id: None,
             cost,
             metrics,
+            context_estimate,
         })
         .await;
 }
@@ -2823,6 +2969,7 @@ struct TurnRuntime {
     // session metric never undercounts user-side scrubbing.
     seed_redactions: u64,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     session_mode: Arc<AtomicU8>,
     session_log: Option<SessionHandle>,
     conversation_state: Arc<Mutex<ConversationState>>,
@@ -2830,6 +2977,7 @@ struct TurnRuntime {
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     replay: Option<Arc<ReplayRuntime>>,
+    subagents: SubagentRegistry,
 }
 
 fn request_response_verbosity(
@@ -3000,6 +3148,12 @@ fn instructions_with_response_verbosity(
 }
 
 impl TurnRuntime {
+    fn session_prompt_cache_key(&self) -> Option<String> {
+        self.session_log
+            .as_ref()
+            .map(|handle| format!("squeezy::{}", handle.session_id()))
+    }
+
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
         let task_title = input.clone();
         let activation = self.tools.activate_skills_for_input(&input)?;
@@ -3014,13 +3168,19 @@ impl TurnRuntime {
             self.config.tui.response_verbosity,
             native_text_verbosity,
         );
+        // Plan mode is enforced by tool-filtering elsewhere; the overlay
+        // here tells the model *why* its toolbox shrank and what the
+        // expected output contract (`<proposed_plan>`) looks like.
+        let active_mode = load_session_mode(&self.session_mode);
+        let mode_instructions =
+            plan_mode::instructions_for_mode(&verbosity_instructions, active_mode);
         let mut prior_state = self.conversation_state.lock().await.clone();
         // Pinned context must reach the model on every turn, not only
         // after a compaction has occurred. Inline it into the per-turn
         // instructions so a `/pin` is immediately visible to the model
         // even on sessions that never cross the compaction threshold.
         let raw_instructions = instructions_with_pinned_context(
-            &verbosity_instructions,
+            &mode_instructions,
             &prior_state.context_compaction.pinned,
         );
         let active_attachments = prior_state
@@ -3189,12 +3349,15 @@ impl TurnRuntime {
                         cancel: self.cancel.clone(),
                         approval_ids: self.approval_ids.clone(),
                         session_rules: self.session_rules.clone(),
+                        ai_reviewer_state: self.ai_reviewer_state.clone(),
                         session_mode: self.session_mode.clone(),
                         session_log: self.session_log.clone(),
+                        conversation_state: Some(self.conversation_state.clone()),
                         task_state: self.task_state.clone(),
                         all_tool_specs: &self.all_tool_specs,
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
                         exploration_state: exploration_state.clone(),
+                        subagents: self.subagents.clone(),
                     },
                     &mut broker,
                 )
@@ -3275,6 +3438,7 @@ impl TurnRuntime {
                 response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
                 reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
                 previous_response_id: previous_response_id.clone(),
+                cache_key: self.session_prompt_cache_key(),
                 tools: request_tool_specs(
                     &self.all_tool_specs,
                     active_mode,
@@ -3408,6 +3572,7 @@ impl TurnRuntime {
                     context_compaction: context_compaction.clone(),
                 })
                 .await;
+                let context_estimate = estimate_context(&conversation);
                 let _ = self
                     .tx
                     .send(AgentEvent::Completed {
@@ -3416,6 +3581,7 @@ impl TurnRuntime {
                         response_id: None,
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
+                        context_estimate,
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -3445,6 +3611,7 @@ impl TurnRuntime {
                     context_compaction: context_compaction.clone(),
                 })
                 .await;
+                let context_estimate = estimate_context(&conversation);
                 let _ = self
                     .tx
                     .send(AgentEvent::Completed {
@@ -3453,6 +3620,7 @@ impl TurnRuntime {
                         response_id,
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
+                        context_estimate,
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -3485,12 +3653,15 @@ impl TurnRuntime {
                         cancel: self.cancel.clone(),
                         approval_ids: self.approval_ids.clone(),
                         session_rules: self.session_rules.clone(),
+                        ai_reviewer_state: self.ai_reviewer_state.clone(),
                         session_mode: self.session_mode.clone(),
                         session_log: self.session_log.clone(),
+                        conversation_state: Some(self.conversation_state.clone()),
                         task_state: self.task_state.clone(),
                         all_tool_specs: &self.all_tool_specs,
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
                         exploration_state: exploration_state.clone(),
+                        subagents: self.subagents.clone(),
                     },
                     &mut broker,
                 )
@@ -3834,7 +4005,7 @@ impl TurnRuntime {
         self.record_replay(
             SessionReplayEventKind::ModelRequest,
             json!({
-                "hash": replay_hash(request),
+                "hash": replay_hash(&replay_request_view(request)),
                 "request": request,
             }),
         );
@@ -3935,6 +4106,8 @@ struct TurnPersistInput<'a> {
 enum SubagentKind {
     Delegate,
     Explore,
+    Plan,
+    Review,
 }
 
 impl SubagentKind {
@@ -3942,6 +4115,22 @@ impl SubagentKind {
         match self {
             Self::Delegate => "delegate",
             Self::Explore => "explore",
+            Self::Plan => "plan",
+            Self::Review => "review",
+        }
+    }
+
+    /// Role-catalog overlay for the subagent kind, when one applies.
+    ///
+    /// `Delegate` keeps its existing broad-research behavior — the Worker
+    /// role is roadmap, and mapping delegate to Explorer would strip its
+    /// access to `plan_patch` and skill discovery — so it returns `None`.
+    fn role(self) -> Option<SubagentRole> {
+        match self {
+            Self::Delegate => None,
+            Self::Explore => Some(SubagentRole::Explorer),
+            Self::Plan => Some(SubagentRole::Planner),
+            Self::Review => Some(SubagentRole::Reviewer),
         }
     }
 }
@@ -3979,9 +4168,12 @@ struct ToolExecutionContext<'a> {
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     session_mode: Arc<AtomicU8>,
     session_log: Option<SessionHandle>,
+    conversation_state: Option<Arc<Mutex<ConversationState>>>,
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
+    subagents: SubagentRegistry,
     all_tool_specs: &'a [AdvertisedTool],
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     exploration_state: Arc<Mutex<ExplorationTurnState>>,
@@ -4043,8 +4235,10 @@ struct PermissionDecisionContext {
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     session_mode: Arc<AtomicU8>,
     session_log: Option<SessionHandle>,
+    conversation_state: Option<Arc<Mutex<ConversationState>>>,
 }
 
 impl PermissionDecisionContext {
@@ -4059,8 +4253,10 @@ impl PermissionDecisionContext {
             cancel: context.cancel.clone(),
             approval_ids: context.approval_ids.clone(),
             session_rules: context.session_rules.clone(),
+            ai_reviewer_state: context.ai_reviewer_state.clone(),
             session_mode: context.session_mode.clone(),
             session_log: context.session_log.clone(),
+            conversation_state: context.conversation_state.clone(),
         }
     }
 }
@@ -4090,6 +4286,128 @@ async fn handle_task_state_call(context: &ToolExecutionContext<'_>, call: &ToolC
         ToolStatus::Success,
         json!({ "ok": true, "summary": snapshot.compact_summary() }),
     )
+}
+
+async fn handle_request_user_input_call(
+    context: &ToolExecutionContext<'_>,
+    call: &ToolCall,
+) -> ToolResult {
+    let active_mode = load_session_mode(&context.session_mode);
+    if active_mode != SessionMode::Plan {
+        return control_tool_result(
+            call,
+            ToolStatus::Denied,
+            json!({
+                "ok": false,
+                "status": "refused",
+                "mode": active_mode.as_str(),
+                "error": "request_user_input is only available in Plan mode"
+            }),
+        );
+    }
+
+    #[derive(Deserialize)]
+    struct Args {
+        question: String,
+        #[serde(default)]
+        choices: Vec<ArgChoice>,
+        #[serde(default)]
+        allow_freeform: bool,
+    }
+    #[derive(Deserialize)]
+    struct ArgChoice {
+        label: String,
+        value: String,
+    }
+
+    let args: Args = match serde_json::from_value(call.arguments.clone()) {
+        Ok(args) => args,
+        Err(error) => {
+            return control_tool_result(
+                call,
+                ToolStatus::Error,
+                json!({
+                    "ok": false,
+                    "error": format!("invalid request_user_input arguments: {error}")
+                }),
+            );
+        }
+    };
+
+    let question = args.question.trim().to_string();
+    if question.is_empty() {
+        return control_tool_result(
+            call,
+            ToolStatus::Error,
+            json!({
+                "ok": false,
+                "error": "request_user_input.question must be non-empty"
+            }),
+        );
+    }
+
+    let request = RequestUserInputRequest {
+        question,
+        choices: args
+            .choices
+            .into_iter()
+            .map(|c| RequestUserInputChoice {
+                label: c.label,
+                value: c.value,
+            })
+            .collect(),
+        allow_freeform: args.allow_freeform,
+    };
+
+    let (response_tx, response_rx) = oneshot::channel::<RequestUserInputResponse>();
+    if context
+        .tx
+        .send(AgentEvent::RequestUserInputRequested {
+            turn_id: context.turn_id,
+            request,
+            response_tx,
+        })
+        .await
+        .is_err()
+    {
+        return control_tool_result(
+            call,
+            ToolStatus::Error,
+            json!({
+                "ok": false,
+                "error": "TUI is no longer receiving events; cannot ask the user"
+            }),
+        );
+    }
+
+    let response = tokio::select! {
+        biased;
+        _ = context.cancel.cancelled() => RequestUserInputResponse::cancelled(),
+        result = response_rx => result.unwrap_or_else(|_| RequestUserInputResponse::cancelled()),
+    };
+
+    let mut payload = json!({
+        "ok": true,
+        "action": match response.action {
+            RequestUserInputAction::Choice => "choice",
+            RequestUserInputAction::Freeform => "freeform",
+            RequestUserInputAction::Cancelled => "cancelled",
+        },
+    });
+    if let Some(map) = payload.as_object_mut() {
+        if let Some(choice) = response.choice_value {
+            map.insert("choice_value".to_string(), Value::String(choice));
+        }
+        if let Some(text) = response.freeform {
+            map.insert("freeform".to_string(), Value::String(text));
+        }
+    }
+    let status = if matches!(response.action, RequestUserInputAction::Cancelled) {
+        ToolStatus::Cancelled
+    } else {
+        ToolStatus::Success
+    };
+    control_tool_result(call, status, payload)
 }
 
 async fn handle_load_tool_schema_call(
@@ -4265,7 +4583,34 @@ async fn handle_subagent_call(
         })
         .await;
 
+    let child_cancel = context.cancel.child_token();
+    let lease = match context.subagents.start(
+        kind.role().unwrap_or(SubagentRole::Explorer),
+        child_cancel.clone(),
+        SUBAGENT_MAX_CONCURRENT,
+        format!("{} starting", kind.as_str()),
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            broker.metrics.subagent_failures += 1;
+            return subagent_control_result(
+                call,
+                kind,
+                SubagentExecution {
+                    status: ToolStatus::Denied,
+                    summary: String::new(),
+                    status_label: "capped",
+                    error: Some(error),
+                    metrics: TurnMetrics::default(),
+                    supporting_receipts: Vec::new(),
+                    model: subagent_model_for_kind(context.provider.name(), context.config, kind),
+                },
+            );
+        }
+    };
+
     let execution = run_subagent(context, kind, request).await;
+    drop(lease);
     broker
         .metrics
         .merge_subagent_tool_metrics(&execution.metrics);
@@ -4336,14 +4681,6 @@ async fn handle_subagent_call(
 }
 
 fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<SubagentRequest, String> {
-    let prompt = call
-        .arguments
-        .get("prompt")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "missing required string field: prompt".to_string())?
-        .to_string();
     let scope = match call.arguments.get("scope") {
         Some(Value::Null) | None => None,
         Some(Value::String(value)) if value.trim().is_empty() => None,
@@ -4364,9 +4701,37 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
         }
         Some(_) => return Err("thoroughness must be a string".to_string()),
     };
-    if kind == SubagentKind::Delegate && thoroughness.is_some() {
-        return Err("delegate does not accept thoroughness".to_string());
+    if !matches!(kind, SubagentKind::Explore) && thoroughness.is_some() {
+        return Err(format!("{} does not accept thoroughness", kind.as_str()));
     }
+    let prompt = match kind {
+        SubagentKind::Plan => call
+            .arguments
+            .get("goal")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "missing required string field: goal".to_string())?
+            .to_string(),
+        SubagentKind::Review => call
+            .arguments
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                "Review the current diff. Report only actionable findings.".to_string()
+            }),
+        SubagentKind::Delegate | SubagentKind::Explore => call
+            .arguments
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "missing required string field: prompt".to_string())?
+            .to_string(),
+    };
     Ok(SubagentRequest {
         prompt,
         scope,
@@ -4491,6 +4856,7 @@ async fn run_subagent_loop(
             response_verbosity: request_response_verbosity(config, parent.provider.name()),
             reasoning_effort: request_reasoning_effort(config, parent.provider.name()),
             previous_response_id: None,
+            cache_key: None,
             tools: tool_specs.to_vec(),
             store: false,
         };
@@ -4618,12 +4984,15 @@ async fn run_subagent_loop(
                         cancel: parent.cancel.child_token(),
                         approval_ids: parent.approval_ids.clone(),
                         session_rules: parent.session_rules.clone(),
+                        ai_reviewer_state: parent.ai_reviewer_state.clone(),
                         session_mode: local_mode.clone(),
                         session_log: None,
+                        conversation_state: None,
                         task_state: local_task_state.clone(),
                         all_tool_specs: allowed_tools,
                         loaded_tool_schemas: local_loaded_schemas.clone(),
                         exploration_state: local_exploration.clone(),
+                        subagents: parent.subagents.clone(),
                     },
                     broker,
                 )
@@ -4760,21 +5129,44 @@ fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> Strin
         }
         SubagentKind::Explore => {
             let thoroughness = request.thoroughness.as_deref().unwrap_or("medium");
+            let base = role_config(SubagentRole::Explorer).instructions;
+            format!("{base}\n\nThoroughness: {thoroughness}.")
+        }
+        SubagentKind::Plan => {
+            let base = role_config(SubagentRole::Planner).instructions;
             format!(
-                "You are Squeezy's cheap read-only code exploration subagent. Use semantic graph tools first: repo_map, decl_search, definition_search, reference_search, symbol_context, hierarchy, upstream_flow, downstream_flow, and read_slice. Use glob, grep, and read_file only as bounded fallback. Thoroughness: {thoroughness}. Return a compact briefing with relevant files/symbols, architecture notes, implementation hazards, and the minimum next reads/actions the parent needs before planning or editing. Do not modify files, run shell/compiler/network/MCP tools, ask the user, or include raw tool dumps."
+                "{base}\n\nReturn structured JSON-ready findings: ordered steps with rationale, impacted files/symbols, and a recommended plan_id when plan_patch is called. Do not modify files or run shell commands."
+            )
+        }
+        SubagentKind::Review => {
+            let base = role_config(SubagentRole::Reviewer).instructions;
+            format!(
+                "{base}\n\nReport actionable issues only. Each finding must include severity (blocker|warning|info), file, line (if known), message, and suggested_fix when one is obvious. Return pass=true only when no blocker or warning remains."
             )
         }
     }
 }
 
 fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKind) -> String {
-    match kind {
-        SubagentKind::Delegate => config.model.clone(),
-        SubagentKind::Explore => config.subagents.explore_model.clone().unwrap_or_else(|| {
+    let parent_model = config.model.clone();
+    // Honor the role catalog's model policy where it applies. `Delegate`
+    // has no role overlay and keeps the parent model. `Explore` defers to
+    // the configured explore_model and falls back to a cheap default for
+    // the provider when one is known.
+    let policy = kind
+        .role()
+        .map(|role| role_config(role).model_policy)
+        .unwrap_or(RoleModelPolicy::Parent);
+    match (kind, policy) {
+        (SubagentKind::Explore, _) => config.subagents.explore_model.clone().unwrap_or_else(|| {
             default_cheap_model_for_provider(provider)
-                .unwrap_or(&config.model)
+                .unwrap_or(&parent_model)
                 .to_string()
         }),
+        (_, RoleModelPolicy::Parent) => parent_model,
+        (_, RoleModelPolicy::Cheap) => default_cheap_model_for_provider(provider)
+            .unwrap_or(&parent_model)
+            .to_string(),
     }
 }
 
@@ -4829,13 +5221,20 @@ fn subagent_allowed_tools(
     all_tool_specs: &[AdvertisedTool],
     kind: SubagentKind,
 ) -> Vec<AdvertisedTool> {
-    let names = match kind {
-        SubagentKind::Delegate => DELEGATE_SUBAGENT_TOOL_NAMES,
-        SubagentKind::Explore => EXPLORE_SUBAGENT_TOOL_NAMES,
-    }
-    .iter()
-    .copied()
-    .collect::<BTreeSet<_>>();
+    let names: BTreeSet<&str> = match kind {
+        SubagentKind::Delegate => DELEGATE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
+        SubagentKind::Explore => EXPLORE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
+        SubagentKind::Plan => role_config(SubagentRole::Planner)
+            .allowed_tools
+            .iter()
+            .copied()
+            .collect(),
+        SubagentKind::Review => role_config(SubagentRole::Reviewer)
+            .allowed_tools
+            .iter()
+            .copied()
+            .collect(),
+    };
     all_tool_specs
         .iter()
         .filter(|tool| names.contains(tool.spec.name.as_str()))
@@ -5053,7 +5452,10 @@ fn repeated_tool_failure_key(result: &ToolResult) -> Option<String> {
 }
 
 fn is_control_tool_name(name: &str) -> bool {
-    matches!(name, TASK_STATE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME)
+    matches!(
+        name,
+        TASK_STATE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME | REQUEST_USER_INPUT_TOOL_NAME
+    )
 }
 
 fn tool_failure_detail(result: &ToolResult) -> String {
@@ -5127,6 +5529,20 @@ async fn execute_tool_calls(
             recorded[index] = true;
             continue;
         }
+        if call.name == REQUEST_USER_INPUT_TOOL_NAME {
+            let result = handle_request_user_input_call(&context, call).await;
+            broker.record_executed_result(&result);
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
+            recorded[index] = true;
+            continue;
+        }
         if has_invalid_tool_arguments(call) {
             let result = invalid_tool_arguments_result(call);
             broker.record_executed_result(&result);
@@ -5167,6 +5583,32 @@ async fn execute_tool_calls(
             recorded[index] = true;
             continue;
         }
+        if call.name == DELEGATE_PLAN_TOOL_NAME {
+            results[index] = Some(
+                Box::pin(handle_subagent_call(
+                    &context,
+                    call,
+                    SubagentKind::Plan,
+                    broker,
+                ))
+                .await,
+            );
+            recorded[index] = true;
+            continue;
+        }
+        if call.name == DELEGATE_REVIEW_TOOL_NAME {
+            results[index] = Some(
+                Box::pin(handle_subagent_call(
+                    &context,
+                    call,
+                    SubagentKind::Review,
+                    broker,
+                ))
+                .await,
+            );
+            recorded[index] = true;
+            continue;
+        }
 
         let tool_sequence = match broker.reserve_call() {
             Ok(tool_sequence) => tool_sequence,
@@ -5177,6 +5619,7 @@ async fn execute_tool_calls(
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
+                    call,
                     &result,
                     Duration::ZERO,
                 );
@@ -5202,6 +5645,7 @@ async fn execute_tool_calls(
                 &context.telemetry,
                 context.turn_id,
                 tool_sequence,
+                call,
                 &result,
                 Duration::ZERO,
             );
@@ -5227,6 +5671,7 @@ async fn execute_tool_calls(
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
+                    call,
                     &result,
                     Duration::ZERO,
                 );
@@ -5248,6 +5693,7 @@ async fn execute_tool_calls(
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
+                    call,
                     &result,
                     Duration::ZERO,
                 );
@@ -5281,6 +5727,7 @@ async fn execute_tool_calls(
                 &context.telemetry,
                 context.turn_id,
                 tool_sequence,
+                &call,
                 &result,
                 Duration::ZERO,
             );
@@ -5304,6 +5751,7 @@ async fn execute_tool_calls(
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
+                    &call,
                     &result,
                     Duration::ZERO,
                 );
@@ -5322,6 +5770,7 @@ async fn execute_tool_calls(
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
+                    &call,
                     &result,
                     Duration::ZERO,
                 );
@@ -5406,6 +5855,7 @@ async fn flush_parallel_batch(
                 &context.telemetry,
                 context.turn_id,
                 tool_sequence,
+                &call,
                 &result,
                 Duration::ZERO,
             );
@@ -5430,6 +5880,7 @@ async fn flush_parallel_batch(
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
+                    &call,
                     &result,
                     Duration::ZERO,
                 );
@@ -5481,6 +5932,7 @@ async fn run_one_tool(
             &context.telemetry,
             context.turn_id,
             tool_sequence,
+            &call,
             &result,
             Duration::ZERO,
         );
@@ -5538,6 +5990,10 @@ async fn run_one_tool(
     } else {
         None
     };
+    // Capture a borrow-able snapshot of the call before it moves into the
+    // tool registry, so paired-SHA telemetry (F06) can hash its arguments
+    // when emitting the completion event.
+    let call_for_telemetry = call.clone();
     let result = context
         .tools
         .execute_for_group_with_options(
@@ -5585,6 +6041,7 @@ async fn run_one_tool(
         &context.telemetry,
         context.turn_id,
         tool_sequence,
+        &call_for_telemetry,
         &result,
         started.elapsed(),
     );
@@ -5722,9 +6179,11 @@ fn emit_tool_telemetry(
     telemetry: &TelemetryClient,
     turn_id: TurnId,
     tool_sequence: u64,
+    call: &ToolCall,
     result: &ToolResult,
     duration: Duration,
 ) {
+    let args_sha256 = tool_call_args_sha256(call);
     telemetry.spawn(TelemetryEvent::tool_completed(ToolTelemetryReport {
         provider: &config.provider,
         model: &config.model,
@@ -5739,7 +6198,18 @@ fn emit_tool_telemetry(
             matches_returned: result.cost_hint.matches_returned,
             output_bytes: result.cost_hint.output_bytes,
         },
+        args_sha256: args_sha256.as_deref(),
+        output_sha256: Some(result.receipt.output_sha256.as_str()),
+        content_sha256: result.receipt.content_sha256.as_deref(),
     }));
+}
+
+/// SHA-256 of the canonical JSON arguments the model sent for a tool call.
+/// Used to pair with `output_sha256` in telemetry (F06).
+fn tool_call_args_sha256(call: &ToolCall) -> Option<String> {
+    serde_json::to_vec(&call.arguments)
+        .ok()
+        .map(|bytes| squeezy_tools::sha256_hex(&bytes))
 }
 
 fn telemetry_tool_status(status: ToolStatus) -> TelemetryToolStatusKind {
@@ -5800,6 +6270,82 @@ async fn permission_decision_for_request(
         .config
         .permissions
         .evaluate_with_extra(&request, &session_rules);
+    if verdict.action == PermissionAction::Ask && context.config.permissions.ai_reviewer.enabled {
+        let transcript = if let Some(conversation_state) = &context.conversation_state {
+            let state = conversation_state.lock().await;
+            Some(ai_reviewer::AiReviewerTranscriptSnapshot {
+                items: state.transcript.clone(),
+                history_version: state.context_compaction.generation,
+                entry_count: state.transcript.len(),
+            })
+        } else {
+            None
+        };
+        match ai_reviewer::review_permission(ai_reviewer::AiReviewerInput {
+            config: &context.config,
+            provider: context.provider.clone(),
+            request: &request,
+            transcript,
+            state: context.ai_reviewer_state.clone(),
+            turn_id: context.turn_id,
+            cancel: context.cancel.child_token(),
+        })
+        .await
+        {
+            ai_reviewer::AiReviewerOutcome::Verdict(reviewed) => {
+                log_session_event(
+                    context.session_log.as_ref(),
+                    &context.redactor,
+                    "permission_ai_reviewer_decided",
+                    Some(context.turn_id),
+                    Some(reviewed.action.as_str().to_string()),
+                    json!({
+                        "action": reviewed.action.as_str(),
+                        "reason": reviewed.reason.clone(),
+                        "capability": request.capability.as_str(),
+                        "target": request.target.clone(),
+                    }),
+                );
+                verdict = reviewed;
+            }
+            ai_reviewer::AiReviewerOutcome::NoDecision { reason } => {
+                log_session_event(
+                    context.session_log.as_ref(),
+                    &context.redactor,
+                    "permission_ai_reviewer_no_decision",
+                    Some(context.turn_id),
+                    Some(reason.clone()),
+                    json!({
+                        "reason": reason,
+                        "capability": request.capability.as_str(),
+                        "target": request.target.clone(),
+                    }),
+                );
+            }
+            ai_reviewer::AiReviewerOutcome::CircuitTripped { reason } => {
+                let reason = context.redactor.redact(&reason).text;
+                log_session_event(
+                    context.session_log.as_ref(),
+                    &context.redactor,
+                    "permission_ai_reviewer_tripped",
+                    Some(context.turn_id),
+                    Some(reason.clone()),
+                    json!({
+                        "reason": reason,
+                        "capability": request.capability.as_str(),
+                        "target": request.target.clone(),
+                    }),
+                );
+                let _ = context
+                    .tx
+                    .send(AgentEvent::AiReviewerTripped {
+                        turn_id: context.turn_id,
+                        reason,
+                    })
+                    .await;
+            }
+        }
+    }
     if should_classify_shell(&context.config, context.provider.name(), &request, &verdict)
         && let Some(classifier) = classify_ambiguous_shell(
             context.provider.clone(),
@@ -5869,6 +6415,27 @@ async fn permission_decision_for_request(
                 Ok(ToolApprovalDecision::Approved | ToolApprovalDecision::AllowOnce) => {
                     ApprovalDecision::Approved
                 }
+                Ok(ToolApprovalDecision::AllowSession) => {
+                    install_persistent_rule(
+                        context,
+                        &request,
+                        PermissionRuleSource::Session,
+                        PermissionAction::Allow,
+                    );
+                    log_session_event(
+                        context.session_log.as_ref(),
+                        &context.redactor,
+                        "permission_session_rule_installed",
+                        Some(context.turn_id),
+                        Some(request.target.clone()),
+                        json!({
+                            "capability": request.capability.as_str(),
+                            "target": request.target,
+                            "action": "allow",
+                        }),
+                    );
+                    ApprovalDecision::Approved
+                }
                 Ok(ToolApprovalDecision::AllowRuleUser) => {
                     install_persistent_rule(
                         context,
@@ -5913,6 +6480,30 @@ async fn permission_decision_for_request(
                     ApprovalDecision::Denied(permission_denied_reason(
                         &request,
                         "user denied tool call",
+                    ))
+                }
+                Ok(ToolApprovalDecision::DenySession) => {
+                    install_persistent_rule(
+                        context,
+                        &request,
+                        PermissionRuleSource::Session,
+                        PermissionAction::Deny,
+                    );
+                    log_session_event(
+                        context.session_log.as_ref(),
+                        &context.redactor,
+                        "permission_session_rule_installed",
+                        Some(context.turn_id),
+                        Some(request.target.clone()),
+                        json!({
+                            "capability": request.capability.as_str(),
+                            "target": request.target,
+                            "action": "deny",
+                        }),
+                    );
+                    ApprovalDecision::Denied(permission_denied_reason(
+                        &request,
+                        "user denied and installed a session rule",
                     ))
                 }
                 Ok(ToolApprovalDecision::DenyRuleUser) => {
@@ -6120,6 +6711,7 @@ Working target: {:?}",
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: Vec::new(),
         store: false,
     };
@@ -6264,12 +6856,27 @@ fn install_persistent_rule(
         Some(path) => path,
         None => return,
     };
-    if let Err(err) = write_permission_rule(&path, &rule) {
-        tracing::warn!(
+    let persisted = match persist_permission_rule(&path, &rule) {
+        Ok(persisted) => persisted,
+        Err(err) => {
+            tracing::warn!(
+                target: "squeezy::permissions",
+                path = %path.display(),
+                error = %err,
+                "failed to persist permission rule",
+            );
+            return;
+        }
+    };
+    if !persisted {
+        tracing::info!(
             target: "squeezy::permissions",
             path = %path.display(),
-            error = %err,
-            "failed to persist permission rule",
+            capability = %rule.capability,
+            target = %rule.target,
+            action = %rule.action.as_str(),
+            source = %rule.source.as_str(),
+            "permission rule already persisted",
         );
     } else {
         tracing::info!(
@@ -6290,41 +6897,6 @@ fn persistence_path_for(config: &AppConfig, source: PermissionRuleSource) -> Opt
         PermissionRuleSource::Project => Some(config.workspace_root.join(PROJECT_SETTINGS_FILE)),
         PermissionRuleSource::Builtin | PermissionRuleSource::Session => None,
     }
-}
-
-fn write_permission_rule(path: &std::path::Path, rule: &PermissionRule) -> io::Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let reason = rule
-        .reason
-        .clone()
-        .unwrap_or_else(|| "added from approval prompt".to_string());
-    let mut text = String::new();
-    text.push_str("\n[[permissions.rules]]\n");
-    text.push_str(&format!(
-        "capability = {}\n",
-        escape_toml_basic_string(&rule.capability)
-    ));
-    text.push_str(&format!(
-        "target = {}\n",
-        escape_toml_basic_string(&rule.target)
-    ));
-    text.push_str(&format!(
-        "action = {}\n",
-        escape_toml_basic_string(rule.action.as_str())
-    ));
-    text.push_str(&format!(
-        "source = {}\n",
-        escape_toml_basic_string(rule.source.as_str())
-    ));
-    text.push_str(&format!("reason = {}\n", escape_toml_basic_string(&reason)));
-    file.write_all(text.as_bytes())
 }
 
 /// Pick a rule shape to persist for this approval. Refuses Allow on any
@@ -6390,13 +6962,21 @@ pub(crate) fn advertised_tool(spec: ToolSpec) -> AdvertisedTool {
 /// `delegate` and `explore` are gated on [`SubagentConfig::enabled`] /
 /// `explore_enabled` so we don't spend prompt tokens advertising tools the
 /// agent would refuse on every call.
-fn core_control_tools(subagents: &SubagentConfig) -> Vec<AdvertisedTool> {
+fn core_control_tools(
+    subagents: &SubagentConfig,
+    session_mode: SessionMode,
+) -> Vec<AdvertisedTool> {
     let mut tools = Vec::new();
     if subagents.enabled {
         tools.push(delegate_advertised_tool());
         if subagents.explore_enabled {
             tools.push(explore_advertised_tool());
         }
+        tools.push(delegate_plan_advertised_tool());
+        tools.push(delegate_review_advertised_tool());
+    }
+    if session_mode == SessionMode::Plan {
+        tools.push(request_user_input_advertised_tool());
     }
     tools
 }
@@ -6456,6 +7036,109 @@ fn delegate_advertised_tool() -> AdvertisedTool {
     }
 }
 
+fn delegate_plan_advertised_tool() -> AdvertisedTool {
+    AdvertisedTool {
+        capability: PermissionCapability::Read,
+        spec: LlmToolSpec {
+            name: DELEGATE_PLAN_TOOL_NAME.to_string(),
+            description: "Delegate read-only implementation planning to a Planner subagent. The parent receives ordered steps, impacted files/symbols, and (when plan_patch is used) a plan_id to bind future edits to.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "Concrete implementation goal the planner should produce steps for."
+                    },
+                    "scope": {
+                        "type": ["string", "null"],
+                        "description": "Optional paths, modules, symbols, or constraints the plan must stay within."
+                    }
+                },
+                "required": ["goal"]
+            }),
+            strict: false,
+        },
+    }
+}
+
+fn delegate_review_advertised_tool() -> AdvertisedTool {
+    AdvertisedTool {
+        capability: PermissionCapability::Read,
+        spec: LlmToolSpec {
+            name: DELEGATE_REVIEW_TOOL_NAME.to_string(),
+            description: "Delegate read-only review of the current diff to a Reviewer subagent. Returns actionable findings (severity, file, line, message, suggested_fix) and a pass flag.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "scope": {
+                        "type": ["string", "null"],
+                        "description": "Optional paths or globs to focus the review on. Defaults to the full pending diff."
+                    },
+                    "prompt": {
+                        "type": ["string", "null"],
+                        "description": "Optional additional review instructions for this turn."
+                    }
+                }
+            }),
+            strict: false,
+        },
+    }
+}
+
+/// Plan-mode tool that lets the model pause the turn and ask the user a
+/// clarifying multiple-choice (or free-form) question. The capability is
+/// `Read` so it survives Plan-mode tool filtering; mode gating happens at
+/// execute time so a Build-mode call returns a clear error instead of
+/// silently disappearing.
+fn request_user_input_advertised_tool() -> AdvertisedTool {
+    AdvertisedTool {
+        capability: PermissionCapability::Read,
+        spec: LlmToolSpec {
+            name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+            description:
+                "Plan mode only. Pause the turn and ask the user a clarifying question. Provide a question; optionally provide multiple-choice options with stable values. Returns the user's selection (or notes they cancelled)."
+                    .to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "Question to display to the user. Should be a complete sentence."
+                    },
+                    "choices": {
+                        "type": "array",
+                        "description": "Multiple-choice options. Omit or pass an empty array for free-form input.",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "label": {
+                                    "type": "string",
+                                    "description": "Short human-readable label shown to the user."
+                                },
+                                "value": {
+                                    "type": "string",
+                                    "description": "Stable value returned to the model when this choice is picked."
+                                }
+                            },
+                            "required": ["label", "value"]
+                        }
+                    },
+                    "allow_freeform": {
+                        "type": "boolean",
+                        "description": "When true, the user may also type a free-form answer alongside choices. Default false."
+                    }
+                },
+                "required": ["question"]
+            }),
+            strict: false,
+        },
+    }
+}
+
 fn explore_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
@@ -6499,7 +7182,10 @@ fn synthetic_tool_by_name(name: &str) -> Option<AdvertisedTool> {
     match name {
         DELEGATE_TOOL_NAME => Some(delegate_advertised_tool()),
         EXPLORE_TOOL_NAME => Some(explore_advertised_tool()),
+        DELEGATE_PLAN_TOOL_NAME => Some(delegate_plan_advertised_tool()),
+        DELEGATE_REVIEW_TOOL_NAME => Some(delegate_review_advertised_tool()),
         LOAD_TOOL_SCHEMA_TOOL_NAME => Some(load_tool_schema_advertised_tool()),
+        REQUEST_USER_INPUT_TOOL_NAME => Some(request_user_input_advertised_tool()),
         _ => None,
     }
 }
@@ -6589,13 +7275,15 @@ fn request_tool_specs(
         DELEGATE_TOOL_NAME,
         EXPLORE_TOOL_NAME,
         LOAD_TOOL_SCHEMA_TOOL_NAME,
+        REQUEST_USER_INPUT_TOOL_NAME,
     ];
     for name in synthetic_order
         .into_iter()
         .filter(|name| {
             // Synthetic control tools may have been filtered out of
-            // `core_control_tools` (e.g. subagents disabled). In that case
-            // don't push them back into the request via name lookup.
+            // `core_control_tools` (e.g. subagents disabled, or Plan-only
+            // tools in Build mode). In that case don't push them back
+            // into the request via name lookup.
             *name == LOAD_TOOL_SCHEMA_TOOL_NAME || advertised_names.contains(name)
         })
         .chain(schema_config.core.iter().map(String::as_str))
@@ -7143,6 +7831,17 @@ fn replay_hash(value: &impl Serialize) -> String {
     sha256_hex(serde_json::to_vec(value).unwrap_or_default())
 }
 
+/// Returns a stable LlmRequest snapshot for replay-hash purposes.
+///
+/// `cache_key` is derived from the live session id, which changes
+/// across record/replay runs, so it must be excluded from the
+/// divergence hash.
+fn replay_request_view(request: &LlmRequest) -> LlmRequest {
+    let mut view = request.clone();
+    view.cache_key = None;
+    view
+}
+
 fn replay_user_inputs(tape: &SessionReplayTape) -> Vec<String> {
     tape.events
         .iter()
@@ -7557,6 +8256,7 @@ async fn compact_conversation_with_strategy(
         previous_response_id: None,
         tools: Vec::new(),
         store: false,
+        cache_key: None,
     };
     let cancel = CancellationToken::new();
     let mut stream = provider.stream_response(request, cancel);
@@ -8191,11 +8891,13 @@ pub enum ToolApprovalDecision {
     Approved,
     Denied,
     AllowOnce,
+    AllowSession,
     AllowRuleUser,
     AllowRuleProject,
     AskRuleUser,
     AskRuleProject,
     DenyOnce,
+    DenySession,
     DenyRuleUser,
     DenyRuleProject,
     Cancelled,
@@ -8207,7 +8909,68 @@ enum ApprovalDecision {
     Cancelled,
 }
 
-#[derive(Debug)]
+/// Request payload sent to the TUI when the model calls
+/// `request_user_input` from Plan mode. The TUI renders a modal, gathers
+/// the user's choice, and replies via the matching
+/// [`RequestUserInputResponse`] over a oneshot channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestUserInputRequest {
+    /// Question to display to the user.
+    pub question: String,
+    /// Optional multiple-choice options. Empty means "free-form only".
+    pub choices: Vec<RequestUserInputChoice>,
+    /// When true, the UI offers a free-form text path alongside any
+    /// configured choices.
+    pub allow_freeform: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestUserInputChoice {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestUserInputAction {
+    Choice,
+    Freeform,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestUserInputResponse {
+    pub action: RequestUserInputAction,
+    pub choice_value: Option<String>,
+    pub freeform: Option<String>,
+}
+
+impl RequestUserInputResponse {
+    pub fn choice(value: impl Into<String>) -> Self {
+        Self {
+            action: RequestUserInputAction::Choice,
+            choice_value: Some(value.into()),
+            freeform: None,
+        }
+    }
+
+    pub fn freeform(text: impl Into<String>) -> Self {
+        Self {
+            action: RequestUserInputAction::Freeform,
+            choice_value: None,
+            freeform: Some(text.into()),
+        }
+    }
+
+    pub fn cancelled() -> Self {
+        Self {
+            action: RequestUserInputAction::Cancelled,
+            choice_value: None,
+            freeform: None,
+        }
+    }
+}
+
 pub enum AgentEvent {
     UserMessage {
         turn_id: TurnId,
@@ -8245,6 +9008,11 @@ pub enum AgentEvent {
         request: McpElicitationRequest,
         response_tx: oneshot::Sender<McpElicitationResponse>,
     },
+    RequestUserInputRequested {
+        turn_id: TurnId,
+        request: RequestUserInputRequest,
+        response_tx: oneshot::Sender<RequestUserInputResponse>,
+    },
     JobUpdated {
         job: JobSnapshot,
     },
@@ -8272,6 +9040,10 @@ pub enum AgentEvent {
         error: String,
         metrics: TurnMetrics,
     },
+    AiReviewerTripped {
+        turn_id: TurnId,
+        reason: String,
+    },
     ApprovalRequested {
         turn_id: TurnId,
         request: ToolApprovalRequest,
@@ -8283,6 +9055,10 @@ pub enum AgentEvent {
         response_id: Option<String>,
         cost: CostSnapshot,
         metrics: TurnMetrics,
+        /// Post-turn estimate of the conversation footprint, used by the
+        /// TUI to update its context-budget indicator without needing a
+        /// follow-up `context_estimate_snapshot()` call.
+        context_estimate: ContextEstimate,
     },
     Cancelled {
         turn_id: TurnId,

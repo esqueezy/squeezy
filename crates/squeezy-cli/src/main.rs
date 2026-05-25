@@ -20,6 +20,9 @@ use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, ModelInfo, PROVIDERS, UnavailableProvider,
     capabilities_for, fetch_ollama_model_names, models_for_provider, provider_from_config,
 };
+
+mod auth;
+use auth::handle_auth_command;
 use squeezy_store::{
     BugReportOptions, RepoProfileLoad, ResumeItem, SemanticSupport, SessionEvent, SessionMetadata,
     SessionQuery, SessionResumeState, SessionStatus, SessionStore, default_bug_report_path,
@@ -59,6 +62,11 @@ struct Cli {
         help = "Ignore saved provider/model defaults and run startup selection again"
     )]
     no_default: bool,
+    #[arg(
+        long = "no-resume-picker",
+        help = "Skip the startup picker that offers to resume a recent session for this directory"
+    )]
+    no_resume_picker: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -89,6 +97,11 @@ enum Command {
     },
     #[command(about = "Ask the running Squeezy shell session for an in-flight permission decision")]
     Ask(AskArgs),
+    #[command(about = "Manage provider credentials stored in the OS keyring")]
+    Auth {
+        #[command(subcommand)]
+        command: auth::AuthCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -268,6 +281,7 @@ struct SessionReportArgs {
 
 #[tokio::main]
 async fn main() -> squeezy_core::Result<()> {
+    squeezy_core::pre_main_hardening(squeezy_core::HardeningConfig::default());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -283,6 +297,7 @@ async fn main() -> squeezy_core::Result<()> {
         Some(Command::Feedback(args)) => return handle_feedback_command(args, &cli).await,
         Some(Command::Mcp { command }) => return handle_mcp_command(command, &cli),
         Some(Command::Ask(args)) => return handle_ask_command(args),
+        Some(Command::Auth { command }) => return handle_auth_command(command),
         None => {}
     }
 
@@ -379,6 +394,7 @@ async fn main() -> squeezy_core::Result<()> {
         squeezy_tui::StartupProfile {
             onboarding_summary: onboarding.visible_summary,
             languages: onboarding.language_summary,
+            skip_resume_picker: cli.no_resume_picker,
         },
     )
     .await;
@@ -1539,6 +1555,9 @@ async fn run_prompt(
         response_verbosity: request_response_verbosity(&config, provider.name()),
         reasoning_effort: request_reasoning_effort(&config, provider.name()),
         previous_response_id: None,
+        cache_key: session
+            .as_ref()
+            .map(|session| format!("squeezy::{}", session.session_id())),
         tools: Vec::new(),
         store: config.store_responses,
     };
