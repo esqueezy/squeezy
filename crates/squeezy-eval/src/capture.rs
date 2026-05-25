@@ -1,13 +1,14 @@
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::driver::EvalError;
+use crate::live::LivePrinter;
 
 /// Normalized trace event written one-per-line to `trace.jsonl`.
 ///
@@ -94,6 +95,7 @@ pub const EVAL_TRACE_SCHEMA_VERSION: u32 = 2;
 /// Append-only JSONL trace writer.
 pub struct Capture {
     inner: Mutex<CaptureInner>,
+    live: Option<Arc<LivePrinter>>,
 }
 
 struct CaptureInner {
@@ -104,6 +106,10 @@ struct CaptureInner {
 
 impl Capture {
     pub fn create(dir: &Path) -> Result<Self, EvalError> {
+        Self::create_with_live(dir, None)
+    }
+
+    pub fn create_with_live(dir: &Path, live: Option<Arc<LivePrinter>>) -> Result<Self, EvalError> {
         std::fs::create_dir_all(dir)
             .map_err(|err| EvalError::Io(format!("create_dir_all {dir:?}: {err}")))?;
         let path = dir.join("trace.jsonl");
@@ -118,6 +124,7 @@ impl Capture {
                 file,
                 sequence: 0,
             }),
+            live,
         })
     }
 
@@ -132,13 +139,18 @@ impl Capture {
             schema_version: EVAL_TRACE_SCHEMA_VERSION,
             ts_unix_ms: now_ms(),
             sequence,
-            turn_id,
+            turn_id: turn_id.clone(),
             kind,
         };
         let line = serde_json::to_string(&event)
             .map_err(|err| EvalError::Internal(format!("serialize trace event: {err}")))?;
         writeln!(guard.file, "{line}")
             .map_err(|err| EvalError::Io(format!("append trace event: {err}")))?;
+        // Mirror to the live printer so a watching user sees activity
+        // as squeezy runs, not just the final summary line.
+        if let Some(printer) = &self.live {
+            printer.event(&event.kind, turn_id.as_deref());
+        }
         Ok(())
     }
 

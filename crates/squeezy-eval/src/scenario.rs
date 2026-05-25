@@ -67,6 +67,17 @@ pub struct SqueezyOverlay {
     pub permission_mode: Option<String>,
     pub instructions: Option<String>,
     pub max_output_tokens: Option<u32>,
+    /// Override `AppConfig.max_tool_calls_per_turn` — squeezy's live
+    /// per-turn tool-call cap (default 64). Scenarios that probe planner
+    /// behavior want this lower (e.g. 6–10) so the budget broker
+    /// actually fires.
+    pub max_tool_calls_per_turn: Option<u64>,
+    /// Override `AppConfig.max_tool_bytes_read_per_turn` (default 20MB).
+    pub max_tool_bytes_read_per_turn: Option<u64>,
+    /// Override `AppConfig.max_session_cost_usd_micros` (default 5_000_000
+    /// = $5). Scenarios that should bail at a tight session budget set
+    /// this lower.
+    pub max_session_cost_usd_micros: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +234,11 @@ pub struct Expect {
     /// Threshold for the `high_tool_burst` auto-finding. Defaults to 10.
     #[serde(default)]
     pub max_tools_per_turn: Option<u64>,
+    /// Threshold for the `expect_input_tokens_per_turn` auto-finding —
+    /// the per-turn equivalent of `max_input_tokens`. When omitted, the
+    /// rule does not fire.
+    #[serde(default)]
+    pub max_input_tokens_per_turn: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

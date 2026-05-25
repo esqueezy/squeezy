@@ -28,6 +28,10 @@ pub struct RunOptions {
     pub run_triage: bool,
     pub emit_github: bool,
     pub gh_repo: Option<String>,
+    /// When true, the driver streams squeezy's activity to stdout as it
+    /// happens — assistant text, tool calls, approvals, findings. Set
+    /// to false for CI or other unattended runs.
+    pub live: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -68,8 +72,21 @@ pub async fn run_scenario(
     std::fs::create_dir_all(&run_dir)
         .map_err(|err| EvalError::Io(format!("create run dir {run_dir:?}: {err}")))?;
 
-    let capture = Arc::new(Capture::create(&run_dir)?);
+    // Live narration sink (stdout by default; suppressed in `--quiet`
+    // and CI mode). The same printer is also handed to the dispatch
+    // loop so it can announce step boundaries before any event fires.
+    let live_printer = Arc::new(crate::live::LivePrinter::stdout(options.live));
+    let capture = Arc::new(Capture::create_with_live(
+        &run_dir,
+        Some(live_printer.clone()),
+    )?);
     let frames = Arc::new(FrameWriter::create(&run_dir)?);
+    if options.live {
+        println!(
+            "▶ squeezy-eval running: {} ({})",
+            scenario.title, scenario.id
+        );
+    }
 
     // 1. Provision the workspace.
     let scratch_root = options.out_root.join("_workspaces");
@@ -109,6 +126,7 @@ pub async fn run_scenario(
         model: model.clone(),
         session_id: session_id.clone(),
         total_cost_micro_usd: TokioMutex::new(0),
+        live_printer: live_printer.clone(),
     };
 
     driver.dispatch_steps().await?;
@@ -170,7 +188,15 @@ pub async fn run_scenario(
     let mut ticket_count = 0u64;
     let triage_enabled = options.run_triage && scenario.triage.enabled;
     let llm_tickets = if triage_enabled {
-        match crate::triage::triage(&scenario, &config, &capture.path(), &frames.path()).await {
+        match crate::triage::triage(
+            &scenario,
+            &config,
+            &capture.path(),
+            &frames.path(),
+            &auto_findings,
+        )
+        .await
+        {
             Ok(drafts) => drafts,
             Err(err) => {
                 tracing::warn!(error = %err, "triage failed; continuing without tickets");
@@ -201,6 +227,7 @@ pub async fn run_scenario(
         )?;
     }
 
+    live_printer.flush();
     Ok(RunOutcome {
         run_dir,
         trace_event_count,
@@ -384,6 +411,20 @@ fn apply_overlay(
         // Intentional silent ignore in first cut. The scenario's expected
         // model still applies. Documented in EVAL_HARNESS.md.
     }
+    // Tighten squeezy's live cost broker for probes. AppConfig already
+    // has these knobs; they default to permissive values (64 tool calls,
+    // 20 MB read, $5 session cap) which lets a planner over-fetch
+    // burst slide. Scenarios that probe budget behavior can ratchet
+    // them down via the overlay.
+    if let Some(v) = overlay.max_tool_calls_per_turn {
+        config.max_tool_calls_per_turn = v;
+    }
+    if let Some(v) = overlay.max_tool_bytes_read_per_turn {
+        config.max_tool_bytes_read_per_turn = v;
+    }
+    if let Some(v) = overlay.max_session_cost_usd_micros {
+        config.max_session_cost_usd_micros = Some(v);
+    }
     Ok(())
 }
 
@@ -425,11 +466,15 @@ struct Driver {
     #[allow(dead_code)]
     session_id: String,
     total_cost_micro_usd: TokioMutex<u64>,
+    live_printer: Arc<crate::live::LivePrinter>,
 }
 
 impl Driver {
     async fn dispatch_steps(&self) -> Result<(), EvalError> {
-        for step in self.scenario.steps.clone() {
+        for (idx, step) in self.scenario.steps.clone().into_iter().enumerate() {
+            // Announce the step on the live printer so a watching user
+            // sees `━━━ step 1: prompt` before any squeezy activity.
+            self.live_printer.step(idx, &step);
             match step {
                 Step::Prompt { text, wait_for } => {
                     self.run_prompt(text, wait_for).await?;
