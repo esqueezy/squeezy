@@ -392,6 +392,20 @@ fn apply_overlay(
         // Intentional silent ignore in first cut. The scenario's expected
         // model still applies. Documented in EVAL_HARNESS.md.
     }
+    // Tighten squeezy's live cost broker for probes. AppConfig already
+    // has these knobs; they default to permissive values (64 tool calls,
+    // 20 MB read, $5 session cap) which lets a planner over-fetch
+    // burst slide. Scenarios that probe budget behavior can ratchet
+    // them down via the overlay.
+    if let Some(v) = overlay.max_tool_calls_per_turn {
+        config.max_tool_calls_per_turn = v;
+    }
+    if let Some(v) = overlay.max_tool_bytes_read_per_turn {
+        config.max_tool_bytes_read_per_turn = v;
+    }
+    if let Some(v) = overlay.max_session_cost_usd_micros {
+        config.max_session_cost_usd_micros = Some(v);
+    }
     Ok(())
 }
 
