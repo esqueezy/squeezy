@@ -773,6 +773,165 @@ async fn slash_plan_and_build_force_modes() {
 }
 
 #[tokio::test]
+async fn slash_plans_list_renders_persisted_plans() {
+    let root = temp_workspace("slash_plans_list");
+    let plans_dir = root
+        .join(proposed_plan::PLAN_DIR)
+        .join(proposed_plan::FALLBACK_SESSION_ID);
+    fs::create_dir_all(&plans_dir).expect("mkdir");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+
+    let (id, _) = proposed_plan::persist_plan(
+        &root,
+        proposed_plan::FALLBACK_SESSION_ID,
+        "Outline: tidy the README.",
+        &proposed_plan::PlanMeta::default(),
+    )
+    .expect("persist");
+
+    set_input(&mut app, "/plans".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.status, "1 plan(s) in this session");
+    let rendered = app
+        .transcript
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Message(item) if item.role == Role::System => {
+                Some(item.content.clone())
+            }
+            _ => None,
+        })
+        .expect("system message rendered");
+    assert!(rendered.contains(&id), "list output should include the id");
+    assert!(
+        rendered.contains("Outline: tidy the README."),
+        "list output should include the objective: {rendered}"
+    );
+    assert!(
+        rendered.contains("  *"),
+        "active plan must be marked with *"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn slash_plans_delete_requires_explicit_yes() {
+    let root = temp_workspace("slash_plans_delete_confirm");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+
+    let (id, path) = proposed_plan::persist_plan(
+        &root,
+        proposed_plan::FALLBACK_SESSION_ID,
+        "delete me",
+        &proposed_plan::PlanMeta::default(),
+    )
+    .expect("persist");
+
+    set_input(&mut app, format!("/plans delete {id}"));
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert!(path.exists(), "first attempt must NOT delete the file");
+    assert!(app.status.contains("--yes"));
+
+    set_input(&mut app, format!("/plans delete {id} --yes"));
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert!(!path.exists(), "second attempt with --yes must delete");
+    assert!(app.status.starts_with("deleted plan"));
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn slash_plans_set_active_updates_pointer_and_app() {
+    let root = temp_workspace("slash_plans_set_active");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+
+    let (id_a, _) = proposed_plan::persist_plan(
+        &root,
+        proposed_plan::FALLBACK_SESSION_ID,
+        "alpha body",
+        &proposed_plan::PlanMeta::default(),
+    )
+    .expect("persist a");
+    let (id_b, _) = proposed_plan::persist_plan(
+        &root,
+        proposed_plan::FALLBACK_SESSION_ID,
+        "beta body",
+        &proposed_plan::PlanMeta::default(),
+    )
+    .expect("persist b");
+    // Persisting `b` left pointer aimed at `b`. Flip back to `a`.
+    set_input(&mut app, format!("/plans set-active {id_a}"));
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.current_plan_id.as_deref(), Some(id_a.as_str()));
+    assert_eq!(
+        proposed_plan::read_current_plan_id(&root, proposed_plan::FALLBACK_SESSION_ID).as_deref(),
+        Some(id_a.as_str())
+    );
+    // `id_b` is intentionally unused beyond establishing two plans.
+    let _ = id_b;
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn slash_plans_show_unknown_id_sets_status() {
+    let root = temp_workspace("slash_plans_show_missing");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+
+    set_input(&mut app, "/plans show plan-does-not-exist".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert!(
+        app.status.starts_with("no plan matches"),
+        "got status: {}",
+        app.status
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn prompt_cursor_moves_and_edits_inside_text() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);

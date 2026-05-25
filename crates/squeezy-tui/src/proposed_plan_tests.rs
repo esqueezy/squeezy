@@ -1,8 +1,9 @@
 use super::{
     BUILD_PLAN_STILL_IN_EFFECT_FORMAT, CURRENT_POINTER_FILE, LEGACY_PLAN_DIR, PLAN_DIR,
-    PLAN_RETENTION_LIMIT, PlanMeta, ProposedPlanExtractor, current_pointer_for,
-    migrate_legacy_plans, persist_plan, plan_file_for, plan_id_for, prune_plan_dir,
-    read_current_plan_id, read_plan_body, session_plan_dir, strip_front_matter,
+    PLAN_RETENTION_LIMIT, PlanLookupError, PlanMeta, ProposedPlanExtractor, current_pointer_for,
+    delete_plan, list_plans, migrate_legacy_plans, persist_plan, plan_file_for, plan_id_for,
+    prune_plan_dir, read_current_plan_id, read_plan_body, resolve_plan_prefix, session_plan_dir,
+    set_active_plan, strip_front_matter,
 };
 
 const TEST_SESSION_ID: &str = "test-sess-tui";
@@ -412,6 +413,151 @@ fn objective_derives_from_first_meaningful_line() {
         raw.contains("objective: Heading"),
         "heading text should be picked, marker stripped: {raw}"
     );
+}
+
+#[test]
+fn list_plans_returns_newest_first_and_marks_active() {
+    let root = fresh_workspace("list_plans");
+    let (id_older, _) =
+        persist_plan(&root, TEST_SESSION_ID, "alpha body", &empty_meta()).expect("persist alpha");
+    // Force older mtime so ordering is deterministic.
+    let alpha_path = plan_file_for(&root, TEST_SESSION_ID, &id_older);
+    std::fs::File::options()
+        .write(true)
+        .open(&alpha_path)
+        .expect("open alpha")
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+        .expect("set mtime alpha");
+    let (id_newer, _) =
+        persist_plan(&root, TEST_SESSION_ID, "beta body", &empty_meta()).expect("persist beta");
+    let entries = list_plans(&root, TEST_SESSION_ID);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].plan_id, id_newer, "newest first");
+    assert_eq!(entries[1].plan_id, id_older);
+    assert!(
+        entries[0].is_active,
+        "the most recently persisted plan is active by default"
+    );
+    assert!(!entries[1].is_active);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn list_plans_objective_round_trips_through_front_matter() {
+    let root = fresh_workspace("list_plans_objective");
+    persist_plan(
+        &root,
+        TEST_SESSION_ID,
+        "Fix Foo: tweak the bar",
+        &empty_meta(),
+    )
+    .expect("persist");
+    let entries = list_plans(&root, TEST_SESSION_ID);
+    assert_eq!(entries.len(), 1);
+    // The yaml_scalar quoting must be unwound when read back.
+    assert_eq!(entries[0].objective, "Fix Foo: tweak the bar");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_plan_prefix_finds_unique_match() {
+    let root = fresh_workspace("resolve_unique");
+    let (id, _) = persist_plan(&root, TEST_SESSION_ID, "body x", &empty_meta()).expect("persist");
+    let hex = id.strip_prefix("plan-").unwrap();
+    // Full id, hex-only, short prefix all resolve.
+    assert_eq!(
+        resolve_plan_prefix(&root, TEST_SESSION_ID, &id).unwrap(),
+        id
+    );
+    assert_eq!(
+        resolve_plan_prefix(&root, TEST_SESSION_ID, hex).unwrap(),
+        id
+    );
+    assert_eq!(
+        resolve_plan_prefix(&root, TEST_SESSION_ID, &hex[..4]).unwrap(),
+        id
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_plan_prefix_reports_not_found_and_ambiguous() {
+    let root = fresh_workspace("resolve_disambig");
+    // Two plans whose hex tails happen to share the same first character
+    // (`plan-0…` collides with `plan-0…` from a different body) — force
+    // by writing files directly so we control the ids.
+    let plans_dir = session_plan_dir(&root, TEST_SESSION_ID);
+    std::fs::create_dir_all(&plans_dir).expect("mkdir");
+    std::fs::write(plans_dir.join("plan-aaaaa1.md"), "---\n---\nbody one\n").expect("write a");
+    std::fs::write(plans_dir.join("plan-aaaaa2.md"), "---\n---\nbody two\n").expect("write b");
+
+    assert!(matches!(
+        resolve_plan_prefix(&root, TEST_SESSION_ID, "plan-aaaaa"),
+        Err(PlanLookupError::Ambiguous(_))
+    ));
+    assert!(matches!(
+        resolve_plan_prefix(&root, TEST_SESSION_ID, "plan-zzzz"),
+        Err(PlanLookupError::NotFound)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn delete_plan_removes_file_and_clears_pointer_when_active() {
+    let root = fresh_workspace("delete_clears_pointer");
+    let (id, path) =
+        persist_plan(&root, TEST_SESSION_ID, "body to delete", &empty_meta()).expect("persist");
+    assert_eq!(
+        read_current_plan_id(&root, TEST_SESSION_ID).as_deref(),
+        Some(id.as_str())
+    );
+    let removed = delete_plan(&root, TEST_SESSION_ID, &id).expect("delete");
+    assert_eq!(removed, path);
+    assert!(!path.exists());
+    assert!(
+        read_current_plan_id(&root, TEST_SESSION_ID).is_none(),
+        "deleting the active plan must clear the pointer"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn delete_plan_keeps_pointer_when_other_plan_is_active() {
+    let root = fresh_workspace("delete_keeps_pointer");
+    let (id_first, _) =
+        persist_plan(&root, TEST_SESSION_ID, "first body", &empty_meta()).expect("persist first");
+    let (id_second, _) =
+        persist_plan(&root, TEST_SESSION_ID, "second body", &empty_meta()).expect("persist second");
+    // Second persist re-pointed `current` at id_second. Delete the
+    // older one and the pointer must keep aiming at id_second.
+    delete_plan(&root, TEST_SESSION_ID, &id_first).expect("delete first");
+    assert_eq!(
+        read_current_plan_id(&root, TEST_SESSION_ID).as_deref(),
+        Some(id_second.as_str())
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn set_active_plan_rewrites_pointer_and_rejects_missing_id() {
+    let root = fresh_workspace("set_active");
+    let (id_a, _) =
+        persist_plan(&root, TEST_SESSION_ID, "alpha", &empty_meta()).expect("persist a");
+    let (id_b, _) = persist_plan(&root, TEST_SESSION_ID, "beta", &empty_meta()).expect("persist b");
+    // Currently `id_b` is active; flip back to `id_a`.
+    set_active_plan(&root, TEST_SESSION_ID, &id_a).expect("set active a");
+    assert_eq!(
+        read_current_plan_id(&root, TEST_SESSION_ID).as_deref(),
+        Some(id_a.as_str())
+    );
+    set_active_plan(&root, TEST_SESSION_ID, &id_b).expect("set active b");
+    assert_eq!(
+        read_current_plan_id(&root, TEST_SESSION_ID).as_deref(),
+        Some(id_b.as_str())
+    );
+    // Phantom plan must error.
+    assert!(set_active_plan(&root, TEST_SESSION_ID, "plan-does-not-exist").is_err());
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

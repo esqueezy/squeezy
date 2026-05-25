@@ -427,6 +427,167 @@ pub(crate) fn read_plan_body(path: &Path) -> io::Result<String> {
     Ok(strip_front_matter(&contents).to_string())
 }
 
+/// Summary record returned by [`list_plans`]. Sourced from the on-disk
+/// YAML front-matter where present; falls back to mtime / empty
+/// objective for legacy files that lack front-matter.
+#[derive(Debug, Clone)]
+pub(crate) struct PlanListEntry {
+    pub plan_id: String,
+    /// Absolute path on disk. Held so callers (PR-F renderers) can avoid
+    /// recomputing it; the `#[allow]` is here because PR-E only needs
+    /// the id + objective.
+    #[allow(dead_code)]
+    pub path: PathBuf,
+    pub modified: SystemTime,
+    pub objective: String,
+    pub is_active: bool,
+}
+
+/// List every plan file under the session's plan dir, newest first.
+/// Marks the entry pointed at by `current` as active. Returns an empty
+/// vec when the dir is missing or empty (never errors — callers render
+/// "no plans" instead).
+pub(crate) fn list_plans(workspace_root: &Path, session_id: &str) -> Vec<PlanListEntry> {
+    let dir = session_plan_dir(workspace_root, session_id);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let active_id = read_current_plan_id(workspace_root, session_id);
+    let mut out: Vec<PlanListEntry> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                return None;
+            }
+            let plan_id = path.file_stem()?.to_string_lossy().to_string();
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let objective = read_plan_objective(&path).unwrap_or_default();
+            let is_active = active_id.as_deref() == Some(plan_id.as_str());
+            Some(PlanListEntry {
+                plan_id,
+                path,
+                modified,
+                objective,
+                is_active,
+            })
+        })
+        .collect();
+    out.sort_by_key(|entry| std::cmp::Reverse(entry.modified));
+    out
+}
+
+/// Pull the `objective:` field out of a plan file's front-matter
+/// without loading a full YAML parser. Returns `None` when the file is
+/// unreadable, has no front-matter, or has no `objective` key.
+fn read_plan_objective(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    let after_open = contents.strip_prefix("---\n")?;
+    let close_rel = after_open.find("\n---")?;
+    let block = &after_open[..close_rel];
+    for line in block.lines() {
+        if let Some(value) = line.strip_prefix("objective: ") {
+            return Some(unquote_yaml_scalar(value.trim()));
+        }
+    }
+    None
+}
+
+/// Inverse of [`yaml_scalar`] for the small subset we emit: single-
+/// quoted strings with `''` escaping, or bare scalars.
+fn unquote_yaml_scalar(raw: &str) -> String {
+    if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
+        raw[1..raw.len() - 1].replace("''", "'")
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Error from a plan-id prefix lookup ([`resolve_plan_prefix`]).
+#[derive(Debug)]
+pub(crate) enum PlanLookupError {
+    /// No plan id in the session matches the prefix.
+    NotFound,
+    /// More than one plan id matches the prefix. Holds the matching ids
+    /// so the caller can render them for disambiguation.
+    Ambiguous(Vec<String>),
+}
+
+/// Resolve a possibly-truncated plan id to an exact one inside the
+/// session's plan dir. Accepts the full `plan-<hex>` form, just the
+/// hex tail, or any unique prefix of either.
+pub(crate) fn resolve_plan_prefix(
+    workspace_root: &Path,
+    session_id: &str,
+    needle: &str,
+) -> Result<String, PlanLookupError> {
+    let plans = list_plans(workspace_root, session_id);
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return Err(PlanLookupError::NotFound);
+    }
+    // Exact match wins, no matter how many other prefixes match.
+    if let Some(entry) = plans.iter().find(|entry| entry.plan_id == needle) {
+        return Ok(entry.plan_id.clone());
+    }
+    let hex_needle = needle.strip_prefix("plan-").unwrap_or(needle);
+    let matches: Vec<String> = plans
+        .iter()
+        .filter(|entry| {
+            let hex = entry
+                .plan_id
+                .strip_prefix("plan-")
+                .unwrap_or(&entry.plan_id);
+            entry.plan_id.starts_with(needle) || hex.starts_with(hex_needle)
+        })
+        .map(|entry| entry.plan_id.clone())
+        .collect();
+    match matches.len() {
+        0 => Err(PlanLookupError::NotFound),
+        1 => Ok(matches.into_iter().next().expect("len==1")),
+        _ => Err(PlanLookupError::Ambiguous(matches)),
+    }
+}
+
+/// Delete a plan file (and clear the `current` pointer if it referenced
+/// this plan). Returns the absolute path that was removed so callers
+/// can log it. Pointer cleanup is best-effort: a failure there does
+/// not roll back the file removal.
+pub(crate) fn delete_plan(
+    workspace_root: &Path,
+    session_id: &str,
+    plan_id: &str,
+) -> io::Result<PathBuf> {
+    let path = plan_file_for(workspace_root, session_id, plan_id);
+    fs::remove_file(&path)?;
+    if read_current_plan_id(workspace_root, session_id).as_deref() == Some(plan_id) {
+        let pointer = current_pointer_for(workspace_root, session_id);
+        let _ = fs::remove_file(&pointer);
+    }
+    Ok(path)
+}
+
+/// Rewrite the `current` pointer to designate `plan_id` as the active
+/// plan. The plan file must already exist on disk; returns an error
+/// when it doesn't so we never aim the pointer at a phantom.
+pub(crate) fn set_active_plan(
+    workspace_root: &Path,
+    session_id: &str,
+    plan_id: &str,
+) -> io::Result<()> {
+    let path = plan_file_for(workspace_root, session_id, plan_id);
+    if !path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("plan {plan_id} not found in session {session_id}"),
+        ));
+    }
+    write_current_pointer(workspace_root, session_id, plan_id)
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ProposedPlanExtractor {
     /// Bytes accumulated inside an unclosed `<proposed_plan>` block.

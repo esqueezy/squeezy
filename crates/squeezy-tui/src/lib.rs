@@ -222,6 +222,12 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         false,
         "[prompt]",
     ),
+    slash_args(
+        "/plans",
+        "manage persisted plan-mode artifacts (list/show/delete/set-active/open)",
+        true,
+        "[list|show|delete|set-active|open] [<id>]",
+    ),
     slash("/cost", "show token and cost accounting"),
     slash("/context", "show context budget and compaction state"),
     slash_args(
@@ -2239,6 +2245,10 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             }
             return true;
         }
+        "/plans" => {
+            handle_plans_command(app, rest);
+            return true;
+        }
         "/cost" => {
             let snapshot = agent.session_accounting_snapshot().await;
             app.status = "cost snapshot".to_string();
@@ -2680,6 +2690,233 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
     app.jobs.insert(job.id, job.clone());
     app.status = format!("started job {} {}", job.id, job.title);
     true
+}
+
+/// Dispatch for `/plans [list|show|delete|set-active|open] [<id>]`.
+/// Bare `/plans` (or `/plans list`) renders a table; the other
+/// subcommands take an id (or any unique prefix of one). Plan ids are
+/// resolved within the active session's plan dir; sibling sessions
+/// are intentionally invisible.
+fn handle_plans_command(app: &mut TuiApp, rest: &str) {
+    let mut parts = rest.split_whitespace();
+    let sub = parts.next().unwrap_or("list");
+    let arg = parts.next();
+    let sid = app.plan_session_id().to_string();
+    match sub {
+        "list" | "ls" => render_plans_list(app, &sid),
+        "show" | "view" | "cat" => {
+            if let Some(plan_id) = plans_resolve(app, &sid, arg) {
+                plans_show(app, &sid, &plan_id);
+            }
+        }
+        "delete" | "rm" => {
+            if let Some(plan_id) = plans_resolve(app, &sid, arg) {
+                plans_delete(app, &sid, &plan_id, parts.next());
+            }
+        }
+        "set-active" | "activate" | "use" => {
+            if let Some(plan_id) = plans_resolve(app, &sid, arg) {
+                plans_set_active(app, &sid, &plan_id);
+            }
+        }
+        "open" | "edit" => {
+            if let Some(plan_id) = plans_resolve(app, &sid, arg) {
+                plans_open(app, &sid, &plan_id);
+            }
+        }
+        "help" | "?" | "--help" | "-h" => {
+            app.status = "plans help".to_string();
+            app.push_transcript_item(TranscriptItem::system(plans_usage()));
+        }
+        other => {
+            app.status = format!("unknown /plans subcommand `{other}`");
+            app.push_transcript_item(TranscriptItem::system(plans_usage()));
+        }
+    }
+}
+
+fn plans_usage() -> String {
+    [
+        "usage:",
+        "  /plans              — list saved plans in this session",
+        "  /plans list",
+        "  /plans show <id>    — render a plan body",
+        "  /plans delete <id>  — remove a plan (add --yes to skip confirm)",
+        "  /plans set-active <id>",
+        "  /plans open <id>    — print path for opening in your editor",
+    ]
+    .join("\n")
+}
+
+/// Resolve the user's `<id>` argument to an exact plan id within the
+/// session. Sets status/transcript on error and returns `None` so the
+/// caller can early-out. On success returns the canonical plan id.
+fn plans_resolve(app: &mut TuiApp, sid: &str, raw: Option<&str>) -> Option<String> {
+    let Some(needle) = raw else {
+        app.status = "usage: /plans <subcommand> <id-or-prefix>".to_string();
+        return None;
+    };
+    match proposed_plan::resolve_plan_prefix(&app.workspace_root, sid, needle) {
+        Ok(plan_id) => Some(plan_id),
+        Err(proposed_plan::PlanLookupError::NotFound) => {
+            app.status = format!("no plan matches `{needle}` in this session");
+            None
+        }
+        Err(proposed_plan::PlanLookupError::Ambiguous(matches)) => {
+            app.status = format!("`{needle}` is ambiguous ({} matches)", matches.len());
+            let body = format!(
+                "Multiple plans match `{needle}`. Disambiguate by re-running with a longer prefix:\n{}",
+                matches
+                    .iter()
+                    .map(|id| format!("  {id}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            app.push_transcript_item(TranscriptItem::system(body));
+            None
+        }
+    }
+}
+
+fn render_plans_list(app: &mut TuiApp, sid: &str) {
+    let entries = proposed_plan::list_plans(&app.workspace_root, sid);
+    if entries.is_empty() {
+        app.status = "no plans persisted in this session".to_string();
+        return;
+    }
+    app.status = format!("{} plan(s) in this session", entries.len());
+    let now = std::time::SystemTime::now();
+    let mut lines = Vec::with_capacity(entries.len() + 1);
+    lines.push("  ACTIVE  ID                    AGE       OBJECTIVE".to_string());
+    for entry in &entries {
+        let age = format_age_short(now, entry.modified);
+        let marker = if entry.is_active {
+            "  *     "
+        } else {
+            "        "
+        };
+        let objective = truncate_for_display(&entry.objective, 60);
+        lines.push(format!(
+            "{marker}{id:<22} {age:<9} {objective}",
+            id = entry.plan_id,
+            age = age,
+            objective = objective,
+        ));
+    }
+    app.push_transcript_item(TranscriptItem::system(lines.join("\n")));
+}
+
+/// Render a short relative-age string (`12s`, `4m`, `3h`, `5d`) for
+/// `/plans list`. Anything older than 99 days collapses to `>99d`.
+fn format_age_short(now: std::time::SystemTime, when: std::time::SystemTime) -> String {
+    let elapsed = now.duration_since(when).unwrap_or_default();
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else if secs < 86_400 * 100 {
+        format!("{}d", secs / 86_400)
+    } else {
+        ">99d".to_string()
+    }
+}
+
+/// Trim `s` to at most `max_chars` codepoints, appending `…` when
+/// truncation actually happens. Empty input is rendered as `-`.
+fn truncate_for_display(s: &str, max_chars: usize) -> String {
+    if s.is_empty() {
+        return "-".to_string();
+    }
+    let mut iter = s.chars();
+    let head: String = (&mut iter).take(max_chars).collect();
+    if iter.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+fn plans_show(app: &mut TuiApp, sid: &str, plan_id: &str) {
+    let path = proposed_plan::plan_file_for(&app.workspace_root, sid, plan_id);
+    match proposed_plan::read_plan_body(&path) {
+        Ok(body) => {
+            app.status = format!("plan {plan_id}");
+            let header = format!("# Plan {plan_id}\n{}", compact_path(&path));
+            app.push_transcript_item(TranscriptItem::system(format!(
+                "{header}\n\n{}",
+                body.trim_end()
+            )));
+        }
+        Err(err) => app.status = format!("plans show failed: {err}"),
+    }
+}
+
+fn plans_delete(app: &mut TuiApp, sid: &str, plan_id: &str, flag: Option<&str>) {
+    // Confirmation gate: destructive ops require an explicit `--yes`
+    // (or `-y`). The user can re-run the same command after seeing the
+    // prompt without losing context.
+    let confirmed = matches!(flag, Some("--yes") | Some("-y") | Some("yes"));
+    if !confirmed {
+        app.status = format!("re-run with --yes to delete {plan_id}");
+        app.push_transcript_item(TranscriptItem::system(format!(
+            "/plans delete is destructive. Re-run as `/plans delete {plan_id} --yes` to confirm."
+        )));
+        return;
+    }
+    match proposed_plan::delete_plan(&app.workspace_root, sid, plan_id) {
+        Ok(path) => {
+            // Clear the in-memory active plan id if this was it; the
+            // pointer file has already been cleaned by `delete_plan`.
+            if app.current_plan_id.as_deref() == Some(plan_id) {
+                app.current_plan_id = None;
+                app.pending_plan_handoff = None;
+                app.plan_handoff_turns_seen = 0;
+            }
+            app.status = format!("deleted plan {plan_id}");
+            app.push_log(format!("plan {plan_id} deleted ({})", compact_path(&path)));
+        }
+        Err(err) => app.status = format!("plans delete failed: {err}"),
+    }
+}
+
+fn plans_set_active(app: &mut TuiApp, sid: &str, plan_id: &str) {
+    match proposed_plan::set_active_plan(&app.workspace_root, sid, plan_id) {
+        Ok(()) => {
+            app.current_plan_id = Some(plan_id.to_string());
+            app.status = format!("active plan → {plan_id}");
+            app.push_log(format!("set active plan: {plan_id}"));
+        }
+        Err(err) => app.status = format!("plans set-active failed: {err}"),
+    }
+}
+
+fn plans_open(app: &mut TuiApp, sid: &str, plan_id: &str) {
+    // The TUI owns the terminal in alternate-screen mode, so launching
+    // a foreground editor (vi/nano) inline would scramble the display.
+    // PR-E scope keeps this surface simple: print the path and the
+    // recommended editor command so the user can run it from another
+    // shell. The terminal-suspend integration is a follow-up.
+    let path = proposed_plan::plan_file_for(&app.workspace_root, sid, plan_id);
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .or_else(|| std::env::var("EDITOR").ok())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "notepad".to_string()
+            } else {
+                "vi".to_string()
+            }
+        });
+    app.status = format!("plan {plan_id} path printed");
+    app.push_transcript_item(TranscriptItem::system(format!(
+        "plan {plan_id}\nfile: {}\nopen with: {editor} {}",
+        compact_path(&path),
+        path.display()
+    )));
 }
 
 fn handle_help_command(app: &mut TuiApp, rest: &str) {
