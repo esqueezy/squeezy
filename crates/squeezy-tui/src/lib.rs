@@ -3094,13 +3094,17 @@ fn dedupe_assistant_repeated_tool_output(
 
 fn assistant_content_without_repeated_tool_output(app: &TuiApp, content: &str) -> String {
     let mut content = content.to_string();
-    for output in recent_shell_tool_outputs(app) {
-        if let Some(stripped) = strip_repeated_fenced_tool_output(&content, &output) {
+    let outputs = recent_shell_tool_outputs(app);
+    for output in &outputs {
+        if let Some(stripped) = strip_repeated_fenced_tool_output(&content, output) {
             content = stripped;
         }
-        if let Some(stripped) = strip_repeated_open_fenced_tool_output(&content, &output) {
+        if let Some(stripped) = strip_repeated_open_fenced_tool_output(&content, output) {
             content = stripped;
         }
+    }
+    if !outputs.is_empty() && assistant_tool_followup_is_filler(&content) {
+        return String::new();
     }
     content
 }
@@ -3303,6 +3307,59 @@ fn tidy_stripped_assistant_text(text: String) -> String {
         text.push('.');
     }
     text
+}
+
+fn assistant_tool_followup_is_filler(content: &str) -> bool {
+    let lines = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return true;
+    }
+    lines.iter().all(|line| tool_followup_filler_line(line))
+}
+
+fn tool_followup_filler_line(line: &str) -> bool {
+    let normalized = normalize_followup_line(line);
+    if normalized.is_empty() {
+        return true;
+    }
+    let generic_offer = normalized.starts_with("if you want")
+        || normalized.starts_with("i can also ")
+        || normalized.starts_with("i can next ")
+        || (normalized.starts_with("i can ") && normalized.contains(" next"))
+        || normalized.starts_with("let me know")
+        || normalized.starts_with("would you like");
+    let generic_output_intro = normalized.starts_with("here is ")
+        || normalized.starts_with("here's ")
+        || normalized.starts_with("this is ")
+        || normalized.starts_with("the output")
+        || normalized.starts_with("output:")
+        || normalized.starts_with("result:")
+        || normalized.starts_with("results:");
+    let generic_completion = matches!(
+        normalized.as_str(),
+        "done" | "completed" | "command completed" | "command completed successfully"
+    );
+    generic_offer || generic_output_intro || generic_completion
+}
+
+fn normalize_followup_line(line: &str) -> String {
+    line.trim()
+        .trim_matches(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '`' | '*' | '_' | '"' | '\'' | ':' | '.' | ',' | ';' | '-' | '—' | '–'
+                )
+        })
+        .replace('’', "'")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -3825,15 +3882,7 @@ fn shell_tool_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         .and_then(|call| string_arg(&call.arguments, "command"))
         .or_else(|| string_arg(&tool.result.content, "command"))
         .unwrap_or_else(|| tool.result.tool_name.clone());
-    let mut spans = Vec::new();
-    if shell_result_is_exploration(tool) {
-        spans.push(Span::styled(
-            shell_exploration_label(&command),
-            Style::default().fg(Color::White),
-        ));
-    }
-    spans.extend(command_spans(&command));
-    spans
+    command_spans(&command)
 }
 
 fn shell_result_is_exploration(tool: &ToolTranscript) -> bool {
@@ -3844,21 +3893,6 @@ fn shell_result_is_exploration(tool: &ToolTranscript) -> bool {
         tool.result.content["policy"]["capability"].as_str(),
         Some("read" | "search")
     )
-}
-
-fn shell_exploration_label(command: &str) -> &'static str {
-    let first = command
-        .split_whitespace()
-        .find(|token| !looks_like_env_assignment(token))
-        .unwrap_or_default();
-    match first {
-        "ls" => "List ",
-        "find" => "Find ",
-        "rg" | "grep" => "Search ",
-        "cat" | "sed" | "head" | "tail" => "Read ",
-        "pwd" => "Show ",
-        _ => "Inspect ",
-    }
 }
 
 fn decl_search_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
@@ -4427,7 +4461,10 @@ fn shell_output_block_lines(
 fn shell_output_title_line(command: &str, workdir: &str) -> Line<'static> {
     let mut spans = vec![
         Span::raw("  "),
-        Span::styled("• ", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "└ ",
+            Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
+        ),
     ];
     spans.extend(command_spans(command));
     spans.push(Span::styled(" in ", Style::default().fg(QUIET)));
