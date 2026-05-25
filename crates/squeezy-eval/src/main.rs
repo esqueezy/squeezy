@@ -35,6 +35,11 @@ enum Command {
         /// Output root directory; defaults to `target/eval`.
         #[arg(long, default_value = "target/eval")]
         out: PathBuf,
+        /// Suppress live streaming output (recommended for CI). Default
+        /// is to stream squeezy's activity to stdout so a watching user
+        /// sees what the agent is doing.
+        #[arg(long)]
+        quiet: bool,
     },
     /// List bundled or directory-provided scenarios.
     List {
@@ -90,7 +95,19 @@ async fn main() -> ExitCode {
             emit,
             gh_repo,
             out,
-        } => run_cmd(scenario, workspace_override, no_triage, emit, gh_repo, out).await,
+            quiet,
+        } => {
+            run_cmd(
+                scenario,
+                workspace_override,
+                no_triage,
+                emit,
+                gh_repo,
+                out,
+                quiet,
+            )
+            .await
+        }
         Command::List { dir } => list_cmd(dir),
         Command::Replay { trace } => replay_cmd(trace),
         Command::View { run } => view_cmd(run),
@@ -118,6 +135,7 @@ async fn run_cmd(
     emit: Option<String>,
     gh_repo: Option<String>,
     out: PathBuf,
+    quiet: bool,
 ) -> Result<(), squeezy_eval::driver::EvalError> {
     let mut scenario = squeezy_eval::scenario::load(&scenario_path)?;
     if let Some(path) = workspace_override {
@@ -133,6 +151,7 @@ async fn run_cmd(
         run_triage: !no_triage,
         emit_github: emit.as_deref() == Some("github"),
         gh_repo,
+        live: !quiet,
     };
     let outcome = squeezy_eval::run_scenario(scenario, options).await?;
     println!("eval run complete: {}", outcome.run_dir.display());

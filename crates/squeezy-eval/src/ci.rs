@@ -119,6 +119,10 @@ pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
             run_triage: false,
             emit_github: false,
             gh_repo: None,
+            // CI runs are unattended; the per-scenario PASS/FAIL summary
+            // line is the right granularity here, not a streamed
+            // narration per turn.
+            live: false,
         };
         match run_scenario(scenario, run_options).await {
             Ok(outcome) => {

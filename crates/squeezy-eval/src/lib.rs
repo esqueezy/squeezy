@@ -13,6 +13,7 @@ pub mod diff;
 pub mod driver;
 pub mod findings;
 pub mod frames;
+pub mod live;
 pub mod mock_provider;
 pub mod scenario;
 pub mod tickets;

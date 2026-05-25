@@ -509,6 +509,7 @@ squeezy-eval run <scenario.toml> [--workspace-override <path>]
                                  [--no-triage]
                                  [--emit github --gh-repo owner/name]
                                  [--out <dir>]
+                                 [--quiet]
 
 squeezy-eval list [<dir>]                       # ls bundled or directory scenarios
 squeezy-eval replay <trace.jsonl>               # one-line summary of a recorded trace
@@ -533,6 +534,7 @@ Flags:
   out (provider not configured, IO error, etc.). Default is
   `expectations,errors`.
 - `--junit <path>`: write a JUnit XML summary; one `<testcase>` per scenario.
+- `--quiet` (on `run`): suppress the default live narration. Without it, `squeezy-eval run` streams squeezy's activity to stdout as it happens — step boundaries, tool calls (`🔧 name(args)` + `↳ ✅/❌ status (bytes)`), the assistant's streaming text rendered inline, approvals, slash commands, and findings the moment each rule fires. Use `--quiet` for CI or when piping output into a pager. `check` always runs quietly because per-scenario PASS/FAIL is the right granularity for batch mode.
 
 ### `view` output
 
