@@ -59,6 +59,30 @@ pub(crate) fn instructions_for_mode(
     }
 }
 
+/// Whether the model should be allowed to edit the active plan file from
+/// inside Plan mode. True only when the session is in Plan mode AND a
+/// plan file already exists on disk for this workspace (no point exposing
+/// `apply_patch` when there is nothing yet to refine).
+pub(crate) fn plan_edit_allowed_in_workspace(mode: SessionMode, workspace_root: &Path) -> bool {
+    mode == SessionMode::Plan && latest_plan_path(workspace_root).is_some()
+}
+
+/// Exact-match check used by the runtime permission gate to grant Plan
+/// mode the right to edit *the* active plan file but nothing else.
+/// Both paths are canonicalised so `..` traversal and symlink trickery
+/// cannot smuggle a different file past the check. Returns `false` on
+/// any canonicalisation failure (e.g. the target does not exist on disk
+/// yet) — the safe default in a deny-by-default permission gate.
+pub(crate) fn is_active_plan_path(target: &Path, active: &Path) -> bool {
+    let Ok(target_canon) = std::fs::canonicalize(target) else {
+        return false;
+    };
+    let Ok(active_canon) = std::fs::canonicalize(active) else {
+        return false;
+    };
+    target_canon == active_canon
+}
+
 /// Newest `.md` file under `<workspace>/.squeezy/plans/`, by mtime. Returns
 /// `None` when the directory does not exist or holds no plan files.
 pub(crate) fn latest_plan_path(workspace_root: &Path) -> Option<PathBuf> {

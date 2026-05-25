@@ -480,6 +480,28 @@ async fn drain_agent_events(app: &mut TuiApp) {
                             app.plan_handoff_turns_seen = 0;
                             app.push_log("plan handoff cleared: plan is in motion".to_string());
                         }
+                        // Plan-mode in-place refinement (issue 2): the model
+                        // edited the active plan file via apply_patch. Re-
+                        // surface the post-plan choice prompt so the user
+                        // sees Execute/Refine/Discard/View against the new
+                        // body without having to wait for another
+                        // <proposed_plan> emission.
+                        if app.mode == SessionMode::Plan
+                            && let Some(plan_id) = app.current_plan_id.clone()
+                        {
+                            let plan_path =
+                                proposed_plan::plan_file_for(&app.workspace_root, &plan_id);
+                            if plan_path.exists() {
+                                app.push_log(format!(
+                                    "plan {plan_id} refined in place (apply_patch)"
+                                ));
+                                app.pending_plan_choice = Some(PendingPlanChoice {
+                                    plan_id,
+                                    plan_path,
+                                    selection_index: 0,
+                                });
+                            }
+                        }
                     }
                     let call = app.active_tool_calls.remove(&result.call_id);
                     app.refresh_active_tool_name();
