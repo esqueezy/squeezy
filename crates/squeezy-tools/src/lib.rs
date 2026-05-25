@@ -10674,6 +10674,7 @@ fn macos_sandbox_plan_probe_failure(
     None
 }
 
+#[cfg(target_os = "macos")]
 fn shell_sandbox_backend_probe_status_reason(
     backend: &'static str,
     status: &std::process::ExitStatus,

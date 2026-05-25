@@ -489,7 +489,9 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     metrics,
                     ..
                 } => {
-                    app.push_transcript_item(message);
+                    if let Some(message) = dedupe_assistant_repeated_tool_output(app, message) {
+                        app.push_transcript_item(message);
+                    }
                     app.pending_assistant.clear();
                     app.cost = cost;
                     app.metrics = metrics;
@@ -3082,6 +3084,116 @@ fn message_outcome(entries: &[TranscriptEntry], index: usize) -> MessageOutcome 
 fn is_failure_log(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("failed") || lower.contains("error") || lower.contains("cancelled")
+}
+
+fn dedupe_assistant_repeated_tool_output(
+    app: &TuiApp,
+    mut message: TranscriptItem,
+) -> Option<TranscriptItem> {
+    if message.role != Role::Assistant {
+        return Some(message);
+    }
+
+    let mut content = message.content.clone();
+    for output in recent_shell_tool_outputs(app) {
+        if let Some(stripped) = strip_repeated_fenced_tool_output(&content, &output) {
+            content = stripped;
+        }
+    }
+
+    message.content = content;
+    (!message.content.trim().is_empty()).then_some(message)
+}
+
+fn recent_shell_tool_outputs(app: &TuiApp) -> Vec<String> {
+    let mut outputs = Vec::new();
+    for entry in app.transcript.iter().rev() {
+        match &entry.kind {
+            TranscriptEntryKind::Message(item) if item.role == Role::User => break,
+            TranscriptEntryKind::ToolResult(tool)
+                if matches!(tool.result.tool_name.as_str(), "shell" | "verify") =>
+            {
+                if let Some(output) = shell_tool_output_text(tool) {
+                    outputs.push(output);
+                }
+            }
+            _ => {}
+        }
+    }
+    outputs
+}
+
+fn shell_tool_output_text(tool: &ToolTranscript) -> Option<String> {
+    let stdout = string_arg(&tool.result.content, "stdout").unwrap_or_default();
+    let stderr = string_arg(&tool.result.content, "stderr").unwrap_or_default();
+    let output = match (!stdout.trim().is_empty(), !stderr.trim().is_empty()) {
+        (true, true) => format!("{stdout}\n{stderr}"),
+        (true, false) => stdout,
+        (false, true) => stderr,
+        (false, false) => string_arg(&tool.result.content, "output").unwrap_or_default(),
+    };
+    (!output.trim().is_empty()).then_some(output)
+}
+
+fn strip_repeated_fenced_tool_output(content: &str, output: &str) -> Option<String> {
+    let duplicate = normalize_duplicate_tool_output(output);
+    if duplicate.len() < 80 && duplicate.lines().count() < 4 {
+        return None;
+    }
+
+    let mut kept = Vec::new();
+    let mut fence = Vec::new();
+    let mut in_fence = false;
+    let mut changed = false;
+
+    for line in content.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_fence {
+                fence.push(line.to_string());
+                let body = fence[1..fence.len().saturating_sub(1)].join("\n");
+                if fenced_block_repeats_tool_output(&body, &duplicate) {
+                    changed = true;
+                } else {
+                    kept.append(&mut fence);
+                }
+                in_fence = false;
+            } else {
+                in_fence = true;
+                fence.push(line.to_string());
+            }
+        } else if in_fence {
+            fence.push(line.to_string());
+        } else {
+            kept.push(line.to_string());
+        }
+    }
+
+    if in_fence {
+        kept.append(&mut fence);
+    }
+
+    changed.then(|| tidy_stripped_assistant_text(kept.join("\n")))
+}
+
+fn fenced_block_repeats_tool_output(body: &str, duplicate: &str) -> bool {
+    let body = normalize_duplicate_tool_output(body);
+    !body.is_empty() && (body == duplicate || body.contains(duplicate) || duplicate.contains(&body))
+}
+
+fn normalize_duplicate_tool_output(text: &str) -> String {
+    text.replace("\r\n", "\n").trim().to_string()
+}
+
+fn tidy_stripped_assistant_text(text: String) -> String {
+    let mut text = text.trim().to_string();
+    while text.contains("\n\n\n") {
+        text = text.replace("\n\n\n", "\n\n");
+    }
+    if text.ends_with(':') {
+        text.pop();
+        text.push('.');
+    }
+    text
 }
 
 #[cfg(test)]

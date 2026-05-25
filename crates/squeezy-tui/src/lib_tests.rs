@@ -2864,6 +2864,68 @@ async fn completed_event_preserves_scroll_offset_in_history() {
 }
 
 #[tokio::test]
+async fn completed_event_suppresses_assistant_duplicate_shell_output_fence() {
+    let mut app = test_app(SessionMode::Build);
+    let stdout = [
+        "total 104",
+        "drwxr-xr-x@  22 abbassabra  staff    704 May 24 14:59 .",
+        "drwxr-x---+ 109 abbassabra  staff   3488 May 25 13:58 ..",
+        "-rw-r--r--@   1 abbassabra  staff  16326 May 24 23:27 README.md",
+        "drwxr-xr-x@  34 abbassabra  staff   1088 May 23 00:01 tools",
+    ]
+    .join("\n");
+    let call = ToolCall {
+        call_id: "shell-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": "ls -la"}),
+    };
+    let mut result = sample_tool_result("shell", "");
+    result.call_id = "shell-1".to_string();
+    result.content = serde_json::json!({
+        "command": "ls -la",
+        "workdir": ".",
+        "exit_code": 0,
+        "stdout": stdout,
+        "stderr": "",
+    });
+    app.push_tool_result_with_call(result, Some(call));
+
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant(format!(
+            "Here’s `ls -la` for the repo root:\n\n```text\n{stdout}\n```\n\nI can list a subdirectory next."
+        )),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+
+    drain_agent_events(&mut app).await;
+
+    let assistant = app
+        .transcript
+        .iter()
+        .find_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Message(item) if item.role == Role::Assistant => {
+                Some(item.content.as_str())
+            }
+            _ => None,
+        })
+        .expect("assistant message");
+    assert!(assistant.contains("Here’s `ls -la`"), "{assistant}");
+    assert!(!assistant.contains("```"), "{assistant}");
+    assert!(!assistant.contains("README.md"), "{assistant}");
+
+    let rendered = render_to_string(&app, 140, 24);
+    assert_eq!(rendered.matches("README.md").count(), 1, "{rendered}");
+}
+
+#[tokio::test]
 async fn job_events_update_state_without_resetting_turn() {
     let mut app = test_app(SessionMode::Build);
     let (tx, rx) = mpsc::channel(4);
