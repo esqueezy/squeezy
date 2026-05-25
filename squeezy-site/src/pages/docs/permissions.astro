@@ -3,46 +3,41 @@ import DocsLayout from "../../layouts/DocsLayout.astro";
 ---
 
 <DocsLayout
-  title="Permissions - SqueezyAgent"
-  description="Draft permissions docs for SqueezyAgent."
+  title="Permissions - Squeezy"
+  description="Squeezy permission policy, shell sandboxing, checkpoints, and verification controls."
   activeDoc="/docs/permissions/"
-  heading="Permissions"
-  lead="A local agent should make mutation explicit and keep cheap semantic reads fast."
+  eyebrow="permissions"
+  heading="Local power is gated by local policy."
+  lead="Squeezy can read, edit, run shell commands, call compilers, fetch web content, and use MCP tools, but those capabilities go through explicit policy checks."
 >
   <section class="doc-block">
-    <span class="status-pill">draft</span>
-    <h2>Permission posture</h2>
-    <p>
-      Read-only semantic queries should be cheap and low-friction. File writes,
-      shell commands, web access, and destructive operations should remain gated
-      by mode and user policy.
-    </p>
+    <h2>Capability classes</h2>
+    <div class="doc-card-grid">
+      <article class="card">
+        <span class="label">read</span>
+        <h3>Filesystem and graph reads</h3>
+        <p>Graph reads are local and read-only. Raw file reads, grep, glob, and tool-output reads are bounded and receipt-backed.</p>
+      </article>
+      <article class="card">
+        <span class="label">mutate</span>
+        <h3>Edits and commands</h3>
+        <p>Plan mode hides mutating tools. Build mode exposes them behind the configured permission engine and optional checkpoints.</p>
+      </article>
+      <article class="card">
+        <span class="label">network</span>
+        <h3>Web and MCP</h3>
+        <p>Web search/fetch and MCP tools are routed through capability checks, output caps, redaction, and remote-evidence labels.</p>
+      </article>
+      <article class="card">
+        <span class="label">verify</span>
+        <h3>Compiler and test evidence</h3>
+        <p>Verification commands provide build, test, lint, and compiler evidence when the task calls for it.</p>
+      </article>
+    </div>
   </section>
 
   <section class="doc-block">
-    <h2>Current foundation</h2>
-    <p>
-      Edit and shell tools route through allow, ask, or deny policy. Web search
-      and fetch are also permission-gated, with host-visible approval summaries
-      and bounded response sizes.
-    </p>
-  </section>
-
-  <section class="doc-block">
-    <h2>Structured denial is part of the loop</h2>
-    <p>
-      When a write or web fetch is denied, the model receives a structured tool
-      result instead of guessing what happened. The file or network request does
-      not proceed, and the agent can continue from the policy result.
-    </p>
-  </section>
-
-  <section class="doc-block">
-    <h2>Modes</h2>
-    <p>
-      Product docs should eventually distinguish planning, building,
-      verification, and general question-answering modes so the tool surface
-      matches the user intent.
-    </p>
+    <h2>Sandbox note</h2>
+    <p>macOS and Linux can use stronger filesystem and network sandboxing. On Windows, shell sandboxing is Job-Object-only and filesystem/network isolation degrades to best-effort-unavailable; required mode denies before spawn.</p>
   </section>
 </DocsLayout>

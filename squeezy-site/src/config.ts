@@ -1,11 +1,12 @@
 export const SITE = {
-  name: "SqueezyAgent",
+  name: "Squeezy",
   url: "https://squeezyagent.com",
   description:
-    "A cost-first coding agent that uses local semantic code understanding before spending model tokens.",
+    "A Rust coding agent that spends model tokens only after local static analysis has narrowed the code evidence.",
   repoUrl: "https://github.com/esqueezy/squeezy",
   issuesUrl: "https://github.com/esqueezy/squeezy/issues",
   discussionsUrl: "https://github.com/esqueezy/squeezy/discussions",
+  telemetryEndpoint: "https://squeezy-telemetry.esqueezy.workers.dev/v1/site",
   securityContactLabel: "security contact before public v0"
 };
 
@@ -13,31 +14,41 @@ export const DOCS_NAV = [
   {
     href: "/docs/install/",
     label: "Install",
-    status: "pre-v0"
-  },
-  {
-    href: "/docs/config/",
-    label: "Configuration",
-    status: "draft"
+    status: "setup"
   },
   {
     href: "/docs/semantic-navigation/",
-    label: "Code structure",
-    status: "pre-v0"
+    label: "Graph",
+    status: "static analysis"
   },
   {
     href: "/docs/cost-receipts/",
-    label: "Cost receipts",
-    status: "draft"
+    label: "Optimization",
+    status: "token budget"
+  },
+  {
+    href: "/docs/config/",
+    label: "Config",
+    status: "settings"
   },
   {
     href: "/docs/permissions/",
     label: "Permissions",
-    status: "draft"
+    status: "policy"
+  },
+  {
+    href: "/docs/languages/",
+    label: "Languages",
+    status: "coverage"
+  },
+  {
+    href: "/docs/providers/",
+    label: "Providers",
+    status: "models"
   },
   {
     href: "/docs/troubleshooting/",
-    label: "Troubleshooting",
-    status: "pre-v0"
+    label: "Support",
+    status: "debug/report"
   }
 ];

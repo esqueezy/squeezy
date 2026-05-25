@@ -1,7 +1,7 @@
 {
-  "name": "SqueezyAgent",
+  "name": "Squeezy",
   "short_name": "Squeezy",
-  "description": "Local semantic code understanding before model spend.",
+  "description": "Local code structure before model context.",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#080807",

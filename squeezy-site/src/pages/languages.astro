@@ -1,0 +1,60 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { languageRows } from "../facts";
+---
+
+<BaseLayout
+  title="Language Coverage - Squeezy"
+  description="Squeezy premium graph support across Rust, Python, Java, C#, Go, C, C++, JavaScript, and TypeScript, with bounded fallback for other languages."
+  active="languages"
+>
+  <section class="page-hero">
+    <div class="page-hero-inner">
+      <span class="eyebrow">language coverage</span>
+      <h1>Premium graph support for the languages your teams maintain most.</h1>
+      <p class="lead">
+        Squeezy gives these languages the strongest cost-saving path: local
+        graph navigation before broad file reads. Other languages still work
+        through bounded search, file reads, shell commands, and verifier tools,
+        but they do not get the same structured navigation savings.
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="matrix">
+      {
+        languageRows.map((row) => (
+          <article class="matrix-row">
+            <div>
+              <h3>{row.name}</h3>
+            </div>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill ok">{row.status}</span>}
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="section-header">
+      <span class="eyebrow">graph coverage</span>
+      <h2>Language-aware indexing gives the model a smaller starting packet.</h2>
+      <p>
+        Premium language support means Squeezy can answer architecture, impact,
+        and symbol questions from local evidence first: declarations,
+        relationships, calls, references, workspace facts, and changed-code
+        context.
+      </p>
+      <div class="actions">
+        <a class="button" href="/docs/semantic-navigation/" data-track-click="languages_graph_docs">
+          Graph docs
+        </a>
+        <a class="button secondary" href="/docs/cost-receipts/" data-track-click="languages_optimization_docs">
+          Optimization docs
+        </a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

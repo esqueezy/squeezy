@@ -1,10 +1,10 @@
-# SqueezyAgent Site
+# Squeezy Site
 
-Draft static website for `squeezyagent.com`.
+Static Astro site for `squeezyagent.com`.
 
-This site is intentionally separate from the Rust implementation repo while the
-product is pre-v0. Content is allowed to evolve as implementation behavior,
-docs, benchmarks, and contact paths become real.
+The site is intentionally static. Motion, diagrams, and interactive browser
+elements run client-side, but there is no app server, database, account system,
+or server-side rendering in the website itself.
 
 ## Local Development
 
@@ -25,7 +25,8 @@ http://127.0.0.1:4321/
 npm run build
 ```
 
-Astro writes the static site to `dist/`.
+Astro writes the generated site to `squeezy-site/dist/`, which is ignored.
+Do not commit generated top-level `dist/` output.
 
 ## Cloudflare Pages
 
@@ -33,41 +34,21 @@ Recommended Pages settings:
 
 ```text
 Framework preset: Astro
-Build command: npm run build
+Build command: npm ci && npm run build
 Build output directory: dist
 Root directory: squeezy-site
-Production branch: main, or the branch used for the website draft
+Production branch: main
 ```
 
-You do not need Cloudflare credentials to edit or build this template locally.
-Publishing to `squeezyagent.com` later requires:
+## Content Boundary
 
-- a Git repository connected to Cloudflare Pages, or a manual Pages upload;
-- a Cloudflare Pages project;
-- `squeezyagent.com` added as a custom domain on that Pages project;
-- optional `www.squeezyagent.com` redirect or alias.
+Public copy should be grounded in repo facts from `README.md`,
+`docs/external/`, `docs/internal/BENCHMARKS.md`, and the implementation.
+Avoid quantitative savings claims until release artifacts and auditable
+benchmark traces exist.
 
-Because the domain is already in Cloudflare, Pages can usually create or update
-the necessary DNS records after the custom domain is added.
+## Website Telemetry
 
-## Content Status
-
-- Homepage: draft positioning.
-- How it works: architecture narrative, pre-v0.
-- Docs: split draft docs under `/docs/` for install, config, semantic
-  navigation, cost receipts, permissions, and troubleshooting.
-- Roadmap: evolving pre-v0 roadmap.
-- Benchmarks: methodology placeholder, no public savings claims yet.
-- Contact: GitHub-first placeholder, with security email to be added before a
-  public release.
-
-Shared site metadata, GitHub URLs, and docs navigation live in
-`src/config.ts`.
-
-Static assets include:
-
-- `public/favicon.svg`
-- `public/og.svg`
-- `public/robots.txt`
-- `public/site.webmanifest`
-- generated `/sitemap.xml`
+The site sends anonymous visitor and CTA events to the Squeezy telemetry Worker
+at `/v1/site`. The browser client respects Do Not Track and the local opt-out
+key `squeezy_site_telemetry_opt_out=1`.

@@ -3,15 +3,21 @@ import { SITE } from "../config";
 const routes = [
   "/",
   "/how-it-works/",
+  "/install/",
+  "/languages/",
+  "/providers/",
+  "/benchmarks/",
+  "/roadmap/",
+  "/contact/",
   "/docs/",
   "/docs/install/",
   "/docs/config/",
   "/docs/semantic-navigation/",
   "/docs/cost-receipts/",
+  "/docs/languages/",
+  "/docs/providers/",
   "/docs/permissions/",
-  "/docs/troubleshooting/",
-  "/benchmarks/",
-  "/contact/"
+  "/docs/troubleshooting/"
 ];
 
 export function GET() {

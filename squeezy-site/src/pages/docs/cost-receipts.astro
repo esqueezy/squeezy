@@ -3,64 +3,52 @@ import DocsLayout from "../../layouts/DocsLayout.astro";
 ---
 
 <DocsLayout
-  title="Cost Receipts - SqueezyAgent"
-  description="Draft cost receipt docs for SqueezyAgent."
+  title="Token And Read Optimization - Squeezy"
+  description="Squeezy tool-call saving, read slicing, receipts, spill handles, lazy schemas, and budget counters."
   activeDoc="/docs/cost-receipts/"
-  heading="Cost receipts"
-  lead="Receipts make context spend visible: what was read, what was sent, what changed, and what was avoided."
+  eyebrow="optimization"
+  heading="The cost work happens before the provider request."
+  lead="Squeezy is designed around the idea that model context is expensive and local CPU work is comparatively cheap. The agent tries to spend deterministic local work before paid model tokens."
 >
   <section class="doc-block">
-    <span class="status-pill">draft</span>
-    <h2>What a receipt should track</h2>
-    <div class="grid-2">
+    <h2>Read optimization</h2>
+    <div class="doc-card-grid">
       <article class="card">
-        <h3>Code slices</h3>
-        <p>Path, content hash, byte range, line range, freshness, and reason.</p>
+        <span class="label">read_slice</span>
+        <h3>Exact ranges</h3>
+        <p>After graph navigation narrows a symbol or code region, Squeezy can send only that slice instead of a whole file.</p>
       </article>
       <article class="card">
-        <h3>Tool output</h3>
-        <p>Bytes scanned, preview size, spill handle, and model-facing tokens.</p>
+        <span class="label">diff reads</span>
+        <h3>Changed code only</h3>
+        <p>read_slice can target worktree, staged, branch-base, index, or last-receipt baselines so review turns focus on changed ranges.</p>
       </article>
       <article class="card">
-        <h3>Repeated reads</h3>
-        <p>Unchanged ranges should return compact receipt references.</p>
+        <span class="label">receipts</span>
+        <h3>Do not resend unchanged bytes</h3>
+        <p>Repeated read-style outputs can return compact receipt stubs when Squeezy has already shown the model the same content.</p>
       </article>
       <article class="card">
-        <h3>Benchmarks</h3>
-        <p>Receipts become the evidence behind any public savings claim.</p>
+        <span class="label">spills</span>
+        <h3>Preview now, exact output later</h3>
+        <p>Large tool outputs are stored locally behind handles. The model receives a shaped preview and can request exact ranges only when needed.</p>
       </article>
     </div>
   </section>
 
   <section class="doc-block">
-    <h2>Implemented foundation</h2>
-    <p>
-      Current fallback tools already return cost hints, output caps, sha256
-      receipts, spill handles for large outputs, and aggregate result budgets.
-      Receipt-backed read stubs and structure-aware navigation are later
-      structural savings.
-    </p>
+    <h2>Tool-call budget</h2>
+    <p>Squeezy tracks and surfaces tool calls, read bytes, search-file counts, receipt hits, output spills, denials, provider tokens, cache counters, and estimated cost. Budget pressure becomes visible in the session instead of being hidden in provider invoices.</p>
+    <pre><code>SQUEEZY_MAX_TOOL_CALLS_PER_TURN
+SQUEEZY_MAX_TOOL_BYTES_READ_PER_TURN
+SQUEEZY_MAX_SEARCH_FILES_PER_TURN
+SQUEEZY_MAX_TOOL_RESULT_BYTES_PER_ROUND
+SQUEEZY_TOOL_SPILL_THRESHOLD_BYTES
+SQUEEZY_EXPLORATION_COMPILER=off</code></pre>
   </section>
 
   <section class="doc-block">
-    <h2>Concrete tool behaviors</h2>
-    <div class="grid-2">
-      <article class="card">
-        <h3>Search modes</h3>
-        <p>`grep` can return content, files-with-matches, or counts depending on how much context the model actually needs.</p>
-      </article>
-      <article class="card">
-        <h3>Spill handles</h3>
-        <p>Large reads and tool outputs become compact previews plus local handles for exact follow-up ranges.</p>
-      </article>
-      <article class="card">
-        <h3>Aggregate budget</h3>
-        <p>Parallel tool results are packed against one model-facing budget for the whole round.</p>
-      </article>
-      <article class="card">
-        <h3>Stable tool surface</h3>
-        <p>Tool schemas are sorted deterministically to keep provider prompt/cache prefixes stable.</p>
-      </article>
-    </div>
+    <h2>Schema loading</h2>
+    <p>Core tools stay visible. Long-tail and MCP tools can be advertised through a compact index and loaded lazily with `load_tool_schema`, preserving smaller initial prompts while keeping tools discoverable.</p>
   </section>
 </DocsLayout>

@@ -3,42 +3,50 @@ import DocsLayout from "../../layouts/DocsLayout.astro";
 ---
 
 <DocsLayout
-  title="SqueezyAgent Configuration"
-  description="Draft configuration docs for SqueezyAgent."
+  title="Configuration - Squeezy"
+  description="Squeezy configuration precedence, provider defaults, credentials, and local inspection commands."
   activeDoc="/docs/config/"
-  heading="Configuration"
-  lead="Configuration should keep provider access, budgets, permissions, and indexing behavior explicit."
+  eyebrow="configuration"
+  heading="Configuration is layered and inspectable."
+  lead="Squeezy keeps provider choice, model profile, permissions, sandboxing, telemetry, graph settings, and session behavior in one typed configuration model."
 >
   <section class="doc-block">
-    <span class="status-pill">draft</span>
-    <h2>Configuration areas</h2>
-    <div class="grid-2">
+    <h2>Precedence</h2>
+    <p>From highest to lowest precedence, Squeezy resolves settings from CLI flags, environment variables, the nearest project `squeezy.toml`, user `~/.squeezy/settings.toml`, and built-in defaults.</p>
+    <div class="doc-card-grid">
       <article class="card">
-        <h3>Providers</h3>
-        <p>OpenAI Responses and Anthropic Messages streaming provider setup, routing defaults, and cache settings.</p>
+        <span class="label">inspect</span>
+        <h3>See the merged config</h3>
+        <pre><code>squeezy config inspect</code></pre>
+        <p>Sensitive values are redacted before display.</p>
       </article>
       <article class="card">
-        <h3>Budgets</h3>
-        <p>Per-turn token limits, tool-result limits, and fallback thresholds.</p>
-      </article>
-      <article class="card">
-        <h3>Indexing</h3>
-        <p>Repo roots, ignored paths, Rust semantic support, fallback languages, and graph freshness.</p>
-      </article>
-      <article class="card">
-        <h3>Permissions</h3>
-        <p>Read, write, shell, web, and verification policy by agent mode.</p>
+        <span class="label">doctor</span>
+        <h3>Check runtime readiness</h3>
+        <pre><code>squeezy doctor</code></pre>
+        <p>Doctor reports config sources, provider credential state, repo profile, session store, and sandbox availability.</p>
       </article>
     </div>
   </section>
 
   <section class="doc-block">
-    <h2>Current runtime knobs</h2>
-    <p>
-      The foundation already exposes environment-driven controls for provider,
-      model, max output tokens, parallel tool limits, spill thresholds, preview
-      sizes, aggregate tool-result budgets, web permissions, and Exa MCP web
-      search configuration.
-    </p>
+    <h2>Provider example</h2>
+    <p>Provider defaults are stored as names and settings. Secret token values stay in environment variables, macOS Keychain, AWS credentials, or the provider's own local runtime.</p>
+    <pre><code>[model]
+provider = "openai"
+profile = "balanced"
+model = ""
+
+[providers.openai]
+api_key_env = "OPENAI_API_KEY"
+
+[permissions]
+web = "ask"
+shell = "ask"</code></pre>
+  </section>
+
+  <section class="doc-block">
+    <h2>Why it matters for cost</h2>
+    <p>Configuration controls the model profile, context limit hints, tool budgets, schema loading, web permission policy, telemetry opt-out, and shell sandbox behavior. Those settings decide when Squeezy can use local evidence and when it is allowed to spend provider context.</p>
   </section>
 </DocsLayout>

@@ -3,45 +3,53 @@ import DocsLayout from "../../layouts/DocsLayout.astro";
 ---
 
 <DocsLayout
-  title="Install SqueezyAgent"
-  description="Draft installation notes for SqueezyAgent."
+  title="Install Docs - Squeezy"
+  description="Squeezy install, first-run provider selection, diagnostics, and session start."
   activeDoc="/docs/install/"
-  heading="Install"
-  lead="Packaging is not final before v0. This page holds the future install path and current expectations."
+  eyebrow="install"
+  heading="Choose a platform, install Squeezy, run doctor."
+  lead="The install flow is platform-first: use the native package path for your OS, verify with doctor, then start Squeezy in the repository you want it to understand."
 >
   <section class="doc-block">
-    <span class="status-pill">pre-v0 placeholder</span>
-    <h2>Expected product surface</h2>
-    <p>
-      The first supported product surface is a local terminal UI. The current
-      repository builds the CLI locally; packaged v0 release instructions will
-      be published once artifacts are ready.
-    </p>
+    <h2>Primary install commands</h2>
+    <div class="doc-card-grid">
+      <article class="card">
+        <span class="label">macOS</span>
+        <h3>Apple Silicon and Intel release targets</h3>
+        <pre><code>curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh</code></pre>
+        <p>Targets: `aarch64-apple-darwin`, `x86_64-apple-darwin`. Homebrew is also documented.</p>
+      </article>
+      <article class="card">
+        <span class="label">Linux</span>
+        <h3>x86_64 static binary</h3>
+        <pre><code>curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh</code></pre>
+        <p>Target: `x86_64-unknown-linux-musl`.</p>
+      </article>
+      <article class="card">
+        <span class="label">Windows</span>
+        <h3>x86_64</h3>
+        <pre><code>winget install esqueezy.Squeezy</code></pre>
+        <p>Target: `x86_64-pc-windows-msvc`. Manual zip install is also documented.</p>
+      </article>
+      <article class="card">
+        <span class="label">source</span>
+        <h3>Cargo install</h3>
+        <pre><code>cargo install squeezy --locked</code></pre>
+        <p>Use when you already have the required Rust toolchain.</p>
+      </article>
+    </div>
   </section>
 
   <section class="doc-block">
-    <h2>Target platforms</h2>
-    <p>
-      v0 targets macOS and Linux. The Linux release artifact is planned for
-      `x86_64-unknown-linux-musl` so it can run without a glibc dependency.
-    </p>
+    <h2>First run</h2>
+    <pre><code>export OPENAI_API_KEY=...
+squeezy doctor
+squeezy</code></pre>
+    <p>On first interactive startup, Squeezy can detect configured provider credentials and local Ollama availability, then save provider/model defaults without writing secret token values.</p>
   </section>
 
   <section class="doc-block">
-    <h2>Likely install notes</h2>
-    <p>
-      The docs should cover provider key setup, first-run indexing behavior, and
-      how to run SqueezyAgent inside an existing repository once packaging is
-      stable.
-    </p>
-  </section>
-
-  <section class="doc-block">
-    <h2>Current CLI smoke paths</h2>
-    <p>
-      The CLI supports `--health` for configuration smoke checks and `--prompt`
-      for a one-shot streamed response. Provider and model can be selected with
-      `SQUEEZY_PROVIDER`, `SQUEEZY_MODEL`, or matching flags.
-    </p>
+    <h2>Self-investigation</h2>
+    <p>Ask Squeezy about Squeezy with `/help` or natural questions such as "how does Squeezy choose providers?" Product-help questions are answered from bundled docs and redacted config before a provider call is made.</p>
   </section>
 </DocsLayout>
