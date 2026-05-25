@@ -60,6 +60,8 @@ mod overlay;
 mod render;
 mod status;
 mod streaming;
+mod streaming_patch;
+pub use streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
 
 use render::palette::{
     AMBER, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN,
