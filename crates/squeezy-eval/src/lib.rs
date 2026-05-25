@@ -13,10 +13,12 @@ pub mod diff;
 pub mod driver;
 pub mod findings;
 pub mod frames;
+pub mod live;
 pub mod mock_provider;
 pub mod scenario;
 pub mod tickets;
 pub mod triage;
+pub mod view;
 pub mod workspace;
 
 pub use capture::{Capture, EvalEvent, EvalEventKind};
