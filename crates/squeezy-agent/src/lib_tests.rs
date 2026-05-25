@@ -61,14 +61,29 @@ impl LlmProvider for MockProvider {
     }
 }
 
-struct PendingProvider;
+struct HangingProvider {
+    requests: Mutex<Vec<LlmRequest>>,
+}
 
-impl LlmProvider for PendingProvider {
-    fn name(&self) -> &'static str {
-        "pending"
+impl HangingProvider {
+    fn new() -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+        }
     }
 
-    fn stream_response(&self, _request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+    fn requests(&self) -> Vec<LlmRequest> {
+        self.requests.lock().expect("requests").clone()
+    }
+}
+
+impl LlmProvider for HangingProvider {
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+
+    fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        self.requests.lock().expect("requests").push(request);
         Box::pin(stream::pending())
     }
 }
@@ -277,7 +292,7 @@ async fn turn_stream_accumulates_assistant_text() {
 
 #[tokio::test]
 async fn llm_stream_observes_cancellation_within_one_yield() {
-    let provider = Arc::new(PendingProvider);
+    let provider = Arc::new(HangingProvider::new());
     let agent = Agent::new(AppConfig::default(), provider);
     let cancel = CancellationToken::new();
     let cancel_task = {
@@ -435,6 +450,33 @@ async fn turn_stream_reports_provider_error() {
     }
 
     assert!(saw_error);
+}
+
+#[tokio::test]
+async fn stalled_model_stream_fails_after_idle_timeout() {
+    let provider = Arc::new(HangingProvider::new());
+    let config = AppConfig {
+        stream_idle_timeout: Duration::from_millis(10),
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut saw_timeout = false;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::Failed { error, .. } = event {
+                saw_timeout = error
+                    .to_string()
+                    .contains("idle timeout waiting for model stream");
+            }
+        }
+    })
+    .await
+    .expect("stalled model stream should fail promptly");
+
+    assert!(saw_timeout);
+    assert_eq!(provider.requests().len(), 1);
 }
 
 #[tokio::test]
