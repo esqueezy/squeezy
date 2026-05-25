@@ -34,7 +34,7 @@ const ERROR_PIPE_BUSY: i32 = 231;
 /// `SQUEEZY_ASK_SOCKET` env-var plumbing. Holds a filesystem path on Unix
 /// and a named-pipe identifier on Windows.
 #[derive(Clone, Debug)]
-pub(crate) struct IpcEndpoint {
+pub struct IpcEndpoint {
     inner: EndpointInner,
 }
 
@@ -54,7 +54,7 @@ impl IpcEndpoint {
     /// — the PID disambiguates concurrent Squeezy processes that picked the
     /// same call_id.
     #[allow(unused_variables)]
-    pub(crate) fn for_shell_ask(root: &std::path::Path, sanitized_id: &str) -> Self {
+    pub fn for_shell_ask(root: &std::path::Path, sanitized_id: &str) -> Self {
         #[cfg(unix)]
         {
             let path = root
@@ -87,10 +87,8 @@ impl IpcEndpoint {
     }
 
     /// Recover an endpoint from the `SQUEEZY_ASK_SOCKET` value the parent
-    /// process exported to a shell child. Wired up by the next commit when
-    /// `squeezy ask` moves onto this abstraction.
-    #[allow(dead_code)]
-    pub(crate) fn from_env_value(value: &OsStr) -> Self {
+    /// process exported to a shell child.
+    pub fn from_env_value(value: &OsStr) -> Self {
         #[cfg(unix)]
         {
             Self {
@@ -106,7 +104,7 @@ impl IpcEndpoint {
     }
 
     /// Value to export as `SQUEEZY_ASK_SOCKET` when launching a child.
-    pub(crate) fn as_env_value(&self) -> OsString {
+    pub fn as_env_value(&self) -> OsString {
         match &self.inner {
             #[cfg(unix)]
             EndpointInner::Unix(path) => path.as_os_str().to_os_string(),
@@ -254,7 +252,7 @@ impl Drop for IpcListener {
 /// One side of an established IPC connection. Implements `AsyncRead +
 /// AsyncWrite + Unpin` so existing tokio code can pass it where it would
 /// have passed a `UnixStream`.
-pub(crate) struct IpcStream {
+pub struct IpcStream {
     inner: StreamInner,
 }
 
@@ -268,10 +266,7 @@ enum StreamInner {
 }
 
 impl IpcStream {
-    /// Wired up by the next commit when `squeezy ask` moves onto this
-    /// abstraction; declared `pub(crate)` so it can be re-exported.
-    #[allow(dead_code)]
-    pub(crate) async fn connect(endpoint: &IpcEndpoint) -> io::Result<Self> {
+    pub async fn connect(endpoint: &IpcEndpoint) -> io::Result<Self> {
         match &endpoint.inner {
             #[cfg(unix)]
             EndpointInner::Unix(path) => {

@@ -69,7 +69,8 @@ mod safety;
 mod schema;
 mod truncate;
 
-use ipc::{IpcEndpoint, IpcListener, IpcStream};
+use ipc::IpcListener;
+pub use ipc::{IpcEndpoint, IpcStream};
 use schema::compact_tool_parameters;
 use truncate::truncate_middle_bytes;
 
