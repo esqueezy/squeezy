@@ -14,7 +14,6 @@ publish = false
 
 [dependencies]
 clap.workspace = true
-futures-core.workspace = true
 futures-util.workspace = true
 ignore.workspace = true
 ratatui.workspace = true
@@ -26,7 +25,6 @@ squeezy-agent.workspace = true
 squeezy-core.workspace = true
 squeezy-llm.workspace = true
 squeezy-store.workspace = true
-squeezy-tools.workspace = true
 squeezy-tui.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

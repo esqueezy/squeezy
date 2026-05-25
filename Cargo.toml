@@ -90,7 +90,6 @@ tree-sitter-typescript = "0.23"
 
 squeezy-agent = { path = "crates/squeezy-agent", version = "=0.1.0" }
 squeezy-core = { path = "crates/squeezy-core", version = "=0.1.0" }
-squeezy-eval = { path = "crates/squeezy-eval", version = "=0.1.0" }
 squeezy-graph = { path = "crates/squeezy-graph", version = "=0.1.0" }
 squeezy-llm = { path = "crates/squeezy-llm", version = "=0.1.0" }
 squeezy-mcp = { path = "crates/squeezy-mcp", version = "=0.1.0" }
