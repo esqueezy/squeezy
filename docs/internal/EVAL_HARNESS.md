@@ -124,6 +124,26 @@ squeezy-eval diff target/eval/<run-a> target/eval/<run-b>
 
 Prints a markdown delta covering totals, per-turn tool-call set difference (added/removed `(name, args_sha256)` pairs), unified text diff of assistant frames, and findings delta (new / resolved rule ids). Pass `--format json` for a structured payload.
 
+## Slash-command coverage
+
+Slash commands dispatch through a new `Agent::dispatch_command(name, args)` method (`crates/squeezy-agent/src/lib.rs`). Today's coverage: `/compact`, `/plan`, `/build`, `/cost`, `/jobs`, `/permissions`. Anything else lands as `CommandOutcome::Unsupported`, which surfaces as the `unsupported_slash_command` auto-finding so triage flags missing automation. When new agent-side commands ship, they get exposed to scenarios for free by adding a match arm to `dispatch_command`.
+
+## inject_user_text + concurrent actions
+
+A new `action = "inject_user_text"` calls `Agent::queue_user_message`, appending an extra user message to the conversation transcript without starting a new turn. Pair with `when.on_tool = "<tool>"` to fire it the moment that tool appears mid-stream:
+
+```toml
+[[steps]]
+kind = "action"
+action = "inject_user_text"
+text = "Actually focus on X instead."
+
+[steps.when]
+on_tool = "grep"
+```
+
+The `wait_for: tool_call` gate no longer cancels the turn — actions with `when.on_tool` are the supported way to script mid-turn interruption. See `fixtures/scenarios/concurrent-inject.toml`.
+
 ## Offline / mock provider
 
 Set `[squeezy] provider = "mock"` to use the built-in scripted

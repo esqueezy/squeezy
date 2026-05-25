@@ -151,6 +151,15 @@ pub enum Action {
         #[serde(default)]
         when: Option<When>,
     },
+    /// Append a user message into the agent's conversation transcript
+    /// (without starting a new turn). Useful for testing the
+    /// "interrupting user" path — pair with `when.on_tool = "..."`
+    /// to fire mid-stream during a long-running turn.
+    InjectUserText {
+        text: String,
+        #[serde(default)]
+        when: Option<When>,
+    },
 }
 
 impl Action {
@@ -162,7 +171,8 @@ impl Action {
             | Action::EditFile { when, .. }
             | Action::WaitSeconds { when, .. }
             | Action::CancelTurn { when, .. }
-            | Action::Assert { when, .. } => when.as_ref(),
+            | Action::Assert { when, .. }
+            | Action::InjectUserText { when, .. } => when.as_ref(),
         }
     }
 }

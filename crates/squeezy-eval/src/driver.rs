@@ -541,34 +541,40 @@ impl Driver {
                     },
                 )?;
             }
+            Action::InjectUserText { text, .. } => {
+                self.agent.queue_user_message(text.clone()).await;
+                self.capture.record(
+                    None,
+                    EvalEventKind::ActionStep {
+                        action: payload,
+                        status: format!("injected:{}", text.chars().take(60).collect::<String>()),
+                    },
+                )?;
+            }
         }
         Ok(())
     }
 
     async fn dispatch_slash_command(&self, command: &str) -> Result<String, EvalError> {
-        // First-cut slash command handling. We support the small set that
-        // is fully expressible through `Agent`'s public API today and
-        // record the rest as unsupported so triage can flag missing
-        // automation rather than silently noop.
         let trimmed = command.trim().trim_start_matches('/');
-        match trimmed.split_whitespace().next().unwrap_or("") {
-            "compact" => {
-                self.agent
-                    .compact_context_manual()
-                    .await
-                    .map_err(|err| EvalError::Internal(format!("compact_context_manual: {err}")))?;
-                Ok("compacted".into())
+        let (name, args) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
+        let outcome = self.agent.dispatch_command(name, args).await;
+        let status = match &outcome {
+            squeezy_agent::CommandOutcome::Compacted => "compacted".to_string(),
+            squeezy_agent::CommandOutcome::ModeChanged { mode, changed } => {
+                format!("mode_{mode}_changed={changed}")
             }
-            "plan" => {
-                self.agent.set_session_mode(SessionMode::Plan, "eval");
-                Ok("mode_plan".into())
+            squeezy_agent::CommandOutcome::CostSnapshot { .. } => "cost_snapshot".to_string(),
+            squeezy_agent::CommandOutcome::JobsList { count } => format!("jobs_list:{count}"),
+            squeezy_agent::CommandOutcome::PermissionsList { count } => {
+                format!("permissions_list:{count}")
             }
-            "build" => {
-                self.agent.set_session_mode(SessionMode::Build, "eval");
-                Ok("mode_build".into())
+            squeezy_agent::CommandOutcome::Unsupported { command } => {
+                format!("unsupported_slash_command:{command}")
             }
-            other => Ok(format!("unsupported_slash_command:{other}")),
-        }
+            squeezy_agent::CommandOutcome::Error { message, .. } => format!("error:{message}"),
+        };
+        Ok(status)
     }
 
     fn apply_file_edit(
@@ -712,10 +718,24 @@ impl Driver {
                         Some(turn_str),
                         EvalEventKind::ToolCallStarted { call: value },
                     )?;
+                    // Note: `wait_for: tool_call` is a *signal* only — we
+                    // no longer cancel the turn when the tool fires.
+                    // Scenarios that want to act mid-stream attach
+                    // `when.on_tool = "..."` to the action they want
+                    // dispatched concurrently; `fire_on_tool_actions`
+                    // above handles that path while the turn keeps
+                    // streaming to completion.
                     if let WaitFor::ToolCall { tool } = &wait_for
                         && &call.name == tool
                     {
-                        cancel.cancel();
+                        // Record that the gate tripped, then continue.
+                        self.capture.record(
+                            Some(format!("{turn_id:?}")),
+                            EvalEventKind::ActionStep {
+                                action: json!({"kind": "wait_for_signal"}),
+                                status: format!("tool_call_seen:{tool}"),
+                            },
+                        )?;
                     }
                 }
                 AgentEvent::ToolCallCompleted { turn_id, result } => {
