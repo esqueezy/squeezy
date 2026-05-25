@@ -32,10 +32,44 @@ use crate::{
     render::palette::{AMBER, ERROR_RED, GOLD, MODE_PURPLE, QUIET, SUCCESS_GREEN},
 };
 
-/// Synthetic row index in the Models section that sits right after
-/// `provider` and exposes the API-key editor for the currently selected
-/// provider. Not backed by a `FieldMeta` in `CONFIG_SECTIONS`.
-const SYNTHETIC_KEY_ROW: usize = 1;
+/// Synthetic row index in the Models section that exposes the API-key
+/// editor for the currently selected provider. Sits right after `model`
+/// so provider + model + key read top-to-bottom as a single "what model
+/// am I talking to and with which credential" cluster. Not backed by a
+/// `FieldMeta` in `CONFIG_SECTIONS`.
+const SYNTHETIC_KEY_ROW: usize = 2;
+
+/// Static row metadata for the synthetic Reset section. Each row deletes
+/// one tier's TOML file. The `Reset` section itself is declared in
+/// `CONFIG_SECTIONS` with an empty `fields` slice — the rendering and
+/// key handling consult this table instead.
+const RESET_ACTIONS: &[ResetAction] = &[
+    ResetAction {
+        scope: ConfigScope::User,
+        label: "Reset User settings",
+        detail: "delete ~/.squeezy/settings.toml — every tab falls back to the binary defaults.",
+    },
+    ResetAction {
+        scope: ConfigScope::Repo,
+        label: "Reset Repo settings",
+        detail: "delete ./squeezy.toml (committed) — Repo and Local tabs inherit User / defaults again.",
+    },
+    ResetAction {
+        scope: ConfigScope::Local,
+        label: "Reset Local settings",
+        detail: "delete ~/.squeezy/projects/<this>/settings.toml — Local tab inherits Repo / User / defaults again.",
+    },
+];
+
+/// A single row in the Reset section. Deletes the corresponding tier
+/// file after a `y/n` confirmation. Inherited values from the remaining
+/// tiers then take over — no other tab's file is touched.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResetAction {
+    scope: ConfigScope,
+    label: &'static str,
+    detail: &'static str,
+}
 
 /// Three scope tabs surfaced in the screen, ordered low → high precedence.
 ///
@@ -86,6 +120,10 @@ pub(crate) struct ConfigScreenState {
     pub picker: Option<ModelPickerState>,
     pub search: Option<SearchOverlayState>,
     pub secret_entry: Option<SecretEntryState>,
+    /// Pending tier-file deletion awaiting `y/n` confirmation. Set when the
+    /// user presses Enter on a Reset-section row; cleared by `y` (after the
+    /// delete fires) or `n` / Esc (cancel).
+    pub reset_confirm: Option<ConfigScope>,
     pub effective: AppConfig,
     pub sources: SeparatedSources,
     pub dirty: bool,
@@ -214,6 +252,7 @@ impl ConfigScreenState {
             picker: None,
             search: None,
             secret_entry: None,
+            reset_confirm: None,
             effective,
             sources,
             dirty: false,
@@ -248,29 +287,49 @@ impl ConfigScreenState {
     }
 
     /// Number of selectable rows on the active section, including the
-    /// synthetic "API key" row for the Models section.
+    /// synthetic "API key" row for the Models section and the three
+    /// per-tier action rows for the Reset section.
     pub(crate) fn row_count(&self) -> usize {
-        let base = self.current_section().fields.len();
-        if self.current_section().id == SectionId::Models {
-            base + 1
-        } else {
-            base
+        let section = self.current_section();
+        match section.id {
+            SectionId::Models => section.fields.len() + 1,
+            SectionId::Reset => RESET_ACTIONS.len(),
+            _ => section.fields.len(),
         }
     }
 
     /// Map a row index back to a real `FieldMeta` — `None` for the
-    /// synthetic API-key row.
+    /// synthetic API-key row and for every row in the Reset section.
+    ///
+    /// Models layout, top to bottom: `provider` → `model` → synthetic
+    /// `api_key` → the rest of the fields. The api_key row pretends to
+    /// be the field at `SYNTHETIC_KEY_ROW`, so every row above it indexes
+    /// `fields[row]` and every row below it indexes `fields[row - 1]`.
     pub(crate) fn field_at_row(&self, row: usize) -> Option<&'static FieldMeta> {
         let section = self.current_section();
-        if section.id == SectionId::Models {
-            match row {
-                0 => Some(&section.fields[0]),
+        match section.id {
+            SectionId::Models => match row {
                 SYNTHETIC_KEY_ROW => None,
-                _ => section.fields.get(row - 1),
-            }
-        } else {
-            section.fields.get(row)
+                r if r < SYNTHETIC_KEY_ROW => section.fields.get(r),
+                r => section.fields.get(r - 1),
+            },
+            SectionId::Reset => None,
+            _ => section.fields.get(row),
         }
+    }
+
+    /// Reset action for the focused row when the active section is `Reset`.
+    pub(crate) fn reset_action_at_row(&self, row: usize) -> Option<&'static ResetAction> {
+        if self.current_section().id == SectionId::Reset {
+            RESET_ACTIONS.get(row)
+        } else {
+            None
+        }
+    }
+
+    /// `true` when the focus is on a Reset-section action row.
+    pub(crate) fn on_reset_action_row(&self) -> bool {
+        self.current_section().id == SectionId::Reset
     }
 
     /// Whether the active scope's tier file explicitly sets the field.
@@ -387,33 +446,30 @@ fn tier_value_at_path(tier: &squeezy_core::TierSource, field: &FieldMeta) -> Opt
 
 /// Inheritance badge label shown next to the field's value.
 ///
-/// `[own]` when the value lives in the active tab's tier, otherwise
-/// `[inherited-X]` naming the tier that supplies it. `[env]` and
-/// `[default]` are tab-independent.
+/// The vocabulary is intentionally uniform across tabs:
+///   - `[env]`                — overridden by an environment variable.
+///   - `[inherited-default]`  — falls through to the binary defaults.
+///   - `[inherited-<tier>]`   — falls through to a higher-precedence tier.
+///   - bare tier name         — the value lives in the active tab's file.
+///
+/// Treating the binary defaults as `[inherited-default]` on every tab
+/// (including User) keeps the labelling honest: the User tab does not own
+/// a value that nobody has typed, so it shouldn't read as `[default]` as
+/// if it were a deliberate setting.
 fn inheritance_label(active: ConfigScope, source: FieldSource) -> String {
     if source == FieldSource::Env {
         return "[env]".to_string();
     }
     if source == FieldSource::Default {
-        // On non-User tabs the default value is technically inherited (it
-        // falls through every tier file that didn't set it), so name it
-        // that way to keep the marker vocabulary uniform with [inherited-user]
-        // and [inherited-repo]. The User tab just calls it [default].
-        return match active {
-            ConfigScope::User => "[default]".to_string(),
-            ConfigScope::Repo | ConfigScope::Local => "[inherited-default]".to_string(),
-        };
+        return "[inherited-default]".to_string();
     }
     let scope_of_source = match source {
         FieldSource::User => ConfigScope::User,
         FieldSource::Project => ConfigScope::Repo,
         FieldSource::Repo => ConfigScope::Local,
-        // Env / Default handled above
         FieldSource::Env | FieldSource::Default => unreachable!(),
     };
     if scope_of_source == active {
-        // The displayed value lives in this tab's own file. Leave the
-        // brackets off so the row reads as "the user's own value here".
         active.label().to_lowercase()
     } else {
         format!("[inherited-{}]", scope_of_source.label().to_lowercase())
@@ -435,6 +491,9 @@ pub(crate) fn handle_key(
     key: KeyEvent,
 ) -> KeyOutcome {
     // Sub-modes take precedence over the regular browse keymap.
+    if state.reset_confirm.is_some() {
+        return handle_reset_confirm_key(state, agent, notifications, key);
+    }
     if state.secret_entry.is_some() {
         return handle_secret_entry_key(state, agent, notifications, key);
     }
@@ -519,6 +578,10 @@ pub(crate) fn handle_key(
                 open_api_key_entry_for_current_provider(state, notifications);
                 return KeyOutcome::KeepOpen;
             }
+            if let Some(action) = state.reset_action_at_row(state.field_index) {
+                state.reset_confirm = Some(action.scope);
+                return KeyOutcome::KeepOpen;
+            }
             let field = state.current_field();
             // Env-shadowed fields are inert; show the same hint we use for
             // Enter so Space doesn't silently no-op.
@@ -539,9 +602,7 @@ pub(crate) fn handle_key(
             // position so the user can return to the parent tier's value
             // without leaving the row.
             let current_value = (field.get)(&state.effective);
-            let active_owns_field = state
-                .scope_owns_field(field)
-                .unwrap_or(false);
+            let active_owns_field = state.scope_owns_field(field).unwrap_or(false);
             // On non-User tabs that aren't currently owning the field, a
             // single Space starts owning it with the FIRST option. The
             // next Spaces walk through the options; when we reach the end
@@ -555,12 +616,8 @@ pub(crate) fn handle_key(
                         // Currently inherited — first Space starts owning at
                         // the first cyclable value (or toggles for Bool).
                         match (field.kind, &current_value) {
-                            (FieldKind::Bool, FieldValue::Bool(b)) => {
-                                Some(FieldValue::Bool(!b))
-                            }
-                            (FieldKind::Enum { options }, _) => {
-                                Some(FieldValue::Enum(options[0]))
-                            }
+                            (FieldKind::Bool, FieldValue::Bool(b)) => Some(FieldValue::Bool(!b)),
+                            (FieldKind::Enum { options }, _) => Some(FieldValue::Enum(options[0])),
                             (FieldKind::OptionalEnum { options }, _) => {
                                 Some(FieldValue::OptionalEnum(Some(options[0])))
                             }
@@ -576,9 +633,7 @@ pub(crate) fn handle_key(
                         should_clear = true;
                         None
                     }
-                    (FieldKind::Bool, FieldValue::Bool(false)) => {
-                        Some(FieldValue::Bool(true))
-                    }
+                    (FieldKind::Bool, FieldValue::Bool(false)) => Some(FieldValue::Bool(true)),
                     (FieldKind::Enum { options }, FieldValue::Enum(current)) => {
                         let idx = options.iter().position(|o| *o == *current).unwrap_or(0);
                         if idx + 1 >= options.len() {
@@ -670,6 +725,10 @@ pub(crate) fn handle_key(
                 open_api_key_entry_for_current_provider(state, notifications);
                 return KeyOutcome::KeepOpen;
             }
+            if let Some(action) = state.reset_action_at_row(state.field_index) {
+                state.reset_confirm = Some(action.scope);
+                return KeyOutcome::KeepOpen;
+            }
             let field = state.current_field();
             // Refuse to edit env-shadowed fields — the value at runtime is
             // the env var's, not the TOML's, so a TOML write is silently
@@ -736,6 +795,13 @@ pub(crate) fn handle_key(
                 );
                 return KeyOutcome::KeepOpen;
             }
+            if state.on_reset_action_row() {
+                notifications.push(
+                    "Use Enter on the Reset row (with y/n confirm) to delete a tier file.",
+                    NotifySeverity::Info,
+                );
+                return KeyOutcome::KeepOpen;
+            }
             let field = state.current_field();
             if let Some(var) = field.env_override
                 && std::env::var(var).is_ok()
@@ -768,6 +834,9 @@ pub(crate) fn handle_key(
             KeyOutcome::KeepOpen
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+            if state.on_synthetic_api_key_row() || state.on_reset_action_row() {
+                return KeyOutcome::KeepOpen;
+            }
             match state.scope {
                 ConfigScope::User => {
                     notifications.push(
@@ -1110,6 +1179,107 @@ fn integer_editor_key(
         }
         _ => EditorOutcome::KeepEditing,
     }
+}
+
+// ─── Reset tab (tier-file deletion) ──────────────────────────────────────────
+
+/// Resolve the tier file path for `scope` using the currently-loaded
+/// `SeparatedSources`. The `*_path_default` fields hold the canonical
+/// location even when the file does not exist on disk.
+fn tier_path(state: &ConfigScreenState, scope: ConfigScope) -> std::path::PathBuf {
+    match scope {
+        ConfigScope::User => state.sources.user_path_default.clone(),
+        ConfigScope::Repo => state.sources.project_path_default.clone(),
+        ConfigScope::Local => state.sources.repo_path_default.clone(),
+    }
+}
+
+fn handle_reset_confirm_key(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    key: KeyEvent,
+) -> KeyOutcome {
+    let scope = state.reset_confirm.expect("checked by caller");
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
+            state.reset_confirm = None;
+            perform_reset(state, agent, notifications, scope);
+        }
+        (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
+            state.reset_confirm = None;
+            notifications.push("Reset cancelled.", NotifySeverity::Info);
+        }
+        _ => {}
+    }
+    KeyOutcome::KeepOpen
+}
+
+/// Delete `scope`'s tier file (no-op when it doesn't exist on disk) and
+/// reload the in-memory sources + effective config. Any field whose
+/// previous value lived in the deleted file falls back through the
+/// remaining tiers — that recompute can also change values shown on
+/// other tabs, which is exactly what "reset" promises.
+fn perform_reset(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    scope: ConfigScope,
+) {
+    let path = tier_path(state, scope);
+    if path.as_os_str().is_empty() {
+        notifications.push(
+            format!(
+                "{} tier has no resolved file path; nothing to reset.",
+                scope.label()
+            ),
+            NotifySeverity::Warn,
+        );
+        return;
+    }
+    // Snapshot the file bytes so Ctrl+Z can put them back.
+    let pre = std::fs::read(&path).ok();
+    state.undo_stack.push((path.clone(), pre.clone()));
+    match restore_path(&path, None) {
+        Ok(()) => {
+            reload_sources_and_agent(state, agent, notifications);
+            let msg = if pre.is_some() {
+                format!(
+                    "✓ reset {} settings — deleted {} (Ctrl+Z to restore)",
+                    scope.label(),
+                    path.display()
+                )
+            } else {
+                // No file existed; nothing was actually removed, but
+                // restating it as "already at defaults" reads cleaner
+                // than a silent no-op.
+                state.undo_stack.pop();
+                format!(
+                    "{} tier already at inherited / default values.",
+                    scope.label()
+                )
+            };
+            notifications.push(msg, NotifySeverity::Success);
+        }
+        Err(err) => {
+            state.undo_stack.pop();
+            notifications.push(
+                format!("Reset of {} failed: {err}", path.display()),
+                NotifySeverity::Error,
+            );
+        }
+    }
+}
+
+/// Locate the `[model].model` `FieldMeta` in `CONFIG_SECTIONS`. Used by
+/// the provider-swap path to read the just-reset model id and to bind
+/// the secondary TOML write to the right `toml_path`.
+fn model_field_meta() -> &'static FieldMeta {
+    CONFIG_SECTIONS
+        .iter()
+        .flat_map(|s| s.fields.iter())
+        .find(|f| f.toml_path == ["model", "model"])
+        .expect("model field exists in CONFIG_SECTIONS")
 }
 
 // ─── Save pipeline ───────────────────────────────────────────────────────────
@@ -1471,8 +1641,21 @@ fn save_field_inner(
         .undo_stack
         .push((target_path.clone(), pre_write_bytes));
 
-    let edit = field_edit(field, &value);
-    let outcome = match apply_edits(&scope_target, &[edit]) {
+    let mut edits: Vec<SettingsEdit> = vec![field_edit(field, &value)];
+    // When the user flips `[model].provider`, the in-memory setter has
+    // already replaced `cfg.model` with that provider's default — persist
+    // the same swap to the tier file so we never leave a half-written
+    // pair like (provider=anthropic, model=gpt-5-codex) on disk. Without
+    // this, the next process start would surface an inconsistent state.
+    if field.toml_path == ["model", "provider"]
+        && let FieldValue::String(model_id) = (model_field_meta().get)(&state.effective)
+    {
+        edits.push(SettingsEdit {
+            path: model_field_meta().toml_path,
+            op: EditOp::SetString(model_id),
+        });
+    }
+    let outcome = match apply_edits(&scope_target, &edits) {
         Ok(o) => o,
         Err(err) => {
             // Roll back the bookkeeping for the failed write so Ctrl+Z
@@ -1928,15 +2111,124 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         Paragraph::new(sep_lines).style(Style::default().fg(QUIET)),
         chunks[1],
     );
-    if let Some(entry) = &state.secret_entry {
+    if state.reset_confirm.is_some() {
+        render_reset_confirm(frame, chunks[2], state);
+    } else if let Some(entry) = &state.secret_entry {
         render_secret_entry(frame, chunks[2], entry);
     } else if let Some(picker) = &state.picker {
         render_model_picker(frame, chunks[2], picker);
     } else if let Some(search) = &state.search {
         render_search_overlay(frame, chunks[2], search);
+    } else if state.current_section().id == SectionId::Reset {
+        render_reset_section(frame, chunks[2], state);
     } else {
         render_field_pane(frame, chunks[2], state);
     }
+}
+
+fn render_reset_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
+    let section = state.current_section();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(RESET_ACTIONS.len() * 3 + 4);
+    lines.push(Line::from(vec![
+        Span::styled(
+            section.label,
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(section.description, Style::default().fg(QUIET)),
+    ]));
+    lines.push(Line::raw(""));
+    for (idx, action) in RESET_ACTIONS.iter().enumerate() {
+        let active = idx == state.field_index;
+        let prefix = if active { "› " } else { "  " };
+        let prefix_style = Style::default().fg(if active { GOLD } else { QUIET });
+        let label_style = if active {
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let tier_path = tier_path(state, action.scope);
+        let exists = std::fs::metadata(&tier_path).is_ok();
+        let status = if exists {
+            Span::styled("[file present]", Style::default().fg(SUCCESS_GREEN))
+        } else {
+            Span::styled("[no file]", Style::default().fg(QUIET))
+        };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, prefix_style),
+            Span::styled(format!("{:<28}", action.label), label_style),
+            status,
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(action.detail, Style::default().fg(QUIET)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(tier_path.display().to_string(), Style::default().fg(QUIET)),
+        ]));
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("? ", Style::default().fg(QUIET)),
+        Span::styled(
+            "Enter on a row to delete that tier's file (with y/n confirmation). Ctrl+Z restores it.",
+            Style::default().fg(QUIET),
+        ),
+    ]));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_reset_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
+    let scope = state.reset_confirm.expect("guarded by caller");
+    let path = tier_path(state, scope);
+    let exists = std::fs::metadata(&path).is_ok();
+    let lines = vec![
+        Line::from(vec![Span::styled(
+            "Reset confirmation",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        )]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  Delete the "),
+            Span::styled(
+                scope.label(),
+                Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" settings file?"),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("    path  ", Style::default().fg(QUIET)),
+            Span::raw(path.display().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("    status ", Style::default().fg(QUIET)),
+            Span::styled(
+                if exists { "exists" } else { "(no file)" },
+                Style::default().fg(if exists { SUCCESS_GREEN } else { QUIET }),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(vec![Span::styled(
+            "  Other tabs are not touched. Inherited / default values then take over,\n  \
+             which may change values shown elsewhere — that's the point of a reset.",
+            Style::default().fg(QUIET),
+        )]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("y", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
+            Span::styled(" delete   ", Style::default().fg(QUIET)),
+            Span::styled("n", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
+            Span::styled(" cancel   ", Style::default().fg(QUIET)),
+            Span::styled(
+                "Esc",
+                Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" cancel", Style::default().fg(QUIET)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntryState) {

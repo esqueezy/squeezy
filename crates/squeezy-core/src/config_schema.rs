@@ -272,6 +272,11 @@ pub enum SectionId {
     McpServers,
     ShellSandbox,
     PermissionRules,
+    /// Synthetic section that hosts tier-wide reset actions ("delete the
+    /// user file", "delete the repo file", "delete the local file"). Has
+    /// no `FieldMeta` entries — the TUI renders an action list and runs
+    /// each action against `SeparatedSources` directly.
+    Reset,
 }
 
 impl SectionId {
@@ -297,6 +302,7 @@ impl SectionId {
             Self::McpServers => "mcp-servers",
             Self::ShellSandbox => "shell-sandbox",
             Self::PermissionRules => "permission-rules",
+            Self::Reset => "reset",
         }
     }
 }
@@ -1310,6 +1316,13 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
         ],
+    },
+    ConfigSectionMeta {
+        id: SectionId::Reset,
+        label: "Reset",
+        description: "Delete a tier's settings file. Inherited values from \
+                      other tiers then take over — no other tab is touched.",
+        fields: &[],
     },
 ];
 

@@ -148,9 +148,8 @@ async fn enter_on_model_field_opens_picker_and_filter_narrows_matches() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
-    // The `provider` field is row 0; row 1 is the synthetic API-key row;
-    // the `model` field is row 2.
-    state.field_index = 2;
+    // Layout: provider at row 0, model at row 1, synthetic API-key at row 2.
+    state.field_index = 1;
     handle_key(
         &mut state,
         &mut agent,
@@ -197,7 +196,7 @@ async fn esc_on_model_picker_closes_picker_only() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
-    state.field_index = 2; // model field (row 1 is the synthetic API-key row)
+    state.field_index = 1; // model row (synthetic API-key now lives at row 2)
     handle_key(
         &mut state,
         &mut agent,
@@ -229,7 +228,7 @@ async fn space_cycles_model_field_to_next_registry_entry() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Models));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
-    state.field_index = 2; // model field (row 1 is the synthetic API-key row)
+    state.field_index = 1; // model row (synthetic API-key now lives at row 2)
     let before = match (CONFIG_SECTIONS[0].fields[1].get)(&state.effective) {
         FieldValue::String(s) => s,
         other => panic!("expected String, got {other:?}"),
@@ -403,6 +402,68 @@ fn notification_dismiss_current_and_clear_all() {
     let removed = q.clear_all();
     assert_eq!(removed, 2);
     assert!(q.is_empty());
+}
+
+#[tokio::test]
+async fn space_cycling_provider_resets_model_in_memory() {
+    use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId};
+    // SAFETY: tests in this module run single-threaded.
+    unsafe {
+        std::env::remove_var("SQUEEZY_PROVIDER");
+        std::env::remove_var("SQUEEZY_MODEL");
+    }
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Models));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    // provider is row 0
+    state.field_index = 0;
+    let model_before = match (CONFIG_SECTIONS[0].fields[1].get)(&state.effective) {
+        FieldValue::String(s) => s,
+        other => panic!("expected String model, got {other:?}"),
+    };
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    let model_after = match (CONFIG_SECTIONS[0].fields[1].get)(&state.effective) {
+        FieldValue::String(s) => s,
+        other => panic!("expected String model, got {other:?}"),
+    };
+    assert_ne!(
+        model_before, model_after,
+        "switching provider via Space must also reset the model to that provider's default"
+    );
+}
+
+#[tokio::test]
+async fn reset_section_enter_arms_confirmation_and_n_cancels() {
+    use squeezy_core::config_schema::SectionId as SId;
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Reset));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    assert_eq!(state.field_index, 0);
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    assert!(
+        state.reset_confirm.is_some(),
+        "Enter on a Reset row should arm the y/n confirmation"
+    );
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+    );
+    assert!(
+        state.reset_confirm.is_none(),
+        "`n` should cancel the confirmation"
+    );
 }
 
 #[test]
