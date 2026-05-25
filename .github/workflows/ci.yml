@@ -116,11 +116,25 @@ jobs:
 
       - name: Test Rust
         shell: bash
-        run: cargo nextest run --workspace --all-targets --profile ci
+        run: |
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+            cargo nextest run --workspace --all-targets --profile ci --target x86_64-unknown-linux-musl
+          else
+            cargo nextest run --workspace --all-targets --profile ci
+          fi
 
       - name: Lint Rust
         shell: bash
-        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+        run: |
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+            cargo clippy --workspace --all-targets --no-deps --target x86_64-unknown-linux-musl -- -D warnings
+          else
+            cargo clippy --workspace --all-targets --no-deps -- -D warnings
+          fi
 
       - name: Run deterministic validation harness
         shell: bash
