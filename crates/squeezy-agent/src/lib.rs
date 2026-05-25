@@ -6460,7 +6460,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::Session,
                         PermissionAction::Allow,
-                    );
+                    )
+                    .await;
                     log_session_event(
                         context.session_log.as_ref(),
                         &context.redactor,
@@ -6481,7 +6482,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::User,
                         PermissionAction::Allow,
-                    );
+                    )
+                    .await;
                     ApprovalDecision::Approved
                 }
                 Ok(ToolApprovalDecision::AllowRuleProject) => {
@@ -6490,7 +6492,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::Project,
                         PermissionAction::Allow,
-                    );
+                    )
+                    .await;
                     ApprovalDecision::Approved
                 }
                 Ok(ToolApprovalDecision::AskRuleUser) => {
@@ -6499,7 +6502,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::User,
                         PermissionAction::Ask,
-                    );
+                    )
+                    .await;
                     ApprovalDecision::Denied(
                         "user asked to require approval for future matching calls".to_string(),
                     )
@@ -6510,7 +6514,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::Project,
                         PermissionAction::Ask,
-                    );
+                    )
+                    .await;
                     ApprovalDecision::Denied(
                         "user asked to require approval for future matching calls".to_string(),
                     )
@@ -6527,7 +6532,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::Session,
                         PermissionAction::Deny,
-                    );
+                    )
+                    .await;
                     log_session_event(
                         context.session_log.as_ref(),
                         &context.redactor,
@@ -6551,7 +6557,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::User,
                         PermissionAction::Deny,
-                    );
+                    )
+                    .await;
                     ApprovalDecision::Denied(permission_denied_reason(
                         &request,
                         "user denied and persisted a user rule",
@@ -6563,7 +6570,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::Project,
                         PermissionAction::Deny,
-                    );
+                    )
+                    .await;
                     ApprovalDecision::Denied(permission_denied_reason(
                         &request,
                         "user denied and persisted a project rule",
@@ -6864,7 +6872,7 @@ fn permission_denied_reason(request: &PermissionRequest, reason: &str) -> String
 /// effort) on disk. Returns immediately when the rule cannot be persisted; the
 /// failure is logged but never bubbled to the caller, since the current call
 /// has already been resolved by the approval response.
-fn install_persistent_rule(
+async fn install_persistent_rule(
     context: &PermissionDecisionContext,
     request: &PermissionRequest,
     source: PermissionRuleSource,
@@ -6896,16 +6904,37 @@ fn install_persistent_rule(
         Some(path) => path,
         None => return,
     };
-    let persisted = match persist_permission_rule(&path, &rule) {
-        Ok(persisted) => persisted,
-        Err(err) => {
-            tracing::warn!(
-                target: "squeezy::permissions",
-                path = %path.display(),
-                error = %err,
-                "failed to persist permission rule",
-            );
-            return;
+    // Persistence touches the filesystem and uses a file-presence lock
+    // with a 10ms retry sleep; running it on a Tokio worker would block
+    // other tasks. `spawn_blocking` parks the work on a dedicated
+    // blocking thread instead.
+    let persisted = {
+        let rule = rule.clone();
+        let path_for_blocking = path.clone();
+        match tokio::task::spawn_blocking(move || {
+            persist_permission_rule(&path_for_blocking, &rule)
+        })
+        .await
+        {
+            Ok(Ok(persisted)) => persisted,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    target: "squeezy::permissions",
+                    path = %path.display(),
+                    error = %err,
+                    "failed to persist permission rule",
+                );
+                return;
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    target: "squeezy::permissions",
+                    path = %path.display(),
+                    error = %join_err,
+                    "permission persistence task panicked",
+                );
+                return;
+            }
         }
     };
     if !persisted {
