@@ -2968,3 +2968,61 @@ fn parse_subagent_request_requires_goal_for_plan_and_allows_empty_review() {
         "review should synthesize a default prompt"
     );
 }
+
+#[tokio::test]
+async fn plan_mode_instructions_are_appended_to_request() {
+    use super::plan_mode::PLAN_MODE_INSTRUCTIONS;
+
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_plan".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let config = AppConfig {
+        session_mode: SessionMode::Plan,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("draft a refactor".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "expected exactly one provider request");
+    let instructions = &requests[0].instructions;
+    assert!(
+        instructions.contains(PLAN_MODE_INSTRUCTIONS),
+        "Plan-mode instructions missing from request: {instructions}"
+    );
+}
+
+#[tokio::test]
+async fn build_mode_instructions_omit_plan_overlay() {
+    use super::plan_mode::PLAN_MODE_INSTRUCTIONS;
+
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_build".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let config = AppConfig {
+        session_mode: SessionMode::Build,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("ship a fix".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "expected exactly one provider request");
+    let instructions = &requests[0].instructions;
+    assert!(
+        !instructions.contains(PLAN_MODE_INSTRUCTIONS),
+        "Build-mode request must not include Plan overlay: {instructions}"
+    );
+}

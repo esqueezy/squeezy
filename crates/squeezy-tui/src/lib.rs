@@ -57,6 +57,7 @@ mod approval;
 mod history;
 mod mention;
 mod overlay;
+mod proposed_plan;
 mod render;
 mod status;
 mod streaming;
@@ -371,7 +372,13 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.note_turn_started();
                 }
                 AgentEvent::AssistantDelta { delta, .. } => {
-                    app.pending_assistant.push_delta(&delta);
+                    let extracted = app.proposed_plan.feed(&delta);
+                    if !extracted.passthrough.is_empty() {
+                        app.pending_assistant.push_delta(&extracted.passthrough);
+                    }
+                    for plan_body in extracted.completed {
+                        app.push_log(format!("proposed plan:\n{plan_body}"));
+                    }
                     // Intentionally preserve `transcript_scroll_from_bottom`
                     // here: if the user paged up to read history we would
                     // otherwise yank them back to the bottom on every delta.
@@ -509,6 +516,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         app.push_transcript_item(message);
                     }
                     app.pending_assistant.clear();
+                    finalize_proposed_plan(app);
                     app.cost = cost;
                     app.metrics = metrics;
                     app.status = "ready".to_string();
@@ -527,6 +535,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.turn_visual = TurnVisualState::Failed;
                     app.push_log("turn cancelled".to_string());
                     app.pending_assistant.clear();
+                    finalize_proposed_plan(app);
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
                     app.note_turn_finished();
@@ -539,6 +548,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.turn_visual = TurnVisualState::Failed;
                     app.push_log(format!("turn failed: {}", app.status));
                     app.pending_assistant.clear();
+                    finalize_proposed_plan(app);
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
                     app.note_turn_finished();
@@ -552,6 +562,18 @@ async fn drain_agent_events(app: &mut TuiApp) {
             app.turn_rx = Some(rx);
         }
     }
+}
+
+/// Flush any straggler bytes held by the `<proposed_plan>` extractor at
+/// turn boundaries. Unterminated blocks are folded back into the
+/// transcript so the user can see what the model attempted; the extractor
+/// itself is rebuilt fresh for the next turn.
+fn finalize_proposed_plan(app: &mut TuiApp) {
+    let leftover = app.proposed_plan.finalize();
+    if !leftover.is_empty() {
+        app.pending_assistant.push_delta(&leftover);
+    }
+    app.proposed_plan = proposed_plan::ProposedPlanExtractor::new();
 }
 
 fn drain_job_events(app: &mut TuiApp) {
@@ -6898,6 +6920,7 @@ struct TuiApp {
     next_entry_id: u64,
     transcript_scroll_from_bottom: u16,
     pending_assistant: streaming::StreamingController,
+    proposed_plan: proposed_plan::ProposedPlanExtractor,
     task_state: Option<TaskStateSnapshot>,
     mcp_status: Option<McpStatusSnapshot>,
     task_panel_collapsed: bool,
@@ -7012,6 +7035,7 @@ impl TuiApp {
             next_entry_id,
             transcript_scroll_from_bottom: 0,
             pending_assistant: streaming::StreamingController::new(),
+            proposed_plan: proposed_plan::ProposedPlanExtractor::new(),
             task_state: None,
             mcp_status: None,
             task_panel_collapsed: false,

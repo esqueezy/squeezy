@@ -3290,6 +3290,46 @@ fn base64_encoder_supports_osc52_payloads() {
 }
 
 #[tokio::test]
+async fn proposed_plan_block_renders_as_log_entry() {
+    let mut app = test_app(SessionMode::Plan);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    for delta in [
+        "intro <propos",
+        "ed_plan>\nstep 1\nstep 2\n</propos",
+        "ed_plan>\ntrailing\n",
+    ] {
+        tx.send(AgentEvent::AssistantDelta {
+            turn_id: TurnId::new(1),
+            delta: delta.to_string(),
+        })
+        .await
+        .expect("send delta");
+    }
+    drop(tx);
+
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        app.pending_assistant.text(),
+        "intro \ntrailing\n",
+        "proposed plan markers must not appear in the live assistant pane",
+    );
+    let plan_log = app.transcript.iter().find_map(|entry| match &entry.kind {
+        TranscriptEntryKind::Log(message) if message.starts_with("proposed plan:") => {
+            Some(message.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(
+        plan_log,
+        Some("proposed plan:\nstep 1\nstep 2".to_string()),
+        "expected exactly one proposed-plan log entry; transcript={:?}",
+        app.transcript
+    );
+}
+
+#[tokio::test]
 async fn assistant_delta_preserves_scroll_offset_in_history() {
     let mut app = test_app(SessionMode::Build);
     app.transcript_scroll_from_bottom = 8;

@@ -61,6 +61,7 @@ mod ai_reviewer;
 mod cancel;
 mod exploration_compiler;
 mod permission_persist;
+mod plan_mode;
 mod roles;
 
 use cancel::{CancelErr, OrCancelExt};
@@ -2906,13 +2907,19 @@ impl TurnRuntime {
             self.config.tui.response_verbosity,
             native_text_verbosity,
         );
+        // Plan mode is enforced by tool-filtering elsewhere; the overlay
+        // here tells the model *why* its toolbox shrank and what the
+        // expected output contract (`<proposed_plan>`) looks like.
+        let active_mode = load_session_mode(&self.session_mode);
+        let mode_instructions =
+            plan_mode::instructions_for_mode(&verbosity_instructions, active_mode);
         let mut prior_state = self.conversation_state.lock().await.clone();
         // Pinned context must reach the model on every turn, not only
         // after a compaction has occurred. Inline it into the per-turn
         // instructions so a `/pin` is immediately visible to the model
         // even on sessions that never cross the compaction threshold.
         let raw_instructions = instructions_with_pinned_context(
-            &verbosity_instructions,
+            &mode_instructions,
             &prior_state.context_compaction.pinned,
         );
         let active_attachments = prior_state
