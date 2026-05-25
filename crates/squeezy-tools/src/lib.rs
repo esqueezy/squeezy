@@ -395,6 +395,14 @@ impl ToolResult {
 
     pub fn denied(call: &ToolCall, reason: impl Into<String>) -> Self {
         let reason = reason.into();
+        let guidance = format!(
+            "The user denied the `{tool}` call. Do not retry the same call. \
+             Consider an alternative: ask the user to clarify their preferred approach, \
+             try a different tool, propose a smaller or different change, or explain \
+             what you were attempting so the user can guide next steps. The turn is \
+             not over — continue.",
+            tool = call.name
+        );
         make_result(
             call,
             ToolStatus::Denied,
@@ -402,6 +410,7 @@ impl ToolResult {
                 "error": reason.clone(),
                 "reason": reason,
                 "permission_denied": true,
+                "guidance": guidance,
             }),
             ToolCostHint::default(),
             None,
