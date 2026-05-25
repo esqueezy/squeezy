@@ -639,32 +639,28 @@ async fn slash_context_keeps_percentages_unknown_without_model_limits() {
 }
 
 #[tokio::test]
-async fn multiline_paste_becomes_attached_context() {
+async fn multiline_paste_inserts_into_prompt_at_cursor() {
     let root = temp_workspace("tui_paste");
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let mut agent = test_agent_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
 
+    set_input(&mut app, "ask  now".to_string());
+    app.input_cursor = 4;
     handle_paste(
         &mut app,
         &mut agent,
-        "2026-05-24 ERROR failed\nOPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\n".to_string(),
+        "first line\r\nsecond line\rthird line".to_string(),
     )
     .await
     .expect("handle paste");
 
-    assert_eq!(app.attachments.len(), 1);
-    assert!(app.status.contains("attached paste"), "{}", app.status);
-    assert!(
-        !app.attachments[0]
-            .preview
-            .contains("sk-abcdefghijklmnopqrstuvwxyz")
+    assert_eq!(app.input, "ask first line\nsecond line\nthird line now");
+    assert_eq!(
+        app.input_cursor,
+        "ask first line\nsecond line\nthird line".len()
     );
-    let rendered = render_to_string(&app, 100, 20);
-    assert!(
-        rendered.contains(&app.attachments[0].id),
-        "attachment should render: {rendered}"
-    );
+    assert!(app.attachments.is_empty());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -846,6 +842,41 @@ fn ctrl_e_without_selection_toggles_latest_transcript_entry() {
     toggle_selected_transcript_entry(&mut app);
     assert!(app.transcript[0].collapsed);
     assert_eq!(app.status, "collapsed transcript entry 1");
+}
+
+#[test]
+fn ctrl_e_without_selection_skips_prompt_rows_and_expands_collapsed_content() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    app.push_transcript_item(TranscriptItem::user("next prompt"));
+
+    assert!(app.transcript[0].collapsed);
+    assert!(!app.transcript[1].is_toggleable());
+
+    toggle_selected_transcript_entry(&mut app);
+
+    assert!(!app.transcript[0].collapsed);
+    assert_eq!(app.status, "expanded transcript entry 1");
+}
+
+#[tokio::test]
+async fn typing_after_selection_returns_focus_to_prompt_editing() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    select_previous_transcript_entry(&mut app);
+    assert_eq!(app.selected_entry, Some(0));
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("type prompt");
+
+    assert_eq!(app.input, "h");
+    assert!(app.selected_entry.is_none());
 }
 
 #[tokio::test]

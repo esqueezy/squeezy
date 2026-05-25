@@ -49,7 +49,6 @@ use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-const INLINE_PASTE_MAX_BYTES: usize = 512;
 const LONG_ASSISTANT_CHARS: usize = 1_200;
 const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
@@ -839,27 +838,13 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
     }
 }
 
-async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Result<()> {
-    if app.turn_rx.is_some() || app.pending_approval.is_some() {
-        app.status = "paste unavailable during active turn".to_string();
-        return Ok(());
-    }
-    if is_inline_paste(&text) {
-        insert_input_text(app, &text);
-        return Ok(());
-    }
-    match agent.attach_pasted_context(text).await {
-        Ok(update) => {
-            app.attachments = agent.context_attachments_snapshot().await;
-            app.status = attachment_update_status("paste", &update);
-        }
-        Err(error) => app.status = format!("paste attach failed: {error}"),
-    }
+async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Result<()> {
+    insert_input_text(app, &normalize_pasted_text(&text));
     Ok(())
 }
 
-fn is_inline_paste(text: &str) -> bool {
-    text.len() <= INLINE_PASTE_MAX_BYTES && !text.contains('\n') && !text.contains('\r')
+fn normalize_pasted_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -877,6 +862,7 @@ enum HistoryDirection {
 fn note_input_edited(app: &mut TuiApp) {
     app.input_history_index = None;
     app.input_history_draft.clear();
+    app.selected_entry = None;
     clamp_slash_menu_index(app);
 }
 
@@ -2157,11 +2143,16 @@ fn select_next_transcript_entry(app: &mut TuiApp) {
 }
 
 fn toggle_selected_transcript_entry(app: &mut TuiApp) {
-    let Some(index) = app
-        .selected_entry
+    let selected = app.selected_entry.filter(|index| {
+        app.transcript
+            .get(*index)
+            .is_some_and(|entry| entry.is_toggleable())
+    });
+    let Some(index) = selected
+        .or_else(|| latest_collapsed_transcript_entry(app))
         .or_else(|| latest_toggleable_transcript_entry(app))
     else {
-        app.status = "transcript is empty".to_string();
+        app.status = "nothing expandable yet".to_string();
         return;
     };
     let Some(entry) = app.transcript.get_mut(index) else {
@@ -2187,6 +2178,15 @@ fn latest_toggleable_transcript_entry(app: &TuiApp) -> Option<usize> {
         .enumerate()
         .rev()
         .find(|(_, entry)| entry.is_toggleable())
+        .map(|(index, _)| index)
+}
+
+fn latest_collapsed_transcript_entry(app: &TuiApp) -> Option<usize> {
+    app.transcript
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, entry)| entry.collapsed && entry.is_toggleable())
         .map(|(index, _)| index)
 }
 
@@ -3507,6 +3507,10 @@ fn collapsed_content_summary(content: &str) -> String {
     } else {
         compact_text(content, 160)
     }
+}
+
+fn text_has_collapsible_content(content: &str) -> bool {
+    content.lines().count() > 1 || content.len() > 160
 }
 
 fn format_tool_result_entry(
@@ -6327,7 +6331,13 @@ impl TranscriptEntry {
     }
 
     fn is_toggleable(&self) -> bool {
-        true
+        match &self.kind {
+            TranscriptEntryKind::Message(item) => {
+                item.role != Role::User && text_has_collapsible_content(&item.content)
+            }
+            TranscriptEntryKind::ToolResult(_) => true,
+            TranscriptEntryKind::Log(message) => text_has_collapsible_content(message),
+        }
     }
 
     fn pin_payload(&self) -> (String, String, String) {
