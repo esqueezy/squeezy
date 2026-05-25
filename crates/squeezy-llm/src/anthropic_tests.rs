@@ -191,6 +191,72 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
 }
 
 #[test]
+fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string(),
+        instructions: "system prompt".to_string(),
+        input: vec![LlmInputItem::UserText("hi".to_string())],
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some("squeezy::session-1".to_string()),
+        tools: vec![
+            LlmToolSpec {
+                name: "tool_a".to_string(),
+                description: "first".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            },
+            LlmToolSpec {
+                name: "tool_b".to_string(),
+                description: "second".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            },
+        ],
+        store: false,
+    };
+
+    let body = AnthropicProvider::request_body(&request);
+    let tools = body["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 2);
+    assert!(
+        tools[0].get("cache_control").is_none(),
+        "earlier tool must not carry a cache breakpoint"
+    );
+    assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+}
+
+#[test]
+fn request_body_omits_tool_cache_control_when_caching_disabled() {
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string(),
+        instructions: "system".to_string(),
+        input: vec![LlmInputItem::UserText("hi".to_string())],
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: vec![LlmToolSpec {
+            name: "tool_a".to_string(),
+            description: "first".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+            strict: false,
+        }],
+        store: false,
+    };
+
+    let body = AnthropicProvider::request_body(&request);
+    let tools = body["tools"].as_array().expect("tools array");
+    assert!(
+        tools[0].get("cache_control").is_none(),
+        "cache breakpoint must not be emitted without a cache_key"
+    );
+}
+
+#[test]
 fn request_body_skips_cache_control_when_cache_key_is_absent() {
     let request = LlmRequest {
         model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string(),

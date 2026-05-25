@@ -7385,7 +7385,10 @@ fn tool_schema_index(
     // Alphabetic ordering (not first-load order like `request_tool_specs`)
     // keeps the rendered `<tools_index>` byte-stable across rounds even if
     // the registry's iteration order shifts, which matters for provider-side
-    // prompt-prefix caching.
+    // prompt-prefix caching. Note: the Anthropic provider marks the last
+    // tool definition with `cache_control: ephemeral` (see
+    // `crates/squeezy-llm/src/anthropic.rs` `request_body`), so byte-stable
+    // tool specs are load-bearing for that prefix cache as well.
     rows.sort();
     if rows.is_empty() {
         return None;
