@@ -2478,6 +2478,10 @@ async fn complete_squeezy_help_turn(
         metrics.clone(),
     ));
     session_metrics.lock().await.merge_turn(&metrics);
+    let context_estimate = {
+        let state = conversation_state.lock().await;
+        estimate_context(&state.conversation)
+    };
     let _ = tx
         .send(AgentEvent::Completed {
             turn_id,
@@ -2485,6 +2489,7 @@ async fn complete_squeezy_help_turn(
             response_id: None,
             cost,
             metrics,
+            context_estimate,
         })
         .await;
 }
@@ -2671,6 +2676,10 @@ async fn complete_local_tool_turn(
         metrics.clone(),
     ));
     session_metrics.lock().await.merge_turn(&metrics);
+    let context_estimate = {
+        let state = conversation_state.lock().await;
+        estimate_context(&state.conversation)
+    };
     let _ = tx
         .send(AgentEvent::Completed {
             turn_id,
@@ -2678,6 +2687,7 @@ async fn complete_local_tool_turn(
             response_id: None,
             cost,
             metrics,
+            context_estimate,
         })
         .await;
 }
@@ -3309,6 +3319,7 @@ impl TurnRuntime {
                     context_compaction: context_compaction.clone(),
                 })
                 .await;
+                let context_estimate = estimate_context(&conversation);
                 let _ = self
                     .tx
                     .send(AgentEvent::Completed {
@@ -3317,6 +3328,7 @@ impl TurnRuntime {
                         response_id: None,
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
+                        context_estimate,
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -3346,6 +3358,7 @@ impl TurnRuntime {
                     context_compaction: context_compaction.clone(),
                 })
                 .await;
+                let context_estimate = estimate_context(&conversation);
                 let _ = self
                     .tx
                     .send(AgentEvent::Completed {
@@ -3354,6 +3367,7 @@ impl TurnRuntime {
                         response_id,
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
+                        context_estimate,
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -8219,6 +8233,10 @@ pub enum AgentEvent {
         response_id: Option<String>,
         cost: CostSnapshot,
         metrics: TurnMetrics,
+        /// Post-turn estimate of the conversation footprint, used by the
+        /// TUI to update its context-budget indicator without needing a
+        /// follow-up `context_estimate_snapshot()` call.
+        context_estimate: ContextEstimate,
     },
     Cancelled {
         turn_id: TurnId,

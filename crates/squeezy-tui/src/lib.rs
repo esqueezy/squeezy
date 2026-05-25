@@ -431,6 +431,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.context_compaction.summary = Some(report.summary.clone());
                     app.context_compaction.history.push(report.record.clone());
                     app.context_estimate = report.record.after.clone();
+                    app.context_compaction_nudge_shown = false;
                     app.status = compaction_status_line(&report.record);
                     app.push_log(format!(
                         "context compacted gen={} trigger={} items={} tok {}->{}",
@@ -510,6 +511,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     message,
                     cost,
                     metrics,
+                    context_estimate,
                     ..
                 } => {
                     if let Some(message) = dedupe_assistant_repeated_tool_output(app, message) {
@@ -517,6 +519,8 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     }
                     app.pending_assistant.clear();
                     finalize_proposed_plan(app);
+                    app.context_estimate = context_estimate;
+                    maybe_push_context_compaction_nudge(app);
                     app.cost = cost;
                     app.metrics = metrics;
                     app.status = "ready".to_string();
@@ -562,6 +566,30 @@ async fn drain_agent_events(app: &mut TuiApp) {
             app.turn_rx = Some(rx);
         }
     }
+}
+
+/// Push a one-shot system transcript advisory when the post-turn context
+/// estimate is closing in on the auto-compaction threshold. We surface
+/// this *before* the next turn so the user has a chance to `/pin` or
+/// `/compact` deliberately rather than discovering after the fact that
+/// the conversation has been rewritten.
+fn maybe_push_context_compaction_nudge(app: &mut TuiApp) {
+    if app.context_compaction_threshold == 0 || app.context_compaction_nudge_shown {
+        return;
+    }
+    let pct = context_window_pct(
+        app.context_estimate.estimated_tokens,
+        app.context_compaction_threshold,
+    );
+    if pct < CONTEXT_NUDGE_PCT {
+        return;
+    }
+    app.context_compaction_nudge_shown = true;
+    app.push_log(format!(
+        "context window {pct}% full ({used}/{threshold} tok) — /pin to keep important context · /compact to summarize before the next turn",
+        used = app.context_estimate.estimated_tokens,
+        threshold = app.context_compaction_threshold,
+    ));
 }
 
 /// Flush any straggler bytes held by the `<proposed_plan>` extractor at
@@ -6571,6 +6599,18 @@ fn format_status_details(app: &TuiApp) -> String {
     status::render_status_details(app)
 }
 
+pub(crate) fn context_window_pct(used: u64, threshold: u64) -> u64 {
+    if threshold == 0 {
+        return 0;
+    }
+    let ratio = (used as f64 / threshold as f64) * 100.0;
+    // Saturate at 999 so the field stays compact even past the limit.
+    ratio.clamp(0.0, 999.0).round() as u64
+}
+
+const CONTEXT_BUDGET_HINT_PCT: u64 = 85;
+const CONTEXT_NUDGE_PCT: u64 = 95;
+
 fn format_status_hints(app: &TuiApp) -> String {
     if app.pending_mcp_elicitation.is_some() {
         if app
@@ -6590,13 +6630,22 @@ fn format_status_hints(app: &TuiApp) -> String {
     } else if app.exit_confirm_armed {
         return "Ctrl+C or Y to exit · any other key to cancel".to_string();
     }
-    if app.alternate_scroll_enabled {
+    let mut base = if app.alternate_scroll_enabled {
         "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
             .to_string()
     } else {
         "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
             .to_string()
+    };
+    if app.context_compaction_threshold > 0
+        && context_window_pct(
+            app.context_estimate.estimated_tokens,
+            app.context_compaction_threshold,
+        ) >= CONTEXT_BUDGET_HINT_PCT
+    {
+        base.push_str(" · /pin to keep important context · /compact to summarize");
     }
+    base
 }
 
 fn format_mcp_status(app: &TuiApp) -> String {
@@ -6914,6 +6963,16 @@ struct TuiApp {
     alternate_scroll_enabled: bool,
     attachments: Vec<ContextAttachment>,
     context_compaction: ContextCompactionState,
+    /// Token threshold above which auto-compaction triggers. Captured at
+    /// startup from `config.context_compaction.estimated_tokens` so the
+    /// status line can express usage as a percentage of the local cap
+    /// (Squeezy's cost thesis cares about the configured budget, not the
+    /// raw model window).
+    context_compaction_threshold: u64,
+    /// Whether the "compaction imminent" advisory has been pushed for the
+    /// current pre-compaction window. Reset when compaction lands so the
+    /// nudge can fire again on the next approach to the threshold.
+    context_compaction_nudge_shown: bool,
     context_estimate: ContextEstimate,
     transcript: Vec<TranscriptEntry>,
     selected_entry: Option<usize>,
@@ -7029,6 +7088,8 @@ impl TuiApp {
                 == TerminalMode::AlternateScreen,
             attachments: Vec::new(),
             context_compaction: ContextCompactionState::default(),
+            context_compaction_threshold: config.context_compaction.estimated_tokens,
+            context_compaction_nudge_shown: false,
             context_estimate: ContextEstimate::default(),
             transcript,
             selected_entry: None,
