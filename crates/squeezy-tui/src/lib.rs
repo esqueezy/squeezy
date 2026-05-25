@@ -2040,6 +2040,13 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                         report.record.before.estimated_tokens,
                         report.record.after.estimated_tokens
                     ));
+                    app.push_transcript_item(TranscriptItem::system(format!(
+                        "/compact discarded {dropped} item(s); context {before}→{after} tokens. \
+                         Run `/compact undo` to restore.",
+                        dropped = report.record.dropped_items,
+                        before = report.record.before.estimated_tokens,
+                        after = report.record.after.estimated_tokens,
+                    )));
                 }
                 Err(error) => app.status = format!("compact failed: {error}"),
             }

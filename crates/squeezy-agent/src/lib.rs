@@ -5915,13 +5915,55 @@ async fn execute_tool_calls(
     }
     flush_parallel_batch(&context, broker, &mut results, &mut parallel_batch).await;
 
-    collect_recorded_results(
+    let mut out = collect_recorded_results(
         results,
         recorded,
         broker,
         context.config,
         &context.telemetry,
-    )
+    );
+    mark_intra_batch_duplicates(&calls, &mut out, context.tools);
+    out
+}
+
+/// Stamp a `duplicate_of` hint onto any tool result whose call has the
+/// same `(tool_name, args_sha256)` as an earlier call in the same batch,
+/// for tools where re-running can only produce the same answer
+/// (`is_parallel_safe`). The execution still happens — flipping that to
+/// a real skip needs to thread through cancellation, event emission,
+/// and broker accounting — but the marker gives the model immediate
+/// feedback so it stops issuing the same grep three times in a row.
+fn mark_intra_batch_duplicates(
+    calls: &[ToolCall],
+    results: &mut [ToolResult],
+    tools: &ToolRegistry,
+) {
+    let mut first_by_key: BTreeMap<(String, String), String> = BTreeMap::new();
+    for (call, result) in calls.iter().zip(results.iter_mut()) {
+        if !tools.is_parallel_safe(call) {
+            continue;
+        }
+        let Some(args_sha) = tool_call_args_sha256(call) else {
+            continue;
+        };
+        let key = (call.name.clone(), args_sha);
+        match first_by_key.entry(key) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(call.call_id.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(slot) => {
+                if let Some(obj) = result.content.as_object_mut() {
+                    obj.insert("duplicate_of".to_string(), json!(slot.get().clone()));
+                    obj.entry("hint").or_insert_with(|| {
+                        json!(
+                            "This call is identical to an earlier call in the same response. \
+                             Do not issue duplicate tool calls; reuse the earlier output."
+                        )
+                    });
+                }
+            }
+        }
+    }
 }
 
 async fn replay_tool_calls(
@@ -7731,7 +7773,7 @@ fn llm_function_call_item(call: ToolCall, redactor: &Redactor) -> LlmInputItem {
 }
 
 fn redact_llm_input_items(input: &[LlmInputItem], redactor: &Redactor) -> Vec<LlmInputItem> {
-    input
+    let redacted: Vec<LlmInputItem> = input
         .iter()
         .cloned()
         .map(|item| match item {
@@ -7755,7 +7797,15 @@ fn redact_llm_input_items(input: &[LlmInputItem], redactor: &Redactor) -> Vec<Ll
                 }
             }
         })
-        .collect()
+        .collect();
+    // Defensive: never let an orphan `function_call_output` reach the
+    // provider. OpenAI 400s the whole turn with
+    // "No tool call found for function call output with call_id …" and the
+    // failure is sticky — once the state contains the orphan, every next
+    // turn hits the same wall. Compaction is now correct at the source,
+    // but state loaded from older sessions or merged from subagents can
+    // still carry one, so we drop here as a last-resort safety net.
+    drop_orphan_function_call_outputs(redacted)
 }
 
 /// Scrub the user/UI-facing surfaces of a `PermissionRequest` so an approval
@@ -8322,6 +8372,13 @@ fn compact_conversation(
     let recent = conversation[split..].to_vec();
     let generation = state.generation.saturating_add(1);
     let summary = build_compaction_summary(generation, state, &older, attachments, store, config);
+    // `snap_compaction_split` handles *consecutive* leading orphan outputs,
+    // but parallel tool calls produce a `[FC(A), FC(B), FCO(A), FCO(B)]`
+    // shape. If the split lands between the two calls, snap stops at the
+    // leading `FC(B)` and `FCO(A)` survives in `recent` as an orphan whose
+    // declaring `FC(A)` is in the dropped `older` slice. Drop any such
+    // orphan outputs before they reach the next provider request.
+    let recent = drop_orphan_function_call_outputs(recent);
     let mut compacted = Vec::with_capacity(recent.len() + 1);
     compacted.push(LlmInputItem::UserText(summary.clone()));
     compacted.extend(recent);
@@ -8423,6 +8480,29 @@ fn snap_compaction_split(conversation: &[LlmInputItem], initial_split: usize) ->
         }
     }
     split
+}
+
+/// Drop any `FunctionCallOutput` whose `call_id` is not declared by a
+/// `FunctionCall` somewhere in `items`. Used post-compaction to ensure
+/// the kept slice cannot reference a tool call that lived only in the
+/// summarized older slice. Order is preserved.
+fn drop_orphan_function_call_outputs(items: Vec<LlmInputItem>) -> Vec<LlmInputItem> {
+    use std::collections::BTreeSet;
+    let declared: BTreeSet<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    items
+        .iter()
+        .filter(|item| match item {
+            LlmInputItem::FunctionCallOutput { call_id, .. } => declared.contains(call_id.as_str()),
+            _ => true,
+        })
+        .cloned()
+        .collect()
 }
 
 fn estimate_context(conversation: &[LlmInputItem]) -> ContextEstimate {
