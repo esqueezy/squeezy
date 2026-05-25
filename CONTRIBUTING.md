@@ -116,6 +116,7 @@ gitleaks detect --source . --redact --no-banner --no-color --verbose
 actionlint
 typos README.md CONTRIBUTING.md docs .github
 cargo deny check
+cargo shear
 ```
 
 ## Coverage
@@ -138,6 +139,7 @@ On every pull request and every push to `main`, CI runs:
 - secret scanning (`gitleaks`)
 - workflow linting (`actionlint`)
 - dependency policy (`cargo deny check --all-features`)
+- dead dependency scan (`cargo shear`)
 - docs text linting (`typos`)
 - formatting (`cargo fmt --all -- --check`)
 - unit test layout (`scripts/check_test_layout.py`)
