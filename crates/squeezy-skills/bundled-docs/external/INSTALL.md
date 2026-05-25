@@ -1,7 +1,21 @@
 # Installation
 
-Squeezy v0 supports macOS and Linux. The fastest macOS install path is the
-Homebrew tap; Cargo and GitHub release archives are also supported.
+Squeezy v0 supports macOS and Linux. The fastest path on any supported
+platform is the one-line installer; Homebrew, Cargo, and GitHub release
+archives are also supported.
+
+## One-line installer
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh
+```
+
+The installer detects your platform, downloads the matching tagged release
+archive plus its SHA-256 sidecar, verifies the checksum, and installs the
+`squeezy` binary into `$HOME/.local/bin` (override with
+`SQUEEZY_INSTALL_DIR`). If that directory is not on your `PATH`, the
+installer prints the line to add. Pin a specific release with
+`SQUEEZY_INSTALL_TAG=v0.1.2`.
 
 ## Homebrew
 
@@ -10,7 +24,7 @@ Install from the Squeezy tap:
 ```sh
 brew tap esqueezy/tap
 brew install squeezy
-squeezy --health
+squeezy doctor
 ```
 
 The one-command form is equivalent:
@@ -20,7 +34,7 @@ brew install esqueezy/tap/squeezy
 ```
 
 Homebrew installs the matching macOS archive for Apple Silicon or Intel. The
-formula smoke test runs `squeezy --health`.
+formula smoke test runs `squeezy doctor`.
 
 ## Cargo
 
@@ -28,7 +42,7 @@ Install from crates.io:
 
 ```sh
 cargo install squeezy --locked
-squeezy --health
+squeezy doctor
 ```
 
 Use this path when you already have a recent Rust toolchain installed. Squeezy
@@ -50,7 +64,7 @@ the `squeezy` binary on your `PATH`:
 shasum -a 256 -c squeezy-aarch64-apple-darwin.tar.gz.sha256
 tar -xzf squeezy-aarch64-apple-darwin.tar.gz
 install -m 0755 squeezy /usr/local/bin/squeezy
-squeezy --health
+squeezy doctor
 ```
 
 Replace the archive name with the Intel macOS or Linux archive when needed.
@@ -63,7 +77,7 @@ settings, then start a turn:
 ```sh
 export OPENAI_API_KEY=...
 squeezy config init --user
-squeezy --health
+squeezy doctor
 squeezy --prompt "Reply with exactly: squeezy-ok"
 ```
 
