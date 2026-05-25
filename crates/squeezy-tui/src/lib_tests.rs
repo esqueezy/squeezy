@@ -294,6 +294,195 @@ async fn prompt_home_end_move_cursor_when_prompt_has_text() {
 }
 
 #[tokio::test]
+async fn prompt_line_editing_matches_common_terminal_shortcuts() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "alpha\nbravo charlie".to_string());
+    app.input_cursor = "alpha\nbravo".len();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER),
+    )
+    .await
+    .expect("super backspace");
+    assert_eq!(app.input, "alpha\n charlie");
+    assert_eq!(app.input_cursor, "alpha\n".len());
+
+    set_input(&mut app, "alpha\nbravo charlie".to_string());
+    app.input_cursor = "alpha\nbravo".len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-u");
+    assert_eq!(app.input, "alpha\n charlie");
+    assert_eq!(app.input_cursor, "alpha\n".len());
+
+    set_input(&mut app, "alpha\nbravo charlie".to_string());
+    app.input_cursor = "alpha\nbravo".len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-k");
+    assert_eq!(app.input, "alpha\nbravo");
+    assert_eq!(app.input_cursor, "alpha\nbravo".len());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-a");
+    assert_eq!(app.input_cursor, "alpha\n".len());
+
+    app.input_cursor = "alpha\nbr".len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-e");
+    assert_eq!(app.input_cursor, app.input.len());
+
+    set_input(&mut app, "alpha\nbravo".to_string());
+    app.input_cursor = "alpha\n".len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-u at line start");
+    assert_eq!(app.input, "alphabravo");
+    assert_eq!(app.input_cursor, "alpha".len());
+}
+
+#[tokio::test]
+async fn prompt_ctrl_e_keeps_expansion_shortcut_when_prompt_is_empty() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-e expands");
+    assert!(!app.transcript[0].collapsed);
+
+    set_input(&mut app, "abc".to_string());
+    app.input_cursor = 0;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-e moves to end");
+    assert_eq!(app.input_cursor, app.input.len());
+    assert!(!app.transcript[0].collapsed);
+}
+
+#[tokio::test]
+async fn prompt_word_editing_matches_codex_shortcuts() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "alpha beta,gamma".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-left");
+    assert_eq!(app.input_cursor, "alpha beta,".len());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-right");
+    assert_eq!(app.input_cursor, app.input.len());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-backspace");
+    assert_eq!(app.input, "alpha beta,");
+    assert_eq!(app.input_cursor, "alpha beta,".len());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-w");
+    assert_eq!(app.input, "alpha beta");
+    assert_eq!(app.input_cursor, "alpha beta".len());
+
+    set_input(&mut app, "alpha beta gamma".to_string());
+    app.input_cursor = "alpha ".len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-d");
+    assert_eq!(app.input, "alpha  gamma");
+    assert_eq!(app.input_cursor, "alpha ".len());
+}
+
+#[tokio::test]
+async fn prompt_ignores_key_release_events() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "abc".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new_with_kind(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ),
+    )
+    .await
+    .expect("release ignored");
+
+    assert_eq!(app.input, "abc");
+    assert_eq!(app.input_cursor, 3);
+}
+
+#[test]
+fn keyboard_enhancement_flags_enable_modified_key_reporting() {
+    let flags = keyboard_enhancement_flags();
+
+    assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+    assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+    assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+}
+
+#[tokio::test]
 async fn prompt_history_uses_plain_up_down_when_prompt_is_empty() {
     let mut agent = test_agent(SessionMode::Build);
     let mut config = test_config(SessionMode::Build);
@@ -1821,6 +2010,15 @@ fn alternate_scroll_commands_use_xterm_private_mode() {
         .write_ansi(&mut disable)
         .expect("disable alternate scroll");
     assert_eq!(disable, "\x1b[?1007l");
+}
+
+#[test]
+fn modify_other_keys_reset_uses_xterm_sequence() {
+    let mut disable = String::new();
+    DisableModifyOtherKeys
+        .write_ansi(&mut disable)
+        .expect("disable modifyOtherKeys");
+    assert_eq!(disable, "\x1b[>4;0m");
 }
 
 #[test]

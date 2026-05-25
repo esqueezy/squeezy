@@ -11,8 +11,9 @@ use crossterm::{
     Command,
     cursor::MoveTo,
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseEventKind,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     style::Print,
@@ -74,6 +75,14 @@ const INLINE_VIEWPORT_HEIGHT: u16 = 18;
 const SLASH_MENU_MAX_ITEMS: usize = 5;
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 const CLEAR_SCROLLBACK_AND_VISIBLE: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H";
+const RESET_KEYBOARD_ENHANCEMENT_FLAGS: &str = "\x1b[<u";
+const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
+
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EnableAlternateScroll;
@@ -108,6 +117,27 @@ impl Command for DisableAlternateScroll {
     fn execute_winapi(&self) -> io::Result<()> {
         Err(io::Error::other(
             "alternate scroll is only supported through ANSI escape sequences",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisableModifyOtherKeys;
+
+impl Command for DisableModifyOtherKeys {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[>4;0m")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::other(
+            "modifyOtherKeys reset is only supported through ANSI escape sequences",
         ))
     }
 
@@ -631,6 +661,10 @@ fn handle_mouse(app: &mut TuiApp, kind: MouseEventKind) {
 }
 
 async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Result<bool> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return Ok(false);
+    }
+
     if key.code != KeyCode::Esc {
         app.exit_armed = false;
     }
@@ -648,7 +682,11 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
-        toggle_selected_transcript_entry(app);
+        if app.input.is_empty() {
+            toggle_selected_transcript_entry(app);
+        } else {
+            move_input_cursor_line_end(app);
+        }
         return Ok(false);
     }
 
@@ -668,6 +706,61 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         && (key.code == KeyCode::Char('j') || key.code == KeyCode::Enter)
     {
         insert_input_char(app, '\n');
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
+        move_input_cursor_line_start(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
+        delete_to_line_end(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+        delete_to_line_start(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('w') {
+        delete_previous_word(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+        delete_at_cursor(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('h') {
+        delete_before_cursor(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
+        move_input_cursor_left(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
+        move_input_cursor_right(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('b') {
+        move_input_cursor_word_left(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('f') {
+        move_input_cursor_word_right(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('d') {
+        delete_next_word(app);
         return Ok(false);
     }
 
@@ -726,7 +819,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             if app.input.is_empty() {
                 app.transcript_scroll_from_bottom = u16::MAX;
             } else {
-                app.input_cursor = 0;
+                move_input_cursor_line_start(app);
             }
             Ok(false)
         }
@@ -734,16 +827,30 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             if app.input.is_empty() {
                 app.transcript_scroll_from_bottom = 0;
             } else {
-                app.input_cursor = app.input.len();
+                move_input_cursor_line_end(app);
             }
             Ok(false)
         }
         KeyCode::Left => {
-            move_input_cursor_left(app);
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+            {
+                move_input_cursor_word_left(app);
+            } else {
+                move_input_cursor_left(app);
+            }
             Ok(false)
         }
         KeyCode::Right => {
-            move_input_cursor_right(app);
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+            {
+                move_input_cursor_word_right(app);
+            } else {
+                move_input_cursor_right(app);
+            }
             Ok(false)
         }
         KeyCode::Up => {
@@ -821,11 +928,35 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             Ok(false)
         }
         KeyCode::Backspace => {
-            delete_before_cursor(app);
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::META)
+            {
+                delete_to_line_start(app);
+            } else if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+            {
+                delete_previous_word(app);
+            } else {
+                delete_before_cursor(app);
+            }
             Ok(false)
         }
         KeyCode::Delete => {
-            delete_at_cursor(app);
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::META)
+            {
+                delete_to_line_end(app);
+            } else if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+            {
+                delete_next_word(app);
+            } else {
+                delete_at_cursor(app);
+            }
             Ok(false)
         }
         KeyCode::Char(ch) => {
@@ -945,6 +1076,62 @@ fn delete_at_cursor(app: &mut TuiApp) {
     note_input_edited(app);
 }
 
+fn delete_to_line_start(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    let start = line_start_before_cursor(&app.input, cursor);
+    if start >= cursor {
+        if cursor > 0 && app.input[..cursor].ends_with('\n') {
+            delete_before_cursor(app);
+        } else {
+            app.input_cursor = cursor;
+        }
+        return;
+    }
+    app.input.drain(start..cursor);
+    app.input_cursor = start;
+    note_input_edited(app);
+}
+
+fn delete_to_line_end(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    let end = line_end_after_cursor(&app.input, cursor);
+    if end <= cursor {
+        if cursor < app.input.len() {
+            delete_at_cursor(app);
+        } else {
+            app.input_cursor = app.input.len();
+        }
+        return;
+    }
+    app.input.drain(cursor..end);
+    app.input_cursor = cursor;
+    note_input_edited(app);
+}
+
+fn delete_previous_word(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    let start = previous_word_start(&app.input, cursor);
+    if start >= cursor {
+        app.input_cursor = cursor;
+        return;
+    }
+    app.input.drain(start..cursor);
+    app.input_cursor = start;
+    note_input_edited(app);
+}
+
+fn delete_next_word(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    let end = next_word_end(&app.input, cursor);
+    if end <= cursor {
+        app.input_cursor = cursor;
+        return;
+    }
+    app.input.drain(cursor..end);
+    app.input_cursor = cursor;
+    note_input_edited(app);
+}
+
 fn move_input_cursor_left(app: &mut TuiApp) {
     let cursor = input_cursor(app);
     app.input_cursor = app.input[..cursor]
@@ -966,6 +1153,84 @@ fn move_input_cursor_right(app: &mut TuiApp) {
             .next()
             .map(char::len_utf8)
             .unwrap_or(0);
+}
+
+fn move_input_cursor_line_start(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    app.input_cursor = line_start_before_cursor(&app.input, cursor);
+}
+
+fn move_input_cursor_line_end(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    app.input_cursor = line_end_after_cursor(&app.input, cursor);
+}
+
+fn move_input_cursor_word_left(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    app.input_cursor = previous_word_start(&app.input, cursor);
+}
+
+fn move_input_cursor_word_right(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    app.input_cursor = next_word_end(&app.input, cursor);
+}
+
+fn line_start_before_cursor(text: &str, cursor: usize) -> usize {
+    let cursor = text_cursor(text, cursor);
+    text[..cursor]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn line_end_after_cursor(text: &str, cursor: usize) -> usize {
+    let cursor = text_cursor(text, cursor);
+    text[cursor..]
+        .find('\n')
+        .map(|index| cursor + index)
+        .unwrap_or(text.len())
+}
+
+fn previous_word_start(text: &str, cursor: usize) -> usize {
+    let cursor = text_cursor(text, cursor);
+    let prefix = &text[..cursor];
+    let Some((mut start, ch)) = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_whitespace())
+    else {
+        return 0;
+    };
+    let separator = is_word_separator(ch);
+    for (index, ch) in prefix[..start].char_indices().rev() {
+        if ch.is_whitespace() || is_word_separator(ch) != separator {
+            break;
+        }
+        start = index;
+    }
+    start
+}
+
+fn next_word_end(text: &str, cursor: usize) -> usize {
+    let cursor = text_cursor(text, cursor);
+    let suffix = &text[cursor..];
+    let Some((first_offset, first)) = suffix.char_indices().find(|(_, ch)| !ch.is_whitespace())
+    else {
+        return text.len();
+    };
+    let separator = is_word_separator(first);
+    let mut end = cursor + first_offset + first.len_utf8();
+    for (offset, ch) in suffix[first_offset + first.len_utf8()..].char_indices() {
+        if ch.is_whitespace() || is_word_separator(ch) != separator {
+            break;
+        }
+        end = cursor + first_offset + first.len_utf8() + offset + ch.len_utf8();
+    }
+    end
+}
+
+fn is_word_separator(ch: char) -> bool {
+    WORD_SEPARATORS.contains(ch)
 }
 
 fn scroll_transcript_up(app: &mut TuiApp, lines: u16) {
@@ -6459,6 +6724,11 @@ impl TerminalGuard {
         let mode = TerminalMode::from(alternate_screen);
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         let mut stdout = io::stdout();
+        let _ = execute!(
+            stdout,
+            DisableModifyOtherKeys,
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
+        );
         match mode {
             TerminalMode::Inline => {
                 execute!(
@@ -6557,6 +6827,9 @@ impl Drop for TerminalGuard {
             TerminalMode::Inline => {
                 let _ = execute!(
                     self.terminal.backend_mut(),
+                    PopKeyboardEnhancementFlags,
+                    Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
+                    DisableModifyOtherKeys,
                     DisableBracketedPaste,
                     DisableAlternateScroll,
                     Print(DISABLE_MOUSE_MODES),
@@ -6566,6 +6839,9 @@ impl Drop for TerminalGuard {
             TerminalMode::AlternateScreen => {
                 let _ = execute!(
                     self.terminal.backend_mut(),
+                    PopKeyboardEnhancementFlags,
+                    Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
+                    DisableModifyOtherKeys,
                     DisableBracketedPaste,
                     DisableAlternateScroll,
                     Print(DISABLE_MOUSE_MODES),
