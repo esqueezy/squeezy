@@ -1348,12 +1348,30 @@ fn apply_by_tier(
                 .map(|head| head == "model" || head == "providers")
                 .unwrap_or(false);
             let new_provider = if touches_provider {
-                match squeezy_llm::provider_from_config(&state.effective.provider) {
-                    Ok(p) => Some(p),
-                    Err(err) => {
+                // `provider_from_config` resolves the API key, which on Linux
+                // talks to D-Bus via the `keyring` crate. zbus refuses to do
+                // blocking I/O inside a tokio runtime and panics. We run the
+                // build on a plain OS thread so the keychain call is not
+                // observed by tokio.
+                let provider_cfg = state.effective.provider.clone();
+                let handle =
+                    std::thread::spawn(move || squeezy_llm::provider_from_config(&provider_cfg));
+                match handle.join() {
+                    Ok(Ok(p)) => Some(p),
+                    Ok(Err(err)) => {
                         notifications.push(
                             format!(
                                 "saved to {} but the new provider failed to build: {err}",
+                                path_str
+                            ),
+                            NotifySeverity::Error,
+                        );
+                        None
+                    }
+                    Err(_) => {
+                        notifications.push(
+                            format!(
+                                "saved to {} but the provider builder thread panicked",
                                 path_str
                             ),
                             NotifySeverity::Error,
