@@ -15,6 +15,13 @@ fn default_instructions_do_not_reference_hidden_task_state_tool() {
 }
 
 #[test]
+fn default_instructions_avoid_repeating_ui_rendered_tool_output() {
+    assert!(DEFAULT_INSTRUCTIONS.contains("Do not repeat raw tool output already shown by the UI"));
+    assert!(!DEFAULT_INSTRUCTIONS.contains("command in cwd"));
+    assert!(!DEFAULT_INSTRUCTIONS.contains("Markdown fences"));
+}
+
+#[test]
 fn transcript_constructors_set_roles() {
     assert_eq!(TranscriptItem::user("hello").role, Role::User);
     assert_eq!(TranscriptItem::assistant("hi").role, Role::Assistant);

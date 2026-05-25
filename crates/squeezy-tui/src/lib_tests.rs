@@ -133,7 +133,7 @@ async fn slash_plan_and_build_force_modes() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
 
-    app.input = "/plan".to_string();
+    set_input(&mut app, "/plan".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -145,7 +145,7 @@ async fn slash_plan_and_build_force_modes() {
     assert_eq!(agent.session_mode(), SessionMode::Plan);
     assert!(app.input.is_empty());
 
-    app.input = "/plan".to_string();
+    set_input(&mut app, "/plan".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -156,7 +156,7 @@ async fn slash_plan_and_build_force_modes() {
     assert_eq!(app.mode, SessionMode::Plan);
     assert_eq!(app.status, "already in plan mode");
 
-    app.input = "/build".to_string();
+    set_input(&mut app, "/build".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -167,6 +167,130 @@ async fn slash_plan_and_build_force_modes() {
     assert_eq!(app.mode, SessionMode::Build);
     assert_eq!(agent.session_mode(), SessionMode::Build);
     assert_eq!(app.status, "mode switched to build");
+}
+
+#[tokio::test]
+async fn prompt_cursor_moves_and_edits_inside_text() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    set_input(&mut app, "abc".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+    )
+    .await
+    .expect("left");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+    )
+    .await
+    .expect("left");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("insert");
+    assert_eq!(app.input, "aXbc");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    )
+    .await
+    .expect("right");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("insert");
+    assert_eq!(app.input, "aXbYc");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+    )
+    .await
+    .expect("backspace");
+    assert_eq!(app.input, "aXbc");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+    )
+    .await
+    .expect("delete");
+    assert_eq!(app.input, "aXb");
+}
+
+#[tokio::test]
+async fn prompt_cursor_moves_on_unicode_boundaries() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    set_input(&mut app, "aéz".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+    )
+    .await
+    .expect("left before z");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+    )
+    .await
+    .expect("left before unicode");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+    )
+    .await
+    .expect("delete previous ascii");
+
+    assert_eq!(app.input, "éz");
+    assert_eq!(app.input_cursor, 0);
+}
+
+#[tokio::test]
+async fn prompt_home_end_move_cursor_when_prompt_has_text() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "abc".to_string());
+    app.transcript_scroll_from_bottom = 4;
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+    )
+    .await
+    .expect("home");
+    assert_eq!(app.input_cursor, 0);
+    assert_eq!(app.transcript_scroll_from_bottom, 4);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+    )
+    .await
+    .expect("end");
+    assert_eq!(app.input_cursor, app.input.len());
+    assert_eq!(app.transcript_scroll_from_bottom, 4);
 }
 
 #[tokio::test]
@@ -244,7 +368,7 @@ async fn alternate_screen_arrows_scroll_transcript_when_draft_is_not_empty() {
     let mut config = test_config(SessionMode::Build);
     config.tui.alternate_screen = TuiAlternateScreen::Always;
     let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.input = "hi".to_string();
+    set_input(&mut app, "hi".to_string());
     app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
     push_input_history(&mut app, "previous prompt".to_string());
 
@@ -338,7 +462,7 @@ fn explicit_alternate_screen_mouse_wheel_scrolls_transcript_without_prompt_histo
 async fn slash_menu_renders_and_completes_selected_command() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    app.input = "/p".to_string();
+    set_input(&mut app, "/p".to_string());
 
     let output = render_to_string(&app, 100, 16);
     assert!(output.contains("/permissions"), "{output}");
@@ -368,7 +492,7 @@ async fn slash_menu_renders_and_completes_selected_command() {
 async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    app.input = "/".to_string();
+    set_input(&mut app, "/".to_string());
 
     let suggestions = slash_suggestions(&app.input);
     let names = suggestions
@@ -437,7 +561,7 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
 #[test]
 fn unknown_slash_command_does_not_start_model_turn() {
     let mut app = test_app(SessionMode::Build);
-    app.input = "/nope".to_string();
+    set_input(&mut app, "/nope".to_string());
 
     let input = app.input.trim().to_string();
     assert!(reject_unknown_slash_command(&mut app, &input));
@@ -1361,7 +1485,7 @@ fn approval_menu_renders_below_prompt_without_border_box() {
         request,
         decision_tx,
     });
-    app.input = "approve?".to_string();
+    set_input(&mut app, "approve?".to_string());
 
     let output = render_to_string(&app, 120, 24);
     let lines = output.lines().collect::<Vec<_>>();
@@ -1676,7 +1800,7 @@ fn inline_live_viewport_excludes_flushed_history() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("old prompt"));
     app.push_transcript_item(TranscriptItem::assistant("old answer"));
-    app.input = "new prompt".to_string();
+    set_input(&mut app, "new prompt".to_string());
 
     let output = render_inline_to_string(&app, 100, 12);
 
@@ -1698,11 +1822,22 @@ fn exit_hint_points_to_session_resume_command() {
 #[test]
 fn render_prompt_uses_rotating_coin_and_cursor() {
     let mut app = test_app(SessionMode::Build);
-    app.input = "ship it".to_string();
+    set_input(&mut app, "ship it".to_string());
     app.turn_visual = TurnVisualState::Running;
 
     let output = render_to_string(&app, 100, 12);
     assert!(output.contains("●  ship it┃"), "{output}");
+}
+
+#[test]
+fn render_prompt_places_cursor_inside_input_text() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "abcd".to_string());
+    app.input_cursor = 2;
+
+    let output = render_to_string(&app, 100, 12);
+    assert!(output.contains("●  ab┃cd"), "{output}");
+    assert!(!output.contains("●  abcd┃"), "{output}");
 }
 
 #[test]
@@ -2201,13 +2336,16 @@ fn prompt_height_grows_for_multiline_input() {
     let mut app = test_app(SessionMode::Build);
     assert_eq!(input_panel_height(&app, 100), 3);
 
-    app.input = "one\ntwo\nthree".to_string();
+    set_input(&mut app, "one\ntwo\nthree".to_string());
     assert_eq!(input_panel_height(&app, 100), 5);
 
-    app.input = (0..20)
-        .map(|index| format!("line {index}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    set_input(
+        &mut app,
+        (0..20)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
     assert_eq!(input_panel_height(&app, 100), PROMPT_MAX_HEIGHT);
 }
 
@@ -2357,7 +2495,7 @@ async fn ctrl_j_and_backslash_enter_insert_prompt_newlines() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
 
-    app.input = "first".to_string();
+    set_input(&mut app, "first".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -2367,7 +2505,7 @@ async fn ctrl_j_and_backslash_enter_insert_prompt_newlines() {
     .expect("ctrl-j newline");
     assert_eq!(app.input, "first\n");
 
-    app.input.push_str("second\\");
+    insert_input_text(&mut app, "second\\");
     handle_key(
         &mut app,
         &mut agent,

@@ -666,8 +666,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && (key.code == KeyCode::Char('j') || key.code == KeyCode::Enter)
     {
-        app.input.push('\n');
-        note_input_edited(app);
+        insert_input_char(app, '\n');
         return Ok(false);
     }
 
@@ -687,7 +686,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
     {
         switch_mode(app, agent, Some(mode), "tui_command");
         if app.turn_rx.is_none() && app.pending_approval.is_none() {
-            app.input.clear();
+            clear_input(app);
         }
         return Ok(false);
     }
@@ -723,11 +722,27 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             Ok(false)
         }
         KeyCode::Home => {
-            app.transcript_scroll_from_bottom = u16::MAX;
+            if app.input.is_empty() {
+                app.transcript_scroll_from_bottom = u16::MAX;
+            } else {
+                app.input_cursor = 0;
+            }
             Ok(false)
         }
         KeyCode::End => {
-            app.transcript_scroll_from_bottom = 0;
+            if app.input.is_empty() {
+                app.transcript_scroll_from_bottom = 0;
+            } else {
+                app.input_cursor = app.input.len();
+            }
+            Ok(false)
+        }
+        KeyCode::Left => {
+            move_input_cursor_left(app);
+            Ok(false)
+        }
+        KeyCode::Right => {
+            move_input_cursor_right(app);
             Ok(false)
         }
         KeyCode::Up => {
@@ -768,10 +783,9 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             if complete_selected_slash_command(app) {
                 return Ok(false);
             }
-            if app.input.ends_with('\\') {
-                app.input.pop();
-                app.input.push('\n');
-                note_input_edited(app);
+            if input_cursor(app) == app.input.len() && app.input.ends_with('\\') {
+                delete_before_cursor(app);
+                insert_input_char(app, '\n');
                 return Ok(false);
             }
             let input = app.input.trim().to_string();
@@ -780,7 +794,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
                 return Ok(false);
             }
             if handle_slash_command(app, agent, &input).await {
-                app.input.clear();
+                clear_input(app);
                 app.input_history_index = None;
                 app.input_history_draft.clear();
                 app.slash_menu_index = 0;
@@ -789,7 +803,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             if reject_unknown_slash_command(app, &input) {
                 return Ok(false);
             }
-            app.input.clear();
+            clear_input(app);
             push_input_history(app, input.clone());
             let cancel = CancellationToken::new();
             app.task_state = None;
@@ -806,14 +820,16 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             Ok(false)
         }
         KeyCode::Backspace => {
-            app.input.pop();
-            note_input_edited(app);
+            delete_before_cursor(app);
+            Ok(false)
+        }
+        KeyCode::Delete => {
+            delete_at_cursor(app);
             Ok(false)
         }
         KeyCode::Char(ch) => {
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
-                app.input.push(ch);
-                note_input_edited(app);
+                insert_input_char(app, ch);
             }
             Ok(false)
         }
@@ -827,8 +843,7 @@ async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Resu
         return Ok(());
     }
     if is_inline_paste(&text) {
-        app.input.push_str(&text);
-        note_input_edited(app);
+        insert_input_text(app, &text);
         return Ok(());
     }
     match agent.attach_pasted_context(text).await {
@@ -861,6 +876,108 @@ fn note_input_edited(app: &mut TuiApp) {
     app.input_history_index = None;
     app.input_history_draft.clear();
     clamp_slash_menu_index(app);
+}
+
+fn clear_input(app: &mut TuiApp) {
+    app.input.clear();
+    app.input_cursor = 0;
+    clamp_slash_menu_index(app);
+}
+
+fn set_input(app: &mut TuiApp, input: String) {
+    app.input = input;
+    app.input_cursor = app.input.len();
+    clamp_input_cursor(app);
+    clamp_slash_menu_index(app);
+}
+
+fn input_cursor(app: &TuiApp) -> usize {
+    text_cursor(&app.input, app.input_cursor)
+}
+
+fn clamp_input_cursor(app: &mut TuiApp) {
+    app.input_cursor = text_cursor(&app.input, app.input_cursor);
+}
+
+fn text_cursor(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while cursor > 0 && !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    cursor
+}
+
+fn insert_input_char(app: &mut TuiApp, ch: char) {
+    clamp_input_cursor(app);
+    app.input.insert(app.input_cursor, ch);
+    app.input_cursor += ch.len_utf8();
+    note_input_edited(app);
+}
+
+fn insert_input_text(app: &mut TuiApp, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    clamp_input_cursor(app);
+    app.input.insert_str(app.input_cursor, text);
+    app.input_cursor += text.len();
+    note_input_edited(app);
+}
+
+fn delete_before_cursor(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    if cursor == 0 {
+        app.input_cursor = 0;
+        return;
+    }
+    let previous = app.input[..cursor]
+        .char_indices()
+        .last()
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    app.input.drain(previous..cursor);
+    app.input_cursor = previous;
+    note_input_edited(app);
+}
+
+fn delete_at_cursor(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    if cursor >= app.input.len() {
+        app.input_cursor = app.input.len();
+        return;
+    }
+    let next = cursor
+        + app.input[cursor..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(0);
+    app.input.drain(cursor..next);
+    app.input_cursor = cursor;
+    note_input_edited(app);
+}
+
+fn move_input_cursor_left(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    app.input_cursor = app.input[..cursor]
+        .char_indices()
+        .last()
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+}
+
+fn move_input_cursor_right(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    if cursor >= app.input.len() {
+        app.input_cursor = app.input.len();
+        return;
+    }
+    app.input_cursor = cursor
+        + app.input[cursor..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(0);
 }
 
 fn scroll_transcript_up(app: &mut TuiApp, lines: u16) {
@@ -921,7 +1038,7 @@ fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirection) {
         (Some(0), HistoryDirection::Previous) => Some(0),
         (Some(index), HistoryDirection::Previous) => Some(index - 1),
         (Some(index), HistoryDirection::Next) if index >= last => {
-            app.input = app.input_history_draft.clone();
+            set_input(app, app.input_history_draft.clone());
             app.input_history_draft.clear();
             app.input_history_index = None;
             app.slash_menu_index = 0;
@@ -930,7 +1047,7 @@ fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirection) {
         (Some(index), HistoryDirection::Next) => Some(index + 1),
     };
     if let Some(index) = next {
-        app.input = app.input_history[index].clone();
+        set_input(app, app.input_history[index].clone());
         app.input_history_index = Some(index);
         app.selected_entry = None;
         app.slash_menu_index = 0;
@@ -988,7 +1105,7 @@ fn complete_selected_slash_command(app: &mut TuiApp) -> bool {
     if app.input.trim() == selected.name {
         return false;
     }
-    app.input = format!("{} ", selected.name);
+    set_input(app, format!("{} ", selected.name));
     app.slash_menu_index = 0;
     app.status = format!("selected {}", selected.name);
     true
@@ -5112,8 +5229,9 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
             prompt_cursor_span(),
         ])];
     }
+    let cursor = input_cursor(app);
     let parts = app.input.split('\n').collect::<Vec<_>>();
-    let last_index = parts.len().saturating_sub(1);
+    let mut line_start = 0usize;
     parts
         .iter()
         .enumerate()
@@ -5131,13 +5249,30 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
                 )]
             };
             let mut spans = prefix;
-            spans.push(Span::styled(
-                line.to_string(),
-                Style::default().fg(Color::White).bg(PROMPT_BG),
-            ));
-            if index == last_index {
+            let line_end = line_start + line.len();
+            if cursor >= line_start && cursor <= line_end {
+                let split_at = cursor.saturating_sub(line_start).min(line.len());
+                let (before, after) = line.split_at(split_at);
+                if !before.is_empty() {
+                    spans.push(Span::styled(
+                        before.to_string(),
+                        Style::default().fg(Color::White).bg(PROMPT_BG),
+                    ));
+                }
                 spans.push(prompt_cursor_span());
+                if !after.is_empty() {
+                    spans.push(Span::styled(
+                        after.to_string(),
+                        Style::default().fg(Color::White).bg(PROMPT_BG),
+                    ));
+                }
+            } else {
+                spans.push(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::White).bg(PROMPT_BG),
+                ));
             }
+            line_start = line_end.saturating_add(1);
             Line::from(spans)
         })
         .collect()
@@ -5619,6 +5754,7 @@ struct TuiApp {
     permissions: PermissionStatus,
     telemetry: TelemetryStatus,
     input: String,
+    input_cursor: usize,
     input_history: Vec<String>,
     input_history_index: Option<usize>,
     input_history_draft: String,
@@ -5725,6 +5861,7 @@ impl TuiApp {
             permissions: PermissionStatus::from_policy(&config.permissions),
             telemetry: TelemetryStatus::from_config(&config.telemetry),
             input: String::new(),
+            input_cursor: 0,
             input_history: Vec::new(),
             input_history_index: None,
             input_history_draft: String::new(),
