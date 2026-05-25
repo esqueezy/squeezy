@@ -417,6 +417,11 @@ async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::ToolCallCompleted { result, .. } => {
                     app.status = tool_result_status_text(&result);
+                    if result.status == ToolStatus::Success
+                        && matches!(result.tool_name.as_str(), "apply_patch" | "write_file")
+                    {
+                        app.last_turn_had_edits = true;
+                    }
                     let call = app.active_tool_calls.remove(&result.call_id);
                     app.refresh_active_tool_name();
                     app.push_tool_result_with_call(result, call);
@@ -553,6 +558,13 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     finalize_proposed_plan(app);
                     app.context_estimate = context_estimate;
                     app.cancelled_prompt = None;
+                    if app.last_turn_had_edits {
+                        app.push_log(
+                            "turn complete · /diff to inspect changes · /undo to revert this turn"
+                                .to_string(),
+                        );
+                        app.last_turn_had_edits = false;
+                    }
                     maybe_push_context_compaction_nudge(app);
                     app.cost = cost;
                     app.metrics = metrics;
@@ -569,9 +581,19 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     break;
                 }
                 AgentEvent::Cancelled { .. } => {
-                    app.status = "cancelled; edit prompt or retry".to_string();
+                    let mut message = "cancelled; edit prompt or retry".to_string();
+                    if app.last_turn_had_edits {
+                        message.push_str(" · /undo to revert this turn's edits");
+                    }
+                    app.status = message;
                     app.turn_visual = TurnVisualState::Failed;
                     app.push_log("turn cancelled".to_string());
+                    if app.last_turn_had_edits {
+                        app.push_log(
+                            "/diff to inspect changes · /undo to revert this turn".to_string(),
+                        );
+                        app.last_turn_had_edits = false;
+                    }
                     app.pending_assistant.clear();
                     finalize_proposed_plan(app);
                     app.clear_active_tools();
@@ -583,9 +605,16 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     break;
                 }
                 AgentEvent::Failed { error, .. } => {
-                    app.status = format_error_status(&error);
+                    let mut status = format_error_status(&error);
+                    if app.last_turn_had_edits {
+                        status.push_str(" · /undo to revert this turn's edits");
+                    }
+                    app.status = status;
                     app.turn_visual = TurnVisualState::Failed;
                     app.push_log(format!("turn failed: {}", app.status));
+                    if app.last_turn_had_edits {
+                        app.last_turn_had_edits = false;
+                    }
                     app.pending_assistant.clear();
                     finalize_proposed_plan(app);
                     app.clear_active_tools();
@@ -688,13 +717,13 @@ fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Enter => {
-            if choice_count > 0 {
-                if let Some(choice) = pending.request.choices.get(pending.selection_index) {
-                    let response = RequestUserInputResponse::choice(choice.value.clone());
-                    let _ = pending.response_tx.send(response);
-                    app.status = format!("answered: {}", choice.label);
-                    return true;
-                }
+            if choice_count > 0
+                && let Some(choice) = pending.request.choices.get(pending.selection_index)
+            {
+                let response = RequestUserInputResponse::choice(choice.value.clone());
+                let _ = pending.response_tx.send(response);
+                app.status = format!("answered: {}", choice.label);
+                return true;
             }
             if pending.request.allow_freeform && !app.input.trim().is_empty() {
                 let text = std::mem::take(&mut app.input);
@@ -995,10 +1024,11 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
-        if restore_cancelled_prompt(app) {
-            return Ok(false);
-        }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('r')
+        && restore_cancelled_prompt(app)
+    {
+        return Ok(false);
     }
 
     if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('b') {
@@ -7219,6 +7249,10 @@ struct TuiApp {
     /// or failed. Surfaced via Ctrl-R so the user can recover from a
     /// typo without retyping. Cleared on successful completion.
     cancelled_prompt: Option<String>,
+    /// True when the in-flight turn has already produced a successful
+    /// edit-capable tool call (apply_patch / write_file). Used to surface
+    /// `/diff` and `/undo` hints at end-of-turn (success or failure).
+    last_turn_had_edits: bool,
     mcp_elicitation_selection_index: usize,
     pending_feedback: Option<PreparedFeedback>,
     pending_report: Option<BugReportBundle>,
@@ -7339,6 +7373,7 @@ impl TuiApp {
             pending_mcp_elicitation: None,
             pending_request_user_input: None,
             cancelled_prompt: None,
+            last_turn_had_edits: false,
             mcp_elicitation_selection_index: 0,
             pending_feedback: None,
             pending_report: None,

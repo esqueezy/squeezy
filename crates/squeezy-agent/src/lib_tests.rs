@@ -2971,7 +2971,7 @@ fn parse_subagent_request_requires_goal_for_plan_and_allows_empty_review() {
 
 #[tokio::test]
 async fn plan_mode_request_user_input_pauses_turn_and_resumes_with_choice() {
-    use super::{REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputAction, RequestUserInputResponse};
+    use super::{REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputResponse};
 
     let provider = Arc::new(MockProvider::new(vec![
         vec![
@@ -3075,16 +3075,14 @@ async fn build_mode_refuses_request_user_input_call() {
     while let Some(event) = rx.recv().await {
         match event {
             AgentEvent::RequestUserInputRequested { .. } => saw_request_user_input = true,
-            AgentEvent::ToolCallCompleted { result, .. } => {
-                if result.call_id == "ask_1" {
-                    assert_eq!(result.status, squeezy_tools::ToolStatus::Denied);
-                    let content = serde_json::to_string(&result.content).unwrap();
-                    assert!(
-                        content.contains("Plan mode"),
-                        "refusal payload should explain the mode gating: {content}",
-                    );
-                    saw_refusal_result = true;
-                }
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "ask_1" => {
+                assert_eq!(result.status, squeezy_tools::ToolStatus::Denied);
+                let content = serde_json::to_string(&result.content).unwrap();
+                assert!(
+                    content.contains("Plan mode"),
+                    "refusal payload should explain the mode gating: {content}",
+                );
+                saw_refusal_result = true;
             }
             AgentEvent::Completed { .. } => break,
             AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),

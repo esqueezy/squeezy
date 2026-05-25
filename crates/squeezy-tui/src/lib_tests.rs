@@ -3290,6 +3290,117 @@ fn base64_encoder_supports_osc52_payloads() {
 }
 
 #[tokio::test]
+async fn successful_edit_turn_pushes_diff_undo_hint() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let edit_result = sample_tool_result("apply_patch", "patched ok");
+    tx.send(AgentEvent::ToolCallCompleted {
+        turn_id: TurnId::new(1),
+        result: edit_result,
+    })
+    .await
+    .expect("send tool result");
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let hint = app.transcript.iter().find_map(|entry| match &entry.kind {
+        TranscriptEntryKind::Log(message)
+            if message.contains("/diff") && message.contains("/undo") =>
+        {
+            Some(message.clone())
+        }
+        _ => None,
+    });
+    assert!(
+        hint.is_some(),
+        "successful edit turn must push a /diff /undo hint; transcript: {:?}",
+        app.transcript
+    );
+    assert!(
+        !app.last_turn_had_edits,
+        "flag must reset after the hint fires"
+    );
+}
+
+#[tokio::test]
+async fn readonly_turn_does_not_push_undo_hint() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let read_result = sample_tool_result("read_file", "file body");
+    tx.send(AgentEvent::ToolCallCompleted {
+        turn_id: TurnId::new(1),
+        result: read_result,
+    })
+    .await
+    .expect("send tool result");
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let hint_count = app
+        .transcript
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.kind, TranscriptEntryKind::Log(message)
+                if message.contains("/diff") && message.contains("/undo"))
+        })
+        .count();
+    assert_eq!(hint_count, 0, "read-only turn must not produce /undo hint");
+}
+
+#[tokio::test]
+async fn failed_edit_turn_error_status_mentions_undo() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let edit_result = sample_tool_result("write_file", "wrote ok");
+    tx.send(AgentEvent::ToolCallCompleted {
+        turn_id: TurnId::new(1),
+        result: edit_result,
+    })
+    .await
+    .expect("send tool result");
+    tx.send(AgentEvent::Failed {
+        turn_id: TurnId::new(1),
+        error: SqueezyError::Permission("denied".to_string()),
+    })
+    .await
+    .expect("send failed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert!(
+        app.status.contains("/undo"),
+        "failed turn after an edit must surface /undo in status; got: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
 async fn cancel_preserves_pending_prompt_for_ctrl_r() {
     let mut app = test_app(SessionMode::Build);
     app.cancelled_prompt = Some("write the README".to_string());
