@@ -33,7 +33,8 @@ use ratatui::{
 };
 use squeezy_agent::{
     Agent, AgentEvent, JobEvent, JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS,
-    MAX_JOBS_RETAINED, SessionAccountingSnapshot, ToolApprovalDecision, ToolApprovalRequest,
+    MAX_JOBS_RETAINED, RequestUserInputRequest, RequestUserInputResponse,
+    SessionAccountingSnapshot, ToolApprovalDecision, ToolApprovalRequest,
 };
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
@@ -520,6 +521,24 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     });
                     break;
                 }
+                AgentEvent::RequestUserInputRequested {
+                    request,
+                    response_tx,
+                    ..
+                } => {
+                    if let Some(previous) = app.pending_request_user_input.take() {
+                        let _ = previous
+                            .response_tx
+                            .send(RequestUserInputResponse::cancelled());
+                    }
+                    app.status = format!("plan-mode question: {}", request.question);
+                    app.pending_request_user_input = Some(PendingRequestUserInput {
+                        request,
+                        response_tx,
+                        selection_index: 0,
+                    });
+                    break;
+                }
                 AgentEvent::Completed {
                     message,
                     cost,
@@ -540,6 +559,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.turn_visual = TurnVisualState::Succeeded;
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
+                    cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     // Preserve the user's scroll position; if they paged up
                     // mid-turn we shouldn't snap them down on completion.
@@ -555,6 +575,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     finalize_proposed_plan(app);
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
+                    cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     app.cancel = None;
                     keep_rx = false;
@@ -568,6 +589,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     finalize_proposed_plan(app);
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
+                    cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     app.cancel = None;
                     keep_rx = false;
@@ -613,6 +635,99 @@ fn maybe_pick_resume_session(
         resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
         resume_picker::ResumeChoice::Resume(id) => Ok(ResumeStartup::Use(id)),
         resume_picker::ResumeChoice::Quit => Ok(ResumeStartup::Quit),
+    }
+}
+
+fn cancel_pending_request_user_input(app: &mut TuiApp) {
+    if let Some(pending) = app.pending_request_user_input.take() {
+        let _ = pending
+            .response_tx
+            .send(RequestUserInputResponse::cancelled());
+    }
+}
+
+fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    let Some(mut pending) = app.pending_request_user_input.take() else {
+        return false;
+    };
+    let choice_count = pending.request.choices.len();
+    match key.code {
+        KeyCode::Up => {
+            if choice_count > 0 {
+                pending.selection_index = pending.selection_index.saturating_sub(1);
+            }
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        KeyCode::Down => {
+            if choice_count > 0 {
+                pending.selection_index =
+                    (pending.selection_index + 1).min(choice_count.saturating_sub(1));
+            }
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        KeyCode::Enter => {
+            if choice_count > 0 {
+                if let Some(choice) = pending.request.choices.get(pending.selection_index) {
+                    let response = RequestUserInputResponse::choice(choice.value.clone());
+                    let _ = pending.response_tx.send(response);
+                    app.status = format!("answered: {}", choice.label);
+                    return true;
+                }
+            }
+            if pending.request.allow_freeform && !app.input.trim().is_empty() {
+                let text = std::mem::take(&mut app.input);
+                app.input_cursor = 0;
+                let _ = pending
+                    .response_tx
+                    .send(RequestUserInputResponse::freeform(text));
+                app.status = "answered with free-form text".to_string();
+                return true;
+            }
+            // Nothing to send yet — keep the modal up.
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        KeyCode::Esc => {
+            let _ = pending
+                .response_tx
+                .send(RequestUserInputResponse::cancelled());
+            app.status = "plan-mode question cancelled".to_string();
+            true
+        }
+        KeyCode::Backspace if pending.request.allow_freeform => {
+            delete_before_cursor(app);
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        KeyCode::Delete if pending.request.allow_freeform => {
+            delete_at_cursor(app);
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        KeyCode::Left if pending.request.allow_freeform => {
+            move_input_cursor_left(app);
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        KeyCode::Right if pending.request.allow_freeform => {
+            move_input_cursor_right(app);
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        KeyCode::Char(ch)
+            if pending.request.allow_freeform
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+        {
+            insert_input_char(app, ch);
+            app.pending_request_user_input = Some(pending);
+            true
+        }
+        _ => {
+            app.pending_request_user_input = Some(pending);
+            true
+        }
     }
 }
 
@@ -806,6 +921,10 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
     }
 
     if handle_mcp_elicitation_key(app, key) {
+        return Ok(false);
+    }
+
+    if handle_request_user_input_key(app, key) {
         return Ok(false);
     }
 
@@ -2744,6 +2863,7 @@ fn switch_mode(
     if app.turn_rx.is_some()
         || app.pending_approval.is_some()
         || app.pending_mcp_elicitation.is_some()
+        || app.pending_request_user_input.is_some()
     {
         app.status = "mode switch unavailable during active turn".to_string();
         return;
@@ -6660,6 +6780,15 @@ const CONTEXT_BUDGET_HINT_PCT: u64 = 85;
 const CONTEXT_NUDGE_PCT: u64 = 95;
 
 fn format_status_hints(app: &TuiApp) -> String {
+    if let Some(pending) = app.pending_request_user_input.as_ref() {
+        if pending.request.choices.is_empty() && pending.request.allow_freeform {
+            return "type your answer · Enter send · Esc cancel".to_string();
+        }
+        if pending.request.allow_freeform {
+            return "Up/Down choose · type for free-form · Enter send · Esc cancel".to_string();
+        }
+        return "Up/Down choose · Enter select · Esc cancel".to_string();
+    }
     if app.pending_mcp_elicitation.is_some() {
         if app
             .pending_mcp_elicitation
@@ -7050,6 +7179,7 @@ struct TuiApp {
     pending_approval: Option<PendingApproval>,
     approval_selection_index: usize,
     pending_mcp_elicitation: Option<PendingMcpElicitation>,
+    pending_request_user_input: Option<PendingRequestUserInput>,
     mcp_elicitation_selection_index: usize,
     pending_feedback: Option<PreparedFeedback>,
     pending_report: Option<BugReportBundle>,
@@ -7168,6 +7298,7 @@ impl TuiApp {
             pending_approval: None,
             approval_selection_index: 0,
             pending_mcp_elicitation: None,
+            pending_request_user_input: None,
             mcp_elicitation_selection_index: 0,
             pending_feedback: None,
             pending_report: None,
@@ -7439,6 +7570,12 @@ struct PendingApproval {
 struct PendingMcpElicitation {
     request: McpElicitationRequest,
     response_tx: oneshot::Sender<McpElicitationResponse>,
+}
+
+struct PendingRequestUserInput {
+    request: RequestUserInputRequest,
+    response_tx: oneshot::Sender<RequestUserInputResponse>,
+    selection_index: usize,
 }
 
 fn exit_hint(session_id: Option<&str>) -> Option<String> {

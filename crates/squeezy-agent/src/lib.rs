@@ -13,7 +13,7 @@ use std::{
 
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentSource, ContextAttachmentStatus,
@@ -79,6 +79,7 @@ const DELEGATE_TOOL_NAME: &str = "delegate";
 const EXPLORE_TOOL_NAME: &str = "explore";
 const DELEGATE_PLAN_TOOL_NAME: &str = "delegate_plan";
 const DELEGATE_REVIEW_TOOL_NAME: &str = "delegate_review";
+const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
@@ -1547,7 +1548,7 @@ impl Agent {
             native_text_verbosity,
         );
         let request_instructions = self.redactor.redact(&raw_instructions).text;
-        let mut all_tool_specs = core_control_tools(&self.config.subagents);
+        let mut all_tool_specs = core_control_tools(&self.config.subagents, mode);
         all_tool_specs.extend(self.tools.specs().iter().cloned().map(advertised_tool));
         LlmRequest {
             model: self.config.model.clone(),
@@ -2152,7 +2153,8 @@ impl Agent {
                     .await;
                     return;
                 }
-                let mut all_tool_specs = core_control_tools(&config.subagents);
+                let mut all_tool_specs =
+                    core_control_tools(&config.subagents, load_session_mode(&session_mode));
                 all_tool_specs.extend(tools.specs().iter().cloned().map(advertised_tool));
                 warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
                 refresh_mcp_tools_in_background(
@@ -3989,6 +3991,128 @@ async fn handle_task_state_call(context: &ToolExecutionContext<'_>, call: &ToolC
     )
 }
 
+async fn handle_request_user_input_call(
+    context: &ToolExecutionContext<'_>,
+    call: &ToolCall,
+) -> ToolResult {
+    let active_mode = load_session_mode(&context.session_mode);
+    if active_mode != SessionMode::Plan {
+        return control_tool_result(
+            call,
+            ToolStatus::Denied,
+            json!({
+                "ok": false,
+                "status": "refused",
+                "mode": active_mode.as_str(),
+                "error": "request_user_input is only available in Plan mode"
+            }),
+        );
+    }
+
+    #[derive(Deserialize)]
+    struct Args {
+        question: String,
+        #[serde(default)]
+        choices: Vec<ArgChoice>,
+        #[serde(default)]
+        allow_freeform: bool,
+    }
+    #[derive(Deserialize)]
+    struct ArgChoice {
+        label: String,
+        value: String,
+    }
+
+    let args: Args = match serde_json::from_value(call.arguments.clone()) {
+        Ok(args) => args,
+        Err(error) => {
+            return control_tool_result(
+                call,
+                ToolStatus::Error,
+                json!({
+                    "ok": false,
+                    "error": format!("invalid request_user_input arguments: {error}")
+                }),
+            );
+        }
+    };
+
+    let question = args.question.trim().to_string();
+    if question.is_empty() {
+        return control_tool_result(
+            call,
+            ToolStatus::Error,
+            json!({
+                "ok": false,
+                "error": "request_user_input.question must be non-empty"
+            }),
+        );
+    }
+
+    let request = RequestUserInputRequest {
+        question,
+        choices: args
+            .choices
+            .into_iter()
+            .map(|c| RequestUserInputChoice {
+                label: c.label,
+                value: c.value,
+            })
+            .collect(),
+        allow_freeform: args.allow_freeform,
+    };
+
+    let (response_tx, response_rx) = oneshot::channel::<RequestUserInputResponse>();
+    if context
+        .tx
+        .send(AgentEvent::RequestUserInputRequested {
+            turn_id: context.turn_id,
+            request,
+            response_tx,
+        })
+        .await
+        .is_err()
+    {
+        return control_tool_result(
+            call,
+            ToolStatus::Error,
+            json!({
+                "ok": false,
+                "error": "TUI is no longer receiving events; cannot ask the user"
+            }),
+        );
+    }
+
+    let response = tokio::select! {
+        biased;
+        _ = context.cancel.cancelled() => RequestUserInputResponse::cancelled(),
+        result = response_rx => result.unwrap_or_else(|_| RequestUserInputResponse::cancelled()),
+    };
+
+    let mut payload = json!({
+        "ok": true,
+        "action": match response.action {
+            RequestUserInputAction::Choice => "choice",
+            RequestUserInputAction::Freeform => "freeform",
+            RequestUserInputAction::Cancelled => "cancelled",
+        },
+    });
+    if let Some(map) = payload.as_object_mut() {
+        if let Some(choice) = response.choice_value {
+            map.insert("choice_value".to_string(), Value::String(choice));
+        }
+        if let Some(text) = response.freeform {
+            map.insert("freeform".to_string(), Value::String(text));
+        }
+    }
+    let status = if matches!(response.action, RequestUserInputAction::Cancelled) {
+        ToolStatus::Cancelled
+    } else {
+        ToolStatus::Success
+    };
+    control_tool_result(call, status, payload)
+}
+
 async fn handle_load_tool_schema_call(
     context: &ToolExecutionContext<'_>,
     call: &ToolCall,
@@ -5031,7 +5155,10 @@ fn repeated_tool_failure_key(result: &ToolResult) -> Option<String> {
 }
 
 fn is_control_tool_name(name: &str) -> bool {
-    matches!(name, TASK_STATE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME)
+    matches!(
+        name,
+        TASK_STATE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME | REQUEST_USER_INPUT_TOOL_NAME
+    )
 }
 
 fn tool_failure_detail(result: &ToolResult) -> String {
@@ -5102,6 +5229,20 @@ async fn execute_tool_calls(
         }
         if call.name == LOAD_TOOL_SCHEMA_TOOL_NAME {
             results[index] = Some(handle_load_tool_schema_call(&context, call).await);
+            recorded[index] = true;
+            continue;
+        }
+        if call.name == REQUEST_USER_INPUT_TOOL_NAME {
+            let result = handle_request_user_input_call(&context, call).await;
+            broker.record_executed_result(&result);
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
             recorded[index] = true;
             continue;
         }
@@ -6524,7 +6665,10 @@ pub(crate) fn advertised_tool(spec: ToolSpec) -> AdvertisedTool {
 /// `delegate` and `explore` are gated on [`SubagentConfig::enabled`] /
 /// `explore_enabled` so we don't spend prompt tokens advertising tools the
 /// agent would refuse on every call.
-fn core_control_tools(subagents: &SubagentConfig) -> Vec<AdvertisedTool> {
+fn core_control_tools(
+    subagents: &SubagentConfig,
+    session_mode: SessionMode,
+) -> Vec<AdvertisedTool> {
     let mut tools = Vec::new();
     if subagents.enabled {
         tools.push(delegate_advertised_tool());
@@ -6533,6 +6677,9 @@ fn core_control_tools(subagents: &SubagentConfig) -> Vec<AdvertisedTool> {
         }
         tools.push(delegate_plan_advertised_tool());
         tools.push(delegate_review_advertised_tool());
+    }
+    if session_mode == SessionMode::Plan {
+        tools.push(request_user_input_advertised_tool());
     }
     tools
 }
@@ -6643,6 +6790,58 @@ fn delegate_review_advertised_tool() -> AdvertisedTool {
     }
 }
 
+/// Plan-mode tool that lets the model pause the turn and ask the user a
+/// clarifying multiple-choice (or free-form) question. The capability is
+/// `Read` so it survives Plan-mode tool filtering; mode gating happens at
+/// execute time so a Build-mode call returns a clear error instead of
+/// silently disappearing.
+fn request_user_input_advertised_tool() -> AdvertisedTool {
+    AdvertisedTool {
+        capability: PermissionCapability::Read,
+        spec: LlmToolSpec {
+            name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+            description:
+                "Plan mode only. Pause the turn and ask the user a clarifying question. Provide a question; optionally provide multiple-choice options with stable values. Returns the user's selection (or notes they cancelled)."
+                    .to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "Question to display to the user. Should be a complete sentence."
+                    },
+                    "choices": {
+                        "type": "array",
+                        "description": "Multiple-choice options. Omit or pass an empty array for free-form input.",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "label": {
+                                    "type": "string",
+                                    "description": "Short human-readable label shown to the user."
+                                },
+                                "value": {
+                                    "type": "string",
+                                    "description": "Stable value returned to the model when this choice is picked."
+                                }
+                            },
+                            "required": ["label", "value"]
+                        }
+                    },
+                    "allow_freeform": {
+                        "type": "boolean",
+                        "description": "When true, the user may also type a free-form answer alongside choices. Default false."
+                    }
+                },
+                "required": ["question"]
+            }),
+            strict: false,
+        },
+    }
+}
+
 fn explore_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
@@ -6689,6 +6888,7 @@ fn synthetic_tool_by_name(name: &str) -> Option<AdvertisedTool> {
         DELEGATE_PLAN_TOOL_NAME => Some(delegate_plan_advertised_tool()),
         DELEGATE_REVIEW_TOOL_NAME => Some(delegate_review_advertised_tool()),
         LOAD_TOOL_SCHEMA_TOOL_NAME => Some(load_tool_schema_advertised_tool()),
+        REQUEST_USER_INPUT_TOOL_NAME => Some(request_user_input_advertised_tool()),
         _ => None,
     }
 }
@@ -6778,13 +6978,15 @@ fn request_tool_specs(
         DELEGATE_TOOL_NAME,
         EXPLORE_TOOL_NAME,
         LOAD_TOOL_SCHEMA_TOOL_NAME,
+        REQUEST_USER_INPUT_TOOL_NAME,
     ];
     for name in synthetic_order
         .into_iter()
         .filter(|name| {
             // Synthetic control tools may have been filtered out of
-            // `core_control_tools` (e.g. subagents disabled). In that case
-            // don't push them back into the request via name lookup.
+            // `core_control_tools` (e.g. subagents disabled, or Plan-only
+            // tools in Build mode). In that case don't push them back
+            // into the request via name lookup.
             *name == LOAD_TOOL_SCHEMA_TOOL_NAME || advertised_names.contains(name)
         })
         .chain(schema_config.core.iter().map(String::as_str))
@@ -8153,7 +8355,68 @@ enum ApprovalDecision {
     Cancelled,
 }
 
-#[derive(Debug)]
+/// Request payload sent to the TUI when the model calls
+/// `request_user_input` from Plan mode. The TUI renders a modal, gathers
+/// the user's choice, and replies via the matching
+/// [`RequestUserInputResponse`] over a oneshot channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestUserInputRequest {
+    /// Question to display to the user.
+    pub question: String,
+    /// Optional multiple-choice options. Empty means "free-form only".
+    pub choices: Vec<RequestUserInputChoice>,
+    /// When true, the UI offers a free-form text path alongside any
+    /// configured choices.
+    pub allow_freeform: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestUserInputChoice {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestUserInputAction {
+    Choice,
+    Freeform,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestUserInputResponse {
+    pub action: RequestUserInputAction,
+    pub choice_value: Option<String>,
+    pub freeform: Option<String>,
+}
+
+impl RequestUserInputResponse {
+    pub fn choice(value: impl Into<String>) -> Self {
+        Self {
+            action: RequestUserInputAction::Choice,
+            choice_value: Some(value.into()),
+            freeform: None,
+        }
+    }
+
+    pub fn freeform(text: impl Into<String>) -> Self {
+        Self {
+            action: RequestUserInputAction::Freeform,
+            choice_value: None,
+            freeform: Some(text.into()),
+        }
+    }
+
+    pub fn cancelled() -> Self {
+        Self {
+            action: RequestUserInputAction::Cancelled,
+            choice_value: None,
+            freeform: None,
+        }
+    }
+}
+
 pub enum AgentEvent {
     UserMessage {
         turn_id: TurnId,
@@ -8190,6 +8453,11 @@ pub enum AgentEvent {
         turn_id: TurnId,
         request: McpElicitationRequest,
         response_tx: oneshot::Sender<McpElicitationResponse>,
+    },
+    RequestUserInputRequested {
+        turn_id: TurnId,
+        request: RequestUserInputRequest,
+        response_tx: oneshot::Sender<RequestUserInputResponse>,
     },
     JobUpdated {
         job: JobSnapshot,
