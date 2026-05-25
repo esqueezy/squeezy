@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs, io,
+    panic::AssertUnwindSafe,
     path::PathBuf,
     pin::Pin,
     sync::{
@@ -11,7 +12,7 @@ use std::{
 };
 
 use futures_core::Stream;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
 use squeezy_core::{
@@ -47,15 +48,23 @@ use squeezy_telemetry::{
 };
 use squeezy_tools::{
     McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
-    ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
+    ShellAskApprover, ShellAskDecision, ShellAskRequest, ToolCall, ToolCostHint,
+    ToolExecutionOptions, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
     ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig, sha256_hex,
 };
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::{
+    sync::{Mutex, Notify, broadcast, mpsc, oneshot},
+    task::AbortHandle,
+};
 use tokio_util::sync::CancellationToken;
 
+mod cancel;
 mod exploration_compiler;
+mod roles;
 
+use cancel::{CancelErr, OrCancelExt};
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
+use roles::{RoleModelPolicy, SubagentRole, role_config};
 
 const MAX_TOOL_ROUNDS: usize = 32;
 const MAX_CONTROL_ONLY_TOOL_ROUNDS: usize = 2;
@@ -65,10 +74,18 @@ const TASK_STATE_TOOL_NAME: &str = "update_task_state";
 const LOAD_TOOL_SCHEMA_TOOL_NAME: &str = "load_tool_schema";
 const DELEGATE_TOOL_NAME: &str = "delegate";
 const EXPLORE_TOOL_NAME: &str = "explore";
+const DELEGATE_PLAN_TOOL_NAME: &str = "delegate_plan";
+const DELEGATE_REVIEW_TOOL_NAME: &str = "delegate_review";
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
+const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
 const JOB_SUMMARY_MAX_CHARS: usize = 320;
 const SUBAGENT_SUMMARY_CHARS_PER_TOKEN: usize = 4;
+/// Maximum number of subagents that may be active at once for a single
+/// parent Agent. The registry rejects further `start()` calls until an
+/// in-flight subagent finishes (lease drops). Keeps fanout flat and
+/// predictable rather than letting a model spawn an unbounded swarm.
+const SUBAGENT_MAX_CONCURRENT: usize = 4;
 // Compaction summary truncation budgets. These are character (not byte)
 // caps because they pass through `compact_text` → `truncate_chars`. They
 // stay collocated so a future audit can read the total summary growth
@@ -463,6 +480,7 @@ pub struct ContextCompactionReport {
 }
 
 pub type JobId = u64;
+pub type SubagentId = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -535,6 +553,7 @@ pub struct JobSnapshot {
     pub turn_id: Option<TurnId>,
     pub tool_name: Option<String>,
     pub call_id: Option<String>,
+    pub subagent_id: Option<SubagentId>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub ended_at_ms: Option<u64>,
@@ -569,10 +588,12 @@ struct JobRegistryState {
     notifications: VecDeque<JobNotification>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct JobRecord {
     snapshot: JobSnapshot,
     cancel: CancellationToken,
+    abort: Option<AbortHandle>,
+    done: Option<Arc<Notify>>,
 }
 
 impl Default for JobRegistry {
@@ -639,6 +660,7 @@ impl JobRegistry {
             turn_id,
             tool_name,
             call_id,
+            subagent_id: None,
             created_at_ms: now,
             updated_at_ms: now,
             ended_at_ms: None,
@@ -681,22 +703,72 @@ impl JobRegistry {
         summary: impl Into<String>,
         output_handle: Option<String>,
     ) -> Option<JobSnapshot> {
+        self.finish_impl(id, status, summary, output_handle, false)
+    }
+
+    fn finish_if_active(
+        &self,
+        id: JobId,
+        status: JobStatus,
+        summary: impl Into<String>,
+        output_handle: Option<String>,
+    ) -> Option<JobSnapshot> {
+        self.finish_impl(id, status, summary, output_handle, true)
+    }
+
+    fn finish_impl(
+        &self,
+        id: JobId,
+        status: JobStatus,
+        summary: impl Into<String>,
+        output_handle: Option<String>,
+        only_active: bool,
+    ) -> Option<JobSnapshot> {
         let summary = truncate_chars(&summary.into(), JOB_SUMMARY_MAX_CHARS);
-        self.update(id, true, |snapshot| {
-            snapshot.status = status;
-            snapshot.result_summary = Some(summary);
-            snapshot.output_handle = output_handle;
-            snapshot.progress = Some(JobProgress {
+        let (snapshot, notification) = {
+            let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+            let record = state.jobs.get_mut(&id)?;
+            if only_active && !record.snapshot.status.is_active() {
+                return None;
+            }
+            record.snapshot.status = status;
+            record.snapshot.result_summary = Some(summary);
+            record.snapshot.output_handle = output_handle;
+            record.snapshot.progress = Some(JobProgress {
                 completed: Some(1),
                 total: Some(1),
                 message: status.as_str().to_string(),
             });
-            snapshot.ended_at_ms = Some(unix_timestamp_millis());
-        })
+            record.snapshot.ended_at_ms = Some(unix_timestamp_millis());
+            record.snapshot.updated_at_ms = unix_timestamp_millis();
+            let snapshot = record.snapshot.clone();
+            push_job_notification(&mut state, &snapshot);
+            let notification = state.notifications.back().cloned();
+            prune_completed_jobs(&mut state);
+            (snapshot, notification)
+        };
+        let _ = self.tx.send(JobEvent::Updated(snapshot.clone()));
+        if let Some(notification) = notification {
+            let _ = self.tx.send(JobEvent::Notification(notification));
+        }
+        Some(snapshot)
+    }
+
+    fn attach_handle(&self, id: JobId, abort: AbortHandle, done: Arc<Notify>) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let Some(record) = state.jobs.get_mut(&id) else {
+            return false;
+        };
+        if !record.snapshot.status.is_active() {
+            return false;
+        }
+        record.abort = Some(abort);
+        record.done = Some(done);
+        true
     }
 
     pub fn cancel(&self, id: JobId) -> bool {
-        let cancel = {
+        let (cancel, abort, done) = {
             let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
             let Some(record) = state.jobs.get(&id) else {
                 return false;
@@ -704,10 +776,36 @@ impl JobRegistry {
             if !record.snapshot.status.is_active() {
                 return false;
             }
-            record.cancel.clone()
+            (
+                record.cancel.clone(),
+                record.abort.clone(),
+                record.done.clone(),
+            )
         };
         cancel.cancel();
         let _ = self.progress(id, None, None, "cancellation requested");
+        if let (Some(abort), Some(done)) = (abort, done) {
+            let jobs = self.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = done.notified() => {}
+                    _ = tokio::time::sleep(JOB_CANCEL_GRACE) => {
+                        abort.abort();
+                        if jobs
+                            .finish_if_active(
+                                id,
+                                JobStatus::Cancelled,
+                                "cancelled after grace window",
+                                None,
+                            )
+                            .is_some()
+                        {
+                            done.notify_waiters();
+                        }
+                    }
+                }
+            });
+        }
         true
     }
 
@@ -752,6 +850,8 @@ impl JobRegistry {
             let record = JobRecord {
                 snapshot: snapshot.clone(),
                 cancel: cancel.unwrap_or_default(),
+                abort: None,
+                done: None,
             };
             state.jobs.insert(snapshot.id, record);
             let notification = if notify {
@@ -767,6 +867,103 @@ impl JobRegistry {
         if let Some(notification) = notification {
             let _ = self.tx.send(JobEvent::Notification(notification));
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SubagentRegistry {
+    state: Arc<StdMutex<BTreeMap<SubagentId, SubagentMetadata>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl Default for SubagentRegistry {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(StdMutex::new(BTreeMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+}
+
+// `id`, `role`, `started_at_ms`, and `last_status_message` are recorded so
+// future code (UI surfaces, telemetry, /subagents introspection) can read
+// the live registry without a second source of truth. They're written by
+// `start` / `update_status` and read via `snapshot` from tests today.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct SubagentMetadata {
+    id: SubagentId,
+    role: SubagentRole,
+    started_at_ms: u64,
+    cancel: CancellationToken,
+    last_status_message: Option<String>,
+}
+
+#[derive(Debug)]
+struct SubagentLease {
+    id: SubagentId,
+    registry: SubagentRegistry,
+}
+
+impl Drop for SubagentLease {
+    fn drop(&mut self) {
+        self.registry.finish(self.id);
+    }
+}
+
+impl SubagentRegistry {
+    fn start(
+        &self,
+        role: SubagentRole,
+        cancel: CancellationToken,
+        max_concurrent: usize,
+        status: impl Into<String>,
+    ) -> Result<SubagentLease, String> {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let active = state
+            .values()
+            .filter(|metadata| !metadata.cancel.is_cancelled())
+            .count();
+        if active >= max_concurrent.max(1) {
+            return Err(format!(
+                "subagent concurrency limit reached ({})",
+                max_concurrent.max(1)
+            ));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        state.insert(
+            id,
+            SubagentMetadata {
+                id,
+                role,
+                started_at_ms: unix_timestamp_millis(),
+                cancel,
+                last_status_message: Some(status.into()),
+            },
+        );
+        Ok(SubagentLease {
+            id,
+            registry: self.clone(),
+        })
+    }
+
+    #[allow(dead_code)]
+    fn update_status(&self, id: SubagentId, status: impl Into<String>) {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(metadata) = state.get_mut(&id) {
+            metadata.last_status_message = Some(status.into());
+        }
+    }
+
+    fn finish(&self, id: SubagentId) {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        state.remove(&id);
+    }
+
+    #[allow(dead_code)]
+    fn snapshot(&self) -> Vec<SubagentMetadata> {
+        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        state.values().cloned().collect()
     }
 }
 
@@ -815,6 +1012,24 @@ fn prune_completed_jobs(state: &mut JobRegistryState) {
     }
 }
 
+fn spawn_observed_job<F>(
+    jobs: JobRegistry,
+    job_id: JobId,
+    done: Arc<Notify>,
+    future: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let outcome = AssertUnwindSafe(future).catch_unwind().await;
+        if outcome.is_err() {
+            let _ = jobs.finish_if_active(job_id, JobStatus::Failed, "job panicked", None);
+        }
+        done.notify_waiters();
+    })
+}
+
 #[derive(Clone)]
 pub struct Agent {
     config: AppConfig,
@@ -829,6 +1044,7 @@ pub struct Agent {
     next_turn_id: Arc<AtomicU64>,
     next_approval_id: Arc<AtomicU64>,
     next_attachment_id: Arc<AtomicU64>,
+    subagents: SubagentRegistry,
     /// In-memory permission rules added via "Allow user/project rule" during
     /// the current process. Persisted to disk on a best-effort basis; this
     /// vector also makes the rule take effect immediately for subsequent
@@ -1101,6 +1317,7 @@ impl Agent {
             next_turn_id: Arc::new(AtomicU64::new(1)),
             next_approval_id: Arc::new(AtomicU64::new(1)),
             next_attachment_id: Arc::new(AtomicU64::new(next_attachment_id)),
+            subagents: SubagentRegistry::default(),
             session_rules: Arc::new(RwLock::new(Vec::new())),
             session_mode: Arc::new(AtomicU8::new(initial_session_mode.to_u8())),
             loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
@@ -1215,7 +1432,8 @@ impl Agent {
         let session_log = self.session_log.clone();
         let redactor = self.redactor.clone();
         let job_id = snapshot.id;
-        tokio::spawn(async move {
+        let done = Arc::new(Notify::new());
+        let handle = spawn_observed_job(self.jobs.clone(), job_id, done.clone(), async move {
             if let Some(started) = jobs.start(job_id) {
                 log_job_lifecycle(session_log.as_ref(), &redactor, "job_started", &started);
             }
@@ -1229,6 +1447,7 @@ impl Agent {
                 log_job_lifecycle(session_log.as_ref(), &redactor, "job_finished", &done);
             }
         });
+        self.jobs.attach_handle(job_id, handle.abort_handle(), done);
         snapshot
     }
 
@@ -1352,14 +1571,17 @@ impl Agent {
         &self,
         query: &SessionQuery,
     ) -> squeezy_core::Result<Vec<SessionMetadata>> {
+        self.flush_active_session_log();
         SessionStore::open(&self.config).list(query)
     }
 
     pub fn show_session(&self, session_id: &str) -> squeezy_core::Result<SessionRecord> {
+        self.flush_session_log_if_current(session_id);
         SessionStore::open(&self.config).show(session_id)
     }
 
     pub fn export_session(&self, session_id: &str) -> squeezy_core::Result<Value> {
+        self.flush_session_log_if_current(session_id);
         SessionStore::open(&self.config).export(session_id)
     }
 
@@ -1440,6 +1662,20 @@ impl Agent {
         let state = self.conversation_state.lock().await.clone();
         let _ = session.write_resume_state(&state.to_resume_state());
         let _ = session.finish(status, state.cost, state.metrics, state.redactions);
+    }
+
+    fn flush_active_session_log(&self) {
+        if let Some(session) = &self.session_log {
+            let _ = session.flush_events();
+        }
+    }
+
+    fn flush_session_log_if_current(&self, session_id: &str) {
+        if let Some(session) = &self.session_log
+            && session.session_id() == session_id
+        {
+            let _ = session.flush_events();
+        }
     }
 
     pub async fn attach_pasted_context(
@@ -1814,152 +2050,257 @@ impl Agent {
         let task_state = Arc::new(Mutex::new(None));
         let loaded_tool_schemas = self.loaded_tool_schemas.clone();
         let replay = self.replay.clone();
+        let subagents = self.subagents.clone();
 
-        tokio::spawn(async move {
-            let redacted_input = redactor.redact(&input);
-            let task_title = redacted_input.text.clone();
-            let failure_session_log = session_log.clone();
-            // Echo the user message into the TUI before kicking MCP
-            // discovery so a slow/flaky external server never delays the
-            // prompt the user just submitted.
-            if tx
-                .send(AgentEvent::UserMessage {
-                    turn_id,
-                    message: TranscriptItem::user(redacted_input.text.clone()),
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
-            if let Some(call) = local_shell_command_call(&task_title) {
-                complete_local_tool_turn(
-                    turn_id,
-                    task_title,
-                    call,
-                    redacted_input.redactions,
-                    LocalToolTurnDeps {
-                        tx: tx.clone(),
-                        provider: provider.clone(),
-                        tools: tools.clone(),
-                        jobs: jobs.clone(),
-                        redactor: redactor.clone(),
-                        session_log: session_log.clone(),
-                        conversation_state: conversation_state.clone(),
-                        session_metrics: session_metrics.clone(),
-                        telemetry: telemetry.clone(),
-                        config: config.clone(),
-                        task_state: task_state.clone(),
-                        session_mode: session_mode.clone(),
-                        cancel: cancel.clone(),
-                        approval_ids: approval_ids.clone(),
-                        session_rules: session_rules.clone(),
-                        loaded_tool_schemas: loaded_tool_schemas.clone(),
-                    },
-                )
-                .await;
-                return;
-            }
-            // Cheap pre-check first so unrelated coding turns do not pay for a
-            // full `inspect_redacted()` rendering on every turn.
-            if matches_squeezy_help_input(&task_title)
-                && let Some(answer) =
-                    SqueezyHelp::new(config.inspect_redacted()).answer_for_input(&task_title)
-            {
-                complete_squeezy_help_turn(
-                    turn_id,
-                    task_title,
-                    answer,
-                    redacted_input.redactions,
-                    HelpTurnDeps {
-                        tx: tx.clone(),
-                        redactor: redactor.clone(),
-                        session_log: session_log.clone(),
-                        conversation_state: conversation_state.clone(),
-                        session_metrics: session_metrics.clone(),
-                        telemetry: telemetry.clone(),
-                        config: config.clone(),
-                        task_state: task_state.clone(),
-                        session_mode: session_mode.clone(),
-                    },
-                )
-                .await;
-                return;
-            }
-            let mut all_tool_specs = core_control_tools(&config.subagents);
-            all_tool_specs.extend(tools.specs().iter().cloned().map(advertised_tool));
-            warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
-            refresh_mcp_tools_in_background(
-                tools.clone(),
-                cancel.clone(),
-                session_log.clone(),
-                redactor.clone(),
-                tx.clone(),
-                turn_id,
-            );
-
-            let outcome = TurnRuntime {
-                turn_id,
-                provider,
-                config,
-                tools,
-                jobs,
-                telemetry: telemetry.clone(),
-                redactor: redactor.clone(),
-                session_metrics,
-                all_tool_specs,
-                tx: tx.clone(),
-                cancel,
-                approval_ids,
-                seed_redactions: redacted_input.redactions,
-                session_rules,
-                session_mode,
-                session_log,
-                conversation_state,
-                store,
-                task_state: task_state.clone(),
-                loaded_tool_schemas,
-                replay,
-            }
-            .run(task_title.clone())
-            .await;
-
-            if let Err(error) = outcome {
-                let error = redact_error(error, &redactor);
-                let latest_task_state = task_state.lock().await.clone();
-                publish_task_state_update(
-                    &tx,
-                    failure_session_log.as_ref(),
-                    &redactor,
-                    &task_state,
-                    turn_id,
-                    TaskStateSnapshot::terminal_from(
-                        latest_task_state.as_ref(),
-                        task_title,
-                        TaskStateStatus::Failed,
-                        Some(error.to_string()),
-                    ),
-                )
-                .await;
-                if let Some(session) = failure_session_log {
-                    let _ = session.append_event(SessionEvent::new(
-                        "failed",
-                        Some(turn_id.to_string()),
-                        Some(error.to_string()),
-                        json!({ "error": error.to_string() }),
-                    ));
-                    let _ = session.update_metadata(|metadata| {
-                        metadata.status = SessionStatus::Failed;
-                        metadata.latest_summary = Some(error.to_string());
-                    });
+        let turn_done = Arc::new(Notify::new());
+        let panic_tx = tx.clone();
+        let panic_session_log = session_log.clone();
+        let panic_redactor = redactor.clone();
+        let panic_telemetry = telemetry.clone();
+        let monitor_tx = tx.clone();
+        let monitor_session_log = session_log.clone();
+        let monitor_redactor = redactor.clone();
+        let monitor_cancel = cancel.clone();
+        let turn_handle = spawn_observed_turn(
+            turn_id,
+            turn_done.clone(),
+            panic_tx,
+            panic_session_log,
+            panic_redactor,
+            panic_telemetry,
+            async move {
+                let redacted_input = redactor.redact(&input);
+                let task_title = redacted_input.text.clone();
+                let failure_session_log = session_log.clone();
+                // Echo the user message into the TUI before kicking MCP
+                // discovery so a slow/flaky external server never delays the
+                // prompt the user just submitted.
+                if tx
+                    .send(AgentEvent::UserMessage {
+                        turn_id,
+                        message: TranscriptItem::user(redacted_input.text.clone()),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
-                telemetry.spawn(TelemetryEvent::failure_seen(error_kind(&error)));
-                let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
-            }
-        });
+                if let Some(call) = local_shell_command_call(&task_title) {
+                    complete_local_tool_turn(
+                        turn_id,
+                        task_title,
+                        call,
+                        redacted_input.redactions,
+                        LocalToolTurnDeps {
+                            tx: tx.clone(),
+                            provider: provider.clone(),
+                            tools: tools.clone(),
+                            jobs: jobs.clone(),
+                            redactor: redactor.clone(),
+                            session_log: session_log.clone(),
+                            conversation_state: conversation_state.clone(),
+                            session_metrics: session_metrics.clone(),
+                            telemetry: telemetry.clone(),
+                            config: config.clone(),
+                            task_state: task_state.clone(),
+                            session_mode: session_mode.clone(),
+                            cancel: cancel.clone(),
+                            approval_ids: approval_ids.clone(),
+                            session_rules: session_rules.clone(),
+                            loaded_tool_schemas: loaded_tool_schemas.clone(),
+                            subagents: subagents.clone(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                // Cheap pre-check first so unrelated coding turns do not pay for a
+                // full `inspect_redacted()` rendering on every turn.
+                if matches_squeezy_help_input(&task_title)
+                    && let Some(answer) =
+                        SqueezyHelp::new(config.inspect_redacted()).answer_for_input(&task_title)
+                {
+                    complete_squeezy_help_turn(
+                        turn_id,
+                        task_title,
+                        answer,
+                        redacted_input.redactions,
+                        HelpTurnDeps {
+                            tx: tx.clone(),
+                            redactor: redactor.clone(),
+                            session_log: session_log.clone(),
+                            conversation_state: conversation_state.clone(),
+                            session_metrics: session_metrics.clone(),
+                            telemetry: telemetry.clone(),
+                            config: config.clone(),
+                            task_state: task_state.clone(),
+                            session_mode: session_mode.clone(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                let mut all_tool_specs = core_control_tools(&config.subagents);
+                all_tool_specs.extend(tools.specs().iter().cloned().map(advertised_tool));
+                warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
+                refresh_mcp_tools_in_background(
+                    tools.clone(),
+                    cancel.clone(),
+                    session_log.clone(),
+                    redactor.clone(),
+                    tx.clone(),
+                    turn_id,
+                );
+
+                let outcome = TurnRuntime {
+                    turn_id,
+                    provider,
+                    config,
+                    tools,
+                    jobs,
+                    telemetry: telemetry.clone(),
+                    redactor: redactor.clone(),
+                    session_metrics,
+                    all_tool_specs,
+                    tx: tx.clone(),
+                    cancel,
+                    approval_ids,
+                    seed_redactions: redacted_input.redactions,
+                    session_rules,
+                    session_mode,
+                    session_log,
+                    conversation_state,
+                    store,
+                    task_state: task_state.clone(),
+                    loaded_tool_schemas,
+                    replay,
+                    subagents,
+                }
+                .run(task_title.clone())
+                .await;
+
+                if let Err(error) = outcome {
+                    let error = redact_error(error, &redactor);
+                    let latest_task_state = task_state.lock().await.clone();
+                    publish_task_state_update(
+                        &tx,
+                        failure_session_log.as_ref(),
+                        &redactor,
+                        &task_state,
+                        turn_id,
+                        TaskStateSnapshot::terminal_from(
+                            latest_task_state.as_ref(),
+                            task_title,
+                            TaskStateStatus::Failed,
+                            Some(error.to_string()),
+                        ),
+                    )
+                    .await;
+                    if let Some(session) = failure_session_log {
+                        let _ = session.append_event(SessionEvent::new(
+                            "failed",
+                            Some(turn_id.to_string()),
+                            Some(error.to_string()),
+                            json!({ "error": error.to_string() }),
+                        ));
+                        let _ = session.update_metadata(|metadata| {
+                            metadata.status = SessionStatus::Failed;
+                            metadata.latest_summary = Some(error.to_string());
+                        });
+                    }
+                    telemetry.spawn(TelemetryEvent::failure_seen(error_kind(&error)));
+                    let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
+                }
+            },
+        );
+        spawn_turn_cancel_monitor(
+            turn_id,
+            monitor_cancel,
+            turn_done,
+            turn_handle.abort_handle(),
+            monitor_tx.downgrade(),
+            monitor_session_log,
+            monitor_redactor,
+        );
 
         rx
     }
+}
+
+fn spawn_observed_turn<F>(
+    turn_id: TurnId,
+    done: Arc<Notify>,
+    tx: mpsc::Sender<AgentEvent>,
+    session_log: Option<SessionHandle>,
+    redactor: Arc<Redactor>,
+    telemetry: TelemetryClient,
+    future: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let outcome = AssertUnwindSafe(future).catch_unwind().await;
+        if outcome.is_err() {
+            let error = SqueezyError::Agent("agent turn panicked".to_string());
+            log_session_event(
+                session_log.as_ref(),
+                &redactor,
+                "failed",
+                Some(turn_id),
+                Some(error.to_string()),
+                json!({ "error": error.to_string(), "panic": true }),
+            );
+            if let Some(session) = &session_log {
+                let _ = session.update_metadata(|metadata| {
+                    metadata.status = SessionStatus::Failed;
+                    metadata.latest_summary = Some(error.to_string());
+                });
+            }
+            telemetry.spawn(TelemetryEvent::failure_seen(error_kind(&error)));
+            let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
+        }
+        done.notify_waiters();
+    })
+}
+
+fn spawn_turn_cancel_monitor(
+    turn_id: TurnId,
+    cancel: CancellationToken,
+    done: Arc<Notify>,
+    abort: AbortHandle,
+    tx: mpsc::WeakSender<AgentEvent>,
+    session_log: Option<SessionHandle>,
+    redactor: Arc<Redactor>,
+) {
+    tokio::spawn(async move {
+        cancel.cancelled().await;
+        tokio::select! {
+            _ = done.notified() => {}
+            _ = tokio::time::sleep(JOB_CANCEL_GRACE) => {
+                abort.abort();
+                log_session_event(
+                    session_log.as_ref(),
+                    &redactor,
+                    "cancelled",
+                    Some(turn_id),
+                    Some("turn cancelled after grace window".to_string()),
+                    json!({ "reason": "cancelled after grace window" }),
+                );
+                if let Some(session) = &session_log {
+                    let _ = session.update_metadata(|metadata| {
+                        metadata.status = SessionStatus::Cancelled;
+                        metadata.latest_summary =
+                            Some("turn cancelled after grace window".to_string());
+                    });
+                }
+                if let Some(tx) = tx.upgrade() {
+                    let _ = tx.send(AgentEvent::Cancelled { turn_id }).await;
+                }
+                done.notify_waiters();
+            }
+        }
+    });
 }
 
 struct HelpTurnDeps {
@@ -1991,6 +2332,7 @@ struct LocalToolTurnDeps {
     approval_ids: Arc<AtomicU64>,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
+    subagents: SubagentRegistry,
 }
 
 async fn complete_squeezy_help_turn(
@@ -2157,6 +2499,7 @@ async fn complete_local_tool_turn(
         approval_ids,
         session_rules,
         loaded_tool_schemas,
+        subagents,
     } = deps;
     let user_item = LlmInputItem::UserText(task_title.clone());
     let user_transcript = TranscriptItem::user(task_title.clone());
@@ -2209,6 +2552,7 @@ async fn complete_local_tool_turn(
             all_tool_specs: &all_tool_specs,
             loaded_tool_schemas,
             exploration_state,
+            subagents,
         },
         &mut broker,
     )
@@ -2455,6 +2799,7 @@ struct TurnRuntime {
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     replay: Option<Arc<ReplayRuntime>>,
+    subagents: SubagentRegistry,
 }
 
 fn request_response_verbosity(
@@ -2717,6 +3062,7 @@ impl TurnRuntime {
                         all_tool_specs: &self.all_tool_specs,
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
                         exploration_state: exploration_state.clone(),
+                        subagents: self.subagents.clone(),
                     },
                     &mut broker,
                 )
@@ -3013,6 +3359,7 @@ impl TurnRuntime {
                         all_tool_specs: &self.all_tool_specs,
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
                         exploration_state: exploration_state.clone(),
+                        subagents: self.subagents.clone(),
                     },
                     &mut broker,
                 )
@@ -3411,6 +3758,8 @@ struct TurnPersistInput<'a> {
 enum SubagentKind {
     Delegate,
     Explore,
+    Plan,
+    Review,
 }
 
 impl SubagentKind {
@@ -3418,6 +3767,22 @@ impl SubagentKind {
         match self {
             Self::Delegate => "delegate",
             Self::Explore => "explore",
+            Self::Plan => "plan",
+            Self::Review => "review",
+        }
+    }
+
+    /// Role-catalog overlay for the subagent kind, when one applies.
+    ///
+    /// `Delegate` keeps its existing broad-research behavior — the Worker
+    /// role is roadmap, and mapping delegate to Explorer would strip its
+    /// access to `plan_patch` and skill discovery — so it returns `None`.
+    fn role(self) -> Option<SubagentRole> {
+        match self {
+            Self::Delegate => None,
+            Self::Explore => Some(SubagentRole::Explorer),
+            Self::Plan => Some(SubagentRole::Planner),
+            Self::Review => Some(SubagentRole::Reviewer),
         }
     }
 }
@@ -3458,6 +3823,7 @@ struct ToolExecutionContext<'a> {
     session_mode: Arc<AtomicU8>,
     session_log: Option<SessionHandle>,
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
+    subagents: SubagentRegistry,
     all_tool_specs: &'a [AdvertisedTool],
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     exploration_state: Arc<Mutex<ExplorationTurnState>>,
@@ -3489,22 +3855,55 @@ fn install_mcp_elicitation_handler<'a>(
                 request,
                 response_tx,
             });
-            let send_result = tokio::select! {
-                _ = cancel.cancelled() => return McpElicitationResponse::cancel(),
-                result = send_request => result,
+            let send_result = match send_request.or_cancel(&cancel).await {
+                Ok(result) => result,
+                Err(CancelErr::Cancelled) => return McpElicitationResponse::cancel(),
             };
             if send_result.is_err() {
                 return McpElicitationResponse::decline();
             }
-            tokio::select! {
-                _ = cancel.cancelled() => McpElicitationResponse::cancel(),
-                response = response_rx => response.unwrap_or_else(|_| McpElicitationResponse::decline()),
+            match response_rx.or_cancel(&cancel).await {
+                Ok(response) => response.unwrap_or_else(|_| McpElicitationResponse::decline()),
+                Err(CancelErr::Cancelled) => McpElicitationResponse::cancel(),
             }
         })
     });
     context.tools.set_mcp_elicitation_handler(Some(handler));
     McpElicitationHandlerScope {
         tools: context.tools,
+    }
+}
+
+#[derive(Clone)]
+struct PermissionDecisionContext {
+    turn_id: TurnId,
+    provider: Arc<dyn LlmProvider>,
+    tools: ToolRegistry,
+    config: AppConfig,
+    redactor: Arc<Redactor>,
+    tx: mpsc::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    approval_ids: Arc<AtomicU64>,
+    session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    session_mode: Arc<AtomicU8>,
+    session_log: Option<SessionHandle>,
+}
+
+impl PermissionDecisionContext {
+    fn from_tool_context(context: &ToolExecutionContext<'_>) -> Self {
+        Self {
+            turn_id: context.turn_id,
+            provider: context.provider.clone(),
+            tools: context.tools.clone(),
+            config: context.config.clone(),
+            redactor: context.redactor.clone(),
+            tx: context.tx.clone(),
+            cancel: context.cancel.clone(),
+            approval_ids: context.approval_ids.clone(),
+            session_rules: context.session_rules.clone(),
+            session_mode: context.session_mode.clone(),
+            session_log: context.session_log.clone(),
+        }
     }
 }
 
@@ -3708,7 +4107,34 @@ async fn handle_subagent_call(
         })
         .await;
 
+    let child_cancel = context.cancel.child_token();
+    let lease = match context.subagents.start(
+        kind.role().unwrap_or(SubagentRole::Explorer),
+        child_cancel.clone(),
+        SUBAGENT_MAX_CONCURRENT,
+        format!("{} starting", kind.as_str()),
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            broker.metrics.subagent_failures += 1;
+            return subagent_control_result(
+                call,
+                kind,
+                SubagentExecution {
+                    status: ToolStatus::Denied,
+                    summary: String::new(),
+                    status_label: "capped",
+                    error: Some(error),
+                    metrics: TurnMetrics::default(),
+                    supporting_receipts: Vec::new(),
+                    model: subagent_model_for_kind(context.provider.name(), context.config, kind),
+                },
+            );
+        }
+    };
+
     let execution = run_subagent(context, kind, request).await;
+    drop(lease);
     broker
         .metrics
         .merge_subagent_tool_metrics(&execution.metrics);
@@ -3779,14 +4205,6 @@ async fn handle_subagent_call(
 }
 
 fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<SubagentRequest, String> {
-    let prompt = call
-        .arguments
-        .get("prompt")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "missing required string field: prompt".to_string())?
-        .to_string();
     let scope = match call.arguments.get("scope") {
         Some(Value::Null) | None => None,
         Some(Value::String(value)) if value.trim().is_empty() => None,
@@ -3807,9 +4225,37 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
         }
         Some(_) => return Err("thoroughness must be a string".to_string()),
     };
-    if kind == SubagentKind::Delegate && thoroughness.is_some() {
-        return Err("delegate does not accept thoroughness".to_string());
+    if !matches!(kind, SubagentKind::Explore) && thoroughness.is_some() {
+        return Err(format!("{} does not accept thoroughness", kind.as_str()));
     }
+    let prompt = match kind {
+        SubagentKind::Plan => call
+            .arguments
+            .get("goal")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "missing required string field: goal".to_string())?
+            .to_string(),
+        SubagentKind::Review => call
+            .arguments
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                "Review the current diff. Report only actionable findings.".to_string()
+            }),
+        SubagentKind::Delegate | SubagentKind::Explore => call
+            .arguments
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "missing required string field: prompt".to_string())?
+            .to_string(),
+    };
     Ok(SubagentRequest {
         prompt,
         scope,
@@ -4067,6 +4513,7 @@ async fn run_subagent_loop(
                         all_tool_specs: allowed_tools,
                         loaded_tool_schemas: local_loaded_schemas.clone(),
                         exploration_state: local_exploration.clone(),
+                        subagents: parent.subagents.clone(),
                     },
                     broker,
                 )
@@ -4203,21 +4650,44 @@ fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> Strin
         }
         SubagentKind::Explore => {
             let thoroughness = request.thoroughness.as_deref().unwrap_or("medium");
+            let base = role_config(SubagentRole::Explorer).instructions;
+            format!("{base}\n\nThoroughness: {thoroughness}.")
+        }
+        SubagentKind::Plan => {
+            let base = role_config(SubagentRole::Planner).instructions;
             format!(
-                "You are Squeezy's cheap read-only code exploration subagent. Use semantic graph tools first: repo_map, decl_search, definition_search, reference_search, symbol_context, hierarchy, upstream_flow, downstream_flow, and read_slice. Use glob, grep, and read_file only as bounded fallback. Thoroughness: {thoroughness}. Return a compact briefing with relevant files/symbols, architecture notes, implementation hazards, and the minimum next reads/actions the parent needs before planning or editing. Do not modify files, run shell/compiler/network/MCP tools, ask the user, or include raw tool dumps."
+                "{base}\n\nReturn structured JSON-ready findings: ordered steps with rationale, impacted files/symbols, and a recommended plan_id when plan_patch is called. Do not modify files or run shell commands."
+            )
+        }
+        SubagentKind::Review => {
+            let base = role_config(SubagentRole::Reviewer).instructions;
+            format!(
+                "{base}\n\nReport actionable issues only. Each finding must include severity (blocker|warning|info), file, line (if known), message, and suggested_fix when one is obvious. Return pass=true only when no blocker or warning remains."
             )
         }
     }
 }
 
 fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKind) -> String {
-    match kind {
-        SubagentKind::Delegate => config.model.clone(),
-        SubagentKind::Explore => config.subagents.explore_model.clone().unwrap_or_else(|| {
+    let parent_model = config.model.clone();
+    // Honor the role catalog's model policy where it applies. `Delegate`
+    // has no role overlay and keeps the parent model. `Explore` defers to
+    // the configured explore_model and falls back to a cheap default for
+    // the provider when one is known.
+    let policy = kind
+        .role()
+        .map(|role| role_config(role).model_policy)
+        .unwrap_or(RoleModelPolicy::Parent);
+    match (kind, policy) {
+        (SubagentKind::Explore, _) => config.subagents.explore_model.clone().unwrap_or_else(|| {
             default_cheap_model_for_provider(provider)
-                .unwrap_or(&config.model)
+                .unwrap_or(&parent_model)
                 .to_string()
         }),
+        (_, RoleModelPolicy::Parent) => parent_model,
+        (_, RoleModelPolicy::Cheap) => default_cheap_model_for_provider(provider)
+            .unwrap_or(&parent_model)
+            .to_string(),
     }
 }
 
@@ -4272,13 +4742,20 @@ fn subagent_allowed_tools(
     all_tool_specs: &[AdvertisedTool],
     kind: SubagentKind,
 ) -> Vec<AdvertisedTool> {
-    let names = match kind {
-        SubagentKind::Delegate => DELEGATE_SUBAGENT_TOOL_NAMES,
-        SubagentKind::Explore => EXPLORE_SUBAGENT_TOOL_NAMES,
-    }
-    .iter()
-    .copied()
-    .collect::<BTreeSet<_>>();
+    let names: BTreeSet<&str> = match kind {
+        SubagentKind::Delegate => DELEGATE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
+        SubagentKind::Explore => EXPLORE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
+        SubagentKind::Plan => role_config(SubagentRole::Planner)
+            .allowed_tools
+            .iter()
+            .copied()
+            .collect(),
+        SubagentKind::Review => role_config(SubagentRole::Reviewer)
+            .allowed_tools
+            .iter()
+            .copied()
+            .collect(),
+    };
     all_tool_specs
         .iter()
         .filter(|tool| names.contains(tool.spec.name.as_str()))
@@ -4603,6 +5080,32 @@ async fn execute_tool_calls(
                     &context,
                     call,
                     SubagentKind::Explore,
+                    broker,
+                ))
+                .await,
+            );
+            recorded[index] = true;
+            continue;
+        }
+        if call.name == DELEGATE_PLAN_TOOL_NAME {
+            results[index] = Some(
+                Box::pin(handle_subagent_call(
+                    &context,
+                    call,
+                    SubagentKind::Plan,
+                    broker,
+                ))
+                .await,
+            );
+            recorded[index] = true;
+            continue;
+        }
+        if call.name == DELEGATE_REVIEW_TOOL_NAME {
+            results[index] = Some(
+                Box::pin(handle_subagent_call(
+                    &context,
+                    call,
+                    SubagentKind::Review,
                     broker,
                 ))
                 .await,
@@ -4986,19 +5489,25 @@ async fn run_one_tool(
         })
         .await;
     let started = Instant::now();
+    let shell_ask_approver = if call.name == "shell" {
+        Some(shell_ask_approver_for_context(&context))
+    } else {
+        None
+    };
     // Capture a borrow-able snapshot of the call before it moves into the
     // tool registry, so paired-SHA telemetry (F06) can hash its arguments
     // when emitting the completion event.
     let call_for_telemetry = call.clone();
     let result = context
         .tools
-        .execute_for_group(
+        .execute_for_group_with_options(
             call,
             tracked_job
                 .as_ref()
                 .map(|(_, cancel)| cancel.clone())
                 .unwrap_or_else(|| context.cancel.clone()),
             context.turn_id.to_string(),
+            ToolExecutionOptions { shell_ask_approver },
         )
         .await;
     record_exploration_tool_result(&context, &result).await;
@@ -5245,7 +5754,16 @@ async fn permission_decision(
     if is_direct_user_shell_call(call) {
         return ApprovalDecision::Approved;
     }
-    let request = context.tools.permission_request(call);
+    let runtime = PermissionDecisionContext::from_tool_context(context);
+    let request = runtime.tools.permission_request(call);
+    permission_decision_for_request(&runtime, call, request).await
+}
+
+async fn permission_decision_for_request(
+    context: &PermissionDecisionContext,
+    call: &ToolCall,
+    request: PermissionRequest,
+) -> ApprovalDecision {
     let active_mode = load_session_mode(&context.session_mode);
     if let Some(verdict) = mode_permission_verdict(active_mode, &request) {
         log_permission_verdict(&request, &verdict);
@@ -5256,10 +5774,10 @@ async fn permission_decision(
         .config
         .permissions
         .evaluate_with_extra(&request, &session_rules);
-    if should_classify_shell(context.config, context.provider.name(), &request, &verdict)
+    if should_classify_shell(&context.config, context.provider.name(), &request, &verdict)
         && let Some(classifier) = classify_ambiguous_shell(
             context.provider.clone(),
-            context.config,
+            &context.config,
             &request,
             context.cancel.clone(),
         )
@@ -5302,16 +5820,16 @@ async fn permission_decision(
                 request: approval_request,
                 decision_tx,
             });
-            let send_result = tokio::select! {
-                _ = context.cancel.cancelled() => return ApprovalDecision::Cancelled,
-                result = send_approval => result,
+            let send_result = match send_approval.or_cancel(&context.cancel).await {
+                Ok(result) => result,
+                Err(CancelErr::Cancelled) => return ApprovalDecision::Cancelled,
             };
             if send_result.is_err() {
                 return ApprovalDecision::Denied("approval channel closed".to_string());
             }
-            let decision = tokio::select! {
-                _ = context.cancel.cancelled() => return ApprovalDecision::Cancelled,
-                decision = decision_rx => decision,
+            let decision = match decision_rx.or_cancel(&context.cancel).await {
+                Ok(decision) => decision,
+                Err(CancelErr::Cancelled) => return ApprovalDecision::Cancelled,
             };
             log_session_event(
                 context.session_log.as_ref(),
@@ -5400,6 +5918,32 @@ async fn permission_decision(
             }
         }
     }
+}
+
+fn shell_ask_approver_for_context(context: &ToolExecutionContext<'_>) -> ShellAskApprover {
+    let runtime = PermissionDecisionContext::from_tool_context(context);
+    Arc::new(move |request: ShellAskRequest| {
+        let runtime = runtime.clone();
+        Box::pin(async move {
+            let synthetic_call = ToolCall {
+                call_id: format!("{}:ask", request.call_id),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": request.command,
+                    "workdir": request.workdir.display().to_string(),
+                    "description": request.justification,
+                }),
+            };
+            let permission = runtime.tools.permission_request(&synthetic_call);
+            match permission_decision_for_request(&runtime, &synthetic_call, permission).await {
+                ApprovalDecision::Approved => ShellAskDecision::allow(),
+                ApprovalDecision::Denied(reason) => ShellAskDecision::deny(reason),
+                ApprovalDecision::Cancelled => {
+                    ShellAskDecision::deny("in-flight permission request was cancelled")
+                }
+            }
+        })
+    })
 }
 
 fn is_direct_user_shell_call(call: &ToolCall) -> bool {
@@ -5663,7 +6207,7 @@ fn permission_denied_reason(request: &PermissionRequest, reason: &str) -> String
 /// failure is logged but never bubbled to the caller, since the current call
 /// has already been resolved by the approval response.
 fn install_persistent_rule(
-    context: &ToolExecutionContext<'_>,
+    context: &PermissionDecisionContext,
     request: &PermissionRequest,
     source: PermissionRuleSource,
     action: PermissionAction,
@@ -5690,7 +6234,7 @@ fn install_persistent_rule(
         }
     }
 
-    let path = match persistence_path_for(context.config, source) {
+    let path = match persistence_path_for(&context.config, source) {
         Some(path) => path,
         None => return,
     };
@@ -5827,6 +6371,8 @@ fn core_control_tools(subagents: &SubagentConfig) -> Vec<AdvertisedTool> {
         if subagents.explore_enabled {
             tools.push(explore_advertised_tool());
         }
+        tools.push(delegate_plan_advertised_tool());
+        tools.push(delegate_review_advertised_tool());
     }
     tools
 }
@@ -5886,6 +6432,57 @@ fn delegate_advertised_tool() -> AdvertisedTool {
     }
 }
 
+fn delegate_plan_advertised_tool() -> AdvertisedTool {
+    AdvertisedTool {
+        capability: PermissionCapability::Read,
+        spec: LlmToolSpec {
+            name: DELEGATE_PLAN_TOOL_NAME.to_string(),
+            description: "Delegate read-only implementation planning to a Planner subagent. The parent receives ordered steps, impacted files/symbols, and (when plan_patch is used) a plan_id to bind future edits to.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "Concrete implementation goal the planner should produce steps for."
+                    },
+                    "scope": {
+                        "type": ["string", "null"],
+                        "description": "Optional paths, modules, symbols, or constraints the plan must stay within."
+                    }
+                },
+                "required": ["goal"]
+            }),
+            strict: false,
+        },
+    }
+}
+
+fn delegate_review_advertised_tool() -> AdvertisedTool {
+    AdvertisedTool {
+        capability: PermissionCapability::Read,
+        spec: LlmToolSpec {
+            name: DELEGATE_REVIEW_TOOL_NAME.to_string(),
+            description: "Delegate read-only review of the current diff to a Reviewer subagent. Returns actionable findings (severity, file, line, message, suggested_fix) and a pass flag.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "scope": {
+                        "type": ["string", "null"],
+                        "description": "Optional paths or globs to focus the review on. Defaults to the full pending diff."
+                    },
+                    "prompt": {
+                        "type": ["string", "null"],
+                        "description": "Optional additional review instructions for this turn."
+                    }
+                }
+            }),
+            strict: false,
+        },
+    }
+}
+
 fn explore_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
@@ -5929,6 +6526,8 @@ fn synthetic_tool_by_name(name: &str) -> Option<AdvertisedTool> {
     match name {
         DELEGATE_TOOL_NAME => Some(delegate_advertised_tool()),
         EXPLORE_TOOL_NAME => Some(explore_advertised_tool()),
+        DELEGATE_PLAN_TOOL_NAME => Some(delegate_plan_advertised_tool()),
+        DELEGATE_REVIEW_TOOL_NAME => Some(delegate_review_advertised_tool()),
         LOAD_TOOL_SCHEMA_TOOL_NAME => Some(load_tool_schema_advertised_tool()),
         _ => None,
     }

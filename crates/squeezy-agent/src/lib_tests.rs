@@ -88,6 +88,21 @@ impl LlmProvider for HangingProvider {
     }
 }
 
+async fn wait_for_job_status(jobs: &JobRegistry, id: JobId, expected: JobStatus) -> JobSnapshot {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(job) = jobs.get(id)
+                && job.status == expected
+            {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("job reached expected status")
+}
+
 #[test]
 fn job_registry_tracks_lifecycle_and_bounds_notifications() {
     let jobs = JobRegistry::new();
@@ -152,6 +167,50 @@ fn job_registry_tracks_lifecycle_and_bounds_notifications() {
     }
 
     assert_eq!(jobs.notifications().len(), MAX_JOB_NOTIFICATIONS);
+}
+
+#[tokio::test]
+async fn panicked_job_transitions_to_failed_status() {
+    let jobs = JobRegistry::new();
+    let job = jobs.create(
+        JobKind::Tool,
+        "panic job",
+        None,
+        None,
+        None,
+        CancellationToken::new(),
+    );
+    jobs.start(job.id).expect("started");
+    let done = Arc::new(Notify::new());
+    let handle = spawn_observed_job(jobs.clone(), job.id, done.clone(), async {
+        panic!("intentional job panic");
+    });
+    assert!(jobs.attach_handle(job.id, handle.abort_handle(), done));
+
+    let failed = wait_for_job_status(&jobs, job.id, JobStatus::Failed).await;
+    assert_eq!(failed.result_summary.as_deref(), Some("job panicked"));
+}
+
+#[tokio::test]
+async fn slow_job_is_hard_aborted_after_grace_window() {
+    let jobs = JobRegistry::new();
+    let cancel = CancellationToken::new();
+    let job = jobs.create(JobKind::Tool, "slow job", None, None, None, cancel);
+    jobs.start(job.id).expect("started");
+    let done = Arc::new(Notify::new());
+    let handle = spawn_observed_job(jobs.clone(), job.id, done.clone(), async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    });
+    assert!(jobs.attach_handle(job.id, handle.abort_handle(), done));
+
+    assert!(jobs.cancel(job.id));
+    let cancelled = wait_for_job_status(&jobs, job.id, JobStatus::Cancelled).await;
+    assert_eq!(
+        cancelled.result_summary.as_deref(),
+        Some("cancelled after grace window")
+    );
 }
 
 #[test]
@@ -229,6 +288,37 @@ async fn turn_stream_accumulates_assistant_text() {
         completed,
         Some(("hello".to_string(), Some("resp_1".to_string())))
     );
+}
+
+#[tokio::test]
+async fn llm_stream_observes_cancellation_within_one_yield() {
+    let provider = Arc::new(HangingProvider::new());
+    let agent = Agent::new(AppConfig::default(), provider);
+    let cancel = CancellationToken::new();
+    let cancel_task = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.cancel();
+        })
+    };
+
+    let mut rx = agent.start_turn("hi".to_string(), cancel);
+    let saw_cancelled = tokio::time::timeout(Duration::from_millis(200), async {
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::Cancelled { .. } => return true,
+                AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+                _ => {}
+            }
+        }
+        false
+    })
+    .await
+    .expect("turn cancellation should not wait for another provider event");
+
+    cancel_task.await.expect("cancel task");
+    assert!(saw_cancelled);
 }
 
 #[tokio::test]
@@ -1847,13 +1937,20 @@ fn advertised_tool_specs_are_mode_aware() {
 fn control_tools_are_advertised_in_build_and_plan_modes() {
     let tools = core_control_tools(&SubagentConfig::default());
 
+    let expected = vec![
+        DELEGATE_TOOL_NAME,
+        EXPLORE_TOOL_NAME,
+        DELEGATE_PLAN_TOOL_NAME,
+        DELEGATE_REVIEW_TOOL_NAME,
+    ];
+
     let build_specs = advertised_tool_specs(&tools, SessionMode::Build);
     let build_names = advertised_tool_names(&build_specs);
-    assert_eq!(build_names, vec![DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]);
+    assert_eq!(build_names, expected);
 
     let plan_specs = advertised_tool_specs(&tools, SessionMode::Plan);
     let plan_names = advertised_tool_names(&plan_specs);
-    assert_eq!(plan_names, vec![DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]);
+    assert_eq!(plan_names, expected);
 }
 
 #[test]
@@ -1876,7 +1973,14 @@ fn core_control_tools_filter_subagents_when_disabled() {
         .into_iter()
         .map(|tool| tool.spec.name)
         .collect();
-    assert_eq!(names, vec![DELEGATE_TOOL_NAME.to_string()]);
+    assert_eq!(
+        names,
+        vec![
+            DELEGATE_TOOL_NAME.to_string(),
+            DELEGATE_PLAN_TOOL_NAME.to_string(),
+            DELEGATE_REVIEW_TOOL_NAME.to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -2049,6 +2153,65 @@ fn registry_specs_carry_capability_aligned_with_permission_request() {
             spec.name, spec.capability, runtime_capability,
         );
     }
+}
+
+#[tokio::test]
+async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy() {
+    let root = temp_workspace("agent_shell_ask_policy");
+    let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(Vec::new()));
+    let tools = ToolRegistry::new(&root).expect("registry");
+    let jobs = JobRegistry::new();
+    let (tx, _rx) = mpsc::channel(4);
+    let advertised = Vec::<AdvertisedTool>::new();
+
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            shell: PermissionMode::Deny,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let context = ToolExecutionContext {
+        turn_id: TurnId::new(1),
+        provider,
+        tools: &tools,
+        jobs: &jobs,
+        config: &config,
+        telemetry: TelemetryClient::disabled(),
+        redactor: Arc::new(Redactor::default()),
+        tx,
+        cancel: CancellationToken::new(),
+        approval_ids: Arc::new(AtomicU64::new(1)),
+        session_rules: Arc::new(RwLock::new(Vec::new())),
+        session_mode: Arc::new(AtomicU8::new(SessionMode::Build.to_u8())),
+        session_log: None,
+        task_state: Arc::new(tokio::sync::Mutex::new(None)),
+        all_tool_specs: &advertised,
+        loaded_tool_schemas: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        exploration_state: Arc::new(tokio::sync::Mutex::new(ExplorationTurnState::from_plan(
+            None,
+        ))),
+        subagents: SubagentRegistry::default(),
+    };
+
+    let approver = shell_ask_approver_for_context(&context);
+    let decision = approver(ShellAskRequest {
+        call_id: "shell_parent".to_string(),
+        parent_command: "script.sh".to_string(),
+        command: "rm -rf target".to_string(),
+        justification: "nested cleanup".to_string(),
+        workdir: root.clone(),
+    })
+    .await;
+
+    assert!(!decision.allow);
+    assert!(
+        !decision.reason.is_empty(),
+        "denied in-flight ask should carry the policy reason",
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2403,4 +2566,123 @@ fn write_skill(dir: &Path, name: &str, triggers: &[&str]) {
         ),
     )
     .expect("write skill");
+}
+
+#[test]
+fn subagent_registry_caps_concurrency() {
+    let registry = SubagentRegistry::default();
+    let cancel = CancellationToken::new();
+    let mut leases = Vec::new();
+    for slot in 0..SUBAGENT_MAX_CONCURRENT {
+        let lease = registry
+            .start(
+                roles::SubagentRole::Explorer,
+                cancel.child_token(),
+                SUBAGENT_MAX_CONCURRENT,
+                format!("slot {slot}"),
+            )
+            .expect("starting under the cap should succeed");
+        leases.push(lease);
+    }
+    let err = registry
+        .start(
+            roles::SubagentRole::Explorer,
+            cancel.child_token(),
+            SUBAGENT_MAX_CONCURRENT,
+            "overflow",
+        )
+        .expect_err("starting past the cap should fail");
+    assert!(
+        err.contains(&SUBAGENT_MAX_CONCURRENT.to_string()),
+        "cap error should mention the limit: {err}"
+    );
+    drop(leases.pop());
+    let lease = registry
+        .start(
+            roles::SubagentRole::Explorer,
+            cancel.child_token(),
+            SUBAGENT_MAX_CONCURRENT,
+            "after drop",
+        )
+        .expect("dropping a lease frees a slot");
+    drop(lease);
+    drop(leases);
+}
+
+#[test]
+fn core_control_tools_includes_new_delegate_planner_reviewer() {
+    let config = SubagentConfig {
+        enabled: true,
+        explore_enabled: true,
+        ..SubagentConfig::default()
+    };
+    let names: Vec<_> = core_control_tools(&config)
+        .into_iter()
+        .map(|tool| tool.spec.name)
+        .collect();
+    assert!(names.iter().any(|n| n == DELEGATE_TOOL_NAME));
+    assert!(names.iter().any(|n| n == EXPLORE_TOOL_NAME));
+    assert!(names.iter().any(|n| n == DELEGATE_PLAN_TOOL_NAME));
+    assert!(names.iter().any(|n| n == DELEGATE_REVIEW_TOOL_NAME));
+}
+
+#[test]
+fn core_control_tools_drops_all_when_subagents_disabled() {
+    let config = SubagentConfig {
+        enabled: false,
+        ..SubagentConfig::default()
+    };
+    assert!(core_control_tools(&config).is_empty());
+}
+
+#[test]
+fn subagent_kind_role_does_not_overlay_delegate() {
+    // Delegate's broader research tool set is intentionally not constrained
+    // by the Worker role (which is roadmap). Other kinds must map to an
+    // active role overlay.
+    assert!(SubagentKind::Delegate.role().is_none());
+    assert_eq!(
+        SubagentKind::Explore.role(),
+        Some(roles::SubagentRole::Explorer)
+    );
+    assert_eq!(
+        SubagentKind::Plan.role(),
+        Some(roles::SubagentRole::Planner)
+    );
+    assert_eq!(
+        SubagentKind::Review.role(),
+        Some(roles::SubagentRole::Reviewer)
+    );
+}
+
+#[test]
+fn parse_subagent_request_requires_goal_for_plan_and_allows_empty_review() {
+    let plan_call = ToolCall {
+        call_id: "c1".to_string(),
+        name: DELEGATE_PLAN_TOOL_NAME.to_string(),
+        arguments: json!({}),
+    };
+    let err = parse_subagent_request(&plan_call, SubagentKind::Plan)
+        .expect_err("plan without goal must error");
+    assert!(err.contains("goal"), "error should mention goal: {err}");
+
+    let plan_call = ToolCall {
+        call_id: "c2".to_string(),
+        name: DELEGATE_PLAN_TOOL_NAME.to_string(),
+        arguments: json!({ "goal": "add tracing to ingest pipeline" }),
+    };
+    let request = parse_subagent_request(&plan_call, SubagentKind::Plan).expect("plan args valid");
+    assert!(request.prompt.contains("ingest"));
+
+    let review_call = ToolCall {
+        call_id: "c3".to_string(),
+        name: DELEGATE_REVIEW_TOOL_NAME.to_string(),
+        arguments: json!({}),
+    };
+    let request =
+        parse_subagent_request(&review_call, SubagentKind::Review).expect("review accepts empty");
+    assert!(
+        !request.prompt.is_empty(),
+        "review should synthesize a default prompt"
+    );
 }
