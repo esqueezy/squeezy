@@ -48,13 +48,14 @@ pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
 pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 24;
 pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 8_388_608;
 pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 2_000;
-// Peer agents either let subagents run unbounded (Claude Code, opencode)
-// or rely on structural caps (codex: depth=1, threads=6). Four rounds
-// systematically truncates non-trivial Explore/Delegate work — see the
-// 2026-05-25 bug-probe trace where a single Explore subagent for
-// "find duplication hotspots" hit this cap twice. 12 keeps a bounded
-// cost while giving real research room to land.
-pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 12;
+// Emergency ceiling on subagent model rounds — *not* an active limit.
+// Subagent runaway is already bounded by `max_tool_calls_per_call`,
+// `max_tool_bytes_read_per_call`, per-round result bytes, the cost
+// broker, and the cancellation token; the natural exit is the model
+// producing a final answer with no tool calls. Matches the parent
+// agent's own `MAX_TOOL_ROUNDS = 32` so neither ceiling is the
+// load-bearing one.
+pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 32;
 pub const DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS: u32 = 1_200;
 pub const DEFAULT_TICK_RATE_MS: u64 = 50;
 pub const DEFAULT_TELEMETRY_ENDPOINT: &str =
@@ -71,14 +72,12 @@ pub const DEFAULT_SESSION_LOG_RETENTION_DAYS: u64 = 30;
 pub const DEFAULT_SESSION_MAX_EVENT_BYTES: usize = 65_536;
 pub const DEFAULT_SESSION_MAX_SESSION_BYTES: usize = 52_428_800;
 pub const DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES: usize = 1_048_576;
-// Absolute fallback for the per-turn compaction trigger when the user
-// has not set `model_context_window` in squeezy.toml. The old 6_000
-// fires absurdly early on any modern model (gpt-5.4-mini and friends
-// have 128k+ context windows) and forces compaction at ~5% of usable
-// context. Peer agents all use percent-of-context-window thresholds —
-// codex 90%, Claude Code ~92%, opencode `limit - 20k`. Until Squeezy
-// auto-derives the window from `model_info_for`, this fallback at
-// least lets a normal session breathe.
+// Absolute fallback for the per-turn compaction trigger when
+// `model_context_window` is not set in `squeezy.toml`. Modern models
+// run with 128k+ context windows; the percent-of-context path (which
+// peer agents use, ~90%) is the right shape and should take over once
+// the window is auto-derived from `model_info_for`. This fallback is
+// only the safety net for the unknown-model case.
 pub const DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS: u64 = 60_000;
 pub const DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS: usize = 16;
 pub const DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS: usize = 6;
