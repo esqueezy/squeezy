@@ -598,6 +598,28 @@ fn matches_squeezy_help_input_agrees_with_answer_for_input() {
 }
 
 #[test]
+fn squeezy_help_ignores_code_navigation_prompts() {
+    let help = SqueezyHelp::new("");
+    let cases = [
+        "where does Agent::start_turn live in Squeezy?",
+        "How does the SqueezyAgent struct route turns in Squeezy?",
+        "what does start_turn do in squeezy?",
+        "Where in squeezy is `compile_exploration_plan` defined?",
+        "find squeezy_agent.rs",
+    ];
+    for input in cases {
+        assert!(
+            help.answer_for_input(input).is_none(),
+            "code-navigation prompt must reach the model: {input}"
+        );
+        assert!(
+            !help::matches_squeezy_help_input(input),
+            "matches_squeezy_help_input must agree: {input}"
+        );
+    }
+}
+
+#[test]
 fn squeezy_help_alias_routes_to_providers_topic() {
     let help = SqueezyHelp::new("");
     let answer = help.answer_for_input("/help model").expect("alias answer");
