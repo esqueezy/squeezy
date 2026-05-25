@@ -54,6 +54,7 @@ pub(crate) struct ConfigScreenState {
     pub field_index: usize,
     pub editor: Option<FieldEditor>,
     pub picker: Option<ModelPickerState>,
+    pub search: Option<SearchOverlayState>,
     pub effective: AppConfig,
     pub sources: SeparatedSources,
     pub dirty: bool,
@@ -66,6 +67,16 @@ pub(crate) struct ModelPickerState {
     pub cursor: usize,
     pub all_providers: bool,
     pub current_provider: &'static str,
+}
+
+/// Fuzzy search across every field label in `CONFIG_SECTIONS`. Triggered
+/// by `/` in browse mode. Enter jumps to the matched field.
+pub(crate) struct SearchOverlayState {
+    pub query: String,
+    pub cursor: usize,
+    /// (section_index, field_index, score) for matches, sorted ascending
+    /// by score (lower is better in `squeezy_rank::fuzzy::fuzzy_score`).
+    pub matches: Vec<(usize, usize, i32)>,
 }
 
 /// Stand-alone editor state. Holds a draft buffer so cancel-on-Esc restores.
@@ -127,6 +138,7 @@ impl ConfigScreenState {
             field_index: 0,
             editor: None,
             picker: None,
+            search: None,
             effective,
             sources,
             dirty: false,
@@ -161,6 +173,9 @@ pub(crate) fn handle_key(
     key: KeyEvent,
 ) -> KeyOutcome {
     // Sub-modes take precedence over the regular browse keymap.
+    if state.search.is_some() {
+        return handle_search_key(state, key);
+    }
     if state.picker.is_some() {
         return handle_picker_key(state, agent, notifications, key);
     }
@@ -255,6 +270,21 @@ pub(crate) fn handle_key(
         }
         (KeyCode::Enter, _) => {
             let field = state.current_field();
+            // Refuse to edit env-shadowed fields — the value at runtime is
+            // the env var's, not the TOML's, so a TOML write is silently
+            // inert.
+            if let Some(var) = field.env_override
+                && std::env::var(var).is_ok()
+            {
+                notifications.push(
+                    format!(
+                        "{} is set by {}; unset the env var to edit in the screen.",
+                        field.label, var
+                    ),
+                    NotifySeverity::Warn,
+                );
+                return KeyOutcome::KeepOpen;
+            }
             // The model field opens a registry-driven picker; every other
             // field goes through the regular per-kind editor.
             if field.toml_path == ["model", "model"] {
@@ -270,11 +300,42 @@ pub(crate) fn handle_key(
                 });
             } else if matches!(field.kind, FieldKind::Secret { .. }) {
                 notifications.push(
-                    "API-key entry lands in the next commit. Use `squeezy auth set <provider>` for now.",
+                    "Use `squeezy auth set <provider>` to write the secret.",
                     NotifySeverity::Info,
                 );
             } else {
                 state.editor = Some(open_editor_for(field, (field.get)(&state.effective)));
+            }
+            KeyOutcome::KeepOpen
+        }
+        (KeyCode::Char('/'), m) if m.is_empty() => {
+            state.search = Some(SearchOverlayState {
+                query: String::new(),
+                cursor: 0,
+                matches: compute_search_matches(""),
+            });
+            KeyOutcome::KeepOpen
+        }
+        (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+            let field = state.current_field();
+            if let Some(var) = field.env_override
+                && std::env::var(var).is_ok()
+            {
+                notifications.push(
+                    format!(
+                        "{} is set by {}; unset the env var to reset.",
+                        field.label, var
+                    ),
+                    NotifySeverity::Warn,
+                );
+                return KeyOutcome::KeepOpen;
+            }
+            let default_val = (field.default)();
+            if let Err(msg) = (field.set)(&mut state.effective, default_val.clone()) {
+                notifications.push(format!("reset failed: {msg}"), NotifySeverity::Error);
+            } else {
+                state.dirty = true;
+                save_field(state, agent, notifications, field, default_val);
             }
             KeyOutcome::KeepOpen
         }
@@ -723,6 +784,67 @@ fn commit_model_picker(
     save_field(state, agent, notifications, field, value);
 }
 
+// ─── Search overlay ───────────────────────────────────────────────────────────
+
+pub(crate) fn compute_search_matches(query: &str) -> Vec<(usize, usize, i32)> {
+    let mut out: Vec<(usize, usize, i32)> = Vec::new();
+    for (sidx, section) in CONFIG_SECTIONS.iter().enumerate() {
+        for (fidx, field) in section.fields.iter().enumerate() {
+            if query.is_empty() {
+                out.push((sidx, fidx, 0));
+                continue;
+            }
+            // Match against `<section>.<field>` so users can type either part.
+            let target = format!("{} {}", section.label, field.label);
+            if let Some(score) = squeezy_rank::fuzzy_score(&target, query) {
+                out.push((sidx, fidx, score));
+            }
+        }
+    }
+    out.sort_by_key(|(_, _, score)| *score);
+    out.truncate(40);
+    out
+}
+
+fn handle_search_key(state: &mut ConfigScreenState, key: KeyEvent) -> KeyOutcome {
+    let search = state.search.as_mut().expect("checked by caller");
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => {
+            state.search = None;
+        }
+        (KeyCode::Up, _) if !search.matches.is_empty() && search.cursor > 0 => {
+            search.cursor -= 1;
+        }
+        (KeyCode::Down, _) => {
+            let n = search.matches.len();
+            if n > 0 {
+                search.cursor = (search.cursor + 1).min(n - 1);
+            }
+        }
+        (KeyCode::Backspace, _) => {
+            search.query.pop();
+            search.matches = compute_search_matches(&search.query);
+            search.cursor = 0;
+        }
+        (KeyCode::Char(c), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
+            search.query.push(c);
+            search.matches = compute_search_matches(&search.query);
+            search.cursor = 0;
+        }
+        (KeyCode::Enter, _) => {
+            if let Some((sidx, fidx, _)) = search.matches.get(search.cursor).copied() {
+                state.section_index = sidx;
+                state.field_index = fidx;
+            }
+            state.search = None;
+        }
+        _ => {}
+    }
+    KeyOutcome::KeepOpen
+}
+
 fn save_field(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
@@ -962,9 +1084,61 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
     );
     if let Some(picker) = &state.picker {
         render_model_picker(frame, chunks[2], picker);
+    } else if let Some(search) = &state.search {
+        render_search_overlay(frame, chunks[2], search);
     } else {
         render_field_pane(frame, chunks[2], state);
     }
+}
+
+fn render_search_overlay(frame: &mut Frame<'_>, area: Rect, search: &SearchOverlayState) {
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(search.matches.len() + 3);
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Search",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled("fuzzy match field labels", Style::default().fg(QUIET)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("/", Style::default().fg(QUIET)),
+        Span::raw(search.query.clone()),
+        Span::styled("_", Style::default().fg(AMBER)),
+    ]));
+    lines.push(Line::raw(""));
+    if search.matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matches",
+            Style::default().fg(QUIET),
+        )));
+    } else {
+        for (idx, (sidx, fidx, _score)) in search.matches.iter().enumerate() {
+            let section = &CONFIG_SECTIONS[*sidx];
+            let field = &section.fields[*fidx];
+            let active = idx == search.cursor.min(search.matches.len() - 1);
+            let prefix = if active { "› " } else { "  " };
+            let style = if active {
+                Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    prefix,
+                    Style::default().fg(if active { GOLD } else { QUIET }),
+                ),
+                Span::styled(format!("{:<22}", section.label), Style::default().fg(QUIET)),
+                Span::styled(format!("{:<28}", field.label), style),
+            ]));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Type to filter · ↑/↓ move · Enter jump · Esc cancel",
+        Style::default().fg(QUIET),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerState) {

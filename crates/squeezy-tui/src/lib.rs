@@ -975,6 +975,22 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
+    // `n` dismisses the current notification, `N` clears all. Only fires
+    // when the prompt is empty so we don't eat keystrokes the user is
+    // typing into the input area.
+    if app.input.is_empty() && !app.app_notifications.is_empty() && key.modifiers.is_empty() {
+        if key.code == KeyCode::Char('n') {
+            if app.app_notifications.dismiss_current() {
+                return Ok(false);
+            }
+        } else if key.code == KeyCode::Char('N') {
+            let removed = app.app_notifications.clear_all();
+            if removed > 0 {
+                return Ok(false);
+            }
+        }
+    }
+
     if app.exit_confirm_armed
         && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
         && key.modifiers.is_empty()

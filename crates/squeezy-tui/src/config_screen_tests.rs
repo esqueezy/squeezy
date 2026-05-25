@@ -186,6 +186,108 @@ async fn enter_on_model_field_opens_picker_and_filter_narrows_matches() {
     );
 }
 
+#[tokio::test]
+async fn slash_opens_search_and_enter_jumps_to_field() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    // Open search with `/`.
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::empty()),
+    );
+    assert!(state.search.is_some(), "search overlay should be open");
+
+    // Type "tele" — should match Telemetry section fields.
+    for ch in ['t', 'e', 'l', 'e'] {
+        handle_key(
+            &mut state,
+            &mut agent,
+            &mut q,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+        );
+    }
+    let matches = state.search.as_ref().unwrap().matches.len();
+    assert!(matches > 0, "fuzzy 'tele' should match Telemetry fields");
+
+    // Enter jumps to the top match.
+    let (target_sidx, target_fidx, _) = state.search.as_ref().unwrap().matches[0];
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    assert!(state.search.is_none(), "Enter closes search");
+    assert_eq!(state.section_index, target_sidx);
+    assert_eq!(state.field_index, target_fidx);
+}
+
+#[tokio::test]
+async fn ctrl_r_resets_field_to_default() {
+    // Use a field whose schema declares no env_override, so the test stays
+    // robust against other tests setting SQUEEZY_* env vars in parallel.
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    // response_verbosity is index 0: env_override=None, default=Normal.
+    state.field_index = 0;
+    state.effective.tui.response_verbosity = squeezy_core::ResponseVerbosity::Verbose;
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(
+        state.effective.tui.response_verbosity,
+        squeezy_core::ResponseVerbosity::Normal,
+        "Ctrl+R should restore default Normal"
+    );
+}
+
+#[tokio::test]
+async fn enter_on_env_shadowed_field_emits_warning_instead_of_opening_editor() {
+    // SAFETY: tests in this module run single-threaded.
+    unsafe { std::env::set_var("SQUEEZY_TELEMETRY", "off") };
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Telemetry));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    assert!(
+        state.editor.is_none(),
+        "env-shadowed field should not open editor"
+    );
+    let current = q.current().expect("warning notification queued");
+    assert!(
+        current.message.contains("SQUEEZY_TELEMETRY"),
+        "warning should name the env var, got: {}",
+        current.message
+    );
+    unsafe { std::env::remove_var("SQUEEZY_TELEMETRY") };
+}
+
+#[test]
+fn notification_dismiss_current_and_clear_all() {
+    let mut q = NotificationQueue::new();
+    q.push("a", crate::notification::Severity::Info);
+    q.push("b", crate::notification::Severity::Info);
+    q.push("c", crate::notification::Severity::Info);
+    assert_eq!(q.len(), 3);
+    assert!(q.dismiss_current());
+    assert_eq!(q.len(), 2);
+    let removed = q.clear_all();
+    assert_eq!(removed, 2);
+    assert!(q.is_empty());
+}
+
 #[test]
 fn path_editor_commits_pathbuf() {
     use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldKind, FieldValue, SectionId as SId};
