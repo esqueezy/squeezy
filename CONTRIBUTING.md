@@ -1,6 +1,6 @@
 # Contributing
 
-Squeezy is implemented in Rust and targets macOS and Linux first. The foundation workspace uses Rust 2024.
+Squeezy is implemented in Rust and targets macOS, Linux, and Windows (x86_64). The foundation workspace uses Rust 2024.
 
 Contributor-facing architecture, validation, benchmark, and deployment notes
 live in [`docs/internal/`](docs/internal/). User-facing product docs live in

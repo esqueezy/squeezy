@@ -2,6 +2,7 @@
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-musl",
 ]
 all-features = true
@@ -70,6 +71,17 @@ skip = [
     # are platform-conditional or used in disjoint code paths.
     { crate = "hmac:0.12.1", reason = "secret-service (Linux keyring) on hmac 0.12 vs aws-sigv4 on 0.13" },
     { crate = "sha2:0.10.9", reason = "secret-service (Linux keyring) on sha2 0.10 vs aws-sigv4 on 0.11" },
+    # Windows MSVC target pulls `aws-lc-sys` (via rustls), whose build
+    # script depends on `cc 1.2 -> jobserver -> getrandom 0.3`, while
+    # `rand_core 0.6` (via `secret-service`/`keyring` and `ring`) stays on
+    # `getrandom 0.2`. Both coexist; aws-lc-sys upstream is migrating.
+    { crate = "getrandom:0.2.17", reason = "aws-lc-sys cc/jobserver build deps pull getrandom 0.3 on Windows; rand_core 0.6 stays on 0.2" },
+    # Several Windows-touching crates (tokio, crossterm, dirs-sys, mio,
+    # parking_lot, rustls-platform-verifier, …) sit on different
+    # `windows-sys` majors. They are platform-conditional and isolated; the
+    # rest of the workspace targets do not link multiple copies.
+    { crate = "windows-sys:0.59.0", reason = "platform-conditional Windows shims sit on different windows-sys majors; coexist without symbol conflicts" },
+    { crate = "windows-sys:0.61.2", reason = "platform-conditional Windows shims sit on different windows-sys majors; coexist without symbol conflicts" },
 ]
 skip-tree = []
 
