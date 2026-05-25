@@ -4113,10 +4113,9 @@ fn expanded_shell_detail_lines(
         .as_ref()
         .and_then(|call| string_arg(&call.arguments, "command"))
         .or_else(|| string_arg(&tool.result.content, "command"))
+        && lines.is_empty()
     {
-        if lines.is_empty() {
-            lines.push(detail_spans_line(command_spans(&command)));
-        }
+        lines.push(detail_spans_line(command_spans(&command)));
     }
     if tool.result.status != ToolStatus::Success
         && let Some(workdir) = string_arg(&tool.result.content, "workdir")
