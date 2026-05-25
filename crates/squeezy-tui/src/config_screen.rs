@@ -53,9 +53,19 @@ pub(crate) struct ConfigScreenState {
     pub section_index: usize,
     pub field_index: usize,
     pub editor: Option<FieldEditor>,
+    pub picker: Option<ModelPickerState>,
     pub effective: AppConfig,
     pub sources: SeparatedSources,
     pub dirty: bool,
+}
+
+/// Filterable picker driven by `squeezy_llm::registry::MODEL_REGISTRY`.
+/// Opens when the user presses Enter on the `[model].model` field.
+pub(crate) struct ModelPickerState {
+    pub filter: String,
+    pub cursor: usize,
+    pub all_providers: bool,
+    pub current_provider: &'static str,
 }
 
 /// Stand-alone editor state. Holds a draft buffer so cancel-on-Esc restores.
@@ -116,6 +126,7 @@ impl ConfigScreenState {
             section_index,
             field_index: 0,
             editor: None,
+            picker: None,
             effective,
             sources,
             dirty: false,
@@ -149,6 +160,10 @@ pub(crate) fn handle_key(
     notifications: &mut NotificationQueue,
     key: KeyEvent,
 ) -> KeyOutcome {
+    // Sub-modes take precedence over the regular browse keymap.
+    if state.picker.is_some() {
+        return handle_picker_key(state, agent, notifications, key);
+    }
     if let Some(editor) = &mut state.editor {
         let commit = handle_editor_key(editor, key);
         match commit {
@@ -240,7 +255,27 @@ pub(crate) fn handle_key(
         }
         (KeyCode::Enter, _) => {
             let field = state.current_field();
-            state.editor = Some(open_editor_for(field, (field.get)(&state.effective)));
+            // The model field opens a registry-driven picker; every other
+            // field goes through the regular per-kind editor.
+            if field.toml_path == ["model", "model"] {
+                let current_provider = match (CONFIG_SECTIONS[0].fields[0].get)(&state.effective) {
+                    FieldValue::Enum(s) => s,
+                    _ => "openai",
+                };
+                state.picker = Some(ModelPickerState {
+                    filter: String::new(),
+                    cursor: 0,
+                    all_providers: false,
+                    current_provider,
+                });
+            } else if matches!(field.kind, FieldKind::Secret { .. }) {
+                notifications.push(
+                    "API-key entry lands in the next commit. Use `squeezy auth set <provider>` for now.",
+                    NotifySeverity::Info,
+                );
+            } else {
+                state.editor = Some(open_editor_for(field, (field.get)(&state.effective)));
+            }
             KeyOutcome::KeepOpen
         }
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
@@ -588,6 +623,106 @@ fn integer_editor_key(
 
 // ─── Save pipeline ───────────────────────────────────────────────────────────
 
+// ─── Model picker ─────────────────────────────────────────────────────────────
+
+fn picker_matches(state: &ModelPickerState) -> Vec<&'static squeezy_llm::ModelInfo> {
+    let filter_lower = state.filter.to_lowercase();
+    squeezy_llm::MODEL_REGISTRY
+        .iter()
+        .filter(|m| state.all_providers || m.provider == state.current_provider)
+        .filter(|m| filter_lower.is_empty() || m.id.to_lowercase().contains(&filter_lower))
+        .collect()
+}
+
+fn handle_picker_key(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    key: KeyEvent,
+) -> KeyOutcome {
+    let picker = state.picker.as_mut().expect("checked by caller");
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => {
+            state.picker = None;
+        }
+        (KeyCode::Tab, _) => {
+            picker.all_providers = !picker.all_providers;
+            picker.cursor = 0;
+        }
+        (KeyCode::Up, _) => {
+            let n = picker_matches(picker).len();
+            if n > 0 && picker.cursor > 0 {
+                picker.cursor -= 1;
+            }
+        }
+        (KeyCode::Down, _) => {
+            let n = picker_matches(picker).len();
+            if n > 0 {
+                picker.cursor = (picker.cursor + 1).min(n - 1);
+            }
+        }
+        (KeyCode::Backspace, _) => {
+            picker.filter.pop();
+            picker.cursor = 0;
+        }
+        (KeyCode::Char(c), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
+            picker.filter.push(c);
+            picker.cursor = 0;
+        }
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+Enter — commit the raw filter buffer as a custom string.
+            let custom = picker.filter.trim().to_string();
+            if custom.is_empty() {
+                notifications.push(
+                    "Type a model id first, then Ctrl+Enter to commit.",
+                    NotifySeverity::Info,
+                );
+            } else {
+                commit_model_picker(state, agent, notifications, custom);
+            }
+        }
+        (KeyCode::Enter, _) => {
+            let matches = picker_matches(picker);
+            if matches.is_empty() {
+                notifications.push(
+                    "No model matches the filter. Ctrl+Enter to commit the filter as a custom id.",
+                    NotifySeverity::Info,
+                );
+            } else {
+                let id = matches[picker.cursor.min(matches.len() - 1)].id.to_string();
+                commit_model_picker(state, agent, notifications, id);
+            }
+        }
+        _ => {}
+    }
+    KeyOutcome::KeepOpen
+}
+
+fn commit_model_picker(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    model_id: String,
+) {
+    state.picker = None;
+    // The model field is the second field of the Models section. Look it up
+    // by path rather than index in case the schema is reordered.
+    let field = CONFIG_SECTIONS
+        .iter()
+        .flat_map(|s| s.fields.iter())
+        .find(|f| f.toml_path == ["model", "model"])
+        .expect("model field exists in CONFIG_SECTIONS");
+    let value = FieldValue::String(model_id);
+    if let Err(msg) = (field.set)(&mut state.effective, value.clone()) {
+        notifications.push(format!("invalid: {msg}"), NotifySeverity::Error);
+        return;
+    }
+    state.dirty = true;
+    save_field(state, agent, notifications, field, value);
+}
+
 fn save_field(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
@@ -825,7 +960,86 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         Paragraph::new(sep_lines).style(Style::default().fg(QUIET)),
         chunks[1],
     );
-    render_field_pane(frame, chunks[2], state);
+    if let Some(picker) = &state.picker {
+        render_model_picker(frame, chunks[2], picker);
+    } else {
+        render_field_pane(frame, chunks[2], state);
+    }
+}
+
+fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerState) {
+    let matches = picker_matches(picker);
+    let scope_label = if picker.all_providers {
+        "all providers"
+    } else {
+        picker.current_provider
+    };
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(matches.len() + 4);
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Pick model",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(format!("scope: {scope_label}"), Style::default().fg(QUIET)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("filter ", Style::default().fg(QUIET)),
+        Span::raw("› "),
+        Span::raw(picker.filter.clone()),
+        Span::styled("_", Style::default().fg(AMBER)),
+    ]));
+    lines.push(Line::raw(""));
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matches · Ctrl+Enter to commit the filter as a custom model id",
+            Style::default().fg(QUIET),
+        )));
+    } else {
+        for (idx, info) in matches.iter().enumerate() {
+            let active = idx == picker.cursor.min(matches.len() - 1);
+            let prefix = if active { "› " } else { "  " };
+            let style = if active {
+                Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let mut row = vec![
+                Span::styled(
+                    prefix,
+                    Style::default().fg(if active { GOLD } else { QUIET }),
+                ),
+                Span::styled(format!("{:<32}", info.id), style),
+            ];
+            if picker.all_providers {
+                row.push(Span::styled(
+                    format!("{:<12}", info.provider),
+                    Style::default().fg(QUIET),
+                ));
+            }
+            for (tag, present) in [
+                ("pcache", info.capabilities.prompt_caching),
+                ("rsn", info.capabilities.reasoning_effort),
+                ("vis", info.capabilities.vision),
+                ("tools", info.capabilities.tool_calling),
+                ("json", info.capabilities.json_mode),
+            ] {
+                if present {
+                    row.push(Span::styled(
+                        format!(" [{tag}]"),
+                        Style::default().fg(SUCCESS_GREEN),
+                    ));
+                }
+            }
+            lines.push(Line::from(row));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Type filter · ↑/↓ move · Enter commit · Tab all-providers · Ctrl+Enter custom · Esc cancel",
+        Style::default().fg(QUIET),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {

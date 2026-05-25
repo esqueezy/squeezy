@@ -138,6 +138,54 @@ fn string_list_editor_round_trips_via_commit() {
     assert_eq!(items, vec!["rust".to_string(), "python".to_string()]);
 }
 
+#[tokio::test]
+async fn enter_on_model_field_opens_picker_and_filter_narrows_matches() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    // The `provider` field is index 0; the `model` field is index 1.
+    state.field_index = 1;
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    let picker = state.picker.as_ref().expect("picker open");
+    assert!(!picker.all_providers);
+    let initial_matches = picker_matches(picker).len();
+    assert!(
+        initial_matches > 0,
+        "registry should have at least one openai model"
+    );
+
+    // Type "claude" — with provider=openai and all_providers=false, this
+    // filter should produce zero matches (claude models live under anthropic).
+    for ch in ['c', 'l', 'a', 'u', 'd', 'e'] {
+        handle_key(
+            &mut state,
+            &mut agent,
+            &mut q,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+        );
+    }
+    let after_filter = picker_matches(state.picker.as_ref().unwrap()).len();
+    assert_eq!(after_filter, 0, "openai filter should not match claude*");
+
+    // Tab toggles all_providers, which should expose claude entries.
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+    );
+    let after_tab = picker_matches(state.picker.as_ref().unwrap()).len();
+    assert!(
+        after_tab > 0,
+        "all-providers + claude filter should match anthropic models"
+    );
+}
+
 #[test]
 fn path_editor_commits_pathbuf() {
     use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldKind, FieldValue, SectionId as SId};
