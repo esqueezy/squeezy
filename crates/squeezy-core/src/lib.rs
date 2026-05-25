@@ -292,7 +292,7 @@ impl AppConfig {
             "anthropic" | "claude" => ProviderConfig::Anthropic(AnthropicConfig {
                 api_key_env: get_var("ANTHROPIC_API_KEY_ENV")
                     .or_else(|| provider_setting(&providers, "anthropic", "api_key_env"))
-                    .unwrap_or_else(|| "ANTHROPIC_API_KEY".to_string()),
+                    .unwrap_or_else(|| "SQUEEZY_ANTHROPIC_KEY".to_string()),
                 api_key_keychain: provider_setting(&providers, "anthropic", "api_key_keychain")
                     .or_else(|| Some("squeezy:anthropic".to_string())),
                 base_url: get_var("ANTHROPIC_BASE_URL")
@@ -303,7 +303,7 @@ impl AppConfig {
             "google" | "gemini" => ProviderConfig::Google(GoogleConfig {
                 api_key_env: get_var("GOOGLE_API_KEY_ENV")
                     .or_else(|| provider_setting(&providers, "google", "api_key_env"))
-                    .unwrap_or_else(|| "GEMINI_API_KEY".to_string()),
+                    .unwrap_or_else(|| "SQUEEZY_GOOGLE_KEY".to_string()),
                 api_key_keychain: provider_setting(&providers, "google", "api_key_keychain")
                     .or_else(|| Some("squeezy:google".to_string())),
                 base_url: get_var("GOOGLE_BASE_URL")
@@ -316,7 +316,7 @@ impl AppConfig {
                     api_key_env: get_var("AZURE_OPENAI_API_KEY_ENV")
                         .or_else(|| provider_setting(&providers, "azure_openai", "api_key_env"))
                         .or_else(|| provider_setting(&providers, "azure", "api_key_env"))
-                        .unwrap_or_else(|| "AZURE_OPENAI_API_KEY".to_string()),
+                        .unwrap_or_else(|| "SQUEEZY_AZURE_OPENAI_KEY".to_string()),
                     api_key_keychain: provider_setting(
                         &providers,
                         "azure_openai",
@@ -355,7 +355,7 @@ impl AppConfig {
             "openai" => ProviderConfig::OpenAi(OpenAiConfig {
                 api_key_env: get_var("OPENAI_API_KEY_ENV")
                     .or_else(|| provider_setting(&providers, "openai", "api_key_env"))
-                    .unwrap_or_else(|| "OPENAI_API_KEY".to_string()),
+                    .unwrap_or_else(|| "SQUEEZY_OPENAI_KEY".to_string()),
                 api_key_keychain: provider_setting(&providers, "openai", "api_key_keychain")
                     .or_else(|| Some("squeezy:openai".to_string())),
                 base_url: get_var("OPENAI_BASE_URL")

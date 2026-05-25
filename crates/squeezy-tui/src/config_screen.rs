@@ -23,7 +23,7 @@ use squeezy_core::{
         ApplyTier, CONFIG_SECTIONS, ConfigSectionMeta, FieldKind, FieldMeta, FieldSource,
         FieldValue, SectionId,
     },
-    load_separated_settings_sources, resolve_field_source,
+    load_separated_settings_sources,
     settings_writer::{EditOp, SettingsEdit, SettingsScope, WriteOutcome, apply_edits},
 };
 
@@ -84,6 +84,13 @@ pub(crate) struct ConfigScreenState {
     pub effective: AppConfig,
     pub sources: SeparatedSources,
     pub dirty: bool,
+    /// File bytes captured the moment the screen opened, per tier path.
+    /// `Discard all` rewrites every file to its baseline.
+    pub baseline: Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
+    /// `(path, pre_write_bytes)` for every write since the screen opened.
+    /// `Ctrl+Z` pops the last entry and rewrites the file to its
+    /// pre-write contents.
+    pub undo_stack: Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
 }
 
 /// Masked text entry for an API key. The plaintext lives only in `draft`
@@ -98,9 +105,10 @@ pub(crate) struct SecretEntryState {
     pub provider_label: String,
     pub draft: String,
     pub cursor: usize,
-    /// When `true`, reveal the last four characters so the user can
-    /// double-check what they pasted. Toggled with Ctrl+T.
-    pub reveal_tail: bool,
+    /// When `true`, reveal the FIRST four characters so the user can
+    /// double-check what they pasted (most keys are prefix-distinctive
+    /// like `sk-…` / `claude-…`). Toggled with Ctrl+T.
+    pub reveal_head: bool,
 }
 
 /// Filterable picker driven by `squeezy_llm::registry::MODEL_REGISTRY`.
@@ -175,6 +183,23 @@ impl ConfigScreenState {
         let section_index = focus
             .and_then(|id| CONFIG_SECTIONS.iter().position(|s| s.id == id))
             .unwrap_or(0);
+        // Snapshot every tier file's bytes the moment the screen opens.
+        // Discard-all rewrites these back; the undo stack covers the
+        // finer-grained per-save history.
+        let baseline = vec![
+            (
+                sources.user_path_default.clone(),
+                std::fs::read(&sources.user_path_default).ok(),
+            ),
+            (
+                sources.project_path_default.clone(),
+                std::fs::read(&sources.project_path_default).ok(),
+            ),
+            (
+                sources.repo_path_default.clone(),
+                std::fs::read(&sources.repo_path_default).ok(),
+            ),
+        ];
         Self {
             scope: ConfigScope::User,
             section_index,
@@ -186,6 +211,8 @@ impl ConfigScreenState {
             effective,
             sources,
             dirty: false,
+            baseline,
+            undo_stack: Vec::new(),
         }
     }
 
@@ -197,8 +224,135 @@ impl ConfigScreenState {
         &self.current_section().fields[self.field_index]
     }
 
-    pub(crate) fn field_source(&self, field: &FieldMeta) -> FieldSource {
-        resolve_field_source(&self.sources, field)
+    /// Compute the displayed value + source for `field` under the currently
+    /// active scope tab. Walks the precedence chain DOWN from the active
+    /// tier (e.g. on the Local tab: Local → Repo → User → defaults) so
+    /// editing the User file doesn't make the Local tab appear to also
+    /// have that value — it shows `[inherited-user]` instead.
+    pub(crate) fn displayed_value_and_source(
+        &self,
+        field: &FieldMeta,
+    ) -> (FieldValue, FieldSource) {
+        // env always wins — render the running value with [env] regardless of tab.
+        if let Some(var) = field.env_override
+            && std::env::var(var).is_ok()
+        {
+            return ((field.get)(&self.effective), FieldSource::Env);
+        }
+        // Precedence chain for the active tab, highest → lowest.
+        let chain: &[(FieldSource, &Option<squeezy_core::TierSource>)] = match self.scope {
+            ConfigScope::User => &[(FieldSource::User, &self.sources.user)],
+            ConfigScope::Repo => &[
+                (FieldSource::Project, &self.sources.project),
+                (FieldSource::User, &self.sources.user),
+            ],
+            ConfigScope::Local => &[
+                (FieldSource::Repo, &self.sources.repo),
+                (FieldSource::Project, &self.sources.project),
+                (FieldSource::User, &self.sources.user),
+            ],
+        };
+        for (src, tier) in chain {
+            if let Some(t) = tier
+                && let Some(val) = tier_value_at_path(t, field)
+            {
+                return (val, *src);
+            }
+        }
+        ((field.default)(), FieldSource::Default)
+    }
+}
+
+/// Parse the `FieldValue` for `field.toml_path` out of a tier's
+/// `DocumentMut`. Returns `None` when the path is unset in this tier or
+/// when the leaf type can't be represented in the current schema (e.g.
+/// `TableArray` / `ProviderSubTabs`).
+fn tier_value_at_path(tier: &squeezy_core::TierSource, field: &FieldMeta) -> Option<FieldValue> {
+    if field.toml_path.is_empty() {
+        return None;
+    }
+    let (leaf, parents) = field.toml_path.split_last().unwrap();
+    let mut node: &toml_edit::Item = tier.doc.as_item();
+    for seg in parents {
+        node = match node {
+            toml_edit::Item::Table(t) => t.get(seg)?,
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(it)) => {
+                let value = it.get(seg)?;
+                // Borrow extension dance: wrap back as a temporary Item.
+                // We need an `&Item` to keep walking; InlineTable values are
+                // `&Value` so we synthesize one via `as_value`. Simpler: bail
+                // on inline-table parents — they're rare in user files.
+                let _ = value;
+                return None;
+            }
+            _ => return None,
+        };
+    }
+    let item = match node {
+        toml_edit::Item::Table(t) => t.get(leaf)?,
+        _ => return None,
+    };
+    let value = item.as_value()?;
+    match field.kind {
+        FieldKind::Bool => value.as_bool().map(FieldValue::Bool),
+        FieldKind::Integer { .. } => value.as_integer().map(FieldValue::Integer),
+        FieldKind::OptionalInteger { .. } => value
+            .as_integer()
+            .map(|v| FieldValue::OptionalInteger(Some(v))),
+        FieldKind::Enum { options } => value
+            .as_str()
+            .and_then(|s| options.iter().find(|o| **o == s).copied())
+            .map(FieldValue::Enum),
+        FieldKind::OptionalEnum { options } => value
+            .as_str()
+            .and_then(|s| options.iter().find(|o| **o == s).copied())
+            .map(|s| FieldValue::OptionalEnum(Some(s))),
+        FieldKind::String { .. } => value.as_str().map(|s| FieldValue::String(s.to_string())),
+        FieldKind::DurationMs => value
+            .as_integer()
+            .map(|ms| FieldValue::Duration(std::time::Duration::from_millis(ms.max(0) as u64))),
+        FieldKind::StringList { .. } => {
+            let arr = value.as_array()?;
+            let mut items = Vec::with_capacity(arr.len());
+            for v in arr.iter() {
+                items.push(v.as_str()?.to_string());
+            }
+            Some(FieldValue::StringList(items))
+        }
+        FieldKind::Path { .. } => value
+            .as_str()
+            .map(|s| FieldValue::Path(std::path::PathBuf::from(s))),
+        FieldKind::Secret { .. } | FieldKind::ProviderSubTabs | FieldKind::TableArray { .. } => {
+            None
+        }
+    }
+}
+
+/// Inheritance badge label shown next to the field's value.
+///
+/// `[own]` when the value lives in the active tab's tier, otherwise
+/// `[inherited-X]` naming the tier that supplies it. `[env]` and
+/// `[default]` are tab-independent.
+fn inheritance_label(active: ConfigScope, source: FieldSource) -> String {
+    if source == FieldSource::Env {
+        return "[env]".to_string();
+    }
+    if source == FieldSource::Default {
+        return "[default]".to_string();
+    }
+    let scope_of_source = match source {
+        FieldSource::User => ConfigScope::User,
+        FieldSource::Project => ConfigScope::Repo,
+        FieldSource::Repo => ConfigScope::Local,
+        // Env / Default handled above
+        FieldSource::Env | FieldSource::Default => unreachable!(),
+    };
+    if scope_of_source == active {
+        // The displayed value lives in this tab's own file. Leave the
+        // brackets off so the row reads as "the user's own value here".
+        active.label().to_lowercase()
+    } else {
+        format!("[inherited-{}]", scope_of_source.label().to_lowercase())
     }
 }
 
@@ -464,6 +618,14 @@ pub(crate) fn handle_key(
         }
         (KeyCode::Char('K'), m) if m == KeyModifiers::SHIFT || m.is_empty() => {
             open_api_key_entry_for_current_provider(state, notifications);
+            KeyOutcome::KeepOpen
+        }
+        (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
+            undo_last_write(state, agent, notifications);
+            KeyOutcome::KeepOpen
+        }
+        (KeyCode::Char('X'), m) if m == KeyModifiers::SHIFT || m.is_empty() => {
+            discard_all_session_writes(state, agent, notifications);
             KeyOutcome::KeepOpen
         }
         _ => KeyOutcome::KeepOpen,
@@ -946,7 +1108,7 @@ fn open_api_key_entry_for_current_provider(
                 provider_label: label.to_string(),
                 draft: String::new(),
                 cursor: 0,
-                reveal_tail: false,
+                reveal_head: false,
             });
         }
         None => {
@@ -975,7 +1137,7 @@ fn handle_secret_entry_key(
             state.secret_entry = None;
         }
         (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-            entry.reveal_tail = !entry.reveal_tail;
+            entry.reveal_head = !entry.reveal_head;
         }
         (KeyCode::Backspace, _) if entry.cursor > 0 => {
             let mut chars: Vec<char> = entry.draft.chars().collect();
@@ -1117,10 +1279,20 @@ fn save_field(
         ConfigScope::Local => SettingsScope::repo(&target_path),
     };
 
+    // Snapshot file bytes before the write so Ctrl+Z can revert this
+    // single save. `None` means the file didn't exist before.
+    let pre_write_bytes = std::fs::read(&target_path).ok();
+    state
+        .undo_stack
+        .push((target_path.clone(), pre_write_bytes));
+
     let edit = field_edit(field, &value);
     let outcome = match apply_edits(&scope_target, &[edit]) {
         Ok(o) => o,
         Err(err) => {
+            // Roll back the bookkeeping for the failed write so Ctrl+Z
+            // doesn't try to revert a write that never happened.
+            state.undo_stack.pop();
             notifications.push(
                 format!("Failed to write {}: {err}", target_path.display()),
                 NotifySeverity::Error,
@@ -1248,6 +1420,123 @@ fn field_edit(field: &'static FieldMeta, value: &FieldValue) -> SettingsEdit {
 /// Clear the focused field's value in whichever tier the active scope tab
 /// points at. The User scope returns early in the caller, so this only runs
 /// for Repo (committed `./squeezy.toml`) or Local (per-machine).
+/// Ctrl+Z — restore the most recent edited tier file to its
+/// pre-write bytes and refresh the agent + sources. No-op when the
+/// session hasn't written anything yet.
+fn undo_last_write(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+) {
+    let Some((path, pre_bytes)) = state.undo_stack.pop() else {
+        notifications.push("Nothing to undo this session.", NotifySeverity::Info);
+        return;
+    };
+    if let Err(err) = restore_path(&path, pre_bytes.as_deref()) {
+        notifications.push(
+            format!("Undo failed for {}: {err}", path.display()),
+            NotifySeverity::Error,
+        );
+        // Put the snapshot back so a retry is possible.
+        state.undo_stack.push((path, pre_bytes));
+        return;
+    }
+    reload_sources_and_agent(state, agent, notifications);
+    notifications.push(
+        format!("✓ undid last write to {}", path.display()),
+        NotifySeverity::Success,
+    );
+}
+
+/// Discard every write made since the screen opened by restoring each
+/// tier file to its baseline bytes. Clears the undo stack.
+fn discard_all_session_writes(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+) {
+    if state.undo_stack.is_empty() {
+        notifications.push(
+            "Nothing to discard — no writes this session.",
+            NotifySeverity::Info,
+        );
+        return;
+    }
+    let mut restored = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    for (path, baseline_bytes) in &state.baseline {
+        if let Err(err) = restore_path(path, baseline_bytes.as_deref()) {
+            failed.push(format!("{}: {err}", path.display()));
+        } else {
+            restored += 1;
+        }
+    }
+    state.undo_stack.clear();
+    reload_sources_and_agent(state, agent, notifications);
+    if failed.is_empty() {
+        notifications.push(
+            format!("✓ discarded all session writes ({restored} files restored)"),
+            NotifySeverity::Success,
+        );
+    } else {
+        notifications.push(
+            format!(
+                "partial restore — {} ok, failures: {}",
+                restored,
+                failed.join("; ")
+            ),
+            NotifySeverity::Warn,
+        );
+    }
+}
+
+/// Either write `bytes` to `path` (overwriting) or remove `path` when
+/// the baseline is `None` (the file didn't exist when the screen opened).
+fn restore_path(path: &std::path::Path, bytes: Option<&[u8]>) -> std::io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    match bytes {
+        Some(b) => {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, b)
+        }
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        },
+    }
+}
+
+/// Reload separated sources and refresh the agent's effective config so
+/// the post-undo/discard state propagates without requiring a restart.
+fn reload_sources_and_agent(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+) {
+    if let Ok(reloaded) = load_separated_settings_sources() {
+        state.sources = reloaded;
+    }
+    match AppConfig::from_env_and_settings() {
+        Ok(new_cfg) => {
+            state.effective = new_cfg.clone();
+            agent.replace_config(new_cfg);
+        }
+        Err(err) => {
+            notifications.push(
+                format!("(note) couldn't rebuild effective config: {err}"),
+                NotifySeverity::Warn,
+            );
+        }
+    }
+}
+
 fn clear_scope_override(state: &mut ConfigScreenState, notifications: &mut NotificationQueue) {
     let field = state.current_field();
     let (path, scope_target) = match state.scope {
@@ -1340,17 +1629,27 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         "~/.squeezy/settings.toml",
         state.scope == ConfigScope::User,
     ));
-    spans.push(Span::styled(" │ ", Style::default().fg(QUIET)));
+    spans.push(Span::styled(
+        " ▸ ",
+        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+    ));
     spans.extend(tab(
         "Repo",
         "./squeezy.toml (committed)",
         state.scope == ConfigScope::Repo,
     ));
-    spans.push(Span::styled(" │ ", Style::default().fg(QUIET)));
+    spans.push(Span::styled(
+        " ▸ ",
+        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+    ));
     spans.extend(tab(
         "Local",
         "~/.squeezy/projects/<this>/settings.toml",
         state.scope == ConfigScope::Local,
+    ));
+    spans.push(Span::styled(
+        "    Local overrides Repo overrides User",
+        Style::default().fg(QUIET),
     ));
     if state.dirty {
         spans.push(Span::styled(
@@ -1394,14 +1693,13 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
 fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntryState) {
     let chars: Vec<char> = entry.draft.chars().collect();
     let total = chars.len();
-    let tail_visible = if entry.reveal_tail { total.min(4) } else { 0 };
-    let masked_count = total - tail_visible;
+    let head_visible = if entry.reveal_head { total.min(4) } else { 0 };
     let mut masked = String::with_capacity(total);
-    for _ in 0..masked_count {
-        masked.push('•');
-    }
-    for c in &chars[masked_count..] {
+    for c in &chars[..head_visible] {
         masked.push(*c);
+    }
+    for _ in head_visible..total {
+        masked.push('•');
     }
     let lines = vec![
         Line::from(vec![
@@ -1437,10 +1735,10 @@ fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntrySta
             Span::styled("save  ", Style::default().fg(QUIET)),
             Span::styled("Ctrl+T ", Style::default().fg(GOLD)),
             Span::styled(
-                if entry.reveal_tail {
-                    "hide tail  "
+                if entry.reveal_head {
+                    "hide first 4  "
                 } else {
-                    "reveal last 4 chars  "
+                    "reveal first 4 chars  "
                 },
                 Style::default().fg(QUIET),
             ),
@@ -1630,10 +1928,9 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
 
     for (idx, field) in fields_iter {
         let active = idx == state.field_index;
-        let value = (field.get)(&state.effective);
+        let (value, source) = state.displayed_value_and_source(field);
         let value_str = value.as_display();
-        let source = state.field_source(field);
-        let source_label = format!("[{}]", source.badge());
+        let source_label = inheritance_label(state.scope, source);
         let prefix = if active { "› " } else { "  " };
         let style = if active {
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
@@ -1855,9 +2152,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, _state: &ConfigScreenState) 
         Span::styled("Space", Style::default().fg(GOLD)),
         Span::raw(" cycle · "),
         Span::styled("K", Style::default().fg(GOLD)),
-        Span::raw(" set API key · "),
+        Span::raw(" key · "),
         Span::styled("/", Style::default().fg(GOLD)),
         Span::raw(" search · "),
+        Span::styled("Ctrl+Z", Style::default().fg(GOLD)),
+        Span::raw(" undo · "),
+        Span::styled("X", Style::default().fg(GOLD)),
+        Span::raw(" discard all · "),
         Span::styled("Esc", Style::default().fg(GOLD)),
         Span::raw(" close "),
     ]);

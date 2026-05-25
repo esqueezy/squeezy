@@ -163,7 +163,7 @@ fn config_without_env_uses_openai_provider_defaults() {
     );
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
-            assert_eq!(openai.api_key_env, "OPENAI_API_KEY");
+            assert_eq!(openai.api_key_env, "SQUEEZY_OPENAI_KEY");
             assert_eq!(openai.api_key_keychain.as_deref(), Some("squeezy:openai"));
             assert_eq!(openai.base_url, DEFAULT_OPENAI_BASE_URL);
         }
@@ -575,7 +575,7 @@ fn config_can_select_anthropic_provider_defaults() {
     assert_eq!(config.model, DEFAULT_ANTHROPIC_MODEL);
     match config.provider {
         ProviderConfig::Anthropic(anthropic) => {
-            assert_eq!(anthropic.api_key_env, "ANTHROPIC_API_KEY");
+            assert_eq!(anthropic.api_key_env, "SQUEEZY_ANTHROPIC_KEY");
             assert_eq!(anthropic.base_url, DEFAULT_ANTHROPIC_BASE_URL);
         }
         _ => panic!("expected Anthropic provider"),

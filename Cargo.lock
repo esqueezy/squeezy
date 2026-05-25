@@ -3572,6 +3572,7 @@ dependencies = [
  "supports-color",
  "tokio",
  "tokio-util",
+ "toml_edit",
  "tree-sitter",
  "tree-sitter-c",
  "tree-sitter-c-sharp",
