@@ -210,8 +210,18 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     ),
     slash("/model", "open config focused on provider and model"),
     slash("/permissions", "open config focused on permissions"),
-    slash_locked("/plan", "switch to Plan mode"),
-    slash_locked("/build", "switch to Build mode"),
+    slash_args(
+        "/plan",
+        "switch to Plan mode (optionally with a prompt to run)",
+        false,
+        "[prompt]",
+    ),
+    slash_args(
+        "/build",
+        "switch to Build mode (optionally with a prompt to run)",
+        false,
+        "[prompt]",
+    ),
     slash("/cost", "show token and cost accounting"),
     slash("/context", "show context budget and compaction state"),
     slash_args(
@@ -2018,8 +2028,14 @@ fn move_slash_menu_selection(app: &mut TuiApp, direction: SelectionDirection) ->
         return false;
     }
     app.slash_menu_index = match direction {
-        SelectionDirection::Previous => app.slash_menu_index.saturating_sub(1),
-        SelectionDirection::Next => (app.slash_menu_index + 1).min(count - 1),
+        SelectionDirection::Previous => {
+            if app.slash_menu_index == 0 {
+                count - 1
+            } else {
+                app.slash_menu_index - 1
+            }
+        }
+        SelectionDirection::Next => (app.slash_menu_index + 1) % count,
     };
     true
 }
@@ -2061,6 +2077,9 @@ fn request_turn_interrupt(app: &mut TuiApp) -> bool {
     interrupted
 }
 
+/// Kick off a new model turn for the given input. Shared between the
+/// Enter-key submission path and slash commands like `/plan <prompt>` that
+/// want to launch a turn after their side-effect.
 fn toggle_config_screen(
     app: &mut TuiApp,
     agent: &Agent,
@@ -2104,10 +2123,24 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         }
         "/plan" => {
             switch_mode(app, agent, Some(SessionMode::Plan), "tui_command");
+            if !rest.is_empty() {
+                let prompt = rest.to_string();
+                app.cancelled_prompt = Some(prompt.clone());
+                clear_input(app);
+                push_input_history(app, prompt.clone());
+                start_user_turn(app, agent, prompt);
+            }
             return true;
         }
         "/build" => {
             switch_mode(app, agent, Some(SessionMode::Build), "tui_command");
+            if !rest.is_empty() {
+                let prompt = rest.to_string();
+                app.cancelled_prompt = Some(prompt.clone());
+                clear_input(app);
+                push_input_history(app, prompt.clone());
+                start_user_turn(app, agent, prompt);
+            }
             return true;
         }
         "/cost" => {

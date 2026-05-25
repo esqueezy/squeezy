@@ -303,6 +303,17 @@ pub(crate) fn handle_key(
                     "Use `squeezy auth set <provider>` to write the secret.",
                     NotifySeverity::Info,
                 );
+            } else if matches!(
+                field.kind,
+                FieldKind::TableArray { .. } | FieldKind::ProviderSubTabs
+            ) {
+                notifications.push(
+                    format!(
+                        "{} is not yet editable in the screen — edit the TOML directly for now.",
+                        field.label
+                    ),
+                    NotifySeverity::Info,
+                );
             } else {
                 state.editor = Some(open_editor_for(field, (field.get)(&state.effective)));
             }
