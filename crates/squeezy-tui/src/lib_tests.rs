@@ -908,6 +908,42 @@ async fn slash_plans_set_active_updates_pointer_and_app() {
 }
 
 #[tokio::test]
+async fn mode_status_text_appends_active_plan_segment() {
+    let root = temp_workspace("mode_status_plan_segment");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    let body = "1. step one\n2. step two\n3. step three\n";
+    let (plan_id, _) = proposed_plan::persist_plan(
+        &root,
+        proposed_plan::FALLBACK_SESSION_ID,
+        body,
+        &proposed_plan::PlanMeta::default(),
+    )
+    .expect("persist plan");
+    app.current_plan_id = Some(plan_id.clone());
+    let line = mode_status_text(&app);
+    assert!(line.contains("Plan mode"), "base segment intact: {line}");
+    let short = format!(
+        "plan-{}",
+        plan_id
+            .strip_prefix("plan-")
+            .unwrap()
+            .chars()
+            .take(6)
+            .collect::<String>()
+    );
+    assert!(
+        line.contains(&short),
+        "status bar must include short plan id `{short}`: {line}"
+    );
+    assert!(
+        line.contains("(3 steps)"),
+        "status bar must include step count: {line}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn slash_plans_show_unknown_id_sets_status() {
     let root = temp_workspace("slash_plans_show_missing");
     let config = test_config_with_root(SessionMode::Plan, root.clone());
@@ -4530,27 +4566,28 @@ async fn proposed_plan_block_renders_as_log_entry_and_persists_under_plans_dir()
         "intro \ntrailing\n",
         "proposed plan markers must not appear in the live assistant pane",
     );
-    let plan_log = app.transcript.iter().find_map(|entry| match &entry.kind {
-        TranscriptEntryKind::Log(message) if message.starts_with("proposed plan plan-") => {
-            Some(message.clone())
-        }
-        _ => None,
-    });
-    let log = plan_log.unwrap_or_else(|| {
-        panic!(
-            "expected a 'proposed plan plan-<id>' log entry; transcript={:?}",
-            app.transcript
-        )
-    });
-    assert!(
-        log.ends_with(":\nstep 1\nstep 2"),
-        "log should include the plan body verbatim; got: {log:?}"
-    );
+    // Plan-mode v3 PR-F: the proposed plan lands as a styled
+    // [`TranscriptEntryKind::PlanCard`], not a free-form log entry.
+    let card_id = app
+        .transcript
+        .iter()
+        .find_map(|entry| match &entry.kind {
+            TranscriptEntryKind::PlanCard(data) => Some(data.plan_id.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a PlanCard transcript entry; transcript={:?}",
+                app.transcript
+            )
+        });
+    assert!(card_id.starts_with("plan-"));
 
     let plan_id = app
         .current_plan_id
         .as_ref()
         .expect("current_plan_id should be set after persistence");
+    assert_eq!(plan_id, &card_id);
     assert!(plan_id.starts_with("plan-"));
     // After PR-D the layout is per-session:
     // <workspace>/.squeezy/plans/<session_id>/<plan_id>.md. Test-mode

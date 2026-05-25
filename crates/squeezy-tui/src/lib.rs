@@ -449,13 +449,14 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     }
                     for plan_body in extracted.completed {
                         let sid = app.plan_session_id().to_string();
+                        // A non-None `current_plan_id` at the time a
+                        // fresh block lands means this body is a
+                        // refinement of the active plan, not a first-
+                        // time draft. Captured for the styled card /
+                        // diff renderer (PR-F).
+                        let parent_plan_id = app.current_plan_id.clone();
                         let meta = proposed_plan::PlanMeta {
-                            // A non-None `current_plan_id` at the time
-                            // a fresh block lands means this body is a
-                            // refinement of the active plan, not a
-                            // first-time draft. Captured for the styled
-                            // card / diff renderer (PR-F).
-                            parent_plan_id: app.current_plan_id.clone(),
+                            parent_plan_id: parent_plan_id.clone(),
                             model: Some(app.model.clone()),
                         };
                         match proposed_plan::persist_plan(
@@ -466,10 +467,11 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         ) {
                             Ok((plan_id, path)) => {
                                 app.current_plan_id = Some(plan_id.clone());
-                                app.push_log(format!(
-                                    "proposed plan {plan_id} (saved to {}):\n{plan_body}",
-                                    compact_path(&path)
-                                ));
+                                app.push_plan_card(render::plan_card::PlanCardData {
+                                    plan_id: plan_id.clone(),
+                                    path: path.clone(),
+                                    parent_plan_id,
+                                });
                                 app.pending_plan_choice = Some(PendingPlanChoice {
                                     plan_id,
                                     plan_path: path,
@@ -5045,7 +5047,21 @@ fn format_transcript_entry_with_width(
             width,
         ),
         TranscriptEntryKind::Log(message) => format_log_entry(message, entry.collapsed, selected),
+        TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, entry.collapsed),
     }
+}
+
+fn format_plan_card_entry(
+    data: &render::plan_card::PlanCardData,
+    collapsed: bool,
+) -> Vec<Line<'static>> {
+    // Collapsed cards show just the header so users can fold a long
+    // plan out of view without losing the anchor.
+    let lines = render::plan_card::render_plan_card(data);
+    if collapsed {
+        return lines.into_iter().take(1).collect();
+    }
+    lines
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7719,7 +7735,69 @@ fn status_left_text(app: &TuiApp) -> String {
 }
 
 fn mode_status_text(app: &TuiApp) -> String {
-    format!("{} mode (Shift+Tab to cycle)", title_case_mode(app.mode))
+    let base = format!("{} mode (Shift+Tab to cycle)", title_case_mode(app.mode));
+    let Some(plan_id) = app.current_plan_id.as_deref() else {
+        return base;
+    };
+    // Truncate the hex tail so the status bar stays compact on narrow
+    // windows. Step count is derived from the on-disk file body so it
+    // reflects the *current* shape of the active plan, including any
+    // in-place refinements via apply_patch (PR-C).
+    let short_id = short_plan_id(plan_id);
+    let sid = app.plan_session_id();
+    let plan_path = proposed_plan::plan_file_for(&app.workspace_root, sid, plan_id);
+    let step_count = proposed_plan::read_plan_body(&plan_path)
+        .map(|body| count_plan_steps(&body))
+        .unwrap_or(0);
+    if step_count == 0 {
+        format!("{base} · {short_id}")
+    } else {
+        format!("{base} · {short_id} ({step_count} steps)")
+    }
+}
+
+/// Render a plan id as `plan-<first-6-hex>` for the status bar. Falls
+/// back to the full id when the input does not match the expected
+/// `plan-<hex>` shape.
+fn short_plan_id(plan_id: &str) -> String {
+    let Some(hex) = plan_id.strip_prefix("plan-") else {
+        return plan_id.to_string();
+    };
+    let head: String = hex.chars().take(6).collect();
+    if head.is_empty() {
+        plan_id.to_string()
+    } else {
+        format!("plan-{head}")
+    }
+}
+
+/// Count top-level numbered list items (e.g. `1.`, `12)`) in a plan
+/// body. Heading lines (`#`, `##`) and nested indented items are
+/// ignored. Matches what the styled card renders as the step list.
+pub(crate) fn count_plan_steps(body: &str) -> usize {
+    body.lines()
+        .filter(|line| {
+            // Top-level only: no leading whitespace.
+            if line.starts_with(|c: char| c.is_whitespace()) {
+                return false;
+            }
+            let mut chars = line.chars().peekable();
+            let mut saw_digit = false;
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() {
+                    saw_digit = true;
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if !saw_digit {
+                return false;
+            }
+            matches!(chars.next(), Some('.') | Some(')'))
+                && matches!(chars.next(), Some(' ') | Some('\t'))
+        })
+        .count()
 }
 
 fn title_case_mode(mode: SessionMode) -> &'static str {
@@ -8434,6 +8512,15 @@ impl TuiApp {
         self.push_entry(TranscriptEntry::log(id, message, self.transcript_default));
     }
 
+    fn push_plan_card(&mut self, data: render::plan_card::PlanCardData) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::plan_card(
+            id,
+            data,
+            self.transcript_default,
+        ));
+    }
+
     fn push_entry(&mut self, entry: TranscriptEntry) {
         self.transcript.push(entry);
     }
@@ -8510,6 +8597,20 @@ impl TranscriptEntry {
         }
     }
 
+    fn plan_card(
+        id: u64,
+        data: render::plan_card::PlanCardData,
+        _transcript_default: TranscriptDefault,
+    ) -> Self {
+        Self {
+            id,
+            kind: TranscriptEntryKind::PlanCard(Box::new(data)),
+            // Plan cards default to fully expanded even in Compact mode
+            // — the whole point of the card is to show the plan body.
+            collapsed: false,
+        }
+    }
+
     fn matches_category(&self, category: TranscriptCategory) -> bool {
         match category {
             TranscriptCategory::All => true,
@@ -8517,6 +8618,7 @@ impl TranscriptEntry {
             TranscriptCategory::Logs => match &self.kind {
                 TranscriptEntryKind::Log(_) => true,
                 TranscriptEntryKind::Message(item) => item.role == Role::System,
+                TranscriptEntryKind::PlanCard(_) => true,
                 _ => false,
             },
             TranscriptCategory::Diffs => match &self.kind {
@@ -8545,6 +8647,10 @@ impl TranscriptEntry {
                 vec![format!("tool result: {}", tool_result_summary(tool))]
             }
             TranscriptEntryKind::Log(message) => vec![format!("log: {message}")],
+            TranscriptEntryKind::PlanCard(data) => {
+                let body = proposed_plan::read_plan_body(&data.path).unwrap_or_default();
+                vec![format!("plan {}\n{body}", data.plan_id)]
+            }
         }
     }
 
@@ -8566,6 +8672,7 @@ impl TranscriptEntry {
             }
             TranscriptEntryKind::ToolResult(_) => true,
             TranscriptEntryKind::Log(message) => text_has_collapsible_content(message),
+            TranscriptEntryKind::PlanCard(_) => true,
         }
     }
 
@@ -8586,6 +8693,11 @@ impl TranscriptEntry {
                 message.clone(),
                 format!("transcript:{}", self.id),
             ),
+            TranscriptEntryKind::PlanCard(data) => (
+                format!("plan {}", data.plan_id),
+                proposed_plan::read_plan_body(&data.path).unwrap_or_default(),
+                format!("transcript:{}", self.id),
+            ),
         }
     }
 }
@@ -8595,6 +8707,10 @@ enum TranscriptEntryKind {
     Message(TranscriptItem),
     ToolResult(Box<ToolTranscript>),
     Log(String),
+    /// Plan-mode v3 (PR-F): a styled card pointing at the persisted
+    /// plan file. The body is loaded from disk at render time so the
+    /// cell tracks in-place refinements and survives compaction.
+    PlanCard(Box<render::plan_card::PlanCardData>),
 }
 
 #[derive(Debug, Clone)]
