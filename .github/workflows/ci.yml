@@ -41,6 +41,33 @@ jobs:
           command: check
           arguments: --all-features
 
+  dead-deps:
+    name: Dead dependency scan
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.inputs.checkout_ref || github.ref }}
+
+      - name: Show Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install cargo-shear
+        uses: taiki-e/install-action@cace7d8762492808237e791b718365fe6f57c8b2 # cargo-shear
+        with:
+          tool: cargo-shear
+
+      - name: Run cargo-shear
+        run: cargo shear
+
   build-test-lint-coverage:
     name: Validate and debug artifact (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}

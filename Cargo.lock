@@ -3267,7 +3267,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml_edit",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -3394,10 +3393,6 @@ dependencies = [
 [[package]]
 name = "squeezy-rank"
 version = "0.1.0"
-dependencies = [
- "serde",
- "squeezy-core",
-]
 
 [[package]]
 name = "squeezy-skills"
@@ -3420,7 +3415,6 @@ dependencies = [
  "squeezy-core",
  "squeezy-llm",
  "squeezy-workspace",
- "thiserror",
  "tokio",
  "toml",
 ]
