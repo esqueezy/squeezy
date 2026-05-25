@@ -4040,6 +4040,22 @@ fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
+    if let Some(state) = &app.config_screen {
+        let notif_h = app.app_notifications.height();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(if notif_h > 0 {
+                vec![Constraint::Min(0), Constraint::Length(notif_h)]
+            } else {
+                vec![Constraint::Min(0)]
+            })
+            .split(area);
+        config_screen::render(frame, chunks[0], state);
+        if notif_h > 0 {
+            render_notification_pane(frame, chunks[1], app);
+        }
+        return;
+    }
     let input_height = input_panel_height(app, area.width);
     let approval_height = approval_menu_height(app);
     let task_height = should_show_task_panel(app).then_some(task_panel_height(app));
