@@ -62,12 +62,17 @@ pub enum FieldSource {
 }
 
 impl FieldSource {
+    /// User-facing badge label. The screen exposes three scopes:
+    ///   User → ~/.squeezy/settings.toml
+    ///   Repo  → ./squeezy.toml          (internal tier name: `project`)
+    ///   Local → ~/.squeezy/projects/<hash>/settings.toml
+    ///                                   (internal tier name: `repo`)
     pub const fn badge(self) -> &'static str {
         match self {
             Self::Default => "default",
             Self::User => "user",
-            Self::Project => "project",
-            Self::Repo => "repo",
+            Self::Project => "repo",
+            Self::Repo => "local",
             Self::Env => "env",
         }
     }

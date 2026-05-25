@@ -35,25 +35,28 @@ fn opens_at_models_when_no_focus() {
 }
 
 #[test]
-fn tab_cycles_scope() {
+fn tab_cycles_through_three_scopes() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     assert_eq!(state.scope, ConfigScope::User);
+    for expected in [ConfigScope::Repo, ConfigScope::Local, ConfigScope::User] {
+        handle_key(
+            &mut state,
+            &mut agent,
+            &mut q,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+        );
+        assert_eq!(state.scope, expected);
+    }
+    // BackTab reverses.
     handle_key(
         &mut state,
         &mut agent,
         &mut q,
-        KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
     );
-    assert_eq!(state.scope, ConfigScope::Project);
-    handle_key(
-        &mut state,
-        &mut agent,
-        &mut q,
-        KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
-    );
-    assert_eq!(state.scope, ConfigScope::User);
+    assert_eq!(state.scope, ConfigScope::Local);
 }
 
 #[test]
@@ -240,7 +243,10 @@ async fn space_cycles_model_field_to_next_registry_entry() {
         FieldValue::String(s) => s,
         other => panic!("expected String, got {other:?}"),
     };
-    assert_ne!(before, after, "Space on model should advance to a different registry entry");
+    assert_ne!(
+        before, after,
+        "Space on model should advance to a different registry entry"
+    );
 }
 
 #[tokio::test]
@@ -290,7 +296,10 @@ async fn space_cycles_enum_field_to_next_option() {
         FieldValue::Enum(v) => v,
         other => panic!("expected enum, got {other:?}"),
     };
-    assert_ne!(before, after, "Space should advance enum to a different value");
+    assert_ne!(
+        before, after,
+        "Space should advance enum to a different value"
+    );
 }
 
 #[tokio::test]

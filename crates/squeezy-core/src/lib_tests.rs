@@ -2127,6 +2127,7 @@ fn resolve_field_source_uses_repo_then_project_then_user() {
         }),
         user_path_default: PathBuf::from("/u.toml"),
         project_path_default: PathBuf::from("/p.toml"),
+        repo_path_default: PathBuf::from("/r.toml"),
     };
     let models = &config_schema::CONFIG_SECTIONS[0];
     let provider_field = &models.fields[0]; // provider
@@ -2164,6 +2165,7 @@ fn resolve_field_source_returns_env_when_env_var_set() {
         repo: None,
         user_path_default: PathBuf::from("/u.toml"),
         project_path_default: PathBuf::from("/p.toml"),
+        repo_path_default: PathBuf::from("/r.toml"),
     };
     let provider_field = &config_schema::CONFIG_SECTIONS[0].fields[0];
     assert_eq!(

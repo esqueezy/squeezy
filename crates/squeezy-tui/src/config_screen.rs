@@ -32,18 +32,43 @@ use crate::{
     render::palette::{AMBER, ERROR_RED, GOLD, QUIET, SUCCESS_GREEN},
 };
 
+/// Three scope tabs surfaced in the screen, ordered low → high precedence.
+///
+/// Reminder of the internal-to-UI mapping (the names diverge for historical
+/// reasons — `squeezy-core`'s tiers are user / project / repo):
+///
+///   User  → `~/.squeezy/settings.toml`                            (user)
+///   Repo  → `./squeezy.toml`, committed to the repo               (project)
+///   Local → `~/.squeezy/projects/<hash>/settings.toml`, per-machine (repo)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigScope {
     User,
-    Project,
+    Repo,
+    Local,
 }
 
 impl ConfigScope {
-    #[allow(dead_code)] // used by header rendering once the layout adds inline scope chips
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::User => "User",
-            Self::Project => "Project",
+            Self::Repo => "Repo",
+            Self::Local => "Local",
+        }
+    }
+
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::User => Self::Repo,
+            Self::Repo => Self::Local,
+            Self::Local => Self::User,
+        }
+    }
+
+    pub(crate) fn prev(self) -> Self {
+        match self {
+            Self::User => Self::Local,
+            Self::Repo => Self::User,
+            Self::Local => Self::Repo,
         }
     }
 }
@@ -236,17 +261,11 @@ pub(crate) fn handle_key(
             KeyOutcome::Close
         }
         (KeyCode::Tab, _) => {
-            state.scope = match state.scope {
-                ConfigScope::User => ConfigScope::Project,
-                ConfigScope::Project => ConfigScope::User,
-            };
+            state.scope = state.scope.next();
             KeyOutcome::KeepOpen
         }
         (KeyCode::BackTab, _) => {
-            state.scope = match state.scope {
-                ConfigScope::User => ConfigScope::Project,
-                ConfigScope::Project => ConfigScope::User,
-            };
+            state.scope = state.scope.prev();
             KeyOutcome::KeepOpen
         }
         (KeyCode::Left, _) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
@@ -332,10 +351,7 @@ pub(crate) fn handle_key(
                 }
             } else {
                 notifications.push(
-                    format!(
-                        "Space doesn't cycle {} — press Enter to edit.",
-                        field.label
-                    ),
+                    format!("Space doesn't cycle {} — press Enter to edit.", field.label),
                     NotifySeverity::Info,
                 );
             }
@@ -433,13 +449,16 @@ pub(crate) fn handle_key(
             KeyOutcome::KeepOpen
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-            if matches!(state.scope, ConfigScope::Project) {
-                clear_project_override(state, notifications);
-            } else {
-                notifications.push(
-                    "Ctrl+D clears overrides — switch to Project (Tab) first.",
-                    NotifySeverity::Info,
-                );
+            match state.scope {
+                ConfigScope::User => {
+                    notifications.push(
+                        "Ctrl+D clears Repo/Local overrides — switch to Repo or Local (Tab) first.",
+                        NotifySeverity::Info,
+                    );
+                }
+                ConfigScope::Repo | ConfigScope::Local => {
+                    clear_scope_override(state, notifications);
+                }
             }
             KeyOutcome::KeepOpen
         }
@@ -958,13 +977,11 @@ fn handle_secret_entry_key(
         (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
             entry.reveal_tail = !entry.reveal_tail;
         }
-        (KeyCode::Backspace, _) => {
-            if entry.cursor > 0 {
-                let mut chars: Vec<char> = entry.draft.chars().collect();
-                chars.remove(entry.cursor - 1);
-                entry.draft = chars.into_iter().collect();
-                entry.cursor -= 1;
-            }
+        (KeyCode::Backspace, _) if entry.cursor > 0 => {
+            let mut chars: Vec<char> = entry.draft.chars().collect();
+            chars.remove(entry.cursor - 1);
+            entry.draft = chars.into_iter().collect();
+            entry.cursor -= 1;
         }
         (KeyCode::Left, _) => {
             entry.cursor = entry.cursor.saturating_sub(1);
@@ -1091,11 +1108,13 @@ fn save_field(
     let scope = state.scope;
     let target_path = match scope {
         ConfigScope::User => state.sources.user_path_default.clone(),
-        ConfigScope::Project => state.sources.project_path_default.clone(),
+        ConfigScope::Repo => state.sources.project_path_default.clone(),
+        ConfigScope::Local => state.sources.repo_path_default.clone(),
     };
     let scope_target = match scope {
         ConfigScope::User => SettingsScope::user(&target_path),
-        ConfigScope::Project => SettingsScope::project(&target_path),
+        ConfigScope::Repo => SettingsScope::project(&target_path),
+        ConfigScope::Local => SettingsScope::repo(&target_path),
     };
 
     let edit = field_edit(field, &value);
@@ -1226,14 +1245,27 @@ fn field_edit(field: &'static FieldMeta, value: &FieldValue) -> SettingsEdit {
     }
 }
 
-fn clear_project_override(state: &mut ConfigScreenState, notifications: &mut NotificationQueue) {
+/// Clear the focused field's value in whichever tier the active scope tab
+/// points at. The User scope returns early in the caller, so this only runs
+/// for Repo (committed `./squeezy.toml`) or Local (per-machine).
+fn clear_scope_override(state: &mut ConfigScreenState, notifications: &mut NotificationQueue) {
     let field = state.current_field();
-    let path = state.sources.project_path_default.clone();
-    let scope_target = SettingsScope::project(&path);
+    let (path, scope_target) = match state.scope {
+        ConfigScope::Repo => {
+            let p = state.sources.project_path_default.clone();
+            (p.clone(), SettingsScope::project(&p))
+        }
+        ConfigScope::Local => {
+            let p = state.sources.repo_path_default.clone();
+            (p.clone(), SettingsScope::repo(&p))
+        }
+        ConfigScope::User => return, // caller filters this out
+    };
     let edit = SettingsEdit {
         path: field.toml_path,
         op: EditOp::Unset,
     };
+    let scope_label = state.scope.label();
     match apply_edits(&scope_target, &[edit]) {
         Ok(outcome) if outcome.edits_applied > 0 => {
             if let Ok(reloaded) = load_separated_settings_sources() {
@@ -1250,7 +1282,7 @@ fn clear_project_override(state: &mut ConfigScreenState, notifications: &mut Not
         }
         Ok(_) => {
             notifications.push(
-                format!("{} had no project override to clear", field.label),
+                format!("{} had no {} override to clear", field.label, scope_label),
                 NotifySeverity::Info,
             );
         }
@@ -1281,54 +1313,55 @@ pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
 }
 
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
-    let user_active = state.scope == ConfigScope::User;
-    let project_active = state.scope == ConfigScope::Project;
-    let title = Span::styled(
+    fn tab(label: &'static str, subtitle: &'static str, active: bool) -> Vec<Span<'static>> {
+        let marker = if active { "▸ " } else { "  " };
+        let label_style = if active {
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if active { GOLD } else { QUIET }),
+            ),
+            Span::styled(label, label_style),
+            Span::styled(format!(" {subtitle}"), Style::default().fg(QUIET)),
+        ]
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
         "  Config  ",
         Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-    );
-    let sep1 = Span::styled(" │ ", Style::default().fg(QUIET));
-    let sep2 = Span::styled(" │ ", Style::default().fg(QUIET));
-    let sep3 = Span::styled(" │ ", Style::default().fg(QUIET));
-    let user = Span::styled(
-        if user_active {
-            "▸ User (~/.squeezy/settings.toml)"
-        } else {
-            "  User (~/.squeezy/settings.toml)"
-        },
-        Style::default()
-            .fg(if user_active { GOLD } else { Color::White })
-            .add_modifier(if user_active {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            }),
-    );
-    let project = Span::styled(
-        if project_active {
-            "▸ Project (./squeezy.toml, committed to repo)"
-        } else {
-            "  Project (./squeezy.toml, committed to repo)"
-        },
-        Style::default()
-            .fg(if project_active { GOLD } else { Color::White })
-            .add_modifier(if project_active {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            }),
-    );
-    let dirty_str = if state.dirty {
-        Span::styled("  (changes applied)", Style::default().fg(QUIET))
-    } else {
-        Span::raw("")
-    };
-    let _ = sep3;
-    let line = Line::from(vec![title, sep1, user, sep2, project, dirty_str]);
+    ));
+    spans.push(Span::styled(" │ ", Style::default().fg(QUIET)));
+    spans.extend(tab(
+        "User",
+        "~/.squeezy/settings.toml",
+        state.scope == ConfigScope::User,
+    ));
+    spans.push(Span::styled(" │ ", Style::default().fg(QUIET)));
+    spans.extend(tab(
+        "Repo",
+        "./squeezy.toml (committed)",
+        state.scope == ConfigScope::Repo,
+    ));
+    spans.push(Span::styled(" │ ", Style::default().fg(QUIET)));
+    spans.extend(tab(
+        "Local",
+        "~/.squeezy/projects/<this>/settings.toml",
+        state.scope == ConfigScope::Local,
+    ));
+    if state.dirty {
+        spans.push(Span::styled(
+            "  (changes applied)",
+            Style::default().fg(QUIET),
+        ));
+    }
     let block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(QUIET));
-    frame.render_widget(Paragraph::new(line).block(block), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 }
 
 fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
@@ -1864,6 +1897,7 @@ fn empty_sources_for(_cfg: &AppConfig) -> SeparatedSources {
         repo: None,
         user_path_default: PathBuf::from(""),
         project_path_default: PathBuf::from(""),
+        repo_path_default: PathBuf::from(""),
     }
 }
 

@@ -5633,6 +5633,12 @@ impl TierSource {
 
 /// The three tier files plus the effective merged config. Used by the config
 /// screen to compute per-leaf inheritance badges.
+///
+/// Field naming intentionally mirrors the internal load order
+/// (`user → project → repo`). User-facing labels in the TUI map differently:
+/// `project` = the committed `./squeezy.toml` ("Repo" in the screen) and
+/// `repo` = the per-machine `~/.squeezy/projects/<hash>/settings.toml`
+/// ("Local" in the screen).
 #[derive(Debug, Clone)]
 pub struct SeparatedSources {
     pub user: Option<TierSource>,
@@ -5640,6 +5646,7 @@ pub struct SeparatedSources {
     pub repo: Option<TierSource>,
     pub user_path_default: PathBuf,
     pub project_path_default: PathBuf,
+    pub repo_path_default: PathBuf,
 }
 
 /// Loads each tier separately so the UI can compute inheritance per leaf.
@@ -5669,6 +5676,7 @@ pub fn load_separated_settings_sources() -> Result<SeparatedSources> {
         repo,
         user_path_default: user_path,
         project_path_default,
+        repo_path_default: repo_path,
     })
 }
 
