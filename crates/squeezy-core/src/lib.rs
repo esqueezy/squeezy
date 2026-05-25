@@ -818,9 +818,43 @@ impl AppConfig {
             toml_string(&self.skills.user_dir.display().to_string())
         ));
         output.push_str(&format!(
-            "compat_user_dir = {}\n\n",
+            "compat_user_dir = {}\n",
             toml_string(&self.skills.compat_user_dir.display().to_string())
         ));
+        output.push_str(&format!(
+            "active_budget_chars = {}\n",
+            self.skills.active_budget_chars
+        ));
+        output.push_str(&format!(
+            "active_body_cap_chars = {}\n",
+            self.skills.active_body_cap_chars
+        ));
+        output.push_str(&format!(
+            "preamble_enabled = {}\n",
+            self.skills.preamble_enabled
+        ));
+        output.push_str(&format!(
+            "preamble_budget_chars = {}\n",
+            self.skills.preamble_budget_chars
+        ));
+        if self.skills.config.is_empty() {
+            output.push('\n');
+        } else {
+            output.push('\n');
+            for entry in &self.skills.config {
+                output.push_str("[[skills.config]]\n");
+                if let Some(name) = &entry.name {
+                    output.push_str(&format!("name = {}\n", toml_string(name)));
+                }
+                if let Some(path) = &entry.path {
+                    output.push_str(&format!(
+                        "path = {}\n",
+                        toml_string(&path.display().to_string())
+                    ));
+                }
+                output.push_str(&format!("enabled = {}\n\n", entry.enabled));
+            }
+        }
 
         output.push_str("[graph]\n");
         output.push_str(&format!(
@@ -3781,11 +3815,29 @@ impl WebSettings {
 pub struct SkillsSettings {
     pub user_dir: Option<PathBuf>,
     pub compat_user_dir: Option<PathBuf>,
+    pub active_budget_chars: Option<usize>,
+    pub active_body_cap_chars: Option<usize>,
+    pub preamble_enabled: Option<bool>,
+    pub preamble_budget_chars: Option<usize>,
+    pub config: Vec<SkillConfigEntry>,
 }
 
 impl SkillsSettings {
     fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
-        reject_unknown_keys(table, &["user_dir", "compat_user_dir"], source, path)?;
+        reject_unknown_keys(
+            table,
+            &[
+                "user_dir",
+                "compat_user_dir",
+                "active_budget_chars",
+                "active_body_cap_chars",
+                "preamble_enabled",
+                "preamble_budget_chars",
+                "config",
+            ],
+            source,
+            path,
+        )?;
         Ok(Self {
             user_dir: path_value(table, "user_dir", source, &field(path, "user_dir"))?,
             compat_user_dir: path_value(
@@ -3794,19 +3846,66 @@ impl SkillsSettings {
                 source,
                 &field(path, "compat_user_dir"),
             )?,
+            active_budget_chars: usize_value(
+                table,
+                "active_budget_chars",
+                source,
+                &field(path, "active_budget_chars"),
+            )?,
+            active_body_cap_chars: usize_value(
+                table,
+                "active_body_cap_chars",
+                source,
+                &field(path, "active_body_cap_chars"),
+            )?,
+            preamble_enabled: bool_value(
+                table,
+                "preamble_enabled",
+                source,
+                &field(path, "preamble_enabled"),
+            )?,
+            preamble_budget_chars: usize_value(
+                table,
+                "preamble_budget_chars",
+                source,
+                &field(path, "preamble_budget_chars"),
+            )?,
+            config: skill_config_entries_value(table, source, &field(path, "config"))?,
         })
     }
 
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.user_dir, next.user_dir);
         replace_if_some(&mut self.compat_user_dir, next.compat_user_dir);
+        replace_if_some(&mut self.active_budget_chars, next.active_budget_chars);
+        replace_if_some(&mut self.active_body_cap_chars, next.active_body_cap_chars);
+        replace_if_some(&mut self.preamble_enabled, next.preamble_enabled);
+        replace_if_some(&mut self.preamble_budget_chars, next.preamble_budget_chars);
+        self.config.extend(next.config);
     }
+}
+
+pub const DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS: usize = 4_000;
+pub const DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS: usize = 16_000;
+pub const DEFAULT_SKILLS_PREAMBLE_ENABLED: bool = true;
+pub const DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS: usize = 800;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillConfigEntry {
+    pub name: Option<String>,
+    pub path: Option<PathBuf>,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillsConfig {
     pub user_dir: PathBuf,
     pub compat_user_dir: PathBuf,
+    pub active_budget_chars: usize,
+    pub active_body_cap_chars: usize,
+    pub preamble_enabled: bool,
+    pub preamble_budget_chars: usize,
+    pub config: Vec<SkillConfigEntry>,
 }
 
 impl SkillsConfig {
@@ -3831,6 +3930,27 @@ impl SkillsConfig {
                     .or(settings.compat_user_dir)
                     .unwrap_or_else(default_agent_compat_skills_dir),
             ),
+            active_budget_chars: settings
+                .active_budget_chars
+                .unwrap_or(DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS),
+            active_body_cap_chars: settings
+                .active_body_cap_chars
+                .unwrap_or(DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS),
+            preamble_enabled: settings
+                .preamble_enabled
+                .unwrap_or(DEFAULT_SKILLS_PREAMBLE_ENABLED),
+            preamble_budget_chars: settings
+                .preamble_budget_chars
+                .unwrap_or(DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS),
+            config: settings
+                .config
+                .into_iter()
+                .map(|entry| SkillConfigEntry {
+                    name: entry.name,
+                    path: entry.path.map(expand_home_path),
+                    enabled: entry.enabled,
+                })
+                .collect(),
         }
     }
 }
@@ -3840,6 +3960,11 @@ impl Default for SkillsConfig {
         Self {
             user_dir: default_squeezy_skills_dir(),
             compat_user_dir: default_agent_compat_skills_dir(),
+            active_budget_chars: DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS,
+            active_body_cap_chars: DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS,
+            preamble_enabled: DEFAULT_SKILLS_PREAMBLE_ENABLED,
+            preamble_budget_chars: DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS,
+            config: Vec::new(),
         }
     }
 }
@@ -4442,6 +4567,14 @@ pub fn user_settings_template() -> &'static str {
 # [skills]
 # user_dir = "~/.squeezy/skills"
 # compat_user_dir = "~/.agents/skills"
+# active_budget_chars = 4000
+# active_body_cap_chars = 16000
+# preamble_enabled = true
+# preamble_budget_chars = 800
+#
+# [[skills.config]]
+# name = "example-skill"
+# enabled = false
 
 # [tools]
 # checkpoints_enabled = false
@@ -4985,6 +5118,42 @@ fn path_value(
     path: &str,
 ) -> Result<Option<PathBuf>> {
     Ok(string_value(table, key, source, path)?.map(PathBuf::from))
+}
+
+fn skill_config_entries_value(
+    table: &toml::value::Table,
+    source: &str,
+    path: &str,
+) -> Result<Vec<SkillConfigEntry>> {
+    let Some(value) = table.get("config") else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        return Err(type_error(source, path, "array of tables"));
+    };
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let entry_path = format!("{path}.{index}");
+            let entry = value
+                .as_table()
+                .ok_or_else(|| type_error(source, &entry_path, "table"))?;
+            reject_unknown_keys(entry, &["name", "path", "enabled"], source, &entry_path)?;
+            let enabled = bool_value(entry, "enabled", source, &field(&entry_path, "enabled"))?
+                .ok_or_else(|| {
+                    SqueezyError::Config(format!(
+                        "{source}: {}: missing field",
+                        field(&entry_path, "enabled")
+                    ))
+                })?;
+            Ok(SkillConfigEntry {
+                name: string_value(entry, "name", source, &field(&entry_path, "name"))?,
+                path: path_value(entry, "path", source, &field(&entry_path, "path"))?,
+                enabled,
+            })
+        })
+        .collect()
 }
 
 fn string_array_value(

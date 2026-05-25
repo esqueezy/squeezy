@@ -38,7 +38,7 @@ use squeezy_graph::{
     SignatureQuery,
 };
 use squeezy_mcp::{ExternalMcpTool, McpClientRegistry};
-use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog};
+use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog, SkillPreambleRender};
 use squeezy_store::SqueezyStore;
 use squeezy_vcs::{
     CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffHunk, DiffMode, DiffOptions,
@@ -1688,17 +1688,19 @@ impl ToolRegistry {
     }
 
     pub fn format_active_skills(&self, skills: &[LoadedSkill]) -> Option<String> {
-        if skills.is_empty() {
-            return None;
-        }
-        Some(format!(
-            "<active_skills>\n{}\n</active_skills>",
-            skills
-                .iter()
-                .map(LoadedSkill::prompt_block)
-                .collect::<Vec<_>>()
-                .join("\n")
-        ))
+        self.skills.render_active_skills(skills)
+    }
+
+    pub fn skills_preamble(&self) -> Option<SkillPreambleRender> {
+        self.skills.render_preamble()
+    }
+
+    pub fn load_skill_for_instructions(&self, name: &str) -> Result<LoadedSkill> {
+        self.skills.load(name)
+    }
+
+    pub fn ambiguous_skill_names(&self) -> Vec<String> {
+        self.skills.ambiguous_names().iter().cloned().collect()
     }
 
     pub async fn execute(&self, call: ToolCall, cancel: CancellationToken) -> ToolResult {
@@ -4724,6 +4726,7 @@ impl ToolRegistry {
                 );
             }
         };
+        let implicit_skill = self.skills.detect_for_command(&args.command, &workdir);
         let timeout_ms = args
             .timeout_ms
             .unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)
@@ -5007,6 +5010,18 @@ impl ToolRegistry {
                 "preserved": preserved_env,
             },
         });
+        if let Some(summary) = implicit_skill {
+            insert_content_field(
+                &mut raw_content,
+                "implicit_skill_activation",
+                json!({
+                    "name": summary.name,
+                    "source": "implicit",
+                    "skill_source": summary.source,
+                    "location": summary.location,
+                }),
+            );
+        }
         if let Some(checkpoint_before) = checkpoint_before.as_ref() {
             self.append_checkpoint_to_content(
                 &mut raw_content,
