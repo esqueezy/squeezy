@@ -73,6 +73,7 @@ mod shell_program;
 mod truncate;
 #[cfg(windows)]
 mod win_job;
+mod windows_cmd;
 
 use ipc::IpcListener;
 pub use ipc::{IpcEndpoint, IpcStream};
@@ -81,6 +82,7 @@ use shell_program::ShellProgram;
 use truncate::truncate_middle_bytes;
 #[cfg(windows)]
 use win_job::ShellJob;
+use windows_cmd::is_destructive_windows_segment;
 
 const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_BYTES_PER_FILE: usize = 1_000_000;
@@ -8866,6 +8868,9 @@ fn is_destructive_shell_segment(segment: &str) -> bool {
         return true;
     }
     if shell_segment_has_destructive_redirect(segment) {
+        return true;
+    }
+    if is_destructive_windows_segment(segment) {
         return true;
     }
     false
