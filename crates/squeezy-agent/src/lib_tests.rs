@@ -3506,7 +3506,8 @@ async fn drained_swap_makes_next_request_carry_new_model_id() {
     let requests = provider.requests();
     assert_eq!(requests.len(), 1, "expected one provider request");
     assert_eq!(
-        requests[0].model, "claude-haiku-4-5-20251001",
+        requests[0].model.as_ref(),
+        "claude-haiku-4-5-20251001",
         "swapped model id should reach the wire (was {})",
         original_model
     );
