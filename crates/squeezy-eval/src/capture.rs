@@ -88,6 +88,12 @@ pub enum EvalEventKind {
         severity: String,
         summary: String,
     },
+    /// Per-turn cost progress emitted by squeezy every few tool calls.
+    CostUpdate {
+        tool_count: u64,
+        input_tokens: u64,
+        micro_usd: u64,
+    },
 }
 
 pub const EVAL_TRACE_SCHEMA_VERSION: u32 = 2;

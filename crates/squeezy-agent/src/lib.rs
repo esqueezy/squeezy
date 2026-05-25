@@ -5737,7 +5737,7 @@ async fn execute_tool_calls(
     for (index, call) in calls.iter().enumerate() {
         if context.cancel.is_cancelled() {
             let result = ToolResult::cancelled(call);
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             let _ = context
                 .tx
                 .send(AgentEvent::ToolCallCompleted {
@@ -5767,7 +5767,7 @@ async fn execute_tool_calls(
         }
         if call.name == REQUEST_USER_INPUT_TOOL_NAME {
             let result = handle_request_user_input_call(&context, call).await;
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             let _ = context
                 .tx
                 .send(AgentEvent::ToolCallCompleted {
@@ -5781,7 +5781,7 @@ async fn execute_tool_calls(
         }
         if has_invalid_tool_arguments(call) {
             let result = invalid_tool_arguments_result(call);
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             let _ = context
                 .tx
                 .send(AgentEvent::ToolCallCompleted {
@@ -5859,7 +5859,7 @@ async fn execute_tool_calls(
                     &result,
                     Duration::ZERO,
                 );
-                broker.record_executed_result(&result);
+                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
                 let _ = context
                     .tx
                     .send(AgentEvent::ToolCallCompleted {
@@ -5885,7 +5885,7 @@ async fn execute_tool_calls(
                 &result,
                 Duration::ZERO,
             );
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             let _ = context
                 .tx
                 .send(AgentEvent::ToolCallCompleted {
@@ -5911,7 +5911,7 @@ async fn execute_tool_calls(
                     &result,
                     Duration::ZERO,
                 );
-                broker.record_executed_result(&result);
+                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
                 let _ = context
                     .tx
                     .send(AgentEvent::ToolCallCompleted {
@@ -5933,7 +5933,7 @@ async fn execute_tool_calls(
                     &result,
                     Duration::ZERO,
                 );
-                broker.record_executed_result(&result);
+                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
                 let _ = context
                     .tx
                     .send(AgentEvent::ToolCallCompleted {
@@ -5967,7 +5967,7 @@ async fn execute_tool_calls(
                 &result,
                 Duration::ZERO,
             );
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             let _ = context
                 .tx
                 .send(AgentEvent::ToolCallCompleted {
@@ -5991,7 +5991,7 @@ async fn execute_tool_calls(
                     &result,
                     Duration::ZERO,
                 );
-                broker.record_executed_result(&result);
+                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
                 results[index] = Some(result);
                 recorded[index] = true;
                 continue;
@@ -6010,13 +6010,13 @@ async fn execute_tool_calls(
                     &result,
                     Duration::ZERO,
                 );
-                broker.record_executed_result(&result);
+                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
                 results[index] = Some(result);
                 recorded[index] = true;
                 continue;
             }
             let result = run_one_tool(context.clone(), tool_sequence, call).await;
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             results[index] = Some(result);
             recorded[index] = true;
         }
@@ -6089,7 +6089,7 @@ async fn replay_tool_calls(
                 call: call.clone(),
             })
             .await;
-        broker.record_executed_result(result);
+        record_and_emit_progress(broker, result, &tx, turn_id).await;
         let _ = tx
             .send(AgentEvent::ToolCallCompleted {
                 turn_id,
@@ -6137,7 +6137,7 @@ async fn flush_parallel_batch(
                 &result,
                 Duration::ZERO,
             );
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             let _ = context
                 .tx
                 .send(AgentEvent::ToolCallCompleted {
@@ -6162,7 +6162,7 @@ async fn flush_parallel_batch(
                     &result,
                     Duration::ZERO,
                 );
-                broker.record_executed_result(&result);
+                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
                 let _ = context
                     .tx
                     .send(AgentEvent::ToolCallCompleted {
@@ -6174,7 +6174,7 @@ async fn flush_parallel_batch(
                 continue;
             }
             let result = run_one_tool(context.clone(), tool_sequence, call).await;
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             results[index] = Some(result);
         }
         return;
@@ -6193,7 +6193,7 @@ async fn flush_parallel_batch(
         .await;
 
     for (index, result) in completions {
-        broker.record_executed_result(&result);
+        record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
         results[index] = Some(result);
     }
 }
@@ -6344,6 +6344,55 @@ pub struct CostCapStatus {
     pub spent_usd_micros: u64,
     pub cap_usd_micros: u64,
     pub percent: u8,
+}
+
+/// Per-turn running cost+tool-count snapshot emitted via
+/// `AgentEvent::CostUpdate` so a user watching a live transcript can see
+/// expense accumulating before the turn footer arrives.
+#[derive(Debug, Clone, Copy)]
+struct CostProgressSnapshot {
+    tool_count: u64,
+    input_tokens: u64,
+    micro_usd: u64,
+}
+
+/// Number of *completed* tool calls between successive
+/// `AgentEvent::CostUpdate` emissions within a single turn.
+const COST_UPDATE_STRIDE: u64 = 3;
+
+/// Emit an `AgentEvent::CostUpdate` if the broker has just crossed a
+/// `COST_UPDATE_STRIDE`-sized boundary. Call this immediately after
+/// `broker.record_executed_result(...)` at every tool-completion site.
+async fn maybe_emit_cost_update(
+    broker: &CostBroker,
+    tx: &mpsc::Sender<AgentEvent>,
+    turn_id: TurnId,
+) {
+    if let Some(snap) = broker.progress_snapshot_if_due(COST_UPDATE_STRIDE) {
+        let _ = tx
+            .send(AgentEvent::CostUpdate {
+                turn_id,
+                tool_count: snap.tool_count,
+                input_tokens: snap.input_tokens,
+                micro_usd: snap.micro_usd,
+            })
+            .await;
+    }
+}
+
+/// Record an executed tool result and emit a progress callout if the
+/// stride boundary was crossed. Replaces direct calls to
+/// `broker.record_executed_result` at tool-completion sites so the
+/// progress event fires for every completion path (success, denial,
+/// budget refusal, cancellation).
+async fn record_and_emit_progress(
+    broker: &mut CostBroker,
+    result: &ToolResult,
+    tx: &mpsc::Sender<AgentEvent>,
+    turn_id: TurnId,
+) {
+    broker.record_executed_result(result);
+    maybe_emit_cost_update(broker, tx, turn_id).await;
 }
 
 #[derive(Debug)]
@@ -6503,6 +6552,27 @@ impl CostBroker {
         if is_budget_denied(result) {
             self.metrics.budget_denials += 1;
         }
+    }
+
+    /// Snapshot the running per-turn progress when the executed-tool count
+    /// is at a stride multiple, so callers can emit a single
+    /// `AgentEvent::CostUpdate`. Returning `None` keeps the per-tool
+    /// hot-path cheap and prevents firing on every call.
+    fn progress_snapshot_if_due(&self, stride: u64) -> Option<CostProgressSnapshot> {
+        let total = self
+            .metrics
+            .tool_successes
+            .saturating_add(self.metrics.tool_errors)
+            .saturating_add(self.metrics.tool_denials)
+            .saturating_add(self.metrics.tool_cancellations);
+        if stride == 0 || total == 0 || !total.is_multiple_of(stride) {
+            return None;
+        }
+        Some(CostProgressSnapshot {
+            tool_count: total,
+            input_tokens: self.metrics.provider.input_tokens.unwrap_or(0),
+            micro_usd: self.metrics.provider.estimated_usd_micros.unwrap_or(0),
+        })
     }
 
     fn record_model_result(&mut self, result: &ToolResult) {
@@ -9580,6 +9650,17 @@ pub enum AgentEvent {
     CostWarning {
         turn_id: TurnId,
         status: CostCapStatus,
+    },
+    /// Per-turn progress callout emitted every few tool calls so a user
+    /// watching a live transcript can see cost accumulating before the
+    /// turn finishes. Carries the turn's running input-token count and
+    /// estimated USD-micro cost so far; consumers (eval, TUI) render
+    /// it inline.
+    CostUpdate {
+        turn_id: TurnId,
+        tool_count: u64,
+        input_tokens: u64,
+        micro_usd: u64,
     },
     Cancelled {
         turn_id: TurnId,

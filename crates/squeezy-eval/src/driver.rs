@@ -968,6 +968,22 @@ impl Driver {
                         },
                     )?;
                 }
+                AgentEvent::CostUpdate {
+                    turn_id,
+                    tool_count,
+                    input_tokens,
+                    micro_usd,
+                } => {
+                    let turn_str = format!("{turn_id:?}");
+                    self.capture.record(
+                        Some(turn_str),
+                        EvalEventKind::CostUpdate {
+                            tool_count,
+                            input_tokens,
+                            micro_usd,
+                        },
+                    )?;
+                }
                 AgentEvent::Completed {
                     turn_id,
                     cost,

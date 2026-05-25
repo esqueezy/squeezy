@@ -195,6 +195,21 @@ impl LivePrinter {
                 );
                 let _ = g.writer.flush();
             }
+            EvalEventKind::CostUpdate {
+                tool_count,
+                input_tokens,
+                micro_usd,
+            } => {
+                g.finish_assistant_chunk_inplace();
+                let _ = writeln!(
+                    g.writer,
+                    "  💰 running this turn: {} in · {} (after {} tools)",
+                    format_token_count(*input_tokens),
+                    format_micro_usd(*micro_usd),
+                    tool_count
+                );
+                let _ = g.writer.flush();
+            }
             _ => {}
         }
     }
@@ -246,6 +261,25 @@ fn describe_action(action: &Action) -> String {
         Action::InjectUserText { text, .. } => {
             format!("inject_user_text: {}", trim_oneline(text, 80))
         }
+    }
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.0}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn format_micro_usd(micro: u64) -> String {
+    let dollars = micro as f64 / 1_000_000.0;
+    if dollars < 0.01 {
+        format!("${dollars:.4}")
+    } else {
+        format!("${dollars:.3}")
     }
 }
 

@@ -260,6 +260,20 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
                 let _ = writeln!(out, "➤ **{kind}:** {}", trim_oneline(status, 200));
                 let _ = writeln!(out);
             }
+            EvalEventKind::CostUpdate {
+                tool_count,
+                input_tokens,
+                micro_usd,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "💰 _running this turn:_ {} in · {} (after {} tool(s))",
+                    format_token_count(*input_tokens),
+                    format_micro_usd(*micro_usd),
+                    tool_count
+                );
+                let _ = writeln!(out);
+            }
             EvalEventKind::TaskStateUpdated { .. }
             | EvalEventKind::SubagentEvent { .. }
             | EvalEventKind::Snapshot { .. }
@@ -358,6 +372,25 @@ fn short_turn(t: &str) -> String {
         return rest.to_string();
     }
     t.to_string()
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.0}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn format_micro_usd(micro: u64) -> String {
+    let dollars = micro as f64 / 1_000_000.0;
+    if dollars < 0.01 {
+        format!("${dollars:.4}")
+    } else {
+        format!("${dollars:.3}")
+    }
 }
 
 fn trim_oneline(s: &str, max: usize) -> String {
