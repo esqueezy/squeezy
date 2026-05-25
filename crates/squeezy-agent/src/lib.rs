@@ -2311,57 +2311,7 @@ fn local_shell_command(input: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed.lines().count() > 1 {
         return None;
     }
-    if let Some(command) = trimmed.strip_prefix('!') {
-        return nonempty_shell_command(command);
-    }
-    for prefix in ["run ", "execute "] {
-        if let Some(command) = trimmed.strip_prefix(prefix) {
-            let command = nonempty_shell_command(strip_current_dir_suffix(command))?;
-            return looks_like_direct_shell_command(&command).then_some(command);
-        }
-    }
-    let direct = strip_current_dir_suffix(trimmed);
-    if looks_like_direct_shell_command(direct) {
-        return Some(direct.to_string());
-    }
-    None
-}
-
-fn strip_current_dir_suffix(command: &str) -> &str {
-    let command = command.trim();
-    for suffix in [
-        " in current dir",
-        " in current directory",
-        " in this dir",
-        " in this directory",
-        " in the current dir",
-        " in the current directory",
-    ] {
-        if let Some(stripped) = command.strip_suffix(suffix) {
-            return stripped.trim();
-        }
-    }
-    command
-}
-
-fn looks_like_direct_shell_command(input: &str) -> bool {
-    let Some(first) = input.split_whitespace().next() else {
-        return false;
-    };
-    matches!(
-        first,
-        "ls" | "pwd"
-            | "rg"
-            | "grep"
-            | "git"
-            | "cargo"
-            | "make"
-            | "just"
-            | "npm"
-            | "pnpm"
-            | "yarn"
-            | "bun"
-    )
+    trimmed.strip_prefix('!').and_then(nonempty_shell_command)
 }
 
 fn nonempty_shell_command(command: &str) -> Option<String> {

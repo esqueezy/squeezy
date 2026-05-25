@@ -5232,10 +5232,10 @@ fn format_status_hints(app: &TuiApp) -> String {
             .to_string();
     }
     if app.alternate_scroll_enabled {
-        "Enter send · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
+        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
             .to_string()
     } else {
-        "Enter send · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
+        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
             .to_string()
     }
 }

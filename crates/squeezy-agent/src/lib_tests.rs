@@ -1149,8 +1149,8 @@ async fn squeezy_help_self_question_completes_without_provider_request() {
 }
 
 #[tokio::test]
-async fn simple_ls_completes_locally_without_provider_request() {
-    let root = temp_workspace("agent_local_ls");
+async fn bang_command_completes_locally_without_provider_request() {
+    let root = temp_workspace("agent_local_bang");
     fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("write cargo");
     fs::create_dir_all(root.join("src")).expect("mkdir src");
     let provider = Arc::new(MockProvider::new(Vec::new()));
@@ -1162,11 +1162,13 @@ async fn simple_ls_completes_locally_without_provider_request() {
         provider.clone(),
     );
 
-    let mut rx = agent.start_turn("ls".to_string(), CancellationToken::new());
+    let mut rx = agent.start_turn("!ls".to_string(), CancellationToken::new());
     let mut completed = None;
     let mut tool_result = None;
+    let mut queued_tools = Vec::new();
     while let Some(event) = rx.recv().await {
         match event {
+            AgentEvent::ToolCallQueued { call, .. } => queued_tools.push(call),
             AgentEvent::ToolCallCompleted { result, .. } => tool_result = Some(result),
             AgentEvent::Completed { message, .. } => completed = Some(message.content),
             _ => {}
@@ -1174,6 +1176,8 @@ async fn simple_ls_completes_locally_without_provider_request() {
     }
 
     assert!(provider.requests().is_empty());
+    assert_eq!(queued_tools.len(), 1);
+    assert_eq!(queued_tools[0].arguments["command"], "ls");
     let tool_result = tool_result.expect("ls should run through the shell tool");
     assert_eq!(tool_result.tool_name, "shell");
     assert_eq!(tool_result.status, ToolStatus::Success);
@@ -1187,10 +1191,19 @@ async fn simple_ls_completes_locally_without_provider_request() {
 }
 
 #[tokio::test]
-async fn run_ls_phrase_uses_local_tool_path_without_provider_request() {
-    let root = temp_workspace("agent_local_run_ls");
+async fn natural_language_run_ls_phrase_goes_to_provider() {
+    let root = temp_workspace("agent_natural_run_ls");
     fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("write cargo");
-    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(
+            "I would run `ls -la` for detailed output.".to_string(),
+        )),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
     let agent = Agent::new(
         AppConfig {
             workspace_root: root.clone(),
@@ -1199,26 +1212,24 @@ async fn run_ls_phrase_uses_local_tool_path_without_provider_request() {
         provider.clone(),
     );
 
-    let mut rx = agent.start_turn(
-        "run ls in current dir".to_string(),
-        CancellationToken::new(),
-    );
+    let mut rx = agent.start_turn("run ls with details".to_string(), CancellationToken::new());
     let mut completed = None;
     let mut queued_tools = Vec::new();
+    let mut tool_results = Vec::new();
     while let Some(event) = rx.recv().await {
         match event {
             AgentEvent::ToolCallQueued { call, .. } => queued_tools.push(call),
+            AgentEvent::ToolCallCompleted { result, .. } => tool_results.push(result),
             AgentEvent::Completed { message, .. } => completed = Some(message.content),
             _ => {}
         }
     }
 
-    assert!(provider.requests().is_empty());
-    assert_eq!(queued_tools.len(), 1);
-    assert_eq!(queued_tools[0].name, "shell");
-    assert_eq!(queued_tools[0].arguments["direct_user_shell"], true);
-    let completed = completed.expect("local run turn should complete");
-    assert!(completed.contains("Cargo.toml"), "{completed}");
+    assert_eq!(provider.requests().len(), 1);
+    assert!(queued_tools.is_empty());
+    assert!(tool_results.is_empty());
+    let completed = completed.expect("provider turn should complete");
+    assert!(completed.contains("ls -la"), "{completed}");
 
     let _ = fs::remove_dir_all(root);
 }
