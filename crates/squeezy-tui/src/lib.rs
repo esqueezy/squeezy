@@ -59,6 +59,7 @@ mod mention;
 mod overlay;
 mod proposed_plan;
 mod render;
+mod resume_picker;
 mod status;
 mod streaming;
 
@@ -254,6 +255,11 @@ impl SlashCommand {
 pub struct StartupProfile {
     pub onboarding_summary: Option<String>,
     pub languages: String,
+    /// When true, the startup resume picker is bypassed and a fresh
+    /// agent is created immediately (or the explicit `--resume` id, if
+    /// any, is honoured). The CLI flips this on via `--no-resume-picker`
+    /// for non-interactive flows (CI, scripts).
+    pub skip_resume_picker: bool,
 }
 
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
@@ -272,6 +278,7 @@ pub async fn run_with_onboarding(
         StartupProfile {
             onboarding_summary,
             languages: String::new(),
+            skip_resume_picker: false,
         },
     )
     .await
@@ -308,6 +315,12 @@ async fn run_inner(
     startup: StartupProfile,
 ) -> Result<()> {
     let mut terminal = TerminalGuard::enter(config.tui.alternate_screen)?;
+    let resume_session_id =
+        match maybe_pick_resume_session(&mut terminal, &config, resume_session_id, &startup)? {
+            ResumeStartup::Use(id) => Some(id),
+            ResumeStartup::Fresh => None,
+            ResumeStartup::Quit => return Ok(()),
+        };
     let (mut agent, initial_transcript) = if let Some(session_id) = resume_session_id {
         Agent::resume(config.clone(), provider, &session_id)?
     } else {
@@ -565,6 +578,41 @@ async fn drain_agent_events(app: &mut TuiApp) {
         if keep_rx {
             app.turn_rx = Some(rx);
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResumeStartup {
+    Use(String),
+    Fresh,
+    Quit,
+}
+
+/// Decide whether to show the startup resume picker, and resolve the
+/// session-id (if any) the TUI should resume into.
+fn maybe_pick_resume_session(
+    terminal: &mut TerminalGuard,
+    config: &AppConfig,
+    resume_session_id: Option<String>,
+    startup: &StartupProfile,
+) -> Result<ResumeStartup> {
+    if let Some(id) = resume_session_id {
+        // Explicit `--resume <id>` bypasses the picker entirely.
+        return Ok(ResumeStartup::Use(id));
+    }
+    if startup.skip_resume_picker {
+        return Ok(ResumeStartup::Fresh);
+    }
+    let candidates = resume_picker::load_candidates(config);
+    if candidates.is_empty() {
+        return Ok(ResumeStartup::Fresh);
+    }
+    let choice = resume_picker::run_picker(&mut terminal.terminal, candidates)
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+    match choice {
+        resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
+        resume_picker::ResumeChoice::Resume(id) => Ok(ResumeStartup::Use(id)),
+        resume_picker::ResumeChoice::Quit => Ok(ResumeStartup::Quit),
     }
 }
 
@@ -7039,6 +7087,7 @@ impl TuiApp {
             StartupProfile {
                 onboarding_summary,
                 languages: String::new(),
+                skip_resume_picker: false,
             },
             clipboard,
         )
