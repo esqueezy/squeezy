@@ -53,9 +53,30 @@ pub(crate) struct ConfigScreenState {
     pub section_index: usize,
     pub field_index: usize,
     pub editor: Option<FieldEditor>,
+    pub picker: Option<ModelPickerState>,
+    pub search: Option<SearchOverlayState>,
     pub effective: AppConfig,
     pub sources: SeparatedSources,
     pub dirty: bool,
+}
+
+/// Filterable picker driven by `squeezy_llm::registry::MODEL_REGISTRY`.
+/// Opens when the user presses Enter on the `[model].model` field.
+pub(crate) struct ModelPickerState {
+    pub filter: String,
+    pub cursor: usize,
+    pub all_providers: bool,
+    pub current_provider: &'static str,
+}
+
+/// Fuzzy search across every field label in `CONFIG_SECTIONS`. Triggered
+/// by `/` in browse mode. Enter jumps to the matched field.
+pub(crate) struct SearchOverlayState {
+    pub query: String,
+    pub cursor: usize,
+    /// (section_index, field_index, score) for matches, sorted ascending
+    /// by score (lower is better in `squeezy_rank::fuzzy::fuzzy_score`).
+    pub matches: Vec<(usize, usize, i32)>,
 }
 
 /// Stand-alone editor state. Holds a draft buffer so cancel-on-Esc restores.
@@ -91,6 +112,17 @@ pub(crate) enum FieldEditor {
         draft: String,
         cursor: usize,
     },
+    /// Comma-separated list editor — commits as `FieldValue::StringList`.
+    /// Trailing/leading whitespace and empty items are trimmed.
+    StringList {
+        draft: String,
+        cursor: usize,
+    },
+    /// Filesystem path editor — commits as `FieldValue::Path`.
+    Path {
+        draft: String,
+        cursor: usize,
+    },
 }
 
 impl ConfigScreenState {
@@ -105,6 +137,8 @@ impl ConfigScreenState {
             section_index,
             field_index: 0,
             editor: None,
+            picker: None,
+            search: None,
             effective,
             sources,
             dirty: false,
@@ -119,8 +153,8 @@ impl ConfigScreenState {
         &self.current_section().fields[self.field_index]
     }
 
-    pub(crate) fn field_source(&self, path: &[&str]) -> FieldSource {
-        resolve_field_source(&self.sources, path)
+    pub(crate) fn field_source(&self, field: &FieldMeta) -> FieldSource {
+        resolve_field_source(&self.sources, field)
     }
 }
 
@@ -138,6 +172,13 @@ pub(crate) fn handle_key(
     notifications: &mut NotificationQueue,
     key: KeyEvent,
 ) -> KeyOutcome {
+    // Sub-modes take precedence over the regular browse keymap.
+    if state.search.is_some() {
+        return handle_search_key(state, key);
+    }
+    if state.picker.is_some() {
+        return handle_picker_key(state, agent, notifications, key);
+    }
     if let Some(editor) = &mut state.editor {
         let commit = handle_editor_key(editor, key);
         match commit {
@@ -229,7 +270,73 @@ pub(crate) fn handle_key(
         }
         (KeyCode::Enter, _) => {
             let field = state.current_field();
-            state.editor = Some(open_editor_for(field, (field.get)(&state.effective)));
+            // Refuse to edit env-shadowed fields — the value at runtime is
+            // the env var's, not the TOML's, so a TOML write is silently
+            // inert.
+            if let Some(var) = field.env_override
+                && std::env::var(var).is_ok()
+            {
+                notifications.push(
+                    format!(
+                        "{} is set by {}; unset the env var to edit in the screen.",
+                        field.label, var
+                    ),
+                    NotifySeverity::Warn,
+                );
+                return KeyOutcome::KeepOpen;
+            }
+            // The model field opens a registry-driven picker; every other
+            // field goes through the regular per-kind editor.
+            if field.toml_path == ["model", "model"] {
+                let current_provider = match (CONFIG_SECTIONS[0].fields[0].get)(&state.effective) {
+                    FieldValue::Enum(s) => s,
+                    _ => "openai",
+                };
+                state.picker = Some(ModelPickerState {
+                    filter: String::new(),
+                    cursor: 0,
+                    all_providers: false,
+                    current_provider,
+                });
+            } else if matches!(field.kind, FieldKind::Secret { .. }) {
+                notifications.push(
+                    "Use `squeezy auth set <provider>` to write the secret.",
+                    NotifySeverity::Info,
+                );
+            } else {
+                state.editor = Some(open_editor_for(field, (field.get)(&state.effective)));
+            }
+            KeyOutcome::KeepOpen
+        }
+        (KeyCode::Char('/'), m) if m.is_empty() => {
+            state.search = Some(SearchOverlayState {
+                query: String::new(),
+                cursor: 0,
+                matches: compute_search_matches(""),
+            });
+            KeyOutcome::KeepOpen
+        }
+        (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+            let field = state.current_field();
+            if let Some(var) = field.env_override
+                && std::env::var(var).is_ok()
+            {
+                notifications.push(
+                    format!(
+                        "{} is set by {}; unset the env var to reset.",
+                        field.label, var
+                    ),
+                    NotifySeverity::Warn,
+                );
+                return KeyOutcome::KeepOpen;
+            }
+            let default_val = (field.default)();
+            if let Err(msg) = (field.set)(&mut state.effective, default_val.clone()) {
+                notifications.push(format!("reset failed: {msg}"), NotifySeverity::Error);
+            } else {
+                state.dirty = true;
+                save_field(state, agent, notifications, field, default_val);
+            }
             KeyOutcome::KeepOpen
         }
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
@@ -256,7 +363,8 @@ pub(crate) fn handle_key(
     }
 }
 
-enum EditorOutcome {
+#[derive(Debug)]
+pub(crate) enum EditorOutcome {
     KeepEditing,
     Commit(FieldValue),
     Cancel,
@@ -321,6 +429,39 @@ fn open_editor_for(field: &FieldMeta, current: FieldValue) -> FieldEditor {
             cursor: d.as_millis().to_string().len(),
         },
         (FieldKind::DurationMs, _) => FieldEditor::Duration {
+            draft: String::new(),
+            cursor: 0,
+        },
+        (FieldKind::StringList { .. }, FieldValue::StringList(items)) => {
+            let draft = items.join(", ");
+            FieldEditor::StringList {
+                cursor: draft.chars().count(),
+                draft,
+            }
+        }
+        (FieldKind::StringList { .. }, _) => FieldEditor::StringList {
+            draft: String::new(),
+            cursor: 0,
+        },
+        (FieldKind::Path { .. }, FieldValue::Path(p)) => {
+            let draft = p.display().to_string();
+            FieldEditor::Path {
+                cursor: draft.chars().count(),
+                draft,
+            }
+        }
+        (FieldKind::Path { .. }, _) => FieldEditor::Path {
+            draft: String::new(),
+            cursor: 0,
+        },
+        // Secret / ProviderSubTabs / TableArray drop into dedicated sub-modes
+        // (Secret entry, provider sub-tabs, table-array editor) in commit 5.
+        // Until then, opening one is a no-op handled by `handle_key` — we
+        // shouldn't have reached `open_editor_for` for these kinds.
+        (
+            FieldKind::Secret { .. } | FieldKind::ProviderSubTabs | FieldKind::TableArray { .. },
+            _,
+        ) => FieldEditor::Text {
             draft: String::new(),
             cursor: 0,
         },
@@ -402,6 +543,17 @@ fn handle_editor_key(editor: &mut FieldEditor, key: KeyEvent) -> EditorOutcome {
             KeyCode::Enter => EditorOutcome::Commit(FieldValue::Bool(*v)),
             _ => EditorOutcome::KeepEditing,
         },
+        FieldEditor::StringList { draft, cursor } => text_editor_key(draft, cursor, key, |d| {
+            let items: Vec<String> = d
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            EditorOutcome::Commit(FieldValue::StringList(items))
+        }),
+        FieldEditor::Path { draft, cursor } => text_editor_key(draft, cursor, key, |d| {
+            EditorOutcome::Commit(FieldValue::Path(std::path::PathBuf::from(d.trim())))
+        }),
     }
 }
 
@@ -532,6 +684,167 @@ fn integer_editor_key(
 
 // ─── Save pipeline ───────────────────────────────────────────────────────────
 
+// ─── Model picker ─────────────────────────────────────────────────────────────
+
+fn picker_matches(state: &ModelPickerState) -> Vec<&'static squeezy_llm::ModelInfo> {
+    let filter_lower = state.filter.to_lowercase();
+    squeezy_llm::MODEL_REGISTRY
+        .iter()
+        .filter(|m| state.all_providers || m.provider == state.current_provider)
+        .filter(|m| filter_lower.is_empty() || m.id.to_lowercase().contains(&filter_lower))
+        .collect()
+}
+
+fn handle_picker_key(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    key: KeyEvent,
+) -> KeyOutcome {
+    let picker = state.picker.as_mut().expect("checked by caller");
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => {
+            state.picker = None;
+        }
+        (KeyCode::Tab, _) => {
+            picker.all_providers = !picker.all_providers;
+            picker.cursor = 0;
+        }
+        (KeyCode::Up, _) => {
+            let n = picker_matches(picker).len();
+            if n > 0 && picker.cursor > 0 {
+                picker.cursor -= 1;
+            }
+        }
+        (KeyCode::Down, _) => {
+            let n = picker_matches(picker).len();
+            if n > 0 {
+                picker.cursor = (picker.cursor + 1).min(n - 1);
+            }
+        }
+        (KeyCode::Backspace, _) => {
+            picker.filter.pop();
+            picker.cursor = 0;
+        }
+        (KeyCode::Char(c), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
+            picker.filter.push(c);
+            picker.cursor = 0;
+        }
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+Enter — commit the raw filter buffer as a custom string.
+            let custom = picker.filter.trim().to_string();
+            if custom.is_empty() {
+                notifications.push(
+                    "Type a model id first, then Ctrl+Enter to commit.",
+                    NotifySeverity::Info,
+                );
+            } else {
+                commit_model_picker(state, agent, notifications, custom);
+            }
+        }
+        (KeyCode::Enter, _) => {
+            let matches = picker_matches(picker);
+            if matches.is_empty() {
+                notifications.push(
+                    "No model matches the filter. Ctrl+Enter to commit the filter as a custom id.",
+                    NotifySeverity::Info,
+                );
+            } else {
+                let id = matches[picker.cursor.min(matches.len() - 1)].id.to_string();
+                commit_model_picker(state, agent, notifications, id);
+            }
+        }
+        _ => {}
+    }
+    KeyOutcome::KeepOpen
+}
+
+fn commit_model_picker(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    model_id: String,
+) {
+    state.picker = None;
+    // The model field is the second field of the Models section. Look it up
+    // by path rather than index in case the schema is reordered.
+    let field = CONFIG_SECTIONS
+        .iter()
+        .flat_map(|s| s.fields.iter())
+        .find(|f| f.toml_path == ["model", "model"])
+        .expect("model field exists in CONFIG_SECTIONS");
+    let value = FieldValue::String(model_id);
+    if let Err(msg) = (field.set)(&mut state.effective, value.clone()) {
+        notifications.push(format!("invalid: {msg}"), NotifySeverity::Error);
+        return;
+    }
+    state.dirty = true;
+    save_field(state, agent, notifications, field, value);
+}
+
+// ─── Search overlay ───────────────────────────────────────────────────────────
+
+pub(crate) fn compute_search_matches(query: &str) -> Vec<(usize, usize, i32)> {
+    let mut out: Vec<(usize, usize, i32)> = Vec::new();
+    for (sidx, section) in CONFIG_SECTIONS.iter().enumerate() {
+        for (fidx, field) in section.fields.iter().enumerate() {
+            if query.is_empty() {
+                out.push((sidx, fidx, 0));
+                continue;
+            }
+            // Match against `<section>.<field>` so users can type either part.
+            let target = format!("{} {}", section.label, field.label);
+            if let Some(score) = squeezy_rank::fuzzy_score(&target, query) {
+                out.push((sidx, fidx, score));
+            }
+        }
+    }
+    out.sort_by_key(|(_, _, score)| *score);
+    out.truncate(40);
+    out
+}
+
+fn handle_search_key(state: &mut ConfigScreenState, key: KeyEvent) -> KeyOutcome {
+    let search = state.search.as_mut().expect("checked by caller");
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => {
+            state.search = None;
+        }
+        (KeyCode::Up, _) if !search.matches.is_empty() && search.cursor > 0 => {
+            search.cursor -= 1;
+        }
+        (KeyCode::Down, _) => {
+            let n = search.matches.len();
+            if n > 0 {
+                search.cursor = (search.cursor + 1).min(n - 1);
+            }
+        }
+        (KeyCode::Backspace, _) => {
+            search.query.pop();
+            search.matches = compute_search_matches(&search.query);
+            search.cursor = 0;
+        }
+        (KeyCode::Char(c), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
+            search.query.push(c);
+            search.matches = compute_search_matches(&search.query);
+            search.cursor = 0;
+        }
+        (KeyCode::Enter, _) => {
+            if let Some((sidx, fidx, _)) = search.matches.get(search.cursor).copied() {
+                state.section_index = sidx;
+                state.field_index = fidx;
+            }
+            state.search = None;
+        }
+        _ => {}
+    }
+    KeyOutcome::KeepOpen
+}
+
 fn save_field(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
@@ -632,6 +945,15 @@ fn field_edit(field: &'static FieldMeta, value: &FieldValue) -> SettingsEdit {
         (_, FieldValue::OptionalEnum(Some(s))) => EditOp::SetString((*s).to_string()),
         (_, FieldValue::OptionalEnum(None)) => EditOp::Unset,
         (_, FieldValue::Duration(d)) => EditOp::SetInteger(d.as_millis() as i64),
+        (_, FieldValue::StringList(items)) => EditOp::SetArrayOfStrings(items.clone()),
+        (_, FieldValue::Path(p)) => EditOp::SetString(p.display().to_string()),
+        // Secret / SubTabs / TableArray* never go through field_edit; their
+        // commits are routed to dedicated handlers in commit 5. If we ever
+        // reach this arm it's a programmer bug.
+        (_, FieldValue::Secret)
+        | (_, FieldValue::SubTabs(_))
+        | (_, FieldValue::TableArrayKeyed(_))
+        | (_, FieldValue::TableArrayOrdered(_)) => EditOp::Unset,
     };
     SettingsEdit {
         path: field.toml_path,
@@ -760,7 +1082,138 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         Paragraph::new(sep_lines).style(Style::default().fg(QUIET)),
         chunks[1],
     );
-    render_field_pane(frame, chunks[2], state);
+    if let Some(picker) = &state.picker {
+        render_model_picker(frame, chunks[2], picker);
+    } else if let Some(search) = &state.search {
+        render_search_overlay(frame, chunks[2], search);
+    } else {
+        render_field_pane(frame, chunks[2], state);
+    }
+}
+
+fn render_search_overlay(frame: &mut Frame<'_>, area: Rect, search: &SearchOverlayState) {
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(search.matches.len() + 3);
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Search",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled("fuzzy match field labels", Style::default().fg(QUIET)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("/", Style::default().fg(QUIET)),
+        Span::raw(search.query.clone()),
+        Span::styled("_", Style::default().fg(AMBER)),
+    ]));
+    lines.push(Line::raw(""));
+    if search.matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matches",
+            Style::default().fg(QUIET),
+        )));
+    } else {
+        for (idx, (sidx, fidx, _score)) in search.matches.iter().enumerate() {
+            let section = &CONFIG_SECTIONS[*sidx];
+            let field = &section.fields[*fidx];
+            let active = idx == search.cursor.min(search.matches.len() - 1);
+            let prefix = if active { "› " } else { "  " };
+            let style = if active {
+                Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    prefix,
+                    Style::default().fg(if active { GOLD } else { QUIET }),
+                ),
+                Span::styled(format!("{:<22}", section.label), Style::default().fg(QUIET)),
+                Span::styled(format!("{:<28}", field.label), style),
+            ]));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Type to filter · ↑/↓ move · Enter jump · Esc cancel",
+        Style::default().fg(QUIET),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerState) {
+    let matches = picker_matches(picker);
+    let scope_label = if picker.all_providers {
+        "all providers"
+    } else {
+        picker.current_provider
+    };
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(matches.len() + 4);
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Pick model",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(format!("scope: {scope_label}"), Style::default().fg(QUIET)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("filter ", Style::default().fg(QUIET)),
+        Span::raw("› "),
+        Span::raw(picker.filter.clone()),
+        Span::styled("_", Style::default().fg(AMBER)),
+    ]));
+    lines.push(Line::raw(""));
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matches · Ctrl+Enter to commit the filter as a custom model id",
+            Style::default().fg(QUIET),
+        )));
+    } else {
+        for (idx, info) in matches.iter().enumerate() {
+            let active = idx == picker.cursor.min(matches.len() - 1);
+            let prefix = if active { "› " } else { "  " };
+            let style = if active {
+                Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let mut row = vec![
+                Span::styled(
+                    prefix,
+                    Style::default().fg(if active { GOLD } else { QUIET }),
+                ),
+                Span::styled(format!("{:<32}", info.id), style),
+            ];
+            if picker.all_providers {
+                row.push(Span::styled(
+                    format!("{:<12}", info.provider),
+                    Style::default().fg(QUIET),
+                ));
+            }
+            for (tag, present) in [
+                ("pcache", info.capabilities.prompt_caching),
+                ("rsn", info.capabilities.reasoning_effort),
+                ("vis", info.capabilities.vision),
+                ("tools", info.capabilities.tool_calling),
+                ("json", info.capabilities.json_mode),
+            ] {
+                if present {
+                    row.push(Span::styled(
+                        format!(" [{tag}]"),
+                        Style::default().fg(SUCCESS_GREEN),
+                    ));
+                }
+            }
+            lines.push(Line::from(row));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Type filter · ↑/↓ move · Enter commit · Tab all-providers · Ctrl+Enter custom · Esc cancel",
+        Style::default().fg(QUIET),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
@@ -807,7 +1260,7 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
         let active = idx == state.field_index;
         let value = (field.get)(&state.effective);
         let value_str = value.as_display();
-        let source = state.field_source(field.toml_path);
+        let source = state.field_source(field);
         let source_label = format!("[{}]", source.badge());
         let prefix = if active { "› " } else { "  " };
         let style = if active {
@@ -992,6 +1445,26 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                 Line::from(spans),
                 Line::from(Span::styled(
                     "Space / ← / → to toggle · Enter to commit · Esc to cancel",
+                    Style::default().fg(QUIET),
+                )),
+            ]
+        }
+        FieldEditor::StringList { draft, cursor } => {
+            let _ = cursor;
+            vec![
+                Line::from(Span::raw(format!("  {draft}"))),
+                Line::from(Span::styled(
+                    "comma-separated · Enter to commit · Esc to cancel",
+                    Style::default().fg(QUIET),
+                )),
+            ]
+        }
+        FieldEditor::Path { draft, cursor } => {
+            let _ = cursor;
+            vec![
+                Line::from(Span::raw(format!("  {draft}"))),
+                Line::from(Span::styled(
+                    "filesystem path · Enter to commit · Esc to cancel",
                     Style::default().fg(QUIET),
                 )),
             ]

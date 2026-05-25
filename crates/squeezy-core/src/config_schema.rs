@@ -6,13 +6,22 @@
 //!
 //! New sections are added by appending a `ConfigSectionMeta` entry below.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use crate::{
     AppConfig, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL, DEFAULT_BEDROCK_MODEL,
-    DEFAULT_GOOGLE_MODEL, DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_TELEMETRY_ENDPOINT,
-    PermissionMode, ProviderConfig, ReasoningEffort, ResponseVerbosity, StatusVerbosity,
-    ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
+    DEFAULT_COST_WARN_PERCENT, DEFAULT_EXA_API_KEY_ENV, DEFAULT_EXA_MCP_URL,
+    DEFAULT_FEEDBACK_ENDPOINT, DEFAULT_FEEDBACK_MAX_BYTES, DEFAULT_GOOGLE_MODEL,
+    DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_SEARCH_FILES_PER_TURN,
+    DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN, DEFAULT_MAX_TOOL_CALLS_PER_TURN, DEFAULT_OLLAMA_MODEL,
+    DEFAULT_OPENAI_MODEL, DEFAULT_REPORT_ENDPOINT, DEFAULT_REPORT_MAX_BYTES,
+    DEFAULT_SESSION_LOG_RETENTION_DAYS, DEFAULT_SESSION_MAX_EVENT_BYTES,
+    DEFAULT_SESSION_MAX_SESSION_BYTES, DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+    DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS, DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
+    DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS, DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL,
+    DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL, DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS,
+    PermissionMode, ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode,
+    StatusVerbosity, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
 };
 
 /// When a save takes effect.
@@ -65,7 +74,7 @@ impl FieldSource {
 }
 
 /// The editor shape for a field. Drives which widget the UI renders.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub enum FieldKind {
     Bool,
     Integer {
@@ -89,6 +98,93 @@ pub enum FieldKind {
     },
     /// `<name>_ms` u64 in TOML, rendered as a duration.
     DurationMs,
+    /// Editable list of strings (e.g. `graph.languages`).
+    StringList {
+        min: usize,
+        max: usize,
+    },
+    /// Filesystem path. `must_exist` validation deferred to the editor.
+    Path {
+        must_exist: bool,
+        dir_only: bool,
+    },
+    /// API-key style secret. Never read into `AppConfig`; edits route to
+    /// `squeezy_llm::credentials::save_api_key_with_store(env_var, ...)`.
+    Secret {
+        env_var: &'static str,
+    },
+    /// Singleton kind used only by the `Providers` section to indicate the
+    /// six per-provider sub-tabs along the right pane.
+    ProviderSubTabs,
+    /// Multi-row editor: each row is itself a `FieldMeta` schema. `Keyed`
+    /// rows are addressed by name (`[mcp.servers.<name>]`); `Ordered` rows
+    /// are positional (`[[permissions.rules]]`).
+    TableArray {
+        kind: TableArrayKind,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub enum TableArrayKind {
+    Keyed { item_fields: &'static [FieldMeta] },
+    Ordered { item_fields: &'static [FieldMeta] },
+}
+
+impl std::fmt::Debug for TableArrayKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keyed { item_fields } => write!(f, "Keyed {{ {} fields }}", item_fields.len()),
+            Self::Ordered { item_fields } => {
+                write!(f, "Ordered {{ {} fields }}", item_fields.len())
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for FieldKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bool => write!(f, "Bool"),
+            Self::Integer { min, max, suffix } => f
+                .debug_struct("Integer")
+                .field("min", min)
+                .field("max", max)
+                .field("suffix", suffix)
+                .finish(),
+            Self::OptionalInteger { min, max, suffix } => f
+                .debug_struct("OptionalInteger")
+                .field("min", min)
+                .field("max", max)
+                .field("suffix", suffix)
+                .finish(),
+            Self::Enum { options } => f.debug_struct("Enum").field("options", options).finish(),
+            Self::OptionalEnum { options } => f
+                .debug_struct("OptionalEnum")
+                .field("options", options)
+                .finish(),
+            Self::String { multiline } => f
+                .debug_struct("String")
+                .field("multiline", multiline)
+                .finish(),
+            Self::DurationMs => write!(f, "DurationMs"),
+            Self::StringList { min, max } => f
+                .debug_struct("StringList")
+                .field("min", min)
+                .field("max", max)
+                .finish(),
+            Self::Path {
+                must_exist,
+                dir_only,
+            } => f
+                .debug_struct("Path")
+                .field("must_exist", must_exist)
+                .field("dir_only", dir_only)
+                .finish(),
+            Self::Secret { env_var } => f.debug_struct("Secret").field("env_var", env_var).finish(),
+            Self::ProviderSubTabs => write!(f, "ProviderSubTabs"),
+            Self::TableArray { kind } => f.debug_struct("TableArray").field("kind", kind).finish(),
+        }
+    }
 }
 
 /// Concrete value carried through reads, writes, and editor commits.
@@ -102,6 +198,18 @@ pub enum FieldValue {
     String(String),
     Duration(Duration),
     Unset,
+    StringList(Vec<String>),
+    Path(PathBuf),
+    /// Placeholder — secrets never carry the plaintext through `FieldValue`.
+    /// The screen mask-renders this as `••••` and routes editing directly
+    /// to the keychain.
+    Secret,
+    /// Selected sub-tab index (read-only convenience for `ProviderSubTabs`).
+    SubTabs(usize),
+    /// Keyed table array (e.g. `[mcp.servers.<name>]`).
+    TableArrayKeyed(BTreeMap<String, BTreeMap<String, FieldValue>>),
+    /// Positional table array (e.g. `[[permissions.rules]]`).
+    TableArrayOrdered(Vec<BTreeMap<String, FieldValue>>),
 }
 
 impl FieldValue {
@@ -117,6 +225,18 @@ impl FieldValue {
             Self::String(s) => s.clone(),
             Self::Duration(d) => format!("{} ms", d.as_millis()),
             Self::Unset => "—".to_string(),
+            Self::StringList(items) => {
+                if items.is_empty() {
+                    "—".to_string()
+                } else {
+                    items.join(", ")
+                }
+            }
+            Self::Path(p) => p.display().to_string(),
+            Self::Secret => "••••".to_string(),
+            Self::SubTabs(_) => String::new(),
+            Self::TableArrayKeyed(map) => format!("{} entries", map.len()),
+            Self::TableArrayOrdered(rows) => format!("{} rows", rows.len()),
         }
     }
 }
@@ -132,6 +252,21 @@ pub enum SectionId {
     Verbosity,
     Limits,
     Telemetry,
+    Providers,
+    Session,
+    Modes,
+    Context,
+    Subagents,
+    Skills,
+    Graph,
+    Cache,
+    Tools,
+    Feedback,
+    Redaction,
+    Web,
+    McpServers,
+    ShellSandbox,
+    PermissionRules,
 }
 
 impl SectionId {
@@ -142,6 +277,21 @@ impl SectionId {
             Self::Verbosity => "verbosity",
             Self::Limits => "limits",
             Self::Telemetry => "telemetry",
+            Self::Providers => "providers",
+            Self::Session => "session",
+            Self::Modes => "modes",
+            Self::Context => "context",
+            Self::Subagents => "subagents",
+            Self::Skills => "skills",
+            Self::Graph => "graph",
+            Self::Cache => "cache",
+            Self::Tools => "tools",
+            Self::Feedback => "feedback",
+            Self::Redaction => "redaction",
+            Self::Web => "web",
+            Self::McpServers => "mcp-servers",
+            Self::ShellSandbox => "shell-sandbox",
+            Self::PermissionRules => "permission-rules",
         }
     }
 }
@@ -155,7 +305,16 @@ pub struct FieldMeta {
     pub get: fn(&AppConfig) -> FieldValue,
     pub set: fn(&mut AppConfig, FieldValue) -> Result<(), &'static str>,
     pub default_display: &'static str,
+    /// Programmatic default — invoked by `Ctrl+R` reset. Must mirror what
+    /// `AppConfig::from_env()` would yield with no overrides set.
+    pub default: fn() -> FieldValue,
     pub help: &'static str,
+    /// `SQUEEZY_*` env var that, when set, shadows this field at runtime.
+    /// Displayed as the `[env]` badge and disables in-screen editing.
+    pub env_override: Option<&'static str>,
+    /// `true` for API-key style fields: rendered as `••••`, edits route to
+    /// the keychain rather than `apply_edits`.
+    pub secret: bool,
 }
 
 pub struct ConfigSectionMeta {
@@ -200,7 +359,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_provider,
                 set: set_provider,
                 default_display: "openai",
+                default: || FieldValue::Enum("openai"),
                 help: "Which LLM provider to use. Switching also resets the model to that provider's default unless you set one explicitly.",
+                env_override: Some("SQUEEZY_PROVIDER"),
+                secret: false,
             },
             FieldMeta {
                 label: "model",
@@ -210,7 +372,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_model,
                 set: set_model,
                 default_display: DEFAULT_OPENAI_MODEL,
+                default: || FieldValue::String(String::new()),
                 help: "Provider-specific model identifier.",
+                env_override: Some("SQUEEZY_MODEL"),
+                secret: false,
             },
             FieldMeta {
                 label: "profile",
@@ -222,7 +387,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_profile,
                 set: set_profile,
                 default_display: "balanced",
+                default: || FieldValue::Enum("balanced"),
                 help: "Default cost/capability profile when model is unset.",
+                env_override: Some("SQUEEZY_PROFILE"),
+                secret: false,
             },
             FieldMeta {
                 label: "reasoning_effort",
@@ -234,7 +402,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_reasoning_effort,
                 set: set_reasoning_effort,
                 default_display: "—",
+                default: || FieldValue::OptionalEnum(None),
                 help: "Reasoning effort hint. Only meaningful for reasoning-capable models.",
+                env_override: Some("SQUEEZY_REASONING_EFFORT"),
+                secret: false,
             },
             FieldMeta {
                 label: "max_output_tokens",
@@ -248,7 +419,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_max_output_tokens,
                 set: set_max_output_tokens,
                 default_display: "—",
+                default: || FieldValue::OptionalInteger(None),
                 help: "Cap on output tokens per request. Unset means provider default.",
+                env_override: Some("SQUEEZY_MAX_OUTPUT_TOKENS"),
+                secret: false,
             },
             FieldMeta {
                 label: "stream_idle_timeout",
@@ -258,7 +432,12 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_stream_idle_timeout,
                 set: set_stream_idle_timeout,
                 default_display: "300000 ms",
+                default: || {
+                    FieldValue::Duration(Duration::from_millis(DEFAULT_STREAM_IDLE_TIMEOUT_MS))
+                },
                 help: "Abort if no streaming bytes arrive for this duration.",
+                env_override: Some("SQUEEZY_STREAM_IDLE_TIMEOUT_MS"),
+                secret: false,
             },
             FieldMeta {
                 label: "store_responses",
@@ -268,7 +447,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_store_responses,
                 set: set_store_responses,
                 default_display: "false",
+                default: || FieldValue::Bool(false),
                 help: "(OpenAI/Azure only) Persist responses on the provider side for retrieval.",
+                env_override: Some("SQUEEZY_STORE_RESPONSES"),
+                secret: false,
             },
         ],
     },
@@ -287,7 +469,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_perm_read,
                 set: set_perm_read,
                 default_display: "allow",
+                default: || FieldValue::Enum("allow"),
                 help: "Default for file reads.",
+                env_override: Some("SQUEEZY_READ_PERMISSION"),
+                secret: false,
             },
             FieldMeta {
                 label: "edit",
@@ -299,7 +484,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_perm_edit,
                 set: set_perm_edit,
                 default_display: "ask",
+                default: || FieldValue::Enum("allow"),
                 help: "Default for file edits and writes.",
+                env_override: Some("SQUEEZY_EDIT_PERMISSION"),
+                secret: false,
             },
             FieldMeta {
                 label: "shell",
@@ -311,7 +499,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_perm_shell,
                 set: set_perm_shell,
                 default_display: "ask",
+                default: || FieldValue::Enum("ask"),
                 help: "Default for shell command execution.",
+                env_override: Some("SQUEEZY_SHELL_PERMISSION"),
+                secret: false,
             },
             FieldMeta {
                 label: "ignored_search",
@@ -323,7 +514,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_perm_ignored_search,
                 set: set_perm_ignored_search,
                 default_display: "ask",
+                default: || FieldValue::Enum("allow"),
                 help: "Default for searches that escape .gitignore boundaries.",
+                env_override: Some("SQUEEZY_IGNORED_SEARCH_PERMISSION"),
+                secret: false,
             },
             FieldMeta {
                 label: "web",
@@ -335,7 +529,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_perm_web,
                 set: set_perm_web,
                 default_display: "ask",
+                default: || FieldValue::Enum("ask"),
                 help: "Default for web fetches and searches.",
+                env_override: Some("SQUEEZY_WEB_PERMISSION"),
+                secret: false,
             },
             FieldMeta {
                 label: "mcp",
@@ -347,7 +544,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_perm_mcp,
                 set: set_perm_mcp,
                 default_display: "ask",
+                default: || FieldValue::Enum("ask"),
                 help: "Default for MCP tool invocations.",
+                env_override: Some("SQUEEZY_MCP_PERMISSION"),
+                secret: false,
             },
         ],
     },
@@ -366,7 +566,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_response_verbosity,
                 set: set_response_verbosity,
                 default_display: "normal",
+                default: || FieldValue::Enum("normal"),
                 help: "How chatty the assistant's prose answers are.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "tool_output_verbosity",
@@ -378,7 +581,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_tool_output_verbosity,
                 set: set_tool_output_verbosity,
                 default_display: "compact",
+                default: || FieldValue::Enum("compact"),
                 help: "How much tool output is shown inline.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "status_verbosity",
@@ -390,7 +596,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_status_verbosity,
                 set: set_status_verbosity,
                 default_display: "compact",
+                default: || FieldValue::Enum("compact"),
                 help: "How much detail the bottom status bar shows.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "transcript_default",
@@ -402,7 +611,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_transcript_default,
                 set: set_transcript_default,
                 default_display: "compact",
+                default: || FieldValue::Enum("compact"),
                 help: "Whether new transcript entries start collapsed or expanded.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "show_reasoning_usage",
@@ -412,7 +624,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_show_reasoning_usage,
                 set: set_show_reasoning_usage,
                 default_display: "true",
+                default: || FieldValue::Bool(true),
                 help: "Show reasoning-token usage alongside completion tokens.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "alternate_screen",
@@ -424,7 +639,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_alternate_screen,
                 set: set_alternate_screen,
                 default_display: "auto",
+                default: || FieldValue::Enum("auto"),
                 help: "Whether to take over the terminal screen on launch.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "tick_rate",
@@ -438,7 +656,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_tick_rate,
                 set: set_tick_rate,
                 default_display: "50 ms",
+                default: || FieldValue::Integer(DEFAULT_TICK_RATE_MS as i64),
                 help: "Frame interval for animations.",
+                env_override: None,
+                secret: false,
             },
         ],
     },
@@ -459,7 +680,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_max_parallel_tools,
                 set: set_max_parallel_tools,
                 default_display: "8",
+                default: || FieldValue::Integer(DEFAULT_MAX_PARALLEL_TOOLS as i64),
                 help: "Maximum tool calls executed concurrently per turn.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "max_tool_calls_per_turn",
@@ -473,7 +697,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_max_tool_calls_per_turn,
                 set: set_max_tool_calls_per_turn,
                 default_display: "64",
+                default: || FieldValue::Integer(DEFAULT_MAX_TOOL_CALLS_PER_TURN as i64),
                 help: "Stop the turn after this many tool calls.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "max_tool_bytes_read_per_turn",
@@ -487,7 +714,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_max_tool_bytes_read_per_turn,
                 set: set_max_tool_bytes_read_per_turn,
                 default_display: "20000000 bytes",
+                default: || FieldValue::Integer(DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN as i64),
                 help: "Aggregate read budget across all tools per turn.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "max_search_files_per_turn",
@@ -501,7 +731,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_max_search_files_per_turn,
                 set: set_max_search_files_per_turn,
                 default_display: "50000 files",
+                default: || FieldValue::Integer(DEFAULT_MAX_SEARCH_FILES_PER_TURN as i64),
                 help: "Files scanned across all search tools per turn.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "cost_warn_percent",
@@ -515,7 +748,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_cost_warn_percent,
                 set: set_cost_warn_percent,
                 default_display: "85 %",
+                default: || FieldValue::Integer(DEFAULT_COST_WARN_PERCENT as i64),
                 help: "Warn when session cost crosses this percentage of the cap.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "max_session_cost_usd_micros",
@@ -529,7 +765,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_max_session_cost_usd_micros,
                 set: set_max_session_cost_usd_micros,
                 default_display: "—",
+                default: || FieldValue::OptionalInteger(None),
                 help: "Hard cap on session cost in micro-dollars. Unset means no cap.",
+                env_override: None,
+                secret: false,
             },
         ],
     },
@@ -546,7 +785,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_telemetry_enabled,
                 set: set_telemetry_enabled,
                 default_display: "true",
+                default: || FieldValue::Bool(true),
                 help: "Send anonymous usage events.",
+                env_override: Some("SQUEEZY_TELEMETRY"),
+                secret: false,
             },
             FieldMeta {
                 label: "endpoint",
@@ -556,7 +798,511 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_telemetry_endpoint,
                 set: set_telemetry_endpoint,
                 default_display: DEFAULT_TELEMETRY_ENDPOINT,
+                default: || FieldValue::String(DEFAULT_TELEMETRY_ENDPOINT.to_string()),
                 help: "Where telemetry events are POSTed.",
+                env_override: Some("SQUEEZY_TELEMETRY_ENDPOINT"),
+                secret: false,
+            },
+        ],
+    },
+    ConfigSectionMeta {
+        id: SectionId::Modes,
+        label: "Modes",
+        description: "Session mode and high-level agent behavior",
+        fields: &[
+            FieldMeta {
+                label: "session_mode",
+                toml_path: &["session", "mode"],
+                kind: FieldKind::Enum {
+                    options: SESSION_MODE_OPTIONS,
+                },
+                tier: ApplyTier::Immediate,
+                get: get_session_mode,
+                set: set_session_mode,
+                default_display: "build",
+                default: || FieldValue::Enum("build"),
+                help: "Build mode runs tools freely; Plan mode is read-only and emits a structured plan.",
+                env_override: Some("SQUEEZY_SESSION_MODE"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "exploration_compiler",
+                toml_path: &["agent", "exploration_compiler"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_exploration_compiler,
+                set: set_exploration_compiler,
+                default_display: "true",
+                default: || FieldValue::Bool(true),
+                help: "Use the graph-first exploration compiler before LLM tool dispatch.",
+                env_override: Some("SQUEEZY_EXPLORATION_COMPILER"),
+                secret: false,
+            },
+        ],
+    },
+    ConfigSectionMeta {
+        id: SectionId::Session,
+        label: "Session Logs",
+        description: "Where session traces are written and how long they live",
+        fields: &[
+            FieldMeta {
+                label: "log_dir",
+                toml_path: &["session", "log_dir"],
+                kind: FieldKind::Path {
+                    must_exist: false,
+                    dir_only: true,
+                },
+                tier: ApplyTier::Restart,
+                get: get_session_log_dir,
+                set: set_session_log_dir,
+                default_display: ".squeezy/sessions",
+                default: || FieldValue::Path(std::path::PathBuf::from(".squeezy/sessions")),
+                help: "Directory where session event logs are written.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "log_retention_days",
+                toml_path: &["session", "log_retention_days"],
+                kind: FieldKind::Integer {
+                    min: 1,
+                    max: 3650,
+                    suffix: Some("days"),
+                },
+                tier: ApplyTier::Restart,
+                get: get_session_log_retention_days,
+                set: set_session_log_retention_days,
+                default_display: "30 days",
+                default: || FieldValue::Integer(DEFAULT_SESSION_LOG_RETENTION_DAYS as i64),
+                help: "Session logs older than this are pruned at startup.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "max_event_bytes",
+                toml_path: &["session", "max_event_bytes"],
+                kind: FieldKind::Integer {
+                    min: 4096,
+                    max: 16_000_000,
+                    suffix: Some("bytes"),
+                },
+                tier: ApplyTier::Restart,
+                get: get_session_max_event_bytes,
+                set: set_session_max_event_bytes,
+                default_display: "65536 bytes",
+                default: || FieldValue::Integer(DEFAULT_SESSION_MAX_EVENT_BYTES as i64),
+                help: "Cap on individual session event size before truncation.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "max_session_bytes",
+                toml_path: &["session", "max_session_bytes"],
+                kind: FieldKind::Integer {
+                    min: 1_048_576,
+                    max: 1_000_000_000,
+                    suffix: Some("bytes"),
+                },
+                tier: ApplyTier::Restart,
+                get: get_session_max_session_bytes,
+                set: set_session_max_session_bytes,
+                default_display: "52428800 bytes",
+                default: || FieldValue::Integer(DEFAULT_SESSION_MAX_SESSION_BYTES as i64),
+                help: "Cap on total session log size; rolls over when exceeded.",
+                env_override: None,
+                secret: false,
+            },
+        ],
+    },
+    ConfigSectionMeta {
+        id: SectionId::Subagents,
+        label: "Subagents",
+        description: "Per-subagent budgets and toggles",
+        fields: &[
+            FieldMeta {
+                label: "enabled",
+                toml_path: &["subagents", "enabled"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_subagents_enabled,
+                set: set_subagents_enabled,
+                default_display: "true",
+                default: || FieldValue::Bool(true),
+                help: "Allow delegate_plan / delegate_review subagent dispatch.",
+                env_override: Some("SQUEEZY_SUBAGENTS_ENABLED"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "explore_enabled",
+                toml_path: &["subagents", "explore_enabled"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_subagent_explore_enabled,
+                set: set_subagent_explore_enabled,
+                default_display: "true",
+                default: || FieldValue::Bool(true),
+                help: "Allow the Explore subagent variant.",
+                env_override: Some("SQUEEZY_EXPLORE_SUBAGENT_ENABLED"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "explore_model",
+                toml_path: &["subagents", "explore_model"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_subagent_explore_model,
+                set: set_subagent_explore_model,
+                default_display: "—",
+                default: || FieldValue::String(String::new()),
+                help: "Override model id for the Explore subagent. Empty inherits the main model.",
+                env_override: Some("SQUEEZY_EXPLORE_MODEL"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "max_tool_calls_per_call",
+                toml_path: &["subagents", "max_tool_calls_per_call"],
+                kind: FieldKind::Integer {
+                    min: 1,
+                    max: 256,
+                    suffix: None,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_subagent_max_tool_calls,
+                set: set_subagent_max_tool_calls,
+                default_display: "24",
+                default: || FieldValue::Integer(DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL as i64),
+                help: "Cap on tool calls within one subagent invocation.",
+                env_override: Some("SQUEEZY_SUBAGENT_MAX_TOOL_CALLS_PER_CALL"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "max_tool_bytes_read_per_call",
+                toml_path: &["subagents", "max_tool_bytes_read_per_call"],
+                kind: FieldKind::Integer {
+                    min: 65_536,
+                    max: 1_000_000_000,
+                    suffix: Some("bytes"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_subagent_max_bytes,
+                set: set_subagent_max_bytes,
+                default_display: "8388608 bytes",
+                default: || {
+                    FieldValue::Integer(DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL as i64)
+                },
+                help: "Cap on bytes a subagent can read across all its tool calls.",
+                env_override: Some("SQUEEZY_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "max_search_files_per_call",
+                toml_path: &["subagents", "max_search_files_per_call"],
+                kind: FieldKind::Integer {
+                    min: 100,
+                    max: 1_000_000,
+                    suffix: Some("files"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_subagent_max_files,
+                set: set_subagent_max_files,
+                default_display: "2000 files",
+                default: || FieldValue::Integer(DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL as i64),
+                help: "Cap on files scanned by a subagent's search tools.",
+                env_override: Some("SQUEEZY_SUBAGENT_MAX_SEARCH_FILES_PER_CALL"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "max_model_rounds",
+                toml_path: &["subagents", "max_model_rounds"],
+                kind: FieldKind::Integer {
+                    min: 1,
+                    max: 32,
+                    suffix: None,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_subagent_max_rounds,
+                set: set_subagent_max_rounds,
+                default_display: "4",
+                default: || FieldValue::Integer(DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS as i64),
+                help: "Cap on model-call rounds inside a single subagent invocation.",
+                env_override: Some("SQUEEZY_SUBAGENT_MAX_MODEL_ROUNDS"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "max_summary_tokens",
+                toml_path: &["subagents", "max_summary_tokens"],
+                kind: FieldKind::Integer {
+                    min: 100,
+                    max: 16_000,
+                    suffix: Some("tokens"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_subagent_max_summary,
+                set: set_subagent_max_summary,
+                default_display: "1200 tokens",
+                default: || FieldValue::Integer(DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS as i64),
+                help: "Cap on the subagent's summary length back to the main agent.",
+                env_override: Some("SQUEEZY_SUBAGENT_MAX_SUMMARY_TOKENS"),
+                secret: false,
+            },
+        ],
+    },
+    ConfigSectionMeta {
+        id: SectionId::Graph,
+        label: "Graph",
+        description: "Semantic graph indexer (per-language)",
+        fields: &[
+            FieldMeta {
+                label: "languages",
+                toml_path: &["graph", "languages"],
+                kind: FieldKind::StringList { min: 0, max: 32 },
+                tier: ApplyTier::Restart,
+                get: get_graph_languages,
+                set: set_graph_languages,
+                default_display: "rust, python",
+                default: || FieldValue::StringList(vec!["rust".to_string(), "python".to_string()]),
+                help: "Languages indexed by the semantic graph at startup.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "max_file_bytes",
+                toml_path: &["graph", "max_file_bytes"],
+                kind: FieldKind::Integer {
+                    min: 1024,
+                    max: 100_000_000,
+                    suffix: Some("bytes"),
+                },
+                tier: ApplyTier::Restart,
+                get: get_graph_max_file_bytes,
+                set: set_graph_max_file_bytes,
+                default_display: "1000000 bytes",
+                default: || FieldValue::Integer(1_000_000),
+                help: "Files larger than this are skipped by the indexer.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "include_hidden",
+                toml_path: &["graph", "include_hidden"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::Restart,
+                get: get_graph_include_hidden,
+                set: set_graph_include_hidden,
+                default_display: "false",
+                default: || FieldValue::Bool(false),
+                help: "Include dotfiles in the graph index.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "require_indexing_signal",
+                toml_path: &["graph", "require_indexing_signal"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::Restart,
+                get: get_graph_require_signal,
+                set: set_graph_require_signal,
+                default_display: "true",
+                default: || FieldValue::Bool(true),
+                help: "Skip files without an explicit indexing hint (improves indexing cost).",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "include",
+                toml_path: &["graph", "include"],
+                kind: FieldKind::StringList { min: 0, max: 256 },
+                tier: ApplyTier::Restart,
+                get: get_graph_include,
+                set: set_graph_include,
+                default_display: "—",
+                default: || FieldValue::StringList(Vec::new()),
+                help: "Globs to force-include for indexing.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "exclude",
+                toml_path: &["graph", "exclude"],
+                kind: FieldKind::StringList { min: 0, max: 256 },
+                tier: ApplyTier::Restart,
+                get: get_graph_exclude,
+                set: set_graph_exclude,
+                default_display: "—",
+                default: || FieldValue::StringList(Vec::new()),
+                help: "Globs to exclude from indexing.",
+                env_override: None,
+                secret: false,
+            },
+        ],
+    },
+    ConfigSectionMeta {
+        id: SectionId::Cache,
+        label: "Cache",
+        description: "On-disk caches for tool output and the persistent state store",
+        fields: &[
+            FieldMeta {
+                label: "root",
+                toml_path: &["cache", "root"],
+                kind: FieldKind::Path {
+                    must_exist: false,
+                    dir_only: true,
+                },
+                tier: ApplyTier::Restart,
+                get: get_cache_root,
+                set: set_cache_root,
+                default_display: ".squeezy/cache",
+                default: || FieldValue::Path(std::path::PathBuf::from(".squeezy/cache")),
+                help: "Workspace root for the persistent state store and tool-output cache.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "tool_outputs",
+                toml_path: &["cache", "tool_outputs"],
+                kind: FieldKind::Path {
+                    must_exist: false,
+                    dir_only: true,
+                },
+                tier: ApplyTier::Restart,
+                get: get_cache_tool_outputs,
+                set: set_cache_tool_outputs,
+                default_display: "<inherits cache.root>",
+                default: || FieldValue::Path(std::path::PathBuf::from("")),
+                help: "Directory for spilled tool-output blobs. Empty inherits cache.root.",
+                env_override: None,
+                secret: false,
+            },
+        ],
+    },
+    ConfigSectionMeta {
+        id: SectionId::Feedback,
+        label: "Feedback",
+        description: "Endpoints and size caps for /feedback and /report",
+        fields: &[
+            FieldMeta {
+                label: "enabled",
+                toml_path: &["feedback", "enabled"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::Immediate,
+                get: get_feedback_enabled,
+                set: set_feedback_enabled,
+                default_display: "true",
+                default: || FieldValue::Bool(true),
+                help: "Allow the /feedback and /report commands to upload.",
+                env_override: Some("SQUEEZY_FEEDBACK_ENABLED"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "feedback_endpoint",
+                toml_path: &["feedback", "feedback_endpoint"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_feedback_endpoint,
+                set: set_feedback_endpoint,
+                default_display: DEFAULT_FEEDBACK_ENDPOINT,
+                default: || FieldValue::String(DEFAULT_FEEDBACK_ENDPOINT.to_string()),
+                help: "Where /feedback POSTs.",
+                env_override: Some("SQUEEZY_FEEDBACK_ENDPOINT"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "report_endpoint",
+                toml_path: &["feedback", "report_endpoint"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_report_endpoint,
+                set: set_report_endpoint,
+                default_display: DEFAULT_REPORT_ENDPOINT,
+                default: || FieldValue::String(DEFAULT_REPORT_ENDPOINT.to_string()),
+                help: "Where /report POSTs.",
+                env_override: Some("SQUEEZY_REPORT_ENDPOINT"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "max_feedback_bytes",
+                toml_path: &["feedback", "max_feedback_bytes"],
+                kind: FieldKind::Integer {
+                    min: 1024,
+                    max: 10_000_000,
+                    suffix: Some("bytes"),
+                },
+                tier: ApplyTier::Immediate,
+                get: get_feedback_max_bytes,
+                set: set_feedback_max_bytes,
+                default_display: "16384 bytes",
+                default: || FieldValue::Integer(DEFAULT_FEEDBACK_MAX_BYTES as i64),
+                help: "Cap on /feedback payload size.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "max_report_bytes",
+                toml_path: &["feedback", "max_report_bytes"],
+                kind: FieldKind::Integer {
+                    min: 1024,
+                    max: 50_000_000,
+                    suffix: Some("bytes"),
+                },
+                tier: ApplyTier::Immediate,
+                get: get_report_max_bytes,
+                set: set_report_max_bytes,
+                default_display: "2097152 bytes",
+                default: || FieldValue::Integer(DEFAULT_REPORT_MAX_BYTES as i64),
+                help: "Cap on /report payload size.",
+                env_override: None,
+                secret: false,
+            },
+        ],
+    },
+    ConfigSectionMeta {
+        id: SectionId::Redaction,
+        label: "Redaction",
+        description: "Custom secret-masking regex patterns",
+        fields: &[FieldMeta {
+            label: "custom_patterns",
+            toml_path: &["redaction", "custom_patterns"],
+            kind: FieldKind::StringList { min: 0, max: 256 },
+            tier: ApplyTier::Immediate,
+            get: get_redaction_custom_patterns,
+            set: set_redaction_custom_patterns,
+            default_display: "—",
+            default: || FieldValue::StringList(Vec::new()),
+            help: "Additional regex patterns to redact from transcripts and logs.",
+            env_override: None,
+            secret: false,
+        }],
+    },
+    ConfigSectionMeta {
+        id: SectionId::Web,
+        label: "Web",
+        description: "Exa web search and fetch",
+        fields: &[
+            FieldMeta {
+                label: "exa_mcp_url",
+                toml_path: &["web", "exa_mcp_url"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_exa_mcp_url,
+                set: set_exa_mcp_url,
+                default_display: DEFAULT_EXA_MCP_URL,
+                default: || FieldValue::String(DEFAULT_EXA_MCP_URL.to_string()),
+                help: "Endpoint for the Exa MCP web tool.",
+                env_override: Some("SQUEEZY_EXA_MCP_URL"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "exa_api_key_env",
+                toml_path: &["web", "exa_api_key_env"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_exa_api_key_env,
+                set: set_exa_api_key_env,
+                default_display: DEFAULT_EXA_API_KEY_ENV,
+                default: || FieldValue::String(DEFAULT_EXA_API_KEY_ENV.to_string()),
+                help: "Env var that holds the Exa API key. Use `squeezy auth set exa` to write the value.",
+                env_override: Some("SQUEEZY_EXA_API_KEY_ENV"),
+                secret: false,
             },
         ],
     },
@@ -1016,6 +1762,469 @@ fn set_telemetry_endpoint(cfg: &mut AppConfig, value: FieldValue) -> Result<(), 
             Ok(())
         }
         FieldValue::String(_) => Err("endpoint cannot be empty"),
+        _ => Err("expects string"),
+    }
+}
+
+// ─── Modes ────────────────────────────────────────────────────────────────────
+
+fn get_session_mode(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.session_mode.as_str())
+}
+fn set_session_mode(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::Enum(s) => s,
+        _ => return Err("session_mode expects enum"),
+    };
+    cfg.session_mode = SessionMode::parse(s).ok_or("invalid session_mode")?;
+    Ok(())
+}
+
+fn get_exploration_compiler(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.exploration_compiler)
+}
+fn set_exploration_compiler(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.exploration_compiler = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+// ─── Session Logs ─────────────────────────────────────────────────────────────
+
+fn get_session_log_dir(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Path(
+        cfg.session_logs
+            .log_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(".squeezy/sessions")),
+    )
+}
+fn set_session_log_dir(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let p = match value {
+        FieldValue::Path(p) => p,
+        FieldValue::String(s) => std::path::PathBuf::from(s),
+        _ => return Err("expects path"),
+    };
+    cfg.session_logs.log_dir = if p.as_os_str().is_empty() {
+        None
+    } else {
+        Some(p)
+    };
+    Ok(())
+}
+
+fn get_session_log_retention_days(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.session_logs.log_retention_days as i64)
+}
+fn set_session_log_retention_days(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    let v = match value {
+        FieldValue::Integer(v) => v,
+        _ => return Err("expects integer"),
+    };
+    if v < 1 {
+        return Err("must be >= 1");
+    }
+    cfg.session_logs.log_retention_days = v as u64;
+    Ok(())
+}
+
+fn get_session_max_event_bytes(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.session_logs.max_event_bytes as i64)
+}
+fn set_session_max_event_bytes(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let v = match value {
+        FieldValue::Integer(v) => v,
+        _ => return Err("expects integer"),
+    };
+    if v < 4096 {
+        return Err("must be >= 4096");
+    }
+    cfg.session_logs.max_event_bytes = v as usize;
+    Ok(())
+}
+
+fn get_session_max_session_bytes(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.session_logs.max_session_bytes as i64)
+}
+fn set_session_max_session_bytes(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    let v = match value {
+        FieldValue::Integer(v) => v,
+        _ => return Err("expects integer"),
+    };
+    if v < 1_048_576 {
+        return Err("must be >= 1 MiB");
+    }
+    cfg.session_logs.max_session_bytes = v as usize;
+    Ok(())
+}
+
+// ─── Subagents ────────────────────────────────────────────────────────────────
+
+fn get_subagents_enabled(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.subagents.enabled)
+}
+fn set_subagents_enabled(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.subagents.enabled = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_subagent_explore_enabled(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.subagents.explore_enabled)
+}
+fn set_subagent_explore_enabled(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.subagents.explore_enabled = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_subagent_explore_model(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(cfg.subagents.explore_model.clone().unwrap_or_default())
+}
+fn set_subagent_explore_model(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("expects string"),
+    };
+    cfg.subagents.explore_model = if s.trim().is_empty() { None } else { Some(s) };
+    Ok(())
+}
+
+fn get_subagent_max_tool_calls(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.subagents.max_tool_calls_per_call as i64)
+}
+fn set_subagent_max_tool_calls(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let v = match value {
+        FieldValue::Integer(v) => v,
+        _ => return Err("expects integer"),
+    };
+    if v < 1 {
+        return Err("must be >= 1");
+    }
+    cfg.subagents.max_tool_calls_per_call = v as u64;
+    Ok(())
+}
+
+fn get_subagent_max_bytes(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.subagents.max_tool_bytes_read_per_call as i64)
+}
+fn set_subagent_max_bytes(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let v = match value {
+        FieldValue::Integer(v) => v,
+        _ => return Err("expects integer"),
+    };
+    if v < 65_536 {
+        return Err("must be >= 64 KiB");
+    }
+    cfg.subagents.max_tool_bytes_read_per_call = v as u64;
+    Ok(())
+}
+
+fn get_subagent_max_files(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.subagents.max_search_files_per_call as i64)
+}
+fn set_subagent_max_files(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let v = match value {
+        FieldValue::Integer(v) => v,
+        _ => return Err("expects integer"),
+    };
+    if v < 100 {
+        return Err("must be >= 100");
+    }
+    cfg.subagents.max_search_files_per_call = v as u64;
+    Ok(())
+}
+
+fn get_subagent_max_rounds(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.subagents.max_model_rounds as i64)
+}
+fn set_subagent_max_rounds(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let v = match value {
+        FieldValue::Integer(v) => v,
+        _ => return Err("expects integer"),
+    };
+    if v < 1 {
+        return Err("must be >= 1");
+    }
+    cfg.subagents.max_model_rounds = v as usize;
+    Ok(())
+}
+
+fn get_subagent_max_summary(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.subagents.max_summary_tokens as i64)
+}
+fn set_subagent_max_summary(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let v = match value {
+        FieldValue::Integer(v) => v,
+        _ => return Err("expects integer"),
+    };
+    if v < 100 {
+        return Err("must be >= 100");
+    }
+    cfg.subagents.max_summary_tokens = v as u32;
+    Ok(())
+}
+
+// ─── Graph ────────────────────────────────────────────────────────────────────
+
+fn get_graph_languages(cfg: &AppConfig) -> FieldValue {
+    FieldValue::StringList(cfg.graph.languages.clone())
+}
+fn set_graph_languages(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::StringList(items) => {
+            cfg.graph.languages = items;
+            Ok(())
+        }
+        _ => Err("expects string list"),
+    }
+}
+
+fn get_graph_max_file_bytes(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.graph.max_file_bytes as i64)
+}
+fn set_graph_max_file_bytes(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let v = match value {
+        FieldValue::Integer(v) => v,
+        _ => return Err("expects integer"),
+    };
+    if v < 1024 {
+        return Err("must be >= 1024");
+    }
+    cfg.graph.max_file_bytes = v as u64;
+    Ok(())
+}
+
+fn get_graph_include_hidden(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.graph.include_hidden)
+}
+fn set_graph_include_hidden(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.graph.include_hidden = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_graph_require_signal(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.graph.require_indexing_signal)
+}
+fn set_graph_require_signal(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.graph.require_indexing_signal = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_graph_include(cfg: &AppConfig) -> FieldValue {
+    FieldValue::StringList(cfg.graph.include.clone())
+}
+fn set_graph_include(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::StringList(items) => {
+            cfg.graph.include = items;
+            Ok(())
+        }
+        _ => Err("expects string list"),
+    }
+}
+
+fn get_graph_exclude(cfg: &AppConfig) -> FieldValue {
+    FieldValue::StringList(cfg.graph.exclude.clone())
+}
+fn set_graph_exclude(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::StringList(items) => {
+            cfg.graph.exclude = items;
+            Ok(())
+        }
+        _ => Err("expects string list"),
+    }
+}
+
+// ─── Cache ────────────────────────────────────────────────────────────────────
+
+fn get_cache_root(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Path(cfg.cache.root.clone().unwrap_or_default())
+}
+fn set_cache_root(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let p = match value {
+        FieldValue::Path(p) => p,
+        FieldValue::String(s) => std::path::PathBuf::from(s),
+        _ => return Err("expects path"),
+    };
+    cfg.cache.root = if p.as_os_str().is_empty() {
+        None
+    } else {
+        Some(p)
+    };
+    Ok(())
+}
+
+fn get_cache_tool_outputs(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Path(cfg.cache.tool_outputs.clone().unwrap_or_default())
+}
+fn set_cache_tool_outputs(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let p = match value {
+        FieldValue::Path(p) => p,
+        FieldValue::String(s) => std::path::PathBuf::from(s),
+        _ => return Err("expects path"),
+    };
+    cfg.cache.tool_outputs = if p.as_os_str().is_empty() {
+        None
+    } else {
+        Some(p)
+    };
+    Ok(())
+}
+
+// ─── Feedback ─────────────────────────────────────────────────────────────────
+
+fn get_feedback_enabled(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.feedback.enabled)
+}
+fn set_feedback_enabled(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.feedback.enabled = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_feedback_endpoint(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(cfg.feedback.feedback_endpoint.clone())
+}
+fn set_feedback_endpoint(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::String(s) if !s.trim().is_empty() => {
+            cfg.feedback.feedback_endpoint = s;
+            Ok(())
+        }
+        FieldValue::String(_) => Err("endpoint cannot be empty"),
+        _ => Err("expects string"),
+    }
+}
+
+fn get_report_endpoint(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(cfg.feedback.report_endpoint.clone())
+}
+fn set_report_endpoint(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::String(s) if !s.trim().is_empty() => {
+            cfg.feedback.report_endpoint = s;
+            Ok(())
+        }
+        FieldValue::String(_) => Err("endpoint cannot be empty"),
+        _ => Err("expects string"),
+    }
+}
+
+fn get_feedback_max_bytes(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.feedback.max_feedback_bytes as i64)
+}
+fn set_feedback_max_bytes(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let v = match value {
+        FieldValue::Integer(v) => v,
+        _ => return Err("expects integer"),
+    };
+    if v < 1024 {
+        return Err("must be >= 1024");
+    }
+    cfg.feedback.max_feedback_bytes = v as usize;
+    Ok(())
+}
+
+fn get_report_max_bytes(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.feedback.max_report_bytes as i64)
+}
+fn set_report_max_bytes(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let v = match value {
+        FieldValue::Integer(v) => v,
+        _ => return Err("expects integer"),
+    };
+    if v < 1024 {
+        return Err("must be >= 1024");
+    }
+    cfg.feedback.max_report_bytes = v as usize;
+    Ok(())
+}
+
+// ─── Redaction ────────────────────────────────────────────────────────────────
+
+fn get_redaction_custom_patterns(cfg: &AppConfig) -> FieldValue {
+    FieldValue::StringList(cfg.redaction.custom_patterns.clone())
+}
+fn set_redaction_custom_patterns(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    let items = match value {
+        FieldValue::StringList(items) => items,
+        _ => return Err("expects string list"),
+    };
+    // Validate each pattern compiles; let RedactionConfig::validate gate.
+    let next = crate::RedactionConfig {
+        custom_patterns: items.clone(),
+    };
+    next.validate().map_err(|_| "invalid regex pattern")?;
+    cfg.redaction.custom_patterns = items;
+    Ok(())
+}
+
+// ─── Web ──────────────────────────────────────────────────────────────────────
+
+fn get_exa_mcp_url(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(cfg.exa_mcp_url.clone())
+}
+fn set_exa_mcp_url(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::String(s) if !s.trim().is_empty() => {
+            cfg.exa_mcp_url = s;
+            Ok(())
+        }
+        FieldValue::String(_) => Err("exa_mcp_url cannot be empty"),
+        _ => Err("expects string"),
+    }
+}
+
+fn get_exa_api_key_env(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(cfg.exa_api_key_env.clone())
+}
+fn set_exa_api_key_env(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::String(s) if !s.trim().is_empty() => {
+            cfg.exa_api_key_env = s;
+            Ok(())
+        }
+        FieldValue::String(_) => Err("env var name cannot be empty"),
         _ => Err("expects string"),
     }
 }
