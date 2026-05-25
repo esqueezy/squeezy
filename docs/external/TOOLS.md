@@ -27,7 +27,9 @@ configured as core tools, and some are discoverable through lazy schema loading.
   filesystem write and refuse paths outside writable roots or under protected
   metadata directories such as `.git`, `.squeezy`, and `.agents`.
 - `shell`: run a bounded local shell command after permission checks and sandbox
-  planning.
+  planning; supports `tty=true` for PTY-backed commands and exposes
+  `squeezy ask` to approved shell children when in-flight permission prompts
+  are available.
 - `verify`: run bounded local verification, defaulting to the current diff
   scope.
 - `refresh_compiler_facts`: explicitly refresh cached Cargo metadata and

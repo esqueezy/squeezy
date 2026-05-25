@@ -61,6 +61,48 @@ impl LlmProvider for MockProvider {
     }
 }
 
+struct HangingProvider {
+    requests: Mutex<Vec<LlmRequest>>,
+}
+
+impl HangingProvider {
+    fn new() -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<LlmRequest> {
+        self.requests.lock().expect("requests").clone()
+    }
+}
+
+impl LlmProvider for HangingProvider {
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+
+    fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        self.requests.lock().expect("requests").push(request);
+        Box::pin(stream::pending())
+    }
+}
+
+async fn wait_for_job_status(jobs: &JobRegistry, id: JobId, expected: JobStatus) -> JobSnapshot {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(job) = jobs.get(id)
+                && job.status == expected
+            {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("job reached expected status")
+}
+
 #[test]
 fn job_registry_tracks_lifecycle_and_bounds_notifications() {
     let jobs = JobRegistry::new();
@@ -125,6 +167,50 @@ fn job_registry_tracks_lifecycle_and_bounds_notifications() {
     }
 
     assert_eq!(jobs.notifications().len(), MAX_JOB_NOTIFICATIONS);
+}
+
+#[tokio::test]
+async fn panicked_job_transitions_to_failed_status() {
+    let jobs = JobRegistry::new();
+    let job = jobs.create(
+        JobKind::Tool,
+        "panic job",
+        None,
+        None,
+        None,
+        CancellationToken::new(),
+    );
+    jobs.start(job.id).expect("started");
+    let done = Arc::new(Notify::new());
+    let handle = spawn_observed_job(jobs.clone(), job.id, done.clone(), async {
+        panic!("intentional job panic");
+    });
+    assert!(jobs.attach_handle(job.id, handle.abort_handle(), done));
+
+    let failed = wait_for_job_status(&jobs, job.id, JobStatus::Failed).await;
+    assert_eq!(failed.result_summary.as_deref(), Some("job panicked"));
+}
+
+#[tokio::test]
+async fn slow_job_is_hard_aborted_after_grace_window() {
+    let jobs = JobRegistry::new();
+    let cancel = CancellationToken::new();
+    let job = jobs.create(JobKind::Tool, "slow job", None, None, None, cancel);
+    jobs.start(job.id).expect("started");
+    let done = Arc::new(Notify::new());
+    let handle = spawn_observed_job(jobs.clone(), job.id, done.clone(), async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    });
+    assert!(jobs.attach_handle(job.id, handle.abort_handle(), done));
+
+    assert!(jobs.cancel(job.id));
+    let cancelled = wait_for_job_status(&jobs, job.id, JobStatus::Cancelled).await;
+    assert_eq!(
+        cancelled.result_summary.as_deref(),
+        Some("cancelled after grace window")
+    );
 }
 
 #[test]
@@ -202,6 +288,37 @@ async fn turn_stream_accumulates_assistant_text() {
         completed,
         Some(("hello".to_string(), Some("resp_1".to_string())))
     );
+}
+
+#[tokio::test]
+async fn llm_stream_observes_cancellation_within_one_yield() {
+    let provider = Arc::new(HangingProvider::new());
+    let agent = Agent::new(AppConfig::default(), provider);
+    let cancel = CancellationToken::new();
+    let cancel_task = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.cancel();
+        })
+    };
+
+    let mut rx = agent.start_turn("hi".to_string(), cancel);
+    let saw_cancelled = tokio::time::timeout(Duration::from_millis(200), async {
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::Cancelled { .. } => return true,
+                AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+                _ => {}
+            }
+        }
+        false
+    })
+    .await
+    .expect("turn cancellation should not wait for another provider event");
+
+    cancel_task.await.expect("cancel task");
+    assert!(saw_cancelled);
 }
 
 #[tokio::test]
@@ -333,6 +450,33 @@ async fn turn_stream_reports_provider_error() {
     }
 
     assert!(saw_error);
+}
+
+#[tokio::test]
+async fn stalled_model_stream_fails_after_idle_timeout() {
+    let provider = Arc::new(HangingProvider::new());
+    let config = AppConfig {
+        stream_idle_timeout: Duration::from_millis(10),
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut saw_timeout = false;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::Failed { error, .. } = event {
+                saw_timeout = error
+                    .to_string()
+                    .contains("idle timeout waiting for model stream");
+            }
+        }
+    })
+    .await
+    .expect("stalled model stream should fail promptly");
+
+    assert!(saw_timeout);
+    assert_eq!(provider.requests().len(), 1);
 }
 
 #[tokio::test]
@@ -2274,6 +2418,66 @@ fn registry_specs_carry_capability_aligned_with_permission_request() {
             spec.name, spec.capability, runtime_capability,
         );
     }
+}
+
+#[tokio::test]
+async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy() {
+    let root = temp_workspace("agent_shell_ask_policy");
+    let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(Vec::new()));
+    let tools = ToolRegistry::new(&root).expect("registry");
+    let jobs = JobRegistry::new();
+    let (tx, _rx) = mpsc::channel(4);
+    let advertised = Vec::<AdvertisedTool>::new();
+
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            shell: PermissionMode::Deny,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let context = ToolExecutionContext {
+        turn_id: TurnId::new(1),
+        provider,
+        tools: &tools,
+        jobs: &jobs,
+        config: &config,
+        telemetry: TelemetryClient::disabled(),
+        redactor: Arc::new(Redactor::default()),
+        tx,
+        cancel: CancellationToken::new(),
+        approval_ids: Arc::new(AtomicU64::new(1)),
+        session_rules: Arc::new(RwLock::new(Vec::new())),
+        ai_reviewer_state: Arc::new(Mutex::new(ai_reviewer::AiReviewerState::default())),
+        session_mode: Arc::new(AtomicU8::new(SessionMode::Build.to_u8())),
+        session_log: None,
+        conversation_state: None,
+        task_state: Arc::new(tokio::sync::Mutex::new(None)),
+        all_tool_specs: &advertised,
+        loaded_tool_schemas: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        exploration_state: Arc::new(tokio::sync::Mutex::new(ExplorationTurnState::from_plan(
+            None,
+        ))),
+    };
+
+    let approver = shell_ask_approver_for_context(&context);
+    let decision = approver(ShellAskRequest {
+        call_id: "shell_parent".to_string(),
+        parent_command: "script.sh".to_string(),
+        command: "rm -rf target".to_string(),
+        justification: "nested cleanup".to_string(),
+        workdir: root.clone(),
+    })
+    .await;
+
+    assert!(!decision.allow);
+    assert!(
+        !decision.reason.is_empty(),
+        "denied in-flight ask should carry the policy reason",
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

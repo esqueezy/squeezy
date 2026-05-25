@@ -294,6 +294,195 @@ async fn prompt_home_end_move_cursor_when_prompt_has_text() {
 }
 
 #[tokio::test]
+async fn prompt_line_editing_matches_common_terminal_shortcuts() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "alpha\nbravo charlie".to_string());
+    app.input_cursor = "alpha\nbravo".len();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER),
+    )
+    .await
+    .expect("super backspace");
+    assert_eq!(app.input, "alpha\n charlie");
+    assert_eq!(app.input_cursor, "alpha\n".len());
+
+    set_input(&mut app, "alpha\nbravo charlie".to_string());
+    app.input_cursor = "alpha\nbravo".len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-u");
+    assert_eq!(app.input, "alpha\n charlie");
+    assert_eq!(app.input_cursor, "alpha\n".len());
+
+    set_input(&mut app, "alpha\nbravo charlie".to_string());
+    app.input_cursor = "alpha\nbravo".len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-k");
+    assert_eq!(app.input, "alpha\nbravo");
+    assert_eq!(app.input_cursor, "alpha\nbravo".len());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-a");
+    assert_eq!(app.input_cursor, "alpha\n".len());
+
+    app.input_cursor = "alpha\nbr".len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-e");
+    assert_eq!(app.input_cursor, app.input.len());
+
+    set_input(&mut app, "alpha\nbravo".to_string());
+    app.input_cursor = "alpha\n".len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-u at line start");
+    assert_eq!(app.input, "alphabravo");
+    assert_eq!(app.input_cursor, "alpha".len());
+}
+
+#[tokio::test]
+async fn prompt_ctrl_e_keeps_expansion_shortcut_when_prompt_is_empty() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-e expands");
+    assert!(!app.transcript[0].collapsed);
+
+    set_input(&mut app, "abc".to_string());
+    app.input_cursor = 0;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-e moves to end");
+    assert_eq!(app.input_cursor, app.input.len());
+    assert!(!app.transcript[0].collapsed);
+}
+
+#[tokio::test]
+async fn prompt_word_editing_matches_codex_shortcuts() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "alpha beta,gamma".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-left");
+    assert_eq!(app.input_cursor, "alpha beta,".len());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-right");
+    assert_eq!(app.input_cursor, app.input.len());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-backspace");
+    assert_eq!(app.input, "alpha beta,");
+    assert_eq!(app.input_cursor, "alpha beta,".len());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-w");
+    assert_eq!(app.input, "alpha beta");
+    assert_eq!(app.input_cursor, "alpha beta".len());
+
+    set_input(&mut app, "alpha beta gamma".to_string());
+    app.input_cursor = "alpha ".len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-d");
+    assert_eq!(app.input, "alpha  gamma");
+    assert_eq!(app.input_cursor, "alpha ".len());
+}
+
+#[tokio::test]
+async fn prompt_ignores_key_release_events() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "abc".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new_with_kind(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ),
+    )
+    .await
+    .expect("release ignored");
+
+    assert_eq!(app.input, "abc");
+    assert_eq!(app.input_cursor, 3);
+}
+
+#[test]
+fn keyboard_enhancement_flags_enable_modified_key_reporting() {
+    let flags = keyboard_enhancement_flags();
+
+    assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+    assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+    assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+}
+
+#[tokio::test]
 async fn prompt_history_uses_plain_up_down_when_prompt_is_empty() {
     let mut agent = test_agent(SessionMode::Build);
     let mut config = test_config(SessionMode::Build);
@@ -648,7 +837,7 @@ async fn multiline_paste_becomes_attached_context() {
     handle_paste(
         &mut app,
         &mut agent,
-        "2026-05-24 ERROR failed\nOPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\n".to_string(),
+        "2026-05-24 ERROR failed\r\nOPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\r".to_string(),
     )
     .await
     .expect("handle paste");
@@ -659,6 +848,13 @@ async fn multiline_paste_becomes_attached_context() {
         !app.attachments[0]
             .preview
             .contains("sk-abcdefghijklmnopqrstuvwxyz")
+    );
+    assert!(
+        app.attachments[0]
+            .preview
+            .contains("2026-05-24 ERROR failed"),
+        "{}",
+        app.attachments[0].preview
     );
     let rendered = render_to_string(&app, 100, 20);
     assert!(
@@ -846,6 +1042,41 @@ fn ctrl_e_without_selection_toggles_latest_transcript_entry() {
     toggle_selected_transcript_entry(&mut app);
     assert!(app.transcript[0].collapsed);
     assert_eq!(app.status, "collapsed transcript entry 1");
+}
+
+#[test]
+fn ctrl_e_without_selection_skips_prompt_rows_and_expands_collapsed_content() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    app.push_transcript_item(TranscriptItem::user("next prompt"));
+
+    assert!(app.transcript[0].collapsed);
+    assert!(!app.transcript[1].is_toggleable());
+
+    toggle_selected_transcript_entry(&mut app);
+
+    assert!(!app.transcript[0].collapsed);
+    assert_eq!(app.status, "expanded transcript entry 1");
+}
+
+#[tokio::test]
+async fn typing_after_selection_returns_focus_to_prompt_editing() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    select_previous_transcript_entry(&mut app);
+    assert_eq!(app.selected_entry, Some(0));
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("type prompt");
+
+    assert_eq!(app.input, "h");
+    assert!(app.selected_entry.is_none());
 }
 
 #[tokio::test]
@@ -1248,16 +1479,26 @@ fn edit_diff_preview_uses_dedicated_diff_colors() {
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.as_ref() == "+new")
         .expect("add span");
-    assert_eq!(add_span.style.fg, Some(DIFF_ADD_FG));
-    assert_eq!(add_span.style.bg, Some(DIFF_ADD_BG));
+    assert_eq!(
+        add_span.style.fg,
+        Some(render::palette::best_color(
+            render::palette::rgb_components(DIFF_ADD_FG,)
+        ))
+    );
+    assert_eq!(add_span.style.bg, None);
 
     let del_span = lines
         .iter()
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.as_ref() == "-old")
         .expect("delete span");
-    assert_eq!(del_span.style.fg, Some(DIFF_DEL_FG));
-    assert_eq!(del_span.style.bg, Some(DIFF_DEL_BG));
+    assert_eq!(
+        del_span.style.fg,
+        Some(render::palette::best_color(
+            render::palette::rgb_components(DIFF_DEL_FG,)
+        ))
+    );
+    assert_eq!(del_span.style.bg, None);
 }
 
 #[test]
@@ -1311,7 +1552,7 @@ fn command_and_output_highlighters_style_key_parts() {
     );
 
     let ansi = ansi_spans("\u{1b}[32mok\u{1b}[0m error");
-    assert_eq!(ansi[0].style.fg, Some(SUCCESS_GREEN));
+    assert_eq!(ansi[0].style.fg, Some(Color::Green));
 
     let keyword = keyword_spans("public class Foo { return ok; }");
     assert!(
@@ -1319,6 +1560,121 @@ fn command_and_output_highlighters_style_key_parts() {
             .iter()
             .any(|span| span.content.as_ref() == "class" && span.style.fg == Some(GOLD)),
         "{keyword:?}"
+    );
+}
+
+#[test]
+fn ansi_passthrough_renders_colors() {
+    let line = render::ansi::ansi_to_line("\u{1b}[32mhello\u{1b}[0m world");
+
+    assert_eq!(line.spans[0].content.as_ref(), "hello");
+    assert_eq!(line.spans[0].style.fg, Some(Color::Green));
+}
+
+#[test]
+fn diff_render_colorizes_gutter() {
+    let file = squeezy_vcs::DiffFile {
+        path: "src/lib.rs".to_string(),
+        status: squeezy_vcs::DiffFileStatus::Modified,
+        code: "M".to_string(),
+        additions: 1,
+        deletions: 1,
+        binary: false,
+        hunks: vec![squeezy_vcs::DiffHunk {
+            old_start: 1,
+            old_lines: 2,
+            new_start: 1,
+            new_lines: 2,
+            start_line: 1,
+            end_line: 4,
+        }],
+        patch: Some("@@ -1,2 +1,2 @@\n context\n-old\n+new\n".to_string()),
+        patch_truncated: false,
+    };
+
+    let lines = render::diff::render_diff_file(&file);
+    let add = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "+new")
+        .expect("add span");
+    let del = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "-old")
+        .expect("delete span");
+
+    assert_eq!(
+        add.style.fg,
+        Some(render::palette::best_color(
+            render::palette::rgb_components(DIFF_ADD_FG,)
+        ))
+    );
+    assert_eq!(
+        del.style.fg,
+        Some(render::palette::best_color(
+            render::palette::rgb_components(DIFF_DEL_FG,)
+        ))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.spans[0].content.as_ref() == "2 ")
+    );
+}
+
+#[test]
+fn highlight_rust_code_block() {
+    let lines = render::highlight::highlight_code(Some("rust"), "fn foo() { /* comment */ 42 }");
+    let spans = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .collect::<Vec<_>>();
+
+    let keyword = spans
+        .iter()
+        .find(|span| span.content.as_ref() == "fn")
+        .expect("keyword span");
+    let comment = spans
+        .iter()
+        .find(|span| span.content.as_ref() == "/* comment */")
+        .expect("comment span");
+    let number = spans
+        .iter()
+        .find(|span| span.content.as_ref() == "42")
+        .expect("number span");
+
+    assert_eq!(keyword.style.fg, Some(render::highlight::KEYWORD_COLOR));
+    assert_eq!(comment.style.fg, Some(render::highlight::COMMENT_COLOR));
+    assert_eq!(number.style.fg, Some(render::highlight::NUMBER_COLOR));
+}
+
+#[test]
+fn markdown_renders_heading_and_code() {
+    let lines = render::markdown::render_markdown("# Heading\n\n```rust\nfn foo() {}\n```");
+    let heading = lines[0]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "Heading")
+        .expect("heading span");
+    let code_keyword = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "fn")
+        .expect("code keyword span");
+
+    assert!(heading.style.add_modifier.contains(Modifier::BOLD));
+    assert_eq!(
+        code_keyword.style.fg,
+        Some(render::highlight::KEYWORD_COLOR)
+    );
+}
+
+#[test]
+fn palette_returns_ansi16_when_unsupported() {
+    assert_eq!(
+        render::palette::best_color_for_level((255, 0, 0), render::palette::ColorLevel::Ansi16),
+        Color::Red
     );
 }
 
@@ -1797,6 +2153,15 @@ fn alternate_scroll_commands_use_xterm_private_mode() {
         .write_ansi(&mut disable)
         .expect("disable alternate scroll");
     assert_eq!(disable, "\x1b[?1007l");
+}
+
+#[test]
+fn modify_other_keys_reset_uses_xterm_sequence() {
+    let mut disable = String::new();
+    DisableModifyOtherKeys
+        .write_ansi(&mut disable)
+        .expect("disable modifyOtherKeys");
+    assert_eq!(disable, "\x1b[>4;0m");
 }
 
 #[test]

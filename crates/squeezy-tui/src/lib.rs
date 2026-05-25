@@ -11,8 +11,9 @@ use crossterm::{
     Command,
     cursor::MoveTo,
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseEventKind,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     style::Print,
@@ -52,32 +53,35 @@ use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+mod render;
+
+use render::palette::{
+    AMBER, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN,
+    WORKING_SHIMMER_HIGHLIGHT, blend_color,
+};
+#[cfg(test)]
+use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG};
+
 const INLINE_PASTE_MAX_BYTES: usize = 512;
 const LONG_ASSISTANT_CHARS: usize = 1_200;
 const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
 const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
 const SHELL_COLLAPSED_OUTPUT_PREVIEW_LINES: usize = 80;
-const AMBER: Color = Color::Rgb(252, 211, 77);
-const GOLD: Color = Color::Rgb(254, 240, 138);
-const MODE_PURPLE: Color = Color::Rgb(216, 180, 254);
-const SUCCESS_GREEN: Color = Color::Rgb(22, 101, 52);
-const MODE_BUILD_GREEN: Color = Color::Rgb(34, 117, 64);
-const ERROR_RED: Color = Color::Rgb(248, 113, 113);
-const QUIET: Color = Color::DarkGray;
-const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
-const WORKING_SHIMMER_HIGHLIGHT: Color = Color::Rgb(255, 251, 235);
-const DIFF_ADD_FG: Color = Color::Rgb(21, 128, 61);
-const DIFF_ADD_BG: Color = Color::Rgb(14, 36, 24);
-const DIFF_DEL_FG: Color = Color::Rgb(252, 165, 165);
-const DIFF_DEL_BG: Color = Color::Rgb(63, 28, 28);
-const DIFF_HUNK_FG: Color = Color::Rgb(254, 240, 138);
 const PROMPT_MIN_HEIGHT: u16 = 3;
 const PROMPT_MAX_HEIGHT: u16 = 8;
 const INLINE_VIEWPORT_HEIGHT: u16 = 18;
 const SLASH_MENU_MAX_ITEMS: usize = 5;
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 const CLEAR_SCROLLBACK_AND_VISIBLE: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H";
+const RESET_KEYBOARD_ENHANCEMENT_FLAGS: &str = "\x1b[<u";
+const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
+
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EnableAlternateScroll;
@@ -112,6 +116,27 @@ impl Command for DisableAlternateScroll {
     fn execute_winapi(&self) -> io::Result<()> {
         Err(io::Error::other(
             "alternate scroll is only supported through ANSI escape sequences",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisableModifyOtherKeys;
+
+impl Command for DisableModifyOtherKeys {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[>4;0m")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::other(
+            "modifyOtherKeys reset is only supported through ANSI escape sequences",
         ))
     }
 
@@ -664,6 +689,10 @@ fn handle_mouse(app: &mut TuiApp, kind: MouseEventKind) {
 }
 
 async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Result<bool> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return Ok(false);
+    }
+
     if key.code != KeyCode::Esc {
         app.exit_armed = false;
     }
@@ -681,7 +710,11 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
-        toggle_selected_transcript_entry(app);
+        if app.input.is_empty() {
+            toggle_selected_transcript_entry(app);
+        } else {
+            move_input_cursor_line_end(app);
+        }
         return Ok(false);
     }
 
@@ -705,6 +738,61 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         && (key.code == KeyCode::Char('j') || key.code == KeyCode::Enter)
     {
         insert_input_char(app, '\n');
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
+        move_input_cursor_line_start(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
+        delete_to_line_end(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+        delete_to_line_start(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('w') {
+        delete_previous_word(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+        delete_at_cursor(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('h') {
+        delete_before_cursor(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
+        move_input_cursor_left(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
+        move_input_cursor_right(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('b') {
+        move_input_cursor_word_left(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('f') {
+        move_input_cursor_word_right(app);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('d') {
+        delete_next_word(app);
         return Ok(false);
     }
 
@@ -766,7 +854,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             if app.input.is_empty() {
                 app.transcript_scroll_from_bottom = u16::MAX;
             } else {
-                app.input_cursor = 0;
+                move_input_cursor_line_start(app);
             }
             Ok(false)
         }
@@ -774,16 +862,30 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             if app.input.is_empty() {
                 app.transcript_scroll_from_bottom = 0;
             } else {
-                app.input_cursor = app.input.len();
+                move_input_cursor_line_end(app);
             }
             Ok(false)
         }
         KeyCode::Left => {
-            move_input_cursor_left(app);
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+            {
+                move_input_cursor_word_left(app);
+            } else {
+                move_input_cursor_left(app);
+            }
             Ok(false)
         }
         KeyCode::Right => {
-            move_input_cursor_right(app);
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+            {
+                move_input_cursor_word_right(app);
+            } else {
+                move_input_cursor_right(app);
+            }
             Ok(false)
         }
         KeyCode::Up => {
@@ -861,11 +963,35 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             Ok(false)
         }
         KeyCode::Backspace => {
-            delete_before_cursor(app);
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::META)
+            {
+                delete_to_line_start(app);
+            } else if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+            {
+                delete_previous_word(app);
+            } else {
+                delete_before_cursor(app);
+            }
             Ok(false)
         }
         KeyCode::Delete => {
-            delete_at_cursor(app);
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::META)
+            {
+                delete_to_line_end(app);
+            } else if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+            {
+                delete_next_word(app);
+            } else {
+                delete_at_cursor(app);
+            }
             Ok(false)
         }
         KeyCode::Char(ch) => {
@@ -879,12 +1005,13 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
 }
 
 async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Result<()> {
+    let normalized = normalize_pasted_text(&text);
     if app
         .pending_mcp_elicitation
         .as_ref()
         .is_some_and(|pending| pending.request.kind == McpElicitationKind::Form)
     {
-        insert_input_text(app, &text);
+        insert_input_text(app, &normalized);
         return Ok(());
     }
     if app.turn_rx.is_some()
@@ -894,11 +1021,11 @@ async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Resu
         app.status = "paste unavailable during active turn".to_string();
         return Ok(());
     }
-    if is_inline_paste(&text) {
-        insert_input_text(app, &text);
+    if is_inline_paste(&normalized) {
+        insert_input_text(app, &normalized);
         return Ok(());
     }
-    match agent.attach_pasted_context(text).await {
+    match agent.attach_pasted_context(normalized).await {
         Ok(update) => {
             app.attachments = agent.context_attachments_snapshot().await;
             app.status = attachment_update_status("paste", &update);
@@ -908,8 +1035,12 @@ async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Resu
     Ok(())
 }
 
+fn normalize_pasted_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn is_inline_paste(text: &str) -> bool {
-    text.len() <= INLINE_PASTE_MAX_BYTES && !text.contains('\n') && !text.contains('\r')
+    text.len() <= INLINE_PASTE_MAX_BYTES && !text.contains('\n')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -927,6 +1058,7 @@ enum HistoryDirection {
 fn note_input_edited(app: &mut TuiApp) {
     app.input_history_index = None;
     app.input_history_draft.clear();
+    app.selected_entry = None;
     clamp_slash_menu_index(app);
 }
 
@@ -1009,6 +1141,62 @@ fn delete_at_cursor(app: &mut TuiApp) {
     note_input_edited(app);
 }
 
+fn delete_to_line_start(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    let start = line_start_before_cursor(&app.input, cursor);
+    if start >= cursor {
+        if cursor > 0 && app.input[..cursor].ends_with('\n') {
+            delete_before_cursor(app);
+        } else {
+            app.input_cursor = cursor;
+        }
+        return;
+    }
+    app.input.drain(start..cursor);
+    app.input_cursor = start;
+    note_input_edited(app);
+}
+
+fn delete_to_line_end(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    let end = line_end_after_cursor(&app.input, cursor);
+    if end <= cursor {
+        if cursor < app.input.len() {
+            delete_at_cursor(app);
+        } else {
+            app.input_cursor = app.input.len();
+        }
+        return;
+    }
+    app.input.drain(cursor..end);
+    app.input_cursor = cursor;
+    note_input_edited(app);
+}
+
+fn delete_previous_word(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    let start = previous_word_start(&app.input, cursor);
+    if start >= cursor {
+        app.input_cursor = cursor;
+        return;
+    }
+    app.input.drain(start..cursor);
+    app.input_cursor = start;
+    note_input_edited(app);
+}
+
+fn delete_next_word(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    let end = next_word_end(&app.input, cursor);
+    if end <= cursor {
+        app.input_cursor = cursor;
+        return;
+    }
+    app.input.drain(cursor..end);
+    app.input_cursor = cursor;
+    note_input_edited(app);
+}
+
 fn move_input_cursor_left(app: &mut TuiApp) {
     let cursor = input_cursor(app);
     app.input_cursor = app.input[..cursor]
@@ -1030,6 +1218,84 @@ fn move_input_cursor_right(app: &mut TuiApp) {
             .next()
             .map(char::len_utf8)
             .unwrap_or(0);
+}
+
+fn move_input_cursor_line_start(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    app.input_cursor = line_start_before_cursor(&app.input, cursor);
+}
+
+fn move_input_cursor_line_end(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    app.input_cursor = line_end_after_cursor(&app.input, cursor);
+}
+
+fn move_input_cursor_word_left(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    app.input_cursor = previous_word_start(&app.input, cursor);
+}
+
+fn move_input_cursor_word_right(app: &mut TuiApp) {
+    let cursor = input_cursor(app);
+    app.input_cursor = next_word_end(&app.input, cursor);
+}
+
+fn line_start_before_cursor(text: &str, cursor: usize) -> usize {
+    let cursor = text_cursor(text, cursor);
+    text[..cursor]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn line_end_after_cursor(text: &str, cursor: usize) -> usize {
+    let cursor = text_cursor(text, cursor);
+    text[cursor..]
+        .find('\n')
+        .map(|index| cursor + index)
+        .unwrap_or(text.len())
+}
+
+fn previous_word_start(text: &str, cursor: usize) -> usize {
+    let cursor = text_cursor(text, cursor);
+    let prefix = &text[..cursor];
+    let Some((mut start, ch)) = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_whitespace())
+    else {
+        return 0;
+    };
+    let separator = is_word_separator(ch);
+    for (index, ch) in prefix[..start].char_indices().rev() {
+        if ch.is_whitespace() || is_word_separator(ch) != separator {
+            break;
+        }
+        start = index;
+    }
+    start
+}
+
+fn next_word_end(text: &str, cursor: usize) -> usize {
+    let cursor = text_cursor(text, cursor);
+    let suffix = &text[cursor..];
+    let Some((first_offset, first)) = suffix.char_indices().find(|(_, ch)| !ch.is_whitespace())
+    else {
+        return text.len();
+    };
+    let separator = is_word_separator(first);
+    let mut end = cursor + first_offset + first.len_utf8();
+    for (offset, ch) in suffix[first_offset + first.len_utf8()..].char_indices() {
+        if ch.is_whitespace() || is_word_separator(ch) != separator {
+            break;
+        }
+        end = cursor + first_offset + first.len_utf8() + offset + ch.len_utf8();
+    }
+    end
+}
+
+fn is_word_separator(ch: char) -> bool {
+    WORD_SEPARATORS.contains(ch)
 }
 
 fn scroll_transcript_up(app: &mut TuiApp, lines: u16) {
@@ -2211,11 +2477,16 @@ fn select_next_transcript_entry(app: &mut TuiApp) {
 }
 
 fn toggle_selected_transcript_entry(app: &mut TuiApp) {
-    let Some(index) = app
-        .selected_entry
+    let selected = app.selected_entry.filter(|index| {
+        app.transcript
+            .get(*index)
+            .is_some_and(|entry| entry.is_toggleable())
+    });
+    let Some(index) = selected
+        .or_else(|| latest_collapsed_transcript_entry(app))
         .or_else(|| latest_toggleable_transcript_entry(app))
     else {
-        app.status = "transcript is empty".to_string();
+        app.status = "nothing expandable yet".to_string();
         return;
     };
     let Some(entry) = app.transcript.get_mut(index) else {
@@ -2241,6 +2512,15 @@ fn latest_toggleable_transcript_entry(app: &TuiApp) -> Option<usize> {
         .enumerate()
         .rev()
         .find(|(_, entry)| entry.is_toggleable())
+        .map(|(index, _)| index)
+}
+
+fn latest_collapsed_transcript_entry(app: &TuiApp) -> Option<usize> {
+    app.transcript
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, entry)| entry.collapsed && entry.is_toggleable())
         .map(|(index, _)| index)
 }
 
@@ -3037,44 +3317,6 @@ fn shimmer_word_spans(text: &'static str, elapsed_ms: u64) -> Vec<Span<'static>>
             Span::styled(ch.to_string(), style)
         })
         .collect()
-}
-
-fn blend_color(base: Color, highlight: Color, intensity: f32) -> Color {
-    let (base_r, base_g, base_b) = rgb_components(base);
-    let (hi_r, hi_g, hi_b) = rgb_components(highlight);
-    let t = intensity.clamp(0.0, 1.0);
-    Color::Rgb(
-        blend_channel(base_r, hi_r, t),
-        blend_channel(base_g, hi_g, t),
-        blend_channel(base_b, hi_b, t),
-    )
-}
-
-fn blend_channel(base: u8, highlight: u8, intensity: f32) -> u8 {
-    (base as f32 + (highlight as f32 - base as f32) * intensity).round() as u8
-}
-
-fn rgb_components(color: Color) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb(r, g, b) => (r, g, b),
-        Color::Black => (0, 0, 0),
-        Color::Red => (255, 0, 0),
-        Color::Green => (0, 128, 0),
-        Color::Yellow => (255, 255, 0),
-        Color::Blue => (0, 0, 255),
-        Color::Magenta => (255, 0, 255),
-        Color::Cyan => (0, 255, 255),
-        Color::Gray => (128, 128, 128),
-        Color::DarkGray => (80, 80, 80),
-        Color::LightRed => (255, 128, 128),
-        Color::LightGreen => (128, 255, 128),
-        Color::LightYellow => (255, 255, 128),
-        Color::LightBlue => (128, 128, 255),
-        Color::LightMagenta => (255, 128, 255),
-        Color::LightCyan => (128, 255, 255),
-        Color::White => (255, 255, 255),
-        Color::Indexed(_) | Color::Reset => (255, 255, 255),
-    }
 }
 
 fn current_turn_duration(app: &TuiApp) -> Duration {
@@ -3896,6 +4138,10 @@ fn collapsed_content_summary(content: &str) -> String {
     }
 }
 
+fn text_has_collapsible_content(content: &str) -> bool {
+    content.lines().count() > 1 || content.len() > 160
+}
+
 fn format_tool_result_entry(
     tool: &ToolTranscript,
     collapsed: bool,
@@ -4130,17 +4376,22 @@ fn assistant_text_lines(
     if content.is_empty() {
         return vec![assistant_line(selected, status, "", content_style)];
     }
-    content
-        .split('\n')
+    render::markdown::render_markdown(content)
+        .into_iter()
         .enumerate()
-        .map(|(index, line)| {
+        .map(|(index, mut line)| {
+            for span in &mut line.spans {
+                span.style = content_style.patch(span.style);
+            }
             if index == 0 {
-                assistant_line(selected, status.clone(), line.to_string(), content_style)
+                let marker = if selected { "> " } else { "  " };
+                let mut spans = vec![Span::raw(marker), status.clone(), Span::raw(" ")];
+                spans.extend(line.spans);
+                Line::from(spans)
             } else {
-                Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(line.to_string(), content_style),
-                ])
+                let mut spans = vec![Span::raw("    ")];
+                spans.extend(line.spans);
+                Line::from(spans)
             }
         })
         .collect()
@@ -4927,8 +5178,45 @@ fn expanded_diff_context_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static
             format!("changed {files} files, +{additions} -{deletions}"),
         ));
     }
-    lines.extend(path_detail_lines(&tool.result.content["files"], "path", 6));
+    let diff_files = diff_context_files(tool);
+    if diff_files.is_empty() {
+        lines.extend(path_detail_lines(&tool.result.content["files"], "path", 6));
+    } else {
+        for file in diff_files {
+            let mut summary = format!("file {}", file.path);
+            if file.additions > 0 || file.deletions > 0 {
+                summary.push_str(&format!(" +{} -{}", file.additions, file.deletions));
+            }
+            if file.patch_truncated {
+                summary.push_str(" · diff truncated");
+            }
+            lines.push(detail_line(false, QUIET, summary));
+            if file
+                .patch
+                .as_ref()
+                .is_some_and(|patch| !patch.trim().is_empty())
+            {
+                lines.extend(
+                    render::diff::render_diff_file(&file)
+                        .into_iter()
+                        .map(detail_rendered_line),
+                );
+            }
+        }
+    }
     lines
+}
+
+fn diff_context_files(tool: &ToolTranscript) -> Vec<squeezy_vcs::DiffFile> {
+    tool.result.content["files"]
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|file| serde_json::from_value(file.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn expanded_plan_patch_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
@@ -5124,67 +5412,17 @@ fn expanded_generic_tool_detail_lines(
 }
 
 fn render_diff_patch_preview_lines(patch: &str, limit: usize) -> Vec<Line<'static>> {
-    let lines = filtered_diff_lines(patch);
-    if lines.is_empty() {
-        return Vec::new();
-    }
-    head_tail_lines(&lines.join("\n"), limit)
+    render::diff::render_patch_preview_lines(patch, limit)
         .into_iter()
-        .map(|line| {
-            if line.truncated_marker {
-                detail_line(false, QUIET, line.text)
-            } else {
-                diff_detail_line(&line.text)
-            }
-        })
+        .map(detail_rendered_line)
         .collect()
 }
 
 fn render_diff_patch_full_lines(patch: &str) -> Vec<Line<'static>> {
-    filtered_diff_lines(patch)
+    render::diff::render_patch_full_lines(patch)
         .into_iter()
-        .map(|line| diff_detail_line(&line))
+        .map(detail_rendered_line)
         .collect()
-}
-
-fn filtered_diff_lines(patch: &str) -> Vec<String> {
-    patch
-        .lines()
-        .filter(|line| !is_diff_metadata_line(line))
-        .map(str::to_string)
-        .collect()
-}
-
-fn is_diff_metadata_line(line: &str) -> bool {
-    line.starts_with("diff --git ")
-        || line.starts_with("index ")
-        || line.starts_with("--- ")
-        || line.starts_with("+++ ")
-}
-
-fn diff_detail_line(content: &str) -> Line<'static> {
-    detail_spans_line(diff_output_spans(content))
-}
-
-fn diff_output_spans(line: &str) -> Vec<Span<'static>> {
-    let style = if line.starts_with("@@") {
-        Style::default()
-            .fg(DIFF_HUNK_FG)
-            .add_modifier(Modifier::BOLD)
-    } else if line.starts_with('+') {
-        Style::default()
-            .fg(DIFF_ADD_FG)
-            .bg(DIFF_ADD_BG)
-            .add_modifier(Modifier::BOLD)
-    } else if line.starts_with('-') {
-        Style::default()
-            .fg(DIFF_DEL_FG)
-            .bg(DIFF_DEL_BG)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::White)
-    };
-    vec![Span::styled(line.to_string(), style)]
 }
 
 fn output_block_lines(
@@ -5272,6 +5510,18 @@ fn detail_spans_line(content: Vec<Span<'static>>) -> Line<'static> {
     Line::from(spans)
 }
 
+fn detail_rendered_line(line: Line<'static>) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            "└ ",
+            Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
 fn command_spans(command: &str) -> Vec<Span<'static>> {
     let tokens = command
         .split_whitespace()
@@ -5325,65 +5575,11 @@ fn styled_output_spans(line: &str) -> Vec<Span<'static>> {
 }
 
 fn ansi_spans(line: &str) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut style = Style::default();
-    let mut buffer = String::new();
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            let mut code = String::new();
-            for next in chars.by_ref() {
-                if next == 'm' {
-                    break;
-                }
-                code.push(next);
-            }
-            if !buffer.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut buffer), style));
-            }
-            apply_sgr_codes(&mut style, &code);
-        } else {
-            buffer.push(ch);
-        }
-    }
-    if !buffer.is_empty() {
-        spans.push(Span::styled(buffer, style));
-    }
+    let mut spans = render::ansi::ansi_to_line(line).spans;
     if spans.is_empty() {
         spans.push(Span::raw(""));
     }
     spans
-}
-
-fn apply_sgr_codes(style: &mut Style, code: &str) {
-    let codes = if code.is_empty() { "0" } else { code };
-    for part in codes.split(';') {
-        let Ok(value) = part.parse::<u16>() else {
-            continue;
-        };
-        match value {
-            0 => *style = Style::default(),
-            1 => *style = style.add_modifier(Modifier::BOLD),
-            30 => *style = style.fg(Color::Black),
-            31 => *style = style.fg(Color::Red),
-            32 => *style = style.fg(SUCCESS_GREEN),
-            33 => *style = style.fg(Color::Yellow),
-            34 => *style = style.fg(Color::Blue),
-            35 => *style = style.fg(Color::Magenta),
-            36 => *style = style.fg(Color::Cyan),
-            37 => *style = style.fg(Color::White),
-            90 => *style = style.fg(Color::DarkGray),
-            91 => *style = style.fg(Color::LightRed),
-            92 => *style = style.fg(SUCCESS_GREEN),
-            93 => *style = style.fg(Color::LightYellow),
-            94 => *style = style.fg(Color::LightBlue),
-            95 => *style = style.fg(Color::LightMagenta),
-            96 => *style = style.fg(Color::LightCyan),
-            97 => *style = style.fg(Color::White),
-            _ => {}
-        }
-    }
 }
 
 fn keyword_spans(line: &str) -> Vec<Span<'static>> {
@@ -5675,9 +5871,22 @@ fn preview_tool_result(result: &ToolResult, verbosity: ToolOutputVerbosity) -> S
         ToolOutputVerbosity::Normal => TOOL_PREVIEW_NORMAL_BYTES,
         ToolOutputVerbosity::Verbose => TOOL_PREVIEW_VERBOSE_BYTES,
     };
-    let text = serde_json::to_string_pretty(&result.content)
-        .unwrap_or_else(|_| result.content.to_string());
+    let text = tool_result_output_text(result).unwrap_or_else(|| {
+        serde_json::to_string_pretty(&result.content).unwrap_or_else(|_| result.content.to_string())
+    });
     truncate_bytes(&text, limit)
+}
+
+fn tool_result_output_text(result: &ToolResult) -> Option<String> {
+    let stdout = string_arg(&result.content, "stdout").unwrap_or_default();
+    let stderr = string_arg(&result.content, "stderr").unwrap_or_default();
+    let output = match (!stdout.trim().is_empty(), !stderr.trim().is_empty()) {
+        (true, true) => format!("{stdout}\n{stderr}"),
+        (true, false) => stdout,
+        (false, true) => stderr,
+        (false, false) => string_arg(&result.content, "output").unwrap_or_default(),
+    };
+    (!output.trim().is_empty()).then_some(output)
 }
 
 fn status_color(status: ToolStatus) -> Color {
@@ -6777,7 +6986,13 @@ impl TranscriptEntry {
     }
 
     fn is_toggleable(&self) -> bool {
-        true
+        match &self.kind {
+            TranscriptEntryKind::Message(item) => {
+                item.role != Role::User && text_has_collapsible_content(&item.content)
+            }
+            TranscriptEntryKind::ToolResult(_) => true,
+            TranscriptEntryKind::Log(message) => text_has_collapsible_content(message),
+        }
     }
 
     fn pin_payload(&self) -> (String, String, String) {
@@ -6904,6 +7119,11 @@ impl TerminalGuard {
         let mode = TerminalMode::from(alternate_screen);
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         let mut stdout = io::stdout();
+        let _ = execute!(
+            stdout,
+            DisableModifyOtherKeys,
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
+        );
         match mode {
             TerminalMode::Inline => {
                 execute!(
@@ -7002,6 +7222,9 @@ impl Drop for TerminalGuard {
             TerminalMode::Inline => {
                 let _ = execute!(
                     self.terminal.backend_mut(),
+                    PopKeyboardEnhancementFlags,
+                    Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
+                    DisableModifyOtherKeys,
                     DisableBracketedPaste,
                     DisableAlternateScroll,
                     Print(DISABLE_MOUSE_MODES),
@@ -7011,6 +7234,9 @@ impl Drop for TerminalGuard {
             TerminalMode::AlternateScreen => {
                 let _ = execute!(
                     self.terminal.backend_mut(),
+                    PopKeyboardEnhancementFlags,
+                    Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
+                    DisableModifyOtherKeys,
                     DisableBracketedPaste,
                     DisableAlternateScroll,
                     Print(DISABLE_MOUSE_MODES),

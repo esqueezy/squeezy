@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
+    panic::AssertUnwindSafe,
     path::PathBuf,
     pin::Pin,
     sync::{
@@ -11,7 +12,7 @@ use std::{
 };
 
 use futures_core::Stream;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
 use squeezy_core::{
@@ -28,7 +29,7 @@ use squeezy_core::{
 };
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolCall, LlmToolSpec,
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
     RequestTokenEstimate, capabilities_for, estimate_cost, estimate_request_context,
     fetch_ollama_context_window,
 };
@@ -46,16 +47,22 @@ use squeezy_telemetry::{
 };
 use squeezy_tools::{
     McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
-    ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
+    ShellAskApprover, ShellAskDecision, ShellAskRequest, ToolCall, ToolCostHint,
+    ToolExecutionOptions, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
     ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig, sha256_hex,
 };
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::{
+    sync::{Mutex, Notify, broadcast, mpsc, oneshot},
+    task::AbortHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 mod ai_reviewer;
+mod cancel;
 mod exploration_compiler;
 mod permission_persist;
 
+use cancel::{CancelErr, OrCancelExt};
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
 use permission_persist::persist_permission_rule;
 
@@ -69,6 +76,7 @@ const DELEGATE_TOOL_NAME: &str = "delegate";
 const EXPLORE_TOOL_NAME: &str = "explore";
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
+const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
 const JOB_SUMMARY_MAX_CHARS: usize = 320;
 const SUBAGENT_SUMMARY_CHARS_PER_TOKEN: usize = 4;
 // Compaction summary truncation budgets. These are character (not byte)
@@ -87,6 +95,25 @@ const COMPACTION_DURABLE_LINES_LIMIT: usize = 24;
 const COMPACTION_UNRESOLVED_LINES_LIMIT: usize = 8;
 const COMPACTION_RECEIPT_LINES_LIMIT: usize = 12;
 const COMPACTION_MAX_HISTORY: usize = 20;
+
+async fn next_llm_stream_event(
+    stream: &mut LlmStream,
+    cancel: &CancellationToken,
+    idle_timeout: Duration,
+) -> squeezy_core::Result<Option<LlmEvent>> {
+    let next = tokio::select! {
+        _ = cancel.cancelled() => return Ok(Some(LlmEvent::Cancelled)),
+        next = tokio::time::timeout(idle_timeout, stream.next()) => next,
+    };
+    match next {
+        Ok(Some(event)) => event.map(Some),
+        Ok(None) => Ok(None),
+        Err(_) => Err(SqueezyError::ProviderStream(format!(
+            "idle timeout waiting for model stream after {}ms",
+            idle_timeout.as_millis()
+        ))),
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct ConversationState {
@@ -552,10 +579,12 @@ struct JobRegistryState {
     notifications: VecDeque<JobNotification>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct JobRecord {
     snapshot: JobSnapshot,
     cancel: CancellationToken,
+    abort: Option<AbortHandle>,
+    done: Option<Arc<Notify>>,
 }
 
 impl Default for JobRegistry {
@@ -664,22 +693,72 @@ impl JobRegistry {
         summary: impl Into<String>,
         output_handle: Option<String>,
     ) -> Option<JobSnapshot> {
+        self.finish_impl(id, status, summary, output_handle, false)
+    }
+
+    fn finish_if_active(
+        &self,
+        id: JobId,
+        status: JobStatus,
+        summary: impl Into<String>,
+        output_handle: Option<String>,
+    ) -> Option<JobSnapshot> {
+        self.finish_impl(id, status, summary, output_handle, true)
+    }
+
+    fn finish_impl(
+        &self,
+        id: JobId,
+        status: JobStatus,
+        summary: impl Into<String>,
+        output_handle: Option<String>,
+        only_active: bool,
+    ) -> Option<JobSnapshot> {
         let summary = truncate_chars(&summary.into(), JOB_SUMMARY_MAX_CHARS);
-        self.update(id, true, |snapshot| {
-            snapshot.status = status;
-            snapshot.result_summary = Some(summary);
-            snapshot.output_handle = output_handle;
-            snapshot.progress = Some(JobProgress {
+        let (snapshot, notification) = {
+            let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+            let record = state.jobs.get_mut(&id)?;
+            if only_active && !record.snapshot.status.is_active() {
+                return None;
+            }
+            record.snapshot.status = status;
+            record.snapshot.result_summary = Some(summary);
+            record.snapshot.output_handle = output_handle;
+            record.snapshot.progress = Some(JobProgress {
                 completed: Some(1),
                 total: Some(1),
                 message: status.as_str().to_string(),
             });
-            snapshot.ended_at_ms = Some(unix_timestamp_millis());
-        })
+            record.snapshot.ended_at_ms = Some(unix_timestamp_millis());
+            record.snapshot.updated_at_ms = unix_timestamp_millis();
+            let snapshot = record.snapshot.clone();
+            push_job_notification(&mut state, &snapshot);
+            let notification = state.notifications.back().cloned();
+            prune_completed_jobs(&mut state);
+            (snapshot, notification)
+        };
+        let _ = self.tx.send(JobEvent::Updated(snapshot.clone()));
+        if let Some(notification) = notification {
+            let _ = self.tx.send(JobEvent::Notification(notification));
+        }
+        Some(snapshot)
+    }
+
+    fn attach_handle(&self, id: JobId, abort: AbortHandle, done: Arc<Notify>) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let Some(record) = state.jobs.get_mut(&id) else {
+            return false;
+        };
+        if !record.snapshot.status.is_active() {
+            return false;
+        }
+        record.abort = Some(abort);
+        record.done = Some(done);
+        true
     }
 
     pub fn cancel(&self, id: JobId) -> bool {
-        let cancel = {
+        let (cancel, abort, done) = {
             let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
             let Some(record) = state.jobs.get(&id) else {
                 return false;
@@ -687,10 +766,36 @@ impl JobRegistry {
             if !record.snapshot.status.is_active() {
                 return false;
             }
-            record.cancel.clone()
+            (
+                record.cancel.clone(),
+                record.abort.clone(),
+                record.done.clone(),
+            )
         };
         cancel.cancel();
         let _ = self.progress(id, None, None, "cancellation requested");
+        if let (Some(abort), Some(done)) = (abort, done) {
+            let jobs = self.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = done.notified() => {}
+                    _ = tokio::time::sleep(JOB_CANCEL_GRACE) => {
+                        abort.abort();
+                        if jobs
+                            .finish_if_active(
+                                id,
+                                JobStatus::Cancelled,
+                                "cancelled after grace window",
+                                None,
+                            )
+                            .is_some()
+                        {
+                            done.notify_waiters();
+                        }
+                    }
+                }
+            });
+        }
         true
     }
 
@@ -735,6 +840,8 @@ impl JobRegistry {
             let record = JobRecord {
                 snapshot: snapshot.clone(),
                 cancel: cancel.unwrap_or_default(),
+                abort: None,
+                done: None,
             };
             state.jobs.insert(snapshot.id, record);
             let notification = if notify {
@@ -796,6 +903,24 @@ fn prune_completed_jobs(state: &mut JobRegistryState) {
         state.jobs.remove(&id);
         to_remove -= 1;
     }
+}
+
+fn spawn_observed_job<F>(
+    jobs: JobRegistry,
+    job_id: JobId,
+    done: Arc<Notify>,
+    future: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let outcome = AssertUnwindSafe(future).catch_unwind().await;
+        if outcome.is_err() {
+            let _ = jobs.finish_if_active(job_id, JobStatus::Failed, "job panicked", None);
+        }
+        done.notify_waiters();
+    })
 }
 
 #[derive(Clone)]
@@ -1200,7 +1325,8 @@ impl Agent {
         let session_log = self.session_log.clone();
         let redactor = self.redactor.clone();
         let job_id = snapshot.id;
-        tokio::spawn(async move {
+        let done = Arc::new(Notify::new());
+        let handle = spawn_observed_job(self.jobs.clone(), job_id, done.clone(), async move {
             if let Some(started) = jobs.start(job_id) {
                 log_job_lifecycle(session_log.as_ref(), &redactor, "job_started", &started);
             }
@@ -1214,6 +1340,7 @@ impl Agent {
                 log_job_lifecycle(session_log.as_ref(), &redactor, "job_finished", &done);
             }
         });
+        self.jobs.attach_handle(job_id, handle.abort_handle(), done);
         snapshot
     }
 
@@ -1337,14 +1464,17 @@ impl Agent {
         &self,
         query: &SessionQuery,
     ) -> squeezy_core::Result<Vec<SessionMetadata>> {
+        self.flush_active_session_log();
         SessionStore::open(&self.config).list(query)
     }
 
     pub fn show_session(&self, session_id: &str) -> squeezy_core::Result<SessionRecord> {
+        self.flush_session_log_if_current(session_id);
         SessionStore::open(&self.config).show(session_id)
     }
 
     pub fn export_session(&self, session_id: &str) -> squeezy_core::Result<Value> {
+        self.flush_session_log_if_current(session_id);
         SessionStore::open(&self.config).export(session_id)
     }
 
@@ -1425,6 +1555,20 @@ impl Agent {
         let state = self.conversation_state.lock().await.clone();
         let _ = session.write_resume_state(&state.to_resume_state());
         let _ = session.finish(status, state.cost, state.metrics, state.redactions);
+    }
+
+    fn flush_active_session_log(&self) {
+        if let Some(session) = &self.session_log {
+            let _ = session.flush_events();
+        }
+    }
+
+    fn flush_session_log_if_current(&self, session_id: &str) {
+        if let Some(session) = &self.session_log
+            && session.session_id() == session_id
+        {
+            let _ = session.flush_events();
+        }
     }
 
     pub async fn attach_pasted_context(
@@ -1801,153 +1945,255 @@ impl Agent {
         let loaded_tool_schemas = self.loaded_tool_schemas.clone();
         let replay = self.replay.clone();
 
-        tokio::spawn(async move {
-            let redacted_input = redactor.redact(&input);
-            let task_title = redacted_input.text.clone();
-            let failure_session_log = session_log.clone();
-            // Echo the user message into the TUI before kicking MCP
-            // discovery so a slow/flaky external server never delays the
-            // prompt the user just submitted.
-            if tx
-                .send(AgentEvent::UserMessage {
-                    turn_id,
-                    message: TranscriptItem::user(redacted_input.text.clone()),
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
-            if let Some(call) = local_shell_command_call(&task_title) {
-                complete_local_tool_turn(
-                    turn_id,
-                    task_title,
-                    call,
-                    redacted_input.redactions,
-                    LocalToolTurnDeps {
-                        tx: tx.clone(),
-                        provider: provider.clone(),
-                        tools: tools.clone(),
-                        jobs: jobs.clone(),
-                        redactor: redactor.clone(),
-                        session_log: session_log.clone(),
-                        conversation_state: conversation_state.clone(),
-                        session_metrics: session_metrics.clone(),
-                        telemetry: telemetry.clone(),
-                        config: config.clone(),
-                        task_state: task_state.clone(),
-                        session_mode: session_mode.clone(),
-                        cancel: cancel.clone(),
-                        approval_ids: approval_ids.clone(),
-                        session_rules: session_rules.clone(),
-                        ai_reviewer_state: ai_reviewer_state.clone(),
-                        loaded_tool_schemas: loaded_tool_schemas.clone(),
-                    },
-                )
-                .await;
-                return;
-            }
-            // Cheap pre-check first so unrelated coding turns do not pay for a
-            // full `inspect_redacted()` rendering on every turn.
-            if matches_squeezy_help_input(&task_title)
-                && let Some(answer) =
-                    SqueezyHelp::new(config.inspect_redacted()).answer_for_input(&task_title)
-            {
-                complete_squeezy_help_turn(
-                    turn_id,
-                    task_title,
-                    answer,
-                    redacted_input.redactions,
-                    HelpTurnDeps {
-                        tx: tx.clone(),
-                        redactor: redactor.clone(),
-                        session_log: session_log.clone(),
-                        conversation_state: conversation_state.clone(),
-                        session_metrics: session_metrics.clone(),
-                        telemetry: telemetry.clone(),
-                        config: config.clone(),
-                        task_state: task_state.clone(),
-                        session_mode: session_mode.clone(),
-                    },
-                )
-                .await;
-                return;
-            }
-            let mut all_tool_specs = core_control_tools(&config.subagents);
-            all_tool_specs.extend(tools.specs().into_iter().map(advertised_tool));
-            warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
-            refresh_mcp_tools_in_background(
-                tools.clone(),
-                cancel.clone(),
-                session_log.clone(),
-                redactor.clone(),
-                tx.clone(),
-                turn_id,
-            );
-
-            let outcome = TurnRuntime {
-                turn_id,
-                provider,
-                config,
-                tools,
-                jobs,
-                telemetry: telemetry.clone(),
-                redactor: redactor.clone(),
-                session_metrics,
-                all_tool_specs,
-                tx: tx.clone(),
-                cancel,
-                approval_ids,
-                seed_redactions: redacted_input.redactions,
-                session_rules,
-                ai_reviewer_state,
-                session_mode,
-                session_log,
-                conversation_state,
-                store,
-                task_state: task_state.clone(),
-                loaded_tool_schemas,
-                replay,
-            }
-            .run(task_title.clone())
-            .await;
-
-            if let Err(error) = outcome {
-                let error = redact_error(error, &redactor);
-                let latest_task_state = task_state.lock().await.clone();
-                publish_task_state_update(
-                    &tx,
-                    failure_session_log.as_ref(),
-                    &redactor,
-                    &task_state,
-                    turn_id,
-                    TaskStateSnapshot::terminal_from(
-                        latest_task_state.as_ref(),
-                        task_title,
-                        TaskStateStatus::Failed,
-                        Some(error.to_string()),
-                    ),
-                )
-                .await;
-                if let Some(session) = failure_session_log {
-                    let _ = session.append_event(SessionEvent::new(
-                        "failed",
-                        Some(turn_id.to_string()),
-                        Some(error.to_string()),
-                        json!({ "error": error.to_string() }),
-                    ));
-                    let _ = session.update_metadata(|metadata| {
-                        metadata.status = SessionStatus::Failed;
-                        metadata.latest_summary = Some(error.to_string());
-                    });
+        let turn_done = Arc::new(Notify::new());
+        let panic_tx = tx.clone();
+        let panic_session_log = session_log.clone();
+        let panic_redactor = redactor.clone();
+        let panic_telemetry = telemetry.clone();
+        let monitor_tx = tx.clone();
+        let monitor_session_log = session_log.clone();
+        let monitor_redactor = redactor.clone();
+        let monitor_cancel = cancel.clone();
+        let turn_handle = spawn_observed_turn(
+            turn_id,
+            turn_done.clone(),
+            panic_tx,
+            panic_session_log,
+            panic_redactor,
+            panic_telemetry,
+            async move {
+                let redacted_input = redactor.redact(&input);
+                let task_title = redacted_input.text.clone();
+                let failure_session_log = session_log.clone();
+                // Echo the user message into the TUI before kicking MCP
+                // discovery so a slow/flaky external server never delays the
+                // prompt the user just submitted.
+                if tx
+                    .send(AgentEvent::UserMessage {
+                        turn_id,
+                        message: TranscriptItem::user(redacted_input.text.clone()),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
-                telemetry.spawn(TelemetryEvent::failure_seen(error_kind(&error)));
-                let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
-            }
-        });
+                if let Some(call) = local_shell_command_call(&task_title) {
+                    complete_local_tool_turn(
+                        turn_id,
+                        task_title,
+                        call,
+                        redacted_input.redactions,
+                        LocalToolTurnDeps {
+                            tx: tx.clone(),
+                            provider: provider.clone(),
+                            tools: tools.clone(),
+                            jobs: jobs.clone(),
+                            redactor: redactor.clone(),
+                            session_log: session_log.clone(),
+                            conversation_state: conversation_state.clone(),
+                            session_metrics: session_metrics.clone(),
+                            telemetry: telemetry.clone(),
+                            config: config.clone(),
+                            task_state: task_state.clone(),
+                            session_mode: session_mode.clone(),
+                            cancel: cancel.clone(),
+                            approval_ids: approval_ids.clone(),
+                            session_rules: session_rules.clone(),
+                            ai_reviewer_state: ai_reviewer_state.clone(),
+                            loaded_tool_schemas: loaded_tool_schemas.clone(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                // Cheap pre-check first so unrelated coding turns do not pay for a
+                // full `inspect_redacted()` rendering on every turn.
+                if matches_squeezy_help_input(&task_title)
+                    && let Some(answer) =
+                        SqueezyHelp::new(config.inspect_redacted()).answer_for_input(&task_title)
+                {
+                    complete_squeezy_help_turn(
+                        turn_id,
+                        task_title,
+                        answer,
+                        redacted_input.redactions,
+                        HelpTurnDeps {
+                            tx: tx.clone(),
+                            redactor: redactor.clone(),
+                            session_log: session_log.clone(),
+                            conversation_state: conversation_state.clone(),
+                            session_metrics: session_metrics.clone(),
+                            telemetry: telemetry.clone(),
+                            config: config.clone(),
+                            task_state: task_state.clone(),
+                            session_mode: session_mode.clone(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                let mut all_tool_specs = core_control_tools(&config.subagents);
+                all_tool_specs.extend(tools.specs().into_iter().map(advertised_tool));
+                warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
+                refresh_mcp_tools_in_background(
+                    tools.clone(),
+                    cancel.clone(),
+                    session_log.clone(),
+                    redactor.clone(),
+                    tx.clone(),
+                    turn_id,
+                );
+
+                let outcome = TurnRuntime {
+                    turn_id,
+                    provider,
+                    config,
+                    tools,
+                    jobs,
+                    telemetry: telemetry.clone(),
+                    redactor: redactor.clone(),
+                    session_metrics,
+                    all_tool_specs,
+                    tx: tx.clone(),
+                    cancel,
+                    approval_ids,
+                    seed_redactions: redacted_input.redactions,
+                    session_rules,
+                    ai_reviewer_state,
+                    session_mode,
+                    session_log,
+                    conversation_state,
+                    store,
+                    task_state: task_state.clone(),
+                    loaded_tool_schemas,
+                    replay,
+                }
+                .run(task_title.clone())
+                .await;
+
+                if let Err(error) = outcome {
+                    let error = redact_error(error, &redactor);
+                    let latest_task_state = task_state.lock().await.clone();
+                    publish_task_state_update(
+                        &tx,
+                        failure_session_log.as_ref(),
+                        &redactor,
+                        &task_state,
+                        turn_id,
+                        TaskStateSnapshot::terminal_from(
+                            latest_task_state.as_ref(),
+                            task_title,
+                            TaskStateStatus::Failed,
+                            Some(error.to_string()),
+                        ),
+                    )
+                    .await;
+                    if let Some(session) = failure_session_log {
+                        let _ = session.append_event(SessionEvent::new(
+                            "failed",
+                            Some(turn_id.to_string()),
+                            Some(error.to_string()),
+                            json!({ "error": error.to_string() }),
+                        ));
+                        let _ = session.update_metadata(|metadata| {
+                            metadata.status = SessionStatus::Failed;
+                            metadata.latest_summary = Some(error.to_string());
+                        });
+                    }
+                    telemetry.spawn(TelemetryEvent::failure_seen(error_kind(&error)));
+                    let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
+                }
+            },
+        );
+        spawn_turn_cancel_monitor(
+            turn_id,
+            monitor_cancel,
+            turn_done,
+            turn_handle.abort_handle(),
+            monitor_tx.downgrade(),
+            monitor_session_log,
+            monitor_redactor,
+        );
 
         rx
     }
+}
+
+fn spawn_observed_turn<F>(
+    turn_id: TurnId,
+    done: Arc<Notify>,
+    tx: mpsc::Sender<AgentEvent>,
+    session_log: Option<SessionHandle>,
+    redactor: Arc<Redactor>,
+    telemetry: TelemetryClient,
+    future: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let outcome = AssertUnwindSafe(future).catch_unwind().await;
+        if outcome.is_err() {
+            let error = SqueezyError::Agent("agent turn panicked".to_string());
+            log_session_event(
+                session_log.as_ref(),
+                &redactor,
+                "failed",
+                Some(turn_id),
+                Some(error.to_string()),
+                json!({ "error": error.to_string(), "panic": true }),
+            );
+            if let Some(session) = &session_log {
+                let _ = session.update_metadata(|metadata| {
+                    metadata.status = SessionStatus::Failed;
+                    metadata.latest_summary = Some(error.to_string());
+                });
+            }
+            telemetry.spawn(TelemetryEvent::failure_seen(error_kind(&error)));
+            let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
+        }
+        done.notify_waiters();
+    })
+}
+
+fn spawn_turn_cancel_monitor(
+    turn_id: TurnId,
+    cancel: CancellationToken,
+    done: Arc<Notify>,
+    abort: AbortHandle,
+    tx: mpsc::WeakSender<AgentEvent>,
+    session_log: Option<SessionHandle>,
+    redactor: Arc<Redactor>,
+) {
+    tokio::spawn(async move {
+        cancel.cancelled().await;
+        tokio::select! {
+            _ = done.notified() => {}
+            _ = tokio::time::sleep(JOB_CANCEL_GRACE) => {
+                abort.abort();
+                log_session_event(
+                    session_log.as_ref(),
+                    &redactor,
+                    "cancelled",
+                    Some(turn_id),
+                    Some("turn cancelled after grace window".to_string()),
+                    json!({ "reason": "cancelled after grace window" }),
+                );
+                if let Some(session) = &session_log {
+                    let _ = session.update_metadata(|metadata| {
+                        metadata.status = SessionStatus::Cancelled;
+                        metadata.latest_summary =
+                            Some("turn cancelled after grace window".to_string());
+                    });
+                }
+                if let Some(tx) = tx.upgrade() {
+                    let _ = tx.send(AgentEvent::Cancelled { turn_id }).await;
+                }
+                done.notify_waiters();
+            }
+        }
+    });
 }
 
 struct HelpTurnDeps {
@@ -2810,13 +3056,16 @@ impl TurnRuntime {
             let mut response_id = None;
             let mut completed_cost = CostSnapshot::default();
 
-            while let Some(event) = stream.next().await {
+            while let Some(event) =
+                next_llm_stream_event(&mut stream, &self.cancel, self.config.stream_idle_timeout)
+                    .await?
+            {
                 if self.cancel.is_cancelled() {
                     self.finish_cancelled_turn(&task_title).await;
                     return Ok(());
                 }
                 match event {
-                    Ok(LlmEvent::Started) => {
+                    LlmEvent::Started => {
                         self.record_replay_model_started();
                         if self
                             .tx
@@ -2829,7 +3078,7 @@ impl TurnRuntime {
                             return Ok(());
                         }
                     }
-                    Ok(LlmEvent::TextDelta(delta)) => {
+                    LlmEvent::TextDelta(delta) => {
                         let chunk = assistant_stream.push(&delta);
                         if chunk.text.is_empty() {
                             continue;
@@ -2848,7 +3097,7 @@ impl TurnRuntime {
                             return Ok(());
                         }
                     }
-                    Ok(LlmEvent::ToolCall(tool_call)) => {
+                    LlmEvent::ToolCall(tool_call) => {
                         let call = ToolCall {
                             call_id: tool_call.call_id,
                             name: tool_call.name,
@@ -2878,10 +3127,10 @@ impl TurnRuntime {
                         }
                         tool_calls.push(call);
                     }
-                    Ok(LlmEvent::Completed {
+                    LlmEvent::Completed {
                         response_id: id,
                         mut cost,
-                    }) => {
+                    } => {
                         if cost.estimated_usd_micros.is_none() {
                             cost.estimated_usd_micros =
                                 estimate_cost(self.provider.name(), &request_model, &cost);
@@ -2893,11 +3142,10 @@ impl TurnRuntime {
                         completed = true;
                         break;
                     }
-                    Ok(LlmEvent::Cancelled) => {
+                    LlmEvent::Cancelled => {
                         self.finish_cancelled_turn(&task_title).await;
                         return Ok(());
                     }
-                    Err(error) => return Err(error),
                 }
             }
 
@@ -3486,22 +3734,59 @@ fn install_mcp_elicitation_handler<'a>(
                 request,
                 response_tx,
             });
-            let send_result = tokio::select! {
-                _ = cancel.cancelled() => return McpElicitationResponse::cancel(),
-                result = send_request => result,
+            let send_result = match send_request.or_cancel(&cancel).await {
+                Ok(result) => result,
+                Err(CancelErr::Cancelled) => return McpElicitationResponse::cancel(),
             };
             if send_result.is_err() {
                 return McpElicitationResponse::decline();
             }
-            tokio::select! {
-                _ = cancel.cancelled() => McpElicitationResponse::cancel(),
-                response = response_rx => response.unwrap_or_else(|_| McpElicitationResponse::decline()),
+            match response_rx.or_cancel(&cancel).await {
+                Ok(response) => response.unwrap_or_else(|_| McpElicitationResponse::decline()),
+                Err(CancelErr::Cancelled) => McpElicitationResponse::cancel(),
             }
         })
     });
     context.tools.set_mcp_elicitation_handler(Some(handler));
     McpElicitationHandlerScope {
         tools: context.tools,
+    }
+}
+
+#[derive(Clone)]
+struct PermissionDecisionContext {
+    turn_id: TurnId,
+    provider: Arc<dyn LlmProvider>,
+    tools: ToolRegistry,
+    config: AppConfig,
+    redactor: Arc<Redactor>,
+    tx: mpsc::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    approval_ids: Arc<AtomicU64>,
+    session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
+    session_mode: Arc<AtomicU8>,
+    session_log: Option<SessionHandle>,
+    conversation_state: Option<Arc<Mutex<ConversationState>>>,
+}
+
+impl PermissionDecisionContext {
+    fn from_tool_context(context: &ToolExecutionContext<'_>) -> Self {
+        Self {
+            turn_id: context.turn_id,
+            provider: context.provider.clone(),
+            tools: context.tools.clone(),
+            config: context.config.clone(),
+            redactor: context.redactor.clone(),
+            tx: context.tx.clone(),
+            cancel: context.cancel.clone(),
+            approval_ids: context.approval_ids.clone(),
+            session_rules: context.session_rules.clone(),
+            ai_reviewer_state: context.ai_reviewer_state.clone(),
+            session_mode: context.session_mode.clone(),
+            session_log: context.session_log.clone(),
+            conversation_state: context.conversation_state.clone(),
+        }
     }
 }
 
@@ -3939,23 +4224,45 @@ async fn run_subagent_loop(
             .stream_response(llm_request, parent.cancel.child_token());
         let mut tool_calls = Vec::new();
         let mut completed = false;
-        while let Some(event) = stream.next().await {
+        loop {
+            let event = match next_llm_stream_event(
+                &mut stream,
+                &parent.cancel,
+                config.stream_idle_timeout,
+            )
+            .await
+            {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) => {
+                    broker.metrics.redactions += assistant_stream.total_redactions();
+                    return SubagentExecution {
+                        status: ToolStatus::Error,
+                        summary: String::new(),
+                        status_label: "failed",
+                        error: Some(error.to_string()),
+                        metrics: broker.metrics.clone(),
+                        supporting_receipts: std::mem::take(supporting_receipts),
+                        model,
+                    };
+                }
+            };
             match event {
-                Ok(LlmEvent::Started) => {}
-                Ok(LlmEvent::TextDelta(delta)) => {
+                LlmEvent::Started => {}
+                LlmEvent::TextDelta(delta) => {
                     let chunk = assistant_stream.push(&delta);
                     if !chunk.text.is_empty() {
                         assistant_message.push_str(&chunk.text);
                     }
                 }
-                Ok(LlmEvent::ToolCall(tool_call)) => {
+                LlmEvent::ToolCall(tool_call) => {
                     tool_calls.push(ToolCall {
                         call_id: tool_call.call_id,
                         name: tool_call.name,
                         arguments: tool_call.arguments,
                     });
                 }
-                Ok(LlmEvent::Completed { mut cost, .. }) => {
+                LlmEvent::Completed { mut cost, .. } => {
                     if cost.estimated_usd_micros.is_none() {
                         cost.estimated_usd_micros =
                             estimate_cost(parent.provider.name(), &request_model, &cost);
@@ -3964,25 +4271,13 @@ async fn run_subagent_loop(
                     completed = true;
                     break;
                 }
-                Ok(LlmEvent::Cancelled) => {
+                LlmEvent::Cancelled => {
                     broker.metrics.redactions += assistant_stream.total_redactions();
                     return SubagentExecution {
                         status: ToolStatus::Cancelled,
                         summary: String::new(),
                         status_label: "cancelled",
                         error: Some("subagent cancelled".to_string()),
-                        metrics: broker.metrics.clone(),
-                        supporting_receipts: std::mem::take(supporting_receipts),
-                        model,
-                    };
-                }
-                Err(error) => {
-                    broker.metrics.redactions += assistant_stream.total_redactions();
-                    return SubagentExecution {
-                        status: ToolStatus::Error,
-                        summary: String::new(),
-                        status_label: "failed",
-                        error: Some(error.to_string()),
                         metrics: broker.metrics.clone(),
                         supporting_receipts: std::mem::take(supporting_receipts),
                         model,
@@ -4965,15 +5260,21 @@ async fn run_one_tool(
         })
         .await;
     let started = Instant::now();
+    let shell_ask_approver = if call.name == "shell" {
+        Some(shell_ask_approver_for_context(&context))
+    } else {
+        None
+    };
     let result = context
         .tools
-        .execute_for_group(
+        .execute_for_group_with_options(
             call,
             tracked_job
                 .as_ref()
                 .map(|(_, cancel)| cancel.clone())
                 .unwrap_or_else(|| context.cancel.clone()),
             context.turn_id.to_string(),
+            ToolExecutionOptions { shell_ask_approver },
         )
         .await;
     record_exploration_tool_result(&context, &result).await;
@@ -5206,7 +5507,16 @@ async fn permission_decision(
     if is_direct_user_shell_call(call) {
         return ApprovalDecision::Approved;
     }
-    let request = context.tools.permission_request(call);
+    let runtime = PermissionDecisionContext::from_tool_context(context);
+    let request = runtime.tools.permission_request(call);
+    permission_decision_for_request(&runtime, call, request).await
+}
+
+async fn permission_decision_for_request(
+    context: &PermissionDecisionContext,
+    call: &ToolCall,
+    request: PermissionRequest,
+) -> ApprovalDecision {
     let active_mode = load_session_mode(&context.session_mode);
     if let Some(verdict) = mode_permission_verdict(active_mode, &request) {
         log_permission_verdict(&request, &verdict);
@@ -5229,7 +5539,7 @@ async fn permission_decision(
             None
         };
         match ai_reviewer::review_permission(ai_reviewer::AiReviewerInput {
-            config: context.config,
+            config: &context.config,
             provider: context.provider.clone(),
             request: &request,
             transcript,
@@ -5293,11 +5603,10 @@ async fn permission_decision(
             }
         }
     }
-    if verdict.action == PermissionAction::Ask
-        && should_classify_shell(context.config, context.provider.name(), &request, &verdict)
+    if should_classify_shell(&context.config, context.provider.name(), &request, &verdict)
         && let Some(classifier) = classify_ambiguous_shell(
             context.provider.clone(),
-            context.config,
+            &context.config,
             &request,
             context.cancel.clone(),
         )
@@ -5340,16 +5649,16 @@ async fn permission_decision(
                 request: approval_request,
                 decision_tx,
             });
-            let send_result = tokio::select! {
-                _ = context.cancel.cancelled() => return ApprovalDecision::Cancelled,
-                result = send_approval => result,
+            let send_result = match send_approval.or_cancel(&context.cancel).await {
+                Ok(result) => result,
+                Err(CancelErr::Cancelled) => return ApprovalDecision::Cancelled,
             };
             if send_result.is_err() {
                 return ApprovalDecision::Denied("approval channel closed".to_string());
             }
-            let decision = tokio::select! {
-                _ = context.cancel.cancelled() => return ApprovalDecision::Cancelled,
-                decision = decision_rx => decision,
+            let decision = match decision_rx.or_cancel(&context.cancel).await {
+                Ok(decision) => decision,
+                Err(CancelErr::Cancelled) => return ApprovalDecision::Cancelled,
             };
             log_session_event(
                 context.session_log.as_ref(),
@@ -5483,6 +5792,32 @@ async fn permission_decision(
             }
         }
     }
+}
+
+fn shell_ask_approver_for_context(context: &ToolExecutionContext<'_>) -> ShellAskApprover {
+    let runtime = PermissionDecisionContext::from_tool_context(context);
+    Arc::new(move |request: ShellAskRequest| {
+        let runtime = runtime.clone();
+        Box::pin(async move {
+            let synthetic_call = ToolCall {
+                call_id: format!("{}:ask", request.call_id),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": request.command,
+                    "workdir": request.workdir.display().to_string(),
+                    "description": request.justification,
+                }),
+            };
+            let permission = runtime.tools.permission_request(&synthetic_call);
+            match permission_decision_for_request(&runtime, &synthetic_call, permission).await {
+                ApprovalDecision::Approved => ShellAskDecision::allow(),
+                ApprovalDecision::Denied(reason) => ShellAskDecision::deny(reason),
+                ApprovalDecision::Cancelled => {
+                    ShellAskDecision::deny("in-flight permission request was cancelled")
+                }
+            }
+        })
+    })
 }
 
 fn is_direct_user_shell_call(call: &ToolCall) -> bool {
@@ -5636,10 +5971,13 @@ Working target: {:?}",
         tools: Vec::new(),
         store: false,
     };
-    let mut stream = provider.stream_response(llm_request, cancel);
+    let mut stream = provider.stream_response(llm_request, cancel.clone());
     let mut text = String::new();
-    while let Some(event) = stream.next().await {
-        match event.ok()? {
+    while let Some(event) = next_llm_stream_event(&mut stream, &cancel, config.stream_idle_timeout)
+        .await
+        .ok()?
+    {
+        match event {
             LlmEvent::TextDelta(delta) => text.push_str(&delta),
             LlmEvent::Completed { .. } => break,
             LlmEvent::Cancelled => return None,
@@ -5743,7 +6081,7 @@ fn permission_denied_reason(request: &PermissionRequest, reason: &str) -> String
 /// failure is logged but never bubbled to the caller, since the current call
 /// has already been resolved by the approval response.
 fn install_persistent_rule(
-    context: &ToolExecutionContext<'_>,
+    context: &PermissionDecisionContext,
     request: &PermissionRequest,
     source: PermissionRuleSource,
     action: PermissionAction,
@@ -5770,7 +6108,7 @@ fn install_persistent_rule(
         }
     }
 
-    let path = match persistence_path_for(context.config, source) {
+    let path = match persistence_path_for(&context.config, source) {
         Some(path) => path,
         None => return,
     };
