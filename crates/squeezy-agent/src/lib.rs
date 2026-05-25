@@ -2634,6 +2634,10 @@ impl TurnRuntime {
         );
         self.publish_task_state(TaskStateSnapshot::starting(task_title.clone()))
             .await;
+        if self.cancel.is_cancelled() {
+            self.finish_cancelled_turn(&task_title).await;
+            return Ok(());
+        }
 
         if let Some(plan) = exploration_plan.clone()
             && !plan.calls.is_empty()
@@ -2695,6 +2699,10 @@ impl TurnRuntime {
                 )
                 .await
             };
+            if self.cancel.is_cancelled() || results.iter().any(cancelled_tool_result) {
+                self.finish_cancelled_turn(&task_title).await;
+                return Ok(());
+            }
             // The planner is advisory: once the preflight block has executed,
             // the model has the planner outputs (success or not) in context, so
             // we lift the raw-read guard to avoid locking the turn on misfires
@@ -2739,6 +2747,10 @@ impl TurnRuntime {
         let mut last_tool_round_summary = None;
         let mut loop_guard = ToolLoopGuard::default();
         for _round in 0..MAX_TOOL_ROUNDS {
+            if self.cancel.is_cancelled() {
+                self.finish_cancelled_turn(&task_title).await;
+                return Ok(());
+            }
             let active_mode = load_session_mode(&self.session_mode);
             let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();
             let request = LlmRequest {
@@ -2773,6 +2785,10 @@ impl TurnRuntime {
             let mut completed_cost = CostSnapshot::default();
 
             while let Some(event) = stream.next().await {
+                if self.cancel.is_cancelled() {
+                    self.finish_cancelled_turn(&task_title).await;
+                    return Ok(());
+                }
                 match event {
                     Ok(LlmEvent::Started) => {
                         self.record_replay_model_started();
@@ -2852,31 +2868,7 @@ impl TurnRuntime {
                         break;
                     }
                     Ok(LlmEvent::Cancelled) => {
-                        // A cancelled turn leaves the session active so the
-                        // user can keep working. The lifecycle status only
-                        // flips when the agent itself is finalized (TUI exit
-                        // or `finish_session`). Recording the event here
-                        // still makes the cancellation discoverable in
-                        // `events.jsonl` and `squeezy sessions show`.
-                        self.publish_terminal_task_state(
-                            TaskStateStatus::Cancelled,
-                            Some("turn cancelled".to_string()),
-                            &task_title,
-                        )
-                        .await;
-                        self.log_event(
-                            "cancelled",
-                            Some(self.turn_id),
-                            Some("turn cancelled".to_string()),
-                            json!({}),
-                        );
-                        self.record_replay(SessionReplayEventKind::ModelCancelled, json!({}));
-                        let _ = self
-                            .tx
-                            .send(AgentEvent::Cancelled {
-                                turn_id: self.turn_id,
-                            })
-                            .await;
+                        self.finish_cancelled_turn(&task_title).await;
                         return Ok(());
                     }
                     Err(error) => return Err(error),
@@ -2993,6 +2985,10 @@ impl TurnRuntime {
                 )
                 .await
             };
+            if self.cancel.is_cancelled() || results.iter().any(cancelled_tool_result) {
+                self.finish_cancelled_turn(&task_title).await;
+                return Ok(());
+            }
             last_tool_round_summary = tool_round_failure_summary(&results);
             if let Some(reason) = loop_guard.observe_round(&tool_calls, &results) {
                 return Err(SqueezyError::Agent(reason));
@@ -3149,6 +3145,28 @@ impl TurnRuntime {
             summary,
         ))
         .await;
+    }
+
+    async fn finish_cancelled_turn(&self, task_title: &str) {
+        self.publish_terminal_task_state(
+            TaskStateStatus::Cancelled,
+            Some("turn cancelled".to_string()),
+            task_title,
+        )
+        .await;
+        self.log_event(
+            "cancelled",
+            Some(self.turn_id),
+            Some("turn cancelled".to_string()),
+            json!({}),
+        );
+        self.record_replay(SessionReplayEventKind::ModelCancelled, json!({}));
+        let _ = self
+            .tx
+            .send(AgentEvent::Cancelled {
+                turn_id: self.turn_id,
+            })
+            .await;
     }
 
     async fn current_task_summary(&self) -> Option<String> {
@@ -4368,6 +4386,26 @@ async fn execute_tool_calls(
     let mut recorded = vec![false; calls.len()];
 
     for (index, call) in calls.iter().enumerate() {
+        if context.cancel.is_cancelled() {
+            let result = ToolResult::cancelled(call);
+            broker.record_executed_result(&result);
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
+            recorded[index] = true;
+            return collect_recorded_results(
+                results,
+                recorded,
+                broker,
+                context.config,
+                &context.telemetry,
+            );
+        }
         if call.name == TASK_STATE_TOOL_NAME {
             results[index] = Some(handle_task_state_call(&context, call).await);
             recorded[index] = true;
@@ -4525,6 +4563,28 @@ async fn execute_tool_calls(
 
     let mut parallel_batch = Vec::new();
     for (index, call, tool_sequence) in approved {
+        if context.cancel.is_cancelled() {
+            let result = ToolResult::cancelled(&call);
+            emit_tool_telemetry(
+                context.config,
+                &context.telemetry,
+                context.turn_id,
+                tool_sequence,
+                &result,
+                Duration::ZERO,
+            );
+            broker.record_executed_result(&result);
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
+            recorded[index] = true;
+            break;
+        }
         if context.tools.is_parallel_safe(&call) {
             if let Some(reason) = broker.deny_reason() {
                 let result = budget_denied_result(&call, reason);
@@ -4612,6 +4672,10 @@ fn collect_recorded_results(
     results.into_iter().flatten().collect()
 }
 
+fn cancelled_tool_result(result: &ToolResult) -> bool {
+    result.status == ToolStatus::Cancelled
+}
+
 async fn flush_parallel_batch(
     context: &ToolExecutionContext<'_>,
     broker: &mut CostBroker,
@@ -4623,6 +4687,29 @@ async fn flush_parallel_batch(
     }
 
     let calls = std::mem::take(batch);
+    if context.cancel.is_cancelled() {
+        for (index, call, tool_sequence) in calls {
+            let result = ToolResult::cancelled(&call);
+            emit_tool_telemetry(
+                context.config,
+                &context.telemetry,
+                context.turn_id,
+                tool_sequence,
+                &result,
+                Duration::ZERO,
+            );
+            broker.record_executed_result(&result);
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
+        }
+        return;
+    }
     if broker.enforces_result_budgets() {
         for (index, call, tool_sequence) in calls {
             if let Some(reason) = broker.deny_reason() {
@@ -4676,6 +4763,25 @@ async fn run_one_tool(
     tool_sequence: u64,
     call: ToolCall,
 ) -> ToolResult {
+    if context.cancel.is_cancelled() {
+        let result = ToolResult::cancelled(&call);
+        emit_tool_telemetry(
+            context.config,
+            &context.telemetry,
+            context.turn_id,
+            tool_sequence,
+            &result,
+            Duration::ZERO,
+        );
+        let _ = context
+            .tx
+            .send(AgentEvent::ToolCallCompleted {
+                turn_id: context.turn_id,
+                result: result.clone(),
+            })
+            .await;
+        return result;
+    }
     let tracked_job = job_kind_for_tool(&call.name).map(|kind| {
         let cancel = context.cancel.child_token();
         let snapshot = context.jobs.create(

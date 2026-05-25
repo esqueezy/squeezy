@@ -62,11 +62,17 @@ const ERROR_RED: Color = Color::Rgb(248, 113, 113);
 const QUIET: Color = Color::DarkGray;
 const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
 const WORKING_SHIMMER_HIGHLIGHT: Color = Color::Rgb(255, 251, 235);
+const DIFF_ADD_FG: Color = Color::Rgb(134, 239, 172);
+const DIFF_ADD_BG: Color = Color::Rgb(20, 48, 33);
+const DIFF_DEL_FG: Color = Color::Rgb(252, 165, 165);
+const DIFF_DEL_BG: Color = Color::Rgb(63, 28, 28);
+const DIFF_HUNK_FG: Color = Color::Rgb(254, 240, 138);
 const PROMPT_MIN_HEIGHT: u16 = 3;
 const PROMPT_MAX_HEIGHT: u16 = 8;
 const INLINE_VIEWPORT_HEIGHT: u16 = 18;
 const SLASH_MENU_MAX_ITEMS: usize = 5;
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
+const CLEAR_SCROLLBACK_AND_VISIBLE: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EnableAlternateScroll;
@@ -611,6 +617,9 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
 }
 
 fn handle_mouse(app: &mut TuiApp, kind: MouseEventKind) {
+    if !app.alternate_scroll_enabled {
+        return;
+    }
     match kind {
         MouseEventKind::ScrollUp => scroll_transcript_up(app, 3),
         MouseEventKind::ScrollDown => scroll_transcript_down(app, 3),
@@ -624,7 +633,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        if cancel_active_turn(app) || cancel_pending_approval(app) {
+        if request_turn_interrupt(app) {
             return Ok(false);
         }
         return Ok(true);
@@ -681,7 +690,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
-    if key.code == KeyCode::Esc && (cancel_active_turn(app) || cancel_pending_approval(app)) {
+    if key.code == KeyCode::Esc && request_turn_interrupt(app) {
         return Ok(false);
     }
 
@@ -691,7 +700,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
 
     match key.code {
         KeyCode::Esc => {
-            if cancel_active_turn(app) || cancel_pending_approval(app) {
+            if request_turn_interrupt(app) {
                 Ok(false)
             } else if app.exit_armed {
                 Ok(true)
@@ -983,25 +992,22 @@ fn complete_selected_slash_command(app: &mut TuiApp) -> bool {
     true
 }
 
-fn cancel_active_turn(app: &mut TuiApp) -> bool {
-    let Some(cancel) = &app.cancel else {
-        return false;
-    };
-    cancel.cancel();
+fn request_turn_interrupt(app: &mut TuiApp) -> bool {
+    let mut interrupted = false;
+    if let Some(cancel) = &app.cancel {
+        cancel.cancel();
+        interrupted = true;
+    }
     if let Some(pending) = app.pending_approval.take() {
         let _ = pending.decision_tx.send(ToolApprovalDecision::Cancelled);
+        interrupted = true;
     }
-    app.status = "cancelling".to_string();
-    true
-}
-
-fn cancel_pending_approval(app: &mut TuiApp) -> bool {
-    let Some(pending) = app.pending_approval.take() else {
-        return false;
-    };
-    let _ = pending.decision_tx.send(ToolApprovalDecision::Cancelled);
-    app.status = "cancelling".to_string();
-    true
+    if interrupted {
+        app.status = "interrupting".to_string();
+        app.turn_visual = TurnVisualState::Failed;
+        app.clear_active_tools();
+    }
+    interrupted
 }
 
 async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
@@ -2481,14 +2487,25 @@ fn turn_in_progress(app: &TuiApp) -> bool {
 }
 
 fn working_line(app: &TuiApp) -> Line<'static> {
+    let interrupting = app.status == "interrupting";
+    let activity_color = if interrupting { ERROR_RED } else { AMBER };
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
             "• ",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(activity_color)
+                .add_modifier(Modifier::BOLD),
         ),
     ];
-    spans.extend(working_word_spans(app));
+    spans.extend(if interrupting {
+        vec![Span::styled(
+            "Interrupting",
+            Style::default().fg(ERROR_RED).add_modifier(Modifier::BOLD),
+        )]
+    } else {
+        working_word_spans(app)
+    });
     spans.push(Span::styled(
         format!(
             " ({} • esc to interrupt)",
@@ -3141,13 +3158,7 @@ fn collapsed_tool_preview_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
         return Vec::new();
     };
     let mut lines = vec![detail_line(false, QUIET, format!("diff {}", file.path))];
-    lines.extend(head_tail_lines(patch, 10).into_iter().map(|line| {
-        if line.truncated_marker {
-            detail_line(false, QUIET, line.text)
-        } else {
-            detail_spans_line(styled_output_spans(&line.text))
-        }
-    }));
+    lines.extend(render_diff_patch_preview_lines(patch, 10));
     lines
 }
 
@@ -4082,7 +4093,8 @@ fn expanded_edit_detail_lines(
         }
         lines.push(detail_line(false, QUIET, summary));
         if let Some(patch) = file.patch.as_deref().filter(|patch| !patch.is_empty()) {
-            lines.extend(output_block_lines("diff", patch, verbosity));
+            lines.push(detail_line(false, QUIET, "diff"));
+            lines.extend(render_diff_patch_full_lines(patch));
         }
     }
     if let Some(matches) = number_field(&tool.result.content, "matches") {
@@ -4227,6 +4239,70 @@ fn expanded_generic_tool_detail_lines(
 ) -> Vec<Line<'static>> {
     let preview = preview_tool_result(&tool.result, verbosity);
     output_block_lines("details", &preview, verbosity)
+}
+
+fn render_diff_patch_preview_lines(patch: &str, limit: usize) -> Vec<Line<'static>> {
+    let lines = filtered_diff_lines(patch);
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    head_tail_lines(&lines.join("\n"), limit)
+        .into_iter()
+        .map(|line| {
+            if line.truncated_marker {
+                detail_line(false, QUIET, line.text)
+            } else {
+                diff_detail_line(&line.text)
+            }
+        })
+        .collect()
+}
+
+fn render_diff_patch_full_lines(patch: &str) -> Vec<Line<'static>> {
+    filtered_diff_lines(patch)
+        .into_iter()
+        .map(|line| diff_detail_line(&line))
+        .collect()
+}
+
+fn filtered_diff_lines(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter(|line| !is_diff_metadata_line(line))
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_diff_metadata_line(line: &str) -> bool {
+    line.starts_with("diff --git ")
+        || line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+}
+
+fn diff_detail_line(content: &str) -> Line<'static> {
+    detail_spans_line(diff_output_spans(content))
+}
+
+fn diff_output_spans(line: &str) -> Vec<Span<'static>> {
+    let style = if line.starts_with("@@") {
+        Style::default()
+            .fg(DIFF_HUNK_FG)
+            .add_modifier(Modifier::BOLD)
+    } else if line.starts_with('+') {
+        Style::default()
+            .fg(DIFF_ADD_FG)
+            .bg(DIFF_ADD_BG)
+            .add_modifier(Modifier::BOLD)
+    } else if line.starts_with('-') {
+        Style::default()
+            .fg(DIFF_DEL_FG)
+            .bg(DIFF_DEL_BG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    vec![Span::styled(line.to_string(), style)]
 }
 
 fn output_block_lines(
@@ -5149,7 +5225,7 @@ fn format_status_hints(app: &TuiApp) -> String {
         return "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Esc cancel"
             .to_string();
     } else if app.cancel.is_some() {
-        return "Ctrl-C/Esc cancel · Ctrl+J newline · Ctrl-P task · Ctrl-E expand/collapse · Ctrl-Y copy · /help"
+        return "Ctrl-C/Esc interrupt · Ctrl+J newline · Ctrl-P task · Ctrl-E expand/collapse · Ctrl-Y copy · /help"
             .to_string();
     } else if app.exit_armed {
         return "Esc again to exit · Enter send · Ctrl+J newline · Ctrl-P task · Ctrl-E expand/collapse · /help"
@@ -5159,7 +5235,7 @@ fn format_status_hints(app: &TuiApp) -> String {
         "Enter send · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
             .to_string()
     } else {
-        "Enter send · Up/Down menu/history · Ctrl+J newline · PgUp/PgDn scroll · Ctrl-E expand/collapse · /help"
+        "Enter send · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
             .to_string()
     }
 }
@@ -5837,7 +5913,7 @@ enum TerminalMode {
 impl From<TuiAlternateScreen> for TerminalMode {
     fn from(value: TuiAlternateScreen) -> Self {
         match value {
-            TuiAlternateScreen::Auto => Self::AlternateScreen,
+            TuiAlternateScreen::Auto => Self::Inline,
             TuiAlternateScreen::Never => Self::Inline,
             TuiAlternateScreen::Always => Self::AlternateScreen,
         }
@@ -5859,8 +5935,14 @@ impl TerminalGuard {
         let mut stdout = io::stdout();
         match mode {
             TerminalMode::Inline => {
-                execute!(stdout, Print(DISABLE_MOUSE_MODES), EnableBracketedPaste)
-                    .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+                execute!(
+                    stdout,
+                    Print(CLEAR_SCROLLBACK_AND_VISIBLE),
+                    Print(DISABLE_MOUSE_MODES),
+                    DisableAlternateScroll,
+                    EnableBracketedPaste
+                )
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
             }
             TerminalMode::AlternateScreen => {
                 execute!(
@@ -5951,9 +6033,9 @@ impl Drop for TerminalGuard {
                     self.terminal.backend_mut(),
                     DisableBracketedPaste,
                     DisableAlternateScroll,
-                    Print(DISABLE_MOUSE_MODES)
+                    Print(DISABLE_MOUSE_MODES),
+                    Print(CLEAR_SCROLLBACK_AND_VISIBLE)
                 );
-                let _ = self.terminal.clear();
             }
             TerminalMode::AlternateScreen => {
                 let _ = execute!(

@@ -425,11 +425,11 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   `response_verbosity` controls answer-length guidance, `tool_output_verbosity`
   controls expanded tool-result preview size, `transcript_default` chooses
   compact or expanded transcript entries, `alternate_screen = "auto"` uses a
-  Codex-style alternate screen in normal terminals, `alternate_screen =
-  "always"` forces that dedicated full-screen buffer, `alternate_screen =
-  "never"` uses the inline viewport escape hatch for copy-friendly terminal
-  scrollback, and `show_reasoning_usage` hides or shows provider-reported
-  reasoning-token accounting when available.
+  Codex-style inline viewport with real terminal scrollback,
+  `alternate_screen = "always"` forces the dedicated full-screen transcript
+  buffer, `alternate_screen = "never"` also uses the inline viewport, and
+  `show_reasoning_usage` hides or shows provider-reported reasoning-token
+  accounting when available.
 
 Legacy top-level `provider`, `model`, and `profile` keys remain accepted, but
 new configuration should use `[model]`.

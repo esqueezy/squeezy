@@ -73,12 +73,12 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
         "missing toggle hint: {status}",
     );
     assert!(
-        status.contains("Wheel/PgUp/PgDn scroll"),
-        "missing scroll hint: {status}"
+        status.contains("Up/Down menu/history"),
+        "missing menu/history hint: {status}"
     );
     assert!(
-        status.contains("Alt+Up/Down history"),
-        "missing menu/history hint: {status}"
+        !status.contains("Wheel/PgUp/PgDn scroll"),
+        "default inline mode should leave wheel scrolling to the terminal: {status}"
     );
 }
 
@@ -219,7 +219,9 @@ async fn prompt_history_uses_plain_up_down_when_prompt_is_empty() {
 #[tokio::test]
 async fn alternate_screen_arrows_recall_history_when_prompt_is_empty() {
     let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    config.tui.alternate_screen = TuiAlternateScreen::Always;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
     push_input_history(&mut app, "first prompt".to_string());
     push_input_history(&mut app, "second prompt".to_string());
@@ -239,7 +241,9 @@ async fn alternate_screen_arrows_recall_history_when_prompt_is_empty() {
 #[tokio::test]
 async fn alternate_screen_arrows_scroll_transcript_when_draft_is_not_empty() {
     let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    config.tui.alternate_screen = TuiAlternateScreen::Always;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
     app.input = "hi".to_string();
     app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
     push_input_history(&mut app, "previous prompt".to_string());
@@ -280,7 +284,9 @@ async fn alternate_screen_arrows_scroll_transcript_when_draft_is_not_empty() {
 #[tokio::test]
 async fn alternate_screen_arrows_keep_scrolling_when_transcript_is_already_scrolled() {
     let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    config.tui.alternate_screen = TuiAlternateScreen::Always;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
     push_input_history(&mut app, "previous prompt".to_string());
     app.transcript_scroll_from_bottom = 3;
@@ -298,8 +304,22 @@ async fn alternate_screen_arrows_keep_scrolling_when_transcript_is_already_scrol
 }
 
 #[test]
-fn mouse_wheel_scrolls_transcript_without_prompt_history() {
+fn default_mouse_wheel_does_not_touch_prompt_history_or_transcript_scroll() {
     let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
+    push_input_history(&mut app, "previous prompt".to_string());
+
+    handle_mouse(&mut app, MouseEventKind::ScrollUp);
+
+    assert_eq!(app.transcript_scroll_from_bottom, 0);
+    assert!(app.input.is_empty());
+}
+
+#[test]
+fn explicit_alternate_screen_mouse_wheel_scrolls_transcript_without_prompt_history() {
+    let mut config = test_config(SessionMode::Build);
+    config.tui.alternate_screen = TuiAlternateScreen::Always;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
     push_input_history(&mut app, "previous prompt".to_string());
 
@@ -1028,6 +1048,51 @@ fn collapsed_edit_row_shows_diff_preview() {
 }
 
 #[test]
+fn edit_diff_preview_uses_dedicated_diff_colors() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("apply_patch", "");
+    result.content = serde_json::json!({
+        "checkpoint": {
+            "files": [{
+                "path": "src/lib.rs",
+                "additions": 1,
+                "deletions": 1,
+                "patch": "diff --git a/src/lib.rs b/src/lib.rs\nindex 123..456 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                "patch_truncated": false
+            }]
+        }
+    });
+    app.push_tool_result(result);
+
+    let lines = format_transcript_entry_with_width(
+        &app.transcript[0],
+        false,
+        ToolOutputVerbosity::Normal,
+        MessageOutcome::Normal,
+        Some(120),
+    );
+    let rendered = lines_to_plain_text(&lines);
+    assert!(!rendered.contains("diff --git"), "{rendered}");
+    assert!(!rendered.contains("index 123"), "{rendered}");
+
+    let add_span = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "+new")
+        .expect("add span");
+    assert_eq!(add_span.style.fg, Some(DIFF_ADD_FG));
+    assert_eq!(add_span.style.bg, Some(DIFF_ADD_BG));
+
+    let del_span = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "-old")
+        .expect("delete span");
+    assert_eq!(del_span.style.fg, Some(DIFF_DEL_FG));
+    assert_eq!(del_span.style.bg, Some(DIFF_DEL_BG));
+}
+
+#[test]
 fn retryable_apply_patch_failure_is_not_rendered_as_final_failure() {
     let mut app = test_app(SessionMode::Build);
     let mut result = sample_tool_result("apply_patch", "");
@@ -1425,7 +1490,7 @@ fn render_uses_two_line_status_footer() {
         "{output}"
     );
     assert!(!output.contains("ready"), "{output}");
-    assert!(output.contains("PgUp/PgDn scroll"), "{output}");
+    assert!(output.contains("Up/Down menu/history"), "{output}");
 }
 
 #[test]
@@ -1532,7 +1597,7 @@ fn auto_mode_is_default_terminal_model() {
     assert_eq!(config.tui.alternate_screen, TuiAlternateScreen::Auto);
     assert_eq!(
         TerminalMode::from(config.tui.alternate_screen),
-        TerminalMode::AlternateScreen
+        TerminalMode::Inline
     );
     assert_eq!(
         TerminalMode::from(TuiAlternateScreen::Never),
@@ -2177,7 +2242,7 @@ async fn esc_cancels_active_turn_and_requires_double_press_to_quit_when_idle() {
     .expect("active esc");
     assert!(!quit);
     assert!(cancel.is_cancelled());
-    assert_eq!(app.status, "cancelling");
+    assert_eq!(app.status, "interrupting");
 
     app.turn_rx = None;
     app.cancel = None;
@@ -2226,7 +2291,7 @@ async fn esc_cancels_pending_approval_without_active_turn() {
         ToolApprovalDecision::Cancelled
     );
     assert!(app.pending_approval.is_none());
-    assert_eq!(app.status, "cancelling");
+    assert_eq!(app.status, "interrupting");
     assert!(!app.exit_armed);
 }
 
@@ -2254,7 +2319,7 @@ async fn ctrl_c_cancels_pending_approval_without_exiting() {
         ToolApprovalDecision::Cancelled
     );
     assert!(app.pending_approval.is_none());
-    assert_eq!(app.status, "cancelling");
+    assert_eq!(app.status, "interrupting");
 }
 
 #[tokio::test]

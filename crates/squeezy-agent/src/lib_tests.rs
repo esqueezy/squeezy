@@ -996,11 +996,12 @@ async fn cancelling_turn_unblocks_pending_approval() {
         },
         ..Default::default()
     };
-    let agent = Agent::new(config, provider);
+    let agent = Agent::new(config, provider.clone());
     let cancel = CancellationToken::new();
     let mut rx = agent.start_turn("write file".to_string(), cancel.clone());
     let mut pending_decision = None;
     let mut saw_cancelled_tool = false;
+    let mut saw_cancelled_turn = false;
 
     tokio::time::timeout(Duration::from_secs(1), async {
         while let Some(event) = rx.recv().await {
@@ -1012,6 +1013,9 @@ async fn cancelling_turn_unblocks_pending_approval() {
                 AgentEvent::ToolCallCompleted { result, .. } => {
                     saw_cancelled_tool = result.status == ToolStatus::Cancelled;
                 }
+                AgentEvent::Cancelled { .. } => {
+                    saw_cancelled_turn = true;
+                }
                 _ => {}
             }
         }
@@ -1021,6 +1025,12 @@ async fn cancelling_turn_unblocks_pending_approval() {
 
     assert!(pending_decision.is_some());
     assert!(saw_cancelled_tool);
+    assert!(saw_cancelled_turn);
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "cancelled approval must not feed a cancelled tool result into another model round",
+    );
     assert!(!root.join("sample.txt").exists());
 
     let _ = fs::remove_dir_all(root);
