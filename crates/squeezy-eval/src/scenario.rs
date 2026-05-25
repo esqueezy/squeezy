@@ -32,6 +32,15 @@ pub enum WorkspaceSpec {
     Local {
         #[serde(rename = "local")]
         path: PathBuf,
+        /// When true, the workspace is materialized as a per-run snapshot
+        /// (git worktree if `<path>/.git` exists, otherwise an
+        /// ignore-respecting tree copy) so the agent never reads the
+        /// user's in-progress edits.
+        #[serde(default)]
+        snapshot: bool,
+        /// Git ref to snapshot. Defaults to `HEAD`.
+        #[serde(default)]
+        snapshot_ref: Option<String>,
     },
     Github {
         github: GithubWorkspace,
@@ -201,6 +210,9 @@ pub struct Expect {
     pub max_input_tokens: Option<u64>,
     #[serde(default)]
     pub no_tool_errors: bool,
+    /// Threshold for the `high_tool_burst` auto-finding. Defaults to 10.
+    #[serde(default)]
+    pub max_tools_per_turn: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -211,6 +223,14 @@ pub struct TriageConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub provider: Option<String>,
+    /// One-line summary of the surface area this scenario is testing.
+    /// Appended to the triage instructions so the LLM drops findings
+    /// unrelated to this area.
+    #[serde(default)]
+    pub focus: Option<String>,
+    /// Arbitrary extra prompt text appended verbatim after `focus`.
+    #[serde(default)]
+    pub extra_prompt: Option<String>,
 }
 
 pub fn load(path: &Path) -> Result<Scenario, EvalError> {

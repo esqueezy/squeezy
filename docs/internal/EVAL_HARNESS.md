@@ -72,6 +72,58 @@ markdown + one JSON per finding under `tickets/`. With
 create`. Local artifacts are the source of truth; failing to open a GH
 issue does not abort the run.
 
+## Per-run outputs
+
+Each run writes to `target/eval/<scenario-id>-<ts>/`:
+
+- `trace.jsonl` — structured event stream (one JSON object per line; schema_version=2).
+- `frames.jsonl` — one frame per turn. Each frame carries the assembled assistant markdown, per-tool-call breadcrumbs (`name`, `args_preview`, `args_sha256`, `status`), elapsed wall clock, token totals, and the per-turn USD cost.
+- `findings.jsonl` — auto-derived findings from the rule matcher (`duplicate_tool_call`, `repeated_turn_failure`, `stale_function_call_output`, `high_tool_burst`, `unsupported_slash_command`, `approval_unanswered`, plus `expect_*` rules promoted from soft expectations).
+- `run.json` — manifest with totals (events, frames, findings, `cost_micro_usd`, per-turn cost breakdown) plus scenario / workspace / provider / model metadata.
+- `tickets/` — markdown + JSON per ticket; when the session log is available a shared `tickets/session-bundle.tar.gz` is produced via `SessionStore::build_bug_report`, and each markdown body links to it under `## Bundle`.
+
+## Sandboxed local workspaces
+
+Set `snapshot = true` on a `[workspace]` `local = "..."` block (and optionally `snapshot_ref = "<ref>"`) to materialize a per-run snapshot before the agent runs. If the source is a git repo we use `git worktree add --detach`; otherwise we copy the tree respecting `.gitignore`. The scratch directory is cleaned up automatically. This keeps the agent off your in-progress edits.
+
+```toml
+[workspace]
+local = "."
+snapshot = true
+# snapshot_ref = "HEAD"  # optional
+```
+
+## Triage focus
+
+When triage is enabled, narrow the LLM's attention to one surface area to get sharper tickets:
+
+```toml
+[triage]
+enabled = true
+focus = "test /compact behavior"
+# extra_prompt = "Be terse and only flag transcript-state bugs."
+```
+
+## CI mode
+
+```sh
+squeezy-eval check crates/squeezy-eval/fixtures/scenarios \
+                   --fail-on expectations,errors \
+                   --junit target/eval/junit.xml
+```
+
+Iterates every `*.toml` scenario in the directory. `--fail-on` accepts a comma list of `findings`, `expectations`, `errors`. Exits non-zero when any scenario violates the policy. JUnit XML output is optional.
+
+## Diff
+
+Compare two run directories:
+
+```sh
+squeezy-eval diff target/eval/<run-a> target/eval/<run-b>
+```
+
+Prints a markdown delta covering totals, per-turn tool-call set difference (added/removed `(name, args_sha256)` pairs), unified text diff of assistant frames, and findings delta (new / resolved rule ids). Pass `--format json` for a structured payload.
+
 ## Offline / mock provider
 
 Set `[squeezy] provider = "mock"` to use the built-in scripted
