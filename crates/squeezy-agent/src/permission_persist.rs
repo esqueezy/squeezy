@@ -15,7 +15,7 @@ pub(crate) fn persist_permission_rule(path: &Path, rule: &PermissionRule) -> io:
         fs::create_dir_all(parent)?;
     }
     let lock_path = lock_path(path);
-    let _lock = FileLock::acquire(&lock_path, Duration::from_millis(250))?;
+    let _lock = FileLock::acquire(&lock_path, Duration::from_secs(5))?;
 
     let existing = match fs::read_to_string(path) {
         Ok(text) => text,
