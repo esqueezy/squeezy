@@ -1256,7 +1256,19 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
         .map(|f| f.label.len())
         .max()
         .unwrap_or(0);
-    for (idx, field) in section.fields.iter().enumerate() {
+
+    // When an editor is open, focus the pane on just the active field + the
+    // editor block, so the editor is always visible in small viewports.
+    // Otherwise list every field.
+    let editing = state.editor.is_some();
+    let fields_iter: Box<dyn Iterator<Item = (usize, &'static FieldMeta)>> = if editing {
+        let idx = state.field_index;
+        Box::new(std::iter::once((idx, &section.fields[idx])))
+    } else {
+        Box::new(section.fields.iter().enumerate())
+    };
+
+    for (idx, field) in fields_iter {
         let active = idx == state.field_index;
         let value = (field.get)(&state.effective);
         let value_str = value.as_display();
