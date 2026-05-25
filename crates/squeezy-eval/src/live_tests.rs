@@ -63,7 +63,7 @@ fn announces_tool_call_started_and_completed() {
             Some("T(1)"),
         );
     });
-    assert!(out.contains("🔧 grep("));
+    assert!(out.contains("🔧 grepping for `X`"));
     assert!(out.contains("✅ grep (1234B)"));
 }
 

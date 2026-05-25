@@ -17,6 +17,7 @@ use std::io::Write;
 use std::sync::Mutex;
 
 use serde_json::Value;
+use squeezy_tools::human_label_for_call;
 
 use crate::capture::EvalEventKind;
 use crate::scenario::{Action, Step};
@@ -103,14 +104,14 @@ impl LivePrinter {
             EvalEventKind::ToolCallStarted { call } => {
                 g.finish_assistant_chunk_inplace();
                 let name = call.get("name").and_then(Value::as_str).unwrap_or("?");
-                let args = call
+                let label = call
                     .get("arguments")
-                    .map(|v| serde_json::to_string(v).unwrap_or_default())
-                    .unwrap_or_default();
+                    .map(|args| human_label_for_call(name, args))
+                    .unwrap_or_else(|| name.to_string());
                 let _ = writeln!(
                     g.writer,
-                    "  🔧 {name}({args})",
-                    args = trim_oneline(&args, TOOL_ARG_PREVIEW_CHARS)
+                    "  🔧 {label}",
+                    label = trim_oneline(&label, TOOL_ARG_PREVIEW_CHARS)
                 );
                 let _ = g.writer.flush();
             }
