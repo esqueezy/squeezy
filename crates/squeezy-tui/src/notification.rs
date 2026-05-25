@@ -133,6 +133,28 @@ impl NotificationQueue {
         }
     }
 
+    /// Drop the currently visible notification. No-op when empty. Returns
+    /// `true` when the queue actually shrank.
+    pub(crate) fn dismiss_current(&mut self) -> bool {
+        if self.items.is_empty() {
+            return false;
+        }
+        let idx = self.current_index.min(self.items.len() - 1);
+        self.items.remove(idx);
+        if self.current_index >= self.items.len() {
+            self.current_index = 0;
+        }
+        true
+    }
+
+    /// Drop everything. Returns the number of items removed.
+    pub(crate) fn clear_all(&mut self) -> usize {
+        let n = self.items.len();
+        self.items.clear();
+        self.current_index = 0;
+        n
+    }
+
     /// Drop expired items, advance rotation if it's time. Returns `true` if
     /// the visible item changed (caller should redraw). Idempotent and cheap
     /// — safe to call on every animation tick.

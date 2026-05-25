@@ -3475,6 +3475,45 @@ fn arm_then_drain_applies_swap_with_optional_provider() {
 }
 
 #[tokio::test]
+async fn drained_swap_makes_next_request_carry_new_model_id() {
+    // Build a provider that records every request it sees and answers with
+    // a single Completed event so the turn loop terminates promptly.
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_swap".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let mut agent = Agent::new(AppConfig::default(), provider.clone());
+    let original_model = agent.config_snapshot().model.clone();
+
+    let mut next = agent.config_snapshot();
+    next.model = "claude-haiku-4-5-20251001".to_string();
+    agent.arm_config_swap(PendingConfigSwap {
+        config: next,
+        provider: None,
+        display_note: None,
+    });
+    // Drain the swap (this is what the TUI does at the top of each new
+    // user turn) then run a real start_turn against the MockProvider.
+    let _drained = agent.drain_pending_swap().expect("swap was armed");
+
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "expected one provider request");
+    assert_eq!(
+        requests[0].model.as_ref(),
+        "claude-haiku-4-5-20251001",
+        "swapped model id should reach the wire (was {})",
+        original_model
+    );
+}
+
+#[tokio::test]
 async fn plan_mode_request_user_input_pauses_turn_and_resumes_with_choice() {
     use super::{REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputResponse};
 
