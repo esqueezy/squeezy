@@ -53,6 +53,7 @@ use tree_sitter::{Node, Parser};
 
 const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_BYTES_PER_FILE: usize = 1_000_000;
+const CHECKPOINTS_DISABLED_MESSAGE: &str = "checkpointing is disabled by default; commit or stash with git, or set [tools].checkpoints_enabled = true to re-enable Squeezy checkpoints";
 const DEFAULT_MAX_MATCHES: usize = 100;
 const DEFAULT_OUTPUT_BYTE_CAP: usize = 24_000;
 const DEFAULT_READ_LIMIT: usize = 32_000;
@@ -178,6 +179,7 @@ pub struct ToolRuntimeConfig {
     pub web: WebToolConfig,
     pub shell_sandbox: ShellSandboxConfig,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+    pub checkpoints_enabled: bool,
 }
 
 impl Default for ToolOutputConfig {
@@ -463,7 +465,7 @@ pub struct ToolRegistry {
     /// (or `new_with_configs_skills_and_mcp`) with a populated
     /// [`ToolRegistryRuntime`].
     state_store: Option<Arc<SqueezyStore>>,
-    checkpoints: Arc<CheckpointStore>,
+    checkpoints: Option<Arc<CheckpointStore>>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
     skills: Arc<SkillCatalog>,
     redactor: Arc<Redactor>,
@@ -788,6 +790,7 @@ impl ToolRegistry {
                 web: web_config,
                 shell_sandbox,
                 mcp_servers: BTreeMap::new(),
+                checkpoints_enabled: false,
             },
             skills,
             crawl_options_from_graph_config(graph_config),
@@ -836,6 +839,7 @@ impl ToolRegistry {
                 web: web_config,
                 shell_sandbox,
                 mcp_servers: BTreeMap::new(),
+                checkpoints_enabled: false,
             },
             skills,
             crawl_options,
@@ -869,7 +873,11 @@ impl ToolRegistry {
         .ok();
         let vcs = GitVcs::open(&root)?;
         let shell_audit = ShellAuditStore::new(&root);
-        let checkpoints = CheckpointStore::open(&root)?;
+        let checkpoints = if config.checkpoints_enabled {
+            Some(Arc::new(CheckpointStore::open(&root)?))
+        } else {
+            None
+        };
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -878,7 +886,7 @@ impl ToolRegistry {
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
             state_store,
-            checkpoints: Arc::new(checkpoints),
+            checkpoints,
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(skills),
             redactor,
@@ -910,7 +918,6 @@ impl ToolRegistry {
                 .ok();
         let vcs = GitVcs::open(&root)?;
         let shell_audit = ShellAuditStore::new(&root);
-        let checkpoints = CheckpointStore::open(&root)?;
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -919,7 +926,7 @@ impl ToolRegistry {
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
             state_store: None,
-            checkpoints: Arc::new(checkpoints),
+            checkpoints: None,
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(SkillCatalog::empty()),
             redactor: Arc::new(Redactor::default()),
@@ -1092,10 +1099,6 @@ impl ToolRegistry {
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = vec![
             apply_patch_spec(),
-            checkpoint_list_spec(),
-            checkpoint_revert_spec(),
-            checkpoint_show_spec(),
-            checkpoint_undo_spec(),
             decl_search_spec(),
             definition_search_spec(),
             diff_context_spec(),
@@ -1120,6 +1123,14 @@ impl ToolRegistry {
             list_skills_spec(),
             load_skill_spec(),
         ];
+        if self.checkpoints.is_some() {
+            specs.extend([
+                checkpoint_list_spec(),
+                checkpoint_revert_spec(),
+                checkpoint_show_spec(),
+                checkpoint_undo_spec(),
+            ]);
+        }
         specs.extend(self.mcp.tools().into_iter().map(mcp_tool_spec));
         specs.sort_by(|left, right| left.name.cmp(&right.name));
         specs
@@ -1786,7 +1797,21 @@ impl ToolRegistry {
         if let Err(err) = serde_json::from_value::<CheckpointListArgs>(call.arguments.clone()) {
             return tool_arg_error(call, err);
         }
-        match self.checkpoints.read_journal() {
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return make_result(
+                call,
+                ToolStatus::Success,
+                json!({
+                    "enabled": false,
+                    "checkpoints": [],
+                    "journal_warnings": 0,
+                    "message": CHECKPOINTS_DISABLED_MESSAGE,
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        };
+        match checkpoints.read_journal() {
             Ok(journal) => {
                 let mut checkpoints = journal.checkpoints;
                 checkpoints.sort_by_key(|record| std::cmp::Reverse(record.created_at_ms));
@@ -1813,7 +1838,10 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
-        match self.checkpoints.show_checkpoint(&args.checkpoint_id) {
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return checkpoints_disabled_result(call);
+        };
+        match checkpoints.show_checkpoint(&args.checkpoint_id) {
             Ok(Some(checkpoint)) => make_result(
                 call,
                 ToolStatus::Success,
@@ -1840,10 +1868,10 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
-        match self
-            .checkpoints
-            .rollback(RollbackTarget::Latest, args.mode.unwrap_or_default())
-        {
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return checkpoints_disabled_result(call);
+        };
+        match checkpoints.rollback(RollbackTarget::Latest, args.mode.unwrap_or_default()) {
             Ok(result) => {
                 self.invalidate_diff_cache();
                 make_result(
@@ -1877,10 +1905,10 @@ impl ToolRegistry {
                 );
             }
         };
-        match self
-            .checkpoints
-            .rollback(target, args.mode.unwrap_or_default())
-        {
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return checkpoints_disabled_result(call);
+        };
+        match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
             Ok(result) => {
                 self.invalidate_diff_cache();
                 make_result(
@@ -4394,7 +4422,7 @@ impl ToolRegistry {
             );
         }
 
-        let checkpoint_before = match self.checkpoints.track_tree() {
+        let checkpoint_before = match self.track_checkpoint_tree() {
             Ok(snapshot) => snapshot,
             Err(err) => return tool_error(call, err),
         };
@@ -4426,7 +4454,7 @@ impl ToolRegistry {
             });
             self.append_checkpoint_to_content(
                 &mut error_content,
-                &checkpoint_before,
+                checkpoint_before.as_ref(),
                 call,
                 group_id,
                 ToolStatus::Error,
@@ -4455,7 +4483,7 @@ impl ToolRegistry {
         });
         self.append_checkpoint_to_content(
             &mut content,
-            &checkpoint_before,
+            checkpoint_before.as_ref(),
             call,
             group_id,
             ToolStatus::Success,
@@ -4596,7 +4624,7 @@ impl ToolRegistry {
             );
         }
 
-        let checkpoint_before = match self.checkpoints.track_tree() {
+        let checkpoint_before = match self.track_checkpoint_tree() {
             Ok(snapshot) => snapshot,
             Err(err) => return tool_error(call, err),
         };
@@ -4641,7 +4669,7 @@ impl ToolRegistry {
         });
         self.append_checkpoint_to_content(
             &mut content,
-            &checkpoint_before,
+            checkpoint_before.as_ref(),
             call,
             group_id,
             ToolStatus::Success,
@@ -4704,9 +4732,11 @@ impl ToolRegistry {
             .output_byte_cap
             .unwrap_or(DEFAULT_SHELL_OUTPUT_BYTE_CAP)
             .min(MAX_SHELL_OUTPUT_BYTE_CAP);
-        let checkpoint_before = if shell_command_needs_checkpoint(direct_user_shell, &analysis) {
-            match self.checkpoints.track_tree() {
-                Ok(snapshot) => Some(snapshot),
+        let checkpoint_before = if shell_command_needs_checkpoint(direct_user_shell, &analysis)
+            && self.checkpoints.is_some()
+        {
+            match self.track_checkpoint_tree() {
+                Ok(snapshot) => snapshot,
                 Err(err) => return tool_error(call, err),
             }
         } else {
@@ -4980,7 +5010,7 @@ impl ToolRegistry {
         if let Some(checkpoint_before) = checkpoint_before.as_ref() {
             self.append_checkpoint_to_content(
                 &mut raw_content,
-                checkpoint_before,
+                Some(checkpoint_before),
                 call,
                 group_id,
                 status,
@@ -5520,16 +5550,26 @@ impl ToolRegistry {
             .to_path_buf()
     }
 
+    fn track_checkpoint_tree(&self) -> Result<Option<WorkspaceSnapshot>> {
+        self.checkpoints
+            .as_ref()
+            .map(|checkpoints| checkpoints.track_tree())
+            .transpose()
+    }
+
     fn append_checkpoint_to_content(
         &self,
         content: &mut Value,
-        before: &WorkspaceSnapshot,
+        before: Option<&WorkspaceSnapshot>,
         call: &ToolCall,
         group_id: &str,
         status: ToolStatus,
         coverage_warnings: Vec<String>,
     ) {
-        match self.checkpoints.create_checkpoint(
+        let (Some(checkpoints), Some(before)) = (self.checkpoints.as_ref(), before) else {
+            return;
+        };
+        match checkpoints.create_checkpoint(
             before,
             &call.name,
             &call.call_id,
@@ -10409,6 +10449,19 @@ fn shell_command_needs_checkpoint(
         }
         _ => true,
     }
+}
+
+fn checkpoints_disabled_result(call: &ToolCall) -> ToolResult {
+    make_result(
+        call,
+        ToolStatus::Stale,
+        json!({
+            "enabled": false,
+            "error": CHECKPOINTS_DISABLED_MESSAGE,
+        }),
+        ToolCostHint::default(),
+        None,
+    )
 }
 
 fn tool_arg_error(call: &ToolCall, err: serde_json::Error) -> ToolResult {

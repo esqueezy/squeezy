@@ -117,6 +117,7 @@ fn config_without_env_uses_openai_provider_defaults() {
         config.max_search_files_per_turn,
         DEFAULT_MAX_SEARCH_FILES_PER_TURN
     );
+    assert!(!config.checkpoints_enabled);
     assert!(config.tools.lazy_schema_loading);
     assert!(config.tools.core.contains(&"grep".to_string()));
     assert!(config.tools.core.contains(&"plan_patch".to_string()));
@@ -330,6 +331,7 @@ fn config_reads_supported_env_overrides() {
         "SQUEEZY_TELEMETRY" => Some("off".to_string()),
         "SQUEEZY_TELEMETRY_ENDPOINT" => Some("https://telemetry.example/v1/batch".to_string()),
         "SQUEEZY_SESSION_MODE" => Some("plan".to_string()),
+        "SQUEEZY_CHECKPOINTS_ENABLED" => Some("true".to_string()),
         "SQUEEZY_SKILLS_USER_DIR" => Some("/tmp/squeezy-skills".to_string()),
         "SQUEEZY_SKILLS_COMPAT_USER_DIR" => Some("/tmp/agent-skills".to_string()),
         _ => None,
@@ -340,6 +342,7 @@ fn config_reads_supported_env_overrides() {
     assert_eq!(config.permissions.shell, PermissionMode::Deny);
     assert_eq!(config.permissions.web, PermissionMode::Allow);
     assert_eq!(config.session_mode, SessionMode::Plan);
+    assert!(config.checkpoints_enabled);
     assert!(config.store_responses);
     assert_eq!(config.max_output_tokens, Some(64_000));
     assert_eq!(config.max_parallel_tools, 3);
@@ -1114,6 +1117,7 @@ root = ".squeezy/cache"
 tool_outputs = ".squeezy/tool_outputs"
 
 [tools]
+checkpoints_enabled = true
 lazy_schema_loading = true
 core = ["webfetch"]
 discoverable = ["read_file"]
@@ -1175,6 +1179,7 @@ reason = "docs lookups are safe"
         config.cache.tool_outputs,
         Some(PathBuf::from(".squeezy/tool_outputs"))
     );
+    assert!(config.checkpoints_enabled);
     assert!(config.tools.lazy_schema_loading);
     assert!(config.tools.core.contains(&"webfetch".to_string()));
     assert!(!config.tools.core.contains(&"read_file".to_string()));

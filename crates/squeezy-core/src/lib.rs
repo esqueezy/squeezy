@@ -131,6 +131,7 @@ pub struct AppConfig {
     pub graph: GraphConfig,
     pub cache: CacheConfig,
     pub tools: ToolSchemaConfig,
+    pub checkpoints_enabled: bool,
     pub tui: TuiConfig,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub config_sources: Vec<String>,
@@ -447,7 +448,12 @@ impl AppConfig {
         );
         let graph = GraphConfig::from_settings(settings.graph.unwrap_or_default());
         let cache = CacheConfig::from_settings(settings.cache.unwrap_or_default());
-        let tools = ToolSchemaConfig::from_settings(settings.tools.unwrap_or_default())?;
+        let tool_settings = settings.tools.unwrap_or_default();
+        let checkpoints_enabled = get_var("SQUEEZY_CHECKPOINTS_ENABLED")
+            .as_deref()
+            .map(parse_enabled_bool)
+            .unwrap_or(tool_settings.checkpoints_enabled.unwrap_or(false));
+        let tools = ToolSchemaConfig::from_settings(tool_settings)?;
         let session_logs = SessionLogConfig::from_settings(&session_settings);
         let context_compaction = ContextCompactionConfig::from_settings_and_env(
             settings.context.unwrap_or_default(),
@@ -497,6 +503,7 @@ impl AppConfig {
             graph,
             cache,
             tools,
+            checkpoints_enabled,
             tui,
             mcp_servers,
             config_sources: sources,
@@ -859,6 +866,10 @@ impl AppConfig {
         output.push('\n');
 
         output.push_str("[tools]\n");
+        output.push_str(&format!(
+            "checkpoints_enabled = {}\n",
+            self.checkpoints_enabled
+        ));
         output.push_str(&format!(
             "lazy_schema_loading = {}\n",
             self.tools.lazy_schema_loading
@@ -1653,6 +1664,7 @@ impl ToolSchemaConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ToolSchemaSettings {
+    pub checkpoints_enabled: Option<bool>,
     pub lazy_schema_loading: Option<bool>,
     pub core: Option<Vec<String>>,
     pub discoverable: Option<Vec<String>>,
@@ -1662,11 +1674,22 @@ impl ToolSchemaSettings {
     fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
         reject_unknown_keys(
             table,
-            &["lazy_schema_loading", "core", "discoverable"],
+            &[
+                "checkpoints_enabled",
+                "lazy_schema_loading",
+                "core",
+                "discoverable",
+            ],
             source,
             path,
         )?;
         Ok(Self {
+            checkpoints_enabled: bool_value(
+                table,
+                "checkpoints_enabled",
+                source,
+                &field(path, "checkpoints_enabled"),
+            )?,
             lazy_schema_loading: bool_value(
                 table,
                 "lazy_schema_loading",
@@ -1684,6 +1707,7 @@ impl ToolSchemaSettings {
     }
 
     fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.checkpoints_enabled, next.checkpoints_enabled);
         replace_if_some(&mut self.lazy_schema_loading, next.lazy_schema_loading);
         merge_string_lists(&mut self.core, next.core);
         merge_string_lists(&mut self.discoverable, next.discoverable);
@@ -4420,6 +4444,7 @@ pub fn user_settings_template() -> &'static str {
 # compat_user_dir = "~/.agents/skills"
 
 # [tools]
+# checkpoints_enabled = false
 # lazy_schema_loading = true
 # `update_task_state` and `load_tool_schema` are always-core control tools
 # and do not need to appear in `core`. See `DEFAULT_CORE_TOOL_NAMES` in
@@ -4527,6 +4552,7 @@ pub fn project_settings_template() -> &'static str {
 # tool_outputs = ".squeezy/tool_outputs"
 
 # [tools]
+# checkpoints_enabled = false
 # lazy_schema_loading = true
 # `update_task_state` and `load_tool_schema` are always-core control tools
 # and do not need to appear in `core`. See `DEFAULT_CORE_TOOL_NAMES` in
@@ -6485,7 +6511,7 @@ fn normalize_task_text(text: String, limit: usize) -> String {
     output
 }
 
-pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Respond in the user's language and do not mix languages unless the user asks, code/source text requires it, or you are translating/quoting. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Treat websearch and webfetch results as remote documentation evidence, cite source URLs from their citation metadata when relying on them, and keep remote docs distinct from local code or graph facts. Do not invent URLs. When shell output directly answers the user's request, do not wrap it in Markdown fences; use a short `command in cwd:` heading and plain terminal text, or summarize briefly if the interface already shows the output. If a tool call is denied, do not retry the same call.";
+pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Treat websearch and webfetch results as remote documentation evidence, cite source URLs from their citation metadata when relying on them, and keep remote docs distinct from local code or graph facts. Do not invent URLs. When shell output directly answers the user's request, do not wrap it in Markdown fences; use a short `command in cwd:` heading and plain terminal text, or summarize briefly if the interface already shows the output. If a tool call is denied, do not retry the same call.";
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

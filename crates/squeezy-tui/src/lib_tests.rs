@@ -1173,7 +1173,7 @@ fn command_and_output_highlighters_style_key_parts() {
     );
 
     let ansi = ansi_spans("\u{1b}[32mok\u{1b}[0m error");
-    assert_eq!(ansi[0].style.fg, Some(Color::Green));
+    assert_eq!(ansi[0].style.fg, Some(SUCCESS_GREEN));
 
     let keyword = keyword_spans("public class Foo { return ok; }");
     assert!(
@@ -1763,7 +1763,7 @@ fn assistant_marker_uses_answer_color() {
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
 
     assert_eq!(lines[0].spans[1].content.as_ref(), "●");
-    assert_eq!(lines[0].spans[1].style.fg, Some(Color::Green));
+    assert_eq!(lines[0].spans[1].style.fg, Some(SUCCESS_GREEN));
     assert_eq!(lines[0].spans[3].content.as_ref(), "done");
     assert_eq!(
         lines.last().expect("trailing blank").spans.len(),

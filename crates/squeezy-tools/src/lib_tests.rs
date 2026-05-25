@@ -23,6 +23,41 @@ fn registry_with_shell_sandbox_off(root: &Path) -> ToolRegistry {
     registry_with_shell_sandbox_off_and_output_config(root, ToolOutputConfig::default())
 }
 
+fn registry_with_checkpoints(root: &Path) -> ToolRegistry {
+    registry_with_runtime_config(
+        root,
+        ToolRuntimeConfig {
+            checkpoints_enabled: true,
+            ..ToolRuntimeConfig::default()
+        },
+    )
+}
+
+fn registry_with_shell_sandbox_off_and_checkpoints(root: &Path) -> ToolRegistry {
+    registry_with_runtime_config(
+        root,
+        ToolRuntimeConfig {
+            shell_sandbox: squeezy_core::ShellSandboxConfig {
+                mode: squeezy_core::ShellSandboxMode::Off,
+                ..squeezy_core::ShellSandboxConfig::default()
+            },
+            checkpoints_enabled: true,
+            ..ToolRuntimeConfig::default()
+        },
+    )
+}
+
+fn registry_with_runtime_config(root: &Path, config: ToolRuntimeConfig) -> ToolRegistry {
+    ToolRegistry::new_with_configs_skills_and_mcp(
+        root,
+        config,
+        SkillsConfig::default(),
+        &GraphConfig::default(),
+        ToolRegistryRuntime::default(),
+    )
+    .expect("registry")
+}
+
 fn registry_with_shell_sandbox_off_and_output_config(
     root: &Path,
     output_config: ToolOutputConfig,
@@ -1226,7 +1261,7 @@ async fn plan_patch_reports_graph_impact_and_locality_warning() {
 async fn apply_patch_edits_file_and_checkpoint_undo_restores_it() {
     let root = temp_workspace("apply_patch_undo");
     fs::write(root.join("sample.txt"), "before\n").expect("write sample");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -1348,7 +1383,7 @@ async fn apply_patch_rejects_stale_hash_without_modifying_file() {
 async fn apply_patch_rejects_multiple_matches_unless_allowed() {
     let root = temp_workspace("apply_patch_multiple");
     fs::write(root.join("sample.txt"), "same same\n").expect("write sample");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_checkpoints(&root);
 
     let rejected = registry
         .execute(
@@ -1467,7 +1502,7 @@ async fn apply_patch_partial_failure_records_checkpoint_for_undo() {
     let mut perms = fs::metadata(&read_only).expect("read meta").permissions();
     perms.set_mode(0o444);
     fs::set_permissions(&read_only, perms).expect("set readonly");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -1956,7 +1991,7 @@ async fn write_file_rejects_stale_expected_hash() {
 async fn write_file_creates_checkpoint_and_checkpoint_undo_restores_file() {
     let root = temp_workspace("checkpoint_write_undo");
     fs::write(root.join("sample.txt"), "before").expect("write sample");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -2002,11 +2037,70 @@ async fn write_file_creates_checkpoint_and_checkpoint_undo_restores_file() {
 }
 
 #[tokio::test]
+async fn checkpointing_is_disabled_by_default_for_mutations() {
+    let root = temp_workspace("checkpoint_disabled_default");
+    fs::write(root.join("sample.txt"), "before").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "write".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "content": "after",
+                    "expected_sha256": sha256_hex("before".as_bytes()),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-disabled".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.content.get("checkpoint").is_none());
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "after"
+    );
+
+    let undo = registry
+        .execute(
+            ToolCall {
+                call_id: "undo".to_string(),
+                name: "checkpoint_undo".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(undo.status, ToolStatus::Stale);
+    assert_eq!(undo.content["enabled"], false);
+
+    let list = registry
+        .execute(
+            ToolCall {
+                call_id: "list".to_string(),
+                name: "checkpoint_list".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(list.status, ToolStatus::Success);
+    assert_eq!(list.content["enabled"], false);
+    assert_eq!(list.content["checkpoints"].as_array().unwrap().len(), 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn shell_created_file_is_checkpointed_and_deleted_on_undo() {
     let root = temp_workspace("checkpoint_shell_undo");
     // Disable the OS sandbox so this test focuses on checkpoint behavior;
     // OS sandbox backend coverage lives in shell_sandbox_tests.
-    let registry = registry_with_shell_sandbox_off(&root);
+    let registry = registry_with_shell_sandbox_off_and_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -2149,7 +2243,7 @@ async fn read_only_git_shell_skips_checkpoint() {
 #[tokio::test]
 async fn model_shell_cannot_request_direct_user_shell_fast_path() {
     let root = temp_workspace("direct_user_shell_model_guard");
-    let registry = registry_with_shell_sandbox_off(&root);
+    let registry = registry_with_shell_sandbox_off_and_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -2183,7 +2277,7 @@ async fn shell_checkpoint_ignores_gitignored_target_outputs() {
     large
         .set_len(3 * 1024 * 1024)
         .expect("write large placeholder");
-    let registry = registry_with_shell_sandbox_off(&root);
+    let registry = registry_with_shell_sandbox_off_and_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -2211,7 +2305,7 @@ async fn shell_checkpoint_ignores_gitignored_target_outputs() {
 async fn checkpoint_undo_reports_conflict_and_preserves_dirty_user_change() {
     let root = temp_workspace("checkpoint_conflict");
     fs::write(root.join("sample.txt"), "before").expect("write sample");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -2260,7 +2354,7 @@ async fn checkpoint_undo_best_effort_restores_clean_files_while_reporting_confli
     let root = temp_workspace("checkpoint_best_effort");
     fs::write(root.join("a.txt"), "before-a").expect("write a");
     fs::write(root.join("b.txt"), "before-b").expect("write b");
-    let registry = registry_with_shell_sandbox_off(&root);
+    let registry = registry_with_shell_sandbox_off_and_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -2309,7 +2403,7 @@ async fn checkpoint_undo_best_effort_restores_clean_files_while_reporting_confli
 async fn checkpoint_revert_group_restores_multiple_actions_in_reverse_order() {
     let root = temp_workspace("checkpoint_group_revert");
     fs::write(root.join("sample.txt"), "one").expect("write sample");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_checkpoints(&root);
 
     for (call_id, before, after) in [("write1", "one", "two"), ("write2", "two", "three")] {
         let result = registry
@@ -2355,7 +2449,7 @@ async fn checkpoint_revert_group_restores_multiple_actions_in_reverse_order() {
 async fn checkpoint_show_returns_patch_metadata_for_specific_checkpoint() {
     let root = temp_workspace("checkpoint_show");
     fs::write(root.join("sample.txt"), "before\n").expect("write sample");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -2410,7 +2504,7 @@ fn suspicious_shell_mutation_reports_checkpoint_coverage_warning() {
 #[tokio::test]
 async fn shell_checkpoint_surfaces_coverage_warnings_inline() {
     let root = temp_workspace("checkpoint_inline_warnings");
-    let registry = registry_with_shell_sandbox_off(&root);
+    let registry = registry_with_shell_sandbox_off_and_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -2446,7 +2540,7 @@ async fn shell_checkpoint_surfaces_coverage_warnings_inline() {
 async fn noop_shell_produces_no_checkpoint_so_undo_targets_real_edit() {
     let root = temp_workspace("checkpoint_noop_undo");
     fs::write(root.join("sample.txt"), "before").expect("write sample");
-    let registry = registry_with_shell_sandbox_off(&root);
+    let registry = registry_with_shell_sandbox_off_and_checkpoints(&root);
 
     let edit = registry
         .execute_for_group(
@@ -4040,10 +4134,6 @@ fn tool_specs_are_sorted_by_name() {
         names,
         vec![
             "apply_patch",
-            "checkpoint_list",
-            "checkpoint_revert",
-            "checkpoint_show",
-            "checkpoint_undo",
             "decl_search",
             "definition_search",
             "diff_context",
@@ -4067,6 +4157,22 @@ fn tool_specs_are_sorted_by_name() {
             "webfetch",
             "websearch",
             "write_file"
+        ]
+    );
+
+    let checkpoint_names = registry_with_checkpoints(&root)
+        .specs()
+        .into_iter()
+        .filter(|spec| spec.name.starts_with("checkpoint_"))
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        checkpoint_names,
+        vec![
+            "checkpoint_list",
+            "checkpoint_revert",
+            "checkpoint_show",
+            "checkpoint_undo"
         ]
     );
 

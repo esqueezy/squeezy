@@ -58,13 +58,14 @@ const SHELL_COLLAPSED_OUTPUT_PREVIEW_LINES: usize = 80;
 const AMBER: Color = Color::Rgb(252, 211, 77);
 const GOLD: Color = Color::Rgb(254, 240, 138);
 const MODE_PURPLE: Color = Color::Rgb(216, 180, 254);
-const MODE_BUILD_GREEN: Color = Color::Rgb(187, 247, 208);
+const SUCCESS_GREEN: Color = Color::Rgb(22, 101, 52);
+const MODE_BUILD_GREEN: Color = Color::Rgb(34, 117, 64);
 const ERROR_RED: Color = Color::Rgb(248, 113, 113);
 const QUIET: Color = Color::DarkGray;
 const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
 const WORKING_SHIMMER_HIGHLIGHT: Color = Color::Rgb(255, 251, 235);
-const DIFF_ADD_FG: Color = Color::Rgb(134, 239, 172);
-const DIFF_ADD_BG: Color = Color::Rgb(20, 48, 33);
+const DIFF_ADD_FG: Color = Color::Rgb(21, 128, 61);
+const DIFF_ADD_BG: Color = Color::Rgb(14, 36, 24);
 const DIFF_DEL_FG: Color = Color::Rgb(252, 165, 165);
 const DIFF_DEL_BG: Color = Color::Rgb(63, 28, 28);
 const DIFF_HUNK_FG: Color = Color::Rgb(254, 240, 138);
@@ -2627,7 +2628,7 @@ fn task_status_label_color(status: squeezy_core::TaskStateStatus) -> (&'static s
     match status {
         squeezy_core::TaskStateStatus::Running => ("Working", AMBER),
         squeezy_core::TaskStateStatus::Blocked => ("Blocked", GOLD),
-        squeezy_core::TaskStateStatus::Completed => ("Done", Color::Green),
+        squeezy_core::TaskStateStatus::Completed => ("Done", SUCCESS_GREEN),
         squeezy_core::TaskStateStatus::Cancelled => ("Cancelled", ERROR_RED),
         squeezy_core::TaskStateStatus::Failed => ("Failed", ERROR_RED),
     }
@@ -3082,7 +3083,7 @@ fn format_assistant_message_entry(
     let color = if outcome == MessageOutcome::Failed {
         ERROR_RED
     } else {
-        Color::Green
+        SUCCESS_GREEN
     };
     let mut lines = if collapsed {
         vec![assistant_line(
@@ -3183,7 +3184,7 @@ fn format_log_entry(message: &str, collapsed: bool, selected: bool) -> Vec<Line<
 fn role_action(role: &Role) -> (&'static str, Color) {
     match role {
         Role::User => ("Asked", AMBER),
-        Role::Assistant => ("Answered", Color::Green),
+        Role::Assistant => ("Answered", SUCCESS_GREEN),
         Role::System => ("Noted", GOLD),
     }
 }
@@ -4533,7 +4534,7 @@ fn command_spans(command: &str) -> Vec<Span<'static>> {
         } else if token.starts_with('-') {
             Style::default().fg(AMBER)
         } else if token.starts_with('"') || token.starts_with('\'') {
-            Style::default().fg(Color::LightGreen)
+            Style::default().fg(SUCCESS_GREEN)
         } else if token.contains('/') || token.contains('.') {
             Style::default().fg(Color::White)
         } else {
@@ -4605,7 +4606,7 @@ fn apply_sgr_codes(style: &mut Style, code: &str) {
             1 => *style = style.add_modifier(Modifier::BOLD),
             30 => *style = style.fg(Color::Black),
             31 => *style = style.fg(Color::Red),
-            32 => *style = style.fg(Color::Green),
+            32 => *style = style.fg(SUCCESS_GREEN),
             33 => *style = style.fg(Color::Yellow),
             34 => *style = style.fg(Color::Blue),
             35 => *style = style.fg(Color::Magenta),
@@ -4613,7 +4614,7 @@ fn apply_sgr_codes(style: &mut Style, code: &str) {
             37 => *style = style.fg(Color::White),
             90 => *style = style.fg(Color::DarkGray),
             91 => *style = style.fg(Color::LightRed),
-            92 => *style = style.fg(Color::LightGreen),
+            92 => *style = style.fg(SUCCESS_GREEN),
             93 => *style = style.fg(Color::LightYellow),
             94 => *style = style.fg(Color::LightBlue),
             95 => *style = style.fg(Color::LightMagenta),
@@ -4656,7 +4657,7 @@ fn push_keyword_token(spans: &mut Vec<Span<'static>>, token: &mut String) {
         Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
     } else if matches!(lower.as_str(), "ok" | "passed" | "success" | "done") {
         Style::default()
-            .fg(Color::Green)
+            .fg(SUCCESS_GREEN)
             .add_modifier(Modifier::BOLD)
     } else if matches!(
         lower.as_str(),
@@ -4920,7 +4921,7 @@ fn preview_tool_result(result: &ToolResult, verbosity: ToolOutputVerbosity) -> S
 
 fn status_color(status: ToolStatus) -> Color {
     match status {
-        ToolStatus::Success => Color::Green,
+        ToolStatus::Success => SUCCESS_GREEN,
         ToolStatus::Error | ToolStatus::Stale => ERROR_RED,
         ToolStatus::Denied | ToolStatus::Cancelled => GOLD,
     }
@@ -5005,7 +5006,7 @@ impl TurnVisualState {
                     AMBER
                 }
             }
-            Self::Succeeded => Color::Green,
+            Self::Succeeded => SUCCESS_GREEN,
             Self::Failed => ERROR_RED,
         }
     }
