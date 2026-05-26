@@ -19,6 +19,7 @@ mod bedrock;
 mod compatible;
 mod credentials;
 mod google;
+mod lmstudio;
 pub mod model_discovery;
 mod ollama;
 mod openai;
@@ -36,7 +37,13 @@ pub use bedrock::BedrockProvider;
 pub use compatible::OpenAiCompatibleProvider;
 pub use credentials::{KeySource, ResolvedKey, resolve_api_key, resolve_api_key_with_inline};
 pub use google::GoogleProvider;
-pub use ollama::{OllamaProvider, fetch_ollama_context_window, fetch_ollama_model_names};
+pub use lmstudio::{
+    DEFAULT_LMSTUDIO_BASE_URL, LMStudioConfig, LMStudioProvider, fetch_lmstudio_model_names,
+};
+pub use ollama::{
+    OllamaProvider, PullEvent, PullStream, fetch_ollama_context_window, fetch_ollama_model_names,
+    pull_model,
+};
 pub use openai::OpenAiProvider;
 pub use registry::{
     MODEL_REGISTRY, ModelCapabilities, ModelInfo, ModelLifecycle, ModelLimits, PROVIDERS,
