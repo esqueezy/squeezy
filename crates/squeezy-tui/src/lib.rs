@@ -91,7 +91,7 @@ use input::{
     recall_prompt_history, reject_unknown_slash_command, slash_suggestions,
 };
 
-use notification::{NotificationQueue, Severity as NotifySeverity};
+use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
 use render::palette::{
     AMBER, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN,
     WORKING_SHIMMER_HIGHLIGHT, blend_color,
@@ -8214,6 +8214,9 @@ pub(crate) struct TuiApp {
     pub(crate) pending_report: Option<BugReportBundle>,
     pub(crate) clipboard: Box<dyn Clipboard>,
     pub(crate) app_notifications: NotificationQueue,
+    /// Opt-in OSC 9 / BEL emitter for off-tab attention. Disabled by
+    /// default; flips on via `[tui].desktop_notifications`.
+    pub(crate) desktop_notifier: DesktopNotifier,
     pub(crate) config_screen: Option<config_screen::ConfigScreenState>,
     /// Configured status-bar items (`[tui].status_line`). `None` means
     /// "use the built-in default list"; `Some(empty)` means the user
@@ -8379,6 +8382,7 @@ impl TuiApp {
             pending_report: None,
             clipboard,
             app_notifications: NotificationQueue::new(),
+            desktop_notifier: DesktopNotifier::new(config.tui.desktop_notifications),
             config_screen: None,
             status_line_items: parse_status_line_items(config.tui.status_line.as_deref()),
             status_line_use_colors: config.tui.status_line_use_colors,
@@ -8436,7 +8440,20 @@ impl TuiApp {
         // end-of-turn footer prints final totals separately.
         self.turn_progress = None;
         self.active_tool_elapsed_ms = None;
+        // Best-effort off-tab attention surface; the in-terminal toast and
+        // title glyph already cover the on-screen case. We ignore any IO
+        // error here because failing to notify is strictly less important
+        // than continuing the turn-finish bookkeeping.
+        let _ = self.desktop_notifier.notify("squeezy turn complete");
         self.needs_redraw = true;
+    }
+
+    /// Fire the desktop-notification surface for an approval-pending event.
+    /// Public to `events.rs` so the approval-request handler can call it
+    /// without poking the field directly.
+    pub(crate) fn notify_approval_pending(&self, tool_name: &str) {
+        let message = format!("squeezy needs approval for {tool_name}");
+        let _ = self.desktop_notifier.notify(&message);
     }
 
     /// Whether the next frame would visibly differ from the current one

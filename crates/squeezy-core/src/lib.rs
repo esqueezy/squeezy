@@ -5580,6 +5580,42 @@ impl TuiTheme {
     }
 }
 
+/// Off-screen notification surface for turn-complete and approval-pending
+/// events. Maps directly to bytes emitted to the controlling terminal:
+/// `Bel` writes `\x07`, `Osc9` writes the iTerm-style OSC 9 desktop
+/// notification escape, `Auto` picks OSC 9 when `$TERM_PROGRAM` matches a
+/// known capable terminal and falls back to BEL otherwise. `Off` is the
+/// default so a fresh install never makes noise the user did not ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationMethod {
+    Off,
+    Bel,
+    Osc9,
+    Auto,
+}
+
+impl NotificationMethod {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Bel => "bel",
+            Self::Osc9 => "osc9",
+            Self::Auto => "auto",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "false" => Some(Self::Off),
+            "bel" | "bell" => Some(Self::Bel),
+            "osc9" | "osc-9" | "osc_9" => Some(Self::Osc9),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiConfig {
     pub tick_rate_ms: u64,
@@ -5598,6 +5634,9 @@ pub struct TuiConfig {
     pub status_line_use_colors: bool,
     /// Palette tone preference. `System` defers to terminal detection.
     pub theme: TuiTheme,
+    /// Off-screen attention surface (OSC 9 desktop notification / BEL).
+    /// Fires on turn-complete and approval-pending; default `Off`.
+    pub desktop_notifications: NotificationMethod,
 }
 
 impl TuiConfig {
@@ -5623,6 +5662,9 @@ impl TuiConfig {
             status_line: settings.status_line,
             status_line_use_colors: settings.status_line_use_colors.unwrap_or(true),
             theme: settings.theme.unwrap_or(TuiTheme::System),
+            desktop_notifications: settings
+                .desktop_notifications
+                .unwrap_or(NotificationMethod::Off),
         }
     }
 }
@@ -5645,6 +5687,7 @@ pub struct TuiSettings {
     pub status_line: Option<Vec<String>>,
     pub status_line_use_colors: Option<bool>,
     pub theme: Option<TuiTheme>,
+    pub desktop_notifications: Option<NotificationMethod>,
 }
 
 impl TuiSettings {
@@ -5662,6 +5705,7 @@ impl TuiSettings {
                 "status_line",
                 "status_line_use_colors",
                 "theme",
+                "desktop_notifications",
             ],
             source,
             path,
@@ -5717,6 +5761,12 @@ impl TuiSettings {
                 &field(path, "status_line_use_colors"),
             )?,
             theme: tui_theme_value(table, "theme", source, &field(path, "theme"))?,
+            desktop_notifications: notification_method_value(
+                table,
+                "desktop_notifications",
+                source,
+                &field(path, "desktop_notifications"),
+            )?,
         })
     }
 
@@ -5734,6 +5784,7 @@ impl TuiSettings {
             next.status_line_use_colors,
         );
         replace_if_some(&mut self.theme, next.theme);
+        replace_if_some(&mut self.desktop_notifications, next.desktop_notifications);
     }
 }
 
@@ -7494,6 +7545,22 @@ fn tui_theme_value(
     TuiTheme::parse(&value).map(Some).ok_or_else(|| {
         SqueezyError::Config(format!(
             "{source}: {path}: invalid TUI theme {value:?}; expected system, dark, or light"
+        ))
+    })
+}
+
+fn notification_method_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<NotificationMethod>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    NotificationMethod::parse(&value).map(Some).ok_or_else(|| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: invalid notification method {value:?}; expected off, bel, osc9, or auto"
         ))
     })
 }

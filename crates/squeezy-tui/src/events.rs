@@ -255,6 +255,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 } => {
                     app.status = format_approval_status_line(&request);
                     app.approval_selection_index = 0;
+                    app.notify_approval_pending(&request.tool_name);
                     app.pending_approval = Some(PendingApproval {
                         request,
                         decision_tx,
