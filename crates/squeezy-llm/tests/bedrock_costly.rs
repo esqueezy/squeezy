@@ -44,6 +44,7 @@ async fn bedrock_converse_streaming_costly() -> Result<()> {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        output_schema: None,
     };
     let stream = provider.stream_response(request, CancellationToken::new());
     let output = common::collect_text(stream, "Amazon Bedrock").await?;

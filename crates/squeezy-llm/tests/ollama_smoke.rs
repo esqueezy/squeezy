@@ -60,6 +60,7 @@ async fn ollama_local_streaming_smoke() -> Result<()> {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        output_schema: None,
     };
 
     let mut stream = provider.stream_response(request, CancellationToken::new());

@@ -1786,6 +1786,7 @@ async fn run_prompt(
             .map(|session| format!("squeezy::{}", session.session_id())),
         tools: Arc::from(Vec::new()),
         store: config.store_responses,
+        output_schema: None,
     };
     let mut stream = provider.stream_response(request, CancellationToken::new());
     let mut stdout = io::stdout().lock();

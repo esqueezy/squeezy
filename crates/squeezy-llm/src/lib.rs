@@ -59,6 +59,8 @@ pub struct LlmRequest {
     pub cache_key: Option<String>,
     pub tools: Arc<[Arc<LlmToolSpec>]>,
     pub store: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<LlmOutputSchema>,
 }
 
 impl LlmRequest {
@@ -79,8 +81,22 @@ impl LlmRequest {
             cache_key: None,
             tools: Arc::from(Vec::new()),
             store: false,
+            output_schema: None,
         }
     }
+}
+
+/// Strict JSON Schema response contract carried on `LlmRequest::output_schema`.
+///
+/// Providers that support structured outputs (OpenAI Responses
+/// `text.format = { type: "json_schema", ... }`) attach this to the request
+/// body; others ignore it. `strict` mirrors OpenAI's "the model MUST emit
+/// JSON that validates" flag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmOutputSchema {
+    pub name: String,
+    pub schema: Value,
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

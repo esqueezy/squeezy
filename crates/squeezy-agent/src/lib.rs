@@ -1764,6 +1764,7 @@ impl Agent {
                 plan_edit_allowed,
             )),
             store,
+            output_schema: None,
         }
     }
 
@@ -3952,6 +3953,7 @@ impl TurnRuntime {
                     plan_edit_allowed,
                 )),
                 store: self.config.store_responses,
+                output_schema: None,
             };
             let request_model = Arc::clone(&request.model);
             let request_input_bytes = llm_request_input_bytes(&request);
@@ -5696,6 +5698,7 @@ async fn run_subagent_rounds(
             cache_key: None,
             tools: Arc::from(tool_specs),
             store: false,
+            output_schema: None,
         };
         let mut stream = parent
             .provider
@@ -7728,6 +7731,7 @@ Working target: {:?}",
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        output_schema: None,
     };
     let mut stream = provider.stream_response(llm_request, cancel.clone());
     let mut text = String::new();

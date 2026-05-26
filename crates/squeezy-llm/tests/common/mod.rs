@@ -74,6 +74,7 @@ pub fn echo_request(model: &str, prompt: &str) -> LlmRequest {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        output_schema: None,
     }
 }
 

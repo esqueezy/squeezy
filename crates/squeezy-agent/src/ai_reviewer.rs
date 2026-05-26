@@ -117,6 +117,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        output_schema: None,
     };
     let timeout = Duration::from_secs(reviewer.timeout_secs);
     let response = match tokio::time::timeout(

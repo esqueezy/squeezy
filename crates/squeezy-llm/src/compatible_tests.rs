@@ -35,6 +35,7 @@ fn sample_request() -> LlmRequest {
             .into(),
         ]),
         store: false,
+        output_schema: None,
     }
 }
 
@@ -98,6 +99,7 @@ fn request_body_serialises_assistant_function_call_history() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        output_schema: None,
     };
     let body = OpenAiCompatibleProvider::request_body(&request);
     let messages = body["messages"].as_array().expect("messages array");
