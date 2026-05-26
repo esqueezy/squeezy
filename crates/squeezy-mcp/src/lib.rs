@@ -30,7 +30,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use squeezy_core::{McpServerConfig, McpTransport};
+use squeezy_core::{McpServerConfig, McpTransport, PermissionMode};
 use squeezy_store::SqueezyStore;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -192,6 +192,37 @@ impl McpElicitationResponse {
     }
 }
 
+/// Outcome of a single elicitation policy check, surfaced for audit/UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpElicitationAuditOutcome {
+    /// Policy + content allowed silent acceptance; no user was prompted.
+    AutoAccepted,
+    /// Policy denied without prompting.
+    AutoDeclined,
+    /// Forwarded to the host handler (UI) for a user decision.
+    Forwarded,
+}
+
+/// Record emitted every time the MCP client takes an elicitation decision.
+///
+/// Provides a structured audit trail so a malicious server spamming empty
+/// `Form` elicitations cannot silently flip behavior — each decision is
+/// observable from the host without scraping `tracing` logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpElicitationAuditEvent {
+    pub server: String,
+    pub request_id: String,
+    pub kind: McpElicitationKind,
+    pub policy: PermissionMode,
+    pub outcome: McpElicitationAuditOutcome,
+    pub unix_millis: u128,
+}
+
+/// Cap on retained audit entries. Older records are dropped FIFO; this is
+/// purely a defense against runaway memory if a misbehaving server floods
+/// elicitations — the host is expected to drain via `audit_log_snapshot`.
+const MCP_AUDIT_LOG_CAPACITY: usize = 256;
+
 #[derive(Clone)]
 pub struct McpClientRegistry {
     servers: Arc<BTreeMap<String, McpServerConfig>>,
@@ -200,6 +231,13 @@ pub struct McpClientRegistry {
     store: Option<Arc<SqueezyStore>>,
     status_tx: watch::Sender<McpStatusSnapshot>,
     elicitation_handler: Arc<Mutex<Option<McpElicitationHandler>>>,
+    /// Approval gate consulted before auto-accepting an elicitation. `Ask`
+    /// (the conservative default) forces every request through the host
+    /// handler; `Allow` keeps the historical fast-path for empty-form
+    /// confirmations; `Deny` short-circuits to a decline so a misbehaving
+    /// server cannot block the agent waiting on user input.
+    elicitation_policy: Arc<Mutex<PermissionMode>>,
+    elicitation_audit: Arc<Mutex<std::collections::VecDeque<McpElicitationAuditEvent>>>,
     pause_state: ElicitationPauseState,
     resource_reads: Arc<Mutex<BTreeMap<(String, String), CachedResourceRead>>>,
 }
@@ -227,6 +265,10 @@ impl McpClientRegistry {
             store,
             status_tx,
             elicitation_handler: Arc::new(Mutex::new(None)),
+            elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
+            elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+                MCP_AUDIT_LOG_CAPACITY,
+            ))),
             pause_state: ElicitationPauseState::default(),
             resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
         };
@@ -256,6 +298,33 @@ impl McpClientRegistry {
         if let Ok(mut slot) = self.elicitation_handler.lock() {
             *slot = handler;
         }
+    }
+
+    /// Update the approval gate that decides how MCP server elicitations are
+    /// handled. Callers should plumb their host policy here (typically the
+    /// `permissions.mcp` mode) so a malicious server cannot bypass user
+    /// consent by spamming empty `Form` elicitations.
+    pub fn set_elicitation_policy(&self, policy: PermissionMode) {
+        if let Ok(mut slot) = self.elicitation_policy.lock() {
+            *slot = policy;
+        }
+    }
+
+    pub fn elicitation_policy(&self) -> PermissionMode {
+        self.elicitation_policy
+            .lock()
+            .map(|policy| *policy)
+            .unwrap_or(PermissionMode::Ask)
+    }
+
+    /// Snapshot of the most recent elicitation decisions (oldest first).
+    /// Intended for audit surfaces; the underlying ring is capped at
+    /// `MCP_AUDIT_LOG_CAPACITY` so a flood cannot exhaust memory.
+    pub fn elicitation_audit_log(&self) -> Vec<McpElicitationAuditEvent> {
+        self.elicitation_audit
+            .lock()
+            .map(|log| log.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn status_snapshot(&self) -> McpStatusSnapshot {
@@ -648,6 +717,8 @@ impl McpClientRegistry {
         let handler = SqueezyMcpClientHandler {
             server_name: server_name.to_string(),
             elicitation_handler: self.elicitation_handler.clone(),
+            elicitation_policy: self.elicitation_policy.clone(),
+            elicitation_audit: self.elicitation_audit.clone(),
             pause_state: self.pause_state.clone(),
         };
         let entry = match server.transport {
@@ -911,6 +982,8 @@ struct McpToolCacheRecord {
 struct SqueezyMcpClientHandler {
     server_name: String,
     elicitation_handler: Arc<Mutex<Option<McpElicitationHandler>>>,
+    elicitation_policy: Arc<Mutex<PermissionMode>>,
+    elicitation_audit: Arc<Mutex<std::collections::VecDeque<McpElicitationAuditEvent>>>,
     pause_state: ElicitationPauseState,
 }
 
@@ -920,37 +993,119 @@ impl ClientHandler for SqueezyMcpClientHandler {
         request: CreateElicitationRequestParams,
         context: RequestContext<RoleClient>,
     ) -> Result<CreateElicitationResult, rmcp::ErrorData> {
-        if can_auto_accept_elicitation(&request) {
-            return Ok(CreateElicitationResult {
-                action: ElicitationAction::Accept,
-                content: Some(json!({})),
-                meta: None,
-            });
-        }
-        let handler = self
-            .elicitation_handler
+        let request_id = format!("{:?}", context.id);
+        let policy = self
+            .elicitation_policy
             .lock()
-            .ok()
-            .and_then(|handler| handler.clone());
-        let Some(handler) = handler else {
-            return Ok(CreateElicitationResult {
-                action: ElicitationAction::Decline,
-                content: None,
-                meta: None,
-            });
-        };
-        let ui_request = elicitation_request_for_ui(&self.server_name, &context, &request);
-        let _pause = self.pause_state.enter();
-        let response = handler(ui_request).await;
-        Ok(CreateElicitationResult {
-            action: match response.action {
-                McpElicitationAction::Accept => ElicitationAction::Accept,
-                McpElicitationAction::Decline => ElicitationAction::Decline,
-                McpElicitationAction::Cancel => ElicitationAction::Cancel,
-            },
-            content: response.content,
-            meta: None,
-        })
+            .map(|policy| *policy)
+            .unwrap_or(PermissionMode::Ask);
+        let kind = elicitation_kind(&request);
+        let auto = classify_elicitation(policy, &request);
+        if matches!(auto, AutoElicitationDecision::AutoAccept) {
+            tracing::info!(
+                target: "squeezy::mcp",
+                server = %self.server_name,
+                request_id = %request_id,
+                kind = ?kind,
+                policy = %policy.as_str(),
+                "auto-accepting MCP elicitation: policy allows and form has no required fields"
+            );
+        } else if matches!(auto, AutoElicitationDecision::AutoDecline) {
+            tracing::info!(
+                target: "squeezy::mcp",
+                server = %self.server_name,
+                request_id = %request_id,
+                kind = ?kind,
+                policy = %policy.as_str(),
+                "auto-declining MCP elicitation: policy denies all elicitations"
+            );
+        }
+        match auto {
+            AutoElicitationDecision::AutoAccept => {
+                push_elicitation_audit(
+                    &self.elicitation_audit,
+                    McpElicitationAuditEvent {
+                        server: self.server_name.clone(),
+                        request_id,
+                        kind,
+                        policy,
+                        outcome: McpElicitationAuditOutcome::AutoAccepted,
+                        unix_millis: unix_millis(),
+                    },
+                );
+                Ok(CreateElicitationResult {
+                    action: ElicitationAction::Accept,
+                    content: Some(json!({})),
+                    meta: None,
+                })
+            }
+            AutoElicitationDecision::AutoDecline => {
+                push_elicitation_audit(
+                    &self.elicitation_audit,
+                    McpElicitationAuditEvent {
+                        server: self.server_name.clone(),
+                        request_id,
+                        kind,
+                        policy,
+                        outcome: McpElicitationAuditOutcome::AutoDeclined,
+                        unix_millis: unix_millis(),
+                    },
+                );
+                Ok(CreateElicitationResult {
+                    action: ElicitationAction::Decline,
+                    content: None,
+                    meta: None,
+                })
+            }
+            AutoElicitationDecision::Forward => {
+                let handler = self
+                    .elicitation_handler
+                    .lock()
+                    .ok()
+                    .and_then(|handler| handler.clone());
+                let Some(handler) = handler else {
+                    push_elicitation_audit(
+                        &self.elicitation_audit,
+                        McpElicitationAuditEvent {
+                            server: self.server_name.clone(),
+                            request_id,
+                            kind,
+                            policy,
+                            outcome: McpElicitationAuditOutcome::AutoDeclined,
+                            unix_millis: unix_millis(),
+                        },
+                    );
+                    return Ok(CreateElicitationResult {
+                        action: ElicitationAction::Decline,
+                        content: None,
+                        meta: None,
+                    });
+                };
+                push_elicitation_audit(
+                    &self.elicitation_audit,
+                    McpElicitationAuditEvent {
+                        server: self.server_name.clone(),
+                        request_id,
+                        kind,
+                        policy,
+                        outcome: McpElicitationAuditOutcome::Forwarded,
+                        unix_millis: unix_millis(),
+                    },
+                );
+                let ui_request = elicitation_request_for_ui(&self.server_name, &context, &request);
+                let _pause = self.pause_state.enter();
+                let response = handler(ui_request).await;
+                Ok(CreateElicitationResult {
+                    action: match response.action {
+                        McpElicitationAction::Accept => ElicitationAction::Accept,
+                        McpElicitationAction::Decline => ElicitationAction::Decline,
+                        McpElicitationAction::Cancel => ElicitationAction::Cancel,
+                    },
+                    content: response.content,
+                    meta: None,
+                })
+            }
+        }
     }
 
     async fn on_cancelled(
@@ -1685,6 +1840,48 @@ fn can_auto_accept_elicitation(request: &CreateElicitationRequestParams) -> bool
             .map(|required| required.is_empty())
             .unwrap_or(true),
         CreateElicitationRequestParams::UrlElicitationParams { .. } => false,
+    }
+}
+
+fn elicitation_kind(request: &CreateElicitationRequestParams) -> McpElicitationKind {
+    match request {
+        CreateElicitationRequestParams::FormElicitationParams { .. } => McpElicitationKind::Form,
+        CreateElicitationRequestParams::UrlElicitationParams { .. } => McpElicitationKind::Url,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoElicitationDecision {
+    AutoAccept,
+    AutoDecline,
+    Forward,
+}
+
+/// Resolve the per-request elicitation decision against the host policy. Pure
+/// function so the gate can be exercised in tests without spinning up an
+/// `rmcp` peer; the audit ring and tracing are applied around it.
+fn classify_elicitation(
+    policy: PermissionMode,
+    request: &CreateElicitationRequestParams,
+) -> AutoElicitationDecision {
+    match policy {
+        PermissionMode::Deny => AutoElicitationDecision::AutoDecline,
+        PermissionMode::Allow if can_auto_accept_elicitation(request) => {
+            AutoElicitationDecision::AutoAccept
+        }
+        PermissionMode::Allow | PermissionMode::Ask => AutoElicitationDecision::Forward,
+    }
+}
+
+fn push_elicitation_audit(
+    log: &Arc<Mutex<std::collections::VecDeque<McpElicitationAuditEvent>>>,
+    event: McpElicitationAuditEvent,
+) {
+    if let Ok(mut log) = log.lock() {
+        if log.len() >= MCP_AUDIT_LOG_CAPACITY {
+            log.pop_front();
+        }
+        log.push_back(event);
     }
 }
 

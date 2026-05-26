@@ -548,6 +548,8 @@ async fn streamable_http_transport_sends_authorization_bearer_header() {
     let handler = SqueezyMcpClientHandler {
         server_name: "slack".to_string(),
         elicitation_handler: Arc::new(Mutex::new(None)),
+        elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
+        elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         pause_state: ElicitationPauseState::default(),
     };
     // The serve call will fail because we hang up after one round trip — that
@@ -574,4 +576,167 @@ async fn streamable_http_transport_sends_authorization_bearer_header() {
             .any(|line| line.eq_ignore_ascii_case("x-squeezy-test: yes")),
         "outgoing request must carry the static custom header; got:\n{request}"
     );
+}
+
+fn empty_form_elicitation() -> CreateElicitationRequestParams {
+    CreateElicitationRequestParams::FormElicitationParams {
+        meta: None,
+        message: "confirm".to_string(),
+        requested_schema: rmcp::model::ElicitationSchema::new(std::collections::BTreeMap::new()),
+    }
+}
+
+fn required_form_elicitation() -> CreateElicitationRequestParams {
+    let mut schema = rmcp::model::ElicitationSchema::new(std::collections::BTreeMap::new());
+    schema.required = Some(vec!["name".to_string()]);
+    CreateElicitationRequestParams::FormElicitationParams {
+        meta: None,
+        message: "name?".to_string(),
+        requested_schema: schema,
+    }
+}
+
+fn url_elicitation() -> CreateElicitationRequestParams {
+    CreateElicitationRequestParams::UrlElicitationParams {
+        meta: None,
+        message: "open?".to_string(),
+        url: "https://example.test/auth".to_string(),
+        elicitation_id: "e1".to_string(),
+    }
+}
+
+#[test]
+fn classify_elicitation_under_ask_forwards_every_request() {
+    // The default `Ask` policy must never silently accept a server-driven
+    // elicitation — even one with no required fields — so the user retains
+    // visibility into what each MCP server is asking for.
+    let decision = classify_elicitation(PermissionMode::Ask, &empty_form_elicitation());
+    assert_eq!(decision, AutoElicitationDecision::Forward);
+    let decision = classify_elicitation(PermissionMode::Ask, &url_elicitation());
+    assert_eq!(decision, AutoElicitationDecision::Forward);
+}
+
+#[test]
+fn classify_elicitation_under_allow_auto_accepts_only_empty_forms() {
+    assert_eq!(
+        classify_elicitation(PermissionMode::Allow, &empty_form_elicitation()),
+        AutoElicitationDecision::AutoAccept,
+    );
+    // A form that needs the user to supply values cannot be silently filled.
+    assert_eq!(
+        classify_elicitation(PermissionMode::Allow, &required_form_elicitation()),
+        AutoElicitationDecision::Forward,
+    );
+    // URL elicitations always need user attention; "Allow" does not blanket-trust them.
+    assert_eq!(
+        classify_elicitation(PermissionMode::Allow, &url_elicitation()),
+        AutoElicitationDecision::Forward,
+    );
+}
+
+#[test]
+fn classify_elicitation_under_deny_short_circuits_to_decline() {
+    assert_eq!(
+        classify_elicitation(PermissionMode::Deny, &empty_form_elicitation()),
+        AutoElicitationDecision::AutoDecline,
+    );
+    assert_eq!(
+        classify_elicitation(PermissionMode::Deny, &url_elicitation()),
+        AutoElicitationDecision::AutoDecline,
+    );
+}
+
+#[test]
+fn registry_default_elicitation_policy_is_ask() {
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    assert_eq!(registry.elicitation_policy(), PermissionMode::Ask);
+}
+
+#[test]
+fn set_elicitation_policy_persists_and_is_readable() {
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    registry.set_elicitation_policy(PermissionMode::Allow);
+    assert_eq!(registry.elicitation_policy(), PermissionMode::Allow);
+    registry.set_elicitation_policy(PermissionMode::Deny);
+    assert_eq!(registry.elicitation_policy(), PermissionMode::Deny);
+}
+
+#[test]
+fn auto_accept_emit_audit_event() {
+    // Acceptance test for squeezy-7pc: every auto-accept must leave an audit
+    // record so a host can observe whether a malicious server has been
+    // silently confirming prompts. We exercise the helper that both the
+    // ClientHandler path and operators use to push records, since the rmcp
+    // `RequestContext<RoleClient>` cannot be constructed in a unit test.
+    let log = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let request = empty_form_elicitation();
+    let policy = PermissionMode::Allow;
+    let decision = classify_elicitation(policy, &request);
+    assert_eq!(
+        decision,
+        AutoElicitationDecision::AutoAccept,
+        "Allow + empty form must auto-accept"
+    );
+
+    push_elicitation_audit(
+        &log,
+        McpElicitationAuditEvent {
+            server: "docs".to_string(),
+            request_id: "req-1".to_string(),
+            kind: elicitation_kind(&request),
+            policy,
+            outcome: McpElicitationAuditOutcome::AutoAccepted,
+            unix_millis: 0,
+        },
+    );
+
+    let entries: Vec<McpElicitationAuditEvent> = log
+        .lock()
+        .map(|log| log.iter().cloned().collect())
+        .unwrap_or_default();
+    assert_eq!(entries.len(), 1, "auto-accept must record one audit entry");
+    assert_eq!(entries[0].server, "docs");
+    assert_eq!(entries[0].policy, PermissionMode::Allow);
+    assert_eq!(entries[0].kind, McpElicitationKind::Form);
+    assert_eq!(entries[0].outcome, McpElicitationAuditOutcome::AutoAccepted);
+}
+
+#[test]
+fn audit_log_is_capacity_bounded_fifo() {
+    // A misbehaving server could spam elicitations; the audit ring must drop
+    // the oldest entry once the cap is hit so a flood cannot pin memory.
+    let log = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+        MCP_AUDIT_LOG_CAPACITY,
+    )));
+    for index in 0..(MCP_AUDIT_LOG_CAPACITY + 16) {
+        push_elicitation_audit(
+            &log,
+            McpElicitationAuditEvent {
+                server: format!("s-{index}"),
+                request_id: format!("req-{index}"),
+                kind: McpElicitationKind::Form,
+                policy: PermissionMode::Allow,
+                outcome: McpElicitationAuditOutcome::AutoAccepted,
+                unix_millis: index as u128,
+            },
+        );
+    }
+    let entries: Vec<McpElicitationAuditEvent> = log
+        .lock()
+        .map(|log| log.iter().cloned().collect())
+        .unwrap_or_default();
+    assert_eq!(entries.len(), MCP_AUDIT_LOG_CAPACITY);
+    // Oldest entries are evicted first; the surviving range starts where the
+    // overflow began (`+16`) so the newest record reflects the last push.
+    assert_eq!(entries.first().unwrap().server, "s-16");
+    assert_eq!(
+        entries.last().unwrap().server,
+        format!("s-{}", MCP_AUDIT_LOG_CAPACITY + 15)
+    );
+}
+
+#[test]
+fn registry_elicitation_audit_log_starts_empty() {
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    assert!(registry.elicitation_audit_log().is_empty());
 }

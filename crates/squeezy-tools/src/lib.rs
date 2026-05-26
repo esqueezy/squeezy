@@ -1288,6 +1288,14 @@ impl ToolRegistry {
         self.mcp.set_elicitation_handler(handler);
     }
 
+    /// Plumb the host's MCP approval policy into the MCP client so it can
+    /// short-circuit elicitations the user has globally denied and avoid
+    /// silently auto-accepting empty-form prompts when the user expects to
+    /// be asked first.
+    pub fn set_mcp_elicitation_policy(&self, policy: squeezy_core::PermissionMode) {
+        self.mcp.set_elicitation_policy(policy);
+    }
+
     fn mcp_tool(&self, name: &str) -> Option<ExternalMcpTool> {
         self.mcp.tool(name)
     }

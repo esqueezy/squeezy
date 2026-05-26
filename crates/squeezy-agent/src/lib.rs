@@ -5154,6 +5154,9 @@ fn install_mcp_elicitation_handler<'a>(
         })
     });
     context.tools.set_mcp_elicitation_handler(Some(handler));
+    context
+        .tools
+        .set_mcp_elicitation_policy(context.config.permissions.mcp);
     McpElicitationHandlerScope {
         tools: context.tools,
     }
