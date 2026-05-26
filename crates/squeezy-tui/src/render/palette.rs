@@ -22,12 +22,12 @@ pub(crate) const DIFF_DEL_FG: Color = Color::Rgb(252, 165, 165);
 pub(crate) const DIFF_HUNK_FG: Color = Color::Rgb(254, 240, 138);
 pub(crate) const SEPARATOR_BLUE: Color = Color::Rgb(96, 165, 250);
 
-/// Status-line accent fallbacks. Softened toward 85% saturation / full
-/// brightness so they sit well on both light and dark terminals, mirroring
-/// codex's `soften_status_line_style` choice.
-pub(crate) const ACCENT_CYAN: Color = Color::Rgb(95, 217, 217);
-pub(crate) const ACCENT_GREEN: Color = Color::Rgb(95, 217, 95);
-pub(crate) const ACCENT_MAGENTA: Color = Color::Rgb(217, 95, 217);
+/// Status-line accent fallbacks. Mid-tone so they stay readable on both
+/// dark and light terminals without screaming for attention next to the
+/// surrounding QUIET-styled separators and hints.
+pub(crate) const ACCENT_CYAN: Color = Color::Rgb(64, 158, 158);
+pub(crate) const ACCENT_GREEN: Color = Color::Rgb(64, 158, 64);
+pub(crate) const ACCENT_MAGENTA: Color = Color::Rgb(158, 64, 158);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaletteTone {
