@@ -2297,9 +2297,14 @@ fn unknown_fields_are_warned_and_removed_from_settings_file() {
     ));
     std::fs::create_dir_all(&dir).expect("mkdir");
     let path = dir.join("settings.toml");
+    // Use a deliberately invented key so the test stays meaningful as the
+    // real schema grows. `tick_rate_ms` is the known control we expect to
+    // survive untouched. (The earlier draft seeded `status_line_use_colors`
+    // here, which became a real known key after #97 and made the assertion
+    // unsatisfiable.)
     std::fs::write(
         &path,
-        "[tui]\nstatus_line_use_colors = true\ntick_rate_ms = 100\n",
+        "[tui]\nlegacy_obsolete_knob = \"v1\"\ntick_rate_ms = 100\n",
     )
     .expect("write seed settings");
 
@@ -2308,7 +2313,7 @@ fn unknown_fields_are_warned_and_removed_from_settings_file() {
 
     let cleaned = std::fs::read_to_string(&path).expect("read cleaned settings");
     assert!(
-        !cleaned.contains("status_line_use_colors"),
+        !cleaned.contains("legacy_obsolete_knob"),
         "unknown key should be stripped, got: {cleaned}"
     );
     assert!(
