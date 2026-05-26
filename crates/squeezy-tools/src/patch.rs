@@ -1,3 +1,29 @@
+//! `plan_patch` and `apply_patch` implementations, plus the binding between
+//! them.
+//!
+//! # Plan ↔ apply binding
+//!
+//! `plan_patch` walks the semantic graph from an objective + optional
+//! symbol/path/query and returns a `plan_id` together with the set of paths
+//! that make up the **plan neighborhood** (direct hits, references, callers,
+//! callees, tests, configs, codeowners). The neighborhood is registered in
+//! [`ToolRegistry::patch_plans`] under the `plan_id` for [`PATCH_PLAN_TTL`].
+//!
+//! `apply_patch` consults that registry: when the caller passes `plan_id`,
+//! every touched path must lie inside the registered neighborhood, otherwise
+//! the call returns [`ToolStatus::Stale`] without mutating disk. The caller
+//! can opt out per-invocation with `confirm_outside_plan=true`, which is
+//! reserved for "the plan was right but I learned something new" cases. The
+//! enforcement site is the F84 block in `execute_apply_patch_blocking`; see
+//! `lookup_patch_plan` for the cleanup-on-read semantics.
+//!
+//! This binding is intentional and is the reason Squeezy can refuse to drift
+//! outside the plan even when the model emits a wider edit set; see
+//! `audits/codex-comparison-2026-05-25/vcs.md` finding `G-vcs-F4` for the
+//! rationale and the comparison with Codex's no-planning model. The binding
+//! is graph-anchored rather than path-prefix based on purpose: a refactor's
+//! neighborhood follows call/reference edges, not directory structure.
+
 use std::{
     collections::BTreeSet,
     fs,
