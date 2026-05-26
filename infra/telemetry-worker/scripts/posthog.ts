@@ -42,6 +42,40 @@ LIMIT 20
 `.trim(),
   },
   {
+    name: "Squeezy Website Visits",
+    description: "Anonymous website page views and CTA clicks.",
+    query: `
+SELECT
+  toDate(timestamp) AS day,
+  event,
+  count() AS events,
+  uniq(properties.visitor_id) AS visitors
+FROM events
+WHERE event IN ('squeezy_site_page_view', 'squeezy_site_cta_clicked', 'squeezy_site_outbound_clicked')
+  AND timestamp > now() - INTERVAL 30 DAY
+GROUP BY day, event
+ORDER BY day ASC, event ASC
+`.trim(),
+  },
+  {
+    name: "Squeezy Website Paths And CTAs",
+    description: "Website paths and clicked calls to action.",
+    query: `
+SELECT
+  properties.path AS path,
+  properties.cta_id AS cta_id,
+  properties.target_kind AS target_kind,
+  count() AS events,
+  uniq(properties.visitor_id) AS visitors
+FROM events
+WHERE event IN ('squeezy_site_page_view', 'squeezy_site_cta_clicked', 'squeezy_site_outbound_clicked')
+  AND timestamp > now() - INTERVAL 30 DAY
+GROUP BY path, cta_id, target_kind
+ORDER BY events DESC
+LIMIT 50
+`.trim(),
+  },
+  {
     name: "Squeezy OS And Arch",
     description: "Anonymous platform distribution.",
     query: `
@@ -165,6 +199,8 @@ async function main(): Promise<void> {
     await setupDashboard();
   } else if (command === "smoke-worker") {
     await smokeWorker();
+  } else if (command === "smoke-site") {
+    await smokeSite();
   } else if (command === "verify-posthog") {
     await verifyPosthog();
   } else {
@@ -177,6 +213,7 @@ function printUsage(): void {
   console.log(`Usage:
   bun scripts/posthog.ts setup-dashboard
   bun scripts/posthog.ts smoke-worker
+  bun scripts/posthog.ts smoke-site
   bun scripts/posthog.ts verify-posthog
 
 Environment:
@@ -184,6 +221,7 @@ Environment:
   POSTHOG_ENVIRONMENT_ID    Defaults to ${DEFAULT_ENVIRONMENT_ID}.
   POSTHOG_HOST              Defaults to ${DEFAULT_POSTHOG_HOST}.
   TELEMETRY_ENDPOINT        Required for smoke-worker, e.g. https://squeezy-telemetry.esqueezy.workers.dev/v1/batch.
+  SITE_TELEMETRY_ENDPOINT   Required for smoke-site, e.g. https://squeezy-telemetry.esqueezy.workers.dev/v1/site.
 `);
 }
 
@@ -279,6 +317,32 @@ async function smokeWorker(): Promise<void> {
     throw new Error(`smoke-worker failed: ${response.status} ${await response.text()}`);
   }
   console.log(`Smoke batch accepted by ${endpoint}`);
+}
+
+async function smokeSite(): Promise<void> {
+  const endpoint = requiredEnv("SITE_TELEMETRY_ENDPOINT");
+  const body = {
+    schema_version: 1,
+    visitor_id: crypto.randomUUID(),
+    session_id: crypto.randomUUID(),
+    timestamp_ms: Date.now(),
+    event: "squeezy_site_page_view",
+    path: "/",
+    referrer_kind: "none",
+    utm_source: "smoke",
+    utm_medium: "script",
+    utm_campaign: "telemetry",
+  };
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "text/plain;charset=UTF-8" },
+    body: JSON.stringify(body),
+  });
+  if (response.status !== 204) {
+    throw new Error(`smoke-site failed: ${response.status} ${await response.text()}`);
+  }
+  console.log(`Smoke site event accepted by ${endpoint}`);
 }
 
 async function verifyPosthog(): Promise<void> {

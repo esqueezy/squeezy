@@ -3,8 +3,10 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.scripts.json --noEmit",
+    "test": "bun test",
     "setup:posthog": "bun scripts/posthog.ts setup-dashboard",
     "smoke:worker": "bun scripts/posthog.ts smoke-worker",
+    "smoke:site": "bun scripts/posthog.ts smoke-site",
     "smoke:posthog": "bun scripts/posthog.ts verify-posthog",
     "deploy": "wrangler deploy"
   },

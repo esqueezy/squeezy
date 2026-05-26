@@ -29,15 +29,17 @@ Override it with `SQUEEZY_TELEMETRY_ENDPOINT` when testing a local or staging
 collector.
 
 The same Worker also exposes consented intake endpoints for `/feedback` and
-`/report`:
+`/report`, plus a separate website visitor endpoint:
 
 ```text
+https://squeezy-telemetry.esqueezy.workers.dev/v1/site
 https://squeezy-telemetry.esqueezy.workers.dev/v1/feedback
 https://squeezy-telemetry.esqueezy.workers.dev/v1/report
 ```
 
-Those endpoints are not anonymous background telemetry. `/feedback` sends
-short redacted user text after explicit confirmation. `/report` uploads a
+Those endpoints are not anonymous product telemetry from the Squeezy binary.
+`/v1/site` receives anonymous website page-view and CTA events. `/feedback`
+sends short redacted user text after explicit confirmation. `/report` uploads a
 redacted archive to private R2 storage after explicit confirmation and forwards
 only metadata to PostHog.
 
@@ -90,6 +92,10 @@ Telemetry must not include:
 - API keys, tokens, environment variable values, or settings file contents,
 - exact model names when they may be user/private configured; telemetry uses
   model family buckets instead.
+
+Website visitor telemetry is separate from product telemetry. It is limited to
+anonymous visitor/session IDs, site-local paths, coarse referrer kind, bounded
+UTM fields, and CTA/target identifiers.
 
 These restrictions describe automatic telemetry events. Consented feedback and
 report submission have their own preview, redaction, and size caps documented

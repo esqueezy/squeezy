@@ -1,0 +1,191 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import GitHubIcon from "../components/GitHubIcon.astro";
+import TerminalWindow from "../components/TerminalWindow.astro";
+import EvidenceLoop from "../components/EvidenceLoop.astro";
+import { SITE } from "../config";
+import { homepageCards, optimizationCards, operatingLoop, productPosition, toolSurface } from "../facts";
+---
+
+<BaseLayout
+  title="Squeezy - Spend model tokens where they matter"
+  description={SITE.description}
+  active="home"
+>
+  <section class="hero">
+    <div class="hero-copy">
+      <span class="eyebrow">{productPosition.eyebrow}</span>
+      <h1>{productPosition.title}</h1>
+      <p class="lead">{productPosition.lead}</p>
+      <div class="hero-actions">
+        <a class="button" href="/install/" data-track-click="hero_install">
+          Install Squeezy
+        </a>
+        <a class="button secondary" href="/docs/" data-track-click="hero_docs">
+          Read technical docs
+        </a>
+      </div>
+    </div>
+    <div class="hero-visual" aria-label="Squeezy evidence loop visual">
+      <EvidenceLoop />
+    </div>
+  </section>
+
+  <section class="metric-strip" aria-label="Squeezy product facts">
+    <div>
+      <span>Runtime</span>
+      <strong>Rust TUI</strong>
+    </div>
+    <div>
+      <span>First pass</span>
+      <strong>static graph</strong>
+    </div>
+    <div>
+      <span>Model input</span>
+      <strong>compact evidence</strong>
+    </div>
+    <div>
+      <span>Providers</span>
+      <strong>bring your key</strong>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">why it exists</span>
+      <h2>Code discovery should not be the most expensive part of an agent turn.</h2>
+      <p>
+        Large repositories create a predictable failure mode: the model spends
+        paid context reading, searching, and re-reading files before it knows
+        what matters. Squeezy moves that work to local analysis, then uses the
+        model for judgment, synthesis, and edits.
+      </p>
+    </div>
+    <div class="grid-3">
+      {
+        homepageCards.map((fact) => (
+          <article class="card">
+            <span class="label">{fact.label}</span>
+            <h3>{fact.title}</h3>
+            <p>{fact.body}</p>
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="grid-2 align-center">
+      <div class="section-header">
+        <span class="eyebrow">agent loop</span>
+        <h2>Static analysis narrows the question before the model sees code.</h2>
+        <p>
+          Squeezy builds and refreshes a local semantic graph from supported
+          languages. The model receives compact evidence: symbols, callers,
+          references, spans, confidence, and exact next reads.
+        </p>
+        <div class="actions">
+          <a class="button" href="/how-it-works/" data-track-click="home_how">How it works</a>
+          <a class="button secondary" href="/languages/" data-track-click="home_languages">Language coverage</a>
+        </div>
+      </div>
+      <TerminalWindow title="squeezy evidence packet">
+        <div class="terminal-body">
+          <div class="terminal-line">
+            <span class="green">repo_map</span>
+            <span>language counts, graph coverage, source groups, next actions</span>
+          </div>
+          <div class="terminal-line">
+            <span class="cyan">symbol_context</span>
+            <span>path, span, confidence, freshness, provenance</span>
+          </div>
+          <div class="terminal-line">
+            <span class="amber">read_slice</span>
+            <span>exact code range after the graph narrows the target</span>
+          </div>
+          <div class="terminal-line">
+            <span class="muted">tools</span>
+            <span>bounded grep, glob, shell, web, and compiler tools when needed</span>
+          </div>
+        </div>
+      </TerminalWindow>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">what changes</span>
+      <h2>The model gets a reasoned work packet with local evidence.</h2>
+    </div>
+    <div class="flow">
+      {
+        operatingLoop.map((item) => (
+          <article class="flow-step">
+            <span>{item.label}</span>
+            <strong>{item.title}</strong>
+            <p>{item.body}</p>
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="section-header">
+      <span class="eyebrow">optimization</span>
+      <h2>Token reduction starts in the architecture.</h2>
+      <p>
+        Squeezy is designed to avoid unnecessary provider work. The optimization
+        lives in local indexes, tool output shaping, receipt reuse, lazy schemas,
+        and explicit verification.
+      </p>
+    </div>
+    <div class="grid-3">
+      {
+        optimizationCards.map((fact) => (
+          <article class="card">
+            <span class="label">{fact.label}</span>
+            <h3>{fact.title}</h3>
+            <p>{fact.body}</p>
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">product surface</span>
+      <h2>Built for engineering work with local code intelligence.</h2>
+    </div>
+    <div class="grid-3">
+      {
+        toolSurface.map((fact) => (
+          <article class="card">
+            <span class="label">{fact.label}</span>
+            <h3>{fact.title}</h3>
+            <p>{fact.body}</p>
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section compact band">
+    <div class="section-header">
+      <span class="eyebrow">next</span>
+      <h2>Review the technical details.</h2>
+      <p>
+        Read the graph design, optimization controls, language coverage,
+        provider support, install flow, and issue-reporting path.
+      </p>
+      <div class="actions">
+        <a class="button" href="/docs/" data-track-click="home_docs">Technical docs</a>
+        <a class="button secondary" href="/providers/" data-track-click="home_providers">Providers</a>
+        <a class="button secondary" href={SITE.repoUrl} data-track-click="home_repo" data-track-target="github">
+          <GitHubIcon /> GitHub
+        </a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

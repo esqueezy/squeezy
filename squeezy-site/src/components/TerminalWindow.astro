@@ -1,0 +1,13 @@
+---
+const { title = "squeezy session", mode = "dark" } = Astro.props;
+---
+
+<div class:list={["terminal-window", mode]}>
+  <div class="terminal-topbar">
+    <span></span>
+    <span></span>
+    <span></span>
+    <p>{title}</p>
+  </div>
+  <slot />
+</div>

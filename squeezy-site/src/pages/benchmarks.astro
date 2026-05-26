@@ -1,0 +1,83 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import TerminalWindow from "../components/TerminalWindow.astro";
+import { benchmarkFacts } from "../facts";
+---
+
+<BaseLayout
+  title="Cost-Saving Benchmark - Squeezy"
+  description="Cost-saving benchmark plan for Squeezy graph navigation, read shaping, receipts, and model-context reduction."
+  active="benchmarks"
+>
+  <section class="page-hero">
+    <div class="page-hero-inner">
+      <span class="eyebrow">cost-saving benchmark</span>
+      <span class="status-pill warning">UNDER CONSTRUCTION</span>
+      <h1>Benchmarking model-context savings without unsupported claims.</h1>
+      <p class="lead">
+        This page will publish the method and results for measuring how much
+        provider context Squeezy avoids by doing code discovery locally first.
+        Until the report is ready, the page is intentionally limited to scope
+        and measurement plan.
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="grid-2 align-center">
+      <TerminalWindow title="planned report shape">
+        <div class="terminal-body">
+          <div class="terminal-line">
+            <span class="green">quality</span>
+            <span>navigation accuracy, missed symbols, false positives</span>
+          </div>
+          <div class="terminal-line">
+            <span class="cyan">local work</span>
+            <span>graph queries, exact reads, receipt hits, output spills</span>
+          </div>
+          <div class="terminal-line">
+            <span class="amber">cost</span>
+            <span>model-visible bytes, provider tokens, repeated context avoided</span>
+          </div>
+          <div class="terminal-line">
+            <span class="muted">baseline</span>
+            <span>graph-first discovery compared with ordinary search and reads</span>
+          </div>
+        </div>
+      </TerminalWindow>
+      <div class="list">
+        {
+          benchmarkFacts.map((fact) => (
+            <div class="list-item">
+              <span class="num">{fact.label.slice(0, 2)}</span>
+              <div>
+                <h3>{fact.title}</h3>
+                <p>{fact.body}</p>
+              </div>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="section-header">
+      <span class="eyebrow">publish criteria</span>
+      <h2>The page stays under construction until the benchmark is reproducible.</h2>
+      <p>
+        Public results should include the corpus, the baseline, the commands,
+        the measured token or byte counters, and the quality checks. A savings
+        number without that evidence should not ship.
+      </p>
+      <div class="actions">
+        <a class="button" href="/docs/cost-receipts/" data-track-click="benchmark_optimization_docs">
+          Optimization docs
+        </a>
+        <a class="button secondary" href="/docs/semantic-navigation/" data-track-click="benchmark_graph_docs">
+          Graph docs
+        </a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

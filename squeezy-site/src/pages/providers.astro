@@ -1,0 +1,70 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { providerRows } from "../facts";
+---
+
+<BaseLayout
+  title="Provider Support - Squeezy"
+  description="Squeezy provider adapter support for OpenAI, Anthropic, Google, Azure OpenAI, Amazon Bedrock, and Ollama."
+  active="providers"
+>
+  <section class="page-hero">
+    <div class="page-hero-inner">
+      <span class="eyebrow">provider support</span>
+      <h1>Bring your model. Keep the optimization local.</h1>
+      <p class="lead">
+        Squeezy is not trying to be a model vendor. It keeps the agent runtime,
+        code analysis, permissions, and cost controls local, then connects to
+        hosted or local model providers through one tool loop.
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="matrix">
+      {
+        providerRows.map((row) => (
+          <article class="matrix-row">
+            <div>
+              <h3>{row.name}</h3>
+            </div>
+            <p>{row.detail}</p>
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="grid-2 align-center">
+      <div class="section-header">
+        <span class="eyebrow">configuration</span>
+        <h2>Provider selection is configuration, not lock-in.</h2>
+        <p>
+          Squeezy resolves model settings from CLI flags, environment variables,
+          project configuration, user settings, and built-in defaults. Hosted
+          providers use the credentials expected by that platform. Ollama uses
+          your local runtime.
+        </p>
+        <div class="actions">
+          <a class="button" href="/docs/config/" data-track-click="providers_config_docs">
+            Configuration docs
+          </a>
+          <a class="button secondary" href="/install/" data-track-click="providers_install">
+            Install
+          </a>
+        </div>
+      </div>
+      <div class="card code-card">
+        <span class="label">example</span>
+        <pre><code>[model]
+provider = "openai"
+profile = "balanced"
+model = ""
+
+[providers.openai]
+api_key_env = "OPENAI_API_KEY"</code></pre>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

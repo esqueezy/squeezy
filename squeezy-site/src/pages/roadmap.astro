@@ -1,0 +1,54 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+---
+
+<BaseLayout
+  title="Roadmap - Squeezy"
+  description="Squeezy launch readiness and product evidence."
+  active="docs"
+>
+  <section class="page-hero">
+    <div class="page-hero-inner">
+      <span class="eyebrow">roadmap</span>
+      <h1>Launch work is focused on evidence and distribution.</h1>
+      <p class="lead">
+        The website, install paths, benchmark reports, telemetry pipeline, and
+        demo assets all support the same goal: explain how Squeezy reduces
+        unnecessary model context with local code understanding.
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="roadmap">
+      <article class="roadmap-item">
+        <span class="status-pill ok">current</span>
+        <div>
+          <h3>Professional static website</h3>
+          <p>Keep the site fast, factual, and focused on CPU-first code understanding and token-aware agent work.</p>
+        </div>
+      </article>
+      <article class="roadmap-item">
+        <span class="status-pill ok">current</span>
+        <div>
+          <h3>Visitor tracking through existing telemetry</h3>
+          <p>Track anonymous website visits and CTA clicks through the Cloudflare Worker and PostHog layer without adding a dynamic website backend.</p>
+        </div>
+      </article>
+      <article class="roadmap-item">
+        <span class="status-pill">launch</span>
+        <div>
+          <h3>Release-linked install assets</h3>
+          <p>Connect package-manager and archive install paths to tagged release artifacts.</p>
+        </div>
+      </article>
+      <article class="roadmap-item">
+        <span class="status-pill">evidence</span>
+        <div>
+          <h3>Benchmark-backed cost story</h3>
+          <p>Publish reproducible reports that connect graph navigation, exact reads, receipts, and output shaping to model-context savings.</p>
+        </div>
+      </article>
+    </div>
+  </section>
+</BaseLayout>
