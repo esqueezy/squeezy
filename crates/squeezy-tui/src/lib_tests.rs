@@ -6661,6 +6661,71 @@ fn status_segment_individually_returns_expected_text() {
     );
 }
 
+#[test]
+fn status_segments_render_in_priority_order() {
+    // Locks the order segments appear in the joined detail line so that
+    // adding a new segment stays a one-place change: append a function in
+    // `status::segments` and add a single row in `render_status_details`.
+    // Downstream consumers (CLI status verbose, logs) parse position-
+    // sensitively, so reordering existing labels is a breaking change.
+    let mut app = test_app(SessionMode::Build);
+    app.cost.input_tokens = Some(120);
+    app.cost.output_tokens = Some(34);
+    app.cost.cached_input_tokens = Some(7);
+    app.cost.cache_write_input_tokens = Some(3);
+    app.cost.estimated_usd_micros = Some(2_500);
+    app.context_estimate.estimated_tokens = 4096;
+    app.context_compaction_threshold = 10_000;
+    app.metrics.tool_calls = 5;
+    app.metrics.bytes_read = 1024;
+    app.metrics.redactions = 1;
+    app.metrics.receipt_stub_hits = 2;
+    app.metrics.negative_receipt_hits = 1;
+    app.metrics.budget_denials = 0;
+    app.context_compaction.generation = 1;
+    app.context_compaction.pinned.clear();
+    app.cost_cap_usd_micros = None;
+
+    // Priority order mirrors `status::render_status_details`. Keep this
+    // list in sync with the segments array in `status.rs`.
+    let expected_labels = [
+        "permissions",
+        "repo ",
+        "sandbox ",
+        "telemetry ",
+        "mcp ",
+        "cost ",
+        "tok ",
+        "ctx ",
+        "pins ",
+        "compact ",
+        "tools ",
+        "budget ",
+        "cfg ",
+        "read ",
+        "receipts ",
+        "redactions ",
+        "cached ",
+        "cache_write ",
+    ];
+
+    let joined = super::status::render_status_details(&app);
+    let mut cursor = 0usize;
+    for label in expected_labels {
+        // `permissions` is the first segment but emits the compact policy
+        // text (e.g. `r:allow…`) rather than a literal `permissions ` prefix.
+        // Skip the prefix check for that one; the second-position
+        // `repo ` anchors the order verification.
+        if label == "permissions" {
+            continue;
+        }
+        let needle_pos = joined[cursor..]
+            .find(label)
+            .unwrap_or_else(|| panic!("segment {label:?} missing or out of order in {joined:?}"));
+        cursor += needle_pos + label.len();
+    }
+}
+
 // ---- F39: slash command capabilities ----
 
 #[test]
