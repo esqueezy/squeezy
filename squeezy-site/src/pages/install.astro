@@ -1,0 +1,115 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+
+const platforms = [
+  {
+    name: "macOS",
+    arch: "Apple Silicon, Intel",
+    targets: ["aarch64-apple-darwin", "x86_64-apple-darwin"],
+    primary: "curl installer",
+    command: "curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh",
+    secondary: "Homebrew: brew install esqueezy/tap/squeezy"
+  },
+  {
+    name: "Linux",
+    arch: "x86_64 static binary",
+    targets: ["x86_64-unknown-linux-musl"],
+    primary: "curl installer",
+    command: "curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh",
+    secondary: "Manual archive: squeezy-x86_64-unknown-linux-musl.tar.gz"
+  },
+  {
+    name: "Windows",
+    arch: "x86_64",
+    targets: ["x86_64-pc-windows-msvc"],
+    primary: "Winget",
+    command: "winget install esqueezy.Squeezy",
+    secondary: "Manual archive: squeezy-x86_64-pc-windows-msvc.zip"
+  }
+];
+---
+
+<BaseLayout
+  title="Install Squeezy"
+  description="Choose a platform, install Squeezy, run doctor, and start the agent."
+  active="install"
+>
+  <section class="page-hero">
+    <div class="page-hero-inner">
+      <span class="eyebrow">install</span>
+      <h1>Install Squeezy and get started.</h1>
+      <p class="lead">
+        Choose your platform, install the native agent, run diagnostics, then
+        start Squeezy inside the repository you want it to understand.
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">choose platform</span>
+      <h2>Release targets and primary install commands.</h2>
+    </div>
+    <div class="platform-grid">
+      {
+        platforms.map((platform) => (
+          <article class="platform-card">
+            <div class="platform-card-header">
+              <div>
+                <span class="label">{platform.primary}</span>
+                <h3>{platform.name}</h3>
+              </div>
+              <span class="status-pill">{platform.arch}</span>
+            </div>
+            <pre><code>{platform.command}</code></pre>
+            <div class="arch-list" aria-label={`${platform.name} release targets`}>
+              {platform.targets.map((target) => <span>{target}</span>)}
+            </div>
+            <p>{platform.secondary}</p>
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="grid-2 align-center">
+      <div class="section-header">
+        <span class="eyebrow">first run</span>
+        <h2>Verify the install before starting real work.</h2>
+        <p>
+          `squeezy doctor` checks configuration, repo profile, provider
+          credentials, session storage, and sandbox availability. After that,
+          run `squeezy` from the repository root.
+        </p>
+      </div>
+      <div class="card code-card">
+        <span class="label">start</span>
+        <pre><code>export OPENAI_API_KEY=...
+squeezy config init --user
+squeezy doctor
+squeezy</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="section compact">
+    <div class="grid-3">
+      <article class="card">
+        <span class="label">providers</span>
+        <h3>Bring your model key</h3>
+        <p>Use OpenAI, Anthropic, Google Gemini, Azure OpenAI, Amazon Bedrock, Ollama, or provider overrides from local config.</p>
+      </article>
+      <article class="card">
+        <span class="label">ask squeezy</span>
+        <h3>Use local help</h3>
+        <p>`/help` and natural questions about Squeezy are answered from bundled docs and redacted config before provider work starts.</p>
+      </article>
+      <article class="card">
+        <span class="label">report</span>
+        <h3>Preview before sending</h3>
+        <p>Use `/feedback`, `/report`, or `squeezy sessions report` to preview redacted support material before anything is uploaded.</p>
+      </article>
+    </div>
+  </section>
+</BaseLayout>

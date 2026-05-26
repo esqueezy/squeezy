@@ -66,7 +66,7 @@ Oracle: `javac` compiler-tree scans for symbols and navigation query checks.
 Indexed: namespaces, using directives, classes, interfaces, records, structs,
 enums, methods, constructors, operators, fields, properties, events, enum
 members, attributes, calls, references, stable language identities, partial-type
-links, inheritance and implements edges, and .NET project facts from `.csproj`,
+links, inheritance and implements edges, and C# project-file facts from `.csproj`,
 `.sln`, `.slnx`, `Directory.Build.props`, `Directory.Build.targets`,
 `global.json`, and `packages.lock.json`.
 
@@ -76,7 +76,7 @@ semantics are not compiler-equivalent. Razor, Blazor `.razor`, and `.cshtml`
 files are intentionally discovered as bounded fallback inputs for v0; embedded
 C# is not assigned graph confidence yet.
 
-Known follow-ups: broader .NET project-system fidelity, generated-source
+Known follow-ups: broader C# project-file fidelity, generated-source
 handling, and framework-specific navigation remain bounded local heuristics.
 
 Oracle: Roslyn project in `benchmarks/oracle/csharp` for declaration symbols and

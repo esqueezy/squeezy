@@ -7,6 +7,8 @@ timestamps, and numeric counters to PostHog.
 
 The Worker also accepts consented maintainer-intake traffic:
 
+- `POST /v1/site` validates anonymous website page-view and CTA events and
+  forwards them to PostHog as `squeezy_site_*` events.
 - `POST /v1/feedback` validates a small redacted text report and forwards it
   to PostHog as `squeezy_feedback_submitted`.
 - `POST /v1/report` stores a redacted tar archive in private R2 storage and
@@ -76,6 +78,7 @@ bun run smoke:posthog
 
 Recommended production controls:
 
+- Cloudflare WAF or rate limiting for `POST /v1/site`.
 - Cloudflare WAF or rate limiting for `POST /v1/batch`.
 - Cloudflare WAF or rate limiting for `POST /v1/feedback` and
   `POST /v1/report`.

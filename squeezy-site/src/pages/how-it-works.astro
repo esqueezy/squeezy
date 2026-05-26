@@ -1,0 +1,96 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import TerminalWindow from "../components/TerminalWindow.astro";
+import EvidenceLoop from "../components/EvidenceLoop.astro";
+import { operatingLoop, toolSurface } from "../facts";
+---
+
+<BaseLayout
+  title="How Squeezy Works"
+  description="How Squeezy uses local static analysis, graph refreshes, bounded reads, and verification before model work."
+  active="how"
+>
+  <section class="page-hero">
+    <div class="page-hero-inner">
+      <span class="eyebrow">agent architecture</span>
+      <h1>CPU work first. Model judgment second.</h1>
+      <p class="lead">
+        Squeezy uses local repository understanding, graph navigation, and
+        output shaping to prepare a smaller work packet before asking a model
+        to reason about the code.
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="grid-2 align-center">
+      <EvidenceLoop />
+      <div class="list">
+        {
+          operatingLoop.map((item) => (
+            <div class="list-item">
+              <span class="num">{item.label}</span>
+              <div>
+                <h3>{item.title}</h3>
+                <p>{item.body}</p>
+              </div>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="grid-2 align-center">
+      <div class="section-header">
+        <span class="eyebrow">graph evidence</span>
+        <h2>The graph records what is known, how fresh it is, and how confident it is.</h2>
+        <p>
+          Static navigation works best when the agent can see how each result
+          was produced. Squeezy keeps syntax, import, candidate, external, and
+          freshness labels attached so the model can move from graph evidence
+          to exact reads or verifier commands.
+        </p>
+      </div>
+      <TerminalWindow title="symbol_context output shape">
+        <div class="terminal-body">
+          <div class="terminal-line">
+            <span class="green">path</span>
+            <span>crates/squeezy-agent/src/lib.rs</span>
+          </div>
+          <div class="terminal-line">
+            <span class="cyan">span</span>
+            <span>line or byte range, source hash, and freshness</span>
+          </div>
+          <div class="terminal-line">
+            <span class="amber">confidence</span>
+            <span>syntax facts, resolved imports, candidate sets, freshness</span>
+          </div>
+          <div class="terminal-line">
+            <span class="muted">next</span>
+            <span>read_slice, reference_search, upstream_flow, bounded grep</span>
+          </div>
+        </div>
+      </TerminalWindow>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">tools</span>
+      <h2>The local tool surface is designed to reduce repeated paid context.</h2>
+    </div>
+    <div class="grid-3">
+      {
+        toolSurface.map((fact) => (
+          <article class="card">
+            <span class="label">{fact.label}</span>
+            <h3>{fact.title}</h3>
+            <p>{fact.body}</p>
+          </article>
+        ))
+      }
+    </div>
+  </section>
+</BaseLayout>

@@ -1,4 +1,5 @@
 const MAX_BODY_BYTES = 64 * 1024;
+const MAX_SITE_BODY_BYTES = 16 * 1024;
 const MAX_FEEDBACK_BODY_BYTES = 32 * 1024;
 const MAX_FEEDBACK_MESSAGE_BYTES = 16 * 1024;
 const MAX_REPORT_BYTES = 2 * 1024 * 1024;
@@ -38,7 +39,14 @@ const EVENT_NAMES = new Set([
   "squeezy_graph_refresh_completed",
   "squeezy_failure_seen",
 ]);
+const SITE_EVENT_NAMES = new Set([
+  "squeezy_site_page_view",
+  "squeezy_site_cta_clicked",
+  "squeezy_site_outbound_clicked",
+]);
 const FEEDBACK_SOURCES = new Set(["cli", "tui"]);
+const SITE_REFERRER_KINDS = new Set(["none", "internal", "search", "social", "external"]);
+const SITE_TARGET_KINDS = new Set(["internal", "github", "release", "docs", "install", "other"]);
 
 const PROVIDERS = new Set(["open_ai", "anthropic", "google", "azure_open_ai", "bedrock", "ollama"]);
 const MODEL_FAMILIES = new Set(["gpt", "claude", "gemini", "bedrock", "ollama", "other"]);
@@ -100,12 +108,18 @@ const PROPERTY_SCHEMAS: Record<string, "u64" | Set<string>> = {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/v1/site" && request.method === "OPTIONS") {
+      return siteCorsResponse(null, { status: 204 });
+    }
     if (request.method !== "POST") {
       return jsonResponse(405, { error: "method_not_allowed" });
     }
-    const url = new URL(request.url);
     if (!env.POSTHOG_PROJECT_TOKEN) {
       return jsonResponse(500, { error: "telemetry_not_configured" });
+    }
+    if (url.pathname === "/v1/site") {
+      return handleSiteEvent(request, env);
     }
     if (url.pathname === "/v1/feedback") {
       return handleFeedback(request, env);
@@ -162,6 +176,53 @@ export default {
     return new Response(null, { status: 204 });
   },
 };
+
+async function handleSiteEvent(request: Request, env: Env): Promise<Response> {
+  let text: string;
+  let event: JsonObject;
+  try {
+    text = await boundedText(request, MAX_SITE_BODY_BYTES);
+    event = JSON.parse(text) as JsonObject;
+    validateSiteEvent(event);
+  } catch (error) {
+    if (error instanceof Error && error.message === "body_too_large") {
+      return siteCorsResponse(JSON.stringify({ error: "body_too_large" }), {
+        status: 413,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return siteCorsResponse(JSON.stringify({ error: "invalid_site_event" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const response = await sendPostHogEvent(env, {
+    event: event.event,
+    timestamp: new Date(event.timestamp_ms as number).toISOString(),
+    properties: {
+      distinct_id: event.visitor_id,
+      $process_person_profile: false,
+      schema_version: event.schema_version,
+      visitor_id: event.visitor_id,
+      session_id: event.session_id,
+      path: event.path,
+      referrer_kind: event.referrer_kind,
+      cta_id: event.cta_id,
+      target_kind: event.target_kind,
+      utm_source: event.utm_source,
+      utm_medium: event.utm_medium,
+      utm_campaign: event.utm_campaign,
+    },
+  });
+  if (!response.ok) {
+    return siteCorsResponse(JSON.stringify({ error: "posthog_rejected" }), {
+      status: 502,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  return siteCorsResponse(null, { status: 204 });
+}
 
 async function handleFeedback(request: Request, env: Env): Promise<Response> {
   let text: string;
@@ -296,6 +357,54 @@ function validateBatch(batch: JsonObject): void {
   for (const event of batch.events) {
     validateEvent(event as JsonObject);
   }
+}
+
+function validateSiteEvent(event: JsonObject): void {
+  assertPlainObject(event, "site_event");
+  assertKeys(event, "site_event", [
+    "schema_version",
+    "visitor_id",
+    "session_id",
+    "timestamp_ms",
+    "event",
+    "path",
+    "referrer_kind",
+    "cta_id",
+    "target_kind",
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+  ]);
+  if (event.schema_version !== SCHEMA_VERSION) {
+    throw new Error("unsupported schema version");
+  }
+  assertUuid(event.visitor_id, "visitor_id");
+  assertUuid(event.session_id, "session_id");
+  assertU64(event.timestamp_ms, "timestamp_ms");
+  const now = Date.now();
+  if (
+    (event.timestamp_ms as number) < now - 1000 * 60 * 60 * 24 * 30 ||
+    (event.timestamp_ms as number) > now + 1000 * 60 * 10
+  ) {
+    throw new Error("timestamp_ms outside accepted window");
+  }
+  if (typeof event.event !== "string" || !SITE_EVENT_NAMES.has(event.event)) {
+    throw new Error("unknown site event name");
+  }
+  assertSitePath(event.path, "path");
+  if (typeof event.referrer_kind !== "string" || !SITE_REFERRER_KINDS.has(event.referrer_kind)) {
+    throw new Error("invalid referrer_kind");
+  }
+  assertOptionalSiteToken(event.cta_id, "cta_id", 80);
+  if (
+    event.target_kind !== undefined &&
+    (typeof event.target_kind !== "string" || !SITE_TARGET_KINDS.has(event.target_kind))
+  ) {
+    throw new Error("invalid target_kind");
+  }
+  assertOptionalSiteToken(event.utm_source, "utm_source", 80);
+  assertOptionalSiteToken(event.utm_medium, "utm_medium", 80);
+  assertOptionalSiteToken(event.utm_campaign, "utm_campaign", 80);
 }
 
 function validateFeedback(feedback: JsonObject): void {
@@ -460,6 +569,30 @@ function assertString(value: unknown, label: string, min: number, max: number): 
   }
 }
 
+function assertSitePath(value: unknown, label: string): void {
+  if (typeof value !== "string" || value.length < 1 || value.length > 160) {
+    throw new Error(`${label} must be a bounded path`);
+  }
+  if (!value.startsWith("/") || value.startsWith("//") || /[\u0000-\u001f]/.test(value)) {
+    throw new Error(`${label} must be a site-local path`);
+  }
+  if (!/^[A-Za-z0-9/_?.=&%#+:-]+$/.test(value)) {
+    throw new Error(`${label} has invalid characters`);
+  }
+}
+
+function assertOptionalSiteToken(value: unknown, label: string, max: number): void {
+  if (value === undefined) {
+    return;
+  }
+  if (typeof value !== "string" || value.length < 1 || value.length > max) {
+    throw new Error(`${label} must be a bounded token`);
+  }
+  if (!/^[A-Za-z0-9._:-]+$/.test(value)) {
+    throw new Error(`${label} has invalid characters`);
+  }
+}
+
 function assertBoundedText(value: unknown, label: string, min: number, maxBytes: number): void {
   if (typeof value !== "string" || value.length < min) {
     throw new Error(`${label} must be a bounded string`);
@@ -509,6 +642,15 @@ async function boundedText(request: Request, maxBytes: number): Promise<string> 
     throw new Error("body_too_large");
   }
   return text;
+}
+
+function siteCorsResponse(body: BodyInit | null, init: ResponseInit = {}): Response {
+  const headers = new Headers(init.headers);
+  headers.set("Access-Control-Allow-Origin", "https://squeezyagent.com");
+  headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  headers.set("Access-Control-Allow-Headers", "content-type");
+  headers.set("Access-Control-Max-Age", "86400");
+  return new Response(body, { ...init, headers });
 }
 
 async function sendPostHogEvent(env: Env, event: JsonObject): Promise<Response> {

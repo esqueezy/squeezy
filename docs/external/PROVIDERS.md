@@ -112,7 +112,7 @@ until added to the registry or reported by the local provider.
 - `google`: Gemini `streamGenerateContent` SSE streaming, function declarations, function calls, usage metadata.
 - `azure_openai`: Azure OpenAI Responses-compatible streaming with `api-key` auth and `api-version`.
 - `ollama`: Local `/api/chat` NDJSON streaming with function tool schemas and zero-dollar pricing.
-- `bedrock`: Registered with model/capability/pricing metadata. The signed AWS ConverseStream transport is isolated behind the provider and currently returns a configuration error until a SigV4/event-stream implementation is enabled.
+- `bedrock`: AWS SDK Bedrock Runtime `ConverseStream` transport, AWS default credential chain, region/base-url configuration, text streaming, tool use/tool results, and usage metadata.
 
 Pricing values are seed metadata for routing and telemetry, not billing authority. Refresh them from provider pricing pages when changing defaults.
 Context usage values are local estimates. They are meant to explain Squeezy's

@@ -1,0 +1,32 @@
+---
+import BaseLayout from "./BaseLayout.astro";
+import DocNav from "../components/DocNav.astro";
+
+const {
+  title,
+  description,
+  activeDoc = "",
+  eyebrow = "docs",
+  heading,
+  lead
+} = Astro.props;
+---
+
+<BaseLayout title={title} description={description} active="docs">
+  <section class="page-hero">
+    <div class="page-hero-inner">
+      <span class="eyebrow">{eyebrow}</span>
+      <h1>{heading}</h1>
+      <p class="lead">{lead}</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="doc-shell">
+      <DocNav active={activeDoc} />
+      <div class="doc-content">
+        <slot />
+      </div>
+    </div>
+  </section>
+</BaseLayout>
