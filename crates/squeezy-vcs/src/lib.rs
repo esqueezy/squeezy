@@ -1199,8 +1199,10 @@ impl CheckpointStore {
             .lock()
             .map_err(|err| SqueezyError::Tool(format!("checkpoint init lock poisoned: {err}")))?;
         if !self.git_dir.join("HEAD").exists() {
-            fs::create_dir_all(&self.git_dir)?;
-            self.git_raw(["init"])?;
+            if let Some(parent) = self.git_dir.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            self.init_shadow_git_dir()?;
             self.git_raw(["config", "core.autocrlf", "false"])?;
             self.git_raw(["config", "core.fsmonitor", "false"])?;
             self.git_raw(["config", "core.quotepath", "false"])?;
@@ -1218,6 +1220,20 @@ impl CheckpointStore {
             fs::write(&exclude_path, "/.squeezy/\n")?;
         }
         Ok(())
+    }
+
+    fn init_shadow_git_dir(&self) -> Result<()> {
+        git_output_vec_allow_status(
+            &self.root,
+            vec![
+                "init".to_string(),
+                "--bare".to_string(),
+                self.git_dir.to_string_lossy().to_string(),
+            ],
+            &[0],
+        )
+        .map(|_| ())
+        .map_err(SqueezyError::Tool)
     }
 
     fn large_file_fingerprints(&self) -> Result<Vec<LargeFileFingerprint>> {

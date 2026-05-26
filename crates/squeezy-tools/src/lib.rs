@@ -12674,32 +12674,24 @@ fn prepare_shell_sandbox_plan_with_probe(
         });
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        if required {
-            return Err(format!(
-                "required shell sandbox unavailable on {}",
-                std::env::consts::OS
-            ));
-        }
-    }
-
     #[cfg(not(target_os = "windows"))]
     {
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            if required {
+                return Err(format!(
+                    "required shell sandbox unavailable on {}",
+                    std::env::consts::OS
+                ));
+            }
+        }
+
         Ok(ShellSandboxPlan::direct_with_fallback(
             command,
             config.mode,
             config,
             fallback_reason,
         ))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // Unreachable: the Windows arm above always returns. This branch
-        // exists only so the function has a tail expression of the right
-        // type for non-Windows targets without the compiler flagging
-        // unreachable_code on Windows.
-        unreachable!()
     }
 }
 
@@ -12816,6 +12808,7 @@ fn macos_read_roots() -> Vec<PathBuf> {
     roots
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn shell_writable_roots(root: &Path, config: &ShellSandboxConfig) -> Vec<PathBuf> {
     let mut roots = vec![
         root.to_path_buf(),

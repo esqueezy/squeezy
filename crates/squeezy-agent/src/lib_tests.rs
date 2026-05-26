@@ -1001,7 +1001,7 @@ async fn shell_tool_emits_job_events_and_session_events() {
                 call_id: "call_1".to_string(),
                 name: "shell".to_string(),
                 arguments: json!({
-                    "command": "printf job-ok",
+                    "command": "echo job-ok",
                     "description": "print a marker",
                     "timeout_ms": 10_000,
                 }),
