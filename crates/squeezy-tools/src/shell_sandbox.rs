@@ -2,12 +2,14 @@
 use std::process::Stdio;
 use std::{
     collections::HashMap,
-    env,
     future::Future,
     path::{Path, PathBuf},
     sync::Mutex as StdMutex,
     time::Duration,
 };
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::env;
 
 #[cfg(target_os = "linux")]
 use std::{fs::OpenOptions, io::Write};

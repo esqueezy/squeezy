@@ -2,7 +2,6 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
-    fs,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -11,6 +10,9 @@ use std::{
     },
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::fs;
 
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
@@ -29,7 +31,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::ipc::{self, IpcListener};
+#[cfg(unix)]
+use crate::ipc;
+use crate::ipc::IpcListener;
+#[cfg(unix)]
+use crate::sha256_hex;
 use crate::shell_output::{insert_content_field, shape_shell_output};
 use crate::shell_parse::{
     analyze_shell_command, dequote_token, expand_wrapper_segments, is_destructive_shell_segment,
@@ -47,7 +53,7 @@ use crate::{
     IpcStream, MAX_SHELL_OUTPUT_BYTE_CAP, MAX_SHELL_TIMEOUT_MS, OutputMode,
     SQUEEZY_ASK_CALL_ID_ENV, SQUEEZY_ASK_SOCKET_ENV, ShellAskApprover, ShellAskDecision,
     ShellAskRequest, ShellPermissionAnalysis, ToolCall, ToolCostHint, ToolRegistry, ToolResult,
-    ToolStatus, make_result, sha256_hex, shell_exit_signal, tool_arg_error, tool_error,
+    ToolStatus, make_result, shell_exit_signal, tool_arg_error, tool_error,
 };
 
 pub(crate) struct ShellRunOutcome {

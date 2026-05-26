@@ -103,26 +103,26 @@ use shell_sandbox::macos_shell_sandbox_profile;
 #[cfg(test)]
 use shell_sandbox::{
     ShellSandboxBackendStatus, prepare_shell_sandbox_plan_with_probe,
-    shell_sandbox_best_effort_fallback_reason, shell_sandbox_direct_fallback_reason,
     shell_sandbox_runtime_unavailable_with_probe,
 };
 use shell_sandbox::{
     ShellSandboxHealth, ShellSandboxPlan, apply_shell_sandbox_backend_health,
     prepare_shell_sandbox_plan, shell_sandbox_backend_probe_failure,
 };
-use truncate::truncate_middle_bytes;
-use web::{
-    ReqwestWebHttpClient, WebFetchArgs, WebHttpClient, WebSearchArgs, enforce_web_quote_limit,
-    web_url_host,
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+use shell_sandbox::{
+    shell_sandbox_best_effort_fallback_reason, shell_sandbox_direct_fallback_reason,
 };
-#[cfg(windows)]
-use win_job::ShellJob;
-
+use truncate::truncate_middle_bytes;
 #[cfg(test)]
 pub(crate) use web::{
     MAX_WEB_REDIRECTS, WebHttpFuture, WebHttpResponse, extract_http_urls, html_to_text,
     is_textual_content_type, parse_mcp_websearch_response, web_cache_receipt_status,
     web_cache_stale_after_unix_ms, web_stable_output_sha256,
+};
+use web::{
+    ReqwestWebHttpClient, WebFetchArgs, WebHttpClient, WebSearchArgs, enforce_web_quote_limit,
+    web_url_host,
 };
 
 pub(crate) const DEFAULT_MAX_FILES: usize = 10_000;
