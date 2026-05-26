@@ -53,6 +53,7 @@ use squeezy_store::{Observation, ObservationKind, SqueezyStore};
 use squeezy_vcs::{
     CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffHunk, DiffMode, DiffOptions,
     DiffSnapshot, GitVcs, RollbackMode, RollbackTarget, WorkspaceSnapshot,
+    canonicalize_workspace_root,
 };
 use squeezy_workspace::{
     CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexCoverage, IndexingPolicy,
@@ -1128,8 +1129,7 @@ impl ToolRegistry {
         runtime: ToolRegistryRuntime,
     ) -> Result<Self> {
         let root = root.into();
-        let root = root
-            .canonicalize()
+        let root = canonicalize_workspace_root(&root)
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let skills = SkillCatalog::discover(&root, &skills_config);
         Self::new_inner_canonical(
@@ -1155,8 +1155,7 @@ impl ToolRegistry {
         runtime: ToolRegistryRuntime,
     ) -> Result<Self> {
         let root = root.into();
-        let root = root
-            .canonicalize()
+        let root = canonicalize_workspace_root(&root)
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let skills = SkillCatalog::discover(&root, &skills_config);
         Self::new_inner_canonical(
@@ -1178,8 +1177,7 @@ impl ToolRegistry {
         runtime: ToolRegistryRuntime,
     ) -> Result<Self> {
         let root = root.into();
-        let root = root
-            .canonicalize()
+        let root = canonicalize_workspace_root(&root)
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         Self::new_inner_canonical(
             root,
@@ -1263,8 +1261,7 @@ impl ToolRegistry {
         http: Arc<dyn WebHttpClient>,
     ) -> Result<Self> {
         let root = root.into();
-        let root = root
-            .canonicalize()
+        let root = canonicalize_workspace_root(&root)
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let output_store = ToolOutputStore::new(&root, output_config)?;
         let crawl_options = CrawlOptions::default();
@@ -3651,7 +3648,7 @@ impl ToolRegistry {
             };
             return self.execute_read_slice_diff_blocking(&ctx);
         }
-        let path = match path.canonicalize() {
+        let path = match canonicalize_workspace_root(&path) {
             Ok(path) => path,
             Err(err) => {
                 return tool_error(
@@ -6945,16 +6942,14 @@ impl ToolRegistry {
 
     fn resolve_existing(&self, raw: &str) -> std::result::Result<PathBuf, String> {
         let candidate = self.join_workspace(raw)?;
-        let canonical = candidate
-            .canonicalize()
+        let canonical = canonicalize_workspace_root(&candidate)
             .map_err(|err| format!("path does not exist or is inaccessible: {err}"))?;
         self.ensure_inside(canonical)
     }
 
     fn resolve_shell_workdir(&self, raw: &str) -> std::result::Result<PathBuf, String> {
         let candidate = self.join_shell_path(raw)?;
-        let canonical = candidate
-            .canonicalize()
+        let canonical = canonicalize_workspace_root(&candidate)
             .map_err(|err| format!("path does not exist or is inaccessible: {err}"))?;
         if !canonical.is_dir() {
             return Err("path is not a directory".to_string());
@@ -6981,8 +6976,7 @@ impl ToolRegistry {
         let parent = candidate
             .parent()
             .ok_or_else(|| "path has no parent".to_string())?;
-        let parent = parent
-            .canonicalize()
+        let parent = canonicalize_workspace_root(parent)
             .map_err(|err| format!("parent directory does not exist or is inaccessible: {err}"))?;
         self.ensure_inside(parent)?;
         Ok(candidate)

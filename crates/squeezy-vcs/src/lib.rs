@@ -28,6 +28,32 @@ pub fn crate_name() -> &'static str {
     CRATE_NAME
 }
 
+/// Canonicalize a workspace root and strip the Windows verbatim (`\\?\`)
+/// prefix so the resulting path is safe to hand to Git for Windows and
+/// `Command::current_dir`, both of which mishandle the extended-path form
+/// produced by `fs::canonicalize` on Windows.
+pub fn canonicalize_workspace_root(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
+    fs::canonicalize(path.as_ref()).map(strip_verbatim_prefix)
+}
+
+/// Remove the `\\?\` Windows extended-path prefix from a canonical path so
+/// downstream tools that still rely on legacy Win32 path parsing (such as
+/// Git for Windows) can resolve it. UNC paths (`\\?\UNC\...`) keep their
+/// prefix because the legacy form has no equivalent.
+pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    if !cfg!(windows) {
+        return path;
+    }
+    let s = path.to_string_lossy();
+    let Some(rest) = s.strip_prefix(r"\\?\") else {
+        return path;
+    };
+    if rest.starts_with("UNC\\") || rest.starts_with("UNC/") {
+        return path;
+    }
+    PathBuf::from(rest.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct GitVcs {
     root: PathBuf,
@@ -251,9 +277,7 @@ pub enum RollbackMode {
 
 impl GitVcs {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root
-            .as_ref()
-            .canonicalize()
+        let root = canonicalize_workspace_root(root.as_ref())
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         Ok(Self { root })
     }
@@ -684,9 +708,7 @@ impl GitVcs {
 
 impl CheckpointStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root
-            .as_ref()
-            .canonicalize()
+        let root = canonicalize_workspace_root(root.as_ref())
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let dir = root.join(".squeezy").join("checkpoints");
         let git_dir = dir.join("git");

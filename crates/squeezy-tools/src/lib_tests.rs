@@ -3807,7 +3807,10 @@ async fn shell_tty_attaches_stdout_to_terminal() {
         )
         .await;
     assert_eq!(tty.status, ToolStatus::Success);
-    assert_eq!(tty.content["stdout"], "tty");
+    // Windows does not yet wire up ConPTY for the shell tool, so `tty: true`
+    // is documented to degrade to pipe-backed stdio on that platform.
+    let expected_tty_output = if cfg!(windows) { "pipe" } else { "tty" };
+    assert_eq!(tty.content["stdout"], expected_tty_output);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -3907,11 +3910,15 @@ async fn shell_exposes_in_flight_ask_socket_when_approver_is_present() {
         let _ = fs::remove_dir_all(root);
         return;
     }
-    assert!(socket.ends_with(".sock"), "{socket}");
-    assert!(
-        !Path::new(socket).exists(),
-        "ask socket should be removed after shell completion"
-    );
+    if cfg!(windows) {
+        assert!(socket.starts_with(r"\\.\pipe\"), "{socket}");
+    } else {
+        assert!(socket.ends_with(".sock"), "{socket}");
+        assert!(
+            !Path::new(socket).exists(),
+            "ask socket should be removed after shell completion"
+        );
+    }
 
     let _ = fs::remove_dir_all(root);
 }
