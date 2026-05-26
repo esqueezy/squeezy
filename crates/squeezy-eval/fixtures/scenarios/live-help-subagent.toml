@@ -1,0 +1,33 @@
+id = "live-help-subagent"
+title = "Live smoke: doc-help subagent answers an unsupported topic from inlined corpus"
+description = """
+End-to-end live check: ask an unsupported help question so the curated
+layer returns Unsupported and the doc-help subagent has to answer from
+the inlined bundled doc corpus. Verifies the subagent produces a useful
+grounded answer (not just refuses), and that it cites a real bundled
+doc path. Requires whichever provider key the active model needs.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+
+# A question that is unambiguously inside the bundled docs (shell
+# sandboxing) but is NOT a curated topic id or alias, so curated returns
+# Unsupported and the doc subagent must do the work.
+[[steps]]
+kind = "prompt"
+text = "/help what shell sandbox backends does squeezy support on linux and macos"
+
+[expect]
+final_text_contains = ["sandbox"]
+max_wall_clock_seconds = 120
+no_tool_errors = true
+
+[triage]
+enabled = false

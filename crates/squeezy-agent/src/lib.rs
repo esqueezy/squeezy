@@ -33,7 +33,9 @@ use squeezy_llm::{
     RequestTokenEstimate, capabilities_for, estimate_cost, estimate_request_context_calibrated,
     fetch_ollama_context_window,
 };
-use squeezy_skills::{HelpAnswer, SqueezyHelp, matches_squeezy_help_input};
+use squeezy_skills::{
+    BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
+};
 use squeezy_store::{
     BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionHandle,
     SessionMetadata, SessionQuery, SessionRecord, SessionReplayEvent, SessionReplayEventKind,
@@ -2420,14 +2422,28 @@ impl Agent {
                 }
                 // Cheap pre-check first so unrelated coding turns do not pay for a
                 // full `inspect_redacted()` rendering on every turn.
-                if matches_squeezy_help_input(&task_title)
-                    && let Some(answer) =
-                        SqueezyHelp::new(config.inspect_redacted()).answer_for_input(&task_title)
-                {
+                if matches_squeezy_help_input(&task_title) {
+                    let outcome = resolve_help_turn(
+                        &task_title,
+                        &HelpResolutionDeps {
+                            provider: provider.clone(),
+                            tools: tools.clone(),
+                            telemetry: telemetry.clone(),
+                            config: config.clone(),
+                            redactor: redactor.clone(),
+                            cancel: cancel.clone(),
+                            approval_ids: approval_ids.clone(),
+                            session_rules: session_rules.clone(),
+                            ai_reviewer_state: ai_reviewer_state.clone(),
+                            session_mode: session_mode.clone(),
+                            subagents: subagents.clone(),
+                        },
+                    )
+                    .await;
                     complete_squeezy_help_turn(
                         turn_id,
                         task_title,
-                        answer,
+                        outcome,
                         redacted_input.redactions,
                         HelpTurnDeps {
                             tx: tx.clone(),
@@ -2621,6 +2637,13 @@ struct HelpTurnDeps {
     session_mode: Arc<AtomicU8>,
 }
 
+#[derive(Debug, Clone)]
+struct HelpTurnOutcome {
+    answer: HelpAnswer,
+    metrics: TurnMetrics,
+    cost: CostSnapshot,
+}
+
 struct LocalToolTurnDeps {
     tx: mpsc::Sender<AgentEvent>,
     provider: Arc<dyn LlmProvider>,
@@ -2642,13 +2665,186 @@ struct LocalToolTurnDeps {
     subagents: SubagentRegistry,
 }
 
+async fn resolve_help_turn(task_title: &str, deps: &HelpResolutionDeps) -> HelpTurnOutcome {
+    let config_inspect = deps.config.inspect_redacted();
+    let curated = SqueezyHelp::new(config_inspect).answer_for_input(task_title);
+
+    // Curated topics always beat the subagent: they have hand-written summaries,
+    // citation paths, and extracted config sections that the model can only
+    // approximate. We only escalate to the subagent when the curated layer
+    // returns `Unsupported` (or returns nothing for a borderline question).
+    if let Some(answer) = curated.as_ref()
+        && answer.status == HelpStatus::Answered
+    {
+        return HelpTurnOutcome {
+            answer: answer.clone(),
+            metrics: TurnMetrics::default(),
+            cost: CostSnapshot::default(),
+        };
+    }
+
+    let subagent = run_doc_help_subagent(task_title, deps).await;
+
+    if let Some(answer) = subagent.answer {
+        return HelpTurnOutcome {
+            answer,
+            metrics: subagent.metrics,
+            cost: subagent.cost,
+        };
+    }
+
+    let answer =
+        curated.unwrap_or_else(|| SqueezyHelp::new(deps.config.inspect_redacted()).topic_index());
+    HelpTurnOutcome {
+        answer,
+        metrics: subagent.metrics,
+        cost: subagent.cost,
+    }
+}
+
+struct DocHelpResolution {
+    answer: Option<HelpAnswer>,
+    metrics: TurnMetrics,
+    cost: CostSnapshot,
+}
+
+impl DocHelpResolution {
+    fn skipped() -> Self {
+        Self {
+            answer: None,
+            metrics: TurnMetrics::default(),
+            cost: CostSnapshot::default(),
+        }
+    }
+}
+
+struct HelpResolutionDeps {
+    provider: Arc<dyn LlmProvider>,
+    tools: ToolRegistry,
+    telemetry: TelemetryClient,
+    config: AppConfig,
+    redactor: Arc<Redactor>,
+    cancel: CancellationToken,
+    approval_ids: Arc<AtomicU64>,
+    session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
+    session_mode: Arc<AtomicU8>,
+    subagents: SubagentRegistry,
+}
+
+async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> DocHelpResolution {
+    if !deps.config.subagents.enabled {
+        return DocHelpResolution::skipped();
+    }
+    let config_inspect = deps.config.inspect_redacted();
+    let prompt = doc_help_subagent_prompt(task_title, &config_inspect, &bundled_docs());
+    let request = SubagentRequest {
+        prompt,
+        scope: Some(
+            "Inlined bundled docs (originally under docs/external) and the inlined redacted config inspect output."
+                .to_string(),
+        ),
+        thoroughness: None,
+    };
+    let mut all_tool_specs = core_control_tools(
+        &deps.config.subagents,
+        load_session_mode(&deps.session_mode),
+    );
+    all_tool_specs.extend(deps.tools.specs().iter().cloned().map(advertised_tool));
+    let jobs = JobRegistry::new();
+    let parent = ToolExecutionContext {
+        turn_id: TurnId::new(0),
+        origin: ToolOrigin::Subagent,
+        provider: deps.provider.clone(),
+        tools: &deps.tools,
+        jobs: &jobs,
+        config: &deps.config,
+        telemetry: deps.telemetry.clone(),
+        redactor: deps.redactor.clone(),
+        tx: mpsc::channel(1).0,
+        cancel: deps.cancel.clone(),
+        approval_ids: deps.approval_ids.clone(),
+        session_rules: deps.session_rules.clone(),
+        ai_reviewer_state: deps.ai_reviewer_state.clone(),
+        session_mode: deps.session_mode.clone(),
+        session_log: None,
+        conversation_state: None,
+        task_state: Arc::new(Mutex::new(None)),
+        all_tool_specs: &all_tool_specs,
+        loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
+        exploration_state: Arc::new(Mutex::new(ExplorationTurnState::from_plan(None))),
+        subagents: deps.subagents.clone(),
+    };
+    let execution = run_subagent(&parent, SubagentKind::DocHelp, request).await;
+
+    let mut metrics = TurnMetrics::default();
+    metrics.merge_subagent_tool_metrics(&execution.metrics);
+    metrics.subagent_calls = 1;
+    if execution.status != ToolStatus::Success {
+        metrics.subagent_failures = 1;
+    }
+    let cost = execution.metrics.provider.clone();
+
+    let answer = if execution.status == ToolStatus::Success && !execution.summary.trim().is_empty()
+    {
+        Some(HelpAnswer {
+            topic: "doc-help".to_string(),
+            status: HelpStatus::Answered,
+            body: execution.summary,
+            citations: Vec::new(),
+            config_sections: Vec::new(),
+        })
+    } else {
+        None
+    };
+
+    DocHelpResolution {
+        answer,
+        metrics,
+        cost,
+    }
+}
+
+fn doc_help_subagent_prompt(task_title: &str, config_inspect: &str, docs: &[BundledDoc]) -> String {
+    // Inlining the bundled docs is what makes this subagent actually work at
+    // runtime: end users run Squeezy outside the source tree, so docs/external
+    // does not exist on disk for filesystem tools to find. The doc corpus is
+    // ~120KB total; that is acceptable for a help turn the user explicitly
+    // invoked.
+    let mut prompt = String::with_capacity(config_inspect.len() + 4096 + docs_total_len(docs));
+    prompt.push_str("User help request:\n");
+    prompt.push_str(task_title.trim());
+    prompt.push_str("\n\nRedacted config inspect:\n```toml\n");
+    prompt.push_str(config_inspect.trim());
+    prompt.push_str("\n```\n\nBundled docs corpus (each section is the full content of one bundled doc; cite by the listed path):\n");
+    for doc in docs {
+        prompt.push_str("\n---\nPATH: ");
+        prompt.push_str(doc.path);
+        prompt.push_str("\n\n");
+        prompt.push_str(doc.content.trim_end());
+        prompt.push('\n');
+    }
+    prompt
+}
+
+fn docs_total_len(docs: &[BundledDoc]) -> usize {
+    docs.iter()
+        .map(|doc| doc.content.len() + doc.path.len() + 16)
+        .sum()
+}
+
 async fn complete_squeezy_help_turn(
     turn_id: TurnId,
     task_title: String,
-    answer: HelpAnswer,
+    outcome: HelpTurnOutcome,
     seed_redactions: u64,
     deps: HelpTurnDeps,
 ) {
+    let HelpTurnOutcome {
+        answer,
+        mut metrics,
+        cost,
+    } = outcome;
     let HelpTurnDeps {
         tx,
         redactor,
@@ -2664,11 +2860,7 @@ async fn complete_squeezy_help_turn(
     let user_transcript = TranscriptItem::user(task_title.clone());
     let rendered = redactor.redact(&answer.render_markdown());
     let message = TranscriptItem::assistant(rendered.text);
-    let metrics = TurnMetrics {
-        redactions: seed_redactions + rendered.redactions,
-        ..TurnMetrics::default()
-    };
-    let cost = CostSnapshot::default();
+    metrics.redactions += seed_redactions + rendered.redactions;
 
     log_session_event(
         session_log.as_ref(),
@@ -2705,7 +2897,7 @@ async fn complete_squeezy_help_turn(
             latest_task_state.as_ref(),
             task_title.clone(),
             TaskStateStatus::Completed,
-            Some(format!("Squeezy help: {}", answer.topic)),
+            Some("Squeezy help".to_string()),
         ),
     )
     .await;
@@ -4361,6 +4553,7 @@ struct TurnPersistInput<'a> {
 enum SubagentKind {
     Delegate,
     Explore,
+    DocHelp,
     Plan,
     Review,
 }
@@ -4370,6 +4563,7 @@ impl SubagentKind {
         match self {
             Self::Delegate => "delegate",
             Self::Explore => "explore",
+            Self::DocHelp => "doc_help",
             Self::Plan => "plan",
             Self::Review => "review",
         }
@@ -4384,6 +4578,7 @@ impl SubagentKind {
         match self {
             Self::Delegate => None,
             Self::Explore => Some(SubagentRole::Explorer),
+            Self::DocHelp => None,
             Self::Plan => Some(SubagentRole::Planner),
             Self::Review => Some(SubagentRole::Reviewer),
         }
@@ -5026,7 +5221,7 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
             .unwrap_or_else(|| {
                 "Review the current diff. Report only actionable findings.".to_string()
             }),
-        SubagentKind::Delegate | SubagentKind::Explore => call
+        SubagentKind::Delegate | SubagentKind::Explore | SubagentKind::DocHelp => call
             .arguments
             .get("prompt")
             .and_then(Value::as_str)
@@ -5062,7 +5257,9 @@ async fn run_subagent(
     config.model = model.clone();
 
     let allowed_tools = subagent_allowed_tools(parent.all_tool_specs, kind);
-    if allowed_tools.is_empty() {
+    // DocHelp answers from inlined corpus, so a tool-less call is the intended
+    // shape. Other subagent kinds still require at least one read-only tool.
+    if allowed_tools.is_empty() && !matches!(kind, SubagentKind::DocHelp) {
         return SubagentExecution {
             status: ToolStatus::Error,
             summary: String::new(),
@@ -5444,6 +5641,9 @@ fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> Strin
             let base = role_config(SubagentRole::Explorer).instructions;
             format!("{base}\n\nThoroughness: {thoroughness}.")
         }
+        SubagentKind::DocHelp => {
+            "You are Squeezy's hidden documentation subagent. Answer the user's Squeezy help question using ONLY the inlined bundled doc corpus and the inlined redacted config snapshot provided in the user prompt. You have no tools and must not request any; the corpus is already in your context. Cite specific bundled doc paths (e.g., `docs/external/PROVIDERS.md`) and relevant config sections (e.g., `[model]`) inline in your answer. If the inlined docs do not cover the question, say so explicitly and point the user to https://squeezyagent.com/docs/ and https://github.com/esqueezy/squeezy rather than guessing. Do not mention internal agent mechanics, do not invent file paths beyond the inlined corpus, and do not ask the user follow-up questions.".to_string()
+        }
         SubagentKind::Plan => {
             let base = role_config(SubagentRole::Planner).instructions;
             format!(
@@ -5475,6 +5675,7 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
                 .unwrap_or(&parent_model)
                 .to_string()
         }),
+        (SubagentKind::DocHelp, _) => parent_model,
         (_, RoleModelPolicy::Parent) => parent_model,
         (_, RoleModelPolicy::Cheap) => default_cheap_model_for_provider(provider)
             .unwrap_or(&parent_model)
@@ -5529,6 +5730,11 @@ const EXPLORE_SUBAGENT_TOOL_NAMES: &[&str] = &[
     "read_file",
 ];
 
+// DocHelp answers from the inlined bundled doc corpus, not from filesystem
+// search — those tools would read the user's working directory (not the
+// bundled docs that ship inside the binary) and produce misleading hits.
+const DOC_HELP_SUBAGENT_TOOL_NAMES: &[&str] = &[];
+
 fn subagent_allowed_tools(
     all_tool_specs: &[AdvertisedTool],
     kind: SubagentKind,
@@ -5536,6 +5742,7 @@ fn subagent_allowed_tools(
     let names: BTreeSet<&str> = match kind {
         SubagentKind::Delegate => DELEGATE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
         SubagentKind::Explore => EXPLORE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
+        SubagentKind::DocHelp => DOC_HELP_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
         SubagentKind::Plan => role_config(SubagentRole::Planner)
             .allowed_tools
             .iter()

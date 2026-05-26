@@ -1557,12 +1557,47 @@ async fn inactive_skills_are_not_eagerly_added_to_instructions() {
 }
 
 #[tokio::test]
-async fn squeezy_help_self_question_completes_without_provider_request() {
+async fn known_help_topic_short_circuits_without_provider_request() {
     let provider = Arc::new(MockProvider::new(Vec::new()));
     let agent = Agent::new(AppConfig::default(), provider.clone());
 
+    let mut rx = agent.start_turn("/help providers".to_string(), CancellationToken::new());
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed { message, .. } = event {
+            completed = Some(message.content);
+        }
+    }
+
+    assert!(
+        provider.requests().is_empty(),
+        "known-topic /help should be answered locally without calling the provider"
+    );
+    let completed = completed.expect("help turn should complete");
+    assert!(
+        completed.contains("docs/external/PROVIDERS.md"),
+        "{completed}"
+    );
+    assert!(completed.contains("[model]"), "{completed}");
+}
+
+#[tokio::test]
+async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(
+            "Squeezy does not document a quantum-billing flow; see docs/external/CONFIGURATION.md."
+                .to_string(),
+        )),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
     let mut rx = agent.start_turn(
-        "How do I configure Squeezy providers?".to_string(),
+        "/help quantum billing rules".to_string(),
         CancellationToken::new(),
     );
     let mut completed = None;
@@ -1572,14 +1607,46 @@ async fn squeezy_help_self_question_completes_without_provider_request() {
         }
     }
 
-    assert!(provider.requests().is_empty());
-    let completed = completed.expect("help turn should complete");
-    assert!(completed.contains("Squeezy help"), "{completed}");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
     assert!(
-        completed.contains("docs/external/PROVIDERS.md"),
-        "{completed}"
+        request
+            .instructions
+            .contains("hidden documentation subagent"),
+        "{:?}",
+        request.instructions
     );
-    assert!(completed.contains("[model]"), "{completed}");
+    assert!(
+        request.instructions.contains("inlined bundled doc corpus"),
+        "{:?}",
+        request.instructions
+    );
+    assert!(
+        request.tools.is_empty(),
+        "doc help subagent must have no tools: {:?}",
+        request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    let user_prompt = request
+        .input
+        .iter()
+        .find_map(|item| match item {
+            squeezy_llm::LlmInputItem::UserText(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .expect("subagent user prompt");
+    assert!(
+        user_prompt.contains("PATH: docs/external/PROVIDERS.md"),
+        "subagent prompt must inline bundled docs: {user_prompt:?}"
+    );
+
+    let completed = completed.expect("help turn should complete");
+    assert!(completed.contains("quantum-billing"), "{completed}");
+    assert!(!completed.contains("won't guess"), "{completed}");
 }
 
 #[tokio::test]
@@ -1754,7 +1821,7 @@ fn tool_loop_guard_distinguishes_shell_failures_by_command() {
 }
 
 #[tokio::test]
-async fn unsupported_squeezy_help_question_refuses_without_provider_request() {
+async fn unsupported_squeezy_help_question_falls_back_after_doc_subagent_failure() {
     let provider = Arc::new(MockProvider::new(Vec::new()));
     let agent = Agent::new(AppConfig::default(), provider.clone());
 
@@ -1769,7 +1836,10 @@ async fn unsupported_squeezy_help_question_refuses_without_provider_request() {
         }
     }
 
-    assert!(provider.requests().is_empty());
+    assert!(
+        !provider.requests().is_empty(),
+        "help should try the doc subagent before falling back"
+    );
     let completed = completed.expect("help turn should complete");
     assert!(completed.contains("won't guess"), "{completed}");
     assert!(
