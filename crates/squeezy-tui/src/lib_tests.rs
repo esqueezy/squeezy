@@ -6606,6 +6606,57 @@ fn json_patch_preview_parser_emits_events_per_patch() {
 }
 
 #[tokio::test]
+async fn shell_sandbox_best_effort_fallback_warns_user_once_per_session() {
+    // F3-4: the TUI must surface the silent sandbox degradation
+    // through the notification banner AND a transcript notice on the
+    // first fallback; the agent's once-per-session gate means this
+    // event only ever fires once, so we assert both surfaces hold a
+    // single entry afterwards.
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::ShellSandboxBestEffortFallback {
+        turn_id: TurnId::new(3),
+        backend: "macos-sandbox-exec".to_string(),
+        fallback_count: 1,
+    })
+    .await
+    .expect("send fallback warning");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let banner_message = app
+        .app_notifications
+        .current()
+        .map(|notification| notification.message.clone())
+        .expect("banner notification should be queued");
+    assert!(
+        banner_message.contains("shell sandbox degraded"),
+        "banner text mismatch: {banner_message}"
+    );
+    assert!(
+        banner_message.contains("macos-sandbox-exec"),
+        "banner must name the degraded backend: {banner_message}"
+    );
+
+    let needle = "shell sandbox degraded";
+    let occurrences = app
+        .transcript
+        .iter()
+        .filter(|entry| match &entry.kind {
+            TranscriptEntryKind::Message(item) => item.content.contains(needle),
+            TranscriptEntryKind::Log(message) => message.contains(needle),
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "fallback warning must render exactly once; transcript: {:?}",
+        app.transcript
+    );
+}
+
+#[tokio::test]
 async fn cost_warning_event_renders_exactly_once() {
     // CostWarning previously pushed the same notice into both the
     // transcript and the log pane; both render in the same stream so the

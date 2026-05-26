@@ -4444,3 +4444,256 @@ fn progress_snapshot_returns_none_before_any_calls() {
     let broker = CostBroker::new(&AppConfig::default());
     assert!(broker.progress_snapshot_if_due(3).is_none());
 }
+
+fn shell_fallback_result(
+    backend: &str,
+    fallback_count: u64,
+    first_in_session: bool,
+) -> squeezy_tools::ToolResult {
+    squeezy_tools::ToolResult {
+        call_id: "shell-call".to_string(),
+        tool_name: "shell".to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "sandbox": {
+                "backend": "none",
+                "mode": "best_effort",
+                "best_effort_fallback": {
+                    "backend": backend,
+                    "fallback_count": fallback_count,
+                    "first_in_session": first_in_session,
+                }
+            }
+        }),
+        cost_hint: squeezy_tools::ToolCostHint::default(),
+        receipt: squeezy_tools::ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    }
+}
+
+#[tokio::test]
+async fn shell_sandbox_fallback_warns_tui_exactly_once_per_session() {
+    // F3-4: the TUI must learn about the sandbox degradation on the
+    // first fallback and never again in the same session. The tool
+    // layer's one-shot latch drives `first_in_session`; the agent
+    // routes that signal into AgentEvent::ShellSandboxBestEffortFallback.
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(8);
+
+    let first = shell_fallback_result("macos-sandbox-exec", 1, true);
+    let second = shell_fallback_result("macos-sandbox-exec", 2, false);
+    let third = shell_fallback_result("macos-sandbox-exec", 3, false);
+
+    maybe_emit_shell_sandbox_fallback_warning(&tx, TurnId::new(7), &first).await;
+    maybe_emit_shell_sandbox_fallback_warning(&tx, TurnId::new(8), &second).await;
+    maybe_emit_shell_sandbox_fallback_warning(&tx, TurnId::new(9), &third).await;
+
+    drop(tx);
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one TUI warning must be emitted per session"
+    );
+    let AgentEvent::ShellSandboxBestEffortFallback {
+        turn_id,
+        backend,
+        fallback_count,
+    } = &events[0]
+    else {
+        panic!("expected AgentEvent::ShellSandboxBestEffortFallback");
+    };
+    assert_eq!(
+        turn_id.get(),
+        7,
+        "warning must carry the originating turn id"
+    );
+    assert_eq!(backend, "macos-sandbox-exec");
+    assert_eq!(*fallback_count, 1);
+}
+
+#[tokio::test]
+async fn shell_sandbox_fallback_ignores_clean_shell_results_and_non_shell_tools() {
+    // Defence in depth: clean shell completions and non-shell tools
+    // must NOT trip the warning; the agent helper inspects the result
+    // payload and only routes on the embedded fallback descriptor.
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(4);
+
+    let clean_shell = squeezy_tools::ToolResult {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "sandbox": {
+                "backend": "macos-sandbox-exec",
+                "mode": "required",
+            }
+        }),
+        cost_hint: squeezy_tools::ToolCostHint::default(),
+        receipt: squeezy_tools::ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    let read_file = squeezy_tools::ToolResult {
+        call_id: "call".to_string(),
+        tool_name: "read_file".to_string(),
+        status: ToolStatus::Success,
+        content: json!({"path": "foo.rs"}),
+        cost_hint: squeezy_tools::ToolCostHint::default(),
+        receipt: squeezy_tools::ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+
+    maybe_emit_shell_sandbox_fallback_warning(&tx, TurnId::new(1), &clean_shell).await;
+    maybe_emit_shell_sandbox_fallback_warning(&tx, TurnId::new(2), &read_file).await;
+    drop(tx);
+
+    assert!(
+        rx.recv().await.is_none(),
+        "no AgentEvent must fire for clean or non-shell results"
+    );
+}
+
+#[tokio::test]
+async fn shell_sandbox_fallback_counter_emits_per_call() {
+    // The `approval.best_effort.fallback{tool=shell}` counter ticks on
+    // EVERY fallback, even after the TUI warning has already fired.
+    // We drive `emit_tool_telemetry` directly with synthesized results
+    // so the test does not depend on the live shell sandbox.
+    let temp = std::env::temp_dir().join(format!(
+        "squeezy-best-effort-fallback-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&temp).expect("temp dir");
+    let install_id_path = temp.join("install_id");
+    let config = AppConfig {
+        telemetry: squeezy_telemetry::telemetry_config(true, "https://telemetry.example/v1/batch"),
+        ..AppConfig::default()
+    };
+    let telemetry = TelemetryClient::from_config_with_install_path(&config, &install_id_path);
+    assert!(telemetry.enabled(), "telemetry must be live for this test");
+
+    let call = ToolCall {
+        call_id: "shell-call".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({"command": "true"}),
+    };
+
+    // First fallback: first_in_session=true.
+    emit_tool_telemetry(
+        &config,
+        &telemetry,
+        TurnId::new(1),
+        1,
+        &call,
+        &shell_fallback_result("macos-sandbox-exec", 1, true),
+        Duration::from_millis(5),
+    );
+    // Second fallback: counter must still tick even though the TUI
+    // one-shot latch has flipped.
+    emit_tool_telemetry(
+        &config,
+        &telemetry,
+        TurnId::new(1),
+        2,
+        &call,
+        &shell_fallback_result("macos-sandbox-exec", 2, false),
+        Duration::from_millis(7),
+    );
+    // Clean shell call must NOT add a fallback counter event.
+    let clean = squeezy_tools::ToolResult {
+        call_id: "clean".to_string(),
+        tool_name: "shell".to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "sandbox": {
+                "backend": "macos-sandbox-exec",
+                "mode": "required",
+            }
+        }),
+        cost_hint: squeezy_tools::ToolCostHint::default(),
+        receipt: squeezy_tools::ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    emit_tool_telemetry(
+        &config,
+        &telemetry,
+        TurnId::new(1),
+        3,
+        &call,
+        &clean,
+        Duration::from_millis(2),
+    );
+
+    // `spawn` is fire-and-forget; let queued tasks land in the queue.
+    // Each `emit_tool_telemetry` schedules background tasks for both
+    // the tool-completed event and (optionally) the fallback counter,
+    // so we yield twice per call and then poll the queue snapshot
+    // until both invariants hold or we run out of patience.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut snapshot = Vec::new();
+    while std::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+        snapshot = telemetry.pending_events_snapshot().await;
+        let tool_completed = snapshot
+            .iter()
+            .filter(|event| event.event == squeezy_telemetry::TelemetryEventName::ToolCompleted)
+            .count();
+        let fallback = snapshot
+            .iter()
+            .filter(|event| {
+                event.event == squeezy_telemetry::TelemetryEventName::ShellSandboxBestEffortFallback
+            })
+            .count();
+        if tool_completed >= 3 && fallback >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut fallback_events = 0;
+    let mut tool_completed_events = 0;
+    for event in &snapshot {
+        match event.event {
+            squeezy_telemetry::TelemetryEventName::ShellSandboxBestEffortFallback => {
+                fallback_events += 1;
+                assert_eq!(
+                    event.properties.sandbox_backend.as_deref(),
+                    Some("macos-sandbox-exec")
+                );
+            }
+            squeezy_telemetry::TelemetryEventName::ToolCompleted => {
+                tool_completed_events += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        fallback_events, 2,
+        "counter must tick on every fallback (got {fallback_events})"
+    );
+    assert_eq!(
+        tool_completed_events, 3,
+        "tool_completed must still fire for every call regardless of fallback"
+    );
+
+    let _ = fs::remove_dir_all(temp);
+}

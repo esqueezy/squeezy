@@ -7156,6 +7156,7 @@ fn fake_sandbox_plan(backend: &'static str, required: bool) -> ShellSandboxPlan 
         filesystem_read_roots: Vec::new(),
         filesystem_write_roots: Vec::new(),
         fallback_reason: None,
+        best_effort_fallback: None,
     }
 }
 
@@ -7592,6 +7593,145 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
 
     assert!(reason.contains("failed at runtime"), "{reason}");
     assert!(reason.contains("best_effort"), "{reason}");
+}
+
+#[test]
+fn shell_sandbox_health_counts_fallbacks_and_latches_warning() {
+    // F3-4: the tools layer is the source of truth for the
+    // `approval.best_effort.fallback{tool=shell}` counter AND the
+    // one-shot TUI warning. The counter ticks every time; the latch
+    // flips to "not first" after the first call.
+    let health = ShellSandboxHealth::default();
+
+    assert_eq!(health.best_effort_fallback_count(), 0);
+
+    let first = health.record_best_effort_fallback();
+    assert_eq!(first.fallback_count, 1);
+    assert!(
+        first.first_in_session,
+        "first fallback in a session must surface the warning"
+    );
+
+    let second = health.record_best_effort_fallback();
+    assert_eq!(second.fallback_count, 2, "counter must keep ticking");
+    assert!(
+        !second.first_in_session,
+        "subsequent fallbacks must NOT re-fire the one-shot warning"
+    );
+
+    let third = health.record_best_effort_fallback();
+    assert_eq!(third.fallback_count, 3);
+    assert!(!third.first_in_session);
+
+    assert_eq!(health.best_effort_fallback_count(), 3);
+}
+
+#[test]
+fn shell_sandbox_plan_metadata_carries_best_effort_fallback_record() {
+    // The fallback record reaches the agent layer via the `sandbox`
+    // JSON in `ToolResult.content`; we round-trip it here to lock in
+    // the schema the agent reads in `shell_best_effort_fallback_from_result`.
+    let health = ShellSandboxHealth::default();
+    let record = health.record_best_effort_fallback();
+
+    let config = sandbox_config(
+        ShellSandboxMode::BestEffort,
+        ShellSandboxNetworkPolicy::DenyByDefault,
+    );
+    let plan = ShellSandboxPlan::direct_with_fallback_record(
+        "printf ok",
+        ShellSandboxMode::BestEffort,
+        &config,
+        Some("backend disabled".to_string()),
+        Some(("macos-sandbox-exec", record)),
+    );
+
+    let metadata = plan.metadata();
+    let fallback = metadata
+        .get("best_effort_fallback")
+        .expect("best_effort_fallback present in metadata");
+    assert_eq!(
+        fallback.get("backend").and_then(Value::as_str),
+        Some("macos-sandbox-exec")
+    );
+    assert_eq!(
+        fallback.get("fallback_count").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        fallback.get("first_in_session").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    // The public agent-facing helper round-trips the same payload off a
+    // synthetic ToolResult.
+    let result = ToolResult {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        status: ToolStatus::Success,
+        content: json!({ "sandbox": metadata }),
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    let parsed = shell_best_effort_fallback_from_result(&result)
+        .expect("agent helper extracts the fallback descriptor");
+    assert_eq!(parsed.backend, "macos-sandbox-exec");
+    assert_eq!(parsed.fallback_count, 1);
+    assert!(parsed.first_in_session);
+}
+
+#[test]
+fn shell_best_effort_fallback_from_result_ignores_non_shell_tools_and_clean_runs() {
+    // Defence in depth: the agent layer must only fire its one-shot
+    // warning for shell calls, and only when the sandbox actually
+    // degraded. Read_file or a clean shell call must return `None`.
+    let plain_result = ToolResult {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "sandbox": {
+                "backend": "macos-sandbox-exec",
+                "mode": "best_effort",
+            }
+        }),
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    assert!(shell_best_effort_fallback_from_result(&plain_result).is_none());
+
+    let non_shell = ToolResult {
+        call_id: "call".to_string(),
+        tool_name: "read_file".to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "sandbox": {
+                "best_effort_fallback": {
+                    "backend": "macos-sandbox-exec",
+                    "fallback_count": 1,
+                    "first_in_session": true,
+                }
+            }
+        }),
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    assert!(
+        shell_best_effort_fallback_from_result(&non_shell).is_none(),
+        "non-shell tools must not trip the shell sandbox warning"
+    );
 }
 
 #[test]

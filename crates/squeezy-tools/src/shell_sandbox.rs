@@ -4,7 +4,10 @@ use std::{
     collections::HashMap,
     future::Future,
     path::{Path, PathBuf},
-    sync::Mutex as StdMutex,
+    sync::{
+        Mutex as StdMutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -34,6 +37,26 @@ pub(crate) enum ShellSandboxBackendStatus {
 #[derive(Debug, Default)]
 pub(crate) struct ShellSandboxHealth {
     backends: StdMutex<HashMap<&'static str, ShellSandboxBackendStatus>>,
+    /// Lifetime count of best_effort fallbacks observed by this registry,
+    /// across all backends. The agent layer pivots on this to keep the
+    /// `approval.best_effort.fallback` telemetry counter in step with the
+    /// runtime — every increment fires one telemetry event.
+    best_effort_fallback_count: AtomicU64,
+    /// One-shot latch so the user-visible TUI warning fires at most once
+    /// per session, even when several shell calls in a row land on the
+    /// same degraded backend. The telemetry counter above keeps ticking.
+    best_effort_warning_emitted: AtomicBool,
+}
+
+/// Outcome of `ShellSandboxHealth::record_best_effort_fallback`. The agent
+/// reads `fallback_count` to drive the telemetry counter and `first_in_session`
+/// to decide whether to surface the user-facing TUI warning. Returning both
+/// in one struct keeps the (count, latch) update atomic — callers never see
+/// the counter advance without also learning whether they're the warner.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShellSandboxFallbackRecord {
+    pub(crate) fallback_count: u64,
+    pub(crate) first_in_session: bool,
 }
 
 impl ShellSandboxHealth {
@@ -67,6 +90,32 @@ impl ShellSandboxHealth {
                 ShellSandboxBackendStatus::Unavailable(reason.into()),
             );
     }
+
+    /// Bump the cumulative best_effort fallback counter and report whether
+    /// this is the first occurrence in the session so the caller can
+    /// publish a one-shot TUI warning. The counter keeps incrementing on
+    /// every call so telemetry dashboards see each silent degradation.
+    pub(crate) fn record_best_effort_fallback(&self) -> ShellSandboxFallbackRecord {
+        // `fetch_add` on a `Relaxed` ordering is fine here: this is a
+        // monotonic counter consumed by the same registry that produced
+        // it, so we don't need to fence between the count update and the
+        // latch flip below.
+        let prev = self
+            .best_effort_fallback_count
+            .fetch_add(1, Ordering::Relaxed);
+        let first_in_session = !self
+            .best_effort_warning_emitted
+            .swap(true, Ordering::Relaxed);
+        ShellSandboxFallbackRecord {
+            fallback_count: prev.saturating_add(1),
+            first_in_session,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn best_effort_fallback_count(&self) -> u64 {
+        self.best_effort_fallback_count.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +134,23 @@ pub(crate) struct ShellSandboxPlan {
     #[allow(dead_code)]
     pub(crate) filesystem_write_roots: Vec<PathBuf>,
     pub(crate) fallback_reason: Option<String>,
+    /// When this plan represents a best_effort fallback after a sandbox
+    /// failure, carries the originating backend plus the session counter
+    /// snapshot. Lets the audit row and the JSON surfaced to the agent
+    /// (which then drives telemetry + a one-shot TUI warning) describe
+    /// the degradation without a side channel.
+    pub(crate) best_effort_fallback: Option<BestEffortFallback>,
+}
+
+/// Side-table that accompanies a best_effort fallback plan. The agent
+/// reads these fields to (a) tick the `approval.best_effort.fallback`
+/// telemetry counter and (b) decide whether to publish the once-per-session
+/// TUI banner.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BestEffortFallback {
+    pub(crate) backend: &'static str,
+    pub(crate) fallback_count: u64,
+    pub(crate) first_in_session: bool,
 }
 
 impl ShellSandboxPlan {
@@ -102,6 +168,16 @@ impl ShellSandboxPlan {
         config: &ShellSandboxConfig,
         fallback_reason: Option<String>,
     ) -> Self {
+        Self::direct_with_fallback_record(command, mode, config, fallback_reason, None)
+    }
+
+    pub(crate) fn direct_with_fallback_record(
+        command: &str,
+        mode: ShellSandboxMode,
+        config: &ShellSandboxConfig,
+        fallback_reason: Option<String>,
+        best_effort: Option<(&'static str, ShellSandboxFallbackRecord)>,
+    ) -> Self {
         let shell = ShellProgram::for_command(command);
         Self {
             program: shell.program,
@@ -116,6 +192,11 @@ impl ShellSandboxPlan {
             filesystem_read_roots: Vec::new(),
             filesystem_write_roots: Vec::new(),
             fallback_reason,
+            best_effort_fallback: best_effort.map(|(backend, record)| BestEffortFallback {
+                backend,
+                fallback_count: record.fallback_count,
+                first_in_session: record.first_in_session,
+            }),
         }
     }
 
@@ -134,11 +215,12 @@ impl ShellSandboxPlan {
             filesystem_read_roots: Vec::new(),
             filesystem_write_roots: Vec::new(),
             fallback_reason: None,
+            best_effort_fallback: None,
         }
     }
 
     pub(crate) fn metadata(&self) -> Value {
-        json!({
+        let mut payload = json!({
             "backend": self.backend,
             "mode": self.mode,
             "network": self.network,
@@ -147,8 +229,48 @@ impl ShellSandboxPlan {
             "read_roots": path_list_json(&self.configured_read_roots),
             "write_roots": path_list_json(&self.configured_write_roots),
             "fallback_reason": self.fallback_reason,
-        })
+        });
+        if let Some(record) = self.best_effort_fallback
+            && let Some(object) = payload.as_object_mut()
+        {
+            object.insert(
+                "best_effort_fallback".to_string(),
+                best_effort_fallback_json(record),
+            );
+        }
+        payload
     }
+
+    /// Build the audit metadata row at the fallback EMISSION site, where
+    /// the plan still references the failing backend (so `backend`,
+    /// `filesystem`, etc. describe the attempt that was abandoned) but
+    /// the caller already has the counter snapshot in hand.
+    pub(crate) fn metadata_with_best_effort_fallback(
+        &self,
+        degraded_backend: &'static str,
+        record: &ShellSandboxFallbackRecord,
+    ) -> Value {
+        let mut payload = self.metadata();
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "best_effort_fallback".to_string(),
+                best_effort_fallback_json(BestEffortFallback {
+                    backend: degraded_backend,
+                    fallback_count: record.fallback_count,
+                    first_in_session: record.first_in_session,
+                }),
+            );
+        }
+        payload
+    }
+}
+
+fn best_effort_fallback_json(record: BestEffortFallback) -> Value {
+    json!({
+        "backend": record.backend,
+        "fallback_count": record.fallback_count,
+        "first_in_session": record.first_in_session,
+    })
 }
 
 pub(crate) fn path_list_json(paths: &[PathBuf]) -> Value {
@@ -415,6 +537,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
                 filesystem_read_roots: Vec::new(),
                 filesystem_write_roots: Vec::new(),
                 fallback_reason: None,
+                best_effort_fallback: None,
             });
         }
         let reason = "required shell sandbox unavailable: /usr/bin/sandbox-exec not found or cannot apply profiles";
@@ -473,6 +596,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
                     Vec::new()
                 },
                 fallback_reason: None,
+                best_effort_fallback: None,
             });
         }
     }
@@ -505,6 +629,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
             fallback_reason: Some(
                 "windows: process-tree cleanup via Job Object; no FS/network isolation".to_string(),
             ),
+            best_effort_fallback: None,
         })
     }
 

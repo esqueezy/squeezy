@@ -290,12 +290,18 @@ impl ToolRegistry {
         };
         if let Some(reason) = shell_sandbox_best_effort_fallback_reason(&sandbox_plan, &run) {
             let exit_code = run.exit_status.as_ref().and_then(|status| status.code());
+            // Record the fallback BEFORE the audit row + the retry plan so
+            // the JSON metadata embedded in both already carries the
+            // counter and one-shot latch the agent layer pivots on for
+            // telemetry + a one-shot TUI warning.
+            let degraded_backend = sandbox_plan.backend;
+            let record = self.shell_sandbox_health.record_best_effort_fallback();
             self.audit_shell(
                 call,
                 &args,
                 &workdir,
                 &analysis,
-                sandbox_plan.metadata(),
+                sandbox_plan.metadata_with_best_effort_fallback(degraded_backend, &record),
                 timeout_ms,
                 output_cap,
                 "fallback",
@@ -306,11 +312,12 @@ impl ToolRegistry {
             );
             self.shell_sandbox_health
                 .mark_unavailable(sandbox_plan.backend, reason.clone());
-            sandbox_plan = ShellSandboxPlan::direct_with_fallback(
+            sandbox_plan = ShellSandboxPlan::direct_with_fallback_record(
                 &args.command,
                 self.shell_sandbox.mode,
                 &self.shell_sandbox,
                 Some(reason),
+                Some((degraded_backend, record)),
             );
             run = match self
                 .run_shell_plan(ShellRunRequest {

@@ -320,6 +320,26 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     );
                     app.push_transcript_item(TranscriptItem::system(notice));
                 }
+                AgentEvent::ShellSandboxBestEffortFallback {
+                    backend,
+                    fallback_count,
+                    ..
+                } => {
+                    // Fires at most once per session — the agent's
+                    // `maybe_emit_shell_sandbox_fallback_warning` gates on
+                    // the tool-layer one-shot latch. Surface both the
+                    // banner (status-bar pane) and a transcript notice
+                    // so users notice mid-turn AND have a durable record.
+                    let banner = format!(
+                        "shell sandbox degraded: {backend} unavailable, running without OS isolation (best_effort)"
+                    );
+                    app.app_notifications
+                        .push(banner, crate::notification::Severity::Warn);
+                    let notice = format!(
+                        "shell sandbox degraded: backend `{backend}` unavailable; subsequent shell calls run without OS isolation under mode=best_effort (fallback #{fallback_count})"
+                    );
+                    app.push_transcript_item(TranscriptItem::system(notice));
+                }
                 AgentEvent::CostUpdate {
                     tool_count,
                     input_tokens,

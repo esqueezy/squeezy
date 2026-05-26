@@ -50,9 +50,10 @@ use squeezy_telemetry::{
 };
 use squeezy_tools::{
     McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
-    ShellAskApprover, ShellAskDecision, ShellAskRequest, ToolCall, ToolCostHint,
-    ToolExecutionOptions, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
-    ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig, sha256_hex,
+    ShellAskApprover, ShellAskDecision, ShellAskRequest, ShellBestEffortFallback, ToolCall,
+    ToolCostHint, ToolExecutionOptions, ToolOutputConfig, ToolReceipt, ToolRegistry,
+    ToolRegistryRuntime, ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig,
+    sha256_hex, shell_best_effort_fallback_from_result,
 };
 use tokio::{
     sync::{Mutex, Notify, broadcast, mpsc, oneshot},
@@ -7047,6 +7048,7 @@ async fn record_and_emit_progress(
 ) {
     broker.record_executed_result(result);
     maybe_emit_cost_update(broker, tx, turn_id).await;
+    maybe_emit_shell_sandbox_fallback_warning(tx, turn_id, result).await;
 }
 
 fn budget_denied_result(call: &ToolCall, reason: String) -> ToolResult {
@@ -7101,6 +7103,46 @@ fn emit_tool_telemetry(
         output_sha256: Some(result.receipt.output_sha256.as_str()),
         content_sha256: result.receipt.content_sha256.as_deref(),
     }));
+    // `approval.best_effort.fallback{tool=shell}` ticks once per silent
+    // shell-sandbox degradation. Co-located with the per-tool event so
+    // every call site that already calls `emit_tool_telemetry` benefits
+    // without threading the new event through individual handlers.
+    if let Some(fallback) = shell_best_effort_fallback_from_result(result) {
+        telemetry.spawn(TelemetryEvent::shell_sandbox_best_effort_fallback(
+            &fallback.backend,
+        ));
+    }
+}
+
+/// Detect a shell best_effort sandbox fallback in `result` and, when this
+/// is the first occurrence in the session, publish a one-shot
+/// [`AgentEvent::ShellSandboxBestEffortFallback`] so the TUI can warn the
+/// user. The per-call telemetry counter is emitted separately by
+/// [`emit_tool_telemetry`]; this function only handles the user-visible
+/// once-per-session signal.
+async fn maybe_emit_shell_sandbox_fallback_warning(
+    tx: &mpsc::Sender<AgentEvent>,
+    turn_id: TurnId,
+    result: &ToolResult,
+) {
+    let Some(ShellBestEffortFallback {
+        backend,
+        fallback_count,
+        first_in_session,
+    }) = shell_best_effort_fallback_from_result(result)
+    else {
+        return;
+    };
+    if !first_in_session {
+        return;
+    }
+    let _ = tx
+        .send(AgentEvent::ShellSandboxBestEffortFallback {
+            turn_id,
+            backend,
+            fallback_count,
+        })
+        .await;
 }
 
 /// SHA-256 of the canonical JSON arguments the model sent for a tool call.
@@ -9292,6 +9334,17 @@ pub enum AgentEvent {
     CostWarning {
         turn_id: TurnId,
         status: CostCapStatus,
+    },
+    /// Emitted at most once per session, the first time the shell tool's OS
+    /// sandbox backend silently degrades to the best_effort path (probe
+    /// failure, runtime sandbox_apply error, etc.). The TUI surfaces a
+    /// warning so users see the degradation; the per-call telemetry counter
+    /// `approval.best_effort.fallback{tool=shell}` keeps ticking on every
+    /// fallback for backend dashboards.
+    ShellSandboxBestEffortFallback {
+        turn_id: TurnId,
+        backend: String,
+        fallback_count: u64,
     },
     /// Per-turn progress callout emitted every few tool calls so a user
     /// watching a live transcript can see cost accumulating before the

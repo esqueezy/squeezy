@@ -4609,6 +4609,44 @@ fn patch_match_contexts(content: &str, search: &str, max_matches: usize) -> Vec<
         .collect()
 }
 
+/// Side-table extracted from a shell `ToolResult` describing a single
+/// best_effort sandbox fallback. The agent layer uses this to (a) tick the
+/// `approval.best_effort.fallback` telemetry counter and (b) decide whether
+/// to publish a once-per-session TUI warning.
+///
+/// `backend` is the OS sandbox backend that was attempted (e.g.
+/// `macos-sandbox-exec`); `fallback_count` is the cumulative number of
+/// fallbacks across the registry's lifetime (so per session); and
+/// `first_in_session` is the one-shot latch indicating whether this is the
+/// first time the registry has seen a fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellBestEffortFallback {
+    pub backend: String,
+    pub fallback_count: u64,
+    pub first_in_session: bool,
+}
+
+/// Extract the best_effort fallback descriptor from a shell `ToolResult`,
+/// or `None` when the call did not degrade to the best_effort path. Reads
+/// the same `sandbox.best_effort_fallback` JSON that the audit row carries,
+/// so the agent and the audit log stay in lockstep.
+pub fn shell_best_effort_fallback_from_result(
+    result: &ToolResult,
+) -> Option<ShellBestEffortFallback> {
+    if result.tool_name != "shell" {
+        return None;
+    }
+    let payload = result.content.get("sandbox")?.get("best_effort_fallback")?;
+    let backend = payload.get("backend")?.as_str()?.to_string();
+    let fallback_count = payload.get("fallback_count")?.as_u64()?;
+    let first_in_session = payload.get("first_in_session")?.as_bool()?;
+    Some(ShellBestEffortFallback {
+        backend,
+        fallback_count,
+        first_in_session,
+    })
+}
+
 pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     let digest = Sha256::digest(bytes.as_ref());
     let mut output = String::with_capacity(digest.len() * 2);
