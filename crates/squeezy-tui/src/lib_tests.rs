@@ -1929,6 +1929,59 @@ async fn slash_cost_reports_empty_session_without_model_turn() {
 }
 
 #[test]
+fn format_reviewer_command_lists_recent_decisions_newest_first() {
+    use std::time::{Duration, SystemTime};
+
+    use squeezy_agent::{ReviewerAuditEntry, ReviewerAuditVerdict};
+    use squeezy_core::PermissionCapability;
+
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    let entries = vec![
+        ReviewerAuditEntry {
+            recorded_at: now - Duration::from_secs(120),
+            turn_id: 3,
+            tool_name: "shell.run".to_string(),
+            capability: PermissionCapability::Shell,
+            target: "command:ls".to_string(),
+            verdict: ReviewerAuditVerdict::Allow,
+            reason: "approved low-risk listing".to_string(),
+        },
+        ReviewerAuditEntry {
+            recorded_at: now - Duration::from_secs(5),
+            turn_id: 4,
+            tool_name: "edit.apply_patch".to_string(),
+            capability: PermissionCapability::Edit,
+            target: "path:secrets.env".to_string(),
+            verdict: ReviewerAuditVerdict::Deny,
+            reason: "writing into protected secrets path".to_string(),
+        },
+    ];
+
+    let output = commands::format_reviewer_command(&entries, now);
+    assert!(output.contains("2 recent decision(s)"), "{output}");
+    // Newest entry should appear before the older one.
+    let deny_idx = output.find("deny edit").expect("deny line present");
+    let allow_idx = output.find("allow shell").expect("allow line present");
+    assert!(deny_idx < allow_idx, "{output}");
+    assert!(
+        output.contains("target=path:secrets.env"),
+        "{output}"
+    );
+    assert!(
+        output.contains("reason: writing into protected secrets path"),
+        "{output}"
+    );
+}
+
+#[test]
+fn format_reviewer_command_handles_empty_buffer() {
+    use std::time::SystemTime;
+
+    let output = commands::format_reviewer_command(&[], SystemTime::UNIX_EPOCH);
+    assert!(output.contains("no auto-decisions recorded"), "{output}");
+}
+
+#[test]
 fn format_cost_command_renders_active_buckets() {
     use squeezy_agent::{
         AttachmentShape, ConversationShape, SessionAccountingSnapshot, TranscriptShape,

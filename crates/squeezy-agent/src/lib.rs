@@ -83,6 +83,7 @@ use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
 use permission_persist::persist_permission_rule;
 use roles::{RoleModelPolicy, SubagentRole, role_config};
 
+pub use ai_reviewer::{ReviewerAuditEntry, ReviewerAuditVerdict};
 pub use context_compaction::ContextCompactionReport;
 pub use cost_broker::CostCapStatus;
 pub use plan_mode::{PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG, strip_proposed_plan_blocks};
@@ -1520,6 +1521,13 @@ impl Agent {
         self.session_rules
             .read()
             .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn reviewer_audit_snapshot(&self) -> Vec<ReviewerAuditEntry> {
+        self.ai_reviewer_state
+            .lock()
+            .map(|guard| guard.recent_decisions())
             .unwrap_or_default()
     }
 

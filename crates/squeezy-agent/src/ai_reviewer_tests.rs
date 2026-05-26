@@ -126,3 +126,62 @@ fn prompt_contains_policy_and_request() {
     assert!(prompt.contains("\"capability\":\"read\""));
     assert!(prompt.contains("\"target\":\"path:README.md\""));
 }
+
+fn sample_request(tool_name: &str, target: &str) -> PermissionRequest {
+    PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: tool_name.to_string(),
+        capability: PermissionCapability::Shell,
+        target: target.to_string(),
+        risk: PermissionRisk::Medium,
+        summary: "sample".to_string(),
+        metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    }
+}
+
+#[test]
+fn record_audit_captures_reason_and_caps_at_ring_size() {
+    let mut state = AiReviewerState::default();
+    let turn = TurnId::new(1);
+    state.record_audit(
+        turn,
+        &sample_request("shell.run", "command:ls"),
+        ReviewerAuditVerdict::Allow,
+        "approved low-risk listing",
+    );
+    state.record_audit(
+        turn,
+        &sample_request("shell.run", "command:rm -rf /"),
+        ReviewerAuditVerdict::Deny,
+        "destructive root operation",
+    );
+    let entries = state.recent_decisions();
+    assert_eq!(entries.len(), 2);
+    let first = &entries[0];
+    assert_eq!(first.verdict, ReviewerAuditVerdict::Allow);
+    assert_eq!(first.tool_name, "shell.run");
+    assert_eq!(first.target, "command:ls");
+    assert_eq!(first.reason, "approved low-risk listing");
+    let second = &entries[1];
+    assert_eq!(second.verdict, ReviewerAuditVerdict::Deny);
+    assert_eq!(second.reason, "destructive root operation");
+
+    // Overflow the ring; oldest entry is evicted while capacity stays at 50.
+    for i in 0..AUDIT_RING_CAPACITY {
+        state.record_audit(
+            turn,
+            &sample_request("shell.run", &format!("command:echo {i}")),
+            ReviewerAuditVerdict::NoDecision,
+            "filler",
+        );
+    }
+    let entries = state.recent_decisions();
+    assert_eq!(entries.len(), AUDIT_RING_CAPACITY);
+    // The two original entries should now be evicted.
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.verdict == ReviewerAuditVerdict::NoDecision)
+    );
+}

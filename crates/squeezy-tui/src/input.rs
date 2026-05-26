@@ -166,6 +166,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     ),
     slash("/cost", "show token and cost accounting"),
     slash("/context", "show context budget and compaction state"),
+    slash("/reviewer", "show recent AI reviewer auto-decisions"),
     slash_args_caps(
         "/attach",
         "attach a file as prompt context",

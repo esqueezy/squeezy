@@ -2,13 +2,14 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fs,
     sync::{Arc, Mutex as StdMutex},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{
-    AppConfig, PermissionAction, PermissionRequest, PermissionVerdict, Role, TranscriptItem, TurnId,
+    AppConfig, PermissionAction, PermissionCapability, PermissionRequest, PermissionVerdict, Role,
+    TranscriptItem, TurnId,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
 use squeezy_skills::{APPROVAL_POLICY_DOC_PATH, bundled_doc};
@@ -30,6 +31,7 @@ const CHARS_PER_TOKEN: usize = 4;
 const CONSECUTIVE_DENIAL_TRIP: usize = 2;
 const RECENT_WINDOW: usize = 20;
 const RECENT_DENIAL_TRIP: usize = 5;
+const AUDIT_RING_CAPACITY: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AiReviewerTranscriptSnapshot {
@@ -38,10 +40,41 @@ pub(crate) struct AiReviewerTranscriptSnapshot {
     pub(crate) entry_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewerAuditVerdict {
+    Allow,
+    Deny,
+    NoDecision,
+    CircuitTripped,
+}
+
+impl ReviewerAuditVerdict {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::NoDecision => "no-decision",
+            Self::CircuitTripped => "circuit-tripped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewerAuditEntry {
+    pub recorded_at: SystemTime,
+    pub turn_id: u64,
+    pub tool_name: String,
+    pub capability: PermissionCapability,
+    pub target: String,
+    pub verdict: ReviewerAuditVerdict,
+    pub reason: String,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct AiReviewerState {
     turn_circuits: BTreeMap<u64, TurnCircuit>,
     transcript_cursor: Option<TranscriptCursor>,
+    audit: VecDeque<ReviewerAuditEntry>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,18 +116,33 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         };
     }
 
-    if let Some(reason) = input
-        .state
-        .lock()
-        .expect("ai reviewer state")
-        .bypass_reason(input.turn_id)
-    {
+    if let Some(reason) = {
+        let mut state = input.state.lock().expect("ai reviewer state");
+        let reason = state.bypass_reason(input.turn_id);
+        if let Some(reason) = reason.as_deref() {
+            state.record_audit(
+                input.turn_id,
+                input.request,
+                ReviewerAuditVerdict::CircuitTripped,
+                reason,
+            );
+        }
+        reason
+    } {
         return AiReviewerOutcome::CircuitTripped { reason };
     }
 
     let policy = match load_policy(input.config) {
         Ok(policy) => policy,
-        Err(reason) => return AiReviewerOutcome::NoDecision { reason },
+        Err(reason) => {
+            input.state.lock().expect("ai reviewer state").record_audit(
+                input.turn_id,
+                input.request,
+                ReviewerAuditVerdict::NoDecision,
+                &reason,
+            );
+            return AiReviewerOutcome::NoDecision { reason };
+        }
     };
     let prompt = {
         let mut state = input.state.lock().expect("ai reviewer state");
@@ -133,76 +181,120 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
     .await
     {
         Ok(Ok(text)) => text,
-        Ok(Err(reason)) => return AiReviewerOutcome::NoDecision { reason },
+        Ok(Err(reason)) => {
+            input.state.lock().expect("ai reviewer state").record_audit(
+                input.turn_id,
+                input.request,
+                ReviewerAuditVerdict::NoDecision,
+                &reason,
+            );
+            return AiReviewerOutcome::NoDecision { reason };
+        }
         Err(_) => {
-            return AiReviewerOutcome::NoDecision {
-                reason: "ai reviewer timed out".to_string(),
-            };
+            let reason = "ai reviewer timed out".to_string();
+            input.state.lock().expect("ai reviewer state").record_audit(
+                input.turn_id,
+                input.request,
+                ReviewerAuditVerdict::NoDecision,
+                &reason,
+            );
+            return AiReviewerOutcome::NoDecision { reason };
         }
     };
     let Some(decision) = parse_reviewer_response(&response) else {
-        return AiReviewerOutcome::NoDecision {
-            reason: "ai reviewer returned invalid decision JSON".to_string(),
-        };
+        let reason = "ai reviewer returned invalid decision JSON".to_string();
+        input.state.lock().expect("ai reviewer state").record_audit(
+            input.turn_id,
+            input.request,
+            ReviewerAuditVerdict::NoDecision,
+            &reason,
+        );
+        return AiReviewerOutcome::NoDecision { reason };
     };
     match decision.action {
         PermissionAction::Allow => {
-            input
-                .state
-                .lock()
-                .expect("ai reviewer state")
-                .record_non_denial(input.turn_id);
             if reviewer
                 .allow_capabilities
                 .contains(&input.request.capability)
             {
+                let reason = format!("AI reviewer approved: {}", decision.reason);
+                {
+                    let mut state = input.state.lock().expect("ai reviewer state");
+                    state.record_non_denial(input.turn_id);
+                    state.record_audit(
+                        input.turn_id,
+                        input.request,
+                        ReviewerAuditVerdict::Allow,
+                        &reason,
+                    );
+                }
                 AiReviewerOutcome::Verdict(PermissionVerdict {
                     action: PermissionAction::Allow,
                     matched_rule: None,
-                    reason: format!("AI reviewer approved: {}", decision.reason),
+                    reason,
                 })
             } else {
-                // squeezy-2so: the model said allow but the operator's
-                // allow_capabilities list excludes this capability, so the
-                // verdict silently falls back to the user prompt. Fire a
-                // counter tagged with the capability so operators can see
-                // how often a wider allowlist would have spared the prompt.
                 input
                     .telemetry
                     .spawn(TelemetryEvent::ai_reviewer_allow_downgrade(
                         input.request.capability.as_str(),
                     ));
-                AiReviewerOutcome::NoDecision {
-                    reason: format!(
-                        "ai reviewer allow ignored for non-allowlisted {} capability",
-                        input.request.capability.as_str()
-                    ),
+                let reason = format!(
+                    "ai reviewer allow ignored for non-allowlisted {} capability",
+                    input.request.capability.as_str()
+                );
+                {
+                    let mut state = input.state.lock().expect("ai reviewer state");
+                    state.record_non_denial(input.turn_id);
+                    state.record_audit(
+                        input.turn_id,
+                        input.request,
+                        ReviewerAuditVerdict::NoDecision,
+                        &reason,
+                    );
                 }
+                AiReviewerOutcome::NoDecision { reason }
             }
         }
         PermissionAction::Ask => {
-            input
-                .state
-                .lock()
-                .expect("ai reviewer state")
-                .record_non_denial(input.turn_id);
-            AiReviewerOutcome::NoDecision {
-                reason: decision.reason,
+            let reason = decision.reason;
+            {
+                let mut state = input.state.lock().expect("ai reviewer state");
+                state.record_non_denial(input.turn_id);
+                state.record_audit(
+                    input.turn_id,
+                    input.request,
+                    ReviewerAuditVerdict::NoDecision,
+                    &reason,
+                );
             }
+            AiReviewerOutcome::NoDecision { reason }
         }
         PermissionAction::Deny => {
-            let tripped = input
-                .state
-                .lock()
-                .expect("ai reviewer state")
-                .record_denial(input.turn_id);
+            let tripped = {
+                let mut state = input.state.lock().expect("ai reviewer state");
+                state.record_denial(input.turn_id)
+            };
             if let Some(reason) = tripped {
+                input.state.lock().expect("ai reviewer state").record_audit(
+                    input.turn_id,
+                    input.request,
+                    ReviewerAuditVerdict::CircuitTripped,
+                    &reason,
+                );
                 return AiReviewerOutcome::CircuitTripped { reason };
             }
+            let reason = format!("AI reviewer denied: {}", decision.reason);
+            input.state.lock().expect("ai reviewer state").record_audit(
+                input.turn_id,
+                input.request,
+                ReviewerAuditVerdict::Deny,
+                &reason,
+            );
             AiReviewerOutcome::Verdict(PermissionVerdict {
                 action: PermissionAction::Deny,
                 matched_rule: None,
-                reason: format!("AI reviewer denied: {}", decision.reason),
+                reason,
             })
         }
     }
@@ -538,6 +630,31 @@ impl AiReviewerState {
             entry_count: snapshot.entry_count,
         });
         marker
+    }
+
+    fn record_audit(
+        &mut self,
+        turn_id: TurnId,
+        request: &PermissionRequest,
+        verdict: ReviewerAuditVerdict,
+        reason: &str,
+    ) {
+        if self.audit.len() == AUDIT_RING_CAPACITY {
+            self.audit.pop_front();
+        }
+        self.audit.push_back(ReviewerAuditEntry {
+            recorded_at: SystemTime::now(),
+            turn_id: turn_id.get(),
+            tool_name: request.tool_name.clone(),
+            capability: request.capability,
+            target: request.target.clone(),
+            verdict,
+            reason: reason.to_string(),
+        });
+    }
+
+    pub fn recent_decisions(&self) -> Vec<ReviewerAuditEntry> {
+        self.audit.iter().cloned().collect()
     }
 }
 

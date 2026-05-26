@@ -1414,6 +1414,19 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             )));
             return true;
         }
+        "/reviewer" => {
+            let entries = agent.reviewer_audit_snapshot();
+            if entries.is_empty() {
+                app.status = "no AI reviewer decisions recorded yet".to_string();
+            } else {
+                app.status = format!("{} AI reviewer decision(s)", entries.len());
+            }
+            app.push_transcript_item(TranscriptItem::system(commands::format_reviewer_command(
+                &entries,
+                std::time::SystemTime::now(),
+            )));
+            return true;
+        }
         "/help" => {
             handle_help_command(app, agent, rest);
             return true;
