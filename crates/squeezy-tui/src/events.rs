@@ -454,11 +454,11 @@ pub(crate) fn finalize_proposed_plan(app: &mut TuiApp) {
 
 pub(crate) fn drain_job_events(app: &mut TuiApp) {
     let mut processed = false;
-    loop {
-        let event = match app.job_rx.as_mut() {
-            Some(rx) => rx.try_recv(),
-            None => break,
-        };
+    while let Some(rx) = app.job_rx.as_mut() {
+        // Release the borrow on `app.job_rx` before any branch that
+        // mutates other `app` fields — `apply_job_update` and
+        // `apply_job_notification` both take `&mut TuiApp`.
+        let event = rx.try_recv();
         match event {
             Ok(JobEvent::Updated(job)) => {
                 apply_job_update(app, job);
