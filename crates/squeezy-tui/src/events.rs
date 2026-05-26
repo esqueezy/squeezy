@@ -129,13 +129,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     if is_control_tool_name(&call.name) {
                         app.status = "planning".to_string();
                     } else {
-                        let label = tool_call_label(&call);
-                        app.status = format!("running {label}");
-                        // Surface in-flight tool work in the transcript so a
-                        // long-running call is visible while it runs, not
-                        // only after ToolCallCompleted lands. The result
-                        // entry appears below this log line on completion.
-                        app.push_log(format!("→ {label}"));
+                        app.status = format!("running {}", tool_call_label(&call));
                         app.remember_active_tool_call(call);
                     }
                 }
