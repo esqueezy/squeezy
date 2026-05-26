@@ -7540,7 +7540,12 @@ pub(crate) fn context_window_pct(used: u64, threshold: u64) -> u64 {
 }
 
 const CONTEXT_BUDGET_HINT_PCT: u64 = 85;
-pub(crate) const CONTEXT_NUDGE_PCT: u64 = 95;
+/// Percent of `context_compaction_threshold` at which we surface the
+/// compaction nudge. The threshold is itself a fraction of the full
+/// context window (default 80% of the model max), so firing the nudge
+/// at 70% of the threshold gives users a runway to `/pin` or `/compact`
+/// deliberately before auto-compaction kicks in at 100%.
+pub(crate) const CONTEXT_NUDGE_THRESHOLD_RATIO_PCT: u64 = 70;
 
 fn format_status_hints(app: &TuiApp) -> String {
     if let Some(pending) = app.pending_request_user_input.as_ref() {

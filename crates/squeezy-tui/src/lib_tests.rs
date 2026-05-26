@@ -4948,6 +4948,22 @@ fn context_budget_hint_omitted_below_threshold() {
     );
 }
 
+/// Helper: count post-turn compaction-nudge log entries in the transcript.
+/// We key on the "auto-compact" wording the nudge introduces — that phrase
+/// is unique to this advisory, so the filter doubles as proof that the
+/// rendered text references the auto-trigger explicitly (the whole point
+/// of the nudge is to be actionable advice *before* auto-compaction
+/// rewrites the conversation).
+fn count_auto_compact_nudges(app: &TuiApp) -> usize {
+    app.transcript
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.kind, TranscriptEntryKind::Log(message)
+                if message.contains("auto-compact"))
+        })
+        .count()
+}
+
 #[tokio::test]
 async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
     let mut app = test_app(SessionMode::Build);
@@ -4962,6 +4978,8 @@ async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         context_estimate: ContextEstimate {
+            // 5_800 / 6_000 ≈ 97% of the auto-compact threshold — comfortably
+            // above the 70% nudge floor and below the 100% suppression edge.
             estimated_tokens: 5_800,
             ..ContextEstimate::default()
         },
@@ -4971,15 +4989,11 @@ async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
     drop(tx);
     drain_agent_events(&mut app).await;
 
-    let nudges = app
-        .transcript
-        .iter()
-        .filter(|entry| {
-            matches!(&entry.kind, TranscriptEntryKind::Log(message)
-                if message.contains("context window") && message.contains("full"))
-        })
-        .count();
-    assert_eq!(nudges, 1, "nudge must fire exactly once on first crossing");
+    assert_eq!(
+        count_auto_compact_nudges(&app),
+        1,
+        "nudge must fire exactly once on first crossing"
+    );
 
     // A second high-usage turn must not fire the nudge again until
     // compaction resets the latch.
@@ -5001,15 +5015,130 @@ async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
     drop(tx);
     drain_agent_events(&mut app).await;
 
-    let nudges = app
+    assert_eq!(
+        count_auto_compact_nudges(&app),
+        1,
+        "nudge must not fire again until compaction"
+    );
+}
+
+/// The nudge must fire as soon as estimated tokens reach 70% of the
+/// auto-compact threshold (well before the 100% mark that triggers
+/// compaction), and the rendered text must reference the auto-trigger so
+/// the advice is actionable — otherwise users only see "consider
+/// /compact" *after* compaction has already rewritten the conversation.
+#[tokio::test]
+async fn pre_compaction_nudge_fires_at_seventy_percent_of_threshold() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_compaction_threshold = 6_000;
+
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("ok"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate {
+            // 4_200 / 6_000 = 70.0% — exactly at the firing point.
+            estimated_tokens: 4_200,
+            ..ContextEstimate::default()
+        },
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let message = app
         .transcript
         .iter()
-        .filter(|entry| {
-            matches!(&entry.kind, TranscriptEntryKind::Log(message)
-                if message.contains("context window") && message.contains("full"))
+        .find_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Log(text) if text.contains("auto-compact") => Some(text.clone()),
+            _ => None,
         })
-        .count();
-    assert_eq!(nudges, 1, "nudge must not fire again until compaction");
+        .expect("nudge must fire at 70% of the auto-compact threshold");
+    // Text must reference the auto-trigger explicitly so the advice is
+    // actionable — without "auto-compact" in the message, users can't tell
+    // why /pin or /compact would help.
+    assert!(
+        message.contains("auto-compact"),
+        "nudge must reference the auto-trigger; got: {message}"
+    );
+    assert!(
+        message.contains("/pin") && message.contains("/compact"),
+        "nudge must surface the deliberate actions; got: {message}"
+    );
+}
+
+/// Once estimated tokens reach or pass the auto-compact threshold the
+/// nudge must stay silent — auto-compaction is already taking over the
+/// UI, and a stale "consider /compact" advisory would just clutter the
+/// post-compaction transcript with advice the user can no longer act on.
+#[tokio::test]
+async fn pre_compaction_nudge_suppressed_at_or_past_threshold() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_compaction_threshold = 6_000;
+
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("ok"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate {
+            // 6_100 / 6_000 ≈ 102% — past the threshold, so we're already in
+            // auto-compaction territory. The nudge would be useless advice.
+            estimated_tokens: 6_100,
+            ..ContextEstimate::default()
+        },
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        count_auto_compact_nudges(&app),
+        0,
+        "nudge must not fire once usage has already crossed the auto-compact threshold",
+    );
+}
+
+/// Below 70% of the auto-compact threshold the nudge should stay silent —
+/// firing earlier would be alarmist for routine sessions.
+#[tokio::test]
+async fn pre_compaction_nudge_silent_below_seventy_percent() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_compaction_threshold = 6_000;
+
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("ok"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate {
+            // 4_100 / 6_000 ≈ 68% — just under the 70% firing floor.
+            estimated_tokens: 4_100,
+            ..ContextEstimate::default()
+        },
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        count_auto_compact_nudges(&app),
+        0,
+        "nudge must stay silent below the 70% firing floor",
+    );
 }
 
 #[tokio::test]
