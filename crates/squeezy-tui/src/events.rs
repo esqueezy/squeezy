@@ -30,7 +30,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 AgentEvent::Started { .. } => {
                     app.status = "thinking".to_string();
                     app.turn_visual = TurnVisualState::Running;
+                    app.pending_reasoning.clear();
                     app.note_turn_started();
+                }
+                AgentEvent::ReasoningDelta { delta, .. } => {
+                    if app.show_reasoning_usage {
+                        app.pending_reasoning.push_str(&delta);
+                    }
                 }
                 AgentEvent::AssistantDelta { delta, .. } => {
                     let extracted = app.proposed_plan.feed(&delta);
@@ -266,6 +272,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.push_transcript_item(message);
                     }
                     app.pending_assistant.clear();
+                    app.pending_reasoning.clear();
                     finalize_proposed_plan(app);
                     app.context_estimate = context_estimate;
                     app.cancelled_prompt = None;
@@ -345,6 +352,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.last_turn_had_edits = false;
                     }
                     app.pending_assistant.clear();
+                    app.pending_reasoning.clear();
                     finalize_proposed_plan(app);
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
@@ -366,6 +374,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.last_turn_had_edits = false;
                     }
                     app.pending_assistant.clear();
+                    app.pending_reasoning.clear();
                     finalize_proposed_plan(app);
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;

@@ -3,6 +3,10 @@ use std::{pin::Pin, sync::Arc};
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+pub use squeezy_core::{
+    AnthropicThinkingBlock, AnthropicThinkingKind, ReasoningKind, ReasoningPayload,
+    ReasoningSnapshot,
+};
 use squeezy_core::{CostSnapshot, ReasoningEffort, ResponseVerbosity, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
 
@@ -97,6 +101,7 @@ pub enum LlmInputItem {
         call_id: String,
         output: String,
     },
+    Reasoning(ReasoningPayload),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +124,11 @@ pub struct LlmToolCall {
 pub enum LlmEvent {
     Started,
     TextDelta(String),
+    ReasoningDelta {
+        text: String,
+        kind: ReasoningKind,
+    },
+    ReasoningDone(ReasoningPayload),
     ToolCall(LlmToolCall),
     Completed {
         response_id: Option<String>,
