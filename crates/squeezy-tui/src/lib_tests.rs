@@ -1844,6 +1844,61 @@ fn unknown_slash_command_does_not_start_model_turn() {
     assert!(app.status.contains("unknown command"), "{}", app.status);
 }
 
+#[test]
+fn slash_menu_surfaces_capability_badges_for_world_touching_commands() {
+    // Typing `/diff` should surface a `[git|read]` capability hint so the
+    // user can tell at a glance the command will hit the worktree on disk.
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/diff".to_string());
+    let rendered = render_to_string(&app, 120, 12);
+    assert!(
+        rendered.contains("[git|read]"),
+        "expected /diff badge in slash menu:\n{rendered}"
+    );
+
+    // Switch to a destructive command and confirm its badge appears too.
+    set_input(&mut app, "/session-cleanup".to_string());
+    let rendered = render_to_string(&app, 120, 12);
+    assert!(
+        rendered.contains("[destructive]"),
+        "expected /session-cleanup badge in slash menu:\n{rendered}"
+    );
+}
+
+#[test]
+fn slash_suggestion_line_contents_match_command_capabilities() {
+    // Build the menu lines directly and assert the badge follows the
+    // declared capabilities — covers both presence (`/help` → `net`) and
+    // absence (`/cost` → no badge).
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/help".to_string());
+    let lines = slash_suggestion_lines(&app);
+    let serialised = lines
+        .iter()
+        .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect::<Vec<String>>();
+    let help_line = serialised
+        .iter()
+        .find(|line| line.contains("/help"))
+        .expect("rendered /help line");
+    assert!(help_line.contains("[net]"), "{help_line}");
+
+    set_input(&mut app, "/cost".to_string());
+    let lines = slash_suggestion_lines(&app);
+    let serialised = lines
+        .iter()
+        .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect::<Vec<String>>();
+    let cost_line = serialised
+        .iter()
+        .find(|line| line.contains("/cost") && !line.contains("/context"))
+        .expect("rendered /cost line");
+    assert!(
+        !cost_line.contains('['),
+        "/cost should not render a capability badge: {cost_line}"
+    );
+}
+
 #[tokio::test]
 async fn slash_cost_reports_empty_session_without_model_turn() {
     let mut agent = test_agent(SessionMode::Build);

@@ -7393,6 +7393,19 @@ fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
                         .add_modifier(Modifier::DIM | Modifier::ITALIC),
                 ));
             }
+            let badges = command.capability_badges();
+            if !badges.is_empty() {
+                spans.push(Span::styled(
+                    format!("  [{}]", badges.join("|")),
+                    Style::default()
+                        .fg(if dimmed { QUIET } else { AMBER })
+                        .add_modifier(if dimmed {
+                            Modifier::DIM | Modifier::ITALIC
+                        } else {
+                            Modifier::ITALIC
+                        }),
+                ));
+            }
             if dimmed {
                 spans.push(Span::styled(
                     "  (unavailable during turn)",
