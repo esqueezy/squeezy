@@ -717,6 +717,7 @@ impl ToolRegistry {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ShellArgs {
     pub(crate) command: String,
     pub(crate) workdir: Option<String>,

@@ -368,6 +368,37 @@ async fn grep_respects_gitignore_by_default_and_can_include_ignored() {
 }
 
 #[tokio::test]
+async fn grep_rejects_unknown_field() {
+    let root = temp_workspace("grep_unknown_field");
+    fs::write(root.join("visible.txt"), "needle\n").expect("write visible");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_unknown".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"patern": "needle"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    let message = result.content["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("unknown field"),
+        "expected serde unknown-field error, got: {message}"
+    );
+    assert!(
+        message.contains("patern"),
+        "expected error to mention misspelled key, got: {message}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn glob_lists_paths_without_reading_content_and_respects_ignore() {
     let root = temp_workspace("glob_ignore");
     fs::write(root.join(".gitignore"), "ignored.rs\n").expect("write gitignore");

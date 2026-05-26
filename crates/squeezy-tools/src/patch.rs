@@ -32,6 +32,7 @@ pub(crate) struct PatchPlan {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DiffContextArgs {
     pub(crate) mode: Option<DiffMode>,
     include_patch: Option<bool>,
@@ -42,6 +43,7 @@ pub(crate) struct DiffContextArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PlanPatchArgs {
     pub(crate) objective: String,
     query: Option<String>,
@@ -54,6 +56,7 @@ pub(crate) struct PlanPatchArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ApplyPatchArgs {
     #[serde(default)]
     pub(crate) patches: Vec<SearchReplacePatch>,
@@ -67,6 +70,7 @@ pub(crate) struct ApplyPatchArgs {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SearchReplacePatch {
     pub(crate) path: String,
     search: String,
@@ -84,7 +88,7 @@ pub(crate) enum SearchReplaceFallback {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ApplyPatchOperation {
     SearchReplace {
         path: String,
@@ -116,6 +120,7 @@ pub(crate) enum ApplyPatchOperation {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PostMoveReplace {
     pub(crate) search: String,
     pub(crate) replace: String,

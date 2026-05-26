@@ -3576,6 +3576,7 @@ pub(crate) struct ShellPermissionAnalysis {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VerifyArgs {
     scope: Option<VerifyScope>,
     level: Option<VerifyLevel>,
@@ -3583,6 +3584,7 @@ struct VerifyArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RefreshCompilerFactsArgs {
     diagnostics: Option<bool>,
 }
@@ -3625,14 +3627,17 @@ impl OutputMode {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListSkillsArgs {}
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LoadSkillArgs {
     name: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NotesRememberArgs {
     kind: String,
     text: String,
@@ -3643,6 +3648,7 @@ struct NotesRememberArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NotesRecallArgs {
     query: String,
     #[serde(default)]
@@ -3650,6 +3656,7 @@ struct NotesRecallArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ObservationsArgs {
     #[serde(default)]
     query: Option<String>,
@@ -3669,18 +3676,21 @@ fn parse_observation_kind(raw: &str) -> Option<ObservationKind> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct McpListResourcesArgs {
     server: String,
     cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct McpReadResourceArgs {
     server: String,
     uri: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WriteFileArgs {
     path: String,
     content: String,
