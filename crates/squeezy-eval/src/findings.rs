@@ -740,10 +740,14 @@ impl Rule for UngroundedCitation {
         "ungrounded_citation"
     }
     fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
-        use std::collections::BTreeMap;
+        use std::collections::{BTreeMap, BTreeSet};
         // Group assistant_delta by turn.
         let mut text_per_turn: BTreeMap<String, String> = BTreeMap::new();
         let mut completed_turns: BTreeMap<String, u64> = BTreeMap::new();
+        // Turns the agent labelled as Squeezy help — both the curated path
+        // and the doc-help subagent path go through the same task-state
+        // summary, so checking it covers both.
+        let mut help_turns: BTreeSet<String> = BTreeSet::new();
         for event in &ctx.events {
             match &event.kind {
                 crate::capture::EvalEventKind::AssistantDelta { delta } => {
@@ -759,6 +763,13 @@ impl Rule for UngroundedCitation {
                         completed_turns.insert(turn.clone(), event.sequence);
                     }
                 }
+                crate::capture::EvalEventKind::TaskStateUpdated { snapshot } => {
+                    if let Some(turn) = &event.turn_id
+                        && task_snapshot_marks_help(snapshot)
+                    {
+                        help_turns.insert(turn.clone());
+                    }
+                }
                 _ => {}
             }
         }
@@ -771,6 +782,14 @@ impl Rule for UngroundedCitation {
                 .map(|v| v.len())
                 .unwrap_or(0);
             if tool_count != 0 {
+                continue;
+            }
+            // Squeezy help turns answer from the bundled doc corpus that
+            // ships compiled into the binary. They legitimately make zero
+            // tool calls AND cite real bundled doc paths — both curated
+            // answers (via `HelpCitation`) and doc-help subagent answers
+            // (free-form inline citations from the inlined corpus).
+            if help_turns.contains(&turn) {
                 continue;
             }
             let text = text_per_turn.get(&turn).cloned().unwrap_or_default();
@@ -792,6 +811,18 @@ impl Rule for UngroundedCitation {
         }
         out
     }
+}
+
+/// True when an emitted `task_state_updated` snapshot is for a Squeezy
+/// help turn. Both the curated path and the doc-help subagent path use
+/// the literal terminal summary `"Squeezy help"` (see
+/// `complete_squeezy_help_turn`); the driver mirrors that into a
+/// top-level `summary` field on the captured snapshot Value.
+fn task_snapshot_marks_help(snapshot: &serde_json::Value) -> bool {
+    snapshot
+        .get("summary")
+        .and_then(|value| value.as_str())
+        .is_some_and(|summary| summary == "Squeezy help")
 }
 
 /// Heuristic — does the text contain a substring that looks like a

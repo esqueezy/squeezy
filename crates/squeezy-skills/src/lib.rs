@@ -14,7 +14,10 @@ pub mod help;
 pub mod implicit;
 pub mod render;
 
-pub use help::{HelpAnswer, HelpCitation, HelpStatus, SqueezyHelp, matches_squeezy_help_input};
+pub use help::{
+    BundledDoc, HelpAnswer, HelpCitation, HelpStatus, SqueezyHelp, bundled_doc_paths, bundled_docs,
+    matches_squeezy_help_input,
+};
 pub use render::SkillPreambleRender;
 
 const SKILL_FILE: &str = "SKILL.md";

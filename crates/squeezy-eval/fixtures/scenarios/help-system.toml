@@ -1,0 +1,99 @@
+id = "help-system"
+title = "Squeezy help: curated topics short-circuit; unknown topics fall back to the doc subagent"
+description = """
+Exercises the user-visible behaviour of `/help`, `/help <topic>`, natural
+language help questions, and unknown-topic questions. Curated answers must
+not call the provider; only the unsupported question is allowed to spend a
+provider request through the doc-help subagent. Runs offline against the
+mock provider.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+# --- bare /help -> local topic index, no provider request ---
+[[steps]]
+kind = "prompt"
+text = "/help"
+
+[[steps]]
+kind = "action"
+action = "assert"
+
+[steps.check]
+kind = "text_contains"
+text = "Supported topics"
+
+[[steps]]
+kind = "action"
+action = "assert"
+
+[steps.check]
+kind = "text_contains"
+text = "providers"
+
+# --- /help providers -> curated answer with citations + extracted config ---
+[[steps]]
+kind = "prompt"
+text = "/help providers"
+
+[[steps]]
+kind = "action"
+action = "assert"
+
+[steps.check]
+kind = "text_contains"
+text = "docs/external/PROVIDERS.md"
+
+[[steps]]
+kind = "action"
+action = "assert"
+
+[steps.check]
+kind = "text_contains"
+text = "[model]"
+
+# --- natural-language question that maps to a curated topic ---
+[[steps]]
+kind = "prompt"
+text = "How do I install Squeezy?"
+
+[[steps]]
+kind = "action"
+action = "assert"
+
+[steps.check]
+kind = "text_contains"
+text = "docs/external/INSTALL.md"
+
+# --- /help <unknown topic> -> doc-help subagent (the one provider request) ---
+[[steps]]
+kind = "prompt"
+text = "/help frobulator widgets"
+
+[[steps]]
+kind = "action"
+action = "assert"
+
+[steps.check]
+kind = "text_contains"
+text = "subagent-frobulator-answer"
+
+# Only the unsupported question hits the provider — everything above is
+# answered locally from the curated index. The mock returns a sentinel
+# string we can assert on.
+[expect]
+final_text_contains = ["subagent-frobulator-answer"]
+max_wall_clock_seconds = 60
+no_tool_errors = true
+
+[mock]
+default_text = "subagent-frobulator-answer: not covered by bundled docs."
+
+[triage]
+enabled = false
