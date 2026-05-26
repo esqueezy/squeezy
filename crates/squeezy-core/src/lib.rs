@@ -7272,8 +7272,11 @@ impl ReasoningSnapshot {
 pub struct TranscriptItem {
     pub role: Role,
     pub content: String,
+    /// Boxed to keep `TranscriptItem` small: it sits inside `AgentEvent`
+    /// variants and the unboxed snapshot is large enough to trip clippy's
+    /// `large_enum_variant` threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<ReasoningSnapshot>,
+    pub reasoning: Option<Box<ReasoningSnapshot>>,
 }
 
 impl TranscriptItem {
@@ -7300,7 +7303,7 @@ impl TranscriptItem {
         Self {
             role: Role::Assistant,
             content: content.into(),
-            reasoning,
+            reasoning: reasoning.map(Box::new),
         }
     }
 
