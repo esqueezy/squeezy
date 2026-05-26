@@ -863,6 +863,159 @@ async fn statusline_picker_renders_in_inline_mode() {
     );
 }
 
+#[test]
+fn status_line_default_layout_renders_users_configured_items() {
+    // Replays the exact list the user has in their ~/.squeezy/settings.toml
+    // and asserts the detail row paints. If this fails, AppConfig loading
+    // or item-parsing is broken; if it passes, the rendered binary should
+    // show the row at startup unmodified.
+    use crate::status::StatusLineItem;
+    let mut app = test_app(SessionMode::Build);
+    app.status_line_items = parse_status_line_items(Some(&[
+        "provider-and-model".to_string(),
+        "model-with-reasoning".to_string(),
+        "current-dir".to_string(),
+        "project-name".to_string(),
+        "git-branch".to_string(),
+        "pull-request-number".to_string(),
+        "branch-changes".to_string(),
+        "context-used".to_string(),
+    ]));
+    app.status_line_use_colors = true;
+    assert!(app.status_line_items.as_ref().is_some_and(|v| v.len() == 8));
+    assert_eq!(
+        app.status_line_items.as_ref().unwrap()[0],
+        StatusLineItem::ProviderAndModel
+    );
+    let lines = format_status_lines(&app, 200);
+    assert_eq!(lines.len(), 2, "expect overview + detail rows");
+    let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        row2.contains("scripted:gpt-test"),
+        "row 2 should include provider:model; got: {row2}"
+    );
+}
+
+#[tokio::test]
+async fn statusline_picker_toggle_then_save_reflects_in_status_row() {
+    // Open the picker, navigate to the first item row and toggle it off
+    // with Space, then save. The detail row should reflect the reduced
+    // selection, not the original pre-checked defaults.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    // Force a writable settings path inside the test, since save_status_line
+    // writes via apply_edits and we don't want to touch the real ~/.squeezy.
+    let tmpdir = std::env::temp_dir().join(format!(
+        "squeezy-statusline-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmpdir).expect("mkdir");
+    let settings_path = tmpdir.join("settings.toml");
+    // SAFETY: tests run sequentially per file with --test-threads=1 if needed;
+    // this env var is read at save time only.
+    unsafe {
+        std::env::set_var("SQUEEZY_SETTINGS_PATH", &settings_path);
+    }
+    set_input(&mut app, "/statusline".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("open picker");
+    // Cursor row 0 = "Use theme colors". Down moves to first item (ProviderAndModel by default).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down");
+    // Space toggles the first item off.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    )
+    .await
+    .expect("space");
+    // Enter saves.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("save");
+    assert!(app.status_line_setup.is_none(), "picker should close");
+    let items = app.status_line_items.as_ref().expect("items saved");
+    assert!(
+        !items.contains(&crate::status::StatusLineItem::ProviderAndModel),
+        "toggled-off item should not be in saved list; got {items:?}"
+    );
+    let lines = format_status_lines(&app, 200);
+    let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        !row2.contains("scripted:gpt-test"),
+        "row 2 should no longer show provider-and-model after toggling it off; got: {row2}"
+    );
+    unsafe {
+        std::env::remove_var("SQUEEZY_SETTINGS_PATH");
+    }
+}
+
+#[tokio::test]
+async fn statusline_save_closes_picker_and_paints_detail_row() {
+    // Open the picker, then press Enter to save the pre-checked defaults.
+    // The picker must close and the status row must start showing the
+    // chosen items.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/statusline".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("open picker");
+    assert!(app.status_line_setup.is_some(), "picker should be open");
+    // Second Enter inside the picker fires Save.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("save");
+    assert!(
+        app.status_line_setup.is_none(),
+        "picker should close after Save; status={:?}",
+        app.status
+    );
+    assert!(
+        app.status_line_items
+            .as_ref()
+            .is_some_and(|items| !items.is_empty()),
+        "Save should populate status_line_items with the pre-checked defaults; \
+         got {:?}, status={:?}",
+        app.status_line_items,
+        app.status
+    );
+    // The detail row should now include a default item that always renders
+    // (ProviderAndModel uses provider:model).
+    let lines = format_status_lines(&app, 200);
+    let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        row2.contains("scripted:gpt-test"),
+        "row 2 should reflect saved items; got: {row2}"
+    );
+}
+
 #[tokio::test]
 async fn slash_model_opens_config_at_models_section() {
     let mut agent = test_agent(SessionMode::Build);

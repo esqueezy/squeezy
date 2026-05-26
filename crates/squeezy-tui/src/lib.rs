@@ -1328,16 +1328,33 @@ fn save_status_line(
             cfg.tui.status_line = if slug_list.is_empty() {
                 None
             } else {
-                Some(slug_list)
+                Some(slug_list.clone())
             };
             cfg.tui.status_line_use_colors = use_colors;
             agent.replace_config(cfg);
             app.status_line_items = Some(items);
             app.status_line_use_colors = use_colors;
             app.status = format!("status line saved to {}", target_path.display());
+            let summary = if slug_list.is_empty() {
+                format!(
+                    "status line cleared (colors {}); written to {}",
+                    if use_colors { "on" } else { "off" },
+                    target_path.display(),
+                )
+            } else {
+                format!(
+                    "status line saved: {} (colors {}); written to {}",
+                    slug_list.join(", "),
+                    if use_colors { "on" } else { "off" },
+                    target_path.display(),
+                )
+            };
+            app.push_transcript_item(TranscriptItem::system(summary));
         }
         Err(err) => {
-            app.status = format!("/statusline save failed: {err}");
+            let msg = format!("/statusline save failed: {err}");
+            app.status = msg.clone();
+            app.push_transcript_item(TranscriptItem::system(msg));
         }
     }
 }
