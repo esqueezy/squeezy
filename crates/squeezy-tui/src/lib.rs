@@ -3280,6 +3280,7 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let include_startup_card = area.height >= 16;
     let input_height = input_panel_height(app, area.width);
     let approval_height = approval_menu_height(app);
+    let plan_indicator_height = plan_mode_indicator_height(app);
     let task_height = if should_show_task_panel(app) {
         let h = if approval_height > 0 {
             task_panel_height(app).min(5)
@@ -3294,6 +3295,7 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         .unwrap_or(0)
         .saturating_add(approval_height)
         .saturating_add(input_height)
+        .saturating_add(plan_indicator_height)
         .saturating_add(2);
     let optional_height = area.height.saturating_sub(required_height);
     let attachment_height = attachment_panel_height(app, optional_height);
@@ -3325,6 +3327,9 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     if attachment_height > 0 {
         constraints.push(Constraint::Length(attachment_height));
     }
+    if plan_indicator_height > 0 {
+        constraints.push(Constraint::Length(plan_indicator_height));
+    }
     constraints.push(Constraint::Length(input_height));
     if approval_height > 0 {
         constraints.push(Constraint::Length(approval_height));
@@ -3353,6 +3358,10 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     }
     if attachment_height > 0 {
         render_attachments(frame, chunks[index], app);
+        index += 1;
+    }
+    if plan_indicator_height > 0 {
+        render_plan_mode_indicator(frame, chunks[index], app);
         index += 1;
     }
     render_input(frame, chunks[index], app);
@@ -3431,6 +3440,7 @@ fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     }
     let input_height = input_panel_height(app, area.width);
     let approval_height = approval_menu_height(app);
+    let plan_indicator_height = plan_mode_indicator_height(app);
     let task_height = should_show_task_panel(app).then_some(task_panel_height(app));
     let status_height = 2;
     let live_lines = pending_assistant_lines(app);
@@ -3440,6 +3450,7 @@ fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
         .unwrap_or(0)
         .saturating_add(input_height)
         .saturating_add(approval_height)
+        .saturating_add(plan_indicator_height)
         .saturating_add(status_height)
         .saturating_add(live_gap);
     let attachment_height =
@@ -3459,6 +3470,9 @@ fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     }
     if attachment_height > 0 {
         constraints.push(Constraint::Length(attachment_height));
+    }
+    if plan_indicator_height > 0 {
+        constraints.push(Constraint::Length(plan_indicator_height));
     }
     constraints.push(Constraint::Length(input_height));
     if approval_height > 0 {
@@ -3489,6 +3503,10 @@ fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     }
     if attachment_height > 0 {
         render_attachments(frame, chunks[index], app);
+        index += 1;
+    }
+    if plan_indicator_height > 0 {
+        render_plan_mode_indicator(frame, chunks[index], app);
         index += 1;
     }
     render_input(frame, chunks[index], app);
@@ -4064,6 +4082,36 @@ fn render_attachments(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(QUIET))
         .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+/// One-row constraint reserved above the composer for the PLAN MODE
+/// indicator. Returns 0 in Build mode so the layout is unchanged for the
+/// majority case (audit f07-plan-mode-prompt-overlay: only Plan mode pays
+/// the row).
+fn plan_mode_indicator_height(app: &TuiApp) -> u16 {
+    match app.mode {
+        SessionMode::Plan => 1,
+        SessionMode::Build => 0,
+    }
+}
+
+/// Build the styled "[PLAN MODE] Shift+Tab to exit" line. Uses the
+/// existing `MODE_PURPLE` palette entry (no new colors) and ASCII
+/// brackets with a Unicode `⊕` glyph — matches the other status glyphs
+/// (`⟳`, `▸`) already used in this file.
+pub(crate) fn format_plan_mode_indicator_line() -> Line<'static> {
+    let label_style = Style::default()
+        .fg(MODE_PURPLE)
+        .add_modifier(Modifier::BOLD);
+    Line::from(vec![
+        Span::styled("⊕ PLAN MODE", label_style),
+        Span::styled(" · Shift+Tab to exit", Style::default().fg(QUIET)),
+    ])
+}
+
+fn render_plan_mode_indicator(frame: &mut Frame<'_>, area: Rect, _app: &TuiApp) {
+    let paragraph = Paragraph::new(format_plan_mode_indicator_line());
     frame.render_widget(paragraph, area);
 }
 

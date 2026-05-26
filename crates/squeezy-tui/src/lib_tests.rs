@@ -100,6 +100,49 @@ fn status_mode_color_distinguishes_build_and_plan() {
     );
 }
 
+#[test]
+fn plan_mode_indicator_renders_above_composer_in_plan_mode() {
+    let app = test_app(SessionMode::Plan);
+    let output = render_to_string(&app, 120, 16);
+    assert!(
+        output.contains("PLAN MODE"),
+        "expected PLAN MODE banner in plan mode output:\n{output}"
+    );
+    assert!(
+        output.contains("Shift+Tab to exit"),
+        "expected exit hint in plan mode output:\n{output}"
+    );
+}
+
+#[test]
+fn plan_mode_indicator_absent_in_build_mode() {
+    let app = test_app(SessionMode::Build);
+    let output = render_to_string(&app, 120, 16);
+    assert!(
+        !output.contains("PLAN MODE"),
+        "build mode must not render the plan banner:\n{output}"
+    );
+}
+
+#[test]
+fn plan_mode_indicator_height_is_zero_in_build_and_one_in_plan() {
+    let mut app = test_app(SessionMode::Build);
+    assert_eq!(plan_mode_indicator_height(&app), 0);
+    app.mode = SessionMode::Plan;
+    assert_eq!(plan_mode_indicator_height(&app), 1);
+}
+
+#[test]
+fn plan_mode_indicator_line_uses_existing_mode_purple_palette() {
+    let line = format_plan_mode_indicator_line();
+    let label_span = line
+        .spans
+        .first()
+        .expect("plan-mode line must have at least one span");
+    assert!(label_span.content.contains("PLAN MODE"));
+    assert_eq!(label_span.style.fg, Some(MODE_PURPLE));
+}
+
 #[tokio::test]
 async fn shift_tab_toggles_mode() {
     let mut agent = test_agent(SessionMode::Build);
