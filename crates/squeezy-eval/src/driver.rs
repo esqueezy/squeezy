@@ -879,7 +879,14 @@ impl Driver {
                 }
                 AgentEvent::TaskStateUpdated { turn_id, snapshot } => {
                     let turn_str = format!("{turn_id:?}");
-                    let value = json!({"debug": format!("{:?}", snapshot)});
+                    // Emit both the debug rendering (retained for old viewers)
+                    // and a structured `summary` field so rule code does not
+                    // have to parse the debug string.
+                    let value = json!({
+                        "debug": format!("{:?}", snapshot),
+                        "summary": snapshot.summary,
+                        "status": format!("{:?}", snapshot.status),
+                    });
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::TaskStateUpdated { snapshot: value },
