@@ -3505,6 +3505,26 @@ fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
+    if app.transcript_overlay.is_some() {
+        render_transcript_overlay(frame, area, app);
+        return;
+    }
+    if let Some(state) = &app.status_line_setup {
+        let notif_h = app.app_notifications.height();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(if notif_h > 0 {
+                vec![Constraint::Min(0), Constraint::Length(notif_h)]
+            } else {
+                vec![Constraint::Min(0)]
+            })
+            .split(area);
+        status_line_setup::render(frame, chunks[0], state, app);
+        if notif_h > 0 {
+            render_notification_pane(frame, chunks[1], app);
+        }
+        return;
+    }
     if let Some(state) = &app.config_screen {
         let notif_h = app.app_notifications.height();
         let chunks = Layout::default()

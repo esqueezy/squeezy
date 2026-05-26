@@ -824,6 +824,46 @@ async fn slash_config_opens_screen() {
 }
 
 #[tokio::test]
+async fn slash_statusline_opens_picker() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/statusline".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert!(
+        app.status_line_setup.is_some(),
+        "/statusline should open the picker overlay; status={:?}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn statusline_picker_renders_in_inline_mode() {
+    // Inline is the default terminal mode; the overlay must be visible
+    // there, not just in AlternateScreen.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/statusline".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    let rendered = render_inline_to_string(&app, 80, 24);
+    assert!(
+        rendered.contains("Configure Status Line"),
+        "inline render should show the picker; got:\n{rendered}"
+    );
+}
+
+#[tokio::test]
 async fn slash_model_opens_config_at_models_section() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
