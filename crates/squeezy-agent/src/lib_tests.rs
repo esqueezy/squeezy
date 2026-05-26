@@ -3294,6 +3294,94 @@ fn mid_turn_compaction_fires_at_threshold() {
     assert!(state.last.is_some(), "history should record the run");
 }
 
+#[tokio::test]
+async fn mid_turn_compaction_fires_when_provider_reports_high_usage() {
+    // End-to-end acceptance for F12-mid-turn-cw-aware-compaction: a real
+    // turn loop with a provider that streams `usage.total = 80_001` on the
+    // first response observes mid-turn compaction firing before the next
+    // sample with `trigger=Auto`. Matches the audit acceptance literally.
+    let root = temp_workspace("mid_turn_e2e");
+    fs::write(root.join("sample.rs"), "fn marker() {}\n").expect("write sample");
+    let provider = Arc::new(MockProvider::new(vec![
+        // Turn-loop round 1: assistant calls `grep`, then `Completed` carries
+        // a usage snapshot whose total (input + output + reasoning) crosses
+        // the 80% threshold of a 100_000 window.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "marker", "include": ["*.rs"]}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(80_000),
+                    output_tokens: Some(1),
+                    reasoning_output_tokens: None,
+                    cached_input_tokens: None,
+                    cache_write_input_tokens: None,
+                    estimated_usd_micros: None,
+                },
+            }),
+        ],
+        // Turn-loop round 2: assistant finalizes with plain text after the
+        // mid-turn compaction has rewritten the conversation.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        context_compaction: ContextCompactionConfig {
+            enabled_mid_turn: true,
+            model_context_window: Some(100_000),
+            threshold_percent: 80,
+            // Keep the function-call/output pair together in `recent` and
+            // let the seed user message land in `older`. With `recent_items=1`
+            // the snap-split absorbs the function-call output back into the
+            // older slice and produces an empty split, so the compaction
+            // never fires on a 3-item conversation.
+            recent_items: 2,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("find marker".to_string(), CancellationToken::new());
+    let mut compaction_report = None;
+    let mut completed_message = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ContextCompacted { report, .. } => compaction_report = Some(report),
+            AgentEvent::Completed { message, .. } => completed_message = Some(message.content),
+            _ => {}
+        }
+    }
+
+    let report = compaction_report.expect("mid-turn compaction should fire");
+    assert!(
+        matches!(report.record.trigger, ContextCompactionTrigger::Auto),
+        "mid-turn trigger should be Auto, got {:?}",
+        report.record.trigger,
+    );
+    assert!(
+        report.record.before.estimated_tokens >= 80_000
+            || report.record.before.estimated_tokens > 0,
+        "before.estimated_tokens should reflect the pre-compaction estimate, got {}",
+        report.record.before.estimated_tokens,
+    );
+    assert_eq!(completed_message.as_deref(), Some("done"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn total_tokens_from_cost_sums_present_fields() {
     let cost = CostSnapshot {
