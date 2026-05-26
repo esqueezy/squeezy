@@ -3273,6 +3273,11 @@ fn local_shell_command_call(input: &str) -> Option<ToolCall> {
             "output_byte_cap": LOCAL_SHELL_OUTPUT_BYTE_CAP,
             "output_mode": "raw",
             "direct_user_shell": true,
+            // Paired with the call_id prefix so a downstream caller (mock
+            // provider, replay tape, future MCP shim) that mints
+            // `local-shell-…` ids cannot silently bypass the sandbox by
+            // toggling `direct_user_shell` alone.
+            "direct_user_shell_nonce": squeezy_tools::direct_user_shell_nonce(),
         }),
     })
 }
@@ -7842,13 +7847,26 @@ fn shell_ask_approver_for_context(context: &ToolExecutionContext<'_>) -> ShellAs
 }
 
 fn is_direct_user_shell_call(call: &ToolCall) -> bool {
-    call.name == "shell"
-        && call.call_id.starts_with("local-shell-")
-        && call
-            .arguments
-            .get("direct_user_shell")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+    if call.name != "shell" || !call.call_id.starts_with("local-shell-") {
+        return false;
+    }
+    let direct = call
+        .arguments
+        .get("direct_user_shell")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !direct {
+        return false;
+    }
+    // Mirror the registry's nonce check: the auto-approve path that skips
+    // the permission prompt requires the same per-process nonce that the
+    // TUI's `!cmd` minter ships. Without it, a downstream caller that
+    // synthesises a `local-shell-…` call_id falls back to the normal
+    // permission flow.
+    call.arguments
+        .get("direct_user_shell_nonce")
+        .and_then(Value::as_str)
+        == Some(squeezy_tools::direct_user_shell_nonce())
 }
 
 /// Lock-free read of the active session mode. Defaults to `Build` if the

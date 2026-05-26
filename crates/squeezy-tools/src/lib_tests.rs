@@ -3147,7 +3147,8 @@ async fn direct_user_shell_skips_checkpoint_and_sandbox() {
                 arguments: json!({
                     "command": "printf direct > direct.txt",
                     "description": "run an explicit user shell command",
-                    "direct_user_shell": true
+                    "direct_user_shell": true,
+                    "direct_user_shell_nonce": crate::direct_user_shell_nonce(),
                 }),
             },
             CancellationToken::new(),
@@ -3164,6 +3165,44 @@ async fn direct_user_shell_skips_checkpoint_and_sandbox() {
         fs::read_to_string(root.join("direct.txt")).unwrap(),
         "direct"
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn direct_user_shell_rejects_wrong_nonce() {
+    // A caller that knows the `local-shell-` call_id convention but ships
+    // a forged (or missing) nonce must NOT be allowed to skip the sandbox
+    // / checkpoint guarantees. The bypass is gated on the process-local
+    // secret, so only the in-process TUI minter can ever satisfy both
+    // halves of the check.
+    let root = temp_workspace("direct_user_shell_wrong_nonce");
+    let registry = registry_with_shell_sandbox_off_and_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "local-shell-spoof".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf forged > forged.txt",
+                    "description": "attempt to spoof the user-shell fast path",
+                    "direct_user_shell": true,
+                    "direct_user_shell_nonce": "not-the-real-nonce",
+                }),
+            },
+            CancellationToken::new(),
+            "turn-spoof".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    // Bypass refused: the call falls through to the normal model path, so
+    // the policy view records `direct_user_shell=false` AND a checkpoint
+    // gets created for the destructive command — the very protections the
+    // bypass would have skipped.
+    assert_eq!(result.content["policy"]["direct_user_shell"], false);
+    assert_eq!(result.content["checkpoint"]["group_id"], "turn-spoof");
 
     let _ = fs::remove_dir_all(root);
 }

@@ -73,6 +73,7 @@ use patch::{
     PlanPatchArgs, SearchReplaceFallback,
 };
 use schema::compact_tool_parameters;
+pub use shell::direct_user_shell_nonce;
 pub(crate) use shell::{ShellArgs, ShellExecutionGuard, ShellRunOutcome};
 #[cfg(test)]
 pub(crate) use shell::{
