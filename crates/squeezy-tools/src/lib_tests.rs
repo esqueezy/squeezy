@@ -2094,6 +2094,196 @@ async fn apply_patch_unified_diff_fallback_applies_via_git_apply_3way() {
         files.iter().any(|f| f["path"] == "doc.txt"),
         "checkpoint should record the touched file"
     );
+    // The unified-diff fallback is squeezy's fuzz/whitespace-tolerant path:
+    // when this lands the op the caller should be able to audit that it was
+    // not an exact match.
+    let delta = result
+        .content
+        .get("delta")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .expect("delta array");
+    assert_eq!(delta.len(), 1);
+    assert_eq!(delta[0]["status"], "applied");
+    assert_eq!(delta[0]["exact"], false);
+    assert_eq!(delta[0]["path"], "doc.txt");
+    let applied_delta = result
+        .content
+        .get("applied_delta")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(applied_delta["exact"], false);
+    assert_eq!(applied_delta["operations"][0]["exact"], false);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_returns_per_op_delta_with_exact_flag_on_success() {
+    // Audit F14: a multi-op apply_patch success must expose a per-op `delta`
+    // array — one entry per requested op, each `applied` and `exact=true`
+    // when the search-replace matched the pre-image byte-for-byte.
+    let root = temp_workspace("apply_patch_delta_exact");
+    fs::write(root.join("alpha.txt"), "alpha-before\n").expect("write alpha");
+    fs::write(root.join("beta.txt"), "beta-before\n").expect("write beta");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_delta_exact".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [
+                        {
+                            "path": "alpha.txt",
+                            "search": "alpha-before\n",
+                            "replace": "alpha-after\n",
+                            "expected_sha256": sha256_hex("alpha-before\n".as_bytes()),
+                        },
+                        {
+                            "path": "beta.txt",
+                            "search": "beta-before\n",
+                            "replace": "beta-after\n",
+                            "expected_sha256": sha256_hex("beta-before\n".as_bytes()),
+                        }
+                    ]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-delta-exact".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let delta = result
+        .content
+        .get("delta")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .expect("top-level delta array");
+    assert_eq!(delta.len(), 2, "one entry per op: {delta:?}");
+    for (idx, entry) in delta.iter().enumerate() {
+        assert_eq!(
+            entry["status"], "applied",
+            "op {idx} status mismatch: {entry}"
+        );
+        assert_eq!(
+            entry["exact"], true,
+            "op {idx} should be an exact match: {entry}"
+        );
+        assert!(
+            entry.get("error").is_none(),
+            "exact success must not carry an error field: {entry}"
+        );
+    }
+    assert_eq!(delta[0]["path"], "alpha.txt");
+    assert_eq!(delta[1]["path"], "beta.txt");
+    // applied_delta.operations should also carry the per-op exact flag.
+    let applied_delta = result.content.get("applied_delta").expect("applied_delta");
+    let ops = applied_delta
+        .get("operations")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(ops.len(), 2);
+    assert_eq!(ops[0]["exact"], true);
+    assert_eq!(ops[1]["exact"], true);
+    assert_eq!(applied_delta["exact"], true);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn apply_patch_delta_reports_per_op_failure_with_error() {
+    // Audit F14: when an op fails mid-apply, the per-op delta must mark that
+    // op `failed` with an `error` field populated, and any later ops must be
+    // `skipped` — the caller needs enough information to audit which path is
+    // broken without reparsing the top-level error string.
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_workspace("apply_patch_delta_failure");
+    fs::write(root.join("first.txt"), "first-before\n").expect("write first");
+    fs::write(root.join("second.txt"), "second-before\n").expect("write second");
+    fs::write(root.join("third.txt"), "third-before\n").expect("write third");
+    let read_only = root.join("second.txt");
+    let mut perms = fs::metadata(&read_only).expect("read meta").permissions();
+    perms.set_mode(0o444);
+    fs::set_permissions(&read_only, perms).expect("set readonly");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_delta_failure".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [
+                        {
+                            "path": "first.txt",
+                            "search": "first-before\n",
+                            "replace": "first-after\n",
+                            "expected_sha256": sha256_hex("first-before\n".as_bytes()),
+                        },
+                        {
+                            "path": "second.txt",
+                            "search": "second-before\n",
+                            "replace": "second-after\n",
+                            "expected_sha256": sha256_hex("second-before\n".as_bytes()),
+                        },
+                        {
+                            "path": "third.txt",
+                            "search": "third-before\n",
+                            "replace": "third-after\n",
+                            "expected_sha256": sha256_hex("third-before\n".as_bytes()),
+                        }
+                    ]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-delta-failure".to_string(),
+        )
+        .await;
+
+    if let Ok(meta) = fs::metadata(&read_only) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o644);
+        let _ = fs::set_permissions(&read_only, perms);
+    }
+
+    if result.status == ToolStatus::Error {
+        let delta = result
+            .content
+            .get("delta")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .expect("delta array on partial failure");
+        assert_eq!(delta.len(), 3, "one entry per op: {delta:?}");
+        assert_eq!(delta[0]["status"], "applied");
+        assert_eq!(delta[0]["exact"], true);
+        assert!(delta[0].get("error").is_none());
+
+        assert_eq!(delta[1]["status"], "failed");
+        assert_eq!(delta[1]["exact"], true);
+        assert!(
+            delta[1]["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "failed op must surface its error string: {}",
+            delta[1]
+        );
+        assert_eq!(delta[1]["path"], "second.txt");
+
+        assert_eq!(
+            delta[2]["status"], "skipped",
+            "ops after the failure must be skipped: {}",
+            delta[2]
+        );
+        assert_eq!(delta[2]["exact"], true);
+    } else {
+        // Some sandboxes (root, etc) ignore 0o444; in that case every op
+        // applied and the failure-path assertions don't fire.
+        assert_eq!(result.status, ToolStatus::Success);
+    }
 
     let _ = fs::remove_dir_all(root);
 }

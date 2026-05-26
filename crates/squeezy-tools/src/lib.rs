@@ -2579,12 +2579,14 @@ impl ToolRegistry {
                                     }
                                 };
                                 state.current = new_contents;
+                                staged.mark_last_op_inexact();
                                 preview_ops.push(json!({
                                     "patch_index": index,
                                     "kind": "search_replace",
                                     "path": rel,
                                     "fallback": "unified_diff",
                                     "applied_via": "git_apply_3way",
+                                    "exact": false,
                                 }));
                                 return Ok(());
                             }
@@ -3718,6 +3720,7 @@ pub(crate) enum StagedOp {
     SearchReplace {
         rel: String,
         file_index: usize,
+        exact: bool,
     },
     CreateFile {
         rel: String,
@@ -3750,6 +3753,7 @@ impl StagedApply {
             self.ops.push(StagedOp::SearchReplace {
                 rel: rel.to_string(),
                 file_index: idx,
+                exact: true,
             });
             return Ok(idx);
         }
@@ -3767,8 +3771,17 @@ impl StagedApply {
         self.ops.push(StagedOp::SearchReplace {
             rel: rel.to_string(),
             file_index: idx,
+            exact: true,
         });
         Ok(idx)
+    }
+
+    /// Mark the most-recently staged op as non-exact (e.g., the search-replace
+    /// matched only via the `unified_diff` fallback rather than verbatim).
+    fn mark_last_op_inexact(&mut self) {
+        if let Some(StagedOp::SearchReplace { exact, .. }) = self.ops.last_mut() {
+            *exact = false;
+        }
     }
 
     fn push_create(&mut self, rel: String, abs_path: PathBuf, contents: String) {
@@ -3932,17 +3945,43 @@ impl StagedOp {
     }
 
     pub(crate) fn delta_json_with_index(&self, status: &str, index_hint: usize) -> Value {
+        self.delta_json_full(status, index_hint, self.exact(), None)
+    }
+
+    /// True when the staged op matched the file's pre-image byte-for-byte.
+    /// Create/Delete/Move are always exact (no fuzz matching applies); a
+    /// SearchReplace becomes inexact when its literal `search` body did not
+    /// appear in the file and the `unified_diff` fallback resolved the change
+    /// via `git apply --3way`.
+    pub(crate) fn exact(&self) -> bool {
+        match self {
+            StagedOp::SearchReplace { exact, .. } => *exact,
+            StagedOp::CreateFile { .. }
+            | StagedOp::DeleteFile { .. }
+            | StagedOp::MoveFile { .. } => true,
+        }
+    }
+
+    pub(crate) fn delta_json_full(
+        &self,
+        status: &str,
+        index_hint: usize,
+        exact: bool,
+        error: Option<&str>,
+    ) -> Value {
         let mut value = json!({
             "kind": self.kind(),
             "status": status,
             "path": self.primary_path(),
+            "exact": exact,
         });
-        if index_hint != usize::MAX
-            && let Some(obj) = value.as_object_mut()
-        {
-            obj.insert("patch_index".to_string(), json!(index_hint));
-        }
         if let Some(obj) = value.as_object_mut() {
+            if index_hint != usize::MAX {
+                obj.insert("patch_index".to_string(), json!(index_hint));
+            }
+            if let Some(message) = error {
+                obj.insert("error".to_string(), json!(message));
+            }
             match self {
                 StagedOp::SearchReplace { .. } => {}
                 StagedOp::CreateFile { contents, .. } => {
