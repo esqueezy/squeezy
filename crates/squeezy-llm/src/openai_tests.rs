@@ -28,6 +28,7 @@ fn request_body_uses_responses_streaming_shape() {
             .into(),
         ]),
         store: true,
+        tool_choice: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -75,6 +76,7 @@ fn request_body_serializes_tool_outputs_as_input_items() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -112,6 +114,7 @@ fn request_body_preserves_function_tool_order() {
             .into(),
         ]),
         store: false,
+        tool_choice: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -134,6 +137,7 @@ fn request_body_includes_reasoning_and_text_verbosity_when_set() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -163,6 +167,7 @@ fn request_body_maps_squeezy_verbosity_to_openai_values() {
             cache_key: None,
             tools: Arc::from(Vec::new()),
             store: false,
+            tool_choice: None,
         };
 
         let body = OpenAiProvider::request_body(&request, "openai");
@@ -184,6 +189,7 @@ fn request_body_emits_prompt_cache_key_when_set() {
         cache_key: Some("squeezy::session-1".to_string()),
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -203,6 +209,7 @@ fn request_body_omits_prompt_cache_key_when_unset() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");

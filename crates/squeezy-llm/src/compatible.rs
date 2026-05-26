@@ -181,6 +181,18 @@ impl OpenAiCompatibleProvider {
                     })
                     .collect::<Vec<_>>()
             );
+            // Forward `tool_choice` when the caller set one. Omitting the
+            // field leaves the provider's default in place (typically
+            // `auto`), which preserves historical behavior for working
+            // models. Tool-shy models routed through aggregators (Qwen
+            // via OpenRouter, smaller MoEs) ignore `auto` and emit a
+            // chatty preamble with zero tool calls; setting
+            // `tool_choice = "required"` in `[model]` flips them into
+            // calling at least one tool per turn — see opencode's
+            // pass-through pattern in `openai-chat.ts:267`.
+            if let Some(choice) = request.tool_choice.as_deref() {
+                body["tool_choice"] = json!(choice);
+            }
         }
         body
     }

@@ -56,6 +56,7 @@ async fn azure_openai_responses_streaming_costly() -> Result<()> {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
     };
     let stream = provider.stream_response(request, CancellationToken::new());
     let output = common::collect_text(stream, "Azure OpenAI").await?;
