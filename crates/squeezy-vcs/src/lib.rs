@@ -1427,7 +1427,8 @@ impl CheckpointStore {
     fn git_raw<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
         git_output_vec_allow_status(
             &self.root,
-            std::iter::once("--git-dir".to_string())
+            std::iter::once("--bare".to_string())
+                .chain(std::iter::once("--git-dir".to_string()))
                 .chain(std::iter::once(self.git_dir.to_string_lossy().to_string()))
                 .chain(args.into_iter().map(str::to_string))
                 .collect(),

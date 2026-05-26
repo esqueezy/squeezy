@@ -6828,7 +6828,9 @@ fn shell_sandbox_plan_mode_off_returns_direct() {
 
     assert_eq!(plan.backend, "none");
     assert_eq!(plan.mode, "off");
-    assert_eq!(plan.program, "sh");
+    let shell = ShellProgram::for_command("printf ok");
+    assert_eq!(plan.program, shell.program);
+    assert_eq!(plan.args, shell.args);
     assert!(!plan.required);
 }
 

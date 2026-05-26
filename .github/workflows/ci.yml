@@ -158,6 +158,8 @@ jobs:
             export CC_x86_64_unknown_linux_musl=musl-gcc
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
             cargo nextest run --workspace --all-targets --profile ci --target x86_64-unknown-linux-musl
+          elif [[ "${{ matrix.platform }}" == "windows" ]]; then
+            SQUEEZY_SHELL=gitbash cargo nextest run --workspace --all-targets --profile ci
           else
             cargo nextest run --workspace --all-targets --profile ci
           fi
