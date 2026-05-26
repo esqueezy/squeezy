@@ -83,20 +83,14 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         state.scope == ConfigScope::User,
         user_exists,
     ));
-    spans.push(Span::styled(
-        " ▸ ",
-        Style::default().fg(SEPARATOR_BLUE),
-    ));
+    spans.push(Span::styled(" ▸ ", Style::default().fg(SEPARATOR_BLUE)));
     spans.extend(tab(
         "Repo",
         "./squeezy.toml (committed)",
         state.scope == ConfigScope::Repo,
         repo_exists,
     ));
-    spans.push(Span::styled(
-        " ▸ ",
-        Style::default().fg(SEPARATOR_BLUE),
-    ));
+    spans.push(Span::styled(" ▸ ", Style::default().fg(SEPARATOR_BLUE)));
     spans.extend(tab(
         "Local",
         "~/.squeezy/projects/<this>/settings.toml",
@@ -516,7 +510,10 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) 
     let scroll = if height == 0 || total <= height {
         0u16
     } else {
-        state.section_index.saturating_sub(height - 1).min(total - height) as u16
+        state
+            .section_index
+            .saturating_sub(height - 1)
+            .min(total - height) as u16
     };
     frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
 }
