@@ -12675,7 +12675,7 @@ fn prepare_shell_sandbox_plan_with_probe(
             );
         }
         let shell = ShellProgram::for_command(command);
-        return Ok(ShellSandboxPlan {
+        Ok(ShellSandboxPlan {
             program: shell.program,
             args: shell.args,
             backend: "windows-job-object",
@@ -12694,7 +12694,7 @@ fn prepare_shell_sandbox_plan_with_probe(
             fallback_reason: Some(
                 "windows: process-tree cleanup via Job Object; no FS/network isolation".to_string(),
             ),
-        });
+        })
     }
 
     #[cfg(not(target_os = "windows"))]

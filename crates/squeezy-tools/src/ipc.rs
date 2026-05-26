@@ -210,9 +210,9 @@ impl IpcListener {
                 // pattern).
                 let server = {
                     let mut guard = next_server.lock().await;
-                    guard.take().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::Other, "ipc listener missing prepared server")
-                    })?
+                    guard
+                        .take()
+                        .ok_or_else(|| io::Error::other("ipc listener missing prepared server"))?
                 };
                 server.connect().await?;
                 let prepared = ServerOptions::new().create(name)?;
