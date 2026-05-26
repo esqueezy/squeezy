@@ -1863,9 +1863,7 @@ async fn slash_help_lists_topics() {
     wait_for_turn_completion(&mut app).await;
     let content = last_message_content(&app).expect("help transcript");
     assert!(
-        transcript_message_contents(&app)
-            .iter()
-            .any(|content| *content == "/help"),
+        transcript_message_contents(&app).contains(&"/help"),
         "user prompt should remain in the transcript"
     );
     assert!(content.contains("Supported topics"), "{content}");
@@ -1882,9 +1880,7 @@ async fn slash_help_config_renders_citations_and_config() {
     wait_for_turn_completion(&mut app).await;
     let content = last_message_content(&app).expect("help transcript");
     assert!(
-        transcript_message_contents(&app)
-            .iter()
-            .any(|content| *content == "/help providers"),
+        transcript_message_contents(&app).contains(&"/help providers"),
         "user prompt should remain in the transcript"
     );
     assert!(content.contains("docs/external/PROVIDERS.md"), "{content}");
@@ -1902,9 +1898,7 @@ async fn slash_help_unsupported_points_to_public_resources() {
     wait_for_turn_completion(&mut app).await;
     let content = last_message_content(&app).expect("help transcript");
     assert!(
-        transcript_message_contents(&app)
-            .iter()
-            .any(|content| *content == "/help quantum billing"),
+        transcript_message_contents(&app).contains(&"/help quantum billing"),
         "user prompt should remain in the transcript"
     );
     assert!(content.contains("won't guess"), "{content}");
