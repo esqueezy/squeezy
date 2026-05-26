@@ -4,6 +4,24 @@ Squeezy's semantic navigation layer is built from tree-sitter parsers, workspace
 file records, and local resolution heuristics. It is designed to answer common
 navigation questions before the model reads raw files.
 
+## Design Policy: Graph-First Navigation
+
+Squeezy deliberately keeps a graph-first navigation surface and will not retreat
+to a bash/grep/`apply_patch` shell-loop navigation model. Tree-sitter grammars
+for Rust, Python, Java, C#, Go, C/C++, and JavaScript/TypeScript drive a
+persisted semantic graph with a typed-confidence call resolver and a documented
+agent-facing tool surface (`decl_search`, `definition_search`,
+`reference_search`, `hierarchy`, `upstream_flow`, `downstream_flow`,
+`symbol_context`, `repo_map`). Lexical fallbacks (`grep`, `glob`, `read_slice`)
+are intentionally framed as graph-anchored last resorts rather than the primary
+navigation surface.
+
+Squeezy does not adopt the alternative seen in adjacent shell-first agents
+where tree-sitter is only used to parse `apply_patch` heredocs and the model is
+expected to navigate code through `bash -lc` + grep + raw reads. That model
+sacrifices the moat — multi-language symbol resolution, capped candidate sets,
+and typed confidence per edge — that this navigation layer exists to preserve.
+
 ## What Is Indexed
 
 - Gitignore-aware file records: path, relative path, size, mtime, stable content
