@@ -2915,6 +2915,7 @@ fn diff_render_colorizes_gutter() {
 
 #[test]
 fn highlight_rust_code_block() {
+    let palette = render::highlight::HighlightPalette::current();
     let lines = render::highlight::highlight_code(Some("rust"), "fn foo() { /* comment */ 42 }");
     let spans = lines
         .iter()
@@ -2934,13 +2935,14 @@ fn highlight_rust_code_block() {
         .find(|span| span.content.as_ref() == "42")
         .expect("number span");
 
-    assert_eq!(keyword.style.fg, Some(render::highlight::KEYWORD_COLOR));
-    assert_eq!(comment.style.fg, Some(render::highlight::COMMENT_COLOR));
-    assert_eq!(number.style.fg, Some(render::highlight::NUMBER_COLOR));
+    assert_eq!(keyword.style.fg, Some(palette.keyword));
+    assert_eq!(comment.style.fg, Some(palette.comment));
+    assert_eq!(number.style.fg, Some(palette.number));
 }
 
 #[test]
 fn markdown_renders_heading_and_code() {
+    let palette = render::highlight::HighlightPalette::current();
     let lines = render::markdown::render_markdown("# Heading\n\n```rust\nfn foo() {}\n```");
     let heading = lines[0]
         .spans
@@ -2954,10 +2956,7 @@ fn markdown_renders_heading_and_code() {
         .expect("code keyword span");
 
     assert!(heading.style.add_modifier.contains(Modifier::BOLD));
-    assert_eq!(
-        code_keyword.style.fg,
-        Some(render::highlight::KEYWORD_COLOR)
-    );
+    assert_eq!(code_keyword.style.fg, Some(palette.keyword));
 }
 
 #[test]
