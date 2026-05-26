@@ -5364,17 +5364,22 @@ struct SubagentExecution {
     structured_output: Option<Value>,
 }
 
-/// Increments the per-kind subagent call bucket. The four audited buckets
-/// (delegate/explore/plan/review) feed `/cost`-style telemetry; kinds
-/// outside that set (e.g. `doc_help`) are intentionally not bucketed so
-/// the rollup matches the operator-facing taxonomy.
-fn record_subagent_kind_call(metrics: &mut TurnMetrics, kind: SubagentKind) {
+/// Bumps the global `subagent_calls` counter and the per-kind bucket so
+/// the two stay aligned. The four audited buckets (delegate/explore/
+/// plan/review) feed `/cost`-style telemetry; kinds outside that set
+/// (e.g. `doc_help`) are intentionally not bucketed so the rollup matches
+/// the operator-facing taxonomy.
+fn record_subagent_call(metrics: &mut TurnMetrics, kind: SubagentKind) {
+    metrics.subagent_calls += 1;
     if let Some(bucket) = metrics.subagent_by_kind.bucket_mut(kind.as_str()) {
         bucket.calls += 1;
     }
 }
 
-fn record_subagent_kind_failure(metrics: &mut TurnMetrics, kind: SubagentKind) {
+/// Pairs the global `subagent_failures` bump with the per-kind bucket
+/// so the totals match every early-return path in `handle_subagent_call`.
+fn record_subagent_failure(metrics: &mut TurnMetrics, kind: SubagentKind) {
+    metrics.subagent_failures += 1;
     if let Some(bucket) = metrics.subagent_by_kind.bucket_mut(kind.as_str()) {
         bucket.failures += 1;
     }
@@ -5398,13 +5403,11 @@ async fn handle_subagent_call(
     kind: SubagentKind,
     broker: &mut CostBroker,
 ) -> ToolResult {
-    broker.metrics.subagent_calls += 1;
-    record_subagent_kind_call(&mut broker.metrics, kind);
+    record_subagent_call(&mut broker.metrics, kind);
     if !context.config.subagents.enabled
         || (kind == SubagentKind::Explore && !context.config.subagents.explore_enabled)
     {
-        broker.metrics.subagent_failures += 1;
-        record_subagent_kind_failure(&mut broker.metrics, kind);
+        record_subagent_failure(&mut broker.metrics, kind);
         return subagent_control_result(
             call,
             kind,
@@ -5423,8 +5426,7 @@ async fn handle_subagent_call(
     let request = match parse_subagent_request(call, kind) {
         Ok(request) => request,
         Err(error) => {
-            broker.metrics.subagent_failures += 1;
-            record_subagent_kind_failure(&mut broker.metrics, kind);
+            record_subagent_failure(&mut broker.metrics, kind);
             return subagent_control_result(
                 call,
                 kind,
@@ -5475,8 +5477,7 @@ async fn handle_subagent_call(
     ) {
         Ok(lease) => lease,
         Err(error) => {
-            broker.metrics.subagent_failures += 1;
-            record_subagent_kind_failure(&mut broker.metrics, kind);
+            record_subagent_failure(&mut broker.metrics, kind);
             return subagent_control_result(
                 call,
                 kind,
@@ -5501,8 +5502,7 @@ async fn handle_subagent_call(
         .merge_subagent_tool_metrics(&execution.metrics);
     record_subagent_kind_execution(&mut broker.metrics, kind, &execution.metrics);
     if execution.status != ToolStatus::Success {
-        broker.metrics.subagent_failures += 1;
-        record_subagent_kind_failure(&mut broker.metrics, kind);
+        record_subagent_failure(&mut broker.metrics, kind);
     }
     let event_payload = json!({
         "agent": kind.as_str(),
