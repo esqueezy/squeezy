@@ -774,6 +774,14 @@ impl Rule for UngroundedCitation {
                 continue;
             }
             let text = text_per_turn.get(&turn).cloned().unwrap_or_default();
+            // Curated Squeezy help answers cite the bundled doc corpus that
+            // ships compiled into the binary. They legitimately make zero tool
+            // calls; the `- docs path:` prefix is emitted only by
+            // `HelpCitation::render` and is not something the model would
+            // naturally produce, so it is a reliable marker.
+            if text.contains("\n- docs path: ") {
+                continue;
+            }
             if looks_like_path_citation(&text) {
                 out.push(Finding {
                     rule_id: "ungrounded_citation".into(),
