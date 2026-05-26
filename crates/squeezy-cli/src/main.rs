@@ -107,7 +107,7 @@ enum Command {
     },
     #[command(about = "Ask the running Squeezy shell session for an in-flight permission decision")]
     Ask(AskArgs),
-    #[command(about = "Manage provider credentials stored in the OS keyring")]
+    #[command(about = "Manage provider API keys stored inline in the settings TOML")]
     Auth {
         #[command(subcommand)]
         command: auth::AuthCommand,
