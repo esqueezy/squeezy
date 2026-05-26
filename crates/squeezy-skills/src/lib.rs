@@ -161,6 +161,7 @@ impl SkillCatalog {
             SkillSource::Project,
         );
         catalog.apply_config_rules(workspace_root, &config.config);
+        catalog.warn_trigger_collisions();
         catalog.rebuild_implicit_indexes();
         catalog
     }
@@ -385,7 +386,18 @@ impl SkillCatalog {
     fn insert(&mut self, entry: SkillEntry) {
         match self.skills.get(&entry.summary.name) {
             Some(existing)
-                if existing.summary.source.precedence() > entry.summary.source.precedence() => {}
+                if existing.summary.source.precedence() > entry.summary.source.precedence() =>
+            {
+                warn!(
+                    target: "squeezy_skills",
+                    name = %entry.summary.name,
+                    kept = %existing.summary.location.display(),
+                    kept_source = existing.summary.source.as_str(),
+                    shadowed = %entry.summary.location.display(),
+                    shadowed_source = entry.summary.source.as_str(),
+                    "skill name reused at lower precedence; lower-precedence copy will not load"
+                );
+            }
             Some(existing)
                 if existing.summary.source.precedence() == entry.summary.source.precedence() =>
             {
@@ -402,13 +414,57 @@ impl SkillCatalog {
                 }
                 self.skills.insert(entry.summary.name.clone(), entry);
             }
-            _ => {
+            Some(existing) => {
+                warn!(
+                    target: "squeezy_skills",
+                    name = %entry.summary.name,
+                    overridden = %existing.summary.location.display(),
+                    overridden_source = existing.summary.source.as_str(),
+                    overriding = %entry.summary.location.display(),
+                    overriding_source = entry.summary.source.as_str(),
+                    "skill name reused at higher precedence; lower-precedence copy will not load"
+                );
                 self.ambiguous_names.remove(&entry.summary.name);
                 if let Ok(mut cache) = self.cache.lock() {
                     cache.remove(&entry.summary.name);
                 }
                 self.skills.insert(entry.summary.name.clone(), entry);
             }
+            None => {
+                self.skills.insert(entry.summary.name.clone(), entry);
+            }
+        }
+    }
+
+    fn warn_trigger_collisions(&self) {
+        let mut by_trigger: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for entry in self.skills.values() {
+            for trigger in &entry.triggers {
+                let normalized = trigger.trim().to_ascii_lowercase();
+                if normalized.is_empty() {
+                    continue;
+                }
+                by_trigger
+                    .entry(normalized)
+                    .or_default()
+                    .push(entry.summary.name.as_str());
+            }
+        }
+        for (trigger, mut names) in by_trigger {
+            if names.len() < 2 {
+                continue;
+            }
+            names.sort_unstable();
+            names.dedup();
+            if names.len() < 2 {
+                continue;
+            }
+            warn!(
+                target: "squeezy_skills",
+                trigger = %trigger,
+                skills = ?names,
+                "duplicate skill trigger across skills; activation will load every match"
+            );
         }
     }
 

@@ -1,11 +1,13 @@
 use std::{
     collections::BTreeSet,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use squeezy_core::{SkillConfigEntry, SkillsBudgetMode, SkillsConfig};
+use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
 
@@ -1046,4 +1048,196 @@ fn temp_workspace(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("squeezy_{name}_{nonce}"));
     fs::create_dir_all(&path).expect("create temp workspace");
     path
+}
+
+#[derive(Clone, Default)]
+struct SharedLogWriter {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedLogWriter {
+    fn contents(&self) -> String {
+        let bytes = self.buffer.lock().expect("log buffer").clone();
+        String::from_utf8(bytes).expect("logs are UTF-8")
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for SharedLogWriter {
+    type Writer = SharedLogWrite;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        SharedLogWrite {
+            buffer: self.buffer.clone(),
+        }
+    }
+}
+
+struct SharedLogWrite {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl io::Write for SharedLogWrite {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer
+            .lock()
+            .expect("log buffer")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn capture_discover_logs(workspace: &Path, config: &SkillsConfig) -> (SkillCatalog, String) {
+    let writer = SharedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(writer.clone())
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let catalog =
+        tracing::subscriber::with_default(subscriber, || SkillCatalog::discover(workspace, config));
+    (catalog, writer.contents())
+}
+
+#[test]
+fn same_precedence_name_collision_emits_load_time_warning() {
+    let root = temp_workspace("skills_warn_same_precedence_name");
+    write_skill(
+        &root.join(".squeezy/skills/first"),
+        "rust-nav",
+        "First Rust nav",
+        &[],
+    );
+    write_skill(
+        &root.join(".squeezy/skills/second"),
+        "rust-nav",
+        "Second Rust nav",
+        &[],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let (catalog, logs) = capture_discover_logs(&root, &config);
+    assert!(catalog.ambiguous_names().contains("rust-nav"));
+    assert!(
+        logs.contains("same-precedence skill name collision"),
+        "missing same-precedence warning: {logs}"
+    );
+    assert!(
+        logs.contains("name=rust-nav"),
+        "missing skill name field: {logs}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cross_precedence_name_collision_emits_load_time_warning() {
+    let root = temp_workspace("skills_warn_cross_precedence_name");
+    write_skill(
+        &root.join(".agents/skills/rust-nav"),
+        "rust-nav",
+        "Compat project Rust nav",
+        &[],
+    );
+    write_skill(
+        &root.join(".squeezy/skills/rust-nav"),
+        "rust-nav",
+        "Native project Rust nav",
+        &[],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user-noop"),
+        compat_user_dir: root.join("compat-noop"),
+        ..Default::default()
+    };
+
+    let (catalog, logs) = capture_discover_logs(&root, &config);
+    // The native-project copy wins; the compat copy is shadowed.
+    let summary = catalog.summaries().pop().expect("summary");
+    assert_eq!(summary.source, SkillSource::Project);
+    assert!(
+        logs.contains("skill name reused at higher precedence"),
+        "missing cross-precedence warning: {logs}"
+    );
+    assert!(
+        logs.contains("overriding_source=\"project\"")
+            || logs.contains("overriding_source=project"),
+        "missing overriding source field: {logs}"
+    );
+    assert!(
+        logs.contains("overridden_source=\"compat_project\"")
+            || logs.contains("overridden_source=compat_project"),
+        "missing overridden source field: {logs}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn duplicate_trigger_across_skills_emits_load_time_warning() {
+    let root = temp_workspace("skills_warn_trigger_collision");
+    write_skill(
+        &root.join(".squeezy/skills/alpha"),
+        "alpha",
+        "Alpha skill",
+        &["graph"],
+    );
+    write_skill(
+        &root.join(".squeezy/skills/beta"),
+        "beta",
+        "Beta skill",
+        &["GRAPH"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let (_catalog, logs) = capture_discover_logs(&root, &config);
+    assert!(
+        logs.contains("duplicate skill trigger"),
+        "missing trigger collision warning: {logs}"
+    );
+    assert!(
+        logs.contains("trigger=graph"),
+        "missing trigger field (case-folded): {logs}"
+    );
+    assert!(
+        logs.contains("\"alpha\"") && logs.contains("\"beta\""),
+        "missing colliding skill names: {logs}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn trigger_warning_skips_single_skill_with_repeated_trigger() {
+    let root = temp_workspace("skills_warn_no_self_trigger");
+    write_skill(
+        &root.join(".squeezy/skills/alpha"),
+        "alpha",
+        "Alpha skill",
+        &["graph", "GRAPH"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let (_catalog, logs) = capture_discover_logs(&root, &config);
+    assert!(
+        !logs.contains("duplicate skill trigger"),
+        "trigger collision must require two distinct skills: {logs}"
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
