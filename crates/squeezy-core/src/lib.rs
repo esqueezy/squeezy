@@ -960,6 +960,10 @@ impl AppConfig {
             ));
         }
         output.push_str(&format!(
+            "max_transcript_tokens = {}\n",
+            self.permissions.ai_reviewer.max_transcript_tokens
+        ));
+        output.push_str(&format!(
             "timeout_secs = {}\n\n",
             self.permissions.ai_reviewer.timeout_secs
         ));
@@ -3512,6 +3516,7 @@ pub struct AiReviewerSettings {
     pub allow_capabilities: Option<Vec<String>>,
     pub policy_file: Option<String>,
     pub timeout_secs: Option<u64>,
+    pub max_transcript_tokens: Option<u64>,
 }
 
 impl AiReviewerSettings {
@@ -3524,6 +3529,7 @@ impl AiReviewerSettings {
                 "allow_capabilities",
                 "policy_file",
                 "timeout_secs",
+                "max_transcript_tokens",
             ],
             source,
             path,
@@ -3539,6 +3545,12 @@ impl AiReviewerSettings {
             )?,
             policy_file: string_value(table, "policy_file", source, &field(path, "policy_file"))?,
             timeout_secs: u64_value(table, "timeout_secs", source, &field(path, "timeout_secs"))?,
+            max_transcript_tokens: u64_value(
+                table,
+                "max_transcript_tokens",
+                source,
+                &field(path, "max_transcript_tokens"),
+            )?,
         })
     }
 
@@ -3548,6 +3560,10 @@ impl AiReviewerSettings {
         replace_if_some(&mut self.allow_capabilities, next.allow_capabilities);
         replace_if_some(&mut self.policy_file, next.policy_file);
         replace_if_some(&mut self.timeout_secs, next.timeout_secs);
+        replace_if_some(
+            &mut self.max_transcript_tokens,
+            next.max_transcript_tokens,
+        );
     }
 }
 
@@ -3558,7 +3574,15 @@ pub struct AiReviewerConfig {
     pub allow_capabilities: Vec<PermissionCapability>,
     pub policy_file: Option<PathBuf>,
     pub timeout_secs: u64,
+    /// Sliding-window transcript budget for the reviewer prompt. Keeps the most
+    /// recent turns whole and compacts older entries into a single summary
+    /// line so late-turn permission requests retain earlier intent context.
+    pub max_transcript_tokens: usize,
 }
+
+pub const DEFAULT_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS: usize = 4_000;
+const MIN_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS: u64 = 512;
+const MAX_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS: u64 = 32_000;
 
 impl Default for AiReviewerConfig {
     fn default() -> Self {
@@ -3568,6 +3592,7 @@ impl Default for AiReviewerConfig {
             allow_capabilities: vec![PermissionCapability::Read, PermissionCapability::Search],
             policy_file: None,
             timeout_secs: 15,
+            max_transcript_tokens: DEFAULT_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS,
         }
     }
 }
@@ -3600,6 +3625,16 @@ impl AiReviewerConfig {
                 )));
             }
             config.timeout_secs = timeout_secs;
+        }
+        if let Some(max_transcript_tokens) = settings.max_transcript_tokens {
+            if !(MIN_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS..=MAX_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS)
+                .contains(&max_transcript_tokens)
+            {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: permissions.ai_reviewer.max_transcript_tokens {max_transcript_tokens} outside supported range {MIN_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS}..={MAX_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS}"
+                )));
+            }
+            config.max_transcript_tokens = max_transcript_tokens as usize;
         }
         if let Some(allow_capabilities) = settings.allow_capabilities {
             let mut parsed = Vec::new();
@@ -6006,6 +6041,7 @@ pub fn user_settings_template() -> &'static str {
 # allow_capabilities = ["read", "search"]
 # policy_file = ""              # optional local approval policy override
 # timeout_secs = 15
+# max_transcript_tokens = 4000  # sliding-window budget: keeps recent turns whole + summary of older
 #
 # Rule targets use prefix-tagged strings so different scopes don't collide.
 # Known prefixes:
