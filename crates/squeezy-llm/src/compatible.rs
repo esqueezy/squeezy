@@ -217,7 +217,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         // the header when nothing routing-related was configured (e.g.
         // a config-bound PortKey "User" key already routes itself).
         let portkey_routing_configured = portkey_routing_header_present(&extra_headers);
-        let portkey_model_was_namespaced = request.model.contains('/');
+        let mut portkey_inferred_provider = false;
         if matches!(preset, OpenAiCompatiblePreset::PortKey)
             && !portkey_routing_configured
             && let Some(provider) = portkey_provider_from_model(&request.model)
@@ -226,10 +226,8 @@ impl LlmProvider for OpenAiCompatibleProvider {
             if let Some((_, bare)) = request.model.split_once('/') {
                 request.model = bare.to_string().into();
             }
+            portkey_inferred_provider = true;
         }
-        let portkey_inferred_provider = matches!(preset, OpenAiCompatiblePreset::PortKey)
-            && !portkey_routing_configured
-            && portkey_model_was_namespaced;
         let body = Self::request_body(&request);
         let provider_label = self.preset.display_name();
 
@@ -278,10 +276,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
                          `providers.portkey.headers.x-portkey-virtual-key` in your \
                          settings TOML."
                     } else {
-                        " — hint: either use a PortKey \"User\" key with a Config attached, \
-                         use a vendor-namespaced model id (e.g. `anthropic/claude-opus-4-7`), \
-                         or set `providers.portkey.headers.x-portkey-provider` (or \
-                         `x-portkey-config` / `x-portkey-virtual-key`) in your settings TOML"
+                        " — hint: PortKey needs to know which upstream provider to call. \
+                         Attach a Config to your User key in PortKey (recommended), or set \
+                         `providers.portkey.headers.x-portkey-virtual-key` / \
+                         `x-portkey-config` / `x-portkey-provider` in your settings TOML. \
+                         Recognised auto-routing model prefixes: openai/, anthropic/, \
+                         google/, azure-openai/, bedrock/, cohere/, mistral/, groq/, \
+                         deepseek/, together/, fireworks/, perplexity/."
                     }
                 } else {
                     ""
