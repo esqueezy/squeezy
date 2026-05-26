@@ -3499,6 +3499,85 @@ fn failed_assistant_marker_uses_error_color() {
 }
 
 #[test]
+fn accounting_block_colors_labels_values_and_dollar_amounts() {
+    let content = "Cost accounting\n\
+session=abc\n\
+provider=openai model=gpt-5.5 mode=build\n\
+estimated_usd=$0.415300 (estimated from provider-reported usage and local pricing metadata)\n\
+provider_tokens input=1200 output=340 reasoning=- cached_input=0 cache_write_input=-\n\
+tools calls=4 successes=3 errors=1 denials=0 cancellations=0 budget_denials=0\n\
+accuracy=provider token counters are provider-reported when available.";
+    let item = TranscriptItem::system(content);
+
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    assert_eq!(lines.len(), 7, "{lines:?}");
+
+    let span_for = |line: &Line<'static>, text: &str| -> Style {
+        line.spans
+            .iter()
+            .find(|span| span.content.as_ref() == text)
+            .unwrap_or_else(|| panic!("missing span {text:?} in {line:?}"))
+            .style
+    };
+
+    // Header still renders the `• Noted` chrome plus the bolded
+    // "Cost accounting" body, in GOLD.
+    let header_style = span_for(&lines[0], "Cost accounting");
+    assert_eq!(header_style.fg, Some(GOLD));
+    assert!(header_style.add_modifier.contains(Modifier::BOLD));
+
+    // `session=` is the dim label, `abc` is the bright value.
+    let session_line = &lines[1];
+    assert_eq!(span_for(session_line, "session=").fg, Some(QUIET));
+    assert_eq!(span_for(session_line, "abc").fg, None);
+
+    // The dollar amount pops in AMBER; the trailing parenthetical fades.
+    let usd_line = &lines[3];
+    assert_eq!(span_for(usd_line, "estimated_usd=").fg, Some(QUIET));
+    assert_eq!(span_for(usd_line, "$0.415300").fg, Some(AMBER));
+    assert_eq!(span_for(usd_line, "(estimated").fg, Some(QUIET));
+
+    // Zero / dash values fade so real numbers carry the eye.
+    let tokens_line = &lines[4];
+    assert_eq!(span_for(tokens_line, "provider_tokens").fg, Some(GOLD));
+    assert_eq!(span_for(tokens_line, "1200").fg, None);
+    assert_eq!(span_for(tokens_line, "-").fg, Some(QUIET));
+    assert_eq!(span_for(tokens_line, "0").fg, Some(QUIET));
+
+    // The leading group word on tool rows is GOLD.
+    let tools_line = &lines[5];
+    assert_eq!(span_for(tools_line, "tools").fg, Some(GOLD));
+    assert_eq!(span_for(tools_line, "4").fg, None);
+
+    // The accuracy epilogue is wholly dimmed.
+    let accuracy_line = &lines[6];
+    assert!(
+        accuracy_line
+            .spans
+            .iter()
+            .all(|span| span.style.fg.is_none()
+                || span.style.fg == Some(QUIET)
+                || span.content.as_ref().chars().all(char::is_whitespace)),
+        "{accuracy_line:?}"
+    );
+}
+
+#[test]
+fn accounting_block_dispatch_skips_unrelated_system_messages() {
+    let item = TranscriptItem::system("Random system note\nwith multiple\nlines");
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    // The unrelated content keeps the default single-style rendering: the
+    // header gets the standard `• Noted` chrome, the body lines fall
+    // through to `action_text_lines_styled` with no per-token coloring.
+    assert!(!lines.is_empty());
+    let header_has_noted = lines[0]
+        .spans
+        .iter()
+        .any(|span| span.content.as_ref() == "Noted");
+    assert!(header_has_noted, "{lines:?}");
+}
+
+#[test]
 fn pending_assistant_uses_rotating_coin_marker() {
     let mut app = test_app(SessionMode::Build);
     app.pending_assistant.push_delta("streaming");
