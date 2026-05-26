@@ -888,11 +888,11 @@ fn status_line_default_layout_renders_users_configured_items() {
         StatusLineItem::ProviderAndModel
     );
     let lines = format_status_lines(&app, 200);
-    assert_eq!(lines.len(), 2, "expect overview + detail rows");
-    let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(lines.len(), 2, "expect detail+mode row + hints row");
+    let row1: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(
-        row2.contains("scripted:gpt-test"),
-        "row 2 should include provider:model; got: {row2}"
+        row1.contains("scripted:gpt-test"),
+        "row 1 should include provider:model; got: {row1}"
     );
 }
 
@@ -958,10 +958,10 @@ async fn statusline_picker_toggle_then_save_reflects_in_status_row() {
         "toggled-off item should not be in saved list; got {items:?}"
     );
     let lines = format_status_lines(&app, 200);
-    let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    let row1: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(
-        !row2.contains("scripted:gpt-test"),
-        "row 2 should no longer show provider-and-model after toggling it off; got: {row2}"
+        !row1.contains("scripted:gpt-test"),
+        "row 1 should no longer show provider-and-model after toggling it off; got: {row1}"
     );
     unsafe {
         std::env::remove_var("SQUEEZY_SETTINGS_PATH");
@@ -1006,13 +1006,13 @@ async fn statusline_save_closes_picker_and_paints_detail_row() {
         app.status_line_items,
         app.status
     );
-    // The detail row should now include a default item that always renders
-    // (ProviderAndModel uses provider:model).
+    // The detail row replaces the overview's dir/branch on row 1 and
+    // should include a default item that always renders (provider:model).
     let lines = format_status_lines(&app, 200);
-    let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    let row1: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(
-        row2.contains("scripted:gpt-test"),
-        "row 2 should reflect saved items; got: {row2}"
+        row1.contains("scripted:gpt-test"),
+        "row 1 should reflect saved items; got: {row1}"
     );
 }
 
@@ -7215,7 +7215,7 @@ fn status_line_unset_keeps_legacy_two_row_layout() {
 }
 
 #[test]
-fn status_line_configured_renders_detail_before_hints() {
+fn status_line_configured_replaces_overview_dir_and_branch() {
     use crate::status::StatusLineItem;
     let mut app = test_app(SessionMode::Build);
     app.status_line_items = Some(vec![
@@ -7225,16 +7225,24 @@ fn status_line_configured_renders_detail_before_hints() {
     app.status_line_use_colors = true;
     let lines = format_status_lines(&app, 200);
     assert_eq!(lines.len(), 2);
+    let row1: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
-    // Detail items render with " · " separator and precede the hints,
-    // which are still appended after another " · " separator.
-    assert!(row2.contains("scripted:gpt-test"), "{row2}");
-    assert!(row2.contains(" · "), "{row2}");
-    assert!(row2.contains("Enter send"), "{row2}");
-    // Provider-and-Model lives in the Model accent group, so the span
-    // carrying it should be styled with the cyan fallback color when
-    // theme colors are enabled.
-    let provider_span = lines[1]
+    // Row 1 carries the configured detail items, no longer the legacy
+    // "dir … · git …" prefix that duplicates them.
+    assert!(row1.contains("scripted:gpt-test"), "row1={row1}");
+    assert!(
+        !row1.contains("dir "),
+        "overview should be replaced; row1={row1}"
+    );
+    assert!(
+        !row1.contains("· git "),
+        "overview should be replaced; row1={row1}"
+    );
+    // Mode label still right-aligns on row 1.
+    assert!(row1.contains("Build mode"), "row1={row1}");
+    // Hints move to row 2 alone.
+    assert!(row2.contains("Enter send"), "row2={row2}");
+    let provider_span = lines[0]
         .spans
         .iter()
         .find(|s| s.content.contains("scripted:gpt-test"))
