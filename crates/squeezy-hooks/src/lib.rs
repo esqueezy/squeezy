@@ -20,13 +20,22 @@ use serde_json::Value;
 
 /// Lifecycle points at which the agent fans out to registered handlers.
 ///
-/// Only [`HookEvent::PreTurn`] is currently dispatched. The remaining
+/// [`HookEvent::PreTurn`], [`HookEvent::PreToolUse`], and
+/// [`HookEvent::PostToolUse`] are currently dispatched. The remaining
 /// variants are reserved so handler implementations can statically
 /// declare interest in them before the agent wires the call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HookEvent {
     /// Fired once per turn, immediately before the LLM request is sent.
     PreTurn,
+    /// Fired immediately before a single tool call is executed. Payload
+    /// carries `{ "tool_name", "call_id", "turn_id" }` so handlers can
+    /// inspect (today) and later rewrite (deferred) tool input.
+    PreToolUse,
+    /// Fired immediately after a single tool call returns. Payload
+    /// mirrors `PreToolUse` and adds `{ "status" }` so handlers can
+    /// audit outcomes.
+    PostToolUse,
     /// Fired after a tool result is appended to the conversation.
     PostTool,
     /// Fired before a context compaction pass runs.

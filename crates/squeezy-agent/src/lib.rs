@@ -2445,6 +2445,7 @@ impl Agent {
                             ai_reviewer_state: ai_reviewer_state.clone(),
                             loaded_tool_schemas: loaded_tool_schemas.clone(),
                             subagents: subagents.clone(),
+                            hooks: hooks.clone(),
                         },
                     )
                     .await;
@@ -2467,6 +2468,7 @@ impl Agent {
                             ai_reviewer_state: ai_reviewer_state.clone(),
                             session_mode: session_mode.clone(),
                             subagents: subagents.clone(),
+                            hooks: hooks.clone(),
                         },
                     )
                     .await;
@@ -2694,6 +2696,7 @@ struct LocalToolTurnDeps {
     ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     subagents: SubagentRegistry,
+    hooks: Option<Arc<HookRegistry>>,
 }
 
 async fn resolve_help_turn(task_title: &str, deps: &HelpResolutionDeps) -> HelpTurnOutcome {
@@ -2761,6 +2764,7 @@ struct HelpResolutionDeps {
     ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     session_mode: Arc<AtomicU8>,
     subagents: SubagentRegistry,
+    hooks: Option<Arc<HookRegistry>>,
 }
 
 async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> DocHelpResolution {
@@ -2805,6 +2809,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
         loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
         exploration_state: Arc::new(Mutex::new(ExplorationTurnState::from_plan(None))),
         subagents: deps.subagents.clone(),
+        hooks: deps.hooks.clone(),
     };
     let execution = run_subagent(&parent, SubagentKind::DocHelp, request).await;
 
@@ -3036,6 +3041,7 @@ async fn complete_local_tool_turn(
         ai_reviewer_state,
         loaded_tool_schemas,
         subagents,
+        hooks,
     } = deps;
     let user_item = LlmInputItem::UserText(task_title.clone());
     let user_transcript = TranscriptItem::user(task_title.clone());
@@ -3092,6 +3098,7 @@ async fn complete_local_tool_turn(
             loaded_tool_schemas,
             exploration_state,
             subagents,
+            hooks,
         },
         &mut broker,
     )
@@ -3901,6 +3908,7 @@ impl TurnRuntime {
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
                         exploration_state: exploration_state.clone(),
                         subagents: self.subagents.clone(),
+                        hooks: self.hooks.clone(),
                     },
                     &mut broker,
                 )
@@ -4355,6 +4363,7 @@ impl TurnRuntime {
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
                         exploration_state: exploration_state.clone(),
                         subagents: self.subagents.clone(),
+                        hooks: self.hooks.clone(),
                     },
                     &mut broker,
                 )
@@ -4969,6 +4978,11 @@ struct ToolExecutionContext<'a> {
     all_tool_specs: &'a [AdvertisedTool],
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     exploration_state: Arc<Mutex<ExplorationTurnState>>,
+    /// Hook registry shared with the parent `Agent` / `TurnRuntime`.
+    /// `None` when no hooks are installed — `run_one_tool` checks this
+    /// before building a `HookContext` so the no-hooks path costs zero
+    /// allocations.
+    hooks: Option<Arc<HookRegistry>>,
 }
 
 impl ToolExecutionContext<'_> {
@@ -5959,6 +5973,7 @@ async fn run_subagent_rounds(
                         loaded_tool_schemas: local_loaded_schemas.clone(),
                         exploration_state: local_exploration.clone(),
                         subagents: parent.subagents.clone(),
+                        hooks: parent.hooks.clone(),
                     },
                     broker,
                 )
@@ -6957,6 +6972,106 @@ async fn flush_parallel_batch(
     }
 }
 
+/// Fan out a `HookEvent::PreToolUse` to every registered handler when
+/// a hook registry is installed. Mutation and deny replies are logged
+/// but not yet applied — mirrors the observational contract of
+/// [`TurnRuntime::dispatch_pre_turn`] so a follow-up commit can wire
+/// enforcement without changing the call site. Returns immediately
+/// when no registry is configured so the no-hooks path costs zero
+/// allocations.
+fn dispatch_pre_tool_use(context: &ToolExecutionContext<'_>, call: &ToolCall) {
+    let Some(registry) = context.hooks.as_ref() else {
+        return;
+    };
+    if registry.is_empty() {
+        return;
+    }
+    let payload = json!({
+        "turn_id": context.turn_id.to_string(),
+        "tool_name": call.name,
+        "call_id": call.call_id,
+    });
+    let results = registry.dispatch(HookEvent::PreToolUse, payload);
+    for (idx, result) in results.iter().enumerate() {
+        if let Some(mutate) = result.mutate.as_ref() {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                turn_id = %context.turn_id,
+                tool_name = %call.name,
+                call_id = %call.call_id,
+                handler_index = idx,
+                %mutate,
+                "PreToolUse handler proposed a mutation (not yet applied)"
+            );
+        }
+        if !result.allow {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                turn_id = %context.turn_id,
+                tool_name = %call.name,
+                call_id = %call.call_id,
+                handler_index = idx,
+                message = result.message.as_deref().unwrap_or(""),
+                "PreToolUse handler returned allow=false (not yet enforced)"
+            );
+        }
+    }
+}
+
+/// Fan out a `HookEvent::PostToolUse` to every registered handler after
+/// a tool result is available. Same observational contract as
+/// [`dispatch_pre_tool_use`]; the payload adds `status` so audit
+/// handlers can record per-tool outcomes.
+fn dispatch_post_tool_use(context: &ToolExecutionContext<'_>, result: &ToolResult) {
+    let Some(registry) = context.hooks.as_ref() else {
+        return;
+    };
+    if registry.is_empty() {
+        return;
+    }
+    let payload = json!({
+        "turn_id": context.turn_id.to_string(),
+        "tool_name": result.tool_name,
+        "call_id": result.call_id,
+        "status": tool_status_str(result.status),
+    });
+    let results = registry.dispatch(HookEvent::PostToolUse, payload);
+    for (idx, hook_result) in results.iter().enumerate() {
+        if let Some(mutate) = hook_result.mutate.as_ref() {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                turn_id = %context.turn_id,
+                tool_name = %result.tool_name,
+                call_id = %result.call_id,
+                handler_index = idx,
+                %mutate,
+                "PostToolUse handler proposed a mutation (not yet applied)"
+            );
+        }
+        if !hook_result.allow {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                turn_id = %context.turn_id,
+                tool_name = %result.tool_name,
+                call_id = %result.call_id,
+                handler_index = idx,
+                message = hook_result.message.as_deref().unwrap_or(""),
+                "PostToolUse handler returned allow=false (not yet enforced)"
+            );
+        }
+    }
+}
+
+fn tool_status_str(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Success => "success",
+        ToolStatus::Error => "error",
+        ToolStatus::Denied => "denied",
+        ToolStatus::Stale => "stale",
+        ToolStatus::Cancelled => "cancelled",
+    }
+}
+
 async fn run_one_tool(
     context: ToolExecutionContext<'_>,
     tool_sequence: u64,
@@ -7034,6 +7149,12 @@ async fn run_one_tool(
     let call_for_telemetry = call.clone();
     let progress_call_id = call_for_telemetry.call_id.clone();
     let progress_tool_name = call_for_telemetry.name.clone();
+    // Fire the PreToolUse hook once per executed tool call, immediately
+    // before the tool registry takes ownership of the call. Mutation /
+    // deny replies are currently observational — see
+    // `dispatch_pre_tool_use` for the contract that will tighten when
+    // enforcement lands.
+    dispatch_pre_tool_use(&context, &call_for_telemetry);
     let exec_future = context.tools.execute_for_group_with_options(
         call,
         tracked_job
@@ -7064,6 +7185,10 @@ async fn run_one_tool(
             }
         }
     };
+    // Fire the PostToolUse hook as soon as the tool result is in hand,
+    // before downstream job/telemetry bookkeeping. Same observational
+    // contract as `dispatch_pre_tool_use`.
+    dispatch_post_tool_use(&context, &result);
     record_exploration_tool_result(&context, &result).await;
     if let Some((job_id, _)) = tracked_job {
         let status = job_status_for_tool_status(result.status);

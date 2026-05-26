@@ -15,6 +15,7 @@ use squeezy_core::{
     AppConfig, ContextCompactionConfig, CostSnapshot, PermissionAction, PermissionMode,
     PermissionPolicy, PermissionRule, PermissionRuleSource, PermissionScope, Result, SessionMode,
 };
+use squeezy_hooks::{HookContext, HookEvent, HookHandler, HookRegistry, HookResult};
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 use squeezy_store::SqueezyStore;
 use squeezy_tools::sha256_hex;
@@ -2413,6 +2414,76 @@ async fn cleanup_sessions_refuses_to_remove_the_active_session() {
             .is_ok_and(|record| record.metadata.session_id == session_id),
         "active session metadata should still be readable",
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Records every hook context the agent dispatched. Used to assert
+/// that PreToolUse and PostToolUse fire for each executed tool call,
+/// in order, with payloads that name the tool and propagate its
+/// terminal status.
+struct RecordingHookHandler {
+    seen: Arc<Mutex<Vec<HookContext>>>,
+}
+
+impl HookHandler for RecordingHookHandler {
+    fn handle(&self, ctx: &HookContext) -> HookResult {
+        self.seen.lock().expect("hook recorder").push(ctx.clone());
+        HookResult::allow()
+    }
+}
+
+#[tokio::test]
+async fn pre_and_post_tool_use_hooks_fire_around_each_tool_call() {
+    let root = temp_workspace("hook_pre_post_tool_use");
+    fs::write(root.join("src.rs"), "fn hooked() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_call".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "src.rs"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut agent = Agent::new(config_for(root.clone()), provider);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(RecordingHookHandler { seen: seen.clone() }));
+    agent.set_hooks(Some(Arc::new(registry)));
+
+    drain_turn(agent.start_turn("inspect hooked".to_string(), CancellationToken::new())).await;
+
+    let captured = seen.lock().expect("seen").clone();
+    let tool_events: Vec<_> = captured
+        .iter()
+        .filter(|ctx| matches!(ctx.event, HookEvent::PreToolUse | HookEvent::PostToolUse))
+        .collect();
+    assert_eq!(
+        tool_events.len(),
+        2,
+        "expected one PreToolUse and one PostToolUse for the single read_file call: {captured:?}"
+    );
+    assert_eq!(tool_events[0].event, HookEvent::PreToolUse);
+    assert_eq!(tool_events[0].payload["tool_name"], "read_file");
+    assert_eq!(tool_events[0].payload["call_id"], "read_call");
+    assert_eq!(tool_events[1].event, HookEvent::PostToolUse);
+    assert_eq!(tool_events[1].payload["tool_name"], "read_file");
+    assert_eq!(tool_events[1].payload["call_id"], "read_call");
+    assert_eq!(tool_events[1].payload["status"], "success");
 
     let _ = fs::remove_dir_all(root);
 }
