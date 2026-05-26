@@ -2473,6 +2473,7 @@ fn expanded_edit_diff_does_not_claim_ctrl_e_can_expand_further() {
         ToolOutputVerbosity::Normal,
         MessageOutcome::Normal,
         Some(120),
+        true,
     );
     let output = lines
         .iter()
@@ -2540,6 +2541,7 @@ fn edit_diff_preview_uses_dedicated_diff_colors() {
         ToolOutputVerbosity::Normal,
         MessageOutcome::Normal,
         Some(120),
+        true,
     );
     let rendered = lines_to_plain_text(&lines);
     assert!(!rendered.contains("diff --git"), "{rendered}");
@@ -3731,8 +3733,14 @@ fn submitted_prompt_keeps_prompt_surface_and_working_line() {
 fn submitted_prompt_surface_extends_to_render_width() {
     let item = TranscriptItem::user("find getFoo");
 
-    let lines =
-        format_message_entry_with_width(&item, false, false, MessageOutcome::Normal, Some(40));
+    let lines = format_message_entry_with_width(
+        &item,
+        false,
+        false,
+        MessageOutcome::Normal,
+        Some(40),
+        true,
+    );
     let rendered = lines[1]
         .spans
         .iter()
@@ -3763,8 +3771,14 @@ fn submitted_prompt_surface_extends_to_render_width() {
 fn submitted_prompt_preserves_empty_lines() {
     let item = TranscriptItem::user("one\n\nthree\n");
 
-    let lines =
-        format_message_entry_with_width(&item, false, false, MessageOutcome::Normal, Some(30));
+    let lines = format_message_entry_with_width(
+        &item,
+        false,
+        false,
+        MessageOutcome::Normal,
+        Some(30),
+        true,
+    );
     let rendered = lines
         .iter()
         .map(|line| {
