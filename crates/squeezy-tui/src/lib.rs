@@ -40,9 +40,9 @@ use squeezy_agent::{
 };
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
-    PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode, SqueezyError, StatusVerbosity,
-    TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem,
-    TuiAlternateScreen, TuiTheme,
+    PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
+    SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity,
+    TranscriptDefault, TranscriptItem, TuiAlternateScreen, TuiTheme,
 };
 use squeezy_llm::LlmProvider;
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
@@ -2961,6 +2961,7 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     let Some(pending) = app.pending_approval.take() else {
         return false;
     };
+    let options = approval_options_for(&pending.request);
 
     match key.code {
         KeyCode::Up => {
@@ -2971,26 +2972,33 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         }
         KeyCode::Down => {
             app.approval_selection_index =
-                (app.approval_selection_index + 1).min(approval_options().len() - 1);
+                (app.approval_selection_index + 1).min(options.len() - 1);
             app.status = format_approval_status_line(&pending.request);
             app.pending_approval = Some(pending);
             true
         }
         KeyCode::Enter => {
-            let option = approval_options()
+            let option = options
                 .get(app.approval_selection_index)
-                .copied()
-                .unwrap_or(APPROVAL_ONCE);
+                .cloned()
+                .unwrap_or_else(approval_once);
             send_approval_decision(app, pending, option)
         }
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            send_approval_decision(app, pending, APPROVAL_ONCE)
+            send_approval_decision(app, pending, approval_once())
         }
         KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('p') | KeyCode::Char('P') => {
-            send_approval_decision(app, pending, APPROVAL_PROJECT)
+            // Capability-scoped "always allow" — picks the per-capability
+            // project option built by `approval_options_for`.
+            let project = options
+                .iter()
+                .find(|opt| opt.choice == ApprovalChoice::ApproveProject)
+                .cloned()
+                .unwrap_or_else(approval_once);
+            send_approval_decision(app, pending, project)
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') | KeyCode::Char('D') => {
-            send_approval_decision(app, pending, APPROVAL_DENY)
+            send_approval_decision(app, pending, approval_deny())
         }
         _ => {
             app.status = format_approval_status_line(&pending.request);
@@ -3026,57 +3034,169 @@ enum ApprovalChoice {
     DenySession,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ApprovalOption {
     choice: ApprovalChoice,
-    label: &'static str,
-    hint: &'static str,
+    label: std::borrow::Cow<'static, str>,
+    hint: std::borrow::Cow<'static, str>,
     decision: ToolApprovalDecision,
 }
 
-const APPROVAL_ONCE: ApprovalOption = ApprovalOption {
-    choice: ApprovalChoice::Approve,
-    label: "Approve",
-    hint: "run this once",
-    decision: ToolApprovalDecision::AllowOnce,
-};
+impl ApprovalOption {
+    const fn new_static(
+        choice: ApprovalChoice,
+        label: &'static str,
+        hint: &'static str,
+        decision: ToolApprovalDecision,
+    ) -> Self {
+        Self {
+            choice,
+            label: std::borrow::Cow::Borrowed(label),
+            hint: std::borrow::Cow::Borrowed(hint),
+            decision,
+        }
+    }
+}
 
-const APPROVAL_SESSION: ApprovalOption = ApprovalOption {
-    choice: ApprovalChoice::ApproveSession,
-    label: "Approve for this session",
-    hint: "save an in-memory rule",
-    decision: ToolApprovalDecision::AllowSession,
-};
+fn approval_once() -> ApprovalOption {
+    ApprovalOption::new_static(
+        ApprovalChoice::Approve,
+        "Approve",
+        "run this once",
+        ToolApprovalDecision::AllowOnce,
+    )
+}
 
-const APPROVAL_PROJECT: ApprovalOption = ApprovalOption {
-    choice: ApprovalChoice::ApproveProject,
-    label: "Always approve this command in this repo",
-    hint: "save a project rule",
-    decision: ToolApprovalDecision::AllowRuleProject,
-};
+fn approval_deny() -> ApprovalOption {
+    ApprovalOption::new_static(
+        ApprovalChoice::Deny,
+        "Deny",
+        "skip this run",
+        ToolApprovalDecision::DenyOnce,
+    )
+}
 
-const APPROVAL_DENY: ApprovalOption = ApprovalOption {
-    choice: ApprovalChoice::Deny,
-    label: "Deny",
-    hint: "skip this run",
-    decision: ToolApprovalDecision::DenyOnce,
-};
+fn approval_deny_session() -> ApprovalOption {
+    ApprovalOption::new_static(
+        ApprovalChoice::DenySession,
+        "Deny for this session",
+        "save an in-memory deny rule",
+        ToolApprovalDecision::DenySession,
+    )
+}
 
-const APPROVAL_DENY_SESSION: ApprovalOption = ApprovalOption {
-    choice: ApprovalChoice::DenySession,
-    label: "Deny for this session",
-    hint: "save an in-memory deny rule",
-    decision: ToolApprovalDecision::DenySession,
-};
-
-fn approval_options() -> &'static [ApprovalOption] {
-    &[
-        APPROVAL_ONCE,
-        APPROVAL_SESSION,
-        APPROVAL_PROJECT,
-        APPROVAL_DENY,
-        APPROVAL_DENY_SESSION,
+/// Build the per-capability allow/deny menu for a pending approval. Codex's
+/// `ExecApprovalRequestEvent::default_available_decisions` shapes the option
+/// list to the request (network host vs exec amendment vs plain accept); the
+/// audit (`ux.md#E-UX-06`) calls out that squeezy's fixed five-option set hides
+/// what scope each "Approve" actually saves. Labels here name the binary, host,
+/// server, or path that the resulting rule will cover so the user can codify
+/// *why* in one keystroke.
+fn approval_options_for(request: &ToolApprovalRequest) -> Vec<ApprovalOption> {
+    let (session_label, session_hint, project_label, project_hint) =
+        capability_scope_labels(request);
+    let session = ApprovalOption {
+        choice: ApprovalChoice::ApproveSession,
+        label: session_label,
+        hint: session_hint,
+        decision: ToolApprovalDecision::AllowSession,
+    };
+    let project = ApprovalOption {
+        choice: ApprovalChoice::ApproveProject,
+        label: project_label,
+        hint: project_hint,
+        decision: ToolApprovalDecision::AllowRuleProject,
+    };
+    vec![
+        approval_once(),
+        session,
+        project,
+        approval_deny(),
+        approval_deny_session(),
     ]
+}
+
+/// Returns `(session_label, session_hint, project_label, project_hint)` for
+/// the allow options. Each label names the capability-specific target (binary,
+/// host, MCP server/tool, write root) so the prompt makes the persisted rule
+/// shape visible without forcing the user to read the rule-preview line.
+fn capability_scope_labels(
+    request: &ToolApprovalRequest,
+) -> (
+    std::borrow::Cow<'static, str>,
+    std::borrow::Cow<'static, str>,
+    std::borrow::Cow<'static, str>,
+    std::borrow::Cow<'static, str>,
+) {
+    use std::borrow::Cow;
+    let permission = &request.permission;
+    let scope_name: Option<String> = match permission.capability {
+        PermissionCapability::Shell => permission
+            .metadata
+            .get("binary")
+            .cloned()
+            .or_else(|| permission.metadata.get("shell_prefix").cloned()),
+        PermissionCapability::Network => permission.metadata.get("host").cloned().or_else(|| {
+            permission
+                .target
+                .strip_prefix("domain:")
+                .map(str::to_string)
+        }),
+        PermissionCapability::Mcp => {
+            let server = permission.metadata.get("server").cloned();
+            let tool = permission.metadata.get("tool").cloned();
+            match (server, tool) {
+                (Some(server), Some(tool)) => Some(format!("{server}/{tool}")),
+                (Some(server), None) => Some(server),
+                _ => None,
+            }
+        }
+        PermissionCapability::Edit => permission
+            .metadata
+            .get("write_root")
+            .cloned()
+            .or_else(|| permission.metadata.get("path").cloned()),
+        PermissionCapability::Read | PermissionCapability::Search => permission
+            .metadata
+            .get("path")
+            .cloned()
+            .or_else(|| permission.metadata.get("query").cloned()),
+        PermissionCapability::Git
+        | PermissionCapability::Compiler
+        | PermissionCapability::Destructive => None,
+    };
+    let Some(scope) = scope_name.and_then(|s| {
+        let trimmed = s.trim().to_string();
+        if trimmed.is_empty() || trimmed == "*" {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }) else {
+        return (
+            Cow::Borrowed("Approve for this session"),
+            Cow::Borrowed("save an in-memory rule"),
+            Cow::Borrowed("Always approve this command in this repo"),
+            Cow::Borrowed("save a project rule"),
+        );
+    };
+    let scope_display = compact_text(&scope, 60);
+    let (kind, hint_kind) = match permission.capability {
+        PermissionCapability::Shell => ("command", "command"),
+        PermissionCapability::Network => ("host", "host"),
+        PermissionCapability::Mcp => ("MCP tool", "MCP tool"),
+        PermissionCapability::Edit => ("edits to", "edit target"),
+        PermissionCapability::Read | PermissionCapability::Search => ("reads of", "read target"),
+        PermissionCapability::Git
+        | PermissionCapability::Compiler
+        | PermissionCapability::Destructive => unreachable!(),
+    };
+    (
+        Cow::Owned(format!("Allow {kind} {scope_display} (session)")),
+        Cow::Owned(format!("save an in-memory {hint_kind} rule")),
+        Cow::Owned(format!("Always allow {kind} {scope_display}")),
+        Cow::Owned(format!("save a project {hint_kind} rule")),
+    )
 }
 
 /// Single-line status banner shown in the 1-line status bar. Compact by
@@ -3315,8 +3435,10 @@ fn format_approval_menu_lines(
     selected: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = approval::render_preview(request);
-    for (index, option) in approval_options().iter().enumerate() {
-        let is_selected = index == selected.min(approval_options().len() - 1);
+    let options = approval_options_for(request);
+    let max_index = options.len().saturating_sub(1);
+    for (index, option) in options.iter().enumerate() {
+        let is_selected = index == selected.min(max_index);
         let marker = if is_selected { "› " } else { "  " };
         let label_style = if is_selected {
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
@@ -3328,7 +3450,7 @@ fn format_approval_menu_lines(
                 marker,
                 Style::default().fg(if is_selected { GOLD } else { QUIET }),
             ),
-            Span::styled(option.label, label_style),
+            Span::styled(option.label.to_string(), label_style),
             Span::styled(format!(" · {}", option.hint), Style::default().fg(QUIET)),
         ]));
     }
