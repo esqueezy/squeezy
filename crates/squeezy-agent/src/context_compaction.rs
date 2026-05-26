@@ -389,6 +389,7 @@ pub(crate) async fn compact_conversation_with_strategy(
         store: false,
         cache_key: None,
         output_schema: None,
+        parallel_tool_calls: None,
     };
     let cancel = CancellationToken::new();
     let mut stream = provider.stream_response(request, cancel);
