@@ -53,7 +53,7 @@ use squeezy_store::{Observation, ObservationKind, SqueezyStore};
 use squeezy_vcs::{
     CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffHunk, DiffMode, DiffOptions,
     DiffSnapshot, GitVcs, RollbackMode, RollbackTarget, WorkspaceSnapshot,
-    canonicalize_workspace_root,
+    canonicalize_workspace_root, strip_verbatim_prefix,
 };
 use squeezy_workspace::{
     CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexCoverage, IndexingPolicy,
@@ -1225,6 +1225,7 @@ impl ToolRegistry {
         } else {
             None
         };
+        let shell_sandbox = normalize_shell_sandbox_paths(config.shell_sandbox);
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -1239,7 +1240,7 @@ impl ToolRegistry {
             redactor,
             crawl_options: Arc::new(crawl_options),
             compiled_policy,
-            shell_sandbox: Arc::new(config.shell_sandbox),
+            shell_sandbox: Arc::new(shell_sandbox),
             shell_sandbox_health: Arc::new(ShellSandboxHealth::default()),
             shell_audit: Arc::new(shell_audit),
             shell_workdir_locks: Arc::new(StdMutex::new(HashMap::new())),
@@ -10552,6 +10553,23 @@ fn shell_quote_path(path: &Path) -> String {
 
 fn workspace_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// Strip the Windows verbatim (`\\?\`) prefix from configured shell sandbox
+/// roots so that comparisons against canonicalized workdirs (which also have
+/// the prefix stripped) match. Without this, sandbox config that came from
+/// `fs::canonicalize` would not align with workdirs canonicalized through
+/// `canonicalize_workspace_root`.
+fn normalize_shell_sandbox_paths(mut config: ShellSandboxConfig) -> ShellSandboxConfig {
+    if cfg!(windows) {
+        for root in config.read_roots.iter_mut() {
+            *root = strip_verbatim_prefix(std::mem::take(root));
+        }
+        for root in config.write_roots.iter_mut() {
+            *root = strip_verbatim_prefix(std::mem::take(root));
+        }
+    }
+    config
 }
 
 fn annotate_graph(manager: &mut GraphManager, snapshot: &DiffSnapshot) {
