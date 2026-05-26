@@ -3628,12 +3628,20 @@ fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
             .replace("{path}", &plan_path.display().to_string());
         return Some(marker);
     }
-    match std::fs::read_to_string(&plan_path) {
+    // Strip the YAML front-matter (PR-D) before handing the body off
+    // to the model: the model should see the plan content, not the
+    // metadata block that the TUI uses for /plans rendering.
+    match proposed_plan::read_plan_body(&plan_path) {
         Ok(body) => {
             let trimmed = body.trim_end();
             app.plan_handoff_turns_seen = app.plan_handoff_turns_seen.saturating_add(1);
+            // PR-G item 6: when this Plan→Build crossing is a resume
+            // from a Shift+Tab pause, prefix the body with a short
+            // marker so the model knows it's mid-execution and learns
+            // whether the plan was refined during the pause window.
+            let resume_marker = app.plan_resume_marker.take().unwrap_or_default();
             Some(format!(
-                "[plan from previous session — {path}]\n{trimmed}\n[end plan]\n\n",
+                "{resume_marker}[plan from previous session — {path}]\n{trimmed}\n[end plan]\n\n",
                 path = plan_path.display(),
             ))
         }
@@ -3655,19 +3663,37 @@ fn switch_mode(
     requested: Option<SessionMode>,
     source: &'static str,
 ) {
-    if app.turn_rx.is_some()
-        || app.pending_approval.is_some()
-        || app.pending_mcp_elicitation.is_some()
-        || app.pending_request_user_input.is_some()
+    let target = requested.unwrap_or(match app.mode {
+        SessionMode::Plan => SessionMode::Build,
+        SessionMode::Build => SessionMode::Plan,
+    });
+    // PR-G item 6: Build→Plan with an in-flight turn AND an active
+    // plan is a *pause*, not a refusal. Cancel the turn, capture the
+    // plan id so the next Plan→Build crossing can emit a resume
+    // marker, and fall through to the normal switch path.
+    let is_build_to_plan_pause = app.mode == SessionMode::Build
+        && target == SessionMode::Plan
+        && app.turn_rx.is_some()
+        && app.current_plan_id.is_some();
+    if is_build_to_plan_pause {
+        request_turn_interrupt(app);
+        app.plan_pause = app
+            .current_plan_id
+            .clone()
+            .map(|plan_id| PlanPauseState { plan_id });
+        app.push_log("plan execution paused (Shift+Tab)".to_string());
+    }
+
+    if !is_build_to_plan_pause
+        && (app.turn_rx.is_some()
+            || app.pending_approval.is_some()
+            || app.pending_mcp_elicitation.is_some()
+            || app.pending_request_user_input.is_some())
     {
         app.status = "mode switch unavailable during active turn".to_string();
         return;
     }
 
-    let target = requested.unwrap_or(match app.mode {
-        SessionMode::Plan => SessionMode::Build,
-        SessionMode::Build => SessionMode::Plan,
-    });
     if target == app.mode {
         app.status = format!("already in {} mode", app.mode.as_str());
         return;
@@ -3690,6 +3716,22 @@ fn switch_mode(
                         // Fresh handoff: next Build turn gets the full plan
                         // body; turns 2+ get the lighter marker.
                         app.plan_handoff_turns_seen = 0;
+                        // Resume marker (PR-G item 6): if the previous
+                        // Build→Plan was a pause, tell the model which
+                        // plan id it resumes from and whether the body
+                        // changed during the pause window.
+                        if let Some(pause) = app.plan_pause.take() {
+                            let refined = pause.plan_id != plan_id;
+                            let note = if refined {
+                                format!(
+                                    "[resuming from plan {plan_id} — plan refined since previous attempt ({prev})]\n",
+                                    prev = pause.plan_id,
+                                )
+                            } else {
+                                format!("[resuming from plan {plan_id} — plan unchanged]\n")
+                            };
+                            app.plan_resume_marker = Some(note);
+                        }
                         app.push_log(format!(
                             "plan attached for next Build turn: {}",
                             compact_path(&plan_path)
@@ -8285,6 +8327,18 @@ struct TuiApp {
     /// `<proposed_plan>` block lands. Set once on persist; cleared by an
     /// explicit user choice. Blocks other input while present.
     pending_plan_choice: Option<PendingPlanChoice>,
+    /// Pause/resume state for Build-mode plan execution (PR-G item 6).
+    /// Set when the user presses Shift+Tab while a Build turn is in
+    /// flight and an active plan exists: the turn is cancelled, the
+    /// captured plan id rides through Plan-mode, and the next Plan→
+    /// Build crossing surfaces a resume marker telling the model
+    /// whether the plan was refined while paused.
+    plan_pause: Option<PlanPauseState>,
+    /// One-shot resume marker queued during a Plan→Build crossing that
+    /// resumes from a pause. Consumed by [`take_pending_plan_prefix`]
+    /// on the first Build turn after the crossing so the marker rides
+    /// alongside the plan body.
+    plan_resume_marker: Option<String>,
     task_state: Option<TaskStateSnapshot>,
     mcp_status: Option<McpStatusSnapshot>,
     task_panel_collapsed: bool,
@@ -8435,6 +8489,8 @@ impl TuiApp {
             pending_plan_handoff: None,
             plan_handoff_turns_seen: 0,
             pending_plan_choice: None,
+            plan_pause: None,
+            plan_resume_marker: None,
             task_state: None,
             mcp_status: None,
             task_panel_collapsed: false,
@@ -8798,6 +8854,15 @@ struct PendingPlanChoice {
     plan_id: String,
     plan_path: PathBuf,
     selection_index: usize,
+}
+
+/// Captured plan-execution state at the moment of a Shift+Tab pause
+/// (PR-G item 6). `plan_id` is compared against `current_plan_id` on
+/// the next Plan→Build crossing so the resume marker can tell the
+/// model whether the plan body was refined while paused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanPauseState {
+    plan_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

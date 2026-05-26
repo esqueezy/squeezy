@@ -908,6 +908,118 @@ async fn slash_plans_set_active_updates_pointer_and_app() {
 }
 
 #[tokio::test]
+async fn shift_tab_during_build_turn_pauses_and_switches_to_plan() {
+    let root = temp_workspace("plan_pause_switch");
+    let plans_dir = root
+        .join(proposed_plan::PLAN_DIR)
+        .join(proposed_plan::FALLBACK_SESSION_ID);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_id = "plan-pause123".to_string();
+    let plan_path = plans_dir.join(format!("{plan_id}.md"));
+    fs::write(&plan_path, "---\n---\nstep 1\nstep 2\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.current_plan_id = Some(plan_id.clone());
+    // Simulate a live model turn.
+    let cancel = CancellationToken::new();
+    app.cancel = Some(cancel.clone());
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+
+    switch_mode(&mut app, &agent, None, "tui_shift_tab");
+    assert_eq!(app.mode, SessionMode::Plan, "pause must reach Plan mode");
+    assert!(
+        cancel.is_cancelled(),
+        "pause must cancel the in-flight turn"
+    );
+    assert!(
+        app.plan_pause.is_some(),
+        "pause state must be captured for the resume marker"
+    );
+    assert_eq!(
+        app.plan_pause.as_ref().unwrap().plan_id,
+        plan_id,
+        "captured plan id must match the active plan"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn resume_marker_announces_plan_change_during_pause() {
+    let root = temp_workspace("plan_pause_resume_refined");
+    let plans_dir = root
+        .join(proposed_plan::PLAN_DIR)
+        .join(proposed_plan::FALLBACK_SESSION_ID);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let original_id = "plan-original0".to_string();
+    let refined_id = "plan-refined00".to_string();
+    let refined_path = plans_dir.join(format!("{refined_id}.md"));
+    fs::write(&refined_path, "---\n---\nrefined step 1\n").expect("write refined plan");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    // Plan id at time of pause differs from current (i.e. refined).
+    app.plan_pause = Some(PlanPauseState {
+        plan_id: original_id.clone(),
+    });
+    app.current_plan_id = Some(refined_id.clone());
+
+    switch_mode(&mut app, &agent, Some(SessionMode::Build), "test");
+    assert_eq!(app.mode, SessionMode::Build);
+    assert!(app.plan_pause.is_none(), "pause state must be consumed");
+    let marker = app
+        .plan_resume_marker
+        .as_deref()
+        .expect("resume marker must be queued");
+    assert!(
+        marker.contains("plan refined"),
+        "marker must announce refinement: {marker}"
+    );
+    assert!(marker.contains(&original_id), "marker mentions previous id");
+    assert!(marker.contains(&refined_id), "marker mentions current id");
+
+    // Take the prefix and confirm the marker rides alongside the body.
+    let prefix =
+        take_pending_plan_prefix(&mut app).expect("plan body returned for first resume turn");
+    assert!(prefix.starts_with("[resuming from plan "));
+    assert!(prefix.contains("refined step 1"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn resume_marker_omits_change_note_when_plan_unchanged() {
+    let root = temp_workspace("plan_pause_resume_same");
+    let plans_dir = root
+        .join(proposed_plan::PLAN_DIR)
+        .join(proposed_plan::FALLBACK_SESSION_ID);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_id = "plan-samesame0".to_string();
+    let plan_path = plans_dir.join(format!("{plan_id}.md"));
+    fs::write(&plan_path, "---\n---\nbody\n").expect("write");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    app.plan_pause = Some(PlanPauseState {
+        plan_id: plan_id.clone(),
+    });
+    app.current_plan_id = Some(plan_id.clone());
+
+    switch_mode(&mut app, &agent, Some(SessionMode::Build), "test");
+    let marker = app.plan_resume_marker.clone().unwrap_or_default();
+    assert!(
+        marker.contains("plan unchanged"),
+        "marker should report no refinement: {marker}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn mode_status_text_appends_active_plan_segment() {
     let root = temp_workspace("mode_status_plan_segment");
     let config = test_config_with_root(SessionMode::Plan, root.clone());
