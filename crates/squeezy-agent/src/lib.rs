@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
     panic::AssertUnwindSafe,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc, Mutex as StdMutex, RwLock,
@@ -1703,6 +1703,12 @@ impl Agent {
         let request_instructions = self.redactor.redact(&raw_instructions).text;
         let mut all_tool_specs = core_control_tools(&self.config.subagents, mode);
         all_tool_specs.extend(self.tools.specs().iter().cloned().map(advertised_tool));
+        let session_id_for_plan_mode = self.session_id();
+        let plan_edit_allowed = plan_mode::plan_edit_allowed_in_workspace(
+            mode,
+            &self.config.workspace_root,
+            session_id_for_plan_mode.as_deref(),
+        );
         LlmRequest {
             model: Arc::from(self.config.model.as_str()),
             instructions: Arc::from(instructions_with_tool_index(
@@ -1710,6 +1716,7 @@ impl Agent {
                 &all_tool_specs,
                 mode,
                 &self.config.tools,
+                plan_edit_allowed,
             )),
             input: Arc::from(input),
             max_output_tokens: self.config.max_output_tokens,
@@ -1726,6 +1733,7 @@ impl Agent {
                 mode,
                 &self.config.tools,
                 loaded_tool_schemas,
+                plan_edit_allowed,
             )),
             store,
         }
@@ -3116,6 +3124,18 @@ struct TurnRuntime {
     subagents: SubagentRegistry,
 }
 
+impl TurnRuntime {
+    /// Session id derived from the session log handle, used by plan-mode
+    /// path-scoped write exception (issue 17). `None` when the session
+    /// has not yet been assigned an id (pre-first-turn window) or has
+    /// no log handle (replay/test scenarios).
+    fn session_id(&self) -> Option<String> {
+        self.session_log
+            .as_ref()
+            .map(|handle| handle.session_id().to_string())
+    }
+}
+
 fn request_response_verbosity(
     config: &AppConfig,
     provider_name: &str,
@@ -3308,10 +3328,12 @@ impl TurnRuntime {
         // here tells the model *why* its toolbox shrank and what the
         // expected output contract (`<proposed_plan>`) looks like.
         let active_mode = load_session_mode(&self.session_mode);
+        let session_id_for_plan_mode = self.session_id();
         let mode_instructions = plan_mode::instructions_for_mode(
             &verbosity_instructions,
             active_mode,
             &self.config.workspace_root,
+            session_id_for_plan_mode.as_deref(),
         );
         let mut prior_state = self.conversation_state.lock().await.clone();
         // Pinned context must reach the model on every turn, not only
@@ -3603,6 +3625,11 @@ impl TurnRuntime {
             }
             let active_mode = load_session_mode(&self.session_mode);
             let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();
+            let plan_edit_allowed = plan_mode::plan_edit_allowed_in_workspace(
+                active_mode,
+                &self.config.workspace_root,
+                self.session_id().as_deref(),
+            );
             let mode_slot = active_mode as usize;
             if instructions_cache[mode_slot].is_none() {
                 instructions_cache[mode_slot] = Some(instructions_with_tool_index(
@@ -3610,6 +3637,7 @@ impl TurnRuntime {
                     &self.all_tool_specs,
                     active_mode,
                     &self.config.tools,
+                    plan_edit_allowed,
                 ));
             }
             let cached_instructions = instructions_cache[mode_slot]
@@ -3630,6 +3658,7 @@ impl TurnRuntime {
                     active_mode,
                     &self.config.tools,
                     &loaded_tool_schemas,
+                    plan_edit_allowed,
                 )),
                 store: self.config.store_responses,
             };
@@ -4426,6 +4455,18 @@ struct ToolExecutionContext<'a> {
     exploration_state: Arc<Mutex<ExplorationTurnState>>,
 }
 
+impl ToolExecutionContext<'_> {
+    /// Session id derived from the session log handle, used by plan-mode
+    /// path-scoped write exception (issue 17). `None` when the session
+    /// has not yet been assigned an id (pre-first-turn window) or has no
+    /// log handle (in-memory test scenarios).
+    fn session_id_for_plan_mode(&self) -> Option<String> {
+        self.session_log
+            .as_ref()
+            .map(|handle| handle.session_id().to_string())
+    }
+}
+
 struct McpElicitationHandlerScope<'a> {
     tools: &'a ToolRegistry,
 }
@@ -4505,6 +4546,15 @@ impl PermissionDecisionContext {
             session_log: context.session_log.clone(),
             conversation_state: context.conversation_state.clone(),
         }
+    }
+
+    /// Session id derived from the session log handle, used by plan-mode
+    /// path-scoped write exception (issue 17). Mirrors
+    /// `ToolExecutionContext::session_id_for_plan_mode`.
+    fn session_id_for_plan_mode(&self) -> Option<String> {
+        self.session_log
+            .as_ref()
+            .map(|handle| handle.session_id().to_string())
     }
 }
 
@@ -4688,7 +4738,13 @@ async fn handle_load_tool_schema_call(
     };
 
     let active_mode = load_session_mode(&context.session_mode);
-    if mode_refuses_capability(active_mode, tool.capability) {
+    let session_id_for_plan_mode = context.session_id_for_plan_mode();
+    let plan_edit_allowed = plan_mode::plan_edit_allowed_in_workspace(
+        active_mode,
+        &context.config.workspace_root,
+        session_id_for_plan_mode.as_deref(),
+    );
+    if mode_refuses_capability(active_mode, tool.capability, plan_edit_allowed) {
         return control_tool_result(
             call,
             ToolStatus::Denied,
@@ -5021,7 +5077,10 @@ async fn run_subagent(
         .iter()
         .map(|tool| tool.spec.name.clone())
         .collect::<BTreeSet<_>>();
-    let tool_specs = advertised_tool_specs(&allowed_tools, SessionMode::Plan);
+    // Subagents in Plan mode are deliberately read-only; the active-plan
+    // write exception applies to the top-level interactive session, not
+    // to spawned subagents.
+    let tool_specs = advertised_tool_specs(&allowed_tools, SessionMode::Plan, false);
     let instructions = subagent_instructions(kind, &request);
     let redacted_instructions = parent.redactor.redact(&instructions);
     let mut broker = CostBroker::new(&config);
@@ -6807,7 +6866,12 @@ async fn permission_decision_for_request(
     request: PermissionRequest,
 ) -> ApprovalDecision {
     let active_mode = load_session_mode(&context.session_mode);
-    if let Some(verdict) = mode_permission_verdict(active_mode, &request) {
+    let session_id_for_plan_mode = context.session_id_for_plan_mode();
+    let active_plan = plan_mode::latest_plan_path(
+        &context.config.workspace_root,
+        session_id_for_plan_mode.as_deref(),
+    );
+    if let Some(verdict) = mode_permission_verdict(active_mode, &request, active_plan.as_deref()) {
         log_permission_verdict(&request, &verdict);
         return ApprovalDecision::Denied(context.redactor.redact(&verdict.reason).text);
     }
@@ -7145,34 +7209,63 @@ fn load_session_mode(session_mode: &Arc<AtomicU8>) -> SessionMode {
 pub(crate) fn mode_permission_verdict(
     mode: SessionMode,
     request: &PermissionRequest,
+    active_plan_path: Option<&Path>,
 ) -> Option<PermissionVerdict> {
-    if !mode_refuses_capability(mode, request.capability) {
+    let plan_edit_allowed = matches!(
+        (mode, request.capability),
+        (SessionMode::Plan, PermissionCapability::Edit)
+    ) && active_plan_path
+        .is_some_and(|active| plan_mode::is_active_plan_path(Path::new(&request.target), active));
+    if !mode_refuses_capability(mode, request.capability, plan_edit_allowed) {
         return None;
     }
-    Some(PermissionVerdict {
-        action: PermissionAction::Deny,
-        matched_rule: None,
-        reason: format!(
+    let reason = if mode == SessionMode::Plan && request.capability == PermissionCapability::Edit {
+        match active_plan_path {
+            Some(active) => format!(
+                "Plan mode: only the active plan file is editable ({}); requested target was {}",
+                active.display(),
+                request.target,
+            ),
+            None => format!(
+                "{} mode refuses {} (no active plan file to edit)",
+                mode.as_str(),
+                request.capability.as_str()
+            ),
+        }
+    } else {
+        format!(
             "{} mode refuses {}",
             mode.as_str(),
             request.capability.as_str()
-        ),
+        )
+    };
+    Some(PermissionVerdict {
+        action: PermissionAction::Deny,
+        matched_rule: None,
+        reason,
     })
 }
 
 /// Single source of truth for whether a session mode forbids a capability.
-/// Plan mode allows only Read and Search; Build mode allows everything (the
-/// configured `PermissionPolicy` still applies). The capability list is
-/// intentionally exhaustive (`match`) so adding a new capability is a
-/// compile-time prompt to decide whether plan mode admits it.
-fn mode_refuses_capability(mode: SessionMode, capability: PermissionCapability) -> bool {
+/// Plan mode allows Read, Search, and (when `plan_edit_allowed` is true)
+/// Edit; Build mode allows everything (the configured `PermissionPolicy`
+/// still applies). The capability list is intentionally exhaustive
+/// (`match`) so adding a new capability is a compile-time prompt to
+/// decide whether plan mode admits it. `plan_edit_allowed` is computed
+/// by `plan_mode::plan_edit_allowed_in_workspace` at schema-build sites
+/// and by `plan_mode::is_active_plan_path` at runtime (issue 2).
+fn mode_refuses_capability(
+    mode: SessionMode,
+    capability: PermissionCapability,
+    plan_edit_allowed: bool,
+) -> bool {
     if mode == SessionMode::Build {
         return false;
     }
     match capability {
         PermissionCapability::Read | PermissionCapability::Search => false,
-        PermissionCapability::Edit
-        | PermissionCapability::Shell
+        PermissionCapability::Edit => !plan_edit_allowed,
+        PermissionCapability::Shell
         | PermissionCapability::Git
         | PermissionCapability::Network
         | PermissionCapability::Mcp
@@ -7746,10 +7839,14 @@ fn explore_advertised_tool() -> AdvertisedTool {
     }
 }
 
-fn advertised_tool_specs(tools: &[AdvertisedTool], mode: SessionMode) -> Vec<Arc<LlmToolSpec>> {
+fn advertised_tool_specs(
+    tools: &[AdvertisedTool],
+    mode: SessionMode,
+    plan_edit_allowed: bool,
+) -> Vec<Arc<LlmToolSpec>> {
     tools
         .iter()
-        .filter(|tool| !mode_refuses_capability(mode, tool.capability))
+        .filter(|tool| !mode_refuses_capability(mode, tool.capability, plan_edit_allowed))
         .map(|tool| Arc::clone(&tool.spec))
         .collect()
 }
@@ -7832,9 +7929,10 @@ fn request_tool_specs(
     mode: SessionMode,
     schema_config: &ToolSchemaConfig,
     loaded_tool_schemas: &[String],
+    plan_edit_allowed: bool,
 ) -> Vec<Arc<LlmToolSpec>> {
     if !schema_config.lazy_schema_loading {
-        return advertised_tool_specs(tools, mode);
+        return advertised_tool_specs(tools, mode, plan_edit_allowed);
     }
 
     // Specs are stored as `Arc<LlmToolSpec>` so a per-round "spec list"
@@ -7861,10 +7959,10 @@ fn request_tool_specs(
         })
         .chain(schema_config.core.iter().map(String::as_str))
     {
-        push_tool_spec_by_name(tools, name, mode, &mut specs, &mut seen);
+        push_tool_spec_by_name(tools, name, mode, plan_edit_allowed, &mut specs, &mut seen);
     }
     for name in loaded_tool_schemas {
-        push_tool_spec_by_name(tools, name, mode, &mut specs, &mut seen);
+        push_tool_spec_by_name(tools, name, mode, plan_edit_allowed, &mut specs, &mut seen);
     }
     specs
 }
@@ -7873,6 +7971,7 @@ fn push_tool_spec_by_name(
     tools: &[AdvertisedTool],
     name: &str,
     mode: SessionMode,
+    plan_edit_allowed: bool,
     specs: &mut Vec<Arc<LlmToolSpec>>,
     seen: &mut BTreeSet<String>,
 ) {
@@ -7880,7 +7979,7 @@ fn push_tool_spec_by_name(
         return;
     }
     if let Some(tool) = synthetic_tool_by_name(name) {
-        if !mode_refuses_capability(mode, tool.capability) {
+        if !mode_refuses_capability(mode, tool.capability, plan_edit_allowed) {
             specs.push(tool.spec);
         }
         return;
@@ -7892,7 +7991,7 @@ fn push_tool_spec_by_name(
         // here keeps the hot path allocation-free.
         return;
     };
-    if !mode_refuses_capability(mode, tool.capability) {
+    if !mode_refuses_capability(mode, tool.capability, plan_edit_allowed) {
         specs.push(Arc::clone(&tool.spec));
     }
 }
@@ -7936,6 +8035,7 @@ fn tool_schema_index(
     tools: &[AdvertisedTool],
     mode: SessionMode,
     schema_config: &ToolSchemaConfig,
+    plan_edit_allowed: bool,
 ) -> Option<String> {
     if !schema_config.lazy_schema_loading {
         return None;
@@ -7943,7 +8043,7 @@ fn tool_schema_index(
     let mut rows = tools
         .iter()
         .filter(|tool| {
-            !mode_refuses_capability(mode, tool.capability)
+            !mode_refuses_capability(mode, tool.capability, plan_edit_allowed)
                 && !tool_is_core_schema(tool, schema_config)
         })
         .map(|tool| {
@@ -7983,8 +8083,9 @@ fn instructions_with_tool_index(
     tools: &[AdvertisedTool],
     mode: SessionMode,
     schema_config: &ToolSchemaConfig,
+    plan_edit_allowed: bool,
 ) -> String {
-    match tool_schema_index(tools, mode, schema_config) {
+    match tool_schema_index(tools, mode, schema_config, plan_edit_allowed) {
         Some(index) => format!("{base}\n\n{index}"),
         None => base.to_string(),
     }

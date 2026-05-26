@@ -2103,7 +2103,6 @@ fn classifier_verdict_does_not_match_action_inside_reason_text() {
 #[test]
 fn plan_mode_denies_mutating_capabilities_before_policy() {
     for capability in [
-        PermissionCapability::Edit,
         PermissionCapability::Shell,
         PermissionCapability::Git,
         PermissionCapability::Network,
@@ -2112,7 +2111,7 @@ fn plan_mode_denies_mutating_capabilities_before_policy() {
         PermissionCapability::Destructive,
     ] {
         let request = permission_request_for_capability(capability);
-        let verdict = mode_permission_verdict(SessionMode::Plan, &request)
+        let verdict = mode_permission_verdict(SessionMode::Plan, &request, None)
             .expect("plan mode should deny mutating capability");
         assert_eq!(verdict.action, PermissionAction::Deny);
         assert_eq!(verdict.matched_rule, None);
@@ -2124,11 +2123,90 @@ fn plan_mode_denies_mutating_capabilities_before_policy() {
 }
 
 #[test]
+fn plan_mode_denies_edit_with_no_active_plan() {
+    let request = permission_request_for_capability(PermissionCapability::Edit);
+    let verdict = mode_permission_verdict(SessionMode::Plan, &request, None)
+        .expect("plan mode with no active plan should deny edits");
+    assert_eq!(verdict.action, PermissionAction::Deny);
+    assert!(
+        verdict.reason.contains("no active plan file to edit"),
+        "denial reason should reference missing plan; got: {}",
+        verdict.reason
+    );
+}
+
+#[test]
+fn plan_mode_allows_edit_when_target_matches_active_plan() {
+    let root = temp_workspace("plan_mode_edit_active");
+    let plans_dir = root.join(super::plan_mode::PLAN_DIR);
+    std::fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let active = plans_dir.join("plan-abc.md");
+    std::fs::write(&active, "step 1\n").expect("write plan");
+
+    // request.target is the active plan path → verdict must be None (allow).
+    let mut request = permission_request_for_capability(PermissionCapability::Edit);
+    request.target = active.display().to_string();
+    assert_eq!(
+        mode_permission_verdict(SessionMode::Plan, &request, Some(active.as_path())),
+        None,
+        "edit to active plan path must be allowed"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn plan_mode_denies_edit_when_target_is_unrelated_file() {
+    let root = temp_workspace("plan_mode_edit_other");
+    let plans_dir = root.join(super::plan_mode::PLAN_DIR);
+    std::fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let active = plans_dir.join("plan-abc.md");
+    std::fs::write(&active, "step 1\n").expect("write plan");
+    let unrelated = root.join("src.rs");
+    std::fs::write(&unrelated, "// some file\n").expect("write unrelated");
+
+    let mut request = permission_request_for_capability(PermissionCapability::Edit);
+    request.target = unrelated.display().to_string();
+    let verdict = mode_permission_verdict(SessionMode::Plan, &request, Some(active.as_path()))
+        .expect("plan mode must deny edits to unrelated files");
+    assert_eq!(verdict.action, PermissionAction::Deny);
+    assert!(
+        verdict.reason.contains("only the active plan file"),
+        "denial should explain plan-only scope; got: {}",
+        verdict.reason
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn plan_mode_denies_edit_when_sibling_plan_file_targeted() {
+    let root = temp_workspace("plan_mode_edit_sibling");
+    let plans_dir = root.join(super::plan_mode::PLAN_DIR);
+    std::fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let active = plans_dir.join("plan-current.md");
+    let sibling = plans_dir.join("plan-old.md");
+    std::fs::write(&active, "active\n").expect("write active");
+    std::fs::write(&sibling, "old\n").expect("write sibling");
+
+    let mut request = permission_request_for_capability(PermissionCapability::Edit);
+    request.target = sibling.display().to_string();
+    let verdict = mode_permission_verdict(SessionMode::Plan, &request, Some(active.as_path()))
+        .expect("write exception is exact-match only — siblings must be denied");
+    assert_eq!(verdict.action, PermissionAction::Deny);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn plan_mode_keeps_read_and_search_on_normal_policy_path() {
     for capability in [PermissionCapability::Read, PermissionCapability::Search] {
         let request = permission_request_for_capability(capability);
-        assert_eq!(mode_permission_verdict(SessionMode::Plan, &request), None);
-        assert_eq!(mode_permission_verdict(SessionMode::Build, &request), None);
+        assert_eq!(
+            mode_permission_verdict(SessionMode::Plan, &request, None),
+            None
+        );
+        assert_eq!(
+            mode_permission_verdict(SessionMode::Build, &request, None),
+            None
+        );
     }
 }
 
@@ -2146,7 +2224,10 @@ fn build_mode_never_adds_mode_denials() {
         PermissionCapability::Destructive,
     ] {
         let request = permission_request_for_capability(capability);
-        assert_eq!(mode_permission_verdict(SessionMode::Build, &request), None);
+        assert_eq!(
+            mode_permission_verdict(SessionMode::Build, &request, None),
+            None
+        );
     }
 }
 
@@ -2230,7 +2311,7 @@ fn advertised_tool_specs_are_mode_aware() {
     ]
     .map(|(name, capability)| test_advertised_tool(name, capability));
 
-    let build_specs = advertised_tool_specs(&tools, SessionMode::Build);
+    let build_specs = advertised_tool_specs(&tools, SessionMode::Build, false);
     let build_names = advertised_tool_names(&build_specs);
     assert_eq!(
         build_names,
@@ -2240,7 +2321,7 @@ fn advertised_tool_specs_are_mode_aware() {
             .collect::<Vec<_>>()
     );
 
-    let plan_specs = advertised_tool_specs(&tools, SessionMode::Plan);
+    let plan_specs = advertised_tool_specs(&tools, SessionMode::Plan, false);
     let plan_names = advertised_tool_names(&plan_specs);
     assert_eq!(
         plan_names,
@@ -2277,11 +2358,11 @@ fn control_tools_are_advertised_in_build_and_plan_modes() {
         DELEGATE_REVIEW_TOOL_NAME,
     ];
 
-    let build_specs = advertised_tool_specs(&tools, SessionMode::Build);
+    let build_specs = advertised_tool_specs(&tools, SessionMode::Build, false);
     let build_names = advertised_tool_names(&build_specs);
     assert_eq!(build_names, expected);
 
-    let plan_specs = advertised_tool_specs(&tools, SessionMode::Plan);
+    let plan_specs = advertised_tool_specs(&tools, SessionMode::Plan, false);
     let plan_names = advertised_tool_names(&plan_specs);
     assert_eq!(plan_names, expected);
 }
@@ -2378,7 +2459,7 @@ fn lazy_request_tool_specs_keep_core_first_and_mcp_discoverable_by_default() {
     ]);
     let config = ToolSchemaConfig::default();
 
-    let initial_specs = request_tool_specs(&tools, SessionMode::Build, &config, &[]);
+    let initial_specs = request_tool_specs(&tools, SessionMode::Build, &config, &[], false);
     let initial_names = advertised_tool_names(&initial_specs);
     assert_eq!(
         initial_names,
@@ -2399,6 +2480,7 @@ fn lazy_request_tool_specs_keep_core_first_and_mcp_discoverable_by_default() {
             "webfetch".to_string(),
             "mcp__docs__lookup".to_string(),
         ],
+        false,
     );
     let loaded_names = advertised_tool_names(&loaded_specs);
     assert_eq!(
@@ -2424,7 +2506,7 @@ fn request_tool_specs_skips_disabled_subagent_control_tools() {
     tools.push(test_advertised_tool("grep", PermissionCapability::Search));
     let config = ToolSchemaConfig::default();
 
-    let specs = request_tool_specs(&tools, SessionMode::Build, &config, &[]);
+    let specs = request_tool_specs(&tools, SessionMode::Build, &config, &[], false);
     let names = advertised_tool_names(&specs);
     assert!(
         !names.contains(&DELEGATE_TOOL_NAME),
@@ -2442,7 +2524,7 @@ fn request_tool_specs_skips_disabled_subagent_control_tools() {
     };
     let mut tools = core_control_tools(&explore_only, SessionMode::Build);
     tools.push(test_advertised_tool("grep", PermissionCapability::Search));
-    let specs = request_tool_specs(&tools, SessionMode::Build, &config, &[]);
+    let specs = request_tool_specs(&tools, SessionMode::Build, &config, &[], false);
     let names = advertised_tool_names(&specs);
     assert!(names.contains(&DELEGATE_TOOL_NAME));
     assert!(
@@ -2460,7 +2542,7 @@ fn lazy_tools_index_lists_discoverable_tools_without_core_schemas() {
     ];
     let config = ToolSchemaConfig::default();
 
-    let index = tool_schema_index(&tools, SessionMode::Build, &config).expect("index");
+    let index = tool_schema_index(&tools, SessionMode::Build, &config, false).expect("index");
 
     assert!(index.contains("webfetch | capability=network"));
     assert!(index.contains("mcp__docs__lookup | capability=mcp"));
@@ -2478,8 +2560,8 @@ fn registry_specs_carry_capability_aligned_with_permission_request() {
             arguments: serde_json::json!({}),
         };
         let runtime_capability = tools.permission_request(&call).capability;
-        let advertised = !mode_refuses_capability(SessionMode::Plan, spec.capability);
-        let runtime = !mode_refuses_capability(SessionMode::Plan, runtime_capability);
+        let advertised = !mode_refuses_capability(SessionMode::Plan, spec.capability, false);
+        let runtime = !mode_refuses_capability(SessionMode::Plan, runtime_capability, false);
         assert_eq!(
             advertised, runtime,
             "{}: advertised_capability={:?} runtime_capability={:?} disagree on plan-mode admittance",

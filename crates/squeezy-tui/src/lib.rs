@@ -222,6 +222,12 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         false,
         "[prompt]",
     ),
+    slash_args(
+        "/plans",
+        "manage persisted plan-mode artifacts (list/show/delete/set-active/open)",
+        true,
+        "[list|show|delete|set-active|open] [<id>]",
+    ),
     slash("/cost", "show token and cost accounting"),
     slash("/context", "show context budget and compaction state"),
     slash_args(
@@ -351,17 +357,45 @@ async fn run_inner(
     } else {
         (Agent::new(config.clone(), provider), Vec::new())
     };
-    let pruned = proposed_plan::prune_plan_dir(&config.workspace_root);
+    // One-shot migration of pre-v3 flat-layout plan files into a
+    // legacy subdir; safe to run unconditionally (no-op when nothing
+    // needs moving). Per-session pruning runs below once we know the
+    // session id.
+    let migrated = proposed_plan::migrate_legacy_plans(&config.workspace_root);
+    let session_id_for_plans = agent.session_id();
+    let plans_session_owned = session_id_for_plans
+        .clone()
+        .unwrap_or_else(|| proposed_plan::FALLBACK_SESSION_ID.to_string());
+    // PR-H (issue 13): plan ids referenced in the last 30 days of git
+    // history survive retention pruning even when older than the cap,
+    // so design-doc references in commits don't get yanked under the
+    // user. Best-effort: no git repo → empty protected set → mtime
+    // behaviour.
+    let protected_plan_ids = proposed_plan::git_referenced_plan_ids(&config.workspace_root, 30);
+    let pruned = proposed_plan::prune_plan_dir(
+        &config.workspace_root,
+        &plans_session_owned,
+        &protected_plan_ids,
+    );
     let mut app = TuiApp::new(
         agent.provider_name(),
         &config,
         agent.session_mode(),
         startup,
     );
+    app.session_id = session_id_for_plans;
+    if migrated > 0 {
+        app.push_log(format!(
+            "migrated {migrated} legacy plan file(s) to {}/{}",
+            proposed_plan::PLAN_DIR,
+            proposed_plan::LEGACY_PLAN_DIR
+        ));
+    }
     if pruned > 0 {
         app.push_log(format!(
-            "pruned {pruned} stale plan file(s) from {} (kept {} newest)",
+            "pruned {pruned} stale plan file(s) from {}/{} (kept {} newest)",
             proposed_plan::PLAN_DIR,
+            plans_session_owned,
             proposed_plan::PLAN_RETENTION_LIMIT
         ));
     }
@@ -424,13 +458,30 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         app.pending_assistant.push_delta(&extracted.passthrough);
                     }
                     for plan_body in extracted.completed {
-                        match proposed_plan::persist_plan(&app.workspace_root, &plan_body) {
+                        let sid = app.plan_session_id().to_string();
+                        // A non-None `current_plan_id` at the time a
+                        // fresh block lands means this body is a
+                        // refinement of the active plan, not a first-
+                        // time draft. Captured for the styled card /
+                        // diff renderer (PR-F).
+                        let parent_plan_id = app.current_plan_id.clone();
+                        let meta = proposed_plan::PlanMeta {
+                            parent_plan_id: parent_plan_id.clone(),
+                            model: Some(app.model.clone()),
+                        };
+                        match proposed_plan::persist_plan(
+                            &app.workspace_root,
+                            &sid,
+                            &plan_body,
+                            &meta,
+                        ) {
                             Ok((plan_id, path)) => {
                                 app.current_plan_id = Some(plan_id.clone());
-                                app.push_log(format!(
-                                    "proposed plan {plan_id} (saved to {}):\n{plan_body}",
-                                    compact_path(&path)
-                                ));
+                                app.push_plan_card(render::plan_card::PlanCardData {
+                                    plan_id: plan_id.clone(),
+                                    path: path.clone(),
+                                    parent_plan_id,
+                                });
                                 app.pending_plan_choice = Some(PendingPlanChoice {
                                     plan_id,
                                     plan_path: path,
@@ -438,8 +489,9 @@ async fn drain_agent_events(app: &mut TuiApp) {
                                 });
                             }
                             Err(err) => app.push_log(format!(
-                                "proposed plan (could not persist under {}: {err}):\n{plan_body}",
-                                proposed_plan::PLAN_DIR
+                                "proposed plan (could not persist under {}/{}: {err}):\n{plan_body}",
+                                proposed_plan::PLAN_DIR,
+                                sid
                             )),
                         }
                     }
@@ -471,6 +523,38 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         && matches!(result.tool_name.as_str(), "apply_patch" | "write_file")
                     {
                         app.last_turn_had_edits = true;
+                        // First successful edit after a Plan→Build handoff
+                        // means the plan is "in motion" — re-attaching it
+                        // on later Build turns is just noise. Clear the
+                        // handoff so the marker stops firing (issue 16).
+                        if app.mode == SessionMode::Build && app.pending_plan_handoff.is_some() {
+                            app.pending_plan_handoff = None;
+                            app.plan_handoff_turns_seen = 0;
+                            app.push_log("plan handoff cleared: plan is in motion".to_string());
+                        }
+                        // Plan-mode in-place refinement (issue 2): the model
+                        // edited the active plan file via apply_patch. Re-
+                        // surface the post-plan choice prompt so the user
+                        // sees Execute/Refine/Discard/View against the new
+                        // body without having to wait for another
+                        // <proposed_plan> emission.
+                        if app.mode == SessionMode::Plan
+                            && let Some(plan_id) = app.current_plan_id.clone()
+                        {
+                            let sid = app.plan_session_id().to_string();
+                            let plan_path =
+                                proposed_plan::plan_file_for(&app.workspace_root, &sid, &plan_id);
+                            if plan_path.exists() {
+                                app.push_log(format!(
+                                    "plan {plan_id} refined in place (apply_patch)"
+                                ));
+                                app.pending_plan_choice = Some(PendingPlanChoice {
+                                    plan_id,
+                                    plan_path,
+                                    selection_index: 0,
+                                });
+                            }
+                        }
                     }
                     let call = app.active_tool_calls.remove(&result.call_id);
                     app.refresh_active_tool_name();
@@ -926,6 +1010,7 @@ async fn apply_plan_choice(
                 }
                 if app.pending_plan_handoff.as_deref() == Some(pending.plan_path.as_path()) {
                     app.pending_plan_handoff = None;
+                    app.plan_handoff_turns_seen = 0;
                 }
             }
             Err(err) => {
@@ -2172,6 +2257,10 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             }
             return true;
         }
+        "/plans" => {
+            handle_plans_command(app, rest);
+            return true;
+        }
         "/cost" => {
             let snapshot = agent.session_accounting_snapshot().await;
             app.status = "cost snapshot".to_string();
@@ -2613,6 +2702,233 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
     app.jobs.insert(job.id, job.clone());
     app.status = format!("started job {} {}", job.id, job.title);
     true
+}
+
+/// Dispatch for `/plans [list|show|delete|set-active|open] [<id>]`.
+/// Bare `/plans` (or `/plans list`) renders a table; the other
+/// subcommands take an id (or any unique prefix of one). Plan ids are
+/// resolved within the active session's plan dir; sibling sessions
+/// are intentionally invisible.
+fn handle_plans_command(app: &mut TuiApp, rest: &str) {
+    let mut parts = rest.split_whitespace();
+    let sub = parts.next().unwrap_or("list");
+    let arg = parts.next();
+    let sid = app.plan_session_id().to_string();
+    match sub {
+        "list" | "ls" => render_plans_list(app, &sid),
+        "show" | "view" | "cat" => {
+            if let Some(plan_id) = plans_resolve(app, &sid, arg) {
+                plans_show(app, &sid, &plan_id);
+            }
+        }
+        "delete" | "rm" => {
+            if let Some(plan_id) = plans_resolve(app, &sid, arg) {
+                plans_delete(app, &sid, &plan_id, parts.next());
+            }
+        }
+        "set-active" | "activate" | "use" => {
+            if let Some(plan_id) = plans_resolve(app, &sid, arg) {
+                plans_set_active(app, &sid, &plan_id);
+            }
+        }
+        "open" | "edit" => {
+            if let Some(plan_id) = plans_resolve(app, &sid, arg) {
+                plans_open(app, &sid, &plan_id);
+            }
+        }
+        "help" | "?" | "--help" | "-h" => {
+            app.status = "plans help".to_string();
+            app.push_transcript_item(TranscriptItem::system(plans_usage()));
+        }
+        other => {
+            app.status = format!("unknown /plans subcommand `{other}`");
+            app.push_transcript_item(TranscriptItem::system(plans_usage()));
+        }
+    }
+}
+
+fn plans_usage() -> String {
+    [
+        "usage:",
+        "  /plans              — list saved plans in this session",
+        "  /plans list",
+        "  /plans show <id>    — render a plan body",
+        "  /plans delete <id>  — remove a plan (add --yes to skip confirm)",
+        "  /plans set-active <id>",
+        "  /plans open <id>    — print path for opening in your editor",
+    ]
+    .join("\n")
+}
+
+/// Resolve the user's `<id>` argument to an exact plan id within the
+/// session. Sets status/transcript on error and returns `None` so the
+/// caller can early-out. On success returns the canonical plan id.
+fn plans_resolve(app: &mut TuiApp, sid: &str, raw: Option<&str>) -> Option<String> {
+    let Some(needle) = raw else {
+        app.status = "usage: /plans <subcommand> <id-or-prefix>".to_string();
+        return None;
+    };
+    match proposed_plan::resolve_plan_prefix(&app.workspace_root, sid, needle) {
+        Ok(plan_id) => Some(plan_id),
+        Err(proposed_plan::PlanLookupError::NotFound) => {
+            app.status = format!("no plan matches `{needle}` in this session");
+            None
+        }
+        Err(proposed_plan::PlanLookupError::Ambiguous(matches)) => {
+            app.status = format!("`{needle}` is ambiguous ({} matches)", matches.len());
+            let body = format!(
+                "Multiple plans match `{needle}`. Disambiguate by re-running with a longer prefix:\n{}",
+                matches
+                    .iter()
+                    .map(|id| format!("  {id}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            app.push_transcript_item(TranscriptItem::system(body));
+            None
+        }
+    }
+}
+
+fn render_plans_list(app: &mut TuiApp, sid: &str) {
+    let entries = proposed_plan::list_plans(&app.workspace_root, sid);
+    if entries.is_empty() {
+        app.status = "no plans persisted in this session".to_string();
+        return;
+    }
+    app.status = format!("{} plan(s) in this session", entries.len());
+    let now = std::time::SystemTime::now();
+    let mut lines = Vec::with_capacity(entries.len() + 1);
+    lines.push("  ACTIVE  ID                    AGE       OBJECTIVE".to_string());
+    for entry in &entries {
+        let age = format_age_short(now, entry.modified);
+        let marker = if entry.is_active {
+            "  *     "
+        } else {
+            "        "
+        };
+        let objective = truncate_for_display(&entry.objective, 60);
+        lines.push(format!(
+            "{marker}{id:<22} {age:<9} {objective}",
+            id = entry.plan_id,
+            age = age,
+            objective = objective,
+        ));
+    }
+    app.push_transcript_item(TranscriptItem::system(lines.join("\n")));
+}
+
+/// Render a short relative-age string (`12s`, `4m`, `3h`, `5d`) for
+/// `/plans list`. Anything older than 99 days collapses to `>99d`.
+fn format_age_short(now: std::time::SystemTime, when: std::time::SystemTime) -> String {
+    let elapsed = now.duration_since(when).unwrap_or_default();
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else if secs < 86_400 * 100 {
+        format!("{}d", secs / 86_400)
+    } else {
+        ">99d".to_string()
+    }
+}
+
+/// Trim `s` to at most `max_chars` codepoints, appending `…` when
+/// truncation actually happens. Empty input is rendered as `-`.
+fn truncate_for_display(s: &str, max_chars: usize) -> String {
+    if s.is_empty() {
+        return "-".to_string();
+    }
+    let mut iter = s.chars();
+    let head: String = (&mut iter).take(max_chars).collect();
+    if iter.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+fn plans_show(app: &mut TuiApp, sid: &str, plan_id: &str) {
+    let path = proposed_plan::plan_file_for(&app.workspace_root, sid, plan_id);
+    match proposed_plan::read_plan_body(&path) {
+        Ok(body) => {
+            app.status = format!("plan {plan_id}");
+            let header = format!("# Plan {plan_id}\n{}", compact_path(&path));
+            app.push_transcript_item(TranscriptItem::system(format!(
+                "{header}\n\n{}",
+                body.trim_end()
+            )));
+        }
+        Err(err) => app.status = format!("plans show failed: {err}"),
+    }
+}
+
+fn plans_delete(app: &mut TuiApp, sid: &str, plan_id: &str, flag: Option<&str>) {
+    // Confirmation gate: destructive ops require an explicit `--yes`
+    // (or `-y`). The user can re-run the same command after seeing the
+    // prompt without losing context.
+    let confirmed = matches!(flag, Some("--yes") | Some("-y") | Some("yes"));
+    if !confirmed {
+        app.status = format!("re-run with --yes to delete {plan_id}");
+        app.push_transcript_item(TranscriptItem::system(format!(
+            "/plans delete is destructive. Re-run as `/plans delete {plan_id} --yes` to confirm."
+        )));
+        return;
+    }
+    match proposed_plan::delete_plan(&app.workspace_root, sid, plan_id) {
+        Ok(path) => {
+            // Clear the in-memory active plan id if this was it; the
+            // pointer file has already been cleaned by `delete_plan`.
+            if app.current_plan_id.as_deref() == Some(plan_id) {
+                app.current_plan_id = None;
+                app.pending_plan_handoff = None;
+                app.plan_handoff_turns_seen = 0;
+            }
+            app.status = format!("deleted plan {plan_id}");
+            app.push_log(format!("plan {plan_id} deleted ({})", compact_path(&path)));
+        }
+        Err(err) => app.status = format!("plans delete failed: {err}"),
+    }
+}
+
+fn plans_set_active(app: &mut TuiApp, sid: &str, plan_id: &str) {
+    match proposed_plan::set_active_plan(&app.workspace_root, sid, plan_id) {
+        Ok(()) => {
+            app.current_plan_id = Some(plan_id.to_string());
+            app.status = format!("active plan → {plan_id}");
+            app.push_log(format!("set active plan: {plan_id}"));
+        }
+        Err(err) => app.status = format!("plans set-active failed: {err}"),
+    }
+}
+
+fn plans_open(app: &mut TuiApp, sid: &str, plan_id: &str) {
+    // The TUI owns the terminal in alternate-screen mode, so launching
+    // a foreground editor (vi/nano) inline would scramble the display.
+    // PR-E scope keeps this surface simple: print the path and the
+    // recommended editor command so the user can run it from another
+    // shell. The terminal-suspend integration is a follow-up.
+    let path = proposed_plan::plan_file_for(&app.workspace_root, sid, plan_id);
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .or_else(|| std::env::var("EDITOR").ok())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "notepad".to_string()
+            } else {
+                "vi".to_string()
+            }
+        });
+    app.status = format!("plan {plan_id} path printed");
+    app.push_transcript_item(TranscriptItem::system(format!(
+        "plan {plan_id}\nfile: {}\nopen with: {editor} {}",
+        compact_path(&path),
+        path.display()
+    )));
 }
 
 fn handle_help_command(app: &mut TuiApp, rest: &str) {
@@ -3306,18 +3622,36 @@ fn start_user_turn(app: &mut TuiApp, agent: &mut Agent, input: String) {
     app.turn_visual = TurnVisualState::Running;
 }
 
-/// If a Plan→Build switch queued a plan file for handoff, read it and
-/// return a labelled prefix to prepend to the next user input. Clears the
-/// pending field on success or non-recoverable failure so a stale handoff
-/// cannot leak across multiple turns. Returns `None` when nothing is
-/// queued.
+/// If a Plan→Build handoff is queued, return the prefix to prepend to the
+/// next user input. Turn 0 (the first call after Plan→Build) returns the
+/// full plan body so the model receives it verbatim; turns 1+ return a
+/// short `[plan still in effect — <path>]` marker so the plan continues
+/// to anchor the conversation without re-paying body tokens each turn
+/// (issue 16). The handoff is cleared automatically when the file is
+/// missing; routine clears (Build→Plan, discard, successful apply_patch)
+/// happen elsewhere.
 fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
-    let plan_path = app.pending_plan_handoff.take()?;
-    match std::fs::read_to_string(&plan_path) {
+    let plan_path = app.pending_plan_handoff.clone()?;
+    if app.plan_handoff_turns_seen > 0 {
+        // Subsequent turns: lightweight marker.
+        let marker = proposed_plan::BUILD_PLAN_STILL_IN_EFFECT_FORMAT
+            .replace("{path}", &plan_path.display().to_string());
+        return Some(marker);
+    }
+    // Strip the YAML front-matter (PR-D) before handing the body off
+    // to the model: the model should see the plan content, not the
+    // metadata block that the TUI uses for /plans rendering.
+    match proposed_plan::read_plan_body(&plan_path) {
         Ok(body) => {
             let trimmed = body.trim_end();
+            app.plan_handoff_turns_seen = app.plan_handoff_turns_seen.saturating_add(1);
+            // PR-G item 6: when this Plan→Build crossing is a resume
+            // from a Shift+Tab pause, prefix the body with a short
+            // marker so the model knows it's mid-execution and learns
+            // whether the plan was refined during the pause window.
+            let resume_marker = app.plan_resume_marker.take().unwrap_or_default();
             Some(format!(
-                "[plan from previous session — {path}]\n{trimmed}\n[end plan]\n\n",
+                "{resume_marker}[plan from previous session — {path}]\n{trimmed}\n[end plan]\n\n",
                 path = plan_path.display(),
             ))
         }
@@ -3326,6 +3660,8 @@ fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
                 "could not read plan file {} for Build handoff: {err}",
                 compact_path(&plan_path)
             ));
+            app.pending_plan_handoff = None;
+            app.plan_handoff_turns_seen = 0;
             None
         }
     }
@@ -3337,19 +3673,37 @@ fn switch_mode(
     requested: Option<SessionMode>,
     source: &'static str,
 ) {
-    if app.turn_rx.is_some()
-        || app.pending_approval.is_some()
-        || app.pending_mcp_elicitation.is_some()
-        || app.pending_request_user_input.is_some()
+    let target = requested.unwrap_or(match app.mode {
+        SessionMode::Plan => SessionMode::Build,
+        SessionMode::Build => SessionMode::Plan,
+    });
+    // PR-G item 6: Build→Plan with an in-flight turn AND an active
+    // plan is a *pause*, not a refusal. Cancel the turn, capture the
+    // plan id so the next Plan→Build crossing can emit a resume
+    // marker, and fall through to the normal switch path.
+    let is_build_to_plan_pause = app.mode == SessionMode::Build
+        && target == SessionMode::Plan
+        && app.turn_rx.is_some()
+        && app.current_plan_id.is_some();
+    if is_build_to_plan_pause {
+        request_turn_interrupt(app);
+        app.plan_pause = app
+            .current_plan_id
+            .clone()
+            .map(|plan_id| PlanPauseState { plan_id });
+        app.push_log("plan execution paused (Shift+Tab)".to_string());
+    }
+
+    if !is_build_to_plan_pause
+        && (app.turn_rx.is_some()
+            || app.pending_approval.is_some()
+            || app.pending_mcp_elicitation.is_some()
+            || app.pending_request_user_input.is_some())
     {
         app.status = "mode switch unavailable during active turn".to_string();
         return;
     }
 
-    let target = requested.unwrap_or(match app.mode {
-        SessionMode::Plan => SessionMode::Build,
-        SessionMode::Build => SessionMode::Plan,
-    });
     if target == app.mode {
         app.status = format!("already in {} mode", app.mode.as_str());
         return;
@@ -3364,9 +3718,30 @@ fn switch_mode(
         match (previous, target) {
             (SessionMode::Plan, SessionMode::Build) => {
                 if let Some(plan_id) = app.current_plan_id.as_deref() {
-                    let plan_path = proposed_plan::plan_file_for(&app.workspace_root, plan_id);
+                    let sid = app.plan_session_id().to_string();
+                    let plan_path =
+                        proposed_plan::plan_file_for(&app.workspace_root, &sid, plan_id);
                     if plan_path.exists() {
                         app.pending_plan_handoff = Some(plan_path.clone());
+                        // Fresh handoff: next Build turn gets the full plan
+                        // body; turns 2+ get the lighter marker.
+                        app.plan_handoff_turns_seen = 0;
+                        // Resume marker (PR-G item 6): if the previous
+                        // Build→Plan was a pause, tell the model which
+                        // plan id it resumes from and whether the body
+                        // changed during the pause window.
+                        if let Some(pause) = app.plan_pause.take() {
+                            let refined = pause.plan_id != plan_id;
+                            let note = if refined {
+                                format!(
+                                    "[resuming from plan {plan_id} — plan refined since previous attempt ({prev})]\n",
+                                    prev = pause.plan_id,
+                                )
+                            } else {
+                                format!("[resuming from plan {plan_id} — plan unchanged]\n")
+                            };
+                            app.plan_resume_marker = Some(note);
+                        }
                         app.push_log(format!(
                             "plan attached for next Build turn: {}",
                             compact_path(&plan_path)
@@ -3380,6 +3755,7 @@ fn switch_mode(
                 // so the next Build entry recomputes from the current
                 // plan file instead of attaching a stale path.
                 app.pending_plan_handoff = None;
+                app.plan_handoff_turns_seen = 0;
             }
             _ => {}
         }
@@ -4723,7 +5099,21 @@ fn format_transcript_entry_with_width(
             width,
         ),
         TranscriptEntryKind::Log(message) => format_log_entry(message, entry.collapsed, selected),
+        TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, entry.collapsed),
     }
+}
+
+fn format_plan_card_entry(
+    data: &render::plan_card::PlanCardData,
+    collapsed: bool,
+) -> Vec<Line<'static>> {
+    // Collapsed cards show just the header so users can fold a long
+    // plan out of view without losing the anchor.
+    let lines = render::plan_card::render_plan_card(data);
+    if collapsed {
+        return lines.into_iter().take(1).collect();
+    }
+    lines
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7397,7 +7787,69 @@ fn status_left_text(app: &TuiApp) -> String {
 }
 
 fn mode_status_text(app: &TuiApp) -> String {
-    format!("{} mode (Shift+Tab to cycle)", title_case_mode(app.mode))
+    let base = format!("{} mode (Shift+Tab to cycle)", title_case_mode(app.mode));
+    let Some(plan_id) = app.current_plan_id.as_deref() else {
+        return base;
+    };
+    // Truncate the hex tail so the status bar stays compact on narrow
+    // windows. Step count is derived from the on-disk file body so it
+    // reflects the *current* shape of the active plan, including any
+    // in-place refinements via apply_patch (PR-C).
+    let short_id = short_plan_id(plan_id);
+    let sid = app.plan_session_id();
+    let plan_path = proposed_plan::plan_file_for(&app.workspace_root, sid, plan_id);
+    let step_count = proposed_plan::read_plan_body(&plan_path)
+        .map(|body| count_plan_steps(&body))
+        .unwrap_or(0);
+    if step_count == 0 {
+        format!("{base} · {short_id}")
+    } else {
+        format!("{base} · {short_id} ({step_count} steps)")
+    }
+}
+
+/// Render a plan id as `plan-<first-6-hex>` for the status bar. Falls
+/// back to the full id when the input does not match the expected
+/// `plan-<hex>` shape.
+fn short_plan_id(plan_id: &str) -> String {
+    let Some(hex) = plan_id.strip_prefix("plan-") else {
+        return plan_id.to_string();
+    };
+    let head: String = hex.chars().take(6).collect();
+    if head.is_empty() {
+        plan_id.to_string()
+    } else {
+        format!("plan-{head}")
+    }
+}
+
+/// Count top-level numbered list items (e.g. `1.`, `12)`) in a plan
+/// body. Heading lines (`#`, `##`) and nested indented items are
+/// ignored. Matches what the styled card renders as the step list.
+pub(crate) fn count_plan_steps(body: &str) -> usize {
+    body.lines()
+        .filter(|line| {
+            // Top-level only: no leading whitespace.
+            if line.starts_with(|c: char| c.is_whitespace()) {
+                return false;
+            }
+            let mut chars = line.chars().peekable();
+            let mut saw_digit = false;
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() {
+                    saw_digit = true;
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if !saw_digit {
+                return false;
+            }
+            matches!(chars.next(), Some('.') | Some(')'))
+                && matches!(chars.next(), Some(' ') | Some('\t'))
+        })
+        .count()
 }
 
 fn title_case_mode(mode: SessionMode) -> &'static str {
@@ -7858,19 +8310,45 @@ struct TuiApp {
     pending_assistant: streaming::StreamingController,
     proposed_plan: proposed_plan::ProposedPlanExtractor,
     workspace_root: PathBuf,
+    /// Session id assigned by the agent. Plan-mode IO (persist, prune,
+    /// resolve-active) is scoped under
+    /// `<workspace_root>/.squeezy/plans/<session_id>/` so concurrent
+    /// sessions cannot see each other's plans. `None` until the agent
+    /// hands one back; in that window plan IO falls back to
+    /// [`proposed_plan::FALLBACK_SESSION_ID`].
+    session_id: Option<String>,
     /// Plan id of the most recent `<proposed_plan>` block persisted under
     /// `.squeezy/plans/`. Used by Build-mode handoff and refinement turns
     /// to identify which plan file is active without scanning the dir.
     current_plan_id: Option<String>,
-    /// Path to a plan file that should be prepended as starting context to
-    /// the very next Build-mode turn. Set when the user switches Plan→Build
-    /// while a plan is active; consumed and cleared by the prompt-submit
-    /// handler.
+    /// Path to a plan file that should be re-attached to upcoming Build-mode
+    /// turns. Set when the user switches Plan→Build while a plan is active.
+    /// Cleared on Build→Plan switch, on plan discard, and on the first
+    /// successful apply_patch / write_file in Build mode (the plan is "in
+    /// motion" — re-attaching it from there is just noise).
     pending_plan_handoff: Option<PathBuf>,
+    /// Number of Build-mode turns since the current `pending_plan_handoff`
+    /// was queued. Turn 0 receives the full plan body as a prefix; turns
+    /// 1+ receive a lighter `[plan still in effect — <path>]` marker so
+    /// the model is reminded the plan applies without re-paying the
+    /// body's tokens on every turn (issue 16).
+    plan_handoff_turns_seen: u32,
     /// Interactive Execute/Refine/Discard/View prompt rendered right after a
     /// `<proposed_plan>` block lands. Set once on persist; cleared by an
     /// explicit user choice. Blocks other input while present.
     pending_plan_choice: Option<PendingPlanChoice>,
+    /// Pause/resume state for Build-mode plan execution (PR-G item 6).
+    /// Set when the user presses Shift+Tab while a Build turn is in
+    /// flight and an active plan exists: the turn is cancelled, the
+    /// captured plan id rides through Plan-mode, and the next Plan→
+    /// Build crossing surfaces a resume marker telling the model
+    /// whether the plan was refined while paused.
+    plan_pause: Option<PlanPauseState>,
+    /// One-shot resume marker queued during a Plan→Build crossing that
+    /// resumes from a pause. Consumed by [`take_pending_plan_prefix`]
+    /// on the first Build turn after the crossing so the marker rides
+    /// alongside the plan body.
+    plan_resume_marker: Option<String>,
     task_state: Option<TaskStateSnapshot>,
     mcp_status: Option<McpStatusSnapshot>,
     task_panel_collapsed: bool,
@@ -7916,6 +8394,16 @@ struct TuiApp {
 }
 
 impl TuiApp {
+    /// Session id to use for plan IO. Falls back to
+    /// [`proposed_plan::FALLBACK_SESSION_ID`] when the agent has not yet
+    /// handed one back so plan-mode IO can still proceed during the
+    /// pre-first-turn window.
+    fn plan_session_id(&self) -> &str {
+        self.session_id
+            .as_deref()
+            .unwrap_or(proposed_plan::FALLBACK_SESSION_ID)
+    }
+
     fn new(
         provider_name: &'static str,
         config: &AppConfig,
@@ -8006,9 +8494,13 @@ impl TuiApp {
             pending_assistant: streaming::StreamingController::new(),
             proposed_plan: proposed_plan::ProposedPlanExtractor::new(),
             workspace_root: config.workspace_root.clone(),
+            session_id: None,
             current_plan_id: None,
             pending_plan_handoff: None,
+            plan_handoff_turns_seen: 0,
             pending_plan_choice: None,
+            plan_pause: None,
+            plan_resume_marker: None,
             task_state: None,
             mcp_status: None,
             task_panel_collapsed: false,
@@ -8084,6 +8576,15 @@ impl TuiApp {
     fn push_log(&mut self, message: String) {
         let id = self.next_id();
         self.push_entry(TranscriptEntry::log(id, message, self.transcript_default));
+    }
+
+    fn push_plan_card(&mut self, data: render::plan_card::PlanCardData) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::plan_card(
+            id,
+            data,
+            self.transcript_default,
+        ));
     }
 
     fn push_entry(&mut self, entry: TranscriptEntry) {
@@ -8162,6 +8663,20 @@ impl TranscriptEntry {
         }
     }
 
+    fn plan_card(
+        id: u64,
+        data: render::plan_card::PlanCardData,
+        _transcript_default: TranscriptDefault,
+    ) -> Self {
+        Self {
+            id,
+            kind: TranscriptEntryKind::PlanCard(Box::new(data)),
+            // Plan cards default to fully expanded even in Compact mode
+            // — the whole point of the card is to show the plan body.
+            collapsed: false,
+        }
+    }
+
     fn matches_category(&self, category: TranscriptCategory) -> bool {
         match category {
             TranscriptCategory::All => true,
@@ -8169,6 +8684,7 @@ impl TranscriptEntry {
             TranscriptCategory::Logs => match &self.kind {
                 TranscriptEntryKind::Log(_) => true,
                 TranscriptEntryKind::Message(item) => item.role == Role::System,
+                TranscriptEntryKind::PlanCard(_) => true,
                 _ => false,
             },
             TranscriptCategory::Diffs => match &self.kind {
@@ -8197,6 +8713,10 @@ impl TranscriptEntry {
                 vec![format!("tool result: {}", tool_result_summary(tool))]
             }
             TranscriptEntryKind::Log(message) => vec![format!("log: {message}")],
+            TranscriptEntryKind::PlanCard(data) => {
+                let body = proposed_plan::read_plan_body(&data.path).unwrap_or_default();
+                vec![format!("plan {}\n{body}", data.plan_id)]
+            }
         }
     }
 
@@ -8218,6 +8738,7 @@ impl TranscriptEntry {
             }
             TranscriptEntryKind::ToolResult(_) => true,
             TranscriptEntryKind::Log(message) => text_has_collapsible_content(message),
+            TranscriptEntryKind::PlanCard(_) => true,
         }
     }
 
@@ -8238,6 +8759,11 @@ impl TranscriptEntry {
                 message.clone(),
                 format!("transcript:{}", self.id),
             ),
+            TranscriptEntryKind::PlanCard(data) => (
+                format!("plan {}", data.plan_id),
+                proposed_plan::read_plan_body(&data.path).unwrap_or_default(),
+                format!("transcript:{}", self.id),
+            ),
         }
     }
 }
@@ -8247,6 +8773,10 @@ enum TranscriptEntryKind {
     Message(TranscriptItem),
     ToolResult(Box<ToolTranscript>),
     Log(String),
+    /// Plan-mode v3 (PR-F): a styled card pointing at the persisted
+    /// plan file. The body is loaded from disk at render time so the
+    /// cell tracks in-place refinements and survives compaction.
+    PlanCard(Box<render::plan_card::PlanCardData>),
 }
 
 #[derive(Debug, Clone)]
@@ -8334,6 +8864,15 @@ struct PendingPlanChoice {
     plan_id: String,
     plan_path: PathBuf,
     selection_index: usize,
+}
+
+/// Captured plan-execution state at the moment of a Shift+Tab pause
+/// (PR-G item 6). `plan_id` is compared against `current_plan_id` on
+/// the next Plan→Build crossing so the resume marker can tell the
+/// model whether the plan body was refined while paused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanPauseState {
+    plan_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
