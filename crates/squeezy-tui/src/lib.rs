@@ -228,6 +228,12 @@ pub struct StartupProfile {
     /// any, is honoured). The CLI flips this on via `--no-resume-picker`
     /// for non-interactive flows (CI, scripts).
     pub skip_resume_picker: bool,
+    /// Optional banner that the CLI populates from
+    /// `update::banner_for_startup()` when GitHub reports a newer
+    /// release than the running binary. Empty / `None` keeps the
+    /// transcript quiet. The TUI flushes this through `push_log` at
+    /// startup so it lands above the first agent turn.
+    pub update_banner: Option<String>,
 }
 
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
@@ -247,6 +253,7 @@ pub async fn run_with_onboarding(
             onboarding_summary,
             languages: String::new(),
             skip_resume_picker: false,
+            update_banner: None,
         },
     )
     .await
@@ -314,6 +321,9 @@ async fn run_inner(
         &plans_session_owned,
         &protected_plan_ids,
     );
+    // `StartupProfile` is moved into `TuiApp::new`, so capture the banner
+    // (the only field needed below) before that hand-off.
+    let update_banner = startup.update_banner.clone();
     let mut app = TuiApp::new(
         agent.provider_name(),
         &config,
@@ -335,6 +345,9 @@ async fn run_inner(
             plans_session_owned,
             proposed_plan::PLAN_RETENTION_LIMIT
         ));
+    }
+    if let Some(banner) = update_banner.filter(|s| !s.trim().is_empty()) {
+        app.push_log(banner);
     }
     for item in initial_transcript {
         app.push_transcript_item(item);
@@ -8182,6 +8195,7 @@ impl TuiApp {
                 onboarding_summary,
                 languages: String::new(),
                 skip_resume_picker: false,
+                update_banner: None,
             },
             clipboard,
         )
