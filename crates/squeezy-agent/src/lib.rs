@@ -3644,7 +3644,6 @@ impl TurnRuntime {
         // text at the end) keeps ordinals stable between what streamed
         // into the TUI and what lands in the transcript.
         let mut assistant_message = String::new();
-        let mut pending_reasoning: Option<ReasoningPayload> = None;
         self.log_event(
             "user_message",
             Some(self.turn_id),
@@ -3914,7 +3913,27 @@ impl TurnRuntime {
                         }
                     }
                     LlmEvent::ReasoningDone(payload) => {
-                        pending_reasoning = Some(payload);
+                        let snapshot = ReasoningSnapshot::from_payload(payload.clone());
+                        // Push the opaque blob into the conversation now so the
+                        // model gets it back on every subsequent provider call
+                        // in this turn (tool result → next model call → ...),
+                        // not just at the end. Mirrors codex: each reasoning
+                        // segment is committed when it closes.
+                        conversation.push(redact_input_item(
+                            LlmInputItem::Reasoning(payload),
+                            &self.redactor,
+                        ));
+                        if self
+                            .tx
+                            .send(AgentEvent::ReasoningSegment {
+                                turn_id: self.turn_id,
+                                snapshot,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
                     }
                     LlmEvent::ToolCall(tool_call) => {
                         let call = ToolCall {
@@ -3990,22 +4009,10 @@ impl TurnRuntime {
                     self.record_replay_model_text_delta(&tail);
                 }
                 broker.metrics.redactions += assistant_stream.total_redactions();
-                let reasoning_snapshot = pending_reasoning
-                    .take()
-                    .map(ReasoningSnapshot::from_payload);
-                let message = TranscriptItem::assistant_with_reasoning(
-                    std::mem::take(&mut assistant_message),
-                    reasoning_snapshot.clone(),
-                );
-                // `assistant_stream` has already redacted the text via
-                // `StreamRedactor`, so this push is idempotent w.r.t. the
-                // conversation invariant.
-                if let Some(snapshot) = &reasoning_snapshot {
-                    conversation.push(redact_input_item(
-                        LlmInputItem::Reasoning(snapshot.payload.clone()),
-                        &self.redactor,
-                    ));
-                }
+                let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
+                // Reasoning blobs and segment events have already been pushed
+                // by the `LlmEvent::ReasoningDone` arm above; only the
+                // assistant text remains.
                 conversation.push(redact_input_item(
                     LlmInputItem::AssistantText(message.content.clone()),
                     &self.redactor,
@@ -4048,19 +4055,7 @@ impl TurnRuntime {
                 }
                 self.record_replay_model_completed(response_id.clone(), &completed_cost);
                 broker.metrics.redactions += assistant_stream.total_redactions();
-                let reasoning_snapshot = pending_reasoning
-                    .take()
-                    .map(ReasoningSnapshot::from_payload);
-                let message = TranscriptItem::assistant_with_reasoning(
-                    std::mem::take(&mut assistant_message),
-                    reasoning_snapshot.clone(),
-                );
-                if let Some(snapshot) = &reasoning_snapshot {
-                    conversation.push(redact_input_item(
-                        LlmInputItem::Reasoning(snapshot.payload.clone()),
-                        &self.redactor,
-                    ));
-                }
+                let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
                 conversation.push(redact_input_item(
                     LlmInputItem::AssistantText(message.content.clone()),
                     &self.redactor,
@@ -4170,12 +4165,6 @@ impl TurnRuntime {
                     }
                 })
                 .collect::<Vec<_>>();
-            if let Some(payload) = pending_reasoning.take() {
-                conversation.push(redact_input_item(
-                    LlmInputItem::Reasoning(payload),
-                    &self.redactor,
-                ));
-            }
             conversation.extend(
                 tool_calls
                     .iter()
@@ -8838,6 +8827,14 @@ pub enum AgentEvent {
     ReasoningDelta {
         turn_id: TurnId,
         delta: String,
+    },
+    /// A reasoning block has finished streaming. Carries the provider-tagged
+    /// payload so the TUI can store the segment as its own collapsible
+    /// transcript entry and clear the live "thinking..." buffer before the
+    /// next block (or tool call, or text) starts.
+    ReasoningSegment {
+        turn_id: TurnId,
+        snapshot: ReasoningSnapshot,
     },
     ToolCallQueued {
         turn_id: TurnId,

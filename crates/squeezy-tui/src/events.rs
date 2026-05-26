@@ -38,6 +38,17 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.pending_reasoning.push_str(&delta);
                     }
                 }
+                AgentEvent::ReasoningSegment { snapshot, .. } => {
+                    // Each reasoning block ends with its own segment event.
+                    // Drop the live "thinking..." buffer (the next block will
+                    // start fresh) and persist the segment as its own
+                    // collapsible transcript entry so the user can still
+                    // read it after tools or text move on.
+                    app.pending_reasoning.clear();
+                    if app.show_reasoning_usage && !snapshot.display_text.trim().is_empty() {
+                        app.push_reasoning_segment(snapshot);
+                    }
+                }
                 AgentEvent::AssistantDelta { delta, .. } => {
                     let extracted = app.proposed_plan.feed(&delta);
                     if !extracted.passthrough.is_empty() {

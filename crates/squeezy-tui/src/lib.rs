@@ -3853,6 +3853,15 @@ fn format_transcript_entry_with_width(
         ),
         TranscriptEntryKind::Log(message) => format_log_entry(message, entry.collapsed, selected),
         TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, entry.collapsed),
+        TranscriptEntryKind::Reasoning(snapshot) => {
+            if show_reasoning {
+                let mut lines = reasoning_block_lines(&snapshot.display_text, entry.collapsed);
+                lines.push(Line::from(""));
+                lines
+            } else {
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -7457,6 +7466,15 @@ impl TuiApp {
         ));
     }
 
+    pub(crate) fn push_reasoning_segment(&mut self, snapshot: squeezy_core::ReasoningSnapshot) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::reasoning(
+            id,
+            snapshot,
+            self.transcript_default,
+        ));
+    }
+
     fn push_entry(&mut self, entry: TranscriptEntry) {
         self.transcript.push(entry);
     }
@@ -7547,6 +7565,19 @@ impl TranscriptEntry {
         }
     }
 
+    fn reasoning(
+        id: u64,
+        snapshot: squeezy_core::ReasoningSnapshot,
+        _transcript_default: TranscriptDefault,
+    ) -> Self {
+        Self {
+            id,
+            kind: TranscriptEntryKind::Reasoning(Box::new(snapshot)),
+            // Always collapsed at first; the user can expand with Ctrl-E.
+            collapsed: true,
+        }
+    }
+
     fn matches_category(&self, category: TranscriptCategory) -> bool {
         match category {
             TranscriptCategory::All => true,
@@ -7587,6 +7618,9 @@ impl TranscriptEntry {
                 let body = proposed_plan::read_plan_body(&data.path).unwrap_or_default();
                 vec![format!("plan {}\n{body}", data.plan_id)]
             }
+            TranscriptEntryKind::Reasoning(snapshot) => {
+                vec![format!("reasoning: {}", snapshot.display_text)]
+            }
         }
     }
 
@@ -7609,6 +7643,9 @@ impl TranscriptEntry {
             TranscriptEntryKind::ToolResult(_) => true,
             TranscriptEntryKind::Log(message) => text_has_collapsible_content(message),
             TranscriptEntryKind::PlanCard(_) => true,
+            TranscriptEntryKind::Reasoning(snapshot) => {
+                text_has_collapsible_content(&snapshot.display_text)
+            }
         }
     }
 
@@ -7634,6 +7671,11 @@ impl TranscriptEntry {
                 proposed_plan::read_plan_body(&data.path).unwrap_or_default(),
                 format!("transcript:{}", self.id),
             ),
+            TranscriptEntryKind::Reasoning(snapshot) => (
+                "reasoning".to_string(),
+                snapshot.display_text.clone(),
+                format!("transcript:{}", self.id),
+            ),
         }
     }
 }
@@ -7647,6 +7689,10 @@ enum TranscriptEntryKind {
     /// plan file. The body is loaded from disk at render time so the
     /// cell tracks in-place refinements and survives compaction.
     PlanCard(Box<render::plan_card::PlanCardData>),
+    /// A finalized reasoning segment from the model. Stored separately
+    /// so each reasoning block becomes its own grey collapsible entry
+    /// instead of being pinned to the next assistant message.
+    Reasoning(Box<squeezy_core::ReasoningSnapshot>),
 }
 
 #[derive(Debug, Clone)]
