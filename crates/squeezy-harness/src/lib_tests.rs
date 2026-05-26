@@ -325,7 +325,12 @@ async fn agent_runner_scopes_tools_to_materialized_workspace_and_counts_tool_cos
         .await
         .expect("agent run");
 
-    assert!(output.final_answer.contains(&path));
+    let normalized_answer = output.final_answer.replace('\\', "/");
+    assert!(
+        normalized_answer.contains(&path),
+        "{:?}",
+        output.final_answer
+    );
     assert_eq!(output.metrics.tool_calls, 1);
     assert!(output.metrics.files_scanned >= 1);
     assert!(output.metrics.bytes_read > 0);

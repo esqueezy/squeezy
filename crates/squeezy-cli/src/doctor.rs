@@ -284,6 +284,7 @@ fn sandbox_check() -> Check {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn which(bin: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     for dir in env::split_paths(&path) {

@@ -16,6 +16,8 @@
 //! source file just to satisfy the unit-test layout would obscure that
 //! these are integration tests.
 
+#![cfg(any(target_os = "macos", target_os = "linux"))]
+
 use std::{
     fs,
     path::{Path, PathBuf},

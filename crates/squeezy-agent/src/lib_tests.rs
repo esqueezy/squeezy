@@ -1001,7 +1001,7 @@ async fn shell_tool_emits_job_events_and_session_events() {
                 call_id: "call_1".to_string(),
                 name: "shell".to_string(),
                 arguments: json!({
-                    "command": "printf job-ok",
+                    "command": "echo job-ok",
                     "description": "print a marker",
                     "timeout_ms": 10_000,
                 }),
@@ -2621,7 +2621,8 @@ fn lazy_tools_index_lists_discoverable_tools_without_core_schemas() {
 
 #[test]
 fn registry_specs_carry_capability_aligned_with_permission_request() {
-    let tools = ToolRegistry::new("/tmp").expect("registry");
+    let root = temp_workspace("agent_registry_specs");
+    let tools = ToolRegistry::new(&root).expect("registry");
     let specs = tools.specs();
     for spec in specs.iter() {
         let call = ToolCall {
@@ -3591,7 +3592,8 @@ fn compaction_drops_orphan_function_call_outputs_from_interleaved_parallel_calls
 
 #[test]
 fn mark_intra_batch_duplicates_stamps_hint_on_second_identical_call() {
-    let tools = ToolRegistry::new("/tmp").expect("registry");
+    let root = temp_workspace("agent_duplicate_tools");
+    let tools = ToolRegistry::new(&root).expect("registry");
     let make_call = |call_id: &str, pattern: &str| ToolCall {
         call_id: call_id.to_string(),
         name: "grep".to_string(),

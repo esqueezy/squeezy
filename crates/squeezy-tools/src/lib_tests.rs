@@ -3505,7 +3505,7 @@ async fn shell_denies_protected_metadata_write_before_spawn() {
 async fn shell_workdir_accepts_configured_extra_root() {
     let root = temp_workspace("shell_extra_workdir");
     let extra = temp_workspace("shell_extra_root");
-    let extra = fs::canonicalize(&extra).expect("canonical extra root");
+    let extra = canonicalize_workspace_root(&extra).expect("canonical extra root");
     let shell_sandbox = squeezy_core::ShellSandboxConfig {
         mode: squeezy_core::ShellSandboxMode::Off,
         write_roots: vec![extra.clone()],
@@ -3807,7 +3807,10 @@ async fn shell_tty_attaches_stdout_to_terminal() {
         )
         .await;
     assert_eq!(tty.status, ToolStatus::Success);
-    assert_eq!(tty.content["stdout"], "tty");
+    // Windows does not yet wire up ConPTY for the shell tool, so `tty: true`
+    // is documented to degrade to pipe-backed stdio on that platform.
+    let expected_tty_output = if cfg!(windows) { "pipe" } else { "tty" };
+    assert_eq!(tty.content["stdout"], expected_tty_output);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -3907,11 +3910,15 @@ async fn shell_exposes_in_flight_ask_socket_when_approver_is_present() {
         let _ = fs::remove_dir_all(root);
         return;
     }
-    assert!(socket.ends_with(".sock"), "{socket}");
-    assert!(
-        !Path::new(socket).exists(),
-        "ask socket should be removed after shell completion"
-    );
+    if cfg!(windows) {
+        assert!(socket.starts_with(r"\\.\pipe\"), "{socket}");
+    } else {
+        assert!(socket.ends_with(".sock"), "{socket}");
+        assert!(
+            !Path::new(socket).exists(),
+            "ask socket should be removed after shell completion"
+        );
+    }
 
     let _ = fs::remove_dir_all(root);
 }
@@ -6828,7 +6835,9 @@ fn shell_sandbox_plan_mode_off_returns_direct() {
 
     assert_eq!(plan.backend, "none");
     assert_eq!(plan.mode, "off");
-    assert_eq!(plan.program, "sh");
+    let shell = ShellProgram::for_command("printf ok");
+    assert_eq!(plan.program, shell.program);
+    assert_eq!(plan.args, shell.args);
     assert!(!plan.required);
 }
 

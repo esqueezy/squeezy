@@ -28,6 +28,32 @@ pub fn crate_name() -> &'static str {
     CRATE_NAME
 }
 
+/// Canonicalize a workspace root and strip the Windows verbatim (`\\?\`)
+/// prefix so the resulting path is safe to hand to Git for Windows and
+/// `Command::current_dir`, both of which mishandle the extended-path form
+/// produced by `fs::canonicalize` on Windows.
+pub fn canonicalize_workspace_root(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
+    fs::canonicalize(path.as_ref()).map(strip_verbatim_prefix)
+}
+
+/// Remove the `\\?\` Windows extended-path prefix from a canonical path so
+/// downstream tools that still rely on legacy Win32 path parsing (such as
+/// Git for Windows) can resolve it. UNC paths (`\\?\UNC\...`) keep their
+/// prefix because the legacy form has no equivalent.
+pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    if !cfg!(windows) {
+        return path;
+    }
+    let s = path.to_string_lossy();
+    let Some(rest) = s.strip_prefix(r"\\?\") else {
+        return path;
+    };
+    if rest.starts_with("UNC\\") || rest.starts_with("UNC/") {
+        return path;
+    }
+    PathBuf::from(rest.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct GitVcs {
     root: PathBuf,
@@ -251,9 +277,7 @@ pub enum RollbackMode {
 
 impl GitVcs {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root
-            .as_ref()
-            .canonicalize()
+        let root = canonicalize_workspace_root(root.as_ref())
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         Ok(Self { root })
     }
@@ -684,9 +708,7 @@ impl GitVcs {
 
 impl CheckpointStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root
-            .as_ref()
-            .canonicalize()
+        let root = canonicalize_workspace_root(root.as_ref())
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let dir = root.join(".squeezy").join("checkpoints");
         let git_dir = dir.join("git");
@@ -1199,8 +1221,10 @@ impl CheckpointStore {
             .lock()
             .map_err(|err| SqueezyError::Tool(format!("checkpoint init lock poisoned: {err}")))?;
         if !self.git_dir.join("HEAD").exists() {
-            fs::create_dir_all(&self.git_dir)?;
-            self.git_raw(["init"])?;
+            if let Some(parent) = self.git_dir.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            self.init_shadow_git_dir()?;
             self.git_raw(["config", "core.autocrlf", "false"])?;
             self.git_raw(["config", "core.fsmonitor", "false"])?;
             self.git_raw(["config", "core.quotepath", "false"])?;
@@ -1218,6 +1242,20 @@ impl CheckpointStore {
             fs::write(&exclude_path, "/.squeezy/\n")?;
         }
         Ok(())
+    }
+
+    fn init_shadow_git_dir(&self) -> Result<()> {
+        git_output_vec_allow_status(
+            &self.root,
+            vec![
+                "init".to_string(),
+                "--bare".to_string(),
+                self.git_dir.to_string_lossy().to_string(),
+            ],
+            &[0],
+        )
+        .map(|_| ())
+        .map_err(SqueezyError::Tool)
     }
 
     fn large_file_fingerprints(&self) -> Result<Vec<LargeFileFingerprint>> {
@@ -1411,7 +1449,8 @@ impl CheckpointStore {
     fn git_raw<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
         git_output_vec_allow_status(
             &self.root,
-            std::iter::once("--git-dir".to_string())
+            std::iter::once("--bare".to_string())
+                .chain(std::iter::once("--git-dir".to_string()))
                 .chain(std::iter::once(self.git_dir.to_string_lossy().to_string()))
                 .chain(args.into_iter().map(str::to_string))
                 .collect(),

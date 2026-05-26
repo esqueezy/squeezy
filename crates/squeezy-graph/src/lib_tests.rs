@@ -447,6 +447,12 @@ fn cargo_compiler_facts_normalize_absolute_paths() {
         .to_path_buf();
     let inside_path = root.join("src/lib.rs");
     let inside_path_str = inside_path.to_string_lossy().into_owned();
+    let outside_path_str = root
+        .parent()
+        .unwrap()
+        .join("squeezy-cargo-outside.rs")
+        .to_string_lossy()
+        .into_owned();
     let mut graph = SemanticGraph::from_parsed(vec![parsed]);
 
     let metadata = cargo_metadata_fixture();
@@ -482,7 +488,7 @@ fn cargo_compiler_facts_normalize_absolute_paths() {
                 "level": "warning",
                 "code": null,
                 "spans": [{
-                    "file_name": "/tmp/squeezy-cargo-outside.rs",
+                    "file_name": outside_path_str,
                     "byte_start": 0,
                     "byte_end": 1,
                     "line_start": 1,

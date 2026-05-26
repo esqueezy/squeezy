@@ -5136,6 +5136,9 @@ fn test_config(mode: SessionMode) -> AppConfig {
             ..Default::default()
         },
         config_sources: vec!["defaults".to_string()],
+        // See `test_agent`: keep the test fixture off the real workspace so
+        // `Agent::new` / `TuiApp::new` don't crawl the repo on every test.
+        workspace_root: temp_workspace("config"),
         ..Default::default()
     }
 }
@@ -5342,8 +5345,13 @@ impl Clipboard for RecordingClipboard {
 }
 
 fn test_agent(mode: SessionMode) -> Agent {
+    // Use a fresh empty temp workspace so the agent's tool registry doesn't
+    // crawl the entire repo (which adds seconds per test, especially on
+    // Windows where filesystem syscalls are slow). The TUI tests never
+    // touch the workspace; they only need a valid `AppConfig`.
     test_agent_with_config(AppConfig {
         session_mode: mode,
+        workspace_root: temp_workspace("agent"),
         ..Default::default()
     })
 }

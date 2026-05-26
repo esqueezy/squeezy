@@ -139,18 +139,10 @@ impl IpcEndpoint {
 }
 
 /// True when `err` indicates the Unix endpoint's `sun_path` exceeded the
-/// platform limit. Always `false` on Windows since pipe names don't have a
-/// hard length cap that surfaces this way.
+/// platform limit.
+#[cfg(unix)]
 pub(crate) fn is_path_too_long(err: &io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        err.to_string().contains("SUN_LEN") || err.raw_os_error() == Some(libc::ENAMETOOLONG)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = err;
-        false
-    }
+    err.to_string().contains("SUN_LEN") || err.raw_os_error() == Some(libc::ENAMETOOLONG)
 }
 
 /// Listening side of the IPC abstraction. Wraps a tokio `UnixListener` on
@@ -218,9 +210,9 @@ impl IpcListener {
                 // pattern).
                 let server = {
                     let mut guard = next_server.lock().await;
-                    guard.take().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::Other, "ipc listener missing prepared server")
-                    })?
+                    guard
+                        .take()
+                        .ok_or_else(|| io::Error::other("ipc listener missing prepared server"))?
                 };
                 server.connect().await?;
                 let prepared = ServerOptions::new().create(name)?;

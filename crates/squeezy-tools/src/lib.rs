@@ -53,6 +53,7 @@ use squeezy_store::{Observation, ObservationKind, SqueezyStore};
 use squeezy_vcs::{
     CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffHunk, DiffMode, DiffOptions,
     DiffSnapshot, GitVcs, RollbackMode, RollbackTarget, WorkspaceSnapshot,
+    canonicalize_workspace_root, strip_verbatim_prefix,
 };
 use squeezy_workspace::{
     CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexCoverage, IndexingPolicy,
@@ -1128,8 +1129,7 @@ impl ToolRegistry {
         runtime: ToolRegistryRuntime,
     ) -> Result<Self> {
         let root = root.into();
-        let root = root
-            .canonicalize()
+        let root = canonicalize_workspace_root(&root)
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let skills = SkillCatalog::discover(&root, &skills_config);
         Self::new_inner_canonical(
@@ -1155,8 +1155,7 @@ impl ToolRegistry {
         runtime: ToolRegistryRuntime,
     ) -> Result<Self> {
         let root = root.into();
-        let root = root
-            .canonicalize()
+        let root = canonicalize_workspace_root(&root)
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let skills = SkillCatalog::discover(&root, &skills_config);
         Self::new_inner_canonical(
@@ -1178,8 +1177,7 @@ impl ToolRegistry {
         runtime: ToolRegistryRuntime,
     ) -> Result<Self> {
         let root = root.into();
-        let root = root
-            .canonicalize()
+        let root = canonicalize_workspace_root(&root)
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         Self::new_inner_canonical(
             root,
@@ -1227,6 +1225,7 @@ impl ToolRegistry {
         } else {
             None
         };
+        let shell_sandbox = normalize_shell_sandbox_paths(config.shell_sandbox);
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -1241,7 +1240,7 @@ impl ToolRegistry {
             redactor,
             crawl_options: Arc::new(crawl_options),
             compiled_policy,
-            shell_sandbox: Arc::new(config.shell_sandbox),
+            shell_sandbox: Arc::new(shell_sandbox),
             shell_sandbox_health: Arc::new(ShellSandboxHealth::default()),
             shell_audit: Arc::new(shell_audit),
             shell_workdir_locks: Arc::new(StdMutex::new(HashMap::new())),
@@ -1263,8 +1262,7 @@ impl ToolRegistry {
         http: Arc<dyn WebHttpClient>,
     ) -> Result<Self> {
         let root = root.into();
-        let root = root
-            .canonicalize()
+        let root = canonicalize_workspace_root(&root)
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let output_store = ToolOutputStore::new(&root, output_config)?;
         let crawl_options = CrawlOptions::default();
@@ -1478,7 +1476,7 @@ impl ToolRegistry {
     ) -> Option<ExclusionReason> {
         let size_bytes = file_len(path).ok()?;
         self.compiled_policy.file_reason(
-            &rel.to_string_lossy(),
+            &workspace_path(rel),
             size_bytes,
             self.crawl_options.max_file_bytes,
             prefix,
@@ -3614,14 +3612,15 @@ impl ToolRegistry {
             }
         };
         let rel = self.relative(&path);
+        let rel_str = workspace_path(&rel);
         if !diff_mode && args.diff_only.unwrap_or(false) {
             let diff_paths =
                 diff_path_set(&self.diff_snapshot(DiffMode::Worktree, DiffOptions::default()));
-            if !diff_paths.contains(rel.to_string_lossy().as_ref()) {
+            if !diff_paths.contains(rel_str.as_str()) {
                 return make_result(
                     call,
                     ToolStatus::Denied,
-                    json!({ "error": "refusing to read a clean file because diff_only=true", "path": rel.to_string_lossy() }),
+                    json!({ "error": "refusing to read a clean file because diff_only=true", "path": rel_str }),
                     ToolCostHint::default(),
                     None,
                 );
@@ -3637,7 +3636,6 @@ impl ToolRegistry {
             );
         }
         if diff_mode {
-            let rel_str = rel.to_string_lossy().to_string();
             let ctx = ReadSliceDiffCtx {
                 call,
                 args: &args,
@@ -3651,7 +3649,7 @@ impl ToolRegistry {
             };
             return self.execute_read_slice_diff_blocking(&ctx);
         }
-        let path = match path.canonicalize() {
+        let path = match canonicalize_workspace_root(&path) {
             Ok(path) => path,
             Err(err) => {
                 return tool_error(
@@ -3698,7 +3696,7 @@ impl ToolRegistry {
         };
         let mut packet = evidence_packet(
             "read_slice returned a bounded exact file slice",
-            vec![span_for_path_json(rel.to_string_lossy(), resolved_span)],
+            vec![span_for_path_json(&rel_str, resolved_span)],
             confidence,
             Freshness::Fresh,
             provenance,
@@ -3706,7 +3704,7 @@ impl ToolRegistry {
             json!({
                 "tool": "read_file",
                 "arguments": {
-                    "path": rel.to_string_lossy(),
+                    "path": &rel_str,
                     "offset": end,
                     "limit": DEFAULT_READ_LIMIT
                 },
@@ -3714,7 +3712,7 @@ impl ToolRegistry {
             }),
         );
         if let Some(object) = packet.as_object_mut() {
-            object.insert("path".to_string(), json!(rel.to_string_lossy()));
+            object.insert("path".to_string(), json!(&rel_str));
             object.insert("offset".to_string(), json!(offset));
             object.insert("bytes_returned".to_string(), json!(bytes.len()));
         }
@@ -3722,7 +3720,7 @@ impl ToolRegistry {
         payload.insert("tool".to_string(), json!("read_slice"));
         payload.insert("graph_available".to_string(), json!(graph.is_some()));
         payload.insert("graph_status".to_string(), json!(graph_status));
-        payload.insert("path".to_string(), json!(rel.to_string_lossy()));
+        payload.insert("path".to_string(), json!(&rel_str));
         payload.insert("offset".to_string(), json!(offset));
         payload.insert("bytes_returned".to_string(), json!(bytes.len()));
         payload.insert("total_bytes".to_string(), json!(total_bytes));
@@ -4391,7 +4389,8 @@ impl ToolRegistry {
             if !include_ignored && self.policy_exclusion_for_file(path, &rel, None).is_some() {
                 continue;
             }
-            if diff_only && !diff_paths.contains(rel.to_string_lossy().as_ref()) {
+            let rel_str = workspace_path(&rel);
+            if diff_only && !diff_paths.contains(rel_str.as_str()) {
                 continue;
             }
             if is_secret_path(&rel) {
@@ -4406,7 +4405,7 @@ impl ToolRegistry {
                 skipped_paths += 1;
                 continue;
             }
-            paths.push(json!(rel.to_string_lossy()));
+            paths.push(json!(rel_str));
             cost.matches_returned += 1;
         }
 
@@ -4525,7 +4524,8 @@ impl ToolRegistry {
             if !include_ignored && self.policy_exclusion_for_file(path, &rel, None).is_some() {
                 continue;
             }
-            if diff_only && !diff_paths.contains(rel.to_string_lossy().as_ref()) {
+            let rel_str = workspace_path(&rel);
+            if diff_only && !diff_paths.contains(rel_str.as_str()) {
                 continue;
             }
             if include
@@ -4576,7 +4576,7 @@ impl ToolRegistry {
                     GrepOutputMode::Content => {
                         let line = truncate_text(line, 500);
                         let next = json!({
-                            "path": rel.to_string_lossy(),
+                            "path": &rel_str,
                             "line": line_index + 1,
                             "text": line,
                         });
@@ -4591,7 +4591,7 @@ impl ToolRegistry {
                         matches.push(next);
                     }
                     GrepOutputMode::FilesWithMatches => {
-                        if paths.insert(rel.to_string_lossy().to_string()) {
+                        if paths.insert(rel_str.clone()) {
                             cost.matches_returned += 1;
                         }
                     }
@@ -4661,14 +4661,15 @@ impl ToolRegistry {
             Err(err) => return tool_error(call, err),
         };
         let rel = self.relative(&path);
+        let rel_str = workspace_path(&rel);
         if args.diff_only.unwrap_or(false) {
             let diff_paths =
                 diff_path_set(&self.diff_snapshot(DiffMode::Worktree, DiffOptions::default()));
-            if !diff_paths.contains(rel.to_string_lossy().as_ref()) {
+            if !diff_paths.contains(rel_str.as_str()) {
                 return make_result(
                     call,
                     ToolStatus::Denied,
-                    json!({ "error": "refusing to read a clean file because diff_only=true", "path": rel.to_string_lossy() }),
+                    json!({ "error": "refusing to read a clean file because diff_only=true", "path": rel_str }),
                     ToolCostHint::default(),
                     None,
                 );
@@ -4705,43 +4706,42 @@ impl ToolRegistry {
             Err(err) => return tool_error(call, err),
         };
         let projected_end = offset.saturating_add(limit).min(total_bytes as usize);
-        if let Some(store) = self.state_store.as_deref() {
-            let rel_str = rel.to_string_lossy();
-            if let Ok(snapshots) = store.read_snapshots_for_path(rel_str.as_ref()) {
-                let prior = snapshots
-                    .iter()
-                    .filter(|snap| {
-                        snap.start_byte == offset as u64
-                            && snap.end_byte == projected_end as u64
-                            && snap.tool_name == "read_file"
-                    })
-                    .filter(|snap| snap.content_sha256.as_deref() == Some(content_sha256.as_str()))
-                    .max_by_key(|snap| snap.created_unix_millis);
-                if let Some(snap) = prior {
-                    return make_result(
-                        call,
-                        ToolStatus::Success,
-                        json!({
-                            "tool": "read_file",
-                            "path": rel_str,
-                            "offset": offset,
-                            "bytes_returned": 0,
-                            "total_bytes": total_bytes,
-                            "sha256": &content_sha256,
-                            "unchanged": true,
-                            "receipt_stub": true,
-                            "dedup": true,
-                            "same_as_call_id": snap.call_id,
-                            "same_as_tool_name": snap.tool_name,
-                            "original_output_sha256": snap.stable_output_sha256,
-                            "original_content_sha256": snap.content_sha256,
-                            "original_model_output_bytes": snap.model_output_bytes,
-                            "truncated": false,
-                        }),
-                        ToolCostHint::default(),
-                        Some(content_sha256.clone()),
-                    );
-                }
+        if let Some(store) = self.state_store.as_deref()
+            && let Ok(snapshots) = store.read_snapshots_for_path(rel_str.as_str())
+        {
+            let prior = snapshots
+                .iter()
+                .filter(|snap| {
+                    snap.start_byte == offset as u64
+                        && snap.end_byte == projected_end as u64
+                        && snap.tool_name == "read_file"
+                })
+                .filter(|snap| snap.content_sha256.as_deref() == Some(content_sha256.as_str()))
+                .max_by_key(|snap| snap.created_unix_millis);
+            if let Some(snap) = prior {
+                return make_result(
+                    call,
+                    ToolStatus::Success,
+                    json!({
+                        "tool": "read_file",
+                        "path": &rel_str,
+                        "offset": offset,
+                        "bytes_returned": 0,
+                        "total_bytes": total_bytes,
+                        "sha256": &content_sha256,
+                        "unchanged": true,
+                        "receipt_stub": true,
+                        "dedup": true,
+                        "same_as_call_id": snap.call_id,
+                        "same_as_tool_name": snap.tool_name,
+                        "original_output_sha256": snap.stable_output_sha256,
+                        "original_content_sha256": snap.content_sha256,
+                        "original_model_output_bytes": snap.model_output_bytes,
+                        "truncated": false,
+                    }),
+                    ToolCostHint::default(),
+                    Some(content_sha256.clone()),
+                );
             }
         }
 
@@ -4759,7 +4759,7 @@ impl ToolRegistry {
         };
 
         let mut payload = serde_json::Map::new();
-        payload.insert("path".to_string(), json!(rel.to_string_lossy()));
+        payload.insert("path".to_string(), json!(&rel_str));
         payload.insert("offset".to_string(), json!(offset));
         payload.insert("bytes_returned".to_string(), json!(bytes.len()));
         payload.insert("total_bytes".to_string(), json!(total_bytes));
@@ -6943,16 +6943,14 @@ impl ToolRegistry {
 
     fn resolve_existing(&self, raw: &str) -> std::result::Result<PathBuf, String> {
         let candidate = self.join_workspace(raw)?;
-        let canonical = candidate
-            .canonicalize()
+        let canonical = canonicalize_workspace_root(&candidate)
             .map_err(|err| format!("path does not exist or is inaccessible: {err}"))?;
         self.ensure_inside(canonical)
     }
 
     fn resolve_shell_workdir(&self, raw: &str) -> std::result::Result<PathBuf, String> {
         let candidate = self.join_shell_path(raw)?;
-        let canonical = candidate
-            .canonicalize()
+        let canonical = canonicalize_workspace_root(&candidate)
             .map_err(|err| format!("path does not exist or is inaccessible: {err}"))?;
         if !canonical.is_dir() {
             return Err("path is not a directory".to_string());
@@ -6979,8 +6977,7 @@ impl ToolRegistry {
         let parent = candidate
             .parent()
             .ok_or_else(|| "path has no parent".to_string())?;
-        let parent = parent
-            .canonicalize()
+        let parent = canonicalize_workspace_root(parent)
             .map_err(|err| format!("parent directory does not exist or is inaccessible: {err}"))?;
         self.ensure_inside(parent)?;
         Ok(candidate)
@@ -10347,7 +10344,7 @@ fn verify_command_plan(
         .map(|manifest| {
             format!(
                 "cargo test --manifest-path {} --message-format=json",
-                shell_quote(&manifest.to_string_lossy())
+                shell_quote_path(manifest)
             )
         })
         .collect::<Vec<_>>();
@@ -10359,7 +10356,7 @@ fn verify_command_plan(
                 .map(|manifest| {
                     format!(
                         "cargo fmt --check --manifest-path {}",
-                        shell_quote(&manifest.to_string_lossy())
+                        shell_quote_path(manifest)
                     )
                 })
                 .collect::<Vec<_>>();
@@ -10368,7 +10365,7 @@ fn verify_command_plan(
                 .map(|manifest| {
                     format!(
                         "cargo clippy --manifest-path {} --all-targets --message-format=json -- -D warnings",
-                        shell_quote(&manifest.to_string_lossy())
+                        shell_quote_path(manifest)
                     )
                 })
                 .collect::<Vec<_>>();
@@ -10547,6 +10544,32 @@ fn shell_quote(value: &str) -> String {
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    let normalized = workspace_path(path);
+    shell_quote(&normalized)
+}
+
+fn workspace_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Strip the Windows verbatim (`\\?\`) prefix from configured shell sandbox
+/// roots so that comparisons against canonicalized workdirs (which also have
+/// the prefix stripped) match. Without this, sandbox config that came from
+/// `fs::canonicalize` would not align with workdirs canonicalized through
+/// `canonicalize_workspace_root`.
+fn normalize_shell_sandbox_paths(mut config: ShellSandboxConfig) -> ShellSandboxConfig {
+    if cfg!(windows) {
+        for root in config.read_roots.iter_mut() {
+            *root = strip_verbatim_prefix(std::mem::take(root));
+        }
+        for root in config.write_roots.iter_mut() {
+            *root = strip_verbatim_prefix(std::mem::take(root));
+        }
+    }
+    config
 }
 
 fn annotate_graph(manager: &mut GraphManager, snapshot: &DiffSnapshot) {
@@ -12652,7 +12675,7 @@ fn prepare_shell_sandbox_plan_with_probe(
             );
         }
         let shell = ShellProgram::for_command(command);
-        return Ok(ShellSandboxPlan {
+        Ok(ShellSandboxPlan {
             program: shell.program,
             args: shell.args,
             backend: "windows-job-object",
@@ -12671,35 +12694,27 @@ fn prepare_shell_sandbox_plan_with_probe(
             fallback_reason: Some(
                 "windows: process-tree cleanup via Job Object; no FS/network isolation".to_string(),
             ),
-        });
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        if required {
-            return Err(format!(
-                "required shell sandbox unavailable on {}",
-                std::env::consts::OS
-            ));
-        }
+        })
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            if required {
+                return Err(format!(
+                    "required shell sandbox unavailable on {}",
+                    std::env::consts::OS
+                ));
+            }
+        }
+
         Ok(ShellSandboxPlan::direct_with_fallback(
             command,
             config.mode,
             config,
             fallback_reason,
         ))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // Unreachable: the Windows arm above always returns. This branch
-        // exists only so the function has a tail expression of the right
-        // type for non-Windows targets without the compiler flagging
-        // unreachable_code on Windows.
-        unreachable!()
     }
 }
 
@@ -12816,6 +12831,7 @@ fn macos_read_roots() -> Vec<PathBuf> {
     roots
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn shell_writable_roots(root: &Path, config: &ShellSandboxConfig) -> Vec<PathBuf> {
     let mut roots = vec![
         root.to_path_buf(),
