@@ -1328,16 +1328,33 @@ fn save_status_line(
             cfg.tui.status_line = if slug_list.is_empty() {
                 None
             } else {
-                Some(slug_list)
+                Some(slug_list.clone())
             };
             cfg.tui.status_line_use_colors = use_colors;
             agent.replace_config(cfg);
             app.status_line_items = Some(items);
             app.status_line_use_colors = use_colors;
             app.status = format!("status line saved to {}", target_path.display());
+            let summary = if slug_list.is_empty() {
+                format!(
+                    "status line cleared (colors {}); written to {}",
+                    if use_colors { "on" } else { "off" },
+                    target_path.display(),
+                )
+            } else {
+                format!(
+                    "status line saved: {} (colors {}); written to {}",
+                    slug_list.join(", "),
+                    if use_colors { "on" } else { "off" },
+                    target_path.display(),
+                )
+            };
+            app.push_transcript_item(TranscriptItem::system(summary));
         }
         Err(err) => {
-            app.status = format!("/statusline save failed: {err}");
+            let msg = format!("/statusline save failed: {err}");
+            app.status = msg.clone();
+            app.push_transcript_item(TranscriptItem::system(msg));
         }
     }
 }
@@ -3505,6 +3522,26 @@ fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
+    if app.transcript_overlay.is_some() {
+        render_transcript_overlay(frame, area, app);
+        return;
+    }
+    if let Some(state) = &app.status_line_setup {
+        let notif_h = app.app_notifications.height();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(if notif_h > 0 {
+                vec![Constraint::Min(0), Constraint::Length(notif_h)]
+            } else {
+                vec![Constraint::Min(0)]
+            })
+            .split(area);
+        status_line_setup::render(frame, chunks[0], state, app);
+        if notif_h > 0 {
+            render_notification_pane(frame, chunks[1], app);
+        }
+        return;
+    }
     if let Some(state) = &app.config_screen {
         let notif_h = app.app_notifications.height();
         let chunks = Layout::default()
@@ -7526,7 +7563,7 @@ pub(crate) fn count_plan_steps(body: &str) -> usize {
         .count()
 }
 
-fn title_case_mode(mode: SessionMode) -> &'static str {
+pub(crate) fn title_case_mode(mode: SessionMode) -> &'static str {
     match mode {
         SessionMode::Plan => "Plan",
         SessionMode::Build => "Build",
@@ -7558,34 +7595,63 @@ fn format_status_tokens(app: &TuiApp) -> String {
 }
 
 fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
-    let mut lines = vec![format_status_overview_line(app, width)];
     let hints_span = Span::styled(format_status_hints(app), Style::default().fg(QUIET));
-    // Only render the codex-style detail line when the user has explicitly
-    // configured `[tui].status_line` via /statusline. When the key is unset
-    // the default is the original two-row layout (overview + hints).
     let detail = configured_status_line_items(app).and_then(|items| {
         status::render_status_detail_line(app, &items, app.status_line_use_colors)
     });
-    if let Some(mut line) = detail {
-        line.spans.push(Span::styled(
-            " · ",
-            Style::default().fg(QUIET).add_modifier(Modifier::DIM),
-        ));
-        line.spans.push(hints_span);
-        lines.push(line);
+    // When the user has configured `[tui].status_line`, the detail items
+    // take the place of `dir … · git …` on row 1 (otherwise both rows
+    // duplicate the same data). Mode label stays right-aligned. Without a
+    // configured list, fall back to the historical overview layout.
+    let top = match detail {
+        Some(detail_line) => compose_status_overview_with_detail(detail_line, app, width),
+        None => format_status_overview_line(app, width),
+    };
+    let bottom = if detail_was_present(app) {
+        Line::from(hints_span)
     } else if app.status_verbosity == StatusVerbosity::Verbose {
-        lines.push(Line::from(Span::styled(
+        Line::from(Span::styled(
             format!(
                 "{} · {}",
                 format_status_details(app),
                 format_status_hints(app)
             ),
             Style::default().fg(QUIET),
-        )));
+        ))
     } else {
-        lines.push(Line::from(hints_span));
-    }
-    lines
+        Line::from(hints_span)
+    };
+    vec![top, bottom]
+}
+
+/// Right-align the mode label on a status row whose left side is the
+/// codex-style detail line. Mirrors [`format_status_overview_line`]'s
+/// alignment math but preserves the detail line's styled spans.
+fn compose_status_overview_with_detail(
+    mut detail: Line<'static>,
+    app: &TuiApp,
+    width: u16,
+) -> Line<'static> {
+    let right = mode_status_text(app);
+    let right_width = right.chars().count();
+    let detail_width: usize = detail
+        .spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum();
+    let padding_width = (width as usize)
+        .saturating_sub(detail_width.saturating_add(right_width))
+        .max(1);
+    detail.spans.push(Span::raw(" ".repeat(padding_width)));
+    detail.spans.push(Span::styled(
+        right,
+        Style::default().fg(mode_status_color(app.mode)),
+    ));
+    detail
+}
+
+fn detail_was_present(app: &TuiApp) -> bool {
+    configured_status_line_items(app).is_some()
 }
 
 /// User-configured `[tui].status_line`. `None` when the TOML key is unset
