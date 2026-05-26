@@ -30,8 +30,8 @@ use squeezy_core::{
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
-    RequestTokenEstimate, capabilities_for, estimate_cost, estimate_request_context_calibrated,
-    fetch_ollama_context_window,
+    ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate, capabilities_for, estimate_cost,
+    estimate_request_context_calibrated, fetch_ollama_context_window,
 };
 use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
@@ -449,8 +449,10 @@ pub struct ConversationShape {
     pub assistant_text: usize,
     pub function_calls: usize,
     pub function_outputs: usize,
+    pub reasoning_items: usize,
     pub text_bytes: usize,
     pub tool_output_bytes: usize,
+    pub reasoning_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3898,6 +3900,42 @@ impl TurnRuntime {
                             return Ok(());
                         }
                     }
+                    LlmEvent::ReasoningDelta { text, .. } => {
+                        if self
+                            .tx
+                            .send(AgentEvent::ReasoningDelta {
+                                turn_id: self.turn_id,
+                                delta: text,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
+                    LlmEvent::ReasoningDone(payload) => {
+                        let snapshot = ReasoningSnapshot::from_payload(payload.clone());
+                        // Push the opaque blob into the conversation now so the
+                        // model gets it back on every subsequent provider call
+                        // in this turn (tool result → next model call → ...),
+                        // not just at the end. Mirrors codex: each reasoning
+                        // segment is committed when it closes.
+                        conversation.push(redact_input_item(
+                            LlmInputItem::Reasoning(payload),
+                            &self.redactor,
+                        ));
+                        if self
+                            .tx
+                            .send(AgentEvent::ReasoningSegment {
+                                turn_id: self.turn_id,
+                                snapshot,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
                     LlmEvent::ToolCall(tool_call) => {
                         let call = ToolCall {
                             call_id: tool_call.call_id,
@@ -3973,6 +4011,10 @@ impl TurnRuntime {
                 }
                 broker.metrics.redactions += assistant_stream.total_redactions();
                 let raw_assistant_text = std::mem::take(&mut assistant_message);
+                // Reasoning blobs and segment events have already been pushed
+                // by the `LlmEvent::ReasoningDone` arm above; only the
+                // assistant text remains.
+                //
                 // Conversation state keeps the raw text (including any
                 // `<proposed_plan>` block) so the model retains its own
                 // prior plan when refining next turn. The displayed and
@@ -5414,6 +5456,8 @@ async fn run_subagent_loop(
                         assistant_message.push_str(&chunk.text);
                     }
                 }
+                LlmEvent::ReasoningDelta { .. } => {}
+                LlmEvent::ReasoningDone(_) => {}
                 LlmEvent::ToolCall(tool_call) => {
                     tool_calls.push(ToolCall {
                         call_id: tool_call.call_id,
@@ -7319,7 +7363,10 @@ Working target: {:?}",
             LlmEvent::TextDelta(delta) => text.push_str(&delta),
             LlmEvent::Completed { .. } => break,
             LlmEvent::Cancelled => return None,
-            LlmEvent::Started | LlmEvent::ToolCall(_) => {}
+            LlmEvent::Started
+            | LlmEvent::ToolCall(_)
+            | LlmEvent::ReasoningDelta { .. }
+            | LlmEvent::ReasoningDone(_) => {}
         }
     }
     Some(parse_classifier_verdict(&text))
@@ -7848,6 +7895,10 @@ fn conversation_shape(conversation: &[LlmInputItem]) -> ConversationShape {
                 shape.function_outputs += 1;
                 shape.tool_output_bytes += output.len();
             }
+            LlmInputItem::Reasoning(payload) => {
+                shape.reasoning_items += 1;
+                shape.reasoning_bytes += payload.display_text().len();
+            }
         }
     }
     shape
@@ -8107,6 +8158,58 @@ fn redact_input_item(item: LlmInputItem, redactor: &Redactor) -> LlmInputItem {
         LlmInputItem::FunctionCallOutput { call_id, output } => LlmInputItem::FunctionCallOutput {
             call_id,
             output: redactor.redact(&output).text,
+        },
+        // Reasoning payloads are model-signed blobs. Redacting the opaque
+        // bytes would break replay; redact only the human-readable summary
+        // fields so secrets that surface in the chain-of-thought are hidden
+        // from the TUI without invalidating the signature.
+        LlmInputItem::Reasoning(payload) => {
+            LlmInputItem::Reasoning(redact_reasoning_payload(payload, redactor))
+        }
+    }
+}
+
+fn redact_reasoning_payload(payload: ReasoningPayload, redactor: &Redactor) -> ReasoningPayload {
+    match payload {
+        ReasoningPayload::OpenAi {
+            item_id,
+            summary,
+            encrypted_content,
+        } => ReasoningPayload::OpenAi {
+            item_id,
+            summary: summary
+                .into_iter()
+                .map(|text| redactor.redact(&text).text)
+                .collect(),
+            encrypted_content,
+        },
+        ReasoningPayload::Anthropic { blocks } => ReasoningPayload::Anthropic {
+            blocks: blocks
+                .into_iter()
+                .map(|block| {
+                    let text = if block.text.is_empty() {
+                        block.text
+                    } else {
+                        redactor.redact(&block.text).text
+                    };
+                    squeezy_core::AnthropicThinkingBlock {
+                        kind: block.kind,
+                        text,
+                        signature: block.signature,
+                        data: block.data,
+                    }
+                })
+                .collect(),
+        },
+        ReasoningPayload::Google {
+            summary,
+            thought_signature,
+        } => ReasoningPayload::Google {
+            summary: summary
+                .into_iter()
+                .map(|text| redactor.redact(&text).text)
+                .collect(),
+            thought_signature,
         },
     }
 }
@@ -8545,6 +8648,7 @@ pub(crate) fn llm_input_to_resume_item(item: LlmInputItem) -> ResumeItem {
         LlmInputItem::FunctionCallOutput { call_id, output } => {
             ResumeItem::FunctionCallOutput { call_id, output }
         }
+        LlmInputItem::Reasoning(payload) => ResumeItem::Reasoning { payload },
     }
 }
 
@@ -8569,6 +8673,7 @@ fn resume_item_to_llm_input(item: ResumeItem) -> LlmInputItem {
         ResumeItem::FunctionCallOutput { call_id, output } => {
             LlmInputItem::FunctionCallOutput { call_id, output }
         }
+        ResumeItem::Reasoning { payload } => LlmInputItem::Reasoning(payload),
     }
 }
 
@@ -8728,6 +8833,21 @@ pub enum AgentEvent {
     AssistantDelta {
         turn_id: TurnId,
         delta: String,
+    },
+    /// Incremental reasoning/thinking tokens emitted by the model. Rendered
+    /// in the TUI as a grey transient block; not part of the visible
+    /// assistant message.
+    ReasoningDelta {
+        turn_id: TurnId,
+        delta: String,
+    },
+    /// A reasoning block has finished streaming. Carries the provider-tagged
+    /// payload so the TUI can store the segment as its own collapsible
+    /// transcript entry and clear the live "thinking..." buffer before the
+    /// next block (or tool call, or text) starts.
+    ReasoningSegment {
+        turn_id: TurnId,
+        snapshot: ReasoningSnapshot,
     },
     ToolCallQueued {
         turn_id: TurnId,

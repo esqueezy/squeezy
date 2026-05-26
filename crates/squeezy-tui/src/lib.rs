@@ -3760,6 +3760,7 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             app.tool_output_verbosity,
             message_outcome(&app.transcript, index),
             width,
+            app.show_reasoning_usage,
         ));
     }
     lines
@@ -3771,10 +3772,11 @@ fn format_transcript_entry_expanded(
     tool_output_verbosity: ToolOutputVerbosity,
     outcome: MessageOutcome,
     width: Option<u16>,
+    show_reasoning: bool,
 ) -> Vec<Line<'static>> {
     match &entry.kind {
         TranscriptEntryKind::Message(item) => {
-            format_message_entry_with_width(item, false, selected, outcome, width)
+            format_message_entry_with_width(item, false, selected, outcome, width, show_reasoning)
         }
         TranscriptEntryKind::ToolResult(tool) => {
             format_tool_result_entry(tool, false, selected, tool_output_verbosity, width)
@@ -3782,6 +3784,15 @@ fn format_transcript_entry_expanded(
         TranscriptEntryKind::Log(message) => format_log_entry(message, false, selected),
         TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, false),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, false, selected),
+        TranscriptEntryKind::Reasoning(snapshot) => {
+            if show_reasoning {
+                let mut lines = reasoning_block_lines(&snapshot.display_text, false);
+                lines.push(Line::from(""));
+                lines
+            } else {
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -3803,7 +3814,11 @@ fn transcript_lines_for_render(
             app.tool_output_verbosity,
             message_outcome(&app.transcript, index),
             width,
+            app.show_reasoning_usage,
         ));
+    }
+    if app.show_reasoning_usage && !app.pending_reasoning.trim().is_empty() {
+        lines.extend(streaming_reasoning_lines(&app.pending_reasoning));
     }
     if let Some(pending_assistant) = pending_assistant_display_content(app) {
         lines.extend(assistant_text_lines(
@@ -3817,10 +3832,32 @@ fn transcript_lines_for_render(
     lines
 }
 
+fn streaming_reasoning_lines(text: &str) -> Vec<Line<'static>> {
+    let style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+    let mut lines = vec![Line::from(Span::styled("▾ thinking…".to_string(), style))];
+    for raw in text.lines() {
+        lines.push(Line::from(Span::styled(format!("  {}", raw), style)));
+    }
+    lines.push(Line::from(""));
+    lines
+}
+
 fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
-    pending_assistant_display_content(app)
-        .map(|content| assistant_text_lines(false, turn_coin_span(app), &content, Style::default()))
-        .unwrap_or_default()
+    let mut lines = Vec::new();
+    if app.show_reasoning_usage && !app.pending_reasoning.trim().is_empty() {
+        lines.extend(streaming_reasoning_lines(&app.pending_reasoning));
+    }
+    if let Some(content) = pending_assistant_display_content(app) {
+        lines.extend(assistant_text_lines(
+            false,
+            turn_coin_span(app),
+            &content,
+            Style::default(),
+        ));
+    }
+    lines
 }
 
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
@@ -3982,7 +4019,7 @@ fn format_transcript_entry(
     tool_output_verbosity: ToolOutputVerbosity,
     outcome: MessageOutcome,
 ) -> Vec<Line<'static>> {
-    format_transcript_entry_with_width(entry, selected, tool_output_verbosity, outcome, None)
+    format_transcript_entry_with_width(entry, selected, tool_output_verbosity, outcome, None, true)
 }
 
 fn format_transcript_entry_with_width(
@@ -3991,11 +4028,17 @@ fn format_transcript_entry_with_width(
     tool_output_verbosity: ToolOutputVerbosity,
     outcome: MessageOutcome,
     width: Option<u16>,
+    show_reasoning: bool,
 ) -> Vec<Line<'static>> {
     match &entry.kind {
-        TranscriptEntryKind::Message(item) => {
-            format_message_entry_with_width(item, entry.collapsed, selected, outcome, width)
-        }
+        TranscriptEntryKind::Message(item) => format_message_entry_with_width(
+            item,
+            entry.collapsed,
+            selected,
+            outcome,
+            width,
+            show_reasoning,
+        ),
         TranscriptEntryKind::ToolResult(tool) => format_tool_result_entry(
             tool,
             entry.collapsed,
@@ -4006,6 +4049,15 @@ fn format_transcript_entry_with_width(
         TranscriptEntryKind::Log(message) => format_log_entry(message, entry.collapsed, selected),
         TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, entry.collapsed),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, entry.collapsed, selected),
+        TranscriptEntryKind::Reasoning(snapshot) => {
+            if show_reasoning {
+                let mut lines = reasoning_block_lines(&snapshot.display_text, entry.collapsed);
+                lines.push(Line::from(""));
+                lines
+            } else {
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -4502,7 +4554,7 @@ fn format_message_entry(
     selected: bool,
     outcome: MessageOutcome,
 ) -> Vec<Line<'static>> {
-    format_message_entry_with_width(item, collapsed, selected, outcome, None)
+    format_message_entry_with_width(item, collapsed, selected, outcome, None, true)
 }
 
 fn format_message_entry_with_width(
@@ -4511,12 +4563,13 @@ fn format_message_entry_with_width(
     selected: bool,
     outcome: MessageOutcome,
     width: Option<u16>,
+    show_reasoning: bool,
 ) -> Vec<Line<'static>> {
     if item.role == Role::User {
         return format_user_prompt_entry(item, selected, width);
     }
     if item.role == Role::Assistant {
-        return format_assistant_message_entry(item, collapsed, selected, outcome);
+        return format_assistant_message_entry(item, collapsed, selected, outcome, show_reasoning);
     }
     let (action, color) = role_action(&item.role);
     let failed = outcome == MessageOutcome::Failed;
@@ -4627,28 +4680,69 @@ fn format_assistant_message_entry(
     collapsed: bool,
     selected: bool,
     outcome: MessageOutcome,
+    show_reasoning: bool,
 ) -> Vec<Line<'static>> {
     let color = if outcome == MessageOutcome::Failed {
         ERROR_RED
     } else {
         SUCCESS_GREEN
     };
-    let mut lines = if collapsed {
-        vec![assistant_line(
+    let mut lines = Vec::new();
+    if show_reasoning
+        && let Some(snapshot) = item.reasoning.as_ref()
+        && !snapshot.display_text.trim().is_empty()
+    {
+        lines.extend(reasoning_block_lines(&snapshot.display_text, collapsed));
+    }
+    if collapsed {
+        lines.push(assistant_line(
             selected,
             assistant_static_span(color),
             collapsed_content_summary(&item.content),
             Style::default(),
-        )]
+        ));
     } else {
-        assistant_text_lines(
+        lines.extend(assistant_text_lines(
             selected,
             assistant_static_span(color),
             &item.content,
             Style::default(),
-        )
-    };
+        ));
+    }
     lines.push(Line::from(""));
+    lines
+}
+
+fn reasoning_block_lines(text: &str, collapsed: bool) -> Vec<Line<'static>> {
+    let style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+    let mut lines = Vec::new();
+    let body_lines: Vec<&str> = text.lines().collect();
+    if collapsed {
+        let summary = body_lines
+            .first()
+            .copied()
+            .map(|first| compact_text(first, 120))
+            .unwrap_or_default();
+        let suffix = if body_lines.len() > 1 {
+            format!(" … +{} lines (Ctrl-E to expand)", body_lines.len() - 1)
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("▸ reasoning: {summary}{suffix}"),
+            style,
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("▾ reasoning ({} lines)", body_lines.len().max(1)),
+            style,
+        )));
+        for raw in body_lines {
+            lines.push(Line::from(Span::styled(format!("  {}", raw), style)));
+        }
+    }
     lines
 }
 
@@ -7542,6 +7636,10 @@ pub(crate) struct TuiApp {
     pub(crate) next_entry_id: u64,
     pub(crate) transcript_scroll_from_bottom: u16,
     pub(crate) pending_assistant: streaming::StreamingController,
+    /// Streaming buffer for reasoning/thinking deltas emitted during the
+    /// current turn. Rendered as a grey transient block above the
+    /// assistant text; cleared at turn completion.
+    pub(crate) pending_reasoning: String,
     pub(crate) proposed_plan: proposed_plan::ProposedPlanExtractor,
     pub(crate) workspace_root: PathBuf,
     /// Session id assigned by the agent. Plan-mode IO (persist, prune,
@@ -7752,6 +7850,7 @@ impl TuiApp {
             next_entry_id,
             transcript_scroll_from_bottom: 0,
             pending_assistant: streaming::StreamingController::new(),
+            pending_reasoning: String::new(),
             proposed_plan: proposed_plan::ProposedPlanExtractor::new(),
             workspace_root: config.workspace_root.clone(),
             session_id: None,
@@ -7949,6 +8048,15 @@ impl TuiApp {
         self.push_entry(TranscriptEntry::diff_card(id, data));
     }
 
+    pub(crate) fn push_reasoning_segment(&mut self, snapshot: squeezy_core::ReasoningSnapshot) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::reasoning(
+            id,
+            snapshot,
+            self.transcript_default,
+        ));
+    }
+
     fn push_entry(&mut self, entry: TranscriptEntry) {
         self.transcript.push(entry);
     }
@@ -8055,6 +8163,19 @@ impl TranscriptEntry {
         }
     }
 
+    fn reasoning(
+        id: u64,
+        snapshot: squeezy_core::ReasoningSnapshot,
+        _transcript_default: TranscriptDefault,
+    ) -> Self {
+        Self {
+            id,
+            kind: TranscriptEntryKind::Reasoning(Box::new(snapshot)),
+            // Always collapsed at first; the user can expand with Ctrl-E.
+            collapsed: true,
+        }
+    }
+
     fn matches_category(&self, category: TranscriptCategory) -> bool {
         match category {
             TranscriptCategory::All => true,
@@ -8099,6 +8220,9 @@ impl TranscriptEntry {
             TranscriptEntryKind::Diff(data) => {
                 vec![format!("diff ({})\n{}", data.summary, data.plain)]
             }
+            TranscriptEntryKind::Reasoning(snapshot) => {
+                vec![format!("reasoning: {}", snapshot.display_text)]
+            }
         }
     }
 
@@ -8122,6 +8246,9 @@ impl TranscriptEntry {
             TranscriptEntryKind::Log(message) => text_has_collapsible_content(message),
             TranscriptEntryKind::PlanCard(_) => true,
             TranscriptEntryKind::Diff(_) => true,
+            TranscriptEntryKind::Reasoning(snapshot) => {
+                text_has_collapsible_content(&snapshot.display_text)
+            }
         }
     }
 
@@ -8152,6 +8279,11 @@ impl TranscriptEntry {
                 data.plain.clone(),
                 format!("transcript:{}", self.id),
             ),
+            TranscriptEntryKind::Reasoning(snapshot) => (
+                "reasoning".to_string(),
+                snapshot.display_text.clone(),
+                format!("transcript:{}", self.id),
+            ),
         }
     }
 }
@@ -8170,6 +8302,10 @@ enum TranscriptEntryKind {
     /// rendered as pre-styled lines using `render::diff`. Stored
     /// pre-rendered so per-frame work is constant.
     Diff(Box<DiffCardData>),
+    /// A finalized reasoning segment from the model. Stored separately
+    /// so each reasoning block becomes its own grey collapsible entry
+    /// instead of being pinned to the next assistant message.
+    Reasoning(Box<squeezy_core::ReasoningSnapshot>),
 }
 
 /// Frozen snapshot of `/diff` output. Lines are pre-rendered with the
@@ -8575,6 +8711,7 @@ fn inline_history_lines_for_flush(
             app.tool_output_verbosity,
             message_outcome(&app.transcript, index),
             Some(width),
+            app.show_reasoning_usage,
         ));
     }
     lines
