@@ -102,6 +102,22 @@ immediately after debounce. There is intentionally no always-on workspace file
 watcher today. If no events arrive, Squeezy polls every 15 seconds as a safety
 net. Refresh recrawls tracked files, compares stable hashes, reparses changed
 files only, removes deleted files, and preserves unchanged graph partitions.
+
+The 250 ms per-tool refresh budget is a hard cap, not a soft hint. Reparse work
+yields with `budget_exhausted=true` on the refresh report once the budget is
+spent and leaves the remaining dirty files queued for the next tool call. This
+keeps `decl_search`, `reference_search`, and other graph tools under a
+predictable latency ceiling even when a branch switch or bulk edit dirties
+hundreds of files, at the cost of letting a small tail of changes settle across
+two or three tool calls instead of one. The alternative — lazy or streaming
+refresh that serves partial results while reparse continues in the background —
+was rejected because it would let stale symbols leak into evidence packets
+with the same `freshness` label as fully-refreshed results, which the
+typed-confidence contract does not allow. Benchmark harnesses or CI gates
+that need a full settle should loop `refresh_before_query` until
+`budget_exhausted` reports `false`, rather than treating a single budgeted
+refresh as authoritative.
+
 Body-only edits replace body-derived facts for that file.
 Signature/module/import edits replace that file's stub and rebuild cross-file
 indexes. JS/TS config edits such as `tsconfig.json` path changes or
