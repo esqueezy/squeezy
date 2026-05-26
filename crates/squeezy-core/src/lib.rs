@@ -3223,7 +3223,9 @@ pub struct ContextCompactionConfig {
     pub repo_doc_max_bytes: usize,
     /// Maximum bytes of `~/.squeezy/MEMORY.md` (or lowercase `memory.md`)
     /// stitched into the base instructions at session start. 0 disables
-    /// ingestion.
+    /// ingestion. The static file is the only cross-session memory
+    /// surface; see `docs/internal/MEMORY_SCOPE.md` for the deferred
+    /// tool-mediated pipeline decision.
     pub user_memory_max_bytes: usize,
     /// When true, the turn loop re-checks token usage between LLM events and
     /// triggers compaction once usage crosses `threshold_percent` of

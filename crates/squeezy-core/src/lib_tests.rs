@@ -2561,3 +2561,27 @@ api_key_env = "OPENAI_API_KEY"
     )
     .expect("api_key + api_key_env both parse cleanly");
 }
+
+#[test]
+fn memory_scope_doc_records_deferred_tool_decision() {
+    let scope_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("docs")
+        .join("internal")
+        .join("MEMORY_SCOPE.md");
+    let body = std::fs::read_to_string(&scope_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", scope_path.display()));
+    assert!(
+        body.contains("user_memory_max_bytes"),
+        "scope doc must anchor to the existing config field"
+    );
+    assert!(
+        body.contains("declines to ship a tool-mediated memory pipeline"),
+        "scope doc must state the deferred decision in absolute terms"
+    );
+    assert!(
+        body.contains("memory_append"),
+        "scope doc must name the staged tool surface for future adoption"
+    );
+}
