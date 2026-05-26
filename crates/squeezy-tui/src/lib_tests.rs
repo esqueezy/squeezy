@@ -2255,6 +2255,48 @@ async fn slash_help_unsupported_points_to_public_resources() {
 }
 
 #[tokio::test]
+async fn slash_fork_branches_into_sibling_session_with_same_transcript() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    // Seed the transcript so we can verify the fork inherits it on the
+    // caller side (the agent-side conversation copy is exercised by the
+    // agent's own integration tests).
+    app.push_transcript_item(TranscriptItem::user("explain this stack trace"));
+    app.push_transcript_item(TranscriptItem::assistant("here's the rundown"));
+    let transcript_before = app.transcript.len();
+
+    let parent_id = agent.session_id().expect("parent session id");
+    assert!(handle_slash_command(&mut app, &mut agent, "/fork").await);
+
+    let child_id = agent.session_id().expect("child session id");
+    assert_ne!(child_id, parent_id, "fork must produce a fresh session id");
+    assert!(
+        app.status.starts_with("forked session → "),
+        "status reports the fork outcome: {}",
+        app.status
+    );
+    assert!(
+        app.status.contains(&child_id),
+        "status includes the new session id: {}",
+        app.status
+    );
+    // Visible transcript stays in place — the new session inherits the
+    // existing turns rather than the user losing their context. The fork
+    // pushes one announcement on top, so the new length is `before + 1`.
+    assert_eq!(
+        app.transcript.len(),
+        transcript_before + 1,
+        "fork preserves prior entries and adds exactly the announcement",
+    );
+    let announce = last_message_content(&app).expect("fork announcement");
+    assert!(
+        announce.contains(&child_id) && announce.contains("/resume"),
+        "fork transcript announcement explains the lineage: {announce}",
+    );
+}
+
+#[tokio::test]
 async fn mode_switch_is_refused_during_active_turn() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -6795,6 +6837,7 @@ fn slash_commands_have_documented_capability_for_every_entry() {
         "/pin",
         "/unpin",
         "/resume",
+        "/fork",
         "/session-export",
         "/session-cleanup",
         "/undo",

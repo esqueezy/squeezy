@@ -1840,6 +1840,19 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             }
             return true;
         }
+        "/fork" => {
+            match agent.fork_current().await {
+                Ok(new_id) => {
+                    app.status = format!("forked session → {new_id}");
+                    app.push_transcript_item(TranscriptItem::system(format!(
+                        "/fork started session {new_id}; the original session is saved and \
+                         remains resumable via /resume."
+                    )));
+                }
+                Err(error) => app.status = format!("fork failed: {error}"),
+            }
+            return true;
+        }
         "/resume" => {
             let Some(session_id) = parts.next() else {
                 app.status = "usage: /resume <session_id>".to_string();

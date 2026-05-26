@@ -230,6 +230,10 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "<id>",
         &[PermissionCapability::Read],
     ),
+    slash_locked(
+        "/fork",
+        "branch the current session into a sibling with the same transcript",
+    ),
     slash_args_caps(
         "/session-export",
         "export a saved session",

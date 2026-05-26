@@ -1914,6 +1914,59 @@ impl Agent {
         Ok(transcript)
     }
 
+    /// Branch the active session into a sibling session that inherits the
+    /// current transcript-so-far. The parent session is left resumable on
+    /// disk (status flipped to `Completed`) so the user can rewind to it via
+    /// `/resume`. The fork copies the live conversation state into a fresh
+    /// session log; subsequent turns append only to the new session.
+    ///
+    /// Returns the new session id, or an error if no active session log is
+    /// attached (e.g. when session logging was disabled at startup).
+    pub async fn fork_current(&mut self) -> squeezy_core::Result<String> {
+        let Some(parent) = self.session_log.clone() else {
+            return Err(SqueezyError::Agent("no active session to fork".to_string()));
+        };
+        let parent_session_id = parent.session_id().to_string();
+        let state = self.conversation_state.lock().await.clone();
+        let resume_state = state.to_resume_state();
+        // Finalise the parent with the latest resume snapshot so `/resume
+        // <parent>` later picks up exactly where the fork branched, and so
+        // retention treats it as a normal closed session rather than an
+        // orphaned running one.
+        parent.write_resume_state(&resume_state)?;
+        parent.finish(
+            SessionStatus::Completed,
+            state.cost.clone(),
+            state.metrics.clone(),
+            state.redactions,
+        )?;
+        // Seed the new session with the inherited cost/metrics so accounting
+        // reflects work the user has already paid for; the conversation copy
+        // lives in resume_state.json.
+        let store = SessionStore::open(&self.config);
+        let metadata = SessionMetadata {
+            cost: state.cost,
+            metrics: state.metrics,
+            redactions: state.redactions,
+            token_calibration: state.token_calibration,
+            ..SessionMetadata::new(&self.config, self.provider.name())
+        };
+        let child = store.start_session(metadata)?;
+        let new_session_id = child.session_id().to_string();
+        child.write_resume_state(&resume_state)?;
+        // Record fork lineage so replay / bug-report tooling can attribute
+        // the child to its parent. Use the free-form append: the typed
+        // SessionEventKind enum has no `Forked` variant.
+        let _ = child.append_event(SessionEvent::new(
+            "session_forked",
+            None,
+            Some(format!("forked from {parent_session_id}")),
+            json!({ "parent_session_id": parent_session_id }),
+        ));
+        self.session_log = Some(child);
+        Ok(new_session_id)
+    }
+
     pub async fn finish_session(&self, status: SessionStatus) {
         let Some(session) = &self.session_log else {
             return;
