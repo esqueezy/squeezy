@@ -87,6 +87,7 @@ pub fn bundled_skills() -> Vec<LoadedSkill> {
                     source: SkillSource::User,
                     location,
                     disabled: false,
+                    manifest: None,
                 },
                 base_dir,
                 body,
