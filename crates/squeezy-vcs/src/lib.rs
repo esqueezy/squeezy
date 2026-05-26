@@ -1,7 +1,7 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -9,7 +9,7 @@ use std::{
         Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,8 @@ pub const CRATE_NAME: &str = "squeezy-vcs";
 const DEFAULT_MAX_PATCH_BYTES: usize = 1_000_000;
 const DEFAULT_CHECKPOINT_RETENTION_DAYS: u64 = 7;
 const DEFAULT_MAX_CHECKPOINT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const SHADOW_LOCK_FILENAME: &str = "shadow.lock";
+const SHADOW_STALE_DIR_RETENTION_DAYS: u64 = 14;
 static SHADOW_REPO_INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CHECKPOINT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -59,11 +61,16 @@ pub struct GitVcs {
     root: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CheckpointStore {
     root: PathBuf,
     git_dir: PathBuf,
     journal_path: PathBuf,
+    lock_path: PathBuf,
+    /// OS-advisory lock held for the lifetime of the store. Dropping the
+    /// [`File`] releases the lock; the [`Drop`] impl also unlinks
+    /// [`Self::lock_path`] so a fresh process sees a clean directory.
+    _lock: Option<File>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -757,11 +764,19 @@ impl CheckpointStore {
         let dir = root.join(".squeezy").join("checkpoints");
         let git_dir = dir.join("git");
         let journal_path = dir.join("journal.jsonl");
+        let lock_path = dir.join(SHADOW_LOCK_FILENAME);
         fs::create_dir_all(&git_dir)?;
+        // Acquire the per-workspace shadow-repo lock before any cleanup or
+        // git work — two squeezy processes pointed at the same workspace
+        // must not race on `git add --all` + `write-tree`.
+        let lock = acquire_shadow_lock(&lock_path)?;
+        cleanup_stale_shadow_dirs(&dir, SHADOW_STALE_DIR_RETENTION_DAYS);
         let store = Self {
             root,
             git_dir,
             journal_path,
+            lock_path,
+            _lock: Some(lock),
         };
         store.ensure_shadow_repo()?;
         store.cleanup_old_checkpoints(DEFAULT_CHECKPOINT_RETENTION_DAYS)?;
@@ -1608,6 +1623,103 @@ fn checkpoint_ref(id: &str, side: &str) -> String {
 
 fn hooks_off_value() -> &'static str {
     if cfg!(windows) { "NUL" } else { "/dev/null" }
+}
+
+/// Acquire an OS-advisory exclusive lock on the per-workspace shadow-repo
+/// lock file. Returns the open [`File`] so the caller can hold the lock by
+/// keeping the handle alive; dropping the file releases the lock.
+///
+/// The lock file body contains `<pid>\n<unix_millis>\n` for human / log
+/// diagnostics — neither field is consulted for correctness, the OS lock
+/// is the source of truth.
+fn acquire_shadow_lock(lock_path: &Path) -> Result<File> {
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            return Err(SqueezyError::Tool(format!(
+                "another squeezy process is holding the shadow-repo lock at {} \
+                 — start one squeezy per workspace or wait for it to exit",
+                lock_path.display()
+            )));
+        }
+        Err(TryLockError::Error(err)) => {
+            return Err(SqueezyError::Tool(format!(
+                "failed to acquire shadow-repo lock at {}: {err}",
+                lock_path.display()
+            )));
+        }
+    }
+    // Best-effort PID/timestamp diagnostics. A failure here must not
+    // release the lock we just took, so we log + continue.
+    let body = format!("{}\n{}\n", std::process::id(), now_ms());
+    if let Ok(mut handle) = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(lock_path)
+    {
+        let _ = handle.write_all(body.as_bytes());
+    }
+    Ok(file)
+}
+
+/// Remove orphan entries inside `.squeezy/checkpoints/` that are older
+/// than `retention_days`. The active shadow `git/` repo, the journal file,
+/// and the current lock file are always preserved; everything else (stray
+/// scratch directories, abandoned `.lock` files from crashed processes,
+/// stale temporaries) is swept so a long-running workspace does not
+/// accumulate untracked bookkeeping.
+///
+/// Failures are intentionally swallowed: cleanup is best-effort and must
+/// never prevent the store from opening.
+fn cleanup_stale_shadow_dirs(checkpoints_dir: &Path, retention_days: u64) {
+    let Ok(entries) = fs::read_dir(checkpoints_dir) else {
+        return;
+    };
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(retention_days * 24 * 60 * 60))
+        .unwrap_or(UNIX_EPOCH);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if matches!(name, "git" | "journal.jsonl" | SHADOW_LOCK_FILENAME) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified >= cutoff {
+            continue;
+        }
+        if metadata.is_dir() {
+            let _ = fs::remove_dir_all(&path);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+impl Drop for CheckpointStore {
+    fn drop(&mut self) {
+        // Release the OS lock first by dropping the file handle, then
+        // remove the lock file so a fresh process opening the same
+        // workspace does not have to inspect a stale sentinel.
+        self._lock.take();
+        let _ = fs::remove_file(&self.lock_path);
+    }
 }
 
 fn mtime_parts(metadata: &fs::Metadata) -> (i64, u32) {
