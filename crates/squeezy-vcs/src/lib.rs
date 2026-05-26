@@ -458,6 +458,32 @@ impl GitVcs {
         }
     }
 
+    // Design note — unified-diff fallback as the explicit escape hatch.
+    //
+    // The primary patch surface in `squeezy-tools::apply_patch` is strict
+    // literal search-replace gated by `expected_sha256`: the `search` block
+    // must substring-match the on-disk file byte-for-byte, and the pre-edit
+    // hash must match the current on-disk hash. A mismatch yields
+    // `ToolStatus::Stale` and refuses to write. This guarantees the agent
+    // can never silently overwrite a file whose contents drifted away from
+    // what it planned against — including drift produced by the user
+    // between turns or by a concurrent tool.
+    //
+    // Codex-style progressive line-pattern fuzz (exact → rstrip → trimmed
+    // → Unicode-normalised) is intentionally NOT the default. It trades a
+    // pre-mutation hash check for opportunistic typographic recovery, and
+    // the resulting "the model intended this so we wrote it" semantics
+    // weaken the cross-turn safety property above.
+    //
+    // The unified-diff path below is the deliberate escape hatch: callers
+    // opt in per-block via `fallback:"unified_diff"` when their literal
+    // search misses. It runs `git apply --3way --ignore-whitespace`, which
+    // recovers the typographic-drift cases (smart quotes, em-dashes, NBSP,
+    // tab/space drift) without giving up the sha256 contract — the caller
+    // still gates around this call with checkpoint capture and post-apply
+    // hash tracking. Promote this fallback in error messages and docs
+    // rather than loosening the literal default.
+
     /// Run `git apply --check --3way` against the user worktree to see whether
     /// the given unified-diff body would apply cleanly. No files are mutated.
     pub fn preflight_unified_diff(&self, diff: &str) -> Result<UnifiedDiffOutcome> {
