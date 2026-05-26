@@ -539,11 +539,19 @@ fn open_api_key_entry_for_current_provider(
 ) {
     match provider_api_key_env(&state.effective.provider) {
         Some((label, env_var)) => {
+            // Pre-fill from whatever the resolver finds (env var or
+            // keychain) so reopening the field shows the existing key as
+            // •••• and Ctrl+T can reveal it instead of looking empty as
+            // if nothing was ever saved.
+            let draft = squeezy_llm::resolve_api_key(&env_var)
+                .ok()
+                .unwrap_or_default();
+            let cursor = draft.chars().count();
             state.secret_entry = Some(SecretEntryState {
                 env_var,
                 provider_label: label.to_string(),
-                draft: String::new(),
-                cursor: 0,
+                draft,
+                cursor,
                 reveal: false,
             });
         }
