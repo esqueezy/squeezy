@@ -3,6 +3,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
 use squeezy_core::{Result, SqueezyError};
 
 /// Where a resolved API key came from. Used by doctor to surface the
@@ -82,6 +83,49 @@ fn env_value(env_var: &str) -> Option<String> {
         Ok(value) if !value.trim().is_empty() => Some(value),
         _ => None,
     }
+}
+
+/// Remove the inline `[providers.<section>] api_key = "..."` entry from
+/// `scope`'s TOML file. Other fields under `[providers.<section>]` (base
+/// url, headers, extra config) are preserved, and surrounding sections
+/// and comments are left untouched. The committed `./squeezy.toml`
+/// (`SettingsScopeKind::Project`) is refused — secrets do not belong in
+/// version control and storing one there is already a misuse worth
+/// surfacing to the caller.
+///
+/// Returns `Ok(true)` when an `api_key` field was actually removed,
+/// `Ok(false)` when no inline key was present for that provider. Either
+/// outcome means the on-disk file no longer carries that key.
+pub fn delete_api_key(provider_section: &str, scope: &SettingsScope) -> Result<bool> {
+    if provider_section.trim().is_empty() {
+        return Err(SqueezyError::Config(
+            "provider section must not be empty".to_string(),
+        ));
+    }
+    if matches!(
+        scope.kind,
+        squeezy_core::settings_writer::SettingsScopeKind::Project
+    ) {
+        return Err(SqueezyError::Config(
+            "refusing to edit the committed project TOML; secrets only live in user or local scope"
+                .to_string(),
+        ));
+    }
+    let edit = SettingsEdit {
+        path: &[],
+        op: EditOp::SetTableEntry {
+            table_path: &["providers"],
+            key: provider_section.to_string(),
+            fields: vec![("api_key", EditOp::Unset)],
+        },
+    };
+    let outcome = apply_edits(scope, &[edit]).map_err(|err| {
+        SqueezyError::Config(format!(
+            "failed to write {}: {err}",
+            scope.path.display()
+        ))
+    })?;
+    Ok(outcome.edits_applied > 0)
 }
 
 /// Translate between Squeezy's `SQUEEZY_<PROVIDER>_KEY` naming and each

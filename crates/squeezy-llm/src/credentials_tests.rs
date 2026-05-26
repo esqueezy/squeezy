@@ -1,7 +1,12 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use squeezy_core::settings_writer::SettingsScope;
+
 use super::*;
+
+static NONCE: AtomicU64 = AtomicU64::new(0);
 
 // `SQUEEZY_CREDENTIALS_FILE` is a single process-wide override and the
 // credentials file is also resolved from `$HOME/.squeezy` when the
@@ -16,6 +21,143 @@ fn creds_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn temp_settings_path(prefix: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "squeezy-credentials-{}-{}-{}",
+        prefix,
+        std::process::id(),
+        NONCE.fetch_add(1, Ordering::SeqCst),
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    dir.join("settings.toml")
+}
+
+#[test]
+fn delete_removes_inline_api_key_for_provider() {
+    let path = temp_settings_path("openai");
+    std::fs::write(
+        &path,
+        "[providers.openai]\napi_key = \"sk-test\"\nbase_url = \"https://example.com\"\n",
+    )
+    .expect("seed file");
+
+    let removed =
+        delete_api_key("openai", &SettingsScope::user(path.clone())).expect("delete returns Ok");
+    assert!(removed, "expected the api_key field to be removed");
+
+    let contents = std::fs::read_to_string(&path).expect("read settings");
+    assert!(
+        !contents.contains("api_key"),
+        "api_key should be gone: {contents}"
+    );
+    assert!(
+        contents.contains("base_url"),
+        "non-secret fields must survive: {contents}"
+    );
+    assert!(
+        contents.contains("[providers.openai]"),
+        "section header should survive: {contents}"
+    );
+}
+
+#[test]
+fn delete_is_idempotent_when_no_inline_key_present() {
+    let path = temp_settings_path("idempotent");
+    std::fs::write(
+        &path,
+        "[providers.openai]\nbase_url = \"https://example.com\"\n",
+    )
+    .expect("seed file");
+
+    let removed =
+        delete_api_key("openai", &SettingsScope::user(path.clone())).expect("delete returns Ok");
+    assert!(!removed, "no api_key to remove → reports false");
+
+    let contents = std::fs::read_to_string(&path).expect("read settings");
+    assert!(contents.contains("base_url"), "{contents}");
+}
+
+#[test]
+fn delete_leaves_other_provider_sections_untouched() {
+    let path = temp_settings_path("merge");
+    std::fs::write(
+        &path,
+        "[providers.openai]\napi_key = \"sk-openai\"\n\n[providers.anthropic]\napi_key = \"sk-ant\"\n",
+    )
+    .expect("seed file");
+
+    delete_api_key("openai", &SettingsScope::user(path.clone())).expect("delete openai");
+
+    let contents = std::fs::read_to_string(&path).expect("read settings");
+    assert!(
+        !contents.contains("sk-openai"),
+        "deleted key still present: {contents}"
+    );
+    assert!(
+        contents.contains("sk-ant"),
+        "untouched provider got clobbered: {contents}"
+    );
+}
+
+#[test]
+fn delete_round_trips_with_set_table_entry() {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, apply_edits};
+
+    let path = temp_settings_path("roundtrip");
+    let scope = SettingsScope::user(path.clone());
+
+    // Stage 1: write via the same `apply_edits` surface that auth set uses.
+    apply_edits(
+        &scope,
+        &[SettingsEdit {
+            path: &[],
+            op: EditOp::SetTableEntry {
+                table_path: &["providers"],
+                key: "openai".to_string(),
+                fields: vec![("api_key", EditOp::SetString("sk-roundtrip".to_string()))],
+            },
+        }],
+    )
+    .expect("set");
+
+    let after_set = std::fs::read_to_string(&path).expect("read after set");
+    assert!(after_set.contains("api_key = \"sk-roundtrip\""), "{after_set}");
+
+    // Stage 2: delete via the new helper.
+    let removed = delete_api_key("openai", &scope).expect("delete");
+    assert!(removed, "round-trip delete should report removal");
+
+    let after_delete = std::fs::read_to_string(&path).expect("read after delete");
+    assert!(
+        !after_delete.contains("sk-roundtrip"),
+        "round-trip delete failed: {after_delete}"
+    );
+}
+
+#[test]
+fn delete_refuses_committed_project_scope() {
+    let path = temp_settings_path("project");
+    let err = delete_api_key("openai", &SettingsScope::project(path.clone()))
+        .expect_err("project scope must refuse");
+    assert!(
+        err.to_string().contains("project TOML"),
+        "expected refusal message, got: {err}"
+    );
+    assert!(
+        !path.exists(),
+        "refusing to write should not create the file: {}",
+        path.display()
+    );
+}
+
+#[test]
+fn delete_rejects_empty_provider_section() {
+    let path = temp_settings_path("empty-section");
+    let err = delete_api_key("", &SettingsScope::user(path.clone()))
+        .expect_err("empty section must error");
+    assert!(err.to_string().contains("must not be empty"), "{err}");
 }
 
 #[test]
