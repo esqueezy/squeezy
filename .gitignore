@@ -30,8 +30,3 @@ node_modules/
 
 # Coverage reports
 /target/llvm-cov/
-
-# Generated pre-publish from docs/external/ by scripts/sync-bundled-docs.sh.
-# build.rs falls back to this path only when building from a published
-# crates.io tarball, where ../../docs/external is unreachable.
-/crates/squeezy-skills/bundled-docs/
