@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
+    ReasoningPayload,
     credentials::resolve_api_key_with_inline,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
     sse::SseDecoder,
@@ -318,10 +319,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
             }
 
             // The aggregator closed the stream without `[DONE]`. Emit any
-            // pending tool calls and a Completed event so the agent loop can
-            // finish cleanly.
+            // pending tool calls, drain accumulated reasoning, and a
+            // Completed event so the agent loop can finish cleanly.
             for emitted in state.drain_tool_calls()? {
                 yield emitted;
+            }
+            if let Some(reasoning_done) = drain_reasoning(&mut state) {
+                yield reasoning_done;
             }
             if !state.completed_emitted {
                 yield LlmEvent::Completed {
@@ -422,6 +426,16 @@ struct StreamState {
     cost: CostSnapshot,
     tool_calls: BTreeMap<usize, PartialToolCall>,
     completed_emitted: bool,
+    /// Accumulates `reasoning_content` / `reasoning` text streamed across
+    /// chat-completions deltas. Drained into a `ReasoningDone` event when
+    /// the stream finishes so the agent loop can persist the segment to
+    /// the conversation history and the TUI can promote the live "thinking"
+    /// buffer into a permanent transcript entry. Without this, providers
+    /// routed through chat-completions (PortKey, OpenRouter, DeepSeek,
+    /// Qwen, etc.) emitted reasoning deltas but never a Done event, so
+    /// the TUI cleared the live buffer on turn completion and the text
+    /// vanished.
+    reasoning_buf: String,
 }
 
 #[derive(Debug, Default)]
@@ -511,9 +525,31 @@ fn collect_delta_text(value: Option<&Value>) -> String {
     }
 }
 
+/// Flush any reasoning text accumulated across delta events into a
+/// `ReasoningDone` event so the agent loop persists the segment to
+/// conversation history and the TUI promotes the live "thinking" buffer
+/// into a permanent transcript entry. Uses the OpenAi payload variant as
+/// a generic carrier — the chat-completions replay path drops
+/// `LlmInputItem::Reasoning` items entirely, so the variant choice only
+/// affects display, never the wire format on the next turn.
+fn drain_reasoning(state: &mut StreamState) -> Option<LlmEvent> {
+    let text = std::mem::take(&mut state.reasoning_buf);
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(LlmEvent::ReasoningDone(ReasoningPayload::OpenAi {
+        item_id: String::new(),
+        summary: vec![text],
+        encrypted_content: None,
+    }))
+}
+
 fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>> {
     if data == "[DONE]" {
         let mut events = state.drain_tool_calls()?;
+        if let Some(reasoning_done) = drain_reasoning(state) {
+            events.push(reasoning_done);
+        }
         if !state.completed_emitted {
             events.push(LlmEvent::Completed {
                 response_id: state.response_id.take(),
@@ -553,6 +589,7 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                 let reasoning = collect_delta_text(delta.get("reasoning_content"))
                     + &collect_delta_text(delta.get("reasoning"));
                 if !reasoning.is_empty() {
+                    state.reasoning_buf.push_str(&reasoning);
                     events.push(LlmEvent::ReasoningDelta {
                         text: reasoning,
                         kind: ReasoningKind::Summary,
