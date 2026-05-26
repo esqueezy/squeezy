@@ -94,16 +94,61 @@ impl OpenAiCompatibleProvider {
     }
 
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
+        // Anthropic-via-aggregator routes accept the same ephemeral
+        // cache_control markers as the native Anthropic API. We attach them
+        // when the caller has supplied a cache_key and the destination model
+        // is namespaced under `anthropic/` (covers OpenRouter, Vercel AI
+        // Gateway, and any other aggregator that uses that namespace
+        // convention). Without this the aggregator route reports zero cached
+        // tokens, which silently inflates cost vs. a direct vendor call.
+        let cache_control =
+            if request.cache_key.is_some() && supports_anthropic_caching(&request.model) {
+                Some(json!({ "type": "ephemeral" }))
+            } else {
+                None
+            };
+        // Find the last user-text turn so we can mark it as the cache
+        // breakpoint. Anthropic caches everything *before* a marker, so the
+        // last user message is the natural place.
+        let last_user_text_index = cache_control.as_ref().and_then(|_| {
+            request
+                .input
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, item)| {
+                    matches!(item, LlmInputItem::UserText(_)).then_some(index)
+                })
+        });
+
         let mut messages = Vec::with_capacity(request.input.len() + 1);
         let trimmed_instructions = request.instructions.trim();
         if !trimmed_instructions.is_empty() {
-            messages.push(json!({
-                "role": "system",
-                "content": &*request.instructions,
-            }));
+            if let Some(cc) = &cache_control {
+                messages.push(json!({
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": &*request.instructions,
+                            "cache_control": cc,
+                        }
+                    ],
+                }));
+            } else {
+                messages.push(json!({
+                    "role": "system",
+                    "content": &*request.instructions,
+                }));
+            }
         }
-        for item in request.input.iter() {
-            messages.push(chat_message(item));
+        for (index, item) in request.input.iter().enumerate() {
+            let attach_cache_control = if Some(index) == last_user_text_index {
+                cache_control.as_ref()
+            } else {
+                None
+            };
+            messages.push(chat_message(item, attach_cache_control));
         }
         let mut body = json!({
             "model": &*request.model,
@@ -113,6 +158,16 @@ impl OpenAiCompatibleProvider {
         });
         if let Some(max_tokens) = request.max_output_tokens {
             body["max_tokens"] = json!(max_tokens);
+        }
+        if let Some(effort) = request.reasoning_effort {
+            // OpenRouter, xAI, and most OpenAI-compatible endpoints accept the
+            // top-level legacy form. OpenRouter's docs now recommend the
+            // nested `reasoning: { effort: ... }` form; send both so we
+            // cover both shapes without per-preset branching. Aggregators
+            // ignore unknown fields; non-reasoning models ignore the hint.
+            let effort_str = effort.as_str();
+            body["reasoning_effort"] = json!(effort_str);
+            body["reasoning"] = json!({ "effort": effort_str });
         }
         if !request.tools.is_empty() {
             body["tools"] = json!(
@@ -134,6 +189,15 @@ impl OpenAiCompatibleProvider {
         }
         body
     }
+}
+
+fn supports_anthropic_caching(model: &str) -> bool {
+    // Aggregator routes that proxy Anthropic models use a `vendor/model`
+    // namespace; OpenRouter's docs treat the `anthropic/` prefix as the
+    // signal to enable cache_control. We mirror that. Direct Anthropic calls
+    // do not go through this client (the native Anthropic provider handles
+    // them with its own cache markers).
+    model.to_ascii_lowercase().starts_with("anthropic/")
 }
 
 impl LlmProvider for OpenAiCompatibleProvider {
@@ -234,12 +298,27 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 }
 
-fn chat_message(item: &LlmInputItem) -> Value {
+fn chat_message(item: &LlmInputItem, cache_control: Option<&Value>) -> Value {
     match item {
-        LlmInputItem::UserText(text) => json!({
-            "role": "user",
-            "content": text,
-        }),
+        LlmInputItem::UserText(text) => {
+            if let Some(cc) = cache_control {
+                json!({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": text,
+                            "cache_control": cc,
+                        }
+                    ],
+                })
+            } else {
+                json!({
+                    "role": "user",
+                    "content": text,
+                })
+            }
+        }
         LlmInputItem::AssistantText(text) => json!({
             "role": "assistant",
             "content": text,

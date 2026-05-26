@@ -829,5 +829,65 @@
     "tokenizer": "openai_compatible",
     "lifecycle": "active",
     "metadata_source": "https://api-docs.deepseek.com/quick_start/pricing"
+  },
+  {
+    "provider": "vertex",
+    "id": "google/gemini-2.5-pro",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 1250000,
+      "output_usd_micros_per_mtok": 10000000,
+      "cache_read_usd_micros_per_mtok": 312500,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 65536,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "google",
+    "lifecycle": "active",
+    "metadata_source": "https://cloud.google.com/vertex-ai/generative-ai/pricing"
+  },
+  {
+    "provider": "vertex",
+    "id": "google/gemini-2.5-flash",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 300000,
+      "output_usd_micros_per_mtok": 2500000,
+      "cache_read_usd_micros_per_mtok": 75000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 65536,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "google",
+    "lifecycle": "active",
+    "metadata_source": "https://cloud.google.com/vertex-ai/generative-ai/pricing"
   }
 ]

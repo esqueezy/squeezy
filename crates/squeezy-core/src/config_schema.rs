@@ -348,6 +348,7 @@ pub const PROVIDER_OPTIONS: &[&str] = &[
     "groq",
     "xai",
     "deepseek",
+    "vertex",
     "mistral",
     "together",
     "fireworks",

@@ -43,6 +43,11 @@ pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_XAI_MODEL: &str = "grok-4";
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 pub const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-chat";
+// Google Cloud Vertex AI's OpenAI-compatible endpoint. The base URL is
+// per-project + per-region, so users must set `vertex_project` and
+// `vertex_location` (or override `base_url` directly).
+pub const DEFAULT_VERTEX_LOCATION: &str = "us-central1";
+pub const DEFAULT_VERTEX_MODEL: &str = "google/gemini-2.5-pro";
 // OpenAI-compatible single-vendor (light preset tier — no curated models, no dedicated costly test).
 pub const DEFAULT_MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
 pub const DEFAULT_MISTRAL_MODEL: &str = "mistral-large-latest";
@@ -52,6 +57,15 @@ pub const DEFAULT_FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference
 pub const DEFAULT_FIREWORKS_MODEL: &str = "accounts/fireworks/models/llama-v3p3-70b-instruct";
 pub const DEFAULT_CEREBRAS_BASE_URL: &str = "https://api.cerebras.ai/v1";
 pub const DEFAULT_CEREBRAS_MODEL: &str = "llama-3.3-70b";
+
+/// Vertex AI's OpenAI-compatible chat completions endpoint lives behind a
+/// regional URL that names the project. Returns the resolved base URL for a
+/// `(project, location)` pair, ready for `/chat/completions` to be appended.
+pub fn vertex_base_url(project: &str, location: &str) -> String {
+    format!(
+        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/endpoints/openapi"
+    )
+}
 
 pub const MODEL_SELECTION_VERSION: u32 = 1;
 pub const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
@@ -1361,6 +1375,7 @@ pub enum OpenAiCompatiblePreset {
     Groq,
     XAi,
     DeepSeek,
+    Vertex,
     Mistral,
     Together,
     Fireworks,
@@ -1379,6 +1394,7 @@ impl OpenAiCompatiblePreset {
             Self::Groq => "groq",
             Self::XAi => "xai",
             Self::DeepSeek => "deepseek",
+            Self::Vertex => "vertex",
             Self::Mistral => "mistral",
             Self::Together => "together",
             Self::Fireworks => "fireworks",
@@ -1396,6 +1412,7 @@ impl OpenAiCompatiblePreset {
             Self::Groq => "Groq",
             Self::XAi => "xAI",
             Self::DeepSeek => "DeepSeek",
+            Self::Vertex => "Google Vertex AI",
             Self::Mistral => "Mistral La Plateforme",
             Self::Together => "Together AI",
             Self::Fireworks => "Fireworks AI",
@@ -1416,6 +1433,7 @@ impl OpenAiCompatiblePreset {
                 | Self::Groq
                 | Self::XAi
                 | Self::DeepSeek
+                | Self::Vertex
         )
     }
 
@@ -1427,6 +1445,11 @@ impl OpenAiCompatiblePreset {
             Self::Groq => DEFAULT_GROQ_BASE_URL,
             Self::XAi => DEFAULT_XAI_BASE_URL,
             Self::DeepSeek => DEFAULT_DEEPSEEK_BASE_URL,
+            // Vertex's base URL is per-project and per-region. The caller
+            // must template it from `vertex_project` + `vertex_location`
+            // (see `vertex_base_url`); presetting a static URL here would
+            // hard-code one project.
+            Self::Vertex => "",
             Self::Mistral => DEFAULT_MISTRAL_BASE_URL,
             Self::Together => DEFAULT_TOGETHER_BASE_URL,
             Self::Fireworks => DEFAULT_FIREWORKS_BASE_URL,
@@ -1443,6 +1466,11 @@ impl OpenAiCompatiblePreset {
             Self::Groq => "GROQ_API_KEY",
             Self::XAi => "XAI_API_KEY",
             Self::DeepSeek => "DEEPSEEK_API_KEY",
+            // Vertex's "key" is an OAuth2 access token (~1 hour TTL). Users
+            // either set this env var to a token they refresh themselves
+            // (e.g. via `gcloud auth print-access-token`) or wire in a
+            // service-account JSON helper.
+            Self::Vertex => "VERTEX_ACCESS_TOKEN",
             Self::Mistral => "MISTRAL_API_KEY",
             Self::Together => "TOGETHER_API_KEY",
             Self::Fireworks => "FIREWORKS_API_KEY",
@@ -1459,6 +1487,7 @@ impl OpenAiCompatiblePreset {
             Self::Groq => DEFAULT_GROQ_MODEL,
             Self::XAi => DEFAULT_XAI_MODEL,
             Self::DeepSeek => DEFAULT_DEEPSEEK_MODEL,
+            Self::Vertex => DEFAULT_VERTEX_MODEL,
             Self::Mistral => DEFAULT_MISTRAL_MODEL,
             Self::Together => DEFAULT_TOGETHER_MODEL,
             Self::Fireworks => DEFAULT_FIREWORKS_MODEL,
@@ -1475,6 +1504,7 @@ impl OpenAiCompatiblePreset {
             Self::Groq => "squeezy:groq",
             Self::XAi => "squeezy:xai",
             Self::DeepSeek => "squeezy:deepseek",
+            Self::Vertex => "squeezy:vertex",
             Self::Mistral => "squeezy:mistral",
             Self::Together => "squeezy:together",
             Self::Fireworks => "squeezy:fireworks",
@@ -1494,6 +1524,7 @@ impl OpenAiCompatiblePreset {
             "groq" => Some(Self::Groq),
             "xai" | "x_ai" | "grok" => Some(Self::XAi),
             "deepseek" | "deep_seek" => Some(Self::DeepSeek),
+            "vertex" | "vertex_ai" | "google_vertex" | "google_vertex_ai" => Some(Self::Vertex),
             "mistral" | "mistral_ai" => Some(Self::Mistral),
             "together" | "together_ai" => Some(Self::Together),
             "fireworks" | "fireworks_ai" => Some(Self::Fireworks),
@@ -1505,7 +1536,7 @@ impl OpenAiCompatiblePreset {
 
     /// Every preset that ships with `cargo run -p squeezy -- --list-providers`.
     /// Used by the CLI to enumerate options without hard-coding the list.
-    pub fn all() -> [Self; 11] {
+    pub fn all() -> [Self; 12] {
         [
             Self::OpenRouter,
             Self::Vercel,
@@ -1513,6 +1544,7 @@ impl OpenAiCompatiblePreset {
             Self::Groq,
             Self::XAi,
             Self::DeepSeek,
+            Self::Vertex,
             Self::Mistral,
             Self::Together,
             Self::Fireworks,
@@ -1920,6 +1952,8 @@ pub struct ProviderSettings {
     pub api_version: Option<String>,
     pub region: Option<String>,
     pub preset: Option<String>,
+    pub vertex_project: Option<String>,
+    pub vertex_location: Option<String>,
     pub request_max_retries: Option<u8>,
     pub stream_max_retries: Option<u8>,
     pub stream_idle_timeout_ms: Option<u64>,
@@ -1938,6 +1972,8 @@ impl ProviderSettings {
                 "api_version",
                 "region",
                 "preset",
+                "vertex_project",
+                "vertex_location",
                 "request_max_retries",
                 "stream_max_retries",
                 "stream_idle_timeout_ms",
@@ -1986,6 +2022,18 @@ impl ProviderSettings {
             api_version: string_value(table, "api_version", source, &field(path, "api_version"))?,
             region: string_value(table, "region", source, &field(path, "region"))?,
             preset: string_value(table, "preset", source, &field(path, "preset"))?,
+            vertex_project: string_value(
+                table,
+                "vertex_project",
+                source,
+                &field(path, "vertex_project"),
+            )?,
+            vertex_location: string_value(
+                table,
+                "vertex_location",
+                source,
+                &field(path, "vertex_location"),
+            )?,
             request_max_retries: u8_nonnegative_value(
                 table,
                 "request_max_retries",
@@ -2016,6 +2064,8 @@ impl ProviderSettings {
         replace_if_some(&mut self.api_version, next.api_version);
         replace_if_some(&mut self.region, next.region);
         replace_if_some(&mut self.preset, next.preset);
+        replace_if_some(&mut self.vertex_project, next.vertex_project);
+        replace_if_some(&mut self.vertex_location, next.vertex_location);
         replace_if_some(&mut self.request_max_retries, next.request_max_retries);
         replace_if_some(&mut self.stream_max_retries, next.stream_max_retries);
         replace_if_some(
@@ -6033,6 +6083,8 @@ fn provider_setting(
         "api_version" => settings.api_version.as_ref(),
         "region" => settings.region.as_ref(),
         "preset" => settings.preset.as_ref(),
+        "vertex_project" => settings.vertex_project.as_ref(),
+        "vertex_location" => settings.vertex_location.as_ref(),
         _ => None,
     }?;
     Some(value.clone())
@@ -6068,9 +6120,27 @@ fn build_openai_compatible_config(
         })?;
     let api_key_keychain = provider_setting(providers, section, "api_key_keychain")
         .or_else(|| Some(preset.default_api_key_keychain().to_string()));
-    let base_url = get_var(&format!("{}_BASE_URL", section.to_ascii_uppercase()))
-        .or_else(|| provider_setting(providers, section, "base_url"))
-        .unwrap_or_else(|| preset.default_base_url().to_string());
+    let base_url_override = get_var(&format!("{}_BASE_URL", section.to_ascii_uppercase()))
+        .or_else(|| provider_setting(providers, section, "base_url"));
+    let base_url = match (preset, base_url_override) {
+        (_, Some(url)) => url,
+        (OpenAiCompatiblePreset::Vertex, None) => {
+            let project = get_var("VERTEX_PROJECT")
+                .or_else(|| get_var("GOOGLE_CLOUD_PROJECT"))
+                .or_else(|| provider_setting(providers, section, "vertex_project"))
+                .ok_or_else(|| {
+                    SqueezyError::Config(
+                        "providers.vertex.vertex_project (or VERTEX_PROJECT / GOOGLE_CLOUD_PROJECT) is required for the Vertex AI preset"
+                            .to_string(),
+                    )
+                })?;
+            let location = get_var("VERTEX_LOCATION")
+                .or_else(|| provider_setting(providers, section, "vertex_location"))
+                .unwrap_or_else(|| DEFAULT_VERTEX_LOCATION.to_string());
+            vertex_base_url(project.trim(), location.trim())
+        }
+        (_, None) => preset.default_base_url().to_string(),
+    };
     if base_url.trim().is_empty() {
         return Err(SqueezyError::Config(format!(
             "providers.{section}.base_url is required for the {} preset",
@@ -6104,6 +6174,7 @@ fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] 
             OpenAiCompatiblePreset::Groq => &["groq"],
             OpenAiCompatiblePreset::XAi => &["xai"],
             OpenAiCompatiblePreset::DeepSeek => &["deepseek"],
+            OpenAiCompatiblePreset::Vertex => &["vertex"],
             OpenAiCompatiblePreset::Mistral => &["mistral"],
             OpenAiCompatiblePreset::Together => &["together"],
             OpenAiCompatiblePreset::Fireworks => &["fireworks"],

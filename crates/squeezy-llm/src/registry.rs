@@ -221,6 +221,7 @@ pub const PROVIDERS: &[&str] = &[
     "groq",
     "xai",
     "deepseek",
+    "vertex",
     "mistral",
     "together",
     "fireworks",

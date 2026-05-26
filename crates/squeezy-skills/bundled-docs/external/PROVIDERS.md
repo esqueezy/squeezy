@@ -79,10 +79,6 @@ base_url = "https://api.portkey.ai/v1"
 # or: "x-portkey-config" = "config-id"
 
 # ── First-party vendor APIs (single vendor) ───────────────────────────────
-# Azure OpenAI is Microsoft's hosted OpenAI deployment and is OpenAI-only.
-# For Azure AI Foundry's broader catalog (Llama, Phi, Mistral, Cohere, …) use
-# the `openai_compatible` preset further down with the Foundry serverless
-# endpoint as the base_url.
 
 [providers.openai]
 api_key_env = "OPENAI_API_KEY"
@@ -102,6 +98,20 @@ api_key_keychain = "squeezy:google"
 base_url = "https://generativelanguage.googleapis.com/v1beta"
 default_model = "gemini-2.5-pro"
 
+# ── Cloud-platform hosts ──────────────────────────────────────────────────
+# Models hosted on a cloud platform's infrastructure behind that platform's
+# IAM rather than a vendor API key.
+#
+#   * Amazon Bedrock — AWS multi-vendor catalog. Uses the AWS credential chain.
+#   * Azure OpenAI Service — OpenAI-only slice of Azure's model catalog.
+#     Use the `openai_compatible` preset further down with the Foundry
+#     serverless endpoint for Azure AI Foundry's broader catalog.
+#   * Google Vertex AI — Gemini and partner models via OAuth2 access tokens.
+
+[providers.bedrock]
+region = "us-east-1"
+default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
+
 [providers.azure_openai]
 api_key_env = "AZURE_OPENAI_API_KEY"
 api_key_keychain = "squeezy:azure_openai"
@@ -109,13 +119,17 @@ base_url = "https://RESOURCE.openai.azure.com/openai/v1"
 api_version = "v1"
 default_model = "gpt-5.5"
 
-# ── Aggregators (continued): Amazon Bedrock ───────────────────────────────
-# Bedrock is AWS's multi-vendor catalog (Anthropic, Meta, Mistral, Amazon,
-# Cohere, AI21, Stability) reached over the AWS default credential chain.
-
-[providers.bedrock]
-region = "us-east-1"
-default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
+[providers.vertex]
+# Either provide a short-lived OAuth2 access token directly, or point at a
+# service-account JSON path; Squeezy refreshes the token transparently in the
+# latter case.
+api_key_env = "VERTEX_ACCESS_TOKEN"
+# service_account_json = "/path/to/key.json"
+vertex_project = "my-gcp-project"
+vertex_location = "us-central1"
+default_model = "google/gemini-2.5-pro"
+# base_url is templated from project + location to
+# https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/endpoints/openapi
 
 # ── Local runtime ─────────────────────────────────────────────────────────
 

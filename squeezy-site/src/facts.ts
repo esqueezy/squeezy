@@ -158,7 +158,7 @@ export const languageRows: MatrixRow[] = [
 export const aggregatorRows: MatrixRow[] = [
   {
     name: "OpenRouter",
-    detail: "One credit, every frontier model. OpenAI-compatible Chat Completions streaming, function tools, usage metadata. Default model: anthropic/claude-opus-4-7.",
+    detail: "One credit, every frontier model. OpenAI-compatible Chat Completions streaming, function tools, usage metadata, reasoning passthrough, Anthropic cache_control forwarding. Default model: anthropic/claude-opus-4-7.",
     status: "OPENROUTER_API_KEY"
   },
   {
@@ -170,11 +170,6 @@ export const aggregatorRows: MatrixRow[] = [
     name: "PortKey",
     detail: "Gateway with virtual keys, caching, and observability. Configure a virtual key via x-portkey-virtual-key header.",
     status: "PORTKEY_API_KEY"
-  },
-  {
-    name: "Amazon Bedrock",
-    detail: "AWS multi-vendor catalog (Anthropic, Meta, Mistral, Amazon, Cohere, AI21, Stability). Bedrock Runtime ConverseStream over the AWS default credential chain. Default model: Claude Haiku 4.5, 200K context.",
-    status: "AWS credentials"
   }
 ];
 
@@ -193,11 +188,24 @@ export const providerRows: MatrixRow[] = [
     name: "Google Gemini",
     detail: "streamGenerateContent SSE, function declarations, usage metadata. Default model: gemini-2.5-pro, 1M context.",
     status: "GEMINI_API_KEY"
+  }
+];
+
+export const cloudPlatformRows: MatrixRow[] = [
+  {
+    name: "Amazon Bedrock",
+    detail: "AWS multi-vendor catalog (Anthropic, Meta, Mistral, Amazon, Cohere, AI21, Stability). Bedrock Runtime ConverseStream over the AWS default credential chain. Default model: Claude Haiku 4.5, 200K context.",
+    status: "AWS credentials"
   },
   {
     name: "Azure OpenAI",
-    detail: "OpenAI models hosted on Microsoft Azure (OpenAI-only — use the openai_compatible preset for Azure AI Foundry's broader catalog). Responses-compatible streaming with api-key auth and api-version. Default model: gpt-5.5, 400K context.",
+    detail: "OpenAI models hosted on Microsoft Azure (single-vendor slice of the broader Azure model catalog). Responses-compatible streaming with api-key auth and api-version. Default model: gpt-5.5, 400K context. For Azure AI Foundry's multi-vendor catalog use the openai_compatible preset with the Foundry serverless endpoint.",
     status: "AZURE_OPENAI_API_KEY"
+  },
+  {
+    name: "Google Vertex AI",
+    detail: "Gemini and other models on Google Cloud Vertex AI's OpenAI-compatible endpoint. OAuth2 access token (refresh every ~50 min) or service-account JSON, project + location templated into base_url. Default model: gemini-2.5-pro.",
+    status: "VERTEX_ACCESS_TOKEN"
   }
 ];
 

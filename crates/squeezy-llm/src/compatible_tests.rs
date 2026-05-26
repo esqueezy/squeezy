@@ -257,6 +257,67 @@ fn preset_default_headers_include_openrouter_attribution() {
 }
 
 #[test]
+fn request_body_passes_reasoning_effort_in_both_legacy_and_unified_shapes() {
+    use squeezy_core::ReasoningEffort;
+    let mut request = sample_request();
+    request.reasoning_effort = Some(ReasoningEffort::High);
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["reasoning_effort"], "high");
+    assert_eq!(body["reasoning"]["effort"], "high");
+}
+
+#[test]
+fn request_body_omits_reasoning_when_caller_did_not_request_it() {
+    let body = OpenAiCompatibleProvider::request_body(&sample_request());
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("reasoning").is_none());
+}
+
+#[test]
+fn request_body_attaches_anthropic_cache_control_when_cache_key_is_set() {
+    let mut request = sample_request();
+    request.cache_key = Some("repo-context".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    // System message becomes the array form with ephemeral cache_control.
+    let system = &body["messages"][0];
+    assert_eq!(system["role"], "system");
+    assert_eq!(system["content"][0]["type"], "text");
+    assert_eq!(system["content"][0]["cache_control"]["type"], "ephemeral");
+    // Last user-text turn (the first input item in sample_request) gets the
+    // breakpoint marker; later assistant/tool turns do not.
+    let last_user = &body["messages"][1];
+    assert_eq!(last_user["role"], "user");
+    assert_eq!(
+        last_user["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    let assistant = &body["messages"][2];
+    assert_eq!(assistant["role"], "assistant");
+    assert_eq!(assistant["content"], "hi there");
+}
+
+#[test]
+fn request_body_skips_cache_control_for_non_anthropic_routes() {
+    let mut request = sample_request();
+    request.model = "openai/gpt-5.5".to_string().into();
+    request.cache_key = Some("repo-context".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["messages"][0]["content"], "be brief");
+    assert_eq!(body["messages"][1]["content"], "hello");
+}
+
+#[test]
+fn request_body_skips_cache_control_when_no_cache_key() {
+    let mut request = sample_request();
+    request.model = "anthropic/claude-opus-4-7".to_string().into();
+    request.cache_key = None;
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    // System and user content stay as plain strings.
+    assert_eq!(body["messages"][0]["content"], "be brief");
+    assert_eq!(body["messages"][1]["content"], "hello");
+}
+
+#[test]
 fn preset_full_tier_matches_documented_set() {
     let full: Vec<_> = OpenAiCompatiblePreset::all()
         .iter()
@@ -272,6 +333,7 @@ fn preset_full_tier_matches_documented_set() {
             OpenAiCompatiblePreset::Groq,
             OpenAiCompatiblePreset::XAi,
             OpenAiCompatiblePreset::DeepSeek,
+            OpenAiCompatiblePreset::Vertex,
         ]
     );
 }

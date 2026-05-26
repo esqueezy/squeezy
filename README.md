@@ -9,10 +9,13 @@ packets — spans, hashes, confidence, freshness — instead of raw file dumps.
 > validation harness tasks run in CI; graph-backed navigation tools expose
 > compact evidence packets. Providers:
 >
-> - **Aggregators (one key/credential, many models):** OpenRouter, Vercel AI
->   Gateway, PortKey, Amazon Bedrock (AWS multi-vendor catalog).
+> - **Aggregators (one key, many models):** OpenRouter, Vercel AI Gateway,
+>   PortKey.
 > - **First-party vendor APIs (single vendor):** OpenAI, Anthropic, Google
->   Gemini, Azure OpenAI (Microsoft-hosted OpenAI, OpenAI-only).
+>   Gemini.
+> - **Cloud-platform hosts:** Amazon Bedrock (AWS multi-vendor catalog), Azure
+>   OpenAI (Microsoft-hosted OpenAI), Google Vertex AI (GCP-hosted Gemini and
+>   partner models).
 > - **Local runtime:** Ollama.
 > - **Other OpenAI-compatible:** Groq, xAI, DeepSeek, Mistral La Plateforme,
 >   Together AI, Fireworks AI, Cerebras.

@@ -105,6 +105,23 @@ enum Command {
     },
     #[command(about = "Diagnose configuration, providers, session store, and sandbox availability")]
     Doctor(DoctorArgs),
+    #[command(
+        about = "Refresh the cached live model catalog from one or more OpenAI-compatible providers"
+    )]
+    RefreshModels(RefreshModelsArgs),
+}
+
+#[derive(Debug, Args)]
+struct RefreshModelsArgs {
+    /// Preset to refresh. Repeat for multiple; defaults to every preset whose
+    /// API-key env var is currently set.
+    #[arg(
+        long = "provider",
+        help = "Preset name (e.g. openrouter, groq, vertex)"
+    )]
+    providers: Vec<String>,
+    #[arg(long, help = "Print the refreshed catalog as JSON")]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -302,13 +319,16 @@ async fn main() -> squeezy_core::Result<()> {
         Some(Command::Ask(args)) => return handle_ask_command(args).await,
         Some(Command::Auth { command }) => return handle_auth_command(command),
         Some(Command::Doctor(args)) => {
-            let report = doctor::run(args)?;
+            let report = doctor::run(args).await?;
             report.print();
             let code = report.exit_code;
             if code != 0 {
                 std::process::exit(code);
             }
             return Ok(());
+        }
+        Some(Command::RefreshModels(args)) => {
+            return handle_refresh_models(args).await;
         }
         None => {}
     }
@@ -662,6 +682,90 @@ fn update_mcp_settings(
     }
     fs::write(&path, doc.to_string())?;
     println!("updated {}", path.display());
+    Ok(())
+}
+
+async fn handle_refresh_models(args: &RefreshModelsArgs) -> squeezy_core::Result<()> {
+    let targets: Vec<OpenAiCompatiblePreset> = if args.providers.is_empty() {
+        // Default: refresh every preset whose API-key env var is currently
+        // populated. This is what a user running `squeezy refresh-models`
+        // without arguments most likely wants — refresh whatever they have
+        // credentials for.
+        OpenAiCompatiblePreset::all()
+            .into_iter()
+            .filter(|preset| {
+                let env_var = preset.default_api_key_env();
+                if env_var.is_empty() {
+                    return false;
+                }
+                env::var(env_var)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        let mut out = Vec::with_capacity(args.providers.len());
+        for name in &args.providers {
+            let preset = OpenAiCompatiblePreset::parse(name).ok_or_else(|| {
+                SqueezyError::Config(format!("refresh-models: unknown provider preset {name:?}"))
+            })?;
+            out.push(preset);
+        }
+        out
+    };
+
+    if targets.is_empty() {
+        eprintln!(
+            "refresh-models: no providers selected. Set an aggregator API key (e.g. OPENROUTER_API_KEY) or pass --provider <name>."
+        );
+        return Ok(());
+    }
+
+    let mut summaries = Vec::with_capacity(targets.len());
+    for preset in targets {
+        let env_var = preset.default_api_key_env();
+        let api_key = if env_var.is_empty() {
+            None
+        } else {
+            env::var(env_var).ok().filter(|v| !v.trim().is_empty())
+        };
+        let base_url = match preset.default_base_url() {
+            "" => {
+                eprintln!(
+                    "refresh-models: {} has no fixed base_url; configure providers.{}.base_url and re-run",
+                    preset.display_name(),
+                    preset.as_str(),
+                );
+                continue;
+            }
+            url => url.to_string(),
+        };
+        match squeezy_llm::model_discovery::refresh(preset.as_str(), &base_url, api_key.as_deref())
+            .await
+        {
+            Ok(catalog) => {
+                let count = catalog.models.len();
+                if args.json {
+                    let body = serde_json::to_string_pretty(&catalog)
+                        .map_err(|err| SqueezyError::Config(err.to_string()))?;
+                    println!("{body}");
+                } else {
+                    println!("{}: {} models cached", preset.display_name(), count);
+                }
+                summaries.push((preset, count));
+            }
+            Err(err) => {
+                eprintln!("{}: refresh failed: {err}", preset.display_name());
+            }
+        }
+    }
+
+    if !args.json && !summaries.is_empty() {
+        eprintln!(
+            "refresh-models: refreshed {} provider(s); cache lives under ~/.squeezy/cache/models/.",
+            summaries.len()
+        );
+    }
     Ok(())
 }
 
@@ -1363,9 +1467,33 @@ fn compatible_provider_choice(
     api_key_env: String,
     base_url: String,
 ) -> ProviderChoice {
-    let curated: Vec<String> = models_for_provider(preset.as_str())
+    let mut curated: Vec<String> = models_for_provider(preset.as_str())
         .map(model_choice_label)
         .collect();
+    let curated_ids: std::collections::BTreeSet<String> = models_for_provider(preset.as_str())
+        .map(|m| m.id.to_string())
+        .collect();
+    // Merge cached live-discovered models into the picker so the user sees the
+    // current catalog without waiting for a release. The cache is populated by
+    // a previous run or by `squeezy refresh-models`; if it's stale or missing
+    // we kick off a background refresh so the next run benefits.
+    let cached = squeezy_llm::model_discovery::read_cached(preset.as_str());
+    let needs_refresh = cached.as_ref().map(|c| !c.is_fresh()).unwrap_or(true);
+    if let Some(catalog) = &cached {
+        for model in &catalog.models {
+            if curated_ids.contains(&model.id) {
+                continue;
+            }
+            curated.push(discovered_model_label(model));
+        }
+    }
+    if needs_refresh {
+        spawn_background_refresh(
+            preset.as_str().to_string(),
+            base_url.clone(),
+            api_key_env.clone(),
+        );
+    }
     let mut models = curated;
     if models.is_empty() {
         let default_model = preset.default_model();
@@ -1387,6 +1515,42 @@ fn compatible_provider_choice(
         base_url: Some(base_url),
         models,
     }
+}
+
+fn discovered_model_label(model: &squeezy_llm::model_discovery::DiscoveredModel) -> String {
+    let price = match (
+        model.pricing_input_usd_micros_per_mtok,
+        model.pricing_output_usd_micros_per_mtok,
+    ) {
+        (Some(input), Some(output)) => format!(
+            "${:.3}/M in, ${:.3}/M out",
+            input as f64 / 1_000_000.0,
+            output as f64 / 1_000_000.0,
+        ),
+        _ => "live catalog".to_string(),
+    };
+    let context = model
+        .context_length
+        .map(|n| format!(", context {}K", n / 1024))
+        .unwrap_or_default();
+    format!("{} (discovered, {price}{context})", model.id)
+}
+
+fn spawn_background_refresh(provider: String, base_url: String, api_key_env: String) {
+    let Some(api_key_value) = env::var(&api_key_env).ok() else {
+        return;
+    };
+    if api_key_value.trim().is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let _ = squeezy_llm::model_discovery::refresh(
+            &provider,
+            &base_url,
+            Some(api_key_value.as_str()),
+        )
+        .await;
+    });
 }
 
 fn detected_env_names(selector_env: &str, defaults: &[&str]) -> Vec<String> {
