@@ -140,6 +140,12 @@ pub const DEFAULT_REPORT_MAX_BYTES: usize = 2 * 1024 * 1024;
 pub const PROJECT_SETTINGS_FILE: &str = "squeezy.toml";
 pub const DEFAULT_SQUEEZY_SKILLS_DIR: &str = ".squeezy/skills";
 pub const DEFAULT_SESSION_LOG_RETENTION_DAYS: u64 = 30;
+/// Days an archived session lives before the retention sweep permanently
+/// deletes it. Live sessions hit `log_retention_days` first, then move to
+/// `archived/<id>/`, where they linger for this long. Matches the live
+/// default so an idle workspace keeps roughly 60 days of recoverable
+/// history (30 live + 30 archived) without manual intervention.
+pub const DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS: u64 = 30;
 pub const DEFAULT_SESSION_MAX_EVENT_BYTES: usize = 65_536;
 pub const DEFAULT_SESSION_MAX_SESSION_BYTES: usize = 52_428_800;
 pub const DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES: usize = 1_048_576;
@@ -783,6 +789,10 @@ impl AppConfig {
         output.push_str(&format!(
             "log_retention_days = {}\n",
             self.session_logs.log_retention_days
+        ));
+        output.push_str(&format!(
+            "log_retention_archive_days = {}\n",
+            self.session_logs.log_retention_archive_days
         ));
         output.push_str(&format!(
             "max_event_bytes = {}\n",
@@ -2662,6 +2672,7 @@ pub struct SessionSettings {
     pub mode: Option<SessionMode>,
     pub log_dir: Option<PathBuf>,
     pub log_retention_days: Option<u64>,
+    pub log_retention_archive_days: Option<u64>,
     pub max_event_bytes: Option<usize>,
     pub max_session_bytes: Option<usize>,
 }
@@ -2674,6 +2685,7 @@ impl SessionSettings {
                 "mode",
                 "log_dir",
                 "log_retention_days",
+                "log_retention_archive_days",
                 "max_event_bytes",
                 "max_session_bytes",
             ],
@@ -2702,6 +2714,12 @@ impl SessionSettings {
                 source,
                 &field(path, "log_retention_days"),
             )?,
+            log_retention_archive_days: u64_value(
+                table,
+                "log_retention_archive_days",
+                source,
+                &field(path, "log_retention_archive_days"),
+            )?,
             max_event_bytes: usize_value(
                 table,
                 "max_event_bytes",
@@ -2721,6 +2739,10 @@ impl SessionSettings {
         replace_if_some(&mut self.mode, next.mode);
         replace_if_some(&mut self.log_dir, next.log_dir);
         replace_if_some(&mut self.log_retention_days, next.log_retention_days);
+        replace_if_some(
+            &mut self.log_retention_archive_days,
+            next.log_retention_archive_days,
+        );
         replace_if_some(&mut self.max_event_bytes, next.max_event_bytes);
         replace_if_some(&mut self.max_session_bytes, next.max_session_bytes);
     }
@@ -2730,8 +2752,17 @@ impl SessionSettings {
 pub struct SessionLogConfig {
     pub log_dir: Option<PathBuf>,
     pub log_retention_days: u64,
+    /// Days an archived session lingers before the retention sweep
+    /// permanently deletes it. Setting this to `0` disables the archive
+    /// sweep; archived sessions are then retained until removed by hand.
+    #[serde(default = "default_log_retention_archive_days")]
+    pub log_retention_archive_days: u64,
     pub max_event_bytes: usize,
     pub max_session_bytes: usize,
+}
+
+fn default_log_retention_archive_days() -> u64 {
+    DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS
 }
 
 impl SessionLogConfig {
@@ -2742,6 +2773,13 @@ impl SessionLogConfig {
                 .log_retention_days
                 .filter(|value| *value > 0)
                 .unwrap_or(DEFAULT_SESSION_LOG_RETENTION_DAYS),
+            // `0` is a valid explicit value here: it disables the archive
+            // sweep and lets archived sessions accumulate until the user
+            // removes them by hand. Anything else falls back to the
+            // built-in default rather than silently being treated as zero.
+            log_retention_archive_days: settings
+                .log_retention_archive_days
+                .unwrap_or(DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS),
             max_event_bytes: settings
                 .max_event_bytes
                 .filter(|value| *value > 0)
@@ -2759,6 +2797,7 @@ impl Default for SessionLogConfig {
         Self {
             log_dir: None,
             log_retention_days: DEFAULT_SESSION_LOG_RETENTION_DAYS,
+            log_retention_archive_days: DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS,
             max_event_bytes: DEFAULT_SESSION_MAX_EVENT_BYTES,
             max_session_bytes: DEFAULT_SESSION_MAX_SESSION_BYTES,
         }
@@ -6031,6 +6070,7 @@ pub fn user_settings_template() -> &'static str {
 # mode = "build"              # build | plan
 # log_dir = ".squeezy/sessions"
 # log_retention_days = 30
+# log_retention_archive_days = 30  # archived sessions deleted after this many days; 0 disables the archive sweep
 # max_event_bytes = 65536
 # max_session_bytes = 52428800
 
@@ -6217,6 +6257,7 @@ pub fn project_settings_template() -> &'static str {
 # mode = "build"              # build | plan
 # log_dir = ".squeezy/sessions"
 # log_retention_days = 30
+# log_retention_archive_days = 30  # archived sessions deleted after this many days; 0 disables the archive sweep
 # max_event_bytes = 65536
 # max_session_bytes = 52428800
 

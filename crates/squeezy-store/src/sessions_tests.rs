@@ -631,14 +631,36 @@ fn cleanup_does_not_sweep_running_sessions_via_retention() {
         .expect("backdate completed session");
 
     let report = store.cleanup(&[]).expect("cleanup");
+    // Live retention is now a soft delete: the completed-and-expired
+    // session moves to `archived/<id>/` instead of being removed
+    // outright. `archived` carries the soft-deleted ids; `removed`
+    // is reserved for the archive retention sweep that runs in the
+    // same pass once `retention_archive_days` is exceeded.
     assert_eq!(
-        report.removed,
+        report.archived,
         vec![completed.session_id().to_string()],
-        "only the completed-and-expired session should be swept",
+        "the completed-and-expired session should be archived, not deleted",
+    );
+    assert!(
+        report.removed.is_empty(),
+        "live retention must not permanently delete; got {:?}",
+        report.removed,
     );
     assert!(
         store.root().join(running.session_id()).exists(),
         "running session must survive a retention sweep",
+    );
+    assert!(
+        store
+            .root()
+            .join(super::ARCHIVED_SUBDIR)
+            .join(completed.session_id())
+            .exists(),
+        "completed session must land in the archive subtree",
+    );
+    assert!(
+        !store.root().join(completed.session_id()).exists(),
+        "completed session must leave the live root after archival",
     );
 }
 
@@ -667,7 +689,10 @@ fn cleanup_excluding_skips_protected_session() {
         )
         .expect("cleanup");
 
-    assert_eq!(report.removed, vec![collateral.session_id().to_string()]);
+    // Explicit `ids` archive the live session rather than deleting it,
+    // matching the retention sweep so neither path destroys history.
+    assert_eq!(report.archived, vec![collateral.session_id().to_string()]);
+    assert!(report.removed.is_empty());
     assert!(
         store.root().join(protected.session_id()).exists(),
         "protected session must remain on disk"
@@ -1273,9 +1298,17 @@ fn cleanup_skips_archived_sessions() {
     let report = store
         .cleanup(std::slice::from_ref(&session_id))
         .expect("cleanup with archived id");
+    // Explicit `ids` for an already-archived session are a no-op: the
+    // archive retention sweep is the only path that hard-deletes, and
+    // the just-archived session has not yet aged past
+    // `retention_archive_days` (default 30 days).
     assert!(
         !report.removed.contains(&session_id),
-        "archived session must not be removed by cleanup",
+        "archived session must not be hard-deleted by cleanup",
+    );
+    assert!(
+        !report.archived.contains(&session_id),
+        "already-archived session must not be re-archived",
     );
 
     let still_there = store
@@ -1289,6 +1322,171 @@ fn cleanup_skips_archived_sessions() {
             .iter()
             .any(|metadata| metadata.session_id == session_id),
         "archived session survives cleanup",
+    );
+}
+
+#[test]
+fn cleanup_deletes_archived_sessions_past_archive_retention() {
+    let root = temp_root("archive-retention-deletes");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            // Live retention stays high so we exercise the archive
+            // retention path in isolation: nothing is archived by the
+            // sweep itself; we age the existing archive entry by hand.
+            log_retention_days: 3650,
+            log_retention_archive_days: 7,
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle.flush_events().expect("flush events");
+    let session_id = handle.session_id().to_string();
+    store.archive_session(&session_id).expect("archive");
+
+    // Backdate the archived metadata so `ended_at_ms` (the archival
+    // timestamp) sits well outside the 7-day archive retention.
+    let archived_dir = store.root().join(super::ARCHIVED_SUBDIR).join(&session_id);
+    let metadata_path = archived_dir.join("metadata.json");
+    let text = fs::read_to_string(&metadata_path).expect("read archived metadata");
+    let mut metadata: super::SessionMetadata =
+        serde_json::from_str(&text).expect("parse archived metadata");
+    metadata.started_at_ms = 1;
+    metadata.ended_at_ms = Some(1);
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).expect("serialize"),
+    )
+    .expect("write metadata");
+
+    let report = store.cleanup(&[]).expect("cleanup archive-retention");
+    assert_eq!(
+        report.removed,
+        vec![session_id.clone()],
+        "expired archived session should be hard-deleted",
+    );
+    assert!(
+        report.archived.is_empty(),
+        "no live session should have been archived in this sweep",
+    );
+    assert!(
+        !archived_dir.exists(),
+        "expired archived session must be removed from disk",
+    );
+}
+
+#[test]
+fn cleanup_with_archive_retention_disabled_keeps_archived_sessions() {
+    let root = temp_root("archive-retention-disabled");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            log_retention_days: 3650,
+            // `0` disables the archive sweep entirely: archived
+            // sessions linger until the user removes them by hand.
+            log_retention_archive_days: 0,
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle.flush_events().expect("flush events");
+    let session_id = handle.session_id().to_string();
+    store.archive_session(&session_id).expect("archive");
+
+    let archived_dir = store.root().join(super::ARCHIVED_SUBDIR).join(&session_id);
+    let metadata_path = archived_dir.join("metadata.json");
+    let text = fs::read_to_string(&metadata_path).expect("read archived metadata");
+    let mut metadata: super::SessionMetadata =
+        serde_json::from_str(&text).expect("parse archived metadata");
+    metadata.started_at_ms = 1;
+    metadata.ended_at_ms = Some(1);
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).expect("serialize"),
+    )
+    .expect("write metadata");
+
+    let report = store.cleanup(&[]).expect("cleanup");
+    assert!(
+        report.removed.is_empty(),
+        "archive sweep must be a no-op when retention_archive_days = 0",
+    );
+    assert!(
+        archived_dir.exists(),
+        "archived session must survive when the archive sweep is disabled",
+    );
+}
+
+#[test]
+fn remove_session_archives_live_session() {
+    let (_root, store, config) = open_test_store("remove-session-archives");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle.flush_events().expect("flush events");
+    let session_id = handle.session_id().to_string();
+    // Drop the handle so the session log writer thread shuts down
+    // before we move the directory out from under it.
+    drop(handle);
+
+    store
+        .remove_session(&session_id)
+        .expect("remove_session should soft-archive");
+
+    assert!(
+        !store.root().join(&session_id).exists(),
+        "live directory must be empty after remove_session",
+    );
+    assert!(
+        store
+            .root()
+            .join(super::ARCHIVED_SUBDIR)
+            .join(&session_id)
+            .exists(),
+        "remove_session must move the directory under the archived/ subtree",
+    );
+}
+
+#[test]
+fn archived_session_remains_readable_via_show() {
+    let (_root, store, config) = open_test_store("archived-readable");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle
+        .append_event(SessionEvent::new(
+            "user_message",
+            None,
+            Some("read me back after archive".to_string()),
+            json!({"ok": true}),
+        ))
+        .expect("append event");
+    handle.flush_events().expect("flush events");
+    let session_id = handle.session_id().to_string();
+    drop(handle);
+    store.archive_session(&session_id).expect("archive");
+
+    let record = store
+        .show(&session_id)
+        .expect("show should resolve an archived session");
+    assert_eq!(record.metadata.session_id, session_id);
+    assert_eq!(record.metadata.status, SessionStatus::Archived);
+    assert!(
+        record
+            .events
+            .iter()
+            .any(|event| event.summary.as_deref() == Some("read me back after archive")),
+        "events.jsonl content must round-trip through archive",
     );
 }
 

@@ -30,6 +30,7 @@ pub const ARCHIVED_SUBDIR: &str = "archived";
 pub struct SessionStore {
     root: PathBuf,
     retention_days: u64,
+    retention_archive_days: u64,
     max_event_bytes: usize,
     max_session_bytes: usize,
 }
@@ -40,6 +41,7 @@ impl SessionStore {
         Self {
             root,
             retention_days: config.session_logs.log_retention_days,
+            retention_archive_days: config.session_logs.log_retention_archive_days,
             max_event_bytes: config.session_logs.max_event_bytes,
             max_session_bytes: config.session_logs.max_session_bytes,
         }
@@ -245,7 +247,7 @@ impl SessionStore {
     }
 
     pub fn show(&self, session_id: &str) -> Result<SessionRecord> {
-        let dir = self.session_dir(session_id);
+        let dir = self.locate_session_dir(session_id);
         let metadata = read_json(&dir.join("metadata.json"))?;
         let (events, event_warnings) = read_jsonl(&dir.join("events.jsonl"))?;
         let resume_state = read_json(&dir.join("resume_state.json")).ok();
@@ -263,13 +265,33 @@ impl SessionStore {
 
     pub fn replay_tape(&self, session_id: &str) -> Result<SessionReplayTape> {
         let (events, warnings) =
-            read_replay_jsonl(&self.session_dir(session_id).join("replay.jsonl"))?;
+            read_replay_jsonl(&self.locate_session_dir(session_id).join("replay.jsonl"))?;
         Ok(SessionReplayTape {
             schema_version: SESSION_REPLAY_SCHEMA_VERSION,
             session_id: session_id.to_string(),
             events,
             warnings,
         })
+    }
+
+    /// Resolve the on-disk directory for a session whether it currently
+    /// lives under the live root or under `archived/<id>/`. Used by
+    /// read-only callers (`show`, `replay_tape`) so an archived session
+    /// stays inspectable; producers continue to use [`Self::session_dir`]
+    /// so they create new sessions under the live root.
+    fn locate_session_dir(&self, session_id: &str) -> PathBuf {
+        let live = self.session_dir(session_id);
+        if live.exists() {
+            return live;
+        }
+        let archived = self.root.join(ARCHIVED_SUBDIR).join(session_id);
+        if archived.exists() {
+            return archived;
+        }
+        // No directory exists at either location. Return the live path
+        // so downstream `read_*` calls produce a consistent "not found"
+        // error rather than a spurious archive-tree error message.
+        live
     }
 
     pub fn export(&self, session_id: &str) -> Result<Value> {
@@ -294,28 +316,65 @@ impl SessionStore {
     /// Like [`cleanup`] but skips `protected_id` even if it would otherwise
     /// match (used to keep the currently active session from being removed
     /// out from under a live agent).
+    ///
+    /// Live sessions that expire (or that the caller names in `ids`) are
+    /// *archived* — moved to `archived/<id>/` and flipped to
+    /// `SessionStatus::Archived` — instead of being deleted outright.
+    /// Sessions that have already been archived for longer than
+    /// `retention_archive_days` are then permanently deleted in the same
+    /// sweep. This gives users a window to recover a session that the
+    /// retention policy would otherwise destroy: live retention reduces
+    /// disk pressure, archive retention bounds the recoverable history.
+    /// Setting `retention_archive_days` to `0` disables the archive sweep
+    /// so archived sessions are kept until the user removes them by hand.
     pub fn cleanup_excluding(
         &self,
         ids: &[String],
         protected_id: Option<&str>,
     ) -> Result<CleanupReport> {
+        let mut archived = Vec::new();
         let mut removed = Vec::new();
         let cutoff = now_ms().saturating_sub(self.retention_days.saturating_mul(86_400_000));
         let explicit: std::collections::BTreeSet<&str> = ids.iter().map(String::as_str).collect();
-        for metadata in self.list(&SessionQuery::default())? {
+        for metadata in self.list(&SessionQuery {
+            include_archived: true,
+            ..SessionQuery::default()
+        })? {
             if protected_id == Some(metadata.session_id.as_str()) {
                 continue;
             }
-            let is_explicit = explicit.contains(metadata.session_id.as_str());
-            // Archived sessions are explicit user keepers: skip them in
-            // every retention sweep, even when listed in `ids`. Callers
-            // that want to permanently delete must unarchive first.
             if matches!(metadata.status, SessionStatus::Archived) {
+                // Archived sessions exist purely so users can recover
+                // history that retention would otherwise have destroyed.
+                // Hard-deleting them on explicit `ids` would defeat that;
+                // the only path that removes them is the archive retention
+                // sweep below, which fires when both the days threshold
+                // is non-zero and the session has been archived long
+                // enough. Until then, callers that truly want to delete
+                // must unarchive first and then run cleanup again.
+                if self.retention_archive_days == 0 {
+                    continue;
+                }
+                let archive_cutoff =
+                    now_ms().saturating_sub(self.retention_archive_days.saturating_mul(86_400_000));
+                // `ended_at_ms` is set when `archive_session` flips the
+                // status, so it is the right "time of archival" anchor.
+                // Fall back to `started_at_ms` for sessions archived by
+                // older code paths that may not have populated it.
+                let archived_at = metadata.ended_at_ms.unwrap_or(metadata.started_at_ms);
+                if archived_at < archive_cutoff {
+                    let dir = self.root.join(ARCHIVED_SUBDIR).join(&metadata.session_id);
+                    if dir.exists() {
+                        fs::remove_dir_all(&dir)?;
+                    }
+                    removed.push(metadata.session_id);
+                }
                 continue;
             }
+            let is_explicit = explicit.contains(metadata.session_id.as_str());
             // Never sweep a `Running` session through retention alone: it may
             // belong to a long-lived process whose `ended_at_ms` simply isn't
-            // set yet. Explicit ids still win so users can force-remove a
+            // set yet. Explicit ids still win so users can force-archive a
             // crashed or stuck session.
             let expired = match metadata.ended_at_ms {
                 Some(end) => end < cutoff,
@@ -325,19 +384,29 @@ impl SessionStore {
                 }
             };
             if is_explicit || expired {
-                let dir = self.session_dir(&metadata.session_id);
-                fs::remove_dir_all(&dir)?;
-                removed.push(metadata.session_id);
+                // `archive_session` is idempotent for the live -> archived
+                // move; a destination collision means another caller raced
+                // us, which we surface so the operator can investigate.
+                self.archive_session(&metadata.session_id)?;
+                archived.push(metadata.session_id);
             }
         }
-        Ok(CleanupReport { removed })
+        Ok(CleanupReport { archived, removed })
     }
 
+    /// Soft-delete that prefers archiving over permanent removal.
+    /// Live sessions are moved into `archived/<id>/` (same path as
+    /// [`archive_session`]); archived sessions are left in place because
+    /// the retention sweep is the only path that permanently deletes
+    /// history. Missing sessions are a no-op so callers can drive this
+    /// from a stale id without erroring.
     pub fn remove_session(&self, session_id: &str) -> Result<()> {
-        let dir = self.session_dir(session_id);
-        if dir.exists() {
-            fs::remove_dir_all(dir)?;
+        let live_dir = self.session_dir(session_id);
+        if live_dir.exists() {
+            return self.archive_session(session_id);
         }
+        // Already archived (or never existed) — nothing to do. The
+        // archive retention sweep handles the eventual hard delete.
         Ok(())
     }
 
@@ -1231,8 +1300,17 @@ pub struct SessionRecord {
     pub replay: Option<SessionReplayTape>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleanupReport {
+    /// Live sessions that were moved into `archived/<id>/` by this
+    /// sweep. They still exist on disk and can be restored with
+    /// [`SessionStore::unarchive_session`] until the archive retention
+    /// sweep deletes them.
+    #[serde(default)]
+    pub archived: Vec<String>,
+    /// Sessions that were permanently deleted by this sweep. Only the
+    /// archive retention sweep populates this list: live sessions
+    /// always move through `archived/` first.
     pub removed: Vec<String>,
 }
 
