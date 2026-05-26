@@ -15,7 +15,6 @@ mod bedrock;
 mod compatible;
 mod credentials;
 mod google;
-mod keychain;
 pub mod model_discovery;
 mod ollama;
 mod openai;
