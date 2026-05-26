@@ -31,6 +31,9 @@ pub enum HookEvent {
     PostTool,
     /// Fired before a context compaction pass runs.
     PreCompact,
+    /// Fired after a context compaction pass lands, with the before/after
+    /// token counts in the payload so observers can react to the rewrite.
+    PostCompact,
     /// Fired when a subagent is spawned.
     SubagentStart,
     /// Fired when a permission decision is about to be presented.

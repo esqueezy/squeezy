@@ -117,6 +117,7 @@ fn enum_variants_are_distinct() {
         HookEvent::PreTurn,
         HookEvent::PostTool,
         HookEvent::PreCompact,
+        HookEvent::PostCompact,
         HookEvent::SubagentStart,
         HookEvent::PermissionRequest,
     ];

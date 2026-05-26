@@ -3312,6 +3312,196 @@ fn total_tokens_from_cost_returns_none_when_no_fields() {
 }
 
 #[test]
+fn mid_turn_compaction_will_fire_matches_maybe_compact_mid_turn_gate() {
+    let config = config_with_mid_turn(100_000, 80);
+    let conversation = mid_turn_test_conversation();
+
+    // Below the configured threshold, the predicate must report `false`
+    // so the agent does not fire a `PreCompact` hook on a turn that
+    // never reaches the rewrite path.
+    assert!(!super::mid_turn_compaction_will_fire(
+        &config,
+        &conversation,
+        Some(50_000),
+    ));
+
+    // At/above the threshold, the predicate must report `true` so the
+    // hook fires before `maybe_compact_mid_turn` mutates conversation.
+    assert!(super::mid_turn_compaction_will_fire(
+        &config,
+        &conversation,
+        Some(80_001),
+    ));
+
+    // Mid-turn disabled disables the predicate too.
+    let mut disabled = config.clone();
+    disabled.context_compaction.enabled_mid_turn = false;
+    assert!(!super::mid_turn_compaction_will_fire(
+        &disabled,
+        &conversation,
+        Some(80_001),
+    ));
+
+    // Missing window short-circuits the predicate.
+    let mut no_window = config;
+    no_window.context_compaction.model_context_window = None;
+    assert!(!super::mid_turn_compaction_will_fire(
+        &no_window,
+        &conversation,
+        Some(80_001),
+    ));
+}
+
+/// HookHandler that counts how many times each variant fires and
+/// snapshots the last payload it saw. Drives the end-to-end test that
+/// verifies the pre-turn compaction site dispatches `PreCompact` and
+/// `PostCompact` with the documented `{ before_tokens, after_tokens }`
+/// payload.
+struct CompactionHookRecorder {
+    pre_count: std::sync::atomic::AtomicUsize,
+    post_count: std::sync::atomic::AtomicUsize,
+    last_post_payload: std::sync::Mutex<Option<serde_json::Value>>,
+}
+
+impl CompactionHookRecorder {
+    fn new() -> Self {
+        Self {
+            pre_count: std::sync::atomic::AtomicUsize::new(0),
+            post_count: std::sync::atomic::AtomicUsize::new(0),
+            last_post_payload: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn pre(&self) -> usize {
+        self.pre_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn post(&self) -> usize {
+        self.post_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn last_post_payload(&self) -> Option<serde_json::Value> {
+        self.last_post_payload.lock().unwrap().clone()
+    }
+}
+
+struct CompactionHookRecorderRef(Arc<CompactionHookRecorder>);
+
+impl squeezy_hooks::HookHandler for CompactionHookRecorderRef {
+    fn handle(&self, ctx: &squeezy_hooks::HookContext) -> squeezy_hooks::HookResult {
+        match ctx.event {
+            squeezy_hooks::HookEvent::PreCompact => {
+                self.0
+                    .pre_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            squeezy_hooks::HookEvent::PostCompact => {
+                self.0
+                    .post_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *self.0.last_post_payload.lock().unwrap() = Some(ctx.payload.clone());
+            }
+            _ => {}
+        }
+        squeezy_hooks::HookResult::allow()
+    }
+}
+
+#[tokio::test]
+async fn pre_turn_compaction_dispatches_pre_and_post_compact_hooks() {
+    use squeezy_hooks::HookRegistry;
+
+    // Two MockProvider responses: turn 1 grows the conversation past
+    // the compaction floor, turn 2 trips the auto trigger because
+    // estimated_tokens=0 + min_items=1 + recent_items=1 means a
+    // conversation of three items will be split into [older..1] /
+    // [recent..2] and compacted.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "first reply long enough to estimate as tokens".to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("second reply".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+
+    let mut config = AppConfig::default();
+    config.context_compaction = ContextCompactionConfig {
+        enabled: true,
+        min_items: 1,
+        recent_items: 1,
+        estimated_tokens: 0,
+        ..ContextCompactionConfig::default()
+    };
+
+    let mut agent = Agent::new(config, provider);
+    let recorder = Arc::new(CompactionHookRecorder::new());
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(CompactionHookRecorderRef(recorder.clone())));
+    agent.set_hooks(Some(Arc::new(registry)));
+
+    // Turn 1: drain to completion. After this, the persisted
+    // conversation contains [UserText, AssistantText].
+    let mut rx = agent.start_turn("seed turn".to_string(), CancellationToken::new());
+    while let Some(_event) = rx.recv().await {}
+    assert_eq!(
+        recorder.pre(),
+        0,
+        "no compaction is possible on turn 1 because items (1) does not exceed keep (1)",
+    );
+    assert_eq!(recorder.post(), 0, "no PostCompact without a rewrite");
+
+    // Turn 2: push the third item (the new UserText) — items=3 now
+    // exceeds keep=1, so `maybe_compact_conversation` fires. PreCompact
+    // must fire before the rewrite, PostCompact must fire after with the
+    // before/after token counts in the payload.
+    let mut rx = agent.start_turn("second turn".to_string(), CancellationToken::new());
+    while let Some(_event) = rx.recv().await {}
+
+    assert_eq!(
+        recorder.pre(),
+        1,
+        "PreCompact must fire exactly once on the turn that compacts",
+    );
+    assert_eq!(
+        recorder.post(),
+        1,
+        "PostCompact must fire exactly once on the turn that compacts",
+    );
+
+    let payload = recorder
+        .last_post_payload()
+        .expect("PostCompact carries a payload");
+    let payload_obj = payload.as_object().expect("payload is an object");
+    assert!(
+        payload_obj.contains_key("before_tokens"),
+        "PostCompact payload missing before_tokens: {payload}",
+    );
+    assert!(
+        payload_obj.contains_key("after_tokens"),
+        "PostCompact payload missing after_tokens: {payload}",
+    );
+    let before = payload_obj["before_tokens"].as_u64().expect("u64");
+    let after = payload_obj["after_tokens"].as_u64().expect("u64");
+    assert!(
+        after <= before,
+        "compaction should shrink or hold token count: before={before} after={after}",
+    );
+}
+
+#[test]
 fn compaction_strategy_default_is_extractive() {
     assert_eq!(
         CompactionStrategy::default(),

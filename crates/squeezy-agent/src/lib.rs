@@ -1495,11 +1495,13 @@ impl Agent {
     }
 
     /// Install a hook registry. Handlers registered here observe
-    /// `HookEvent::PreTurn` before each turn's LLM request and are
-    /// reserved (variant-only) for the other event kinds. Passing
-    /// `None` clears any previously-installed registry. Wrapped in
-    /// `Arc` so cloned `TurnRuntime`s share the same handler set
-    /// without paying for re-registration on every turn.
+    /// `HookEvent::PreTurn` before each turn's LLM request and
+    /// `HookEvent::{PreCompact, PostCompact}` around each compaction
+    /// pass (pre- and mid-turn). Remaining variants are reserved
+    /// (variant-only) for follow-up wiring. Passing `None` clears any
+    /// previously-installed registry. Wrapped in `Arc` so cloned
+    /// `TurnRuntime`s share the same handler set without paying for
+    /// re-registration on every turn.
     pub fn set_hooks(&mut self, hooks: Option<Arc<HookRegistry>>) {
         self.hooks = hooks;
     }
@@ -3572,6 +3574,85 @@ impl TurnRuntime {
         }
     }
 
+    /// Fan out a `HookEvent::PreCompact` to every registered handler
+    /// when a hook registry is installed. `before_tokens` is the
+    /// pre-compaction estimate so handlers can decide whether to log,
+    /// veto (advisory today; not yet enforced), or react. The hook is
+    /// skipped entirely when no registry is configured so the no-hooks
+    /// path stays allocation-free.
+    fn dispatch_pre_compact(&self, before_tokens: u64) {
+        let Some(registry) = self.hooks.as_ref() else {
+            return;
+        };
+        if registry.is_empty() {
+            return;
+        }
+        let payload = json!({
+            "turn_index": self.turn_id.to_string(),
+            "before_tokens": before_tokens,
+        });
+        let results = registry.dispatch(HookEvent::PreCompact, payload);
+        for (idx, result) in results.iter().enumerate() {
+            if let Some(mutate) = result.mutate.as_ref() {
+                tracing::debug!(
+                    target: "squeezy::hooks",
+                    turn_id = %self.turn_id,
+                    handler_index = idx,
+                    %mutate,
+                    "PreCompact handler proposed a mutation (not yet applied)"
+                );
+            }
+            if !result.allow {
+                tracing::debug!(
+                    target: "squeezy::hooks",
+                    turn_id = %self.turn_id,
+                    handler_index = idx,
+                    message = result.message.as_deref().unwrap_or(""),
+                    "PreCompact handler returned allow=false (not yet enforced)"
+                );
+            }
+        }
+    }
+
+    /// Fan out a `HookEvent::PostCompact` carrying the before/after
+    /// token counts so handlers can observe how much the rewrite
+    /// shrank the conversation. Mirrors `dispatch_pre_compact` in
+    /// every other respect.
+    fn dispatch_post_compact(&self, before_tokens: u64, after_tokens: u64) {
+        let Some(registry) = self.hooks.as_ref() else {
+            return;
+        };
+        if registry.is_empty() {
+            return;
+        }
+        let payload = json!({
+            "turn_index": self.turn_id.to_string(),
+            "before_tokens": before_tokens,
+            "after_tokens": after_tokens,
+        });
+        let results = registry.dispatch(HookEvent::PostCompact, payload);
+        for (idx, result) in results.iter().enumerate() {
+            if let Some(mutate) = result.mutate.as_ref() {
+                tracing::debug!(
+                    target: "squeezy::hooks",
+                    turn_id = %self.turn_id,
+                    handler_index = idx,
+                    %mutate,
+                    "PostCompact handler proposed a mutation (not yet applied)"
+                );
+            }
+            if !result.allow {
+                tracing::debug!(
+                    target: "squeezy::hooks",
+                    turn_id = %self.turn_id,
+                    handler_index = idx,
+                    message = result.message.as_deref().unwrap_or(""),
+                    "PostCompact handler returned allow=false (not yet enforced)"
+                );
+            }
+        }
+    }
+
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
         let task_title = input.clone();
         let activation = self.tools.activate_skills_for_input(&input)?;
@@ -3632,6 +3713,19 @@ impl TurnRuntime {
             redact_llm_input_items(prior_state.conversation.clone(), &self.redactor);
         conversation.push(user_item.clone());
         let mut context_compaction = prior_state.context_compaction.clone();
+        // PreCompact hook fires only when the auto trigger's
+        // thresholds are crossed so handlers don't see a hook on every
+        // turn — only when compaction will actually run. PostCompact
+        // mirrors the report's before/after counts so observers can
+        // measure the rewrite. The no-hook path stays allocation-free.
+        let pre_compaction_estimate = estimate_context(&conversation);
+        let compaction_likely = self.config.context_compaction.enabled
+            && pre_compaction_estimate.items >= self.config.context_compaction.min_items
+            && pre_compaction_estimate.estimated_tokens
+                >= self.config.context_compaction.estimated_tokens;
+        if compaction_likely {
+            self.dispatch_pre_compact(pre_compaction_estimate.estimated_tokens);
+        }
         if let Some(report) = maybe_compact_conversation(
             &mut conversation,
             &mut context_compaction,
@@ -3640,6 +3734,10 @@ impl TurnRuntime {
             &self.config,
             ContextCompactionTrigger::Auto,
         ) {
+            self.dispatch_post_compact(
+                report.record.before.estimated_tokens,
+                report.record.after.estimated_tokens,
+            );
             self.log_event(
                 "context_compacted",
                 Some(self.turn_id),
@@ -4325,16 +4423,37 @@ impl TurnRuntime {
             // compaction generation, which forces previous_response_id
             // off the next request to keep the provider state consistent
             // with the new history.
+            //
+            // The PreCompact / PostCompact hook fan-out mirrors the
+            // pre-turn path: PreCompact fires only when the mid-turn
+            // gate will trip; PostCompact carries the report's
+            // before/after counts when the rewrite landed.
+            let mid_turn_observed_tokens = total_tokens_from_cost(&completed_cost);
+            let mid_turn_compaction_likely = mid_turn_compaction_will_fire(
+                &self.config,
+                &conversation,
+                mid_turn_observed_tokens,
+            );
+            if mid_turn_compaction_likely {
+                let pre_estimate = mid_turn_observed_tokens.unwrap_or_else(|| {
+                    estimate_context(&conversation).estimated_tokens
+                });
+                self.dispatch_pre_compact(pre_estimate);
+            }
             let mid_turn_report = maybe_compact_mid_turn(
                 &mut conversation,
                 &mut context_compaction,
                 &active_attachments,
                 self.store.as_deref(),
                 &self.config,
-                total_tokens_from_cost(&completed_cost),
+                mid_turn_observed_tokens,
             );
             let mid_turn_compacted = mid_turn_report.is_some();
             if let Some(report) = mid_turn_report {
+                self.dispatch_post_compact(
+                    report.record.before.estimated_tokens,
+                    report.record.after.estimated_tokens,
+                );
                 self.log_event(
                     "context_compacted",
                     Some(self.turn_id),
@@ -9078,6 +9197,34 @@ fn total_tokens_from_cost(cost: &CostSnapshot) -> Option<u64> {
         total = total.saturating_add(value);
     }
     if saw_any { Some(total) } else { None }
+}
+
+/// Mirror of the gate inside `maybe_compact_mid_turn`. Returns `true`
+/// when the configured threshold is crossed so the agent can fire a
+/// `HookEvent::PreCompact` before the rewrite call. Kept here (rather
+/// than in `context_compaction.rs`) because the hook fan-out is an
+/// agent-loop concern; the function reads only public config and
+/// estimator state so it stays a thin predicate.
+fn mid_turn_compaction_will_fire(
+    config: &AppConfig,
+    conversation: &[LlmInputItem],
+    last_total_tokens: Option<u64>,
+) -> bool {
+    if !config.context_compaction.enabled_mid_turn {
+        return false;
+    }
+    let Some(window) = config.context_compaction.model_context_window else {
+        return false;
+    };
+    if window == 0 {
+        return false;
+    }
+    let threshold = window
+        .saturating_mul(config.context_compaction.threshold_percent.min(100) as u64)
+        .saturating_div(100);
+    let observed = last_total_tokens
+        .unwrap_or_else(|| estimate_context(conversation).estimated_tokens);
+    observed >= threshold
 }
 
 pub(crate) fn compact_text(text: &str, max_chars: usize) -> String {
