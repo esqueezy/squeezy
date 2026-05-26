@@ -1819,8 +1819,89 @@ async fn slash_cost_reports_empty_session_without_model_turn() {
         output.contains("provider_tokens input=- output=-"),
         "{output}"
     );
-    assert!(output.contains("tools calls=0"), "{output}");
+    // Empty buckets are suppressed so a fresh session is a short report,
+    // not a wall of zero-valued counters.
+    assert!(!output.contains("tools calls="), "{output}");
+    assert!(!output.contains("subagents calls="), "{output}");
+    assert!(!output.contains("receipts stub_hits="), "{output}");
+    assert!(!output.contains("spills writes="), "{output}");
+    assert!(!output.contains("\nio bytes_read="), "{output}");
+    assert!(!output.contains("\nredactions="), "{output}");
     assert!(app.jobs.is_empty());
+}
+
+#[test]
+fn format_cost_command_renders_active_buckets() {
+    use squeezy_agent::{
+        AttachmentShape, ConversationShape, SessionAccountingSnapshot, TranscriptShape,
+    };
+    use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
+    use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
+
+    let estimate = RequestTokenEstimate {
+        input_tokens: 0,
+        context_window_tokens: None,
+        effective_context_window_tokens: None,
+        headroom_tokens: None,
+        max_output_tokens: None,
+        input_budget_tokens: None,
+        remaining_input_tokens: None,
+        used_input_percent_x100: None,
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        estimated: true,
+    };
+
+    let metrics = SessionMetrics {
+        tool_calls: 4,
+        tool_successes: 3,
+        tool_errors: 1,
+        bytes_read: 12_345,
+        subagent_calls: 1,
+        subagent_provider: CostSnapshot {
+            input_tokens: Some(900),
+            output_tokens: Some(120),
+            estimated_usd_micros: Some(7_500),
+            ..CostSnapshot::default()
+        },
+        receipt_stub_hits: 2,
+        spill_writes: 1,
+        ..SessionMetrics::default()
+    };
+
+    let snapshot = SessionAccountingSnapshot {
+        session_id: Some("sess-1".to_string()),
+        provider: "scripted",
+        model: "gpt-5.5".to_string(),
+        mode: SessionMode::Build,
+        store_responses: false,
+        previous_response_id: None,
+        cost: CostSnapshot {
+            input_tokens: Some(1_200),
+            output_tokens: Some(340),
+            estimated_usd_micros: Some(415_300),
+            ..CostSnapshot::default()
+        },
+        metrics,
+        redactions: 2,
+        transcript: TranscriptShape::default(),
+        conversation: ConversationShape::default(),
+        attachments: AttachmentShape::default(),
+        transmitted_request: estimate,
+        full_history_request: estimate,
+    };
+
+    let output = commands::format_cost_command(&snapshot);
+    assert!(output.contains("estimated_usd=$0.415300"), "{output}");
+    assert!(output.contains("provider_tokens input=1200"), "{output}");
+    assert!(
+        output.contains("tools calls=4 successes=3 errors=1"),
+        "{output}"
+    );
+    assert!(output.contains("subagents calls=1"), "{output}");
+    assert!(output.contains("receipts stub_hits=2"), "{output}");
+    assert!(output.contains("spills writes=1"), "{output}");
+    assert!(output.contains("io bytes_read=12345"), "{output}");
+    assert!(output.contains("redactions=2"), "{output}");
 }
 
 #[tokio::test]
@@ -3527,6 +3608,85 @@ fn failed_assistant_marker_uses_error_color() {
 
     assert_eq!(lines[0].spans[1].content.as_ref(), "●");
     assert_eq!(lines[0].spans[1].style.fg, Some(ERROR_RED));
+}
+
+#[test]
+fn accounting_block_colors_labels_values_and_dollar_amounts() {
+    let content = "Cost accounting\n\
+session=abc\n\
+provider=openai model=gpt-5.5 mode=build\n\
+estimated_usd=$0.415300 (estimated from provider-reported usage and local pricing metadata)\n\
+provider_tokens input=1200 output=340 reasoning=- cached_input=0 cache_write_input=-\n\
+tools calls=4 successes=3 errors=1 denials=0 cancellations=0 budget_denials=0\n\
+accuracy=provider token counters are provider-reported when available.";
+    let item = TranscriptItem::system(content);
+
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    assert_eq!(lines.len(), 7, "{lines:?}");
+
+    let span_for = |line: &Line<'static>, text: &str| -> Style {
+        line.spans
+            .iter()
+            .find(|span| span.content.as_ref() == text)
+            .unwrap_or_else(|| panic!("missing span {text:?} in {line:?}"))
+            .style
+    };
+
+    // Header still renders the `• Noted` chrome plus the bolded
+    // "Cost accounting" body, in GOLD.
+    let header_style = span_for(&lines[0], "Cost accounting");
+    assert_eq!(header_style.fg, Some(GOLD));
+    assert!(header_style.add_modifier.contains(Modifier::BOLD));
+
+    // `session=` is the dim label, `abc` is the bright value.
+    let session_line = &lines[1];
+    assert_eq!(span_for(session_line, "session=").fg, Some(QUIET));
+    assert_eq!(span_for(session_line, "abc").fg, None);
+
+    // The dollar amount pops in AMBER; the trailing parenthetical fades.
+    let usd_line = &lines[3];
+    assert_eq!(span_for(usd_line, "estimated_usd=").fg, Some(QUIET));
+    assert_eq!(span_for(usd_line, "$0.415300").fg, Some(AMBER));
+    assert_eq!(span_for(usd_line, "(estimated").fg, Some(QUIET));
+
+    // Zero / dash values fade so real numbers carry the eye.
+    let tokens_line = &lines[4];
+    assert_eq!(span_for(tokens_line, "provider_tokens").fg, Some(GOLD));
+    assert_eq!(span_for(tokens_line, "1200").fg, None);
+    assert_eq!(span_for(tokens_line, "-").fg, Some(QUIET));
+    assert_eq!(span_for(tokens_line, "0").fg, Some(QUIET));
+
+    // The leading group word on tool rows is GOLD.
+    let tools_line = &lines[5];
+    assert_eq!(span_for(tools_line, "tools").fg, Some(GOLD));
+    assert_eq!(span_for(tools_line, "4").fg, None);
+
+    // The accuracy epilogue is wholly dimmed.
+    let accuracy_line = &lines[6];
+    assert!(
+        accuracy_line
+            .spans
+            .iter()
+            .all(|span| span.style.fg.is_none()
+                || span.style.fg == Some(QUIET)
+                || span.content.as_ref().chars().all(char::is_whitespace)),
+        "{accuracy_line:?}"
+    );
+}
+
+#[test]
+fn accounting_block_dispatch_skips_unrelated_system_messages() {
+    let item = TranscriptItem::system("Random system note\nwith multiple\nlines");
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    // The unrelated content keeps the default single-style rendering: the
+    // header gets the standard `• Noted` chrome, the body lines fall
+    // through to `action_text_lines_styled` with no per-token coloring.
+    assert!(!lines.is_empty());
+    let header_has_noted = lines[0]
+        .spans
+        .iter()
+        .any(|span| span.content.as_ref() == "Noted");
+    assert!(header_has_noted, "{lines:?}");
 }
 
 #[test]
