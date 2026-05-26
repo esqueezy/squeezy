@@ -7232,6 +7232,43 @@ fn macos_sandbox_profile_deny_lists_protected_metadata_under_write_roots() {
 
 #[test]
 #[cfg(target_os = "macos")]
+fn macos_sandbox_profile_denies_af_unix_when_network_denied() {
+    let root = temp_workspace("macos_profile_af_unix_denied");
+    let profile = macos_shell_sandbox_profile(&root, &ShellSandboxConfig::default(), false);
+
+    // With network denied and the default empty AF_UNIX allowlist, the
+    // profile must not emit any allow-network rule. The default
+    // `(deny default)` then keeps AF_UNIX blocked.
+    assert!(
+        !profile.contains("(allow network"),
+        "denied-network profile must not allow AF_UNIX sockets: {profile}"
+    );
+    assert!(
+        !profile.contains("(local unix)"),
+        "stale `(local unix)` rule should be removed: {profile}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn macos_sandbox_profile_allows_full_network_when_network_allowed() {
+    let root = temp_workspace("macos_profile_network_allowed");
+    let profile = macos_shell_sandbox_profile(&root, &ShellSandboxConfig::default(), true);
+
+    // When network is permitted the existing wildcard allow remains so
+    // that classified-network commands keep working unchanged.
+    assert!(
+        profile.contains("(allow network*)"),
+        "allow-network profile must keep the wildcard rule: {profile}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
 fn shell_sandbox_plan_required_when_sandbox_exec_absent() {
     let err = prepare_sandbox_plan_with_probes(
         "printf ok",

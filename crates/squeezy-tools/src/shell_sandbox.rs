@@ -594,14 +594,33 @@ pub(crate) fn macos_shell_sandbox_profile(
     if allow_network {
         profile.push_str("(allow network*)\n");
     } else {
-        // The kernel still expects an explicit allow for AF_UNIX so that
-        // local sockets (DNS resolver shared memory, IPC) work; only the
-        // network-family connections are denied by default.
-        profile.push_str("(allow network* (local unix))\n");
-        profile.push_str("(allow network-inbound (local unix))\n");
+        // When network is denied we narrow AF_UNIX to an explicit
+        // allowlist rather than allowing every local socket. Without an
+        // allowlist a sandboxed shell can reach pulseaudio, ssh-agent,
+        // WindowServer, etc. via `nc -U`. Each allowed entry is matched
+        // as a path subpath so prefixes like `/private/tmp/agent.sock`
+        // cover sockets created beneath them.
+        for entry in MACOS_AF_UNIX_ALLOWLIST {
+            let escaped = sandbox_profile_string(entry);
+            profile.push_str(&format!(
+                "(allow network* (local unix-socket (subpath {escaped})))\n"
+            ));
+            profile.push_str(&format!(
+                "(allow network-inbound (local unix-socket (subpath {escaped})))\n"
+            ));
+        }
     }
     profile
 }
+
+/// Subpath-qualified AF_UNIX socket allowlist used when the network
+/// posture is denied. An empty list means AF_UNIX is denied entirely
+/// when network is denied; the default Seatbelt `(deny default)` rule
+/// supplies the actual deny. A future ticket can promote this to a
+/// `ShellSandboxConfig::socket_domain_allowlist` field; the constant
+/// keeps the policy site visible in one place.
+#[cfg(target_os = "macos")]
+const MACOS_AF_UNIX_ALLOWLIST: &[&str] = &[];
 
 /// Read-only roots every shell needs to look at: system libraries, the
 /// dynamic linker, certificate stores, the toolchain prefix, and the user's
