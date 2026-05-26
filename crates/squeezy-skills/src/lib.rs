@@ -217,9 +217,9 @@ impl SkillCatalog {
 
     pub fn activate_for_input(&self, input: &str) -> Result<SkillActivation> {
         let mut task = input.to_string();
-        let mut names = Vec::new();
+        let mut candidates: Vec<(String, SkillActivationKind)> = Vec::new();
         if let Some((name, rest)) = parse_explicit_skill_command(input) {
-            names.push(name.to_string());
+            candidates.push((name.to_string(), SkillActivationKind::Explicit));
             task = rest.to_string();
         }
 
@@ -233,20 +233,23 @@ impl SkillCatalog {
                 .iter()
                 .any(|trigger| input_matches_trigger(&lowered, trigger))
             {
-                names.push(entry.summary.name.clone());
+                candidates.push((entry.summary.name.clone(), SkillActivationKind::Trigger));
             }
         }
 
         let mut seen = BTreeSet::new();
         let mut loaded = Vec::new();
-        for name in names {
+        let mut kinds = Vec::new();
+        for (name, kind) in candidates {
             if seen.insert(name.clone()) {
                 loaded.push(self.load(&name)?);
+                kinds.push(kind);
             }
         }
         Ok(SkillActivation {
             task_input: task,
             skills: loaded,
+            kinds,
         })
     }
 
@@ -488,6 +491,24 @@ impl Clone for SkillCatalog {
 pub struct SkillActivation {
     pub task_input: String,
     pub skills: Vec<LoadedSkill>,
+    /// Activation reason per entry in `skills`, same length and order. Lets
+    /// callers emit `skill.activation.kind` telemetry so trigger-vs-explicit
+    /// hit rates are observable without re-deriving from the input.
+    pub kinds: Vec<SkillActivationKind>,
+}
+
+/// Why a skill was activated for a turn. Stays in sync with the
+/// `skill.activation.kind` telemetry label so producers and consumers agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillActivationKind {
+    /// User typed `/skill <name> ...`.
+    Explicit,
+    /// A configured trigger phrase matched the user's input.
+    Trigger,
+    /// Inferred from a shell command that touched a skill's `scripts/` dir
+    /// or `SKILL.md`. Surfaced from the shell tool, not `activate_for_input`.
+    ImplicitShell,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

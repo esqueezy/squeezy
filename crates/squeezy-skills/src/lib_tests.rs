@@ -119,11 +119,54 @@ fn explicit_and_trigger_activation_loads_lazily() {
         .expect("activate");
     assert_eq!(explicit.task_input, "find main");
     assert_eq!(explicit.skills.len(), 1);
+    assert_eq!(explicit.kinds, vec![SkillActivationKind::Explicit]);
 
     let trigger = catalog
         .activate_for_input("please inspect this Rust symbol")
         .expect("activate");
     assert_eq!(trigger.skills.len(), 1);
+    assert_eq!(trigger.kinds, vec![SkillActivationKind::Trigger]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn activation_kind_serializes_as_snake_case() {
+    let cases = [
+        (SkillActivationKind::Explicit, "\"explicit\""),
+        (SkillActivationKind::Trigger, "\"trigger\""),
+        (SkillActivationKind::ImplicitShell, "\"implicit_shell\""),
+    ];
+    for (kind, expected) in cases {
+        let json = serde_json::to_string(&kind).expect("serialize");
+        assert_eq!(json, expected);
+    }
+}
+
+#[test]
+fn explicit_then_trigger_dedup_keeps_explicit_kind() {
+    let root = temp_workspace("skills_activation_kind_dedup");
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+    write_skill(
+        &root.join(".squeezy/skills/rust-nav"),
+        "rust-nav",
+        "Rust nav",
+        &["rust symbol"],
+    );
+    let catalog = SkillCatalog::discover(&root, &config);
+
+    // Input names the skill explicitly *and* the trigger phrase matches.
+    // Dedup must keep the first occurrence (Explicit) so telemetry reports
+    // the strongest signal, not the incidental trigger hit.
+    let activation = catalog
+        .activate_for_input("/skill rust-nav inspect this rust symbol")
+        .expect("activate");
+    assert_eq!(activation.skills.len(), 1);
+    assert_eq!(activation.kinds, vec![SkillActivationKind::Explicit]);
 
     let _ = fs::remove_dir_all(root);
 }
