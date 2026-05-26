@@ -24,6 +24,76 @@ const SKILL_FILE: &str = "SKILL.md";
 const PROJECT_SKILLS_DIR: &str = ".squeezy/skills";
 const COMPAT_PROJECT_SKILLS_DIR: &str = ".agents/skills";
 
+/// Source identifier used for the in-binary skills returned by
+/// [`bundled_skills`]; the on-disk catalog uses real filesystem roots, so the
+/// `location` and `base_dir` on these summaries reference a sentinel path that
+/// will never collide with a real skill on disk.
+const BUNDLED_VIRTUAL_ROOT: &str = "<squeezy-builtin>";
+
+struct BundledSkillSource {
+    dir_name: &'static str,
+    content: &'static str,
+}
+
+const BUNDLED_SKILL_SOURCES: &[BundledSkillSource] = &[
+    BundledSkillSource {
+        dir_name: "beads-workflow",
+        content: include_str!("../builtin/beads-workflow/SKILL.md"),
+    },
+    BundledSkillSource {
+        dir_name: "release-notes",
+        content: include_str!("../builtin/release-notes/SKILL.md"),
+    },
+    BundledSkillSource {
+        dir_name: "skill-creator",
+        content: include_str!("../builtin/skill-creator/SKILL.md"),
+    },
+];
+
+/// Return the in-binary sample skills that ship with Squeezy.
+///
+/// These are not registered into a [`SkillCatalog`] automatically; callers
+/// that want to surface them as first-run examples can write them under a
+/// user-controlled skills root (typically `~/.squeezy/skills/`) before
+/// constructing the catalog, or render them directly without disk install.
+/// The on-disk discovery flow remains the authoritative path for normal use.
+pub fn bundled_skills() -> Vec<LoadedSkill> {
+    BUNDLED_SKILL_SOURCES
+        .iter()
+        .map(|source| {
+            let (metadata, body) = parse_skill_file(source.content).unwrap_or_else(|err| {
+                panic!("bundled skill {} is malformed: {err}", source.dir_name)
+            });
+            assert!(
+                is_valid_skill_name(&metadata.name),
+                "bundled skill {} has invalid name {}",
+                source.dir_name,
+                metadata.name
+            );
+            assert_eq!(
+                metadata.name, source.dir_name,
+                "bundled skill {} has mismatched frontmatter name {}",
+                source.dir_name, metadata.name
+            );
+            let virtual_root = PathBuf::from(BUNDLED_VIRTUAL_ROOT);
+            let base_dir = virtual_root.join(source.dir_name);
+            let location = base_dir.join(SKILL_FILE);
+            LoadedSkill {
+                summary: SkillSummary {
+                    name: metadata.name,
+                    description: metadata.description,
+                    when_to_use: metadata.when_to_use,
+                    source: SkillSource::User,
+                    location,
+                    disabled: false,
+                },
+                base_dir,
+                body,
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillSource {

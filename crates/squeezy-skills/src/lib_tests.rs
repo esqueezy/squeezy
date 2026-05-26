@@ -12,6 +12,56 @@ use tracing_subscriber::fmt::MakeWriter;
 use super::*;
 
 #[test]
+fn bundled_skills_load_with_valid_metadata() {
+    let bundled = bundled_skills();
+    assert!(
+        bundled.len() >= 2,
+        "expected at least two bundled samples, got {}",
+        bundled.len()
+    );
+    let mut seen = BTreeSet::new();
+    for skill in &bundled {
+        assert!(
+            is_valid_skill_name(&skill.summary.name),
+            "bundled skill name {} must satisfy SKILL.md naming rules",
+            skill.summary.name
+        );
+        assert!(
+            !skill.summary.description.trim().is_empty(),
+            "bundled skill {} must have a non-empty description",
+            skill.summary.name
+        );
+        assert!(
+            !skill.body.trim().is_empty(),
+            "bundled skill {} must have a non-empty body",
+            skill.summary.name
+        );
+        assert!(
+            seen.insert(skill.summary.name.clone()),
+            "duplicate bundled skill name: {}",
+            skill.summary.name
+        );
+        assert!(
+            skill.base_dir.starts_with("<squeezy-builtin>"),
+            "bundled skill {} base_dir must be the in-binary sentinel root, got {}",
+            skill.summary.name,
+            skill.base_dir.display()
+        );
+    }
+}
+
+#[test]
+fn bundled_skills_render_through_catalog_helpers() {
+    let bundled = bundled_skills();
+    let block = bundled
+        .first()
+        .expect("at least one bundled skill")
+        .prompt_block();
+    assert!(block.contains("<skill name=\""));
+    assert!(block.contains("<content>"));
+}
+
+#[test]
 fn parses_skill_frontmatter_and_body() {
     let (metadata, body) = parse_skill_file(
         r#"---
