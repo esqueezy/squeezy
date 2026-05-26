@@ -21,6 +21,7 @@ pub use help::{
 pub use render::SkillPreambleRender;
 
 const SKILL_FILE: &str = "SKILL.md";
+const SKILL_MANIFEST_FILE: &str = "skill.toml";
 const PROJECT_SKILLS_DIR: &str = ".squeezy/skills";
 const COMPAT_PROJECT_SKILLS_DIR: &str = ".agents/skills";
 
@@ -123,6 +124,39 @@ impl SkillSource {
     }
 }
 
+/// Optional sidecar manifest read from `skill.toml` next to `SKILL.md`.
+///
+/// The sidecar is a strict superset of the `SKILL.md` frontmatter — the
+/// frontmatter remains the catalog identity (name, description). Fields
+/// here are catalog metadata that the model can see (tool_deps,
+/// prompt_hint) plus pure display metadata that does not affect routing
+/// (icon).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillManifest {
+    /// Tool dependencies the skill expects to find at activation time
+    /// (e.g. `"mcp:exa"`, `"shell"`, `"web_fetch"`). Surfaced in the
+    /// active-skill prompt block so the model can refuse early when a
+    /// required tool is missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_deps: Vec<String>,
+    /// Display icon path resolved relative to the skill's base directory.
+    /// Pure display metadata; not rendered into the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<PathBuf>,
+    /// Short prompt fragment surfaced to the model when the skill is
+    /// activated. Distinct from the skill body — used as a one-line
+    /// activation hint rather than the full instruction set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_hint: Option<String>,
+}
+
+impl SkillManifest {
+    fn is_empty(&self) -> bool {
+        self.tool_deps.is_empty() && self.icon.is_none() && self.prompt_hint.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillSummary {
     pub name: String,
@@ -131,6 +165,8 @@ pub struct SkillSummary {
     pub source: SkillSource,
     pub location: PathBuf,
     pub disabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<SkillManifest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,13 +185,18 @@ impl LoadedSkill {
             source,
             location,
             disabled: _,
+            manifest,
         } = &self.summary;
         let when_to_use = when_to_use
             .as_ref()
             .map(|value| format!("\n<when_to_use>{}</when_to_use>", xml_escape(value)))
             .unwrap_or_default();
+        let manifest_block = manifest
+            .as_ref()
+            .map(render_manifest_block)
+            .unwrap_or_default();
         format!(
-            "<skill name=\"{}\" source=\"{}\">\n<description>{}</description>{when_to_use}\n<location>{}</location>\n<base_directory>{}</base_directory>\n<content>\n{}\n</content>\n</skill>",
+            "<skill name=\"{}\" source=\"{}\">\n<description>{}</description>{when_to_use}\n<location>{}</location>\n<base_directory>{}</base_directory>{manifest_block}\n<content>\n{}\n</content>\n</skill>",
             xml_escape(name),
             source.as_str(),
             xml_escape(description),
@@ -164,6 +205,32 @@ impl LoadedSkill {
             escape_body_breakouts(self.body.trim())
         )
     }
+}
+
+fn render_manifest_block(manifest: &SkillManifest) -> String {
+    if manifest.is_empty() {
+        return String::new();
+    }
+    let mut lines = Vec::new();
+    if !manifest.tool_deps.is_empty() {
+        let deps = manifest
+            .tool_deps
+            .iter()
+            .map(|dep| format!("<tool>{}</tool>", xml_escape(dep)))
+            .collect::<Vec<_>>()
+            .join("");
+        lines.push(format!("<tool_deps>{deps}</tool_deps>"));
+    }
+    if let Some(hint) = manifest.prompt_hint.as_ref() {
+        lines.push(format!(
+            "<prompt_hint>{}</prompt_hint>",
+            xml_escape(hint.trim())
+        ));
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("\n<manifest>{}</manifest>", lines.concat())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +315,16 @@ impl SkillCatalog {
             "skills": self.summaries()
                 .into_iter()
                 .map(|summary| {
+                    let manifest = summary
+                        .manifest
+                        .as_ref()
+                        .map(|manifest| {
+                            json!({
+                                "tool_deps": manifest.tool_deps,
+                                "icon": manifest.icon,
+                                "prompt_hint": manifest.prompt_hint,
+                            })
+                        });
                     json!({
                         "name": summary.name,
                         "description": summary.description,
@@ -255,6 +332,7 @@ impl SkillCatalog {
                         "source": summary.source.as_str(),
                         "location": summary.location,
                         "disabled": summary.disabled,
+                        "manifest": manifest,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -437,6 +515,7 @@ impl SkillCatalog {
                 );
                 continue;
             }
+            let manifest = load_manifest(&path);
             let summary = SkillSummary {
                 name: metadata.name.clone(),
                 description: metadata.description,
@@ -444,6 +523,7 @@ impl SkillCatalog {
                 source,
                 location: skill_path,
                 disabled: false,
+                manifest,
             };
             self.insert(SkillEntry {
                 summary,
@@ -840,6 +920,46 @@ pub(crate) fn xml_escape(value: &str) -> String {
 pub(crate) fn escape_body_breakouts(body: &str) -> String {
     body.replace("</content>", "<\\/content>")
         .replace("</skill>", "<\\/skill>")
+}
+
+/// Read the optional `skill.toml` sidecar next to a skill directory.
+///
+/// Returns `None` when the file is absent, unreadable, malformed, or
+/// empty after parsing. Missing-file is the common case and not logged;
+/// every other failure path is logged at WARN so a sidecar typo never
+/// silently disables a skill's catalog routing.
+fn load_manifest(base_dir: &Path) -> Option<SkillManifest> {
+    let manifest_path = base_dir.join(SKILL_MANIFEST_FILE);
+    let content = match fs::read_to_string(&manifest_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            warn!(
+                target: "squeezy_skills",
+                path = %manifest_path.display(),
+                error = %error,
+                "skipping skill.toml due to read error"
+            );
+            return None;
+        }
+    };
+    match parse_skill_manifest(&content) {
+        Ok(manifest) if manifest.is_empty() => None,
+        Ok(manifest) => Some(manifest),
+        Err(error) => {
+            warn!(
+                target: "squeezy_skills",
+                path = %manifest_path.display(),
+                error = %error,
+                "ignoring malformed skill.toml"
+            );
+            None
+        }
+    }
+}
+
+pub(crate) fn parse_skill_manifest(content: &str) -> std::result::Result<SkillManifest, String> {
+    toml::from_str::<SkillManifest>(content).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

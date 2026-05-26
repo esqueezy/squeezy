@@ -2925,6 +2925,7 @@ dependencies = [
  "serde",
  "serde_json",
  "squeezy-core",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
