@@ -37,10 +37,10 @@ use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
 };
 use squeezy_store::{
-    BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionEventKind,
-    SessionHandle, SessionMetadata, SessionQuery, SessionRecord, SessionReplayEvent,
-    SessionReplayEventKind, SessionReplayTape, SessionResumeState, SessionStatus, SessionStore,
-    SqueezyStore,
+    BugReportBundle, BugReportOptions, CleanupMode, CleanupReport, ResumeItem, SessionEvent,
+    SessionEventKind, SessionHandle, SessionMetadata, SessionQuery, SessionRecord,
+    SessionReplayEvent, SessionReplayEventKind, SessionReplayTape, SessionResumeState,
+    SessionStatus, SessionStore, SqueezyStore,
 };
 use squeezy_telemetry::{
     ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback, ReportUpload,
@@ -1911,6 +1911,18 @@ impl Agent {
     }
 
     pub fn cleanup_sessions(&self, ids: &[String]) -> squeezy_core::Result<CleanupReport> {
+        self.cleanup_sessions_with(ids, CleanupMode::Archive)
+    }
+
+    /// Like [`Self::cleanup_sessions`] but lets the caller pick between the
+    /// soft-archive default and the hard-delete [`CleanupMode::Purge`]. The
+    /// TUI `/session-cleanup --purge` and CLI `sessions cleanup --purge`
+    /// thread the mode through this entry point.
+    pub fn cleanup_sessions_with(
+        &self,
+        ids: &[String],
+        mode: CleanupMode,
+    ) -> squeezy_core::Result<CleanupReport> {
         // Refuse to delete the session that this agent is currently writing
         // to. Removing it under our feet would orphan future event writes and
         // leave a session that no longer exists on disk but still appears in
@@ -1923,7 +1935,7 @@ impl Agent {
                 "refusing to clean up the active session {active_id}; finish or exit first"
             )));
         }
-        SessionStore::open(&self.config).cleanup_excluding(ids, active.as_deref())
+        SessionStore::open(&self.config).cleanup_with(ids, active.as_deref(), mode)
     }
 
     pub fn resume_current(

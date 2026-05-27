@@ -245,12 +245,12 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "<id>",
         &[PermissionCapability::Read, PermissionCapability::Edit],
     ),
-    // Locked + destructive: deletes session JSON on disk.
+    // Locked + destructive: archives or purges sessions on disk.
     SlashCommand {
         name: "/session-cleanup",
-        description: "remove old sessions",
+        description: "soft-archive (default) or --purge old sessions",
         available_during_task: false,
-        parameter_hint: None,
+        parameter_hint: Some("[--archive|--purge] [<id>...]"),
         capabilities: &[PermissionCapability::Destructive],
     },
     slash_caps(

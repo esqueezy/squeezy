@@ -45,7 +45,7 @@ use squeezy_core::{
     TranscriptDefault, TranscriptItem, TuiAlternateScreen, TuiTheme,
 };
 use squeezy_llm::LlmProvider;
-use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
+use squeezy_store::{BugReportBundle, BugReportOptions, CleanupMode, SessionQuery};
 use squeezy_telemetry::PreparedFeedback;
 use squeezy_tools::{
     McpElicitationKind, McpElicitationRequest, McpElicitationResponse, McpServerStatus,
@@ -2101,9 +2101,28 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             return true;
         }
         "/session-cleanup" => {
-            let ids = parts.map(str::to_string).collect::<Vec<_>>();
-            match agent.cleanup_sessions(&ids) {
-                Ok(report) => app.status = format!("removed {} sessions", report.removed.len()),
+            // Pull the mode flag out of the args before the id list so
+            // `--archive` / `--purge` can appear anywhere on the line.
+            // `--archive` is the default; `--purge` switches to
+            // hard-delete (live sessions skip the archive tree,
+            // already-archived ids named here are removed immediately).
+            let mut mode = CleanupMode::Archive;
+            let mut ids = Vec::new();
+            for token in parts {
+                match token {
+                    "--archive" => mode = CleanupMode::Archive,
+                    "--purge" => mode = CleanupMode::Purge,
+                    other => ids.push(other.to_string()),
+                }
+            }
+            match agent.cleanup_sessions_with(&ids, mode) {
+                Ok(report) => {
+                    app.status = format!(
+                        "archived {} removed {}",
+                        report.archived.len(),
+                        report.removed.len()
+                    );
+                }
                 Err(error) => app.status = format!("session cleanup failed: {error}"),
             }
             return true;

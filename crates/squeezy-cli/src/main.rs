@@ -30,9 +30,9 @@ use auth::handle_auth_command;
 use doctor::DoctorArgs;
 use providers::{ProvidersCommand, handle_providers_command};
 use squeezy_store::{
-    BugReportOptions, RepoProfileLoad, ResumeItem, SemanticSupport, SessionEvent, SessionMetadata,
-    SessionQuery, SessionResumeState, SessionStatus, SessionStore, default_bug_report_path,
-    ensure_repo_profile, parse_bug_report_section, refresh_repo_profile,
+    BugReportOptions, CleanupMode, RepoProfileLoad, ResumeItem, SemanticSupport, SessionEvent,
+    SessionMetadata, SessionQuery, SessionResumeState, SessionStatus, SessionStore,
+    default_bug_report_path, ensure_repo_profile, parse_bug_report_section, refresh_repo_profile,
 };
 use squeezy_telemetry::{
     FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
@@ -286,10 +286,21 @@ enum SessionsCommand {
     Export { id: String },
     #[command(about = "Preview, save, or send a redacted bug-report archive")]
     Report(SessionReportArgs),
-    #[command(about = "Remove expired sessions or explicit session ids")]
+    #[command(
+        about = "Soft-archive expired sessions or explicit ids (default), or --purge to hard-delete"
+    )]
     Cleanup {
         #[arg(long = "id")]
         ids: Vec<String>,
+        /// Explicitly soft-archive — the default — kept as a flag so
+        /// scripts can be self-documenting alongside `--purge`.
+        #[arg(long, conflicts_with = "purge")]
+        archive: bool,
+        /// Hard-delete instead of soft-archiving. Live sessions skip the
+        /// `archived/` tree entirely; archived sessions named in `--id`
+        /// are removed without waiting for archive retention.
+        #[arg(long)]
+        purge: bool,
     },
     #[command(about = "Soft-archive a session so it survives retention sweeps")]
     Archive { id: String },
@@ -1112,8 +1123,20 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             Ok(())
         }
         SessionsCommand::Report(args) => handle_session_report_command(args, &config).await,
-        SessionsCommand::Cleanup { ids } => {
-            let report = store.cleanup(ids)?;
+        SessionsCommand::Cleanup {
+            ids,
+            archive: _,
+            purge,
+        } => {
+            let mode = if *purge {
+                CleanupMode::Purge
+            } else {
+                CleanupMode::Archive
+            };
+            let report = store.cleanup_with(ids, None, mode)?;
+            for id in report.archived {
+                println!("archived {id}");
+            }
             for id in report.removed {
                 println!("removed {id}");
             }

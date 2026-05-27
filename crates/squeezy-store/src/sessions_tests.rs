@@ -1510,8 +1510,10 @@ fn cleanup_deletes_archived_sessions_past_archive_retention() {
     let session_id = handle.session_id().to_string();
     store.archive_session(&session_id).expect("archive");
 
-    // Backdate the archived metadata so `ended_at_ms` (the archival
-    // timestamp) sits well outside the 7-day archive retention.
+    // Backdate the archived metadata so the archival timestamp sits well
+    // outside the 7-day archive retention. The cleanup sweep prefers
+    // `archived_at_ms`, with `ended_at_ms`/`started_at_ms` as fallbacks
+    // for legacy metadata files that predate `archived_at_ms`.
     let archived_dir = store.root().join(super::ARCHIVED_SUBDIR).join(&session_id);
     let metadata_path = archived_dir.join("metadata.json");
     let text = fs::read_to_string(&metadata_path).expect("read archived metadata");
@@ -1519,6 +1521,7 @@ fn cleanup_deletes_archived_sessions_past_archive_retention() {
         serde_json::from_str(&text).expect("parse archived metadata");
     metadata.started_at_ms = 1;
     metadata.ended_at_ms = Some(1);
+    metadata.archived_at_ms = Some(1);
     fs::write(
         &metadata_path,
         serde_json::to_vec_pretty(&metadata).expect("serialize"),
@@ -1670,6 +1673,111 @@ fn unarchive_round_trip_restores_session() {
         .find(|metadata| metadata.session_id == session_id)
         .expect("unarchived session in default list");
     assert_eq!(found.status, SessionStatus::Completed);
+    assert!(
+        found.archived_at_ms.is_none(),
+        "unarchive must clear the lifecycle timestamp",
+    );
+}
+
+/// Acceptance test for the lifecycle field extension from
+/// `audits/opencode-comparison-2026-05-25/12-sessions-state-and-compaction.md#f12-session-archived-state`:
+/// once a session is archived, it must disappear from the default list
+/// surface so `bd ready`-style discovery does not pull stale history into
+/// the user's working view.
+#[test]
+fn archived_session_excluded_from_list_default() {
+    let (_root, store, config) = open_test_store("archived-excluded-default");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle.flush_events().expect("flush events");
+    let session_id = handle.session_id().to_string();
+    store.archive_session(&session_id).expect("archive session");
+
+    let listed_default = store.list(&SessionQuery::default()).expect("list default");
+    assert!(
+        listed_default
+            .iter()
+            .all(|metadata| metadata.session_id != session_id),
+        "archived session must be hidden from default list",
+    );
+
+    let listed_include = store
+        .list(&SessionQuery {
+            include_archived: true,
+            ..SessionQuery::default()
+        })
+        .expect("list include archived");
+    let found = listed_include
+        .iter()
+        .find(|metadata| metadata.session_id == session_id)
+        .expect("archived session visible with include_archived=true");
+    assert_eq!(found.status, SessionStatus::Archived);
+    assert!(
+        found.archived_at_ms.is_some(),
+        "archive_session must stamp the lifecycle timestamp",
+    );
+}
+
+/// `cleanup_with(CleanupMode::Purge, …)` is the explicit "I want this
+/// gone now" escape hatch from archive-by-default. Live sessions named
+/// in `ids` skip the archive tree; archived sessions named in `ids` are
+/// removed immediately rather than waiting for archive retention.
+#[test]
+fn cleanup_with_purge_hard_deletes_live_and_archived_sessions() {
+    let (_root, store, config) = open_test_store("cleanup-purge");
+    let live = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start live session");
+    live.flush_events().expect("flush live events");
+    let live_id = live.session_id().to_string();
+    drop(live);
+
+    let archived = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start archived session");
+    archived.flush_events().expect("flush archived events");
+    let archived_id = archived.session_id().to_string();
+    drop(archived);
+    store
+        .archive_session(&archived_id)
+        .expect("archive session");
+
+    let report = store
+        .cleanup_with(
+            &[live_id.clone(), archived_id.clone()],
+            None,
+            super::CleanupMode::Purge,
+        )
+        .expect("cleanup purge");
+
+    assert!(
+        report.archived.is_empty(),
+        "purge must not soft-archive: archived={:?}",
+        report.archived,
+    );
+    assert!(
+        report.removed.contains(&live_id),
+        "purge must hard-delete the live session: removed={:?}",
+        report.removed,
+    );
+    assert!(
+        report.removed.contains(&archived_id),
+        "purge must hard-delete the already-archived session: removed={:?}",
+        report.removed,
+    );
+    assert!(
+        !store.root().join(&live_id).exists(),
+        "live directory must be gone after purge",
+    );
+    assert!(
+        !store
+            .root()
+            .join(super::ARCHIVED_SUBDIR)
+            .join(&archived_id)
+            .exists(),
+        "archived directory must be gone after purge",
+    );
 }
 
 #[test]
