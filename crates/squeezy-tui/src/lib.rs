@@ -96,10 +96,10 @@ use input::{
 use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
 use render::palette::{
     AMBER, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN,
-    WORKING_SHIMMER_HIGHLIGHT, blend_color,
+    blend_color,
 };
 #[cfg(test)]
-use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG};
+use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG, WORKING_SHIMMER_HIGHLIGHT};
 use toast::ToastQueue;
 
 const INLINE_PASTE_MAX_BYTES: usize = 512;

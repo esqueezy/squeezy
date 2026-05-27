@@ -110,6 +110,7 @@ pub(crate) mod json_markers {
     }
 
     /// Attach a marker to the final tool definition.
+    #[cfg(test)]
     pub(crate) fn mark_last_tool(tool_values: &mut [Value]) {
         if let Some(obj) = tool_values.last_mut().and_then(Value::as_object_mut) {
             obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));

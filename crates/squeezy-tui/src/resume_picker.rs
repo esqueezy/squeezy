@@ -131,6 +131,7 @@ pub(crate) enum ResumeChoice {
 /// Pure filter applied to the raw session list. Returns the most-recent
 /// resumable sessions whose cwd matches the current working directory and
 /// that started within [`RECENT_WINDOW_MS`].
+#[cfg(test)]
 pub(crate) fn filter_candidates(
     sessions: &[SessionMetadata],
     cwd: &Path,
