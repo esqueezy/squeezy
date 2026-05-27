@@ -4,7 +4,7 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::render::{highlight, palette};
+use crate::render::{cache, highlight, palette};
 
 /// Render Markdown source as styled ratatui `Line`s.
 ///
@@ -18,6 +18,10 @@ use crate::render::{highlight, palette};
 /// shaped intermediate "for symmetry" with non-TUI consumers; ratatui already
 /// carries `Style` structurally and any ANSI encode/decode hop is pure cost.
 pub fn render_markdown(source: &str) -> Vec<Line<'static>> {
+    cache::get_or_compute_markdown(source, || render_markdown_uncached(source))
+}
+
+fn render_markdown_uncached(source: &str) -> Vec<Line<'static>> {
     let mut writer = Writer::default();
     let options = Options::ENABLE_TABLES;
     for event in Parser::new_ext(source, options) {

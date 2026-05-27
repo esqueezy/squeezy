@@ -2995,6 +2995,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "ignore",
+ "lru",
  "pulldown-cmark",
  "ratatui",
  "serde",
