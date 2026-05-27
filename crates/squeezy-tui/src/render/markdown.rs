@@ -6,6 +6,17 @@ use ratatui::{
 
 use crate::render::{highlight, palette};
 
+/// Render Markdown source as styled ratatui `Line`s.
+///
+/// Invariant: spans are built directly from `pulldown_cmark` events into
+/// `Span<'static>` / `Line<'static>` — there is no intermediate AST or ANSI
+/// string round-trip. `push_text` (below) emits `Span::styled` per inline
+/// run, and `finish_line` commits a `Line` per `\n`. Fenced blocks delegate
+/// to `highlight::highlight_code`, which preserves the same invariant.
+///
+/// Contributors: keep this path Span-native. Do not introduce a `String`-
+/// shaped intermediate "for symmetry" with non-TUI consumers; ratatui already
+/// carries `Style` structurally and any ANSI encode/decode hop is pure cost.
 pub fn render_markdown(source: &str) -> Vec<Line<'static>> {
     let mut writer = Writer::default();
     let options = Options::ENABLE_TABLES;
