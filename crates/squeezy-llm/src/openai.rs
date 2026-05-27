@@ -220,6 +220,7 @@ impl LlmProvider for OpenAiProvider {
 
             let mut decoder = SseDecoder::default();
             let mut saw_completed = false;
+            let mut reasoning_acc = ReasoningAccumulator::default();
             let mut bytes = response.bytes_stream();
             loop {
                 let polled = tokio::select! {
@@ -235,7 +236,7 @@ impl LlmProvider for OpenAiProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
-                    if let Some(llm_event) = parse_openai_event(&event)? {
+                    if let Some(llm_event) = parse_openai_event(&event, &mut reasoning_acc)? {
                         if matches!(llm_event, LlmEvent::Completed { .. }) {
                             saw_completed = true;
                         }
@@ -245,7 +246,7 @@ impl LlmProvider for OpenAiProvider {
             }
 
             for event in decoder.finish() {
-                if let Some(llm_event) = parse_openai_event(&event)? {
+                if let Some(llm_event) = parse_openai_event(&event, &mut reasoning_acc)? {
                     if matches!(llm_event, LlmEvent::Completed { .. }) {
                         saw_completed = true;
                     }
@@ -262,7 +263,38 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
-fn parse_openai_event(data: &str) -> Result<Option<LlmEvent>> {
+/// Buffers reasoning deltas across an OpenAI Responses stream so
+/// `response.output_item.done` can backfill an empty `summary` from
+/// the streamed text. The Responses API sometimes ships the item-close
+/// event with `summary: []` even though `response.reasoning_summary_text.delta`
+/// (or `response.reasoning_text.delta`) already streamed the real text;
+/// without the buffer the persisted `ReasoningPayload::OpenAi.summary`
+/// would be empty and the next turn's replay would drop the segment.
+#[derive(Debug, Default)]
+struct ReasoningAccumulator {
+    summary: String,
+    text: String,
+}
+
+impl ReasoningAccumulator {
+    fn take(&mut self) -> Vec<String> {
+        let mut out = Vec::with_capacity(2);
+        let summary = std::mem::take(&mut self.summary);
+        if !summary.is_empty() {
+            out.push(summary);
+        }
+        let text = std::mem::take(&mut self.text);
+        if !text.is_empty() {
+            out.push(text);
+        }
+        out
+    }
+}
+
+fn parse_openai_event(
+    data: &str,
+    reasoning_acc: &mut ReasoningAccumulator,
+) -> Result<Option<LlmEvent>> {
     if data == "[DONE]" {
         return Ok(None);
     }
@@ -290,6 +322,7 @@ fn parse_openai_event(data: &str) -> Result<Option<LlmEvent>> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            reasoning_acc.summary.push_str(&delta);
             Ok(Some(LlmEvent::ReasoningDelta {
                 text: delta,
                 kind: ReasoningKind::Summary,
@@ -301,6 +334,7 @@ fn parse_openai_event(data: &str) -> Result<Option<LlmEvent>> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            reasoning_acc.text.push_str(&delta);
             Ok(Some(LlmEvent::ReasoningDelta {
                 text: delta,
                 kind: ReasoningKind::Text,
@@ -308,7 +342,7 @@ fn parse_openai_event(data: &str) -> Result<Option<LlmEvent>> {
         }
         "response.output_item.done" => {
             let item = value.get("item");
-            if let Some(payload) = parse_reasoning_item(item) {
+            if let Some(payload) = parse_reasoning_item(item, reasoning_acc) {
                 Ok(Some(LlmEvent::ReasoningDone(payload)))
             } else if let Some(tool_call) = parse_tool_call(item)? {
                 Ok(Some(LlmEvent::ToolCall(tool_call)))
@@ -416,7 +450,10 @@ fn openai_input_item(item: &LlmInputItem) -> Option<Value> {
     })
 }
 
-fn parse_reasoning_item(item: Option<&Value>) -> Option<ReasoningPayload> {
+fn parse_reasoning_item(
+    item: Option<&Value>,
+    reasoning_acc: &mut ReasoningAccumulator,
+) -> Option<ReasoningPayload> {
     let item = item?;
     if item.get("type").and_then(Value::as_str) != Some("reasoning") {
         return None;
@@ -426,16 +463,27 @@ fn parse_reasoning_item(item: Option<&Value>) -> Option<ReasoningPayload> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let summary = item
+    let mut summary: Vec<String> = item
         .get("summary")
         .and_then(Value::as_array)
         .map(|parts| {
             parts
                 .iter()
                 .filter_map(|part| part.get("text").and_then(Value::as_str).map(str::to_string))
+                .filter(|text| !text.is_empty())
                 .collect()
         })
         .unwrap_or_default();
+    // OpenAI Responses sometimes closes the reasoning item with `summary: []`
+    // even when `response.reasoning_summary_text.delta` already streamed the
+    // real text; without backfilling from the streamed deltas the persisted
+    // payload would be empty and the next turn's replay would lose the
+    // segment. Drain the accumulator on every `output_item.done` so a
+    // subsequent reasoning item starts clean.
+    let buffered = reasoning_acc.take();
+    if summary.is_empty() {
+        summary = buffered;
+    }
     let encrypted_content = item
         .get("encrypted_content")
         .and_then(Value::as_str)

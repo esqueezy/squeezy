@@ -49,8 +49,12 @@ fn request_body_uses_responses_streaming_shape() {
 
 #[test]
 fn parser_extracts_text_delta() {
-    let event = parse_openai_event(r#"{"type":"response.output_text.delta","delta":"hello"}"#)
-        .expect("valid event");
+    let mut acc = ReasoningAccumulator::default();
+    let event = parse_openai_event(
+        r#"{"type":"response.output_text.delta","delta":"hello"}"#,
+        &mut acc,
+    )
+    .expect("valid event");
 
     assert_eq!(event, Some(LlmEvent::TextDelta("hello".to_string())));
 }
@@ -232,6 +236,7 @@ fn request_body_omits_prompt_cache_key_when_unset() {
 
 #[test]
 fn parser_extracts_function_call_from_output_item_done() {
+    let mut acc = ReasoningAccumulator::default();
     let event = parse_openai_event(
         r#"{
           "type": "response.output_item.done",
@@ -242,6 +247,7 @@ fn parser_extracts_function_call_from_output_item_done() {
             "arguments": "{\"pattern\":\"needle\"}"
           }
         }"#,
+        &mut acc,
     )
     .expect("valid event");
 
@@ -257,6 +263,7 @@ fn parser_extracts_function_call_from_output_item_done() {
 
 #[test]
 fn parser_preserves_malformed_function_arguments_as_tool_error_payload() {
+    let mut acc = ReasoningAccumulator::default();
     let event = parse_openai_event(
         r#"{
           "type": "response.output_item.done",
@@ -267,6 +274,7 @@ fn parser_preserves_malformed_function_arguments_as_tool_error_payload() {
             "arguments": "{\"query\":\"getFoo"
           }
         }"#,
+        &mut acc,
     )
     .expect("malformed arguments stay recoverable");
 
@@ -291,6 +299,7 @@ fn parser_preserves_malformed_function_arguments_as_tool_error_payload() {
 
 #[test]
 fn parser_extracts_completed_response_id_and_usage() {
+    let mut acc = ReasoningAccumulator::default();
     let event = parse_openai_event(
         r#"{
           "type":"response.completed",
@@ -304,6 +313,7 @@ fn parser_extracts_completed_response_id_and_usage() {
             }
           }
         }"#,
+        &mut acc,
     )
     .expect("valid event");
 
@@ -325,14 +335,19 @@ fn parser_extracts_completed_response_id_and_usage() {
 
 #[test]
 fn parser_surfaces_error_events() {
-    let err = parse_openai_event(r#"{"type":"error","error":{"message":"bad request"}}"#)
-        .expect_err("stream error");
+    let mut acc = ReasoningAccumulator::default();
+    let err = parse_openai_event(
+        r#"{"type":"error","error":{"message":"bad request"}}"#,
+        &mut acc,
+    )
+    .expect_err("stream error");
 
     assert!(err.to_string().contains("bad request"));
 }
 
 #[test]
 fn parser_surfaces_incomplete_events() {
+    let mut acc = ReasoningAccumulator::default();
     let err = parse_openai_event(
         r#"{
           "type":"response.incomplete",
@@ -340,6 +355,7 @@ fn parser_surfaces_incomplete_events() {
             "incomplete_details":{"reason":"max_output_tokens"}
           }
         }"#,
+        &mut acc,
     )
     .expect_err("incomplete response is a stream error");
 
@@ -348,8 +364,10 @@ fn parser_surfaces_incomplete_events() {
 
 #[test]
 fn parser_extracts_reasoning_summary_delta_and_done_with_encrypted_blob() {
+    let mut acc = ReasoningAccumulator::default();
     let summary_delta = parse_openai_event(
         r#"{"type":"response.reasoning_summary_text.delta","delta":"weighing options"}"#,
+        &mut acc,
     )
     .expect("valid summary delta");
     assert_eq!(
@@ -370,6 +388,7 @@ fn parser_extracts_reasoning_summary_delta_and_done_with_encrypted_blob() {
             "encrypted_content":"OPAQUE"
           }
         }"#,
+        &mut acc,
     )
     .expect("valid done");
     assert_eq!(
@@ -378,6 +397,69 @@ fn parser_extracts_reasoning_summary_delta_and_done_with_encrypted_blob() {
             item_id: "rs_abc".to_string(),
             summary: vec!["weighed options".to_string()],
             encrypted_content: Some("OPAQUE".to_string()),
+        }))
+    );
+}
+
+#[test]
+fn parser_backfills_empty_summary_from_streamed_deltas() {
+    let mut acc = ReasoningAccumulator::default();
+    // Stream two summary deltas (no `summary_text` will land in the item).
+    parse_openai_event(
+        r#"{"type":"response.reasoning_summary_text.delta","delta":"weighing "}"#,
+        &mut acc,
+    )
+    .expect("valid summary delta");
+    parse_openai_event(
+        r#"{"type":"response.reasoning_summary_text.delta","delta":"options"}"#,
+        &mut acc,
+    )
+    .expect("valid summary delta");
+
+    // `output_item.done` arrives with `summary: []` (Responses sometimes ships
+    // the close event without the aggregated summary parts).
+    let done = parse_openai_event(
+        r#"{
+          "type":"response.output_item.done",
+          "item":{
+            "type":"reasoning",
+            "id":"rs_abc",
+            "summary":[],
+            "encrypted_content":"OPAQUE"
+          }
+        }"#,
+        &mut acc,
+    )
+    .expect("valid done");
+    assert_eq!(
+        done,
+        Some(LlmEvent::ReasoningDone(crate::ReasoningPayload::OpenAi {
+            item_id: "rs_abc".to_string(),
+            summary: vec!["weighing options".to_string()],
+            encrypted_content: Some("OPAQUE".to_string()),
+        }))
+    );
+
+    // Accumulator must be drained so the next item starts clean.
+    let next_done = parse_openai_event(
+        r#"{
+          "type":"response.output_item.done",
+          "item":{
+            "type":"reasoning",
+            "id":"rs_def",
+            "summary":[],
+            "encrypted_content":null
+          }
+        }"#,
+        &mut acc,
+    )
+    .expect("valid done");
+    assert_eq!(
+        next_done,
+        Some(LlmEvent::ReasoningDone(crate::ReasoningPayload::OpenAi {
+            item_id: "rs_def".to_string(),
+            summary: Vec::new(),
+            encrypted_content: None,
         }))
     );
 }
