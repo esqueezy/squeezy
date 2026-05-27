@@ -95,8 +95,8 @@ use input::{
 
 use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
 use render::palette::{
-    self, AMBER, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN,
-    blend_color,
+    self, AMBER, BANG_RED, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET,
+    SUCCESS_GREEN, blend_color,
 };
 #[cfg(test)]
 use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG, WORKING_SHIMMER_HIGHLIGHT};
@@ -5249,6 +5249,9 @@ fn assistant_content_without_repeated_tool_output(app: &TuiApp, content: &str) -
     let mut content = normalize_fence_boundaries(content);
     let outputs = recent_shell_tool_outputs(app);
     for output in &outputs {
+        if let Some(stripped) = strip_repeated_raw_tool_output(&content, output) {
+            content = stripped;
+        }
         if let Some(stripped) = strip_repeated_fenced_tool_output(&content, output) {
             content = stripped;
         }
@@ -5260,6 +5263,12 @@ fn assistant_content_without_repeated_tool_output(app: &TuiApp, content: &str) -
         return String::new();
     }
     content
+}
+
+fn strip_repeated_raw_tool_output(content: &str, output: &str) -> Option<String> {
+    let content = normalize_duplicate_tool_output(content);
+    let output = normalize_duplicate_tool_output(output);
+    (!output.is_empty() && content == output).then(String::new)
 }
 
 /// Insert a newline before any ```` ``` ```` that's glued to non-whitespace
@@ -5701,15 +5710,19 @@ fn format_user_prompt_entry(
     _selected: bool,
     width: Option<u16>,
 ) -> Vec<Line<'static>> {
+    let bang_offset = bang_command_marker_offset(&item.content);
     let mut content = item.content.split('\n').collect::<Vec<_>>();
     if content.is_empty() {
         content.push("");
     }
     let mut lines = Vec::with_capacity(content.len() + 3);
     lines.push(user_prompt_blank_line(width));
+    let mut line_start = 0usize;
     lines.extend(content.into_iter().enumerate().map(|(index, line)| {
         let marker = if index == 0 { "> " } else { "  " };
-        user_prompt_content_line(marker, line, width)
+        let rendered = user_prompt_content_line(marker, line, line_start, bang_offset, width);
+        line_start = line_start.saturating_add(line.len()).saturating_add(1);
+        rendered
     }));
     lines.push(user_prompt_blank_line(width));
     lines.push(Line::from(""));
@@ -5725,7 +5738,13 @@ fn user_prompt_blank_line(width: Option<u16>) -> Line<'static> {
     ])
 }
 
-fn user_prompt_content_line(marker: &'static str, line: &str, width: Option<u16>) -> Line<'static> {
+fn user_prompt_content_line(
+    marker: &'static str,
+    line: &str,
+    line_start: usize,
+    bang_offset: Option<usize>,
+    width: Option<u16>,
+) -> Line<'static> {
     let text_width = line.chars().count();
     let padding = user_prompt_surface_width(marker, width)
         .map(|surface_width| " ".repeat(surface_width.saturating_sub(text_width)))
@@ -5738,26 +5757,29 @@ fn user_prompt_content_line(marker: &'static str, line: &str, width: Option<u16>
     let slash_len = (marker == "> ")
         .then(|| input::match_slash_command_prefix(line))
         .flatten();
-    if let Some(len) = slash_len {
-        let (prefix, rest) = line.split_at(len);
-        spans.push(Span::styled(
-            prefix.to_string(),
-            Style::default().fg(AMBER).bg(PROMPT_BG),
-        ));
-        if !rest.is_empty() {
-            spans.push(Span::styled(
-                rest.to_string(),
-                Style::default().fg(Color::White).bg(PROMPT_BG),
-            ));
+    let style_text_at = |abs_offset: usize| -> Style {
+        let base = Style::default().bg(PROMPT_BG);
+        if Some(abs_offset) == bang_offset {
+            base.fg(BANG_RED)
+        } else if let Some(len) = slash_len {
+            if marker == "> " && abs_offset < len {
+                base.fg(AMBER)
+            } else {
+                base.fg(Color::White)
+            }
+        } else {
+            base.fg(Color::White)
         }
-    } else {
-        spans.push(Span::styled(
-            line.to_string(),
-            Style::default().fg(Color::White).bg(PROMPT_BG),
-        ));
-    }
+    };
+    push_styled_segments(&mut spans, line, line_start, style_text_at);
     spans.push(Span::styled(padding, Style::default().bg(PROMPT_BG)));
     Line::from(spans)
+}
+
+fn bang_command_marker_offset(text: &str) -> Option<usize> {
+    text.char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .and_then(|(offset, ch)| (ch == '!').then_some(offset))
 }
 
 fn user_prompt_surface_width(marker: &str, width: Option<u16>) -> Option<usize> {
@@ -8271,6 +8293,7 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     let slash_len = parts
         .first()
         .and_then(|first| input::match_slash_command_prefix(first));
+    let bang_offset = bang_command_marker_offset(&app.input);
     let mut line_start = 0usize;
     parts
         .iter()
@@ -8293,36 +8316,28 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
             let slash_split = if index == 0 { slash_len } else { None };
             let style_text_at = |abs_offset: usize| -> Style {
                 let base = Style::default().bg(PROMPT_BG);
-                match slash_split {
-                    Some(len) if abs_offset < len => base.fg(AMBER),
-                    _ => base.fg(Color::White),
+                if Some(abs_offset) == bang_offset {
+                    base.fg(BANG_RED)
+                } else {
+                    match slash_split {
+                        Some(len) if abs_offset < len => base.fg(AMBER),
+                        _ => base.fg(Color::White),
+                    }
                 }
             };
             if cursor >= line_start && cursor <= line_end {
                 let split_at = cursor.saturating_sub(line_start).min(line.len());
                 let (before, after) = line.split_at(split_at);
                 if !before.is_empty() {
-                    push_styled_segments(
-                        &mut spans,
-                        before,
-                        line_start,
-                        slash_split,
-                        style_text_at,
-                    );
+                    push_styled_segments(&mut spans, before, line_start, style_text_at);
                 }
                 spans.push(prompt_cursor_span());
                 if !after.is_empty() {
                     let after_start = line_start + split_at;
-                    push_styled_segments(
-                        &mut spans,
-                        after,
-                        after_start,
-                        slash_split,
-                        style_text_at,
-                    );
+                    push_styled_segments(&mut spans, after, after_start, style_text_at);
                 }
             } else {
-                push_styled_segments(&mut spans, line, line_start, slash_split, style_text_at);
+                push_styled_segments(&mut spans, line, line_start, style_text_at);
             }
             line_start = line_end.saturating_add(1);
             Line::from(spans)
@@ -8330,32 +8345,32 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Push one or two styled spans for `chunk`, splitting on the slash
-/// boundary when the chunk straddles it so the amber prefix and the white
-/// rest remain visually distinct on the live input row.
+/// Push styled spans for `chunk`, splitting anywhere the computed style
+/// changes so special command prefixes stay visually distinct from the rest
+/// of the prompt.
 fn push_styled_segments(
     spans: &mut Vec<Span<'static>>,
     chunk: &str,
     chunk_start: usize,
-    slash_split: Option<usize>,
     style_text_at: impl Fn(usize) -> Style,
 ) {
-    let chunk_end = chunk_start + chunk.len();
-    if let Some(split) = slash_split
-        && chunk_start < split
-        && split < chunk_end
-    {
-        let local = split - chunk_start;
-        let (head, tail) = chunk.split_at(local);
-        if !head.is_empty() {
-            spans.push(Span::styled(head.to_string(), style_text_at(chunk_start)));
+    let mut current = String::new();
+    let mut current_style: Option<Style> = None;
+    for (relative, ch) in chunk.char_indices() {
+        let offset = chunk_start + relative;
+        let style = style_text_at(offset);
+        if current_style.is_some_and(|existing| existing != style) {
+            spans.push(Span::styled(
+                std::mem::take(&mut current),
+                current_style.unwrap(),
+            ));
         }
-        if !tail.is_empty() {
-            spans.push(Span::styled(tail.to_string(), style_text_at(split)));
-        }
-        return;
+        current_style = Some(style);
+        current.push(ch);
     }
-    spans.push(Span::styled(chunk.to_string(), style_text_at(chunk_start)));
+    if let Some(style) = current_style {
+        spans.push(Span::styled(current, style));
+    }
 }
 
 fn prompt_blank_line() -> Line<'static> {

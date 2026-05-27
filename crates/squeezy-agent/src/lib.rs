@@ -3257,12 +3257,6 @@ async fn complete_local_tool_turn(
     let mut metrics = broker.metrics.clone();
     metrics.redactions += seed_redactions + rendered.redactions;
     let cost = CostSnapshot::default();
-    let _ = tx
-        .send(AgentEvent::AssistantDelta {
-            turn_id,
-            delta: message.content.clone(),
-        })
-        .await;
     let terminal_status = if results
         .first()
         .is_some_and(|result| result.status == ToolStatus::Success)
