@@ -4492,12 +4492,10 @@ fn transcript_lines_for_render(
 }
 
 fn streaming_reasoning_lines(text: &str) -> Vec<Line<'static>> {
-    let style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::ITALIC);
+    let style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
     let mut lines = vec![Line::from(Span::styled("▾ thinking…".to_string(), style))];
     for raw in text.lines() {
-        lines.push(Line::from(Span::styled(format!("  {}", raw), style)));
+        lines.push(Line::from(Span::styled(format!("▏ {}", raw), style)));
     }
     lines.push(Line::from(""));
     lines
@@ -5511,9 +5509,7 @@ fn format_assistant_message_entry(
 }
 
 fn reasoning_block_lines(text: &str, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
-    let style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::ITALIC);
+    let style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
     let marker = if selected { "> " } else { "" };
     let mut lines = Vec::new();
     let body_lines: Vec<&str> = text.lines().collect();
@@ -5538,7 +5534,7 @@ fn reasoning_block_lines(text: &str, collapsed: bool, selected: bool) -> Vec<Lin
             style,
         )));
         for raw in body_lines {
-            lines.push(Line::from(Span::styled(format!("  {}", raw), style)));
+            lines.push(Line::from(Span::styled(format!("▏ {}", raw), style)));
         }
     }
     lines

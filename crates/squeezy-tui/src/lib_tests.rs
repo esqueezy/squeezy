@@ -3521,6 +3521,56 @@ fn reasoning_usage_status_is_hidden_when_disabled() {
 }
 
 #[test]
+fn reasoning_delta_renders_with_dim_italic() {
+    let expected_modifiers = Modifier::DIM | Modifier::ITALIC;
+
+    let block = reasoning_block_lines("first thought\nsecond thought", false, false);
+    assert!(
+        block.len() >= 2,
+        "expanded reasoning emits header and at least one body line: {block:?}"
+    );
+    for line in &block {
+        for span in &line.spans {
+            assert!(
+                span.style.add_modifier.contains(expected_modifiers),
+                "reasoning span missing dim+italic: {span:?}"
+            );
+            assert!(
+                span.style.fg.is_none(),
+                "reasoning style should not pin a foreground colour: {span:?}"
+            );
+        }
+    }
+    let body_text: String = block
+        .iter()
+        .skip(1)
+        .flat_map(|line| line.spans.iter().map(|s| s.content.as_ref()))
+        .collect();
+    assert!(
+        body_text.contains("▏ first thought") && body_text.contains("▏ second thought"),
+        "reasoning body should use ▏ left-indent marker: {body_text}",
+    );
+
+    let streaming = streaming_reasoning_lines("partial thinking");
+    let header = streaming
+        .first()
+        .expect("streaming reasoning emits a header line");
+    assert!(
+        header.spans.iter().any(|s| s.content.contains("thinking…")
+            && s.style.add_modifier.contains(expected_modifiers)),
+        "streaming header missing dim+italic: {header:?}",
+    );
+    let body = streaming
+        .get(1)
+        .expect("streaming reasoning emits a body line");
+    let body_text: String = body.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        body_text.starts_with("▏ "),
+        "streaming body should use ▏ left-indent marker: {body_text}",
+    );
+}
+
+#[test]
 fn approval_prompt_renders_actionable_menu_without_metadata_dump() {
     let request = sample_approval_request();
 
