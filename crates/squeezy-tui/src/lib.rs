@@ -1429,7 +1429,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 // Ctrl+E didn't expand — composer state is the most
                 // common reason this surface appears "broken".
                 app.status =
-                    "Ctrl+E moves to end-of-line in the composer · clear input or press Alt+E to expand transcript"
+                    "Ctrl+E moves to end-of-line in the composer · clear input, press Alt+E, or run /expand all to expand transcript"
                         .to_string();
                 return false;
             }
@@ -1937,8 +1937,9 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 Some(value) => match parse_transcript_category(value) {
                     Some(category) => category,
                     None => {
-                        app.status = "usage: /collapse [all|tools|logs|diffs|receipts|assistant]"
-                            .to_string();
+                        app.status = format!(
+                            "usage: {command} [all|tools|logs|diffs|receipts|assistant|reasoning]"
+                        );
                         return true;
                     }
                 },
@@ -2833,6 +2834,7 @@ fn parse_transcript_category(value: &str) -> Option<TranscriptCategory> {
         "diffs" => Some(TranscriptCategory::Diffs),
         "receipts" => Some(TranscriptCategory::Receipts),
         "assistant" => Some(TranscriptCategory::Assistant),
+        "reasoning" | "thinking" => Some(TranscriptCategory::Reasoning),
         _ => None,
     }
 }
@@ -3009,7 +3011,7 @@ fn toggle_selected_transcript_entry(app: &mut TuiApp) {
         .or_else(|| latest_collapsed_transcript_entry(app))
         .or_else(|| latest_toggleable_transcript_entry(app))
     else {
-        app.status = "nothing expandable yet · Alt+E expand all".to_string();
+        app.status = "nothing expandable yet · /expand all also works".to_string();
         return;
     };
     let Some(entry) = app.transcript.get_mut(index) else {
@@ -10082,6 +10084,9 @@ impl TranscriptEntry {
                 TranscriptEntryKind::Message(item) => item.role == Role::Assistant,
                 _ => false,
             },
+            TranscriptCategory::Reasoning => {
+                matches!(self.kind, TranscriptEntryKind::Reasoning(_))
+            }
         }
     }
 
@@ -10311,6 +10316,12 @@ enum TranscriptCategory {
     Diffs,
     Receipts,
     Assistant,
+    /// Streamed model reasoning blocks (greyed-out chevrons in the
+    /// transcript). The most common Ctrl+E target — exposing it as a
+    /// dedicated `/expand reasoning` lets users on terminals where
+    /// Ctrl+E / Alt+E never reach the application still drive the
+    /// expansion surface from a keystroke they control.
+    Reasoning,
 }
 
 /// Mid-turn cost/token snapshot surfaced in the status bar so the user

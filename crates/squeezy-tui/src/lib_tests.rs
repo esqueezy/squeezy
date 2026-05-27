@@ -2678,6 +2678,19 @@ async fn alt_e_dispatches_expand_all() {
     assert!(app.status.contains("expanded"));
 }
 
+#[test]
+fn parse_transcript_category_accepts_reasoning_and_thinking_aliases() {
+    assert!(matches!(
+        parse_transcript_category("reasoning"),
+        Some(TranscriptCategory::Reasoning)
+    ));
+    assert!(matches!(
+        parse_transcript_category("thinking"),
+        Some(TranscriptCategory::Reasoning)
+    ));
+    assert!(parse_transcript_category("rambling").is_none());
+}
+
 #[tokio::test]
 async fn ctrl_e_with_composer_text_keeps_line_end_and_emits_hint() {
     let mut agent = test_agent(SessionMode::Build);
