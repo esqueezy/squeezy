@@ -1063,7 +1063,7 @@ fn is_git_read_only_segment(segment: &str) -> bool {
     )
 }
 
-fn is_read_only_shell_segment(segment: &str) -> bool {
+pub(crate) fn is_read_only_shell_segment(segment: &str) -> bool {
     matches!(
         shell_command_prefix(segment).as_str(),
         "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "file" | "stat" | "du" | "grep" | "rg"

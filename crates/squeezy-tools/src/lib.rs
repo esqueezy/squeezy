@@ -73,6 +73,7 @@ use patch::{
     ApplyPatchArgs, ApplyPatchOperation, DiffContextArgs, PATCH_SNIPPET_MAX_CHARS, PatchPlan,
     PlanPatchArgs, SearchReplaceFallback, render_apply_patch_diff, render_write_file_diff,
 };
+pub use safety::{ShellPreClassification, pre_classify_shell};
 use schema::compact_tool_parameters;
 pub use shell::direct_user_shell_nonce;
 pub(crate) use shell::{ShellArgs, ShellExecutionGuard, ShellRunOutcome};

@@ -49,10 +49,11 @@ use squeezy_telemetry::{
 };
 use squeezy_tools::{
     McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
-    ShellAskApprover, ShellAskDecision, ShellAskRequest, ShellBestEffortFallback, ToolCall,
-    ToolCostHint, ToolExecutionOptions, ToolOutputConfig, ToolReceipt, ToolRegistry,
-    ToolRegistryRuntime, ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig,
-    sha256_hex, shell_best_effort_fallback_from_result,
+    ShellAskApprover, ShellAskDecision, ShellAskRequest, ShellBestEffortFallback,
+    ShellPreClassification, ToolCall, ToolCostHint, ToolExecutionOptions, ToolOutputConfig,
+    ToolReceipt, ToolRegistry, ToolRegistryRuntime, ToolResult, ToolRuntimeConfig, ToolSpec,
+    ToolStatus, WebToolConfig, pre_classify_shell, sha256_hex,
+    shell_best_effort_fallback_from_result,
 };
 use tokio::{
     sync::{Mutex, Notify, broadcast, mpsc, oneshot},
@@ -7912,6 +7913,54 @@ async fn permission_decision_for_request(
         .config
         .permissions
         .evaluate_with_extra(&request, &session_rules);
+    if verdict.action == PermissionAction::Ask
+        && request.tool_name == "shell"
+        && let Some(command) = request.metadata.get("command")
+    {
+        match pre_classify_shell(command, &context.config.permissions.shell_sandbox) {
+            ShellPreClassification::AutoAllow { reason } => {
+                let reason = format!("pre-classifier auto-allow: {reason}");
+                log_session_event(
+                    context.session_log.as_ref(),
+                    &context.redactor,
+                    "permission_pre_classifier_allow",
+                    Some(context.turn_id),
+                    Some(reason.clone()),
+                    json!({
+                        "reason": reason,
+                        "capability": request.capability.as_str(),
+                        "target": request.target.clone(),
+                    }),
+                );
+                verdict = PermissionVerdict {
+                    action: PermissionAction::Allow,
+                    matched_rule: None,
+                    reason,
+                };
+            }
+            ShellPreClassification::AutoDeny { reason } => {
+                let reason = format!("pre-classifier auto-deny: {reason}");
+                log_session_event(
+                    context.session_log.as_ref(),
+                    &context.redactor,
+                    "permission_pre_classifier_deny",
+                    Some(context.turn_id),
+                    Some(reason.clone()),
+                    json!({
+                        "reason": reason,
+                        "capability": request.capability.as_str(),
+                        "target": request.target.clone(),
+                    }),
+                );
+                verdict = PermissionVerdict {
+                    action: PermissionAction::Deny,
+                    matched_rule: None,
+                    reason,
+                };
+            }
+            ShellPreClassification::AskAi => {}
+        }
+    }
     if verdict.action == PermissionAction::Ask && context.config.permissions.ai_reviewer.enabled {
         let transcript = if let Some(conversation_state) = &context.conversation_state {
             let state = conversation_state.lock().await;
