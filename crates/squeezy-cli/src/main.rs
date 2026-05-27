@@ -99,6 +99,18 @@ struct Cli {
         help = "Skip the startup picker that offers to resume a recent session for this directory"
     )]
     no_resume_picker: bool,
+    #[arg(
+        long = "continue",
+        conflicts_with = "session",
+        help = "Resume the most recent resumable session for the current directory; falls back to a fresh session if none exists"
+    )]
+    continue_session: bool,
+    #[arg(
+        long = "session",
+        value_name = "ID",
+        help = "Resume an explicit session id"
+    )]
+    session: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -435,6 +447,28 @@ async fn main() -> squeezy_core::Result<()> {
     telemetry.record(TelemetryEvent::app_started(&config)).await;
 
     let provider = provider_from_app_config(&config);
+    let resume_flag = if cli.continue_session {
+        ResumeFlag::Continue
+    } else if let Some(id) = cli.session.as_deref() {
+        ResumeFlag::Explicit(id)
+    } else {
+        ResumeFlag::None
+    };
+    let resume_resolution = if matches!(resume_flag, ResumeFlag::None) {
+        ResumeResolution {
+            session_id: None,
+            note: None,
+        }
+    } else {
+        let sessions = SessionStore::open(&config)
+            .list(&SessionQuery::default())
+            .unwrap_or_default();
+        let cwd_str = config.workspace_root.display().to_string();
+        resolve_resume_session(resume_flag, &sessions, &cwd_str)
+    };
+    if let Some(note) = &resume_resolution.note {
+        eprintln!("{note}");
+    }
     if let Some(prompt) = cli.prompt {
         // Non-interactive prompt mode has no TUI to seed the summary into,
         // so surface it on stderr before the streamed completion lands on
@@ -443,7 +477,14 @@ async fn main() -> squeezy_core::Result<()> {
         if let Some(summary) = &onboarding.visible_summary {
             eprintln!("{summary}");
         }
-        let result = run_prompt(config, provider, prompt, cli.format).await;
+        let result = run_prompt(
+            config,
+            provider,
+            prompt,
+            cli.format,
+            resume_resolution.session_id,
+        )
+        .await;
         let _ = telemetry.flush().await;
         return result;
     }
@@ -453,14 +494,17 @@ async fn main() -> squeezy_core::Result<()> {
     // startups; the banner stays quiet unless GitHub reports a new release
     // we haven't already nagged the user about.
     let update_banner = update::banner_for_startup(&update::check_for_update().await);
+    let resume_session_id = resume_resolution.session_id;
+    let skip_resume_picker = cli.no_resume_picker || resume_session_id.is_some();
     let result = squeezy_tui::run_with_startup_profile(
         config,
         provider,
         squeezy_tui::StartupProfile {
             onboarding_summary: onboarding.visible_summary,
             languages: onboarding.language_summary,
-            skip_resume_picker: cli.no_resume_picker,
+            skip_resume_picker,
             update_banner,
+            resume_session_id,
         },
     )
     .await;
@@ -1778,6 +1822,68 @@ fn session_query_from_args(args: &SessionListArgs) -> squeezy_core::Result<Sessi
     })
 }
 
+/// What the `--continue` / `--session` pair (or neither) requests for
+/// startup. `Continue` resolves to the most-recent resumable session in
+/// `cwd_str`; `Explicit` is taken at face value and downstream
+/// errors-out if the id is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeFlag<'a> {
+    None,
+    Continue,
+    Explicit(&'a str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResumeResolution {
+    /// `Some(id)` requests resuming that session; `None` means start
+    /// fresh.
+    session_id: Option<String>,
+    /// Human-readable note to print on stderr (e.g. fallback warning).
+    note: Option<String>,
+}
+
+/// Pure: pick the session id to resume given the parsed flags, a
+/// snapshot of `SessionStore::list(&SessionQuery::default())`, and the
+/// caller's cwd. `sessions` is expected to be sorted newest-first by
+/// `started_at_ms`, which is what `SessionStore::list` already
+/// guarantees.
+fn resolve_resume_session(
+    flag: ResumeFlag<'_>,
+    sessions: &[SessionMetadata],
+    cwd_str: &str,
+) -> ResumeResolution {
+    match flag {
+        ResumeFlag::None => ResumeResolution {
+            session_id: None,
+            note: None,
+        },
+        ResumeFlag::Explicit(id) => ResumeResolution {
+            session_id: Some(id.to_string()),
+            note: None,
+        },
+        ResumeFlag::Continue => {
+            let pick = sessions
+                .iter()
+                .find(|meta| meta.resume_available && meta.cwd == cwd_str)
+                .map(|meta| meta.session_id.clone());
+            if pick.is_some() {
+                ResumeResolution {
+                    session_id: pick,
+                    note: None,
+                }
+            } else {
+                ResumeResolution {
+                    session_id: None,
+                    note: Some(
+                        "squeezy: --continue: no resumable session found for this directory; starting fresh"
+                            .to_string(),
+                    ),
+                }
+            }
+        }
+    }
+}
+
 fn parse_session_status(value: &str) -> squeezy_core::Result<SessionStatus> {
     match value.trim().to_ascii_lowercase().as_str() {
         "running" => Ok(SessionStatus::Running),
@@ -1801,11 +1907,30 @@ async fn run_prompt(
     provider: Arc<dyn LlmProvider>,
     prompt: String,
     format: PromptFormat,
+    resume_session_id: Option<String>,
 ) -> squeezy_core::Result<()> {
     let redactor = config.redaction.redactor()?;
-    let session = SessionStore::open(&config)
-        .start_session(SessionMetadata::new(&config, provider.name()))
-        .ok();
+    let store = SessionStore::open(&config);
+    // When `--continue` or `--session` resolved to an existing session,
+    // append onto it instead of spawning a fresh row. The previous
+    // response id (if any) is fed back so a server-side conversation
+    // thread carries over even though prompt mode runs single-shot.
+    let (session, previous_response_id) = if let Some(id) = resume_session_id {
+        let handle = store.open_session(id);
+        let previous = store
+            .show(handle.session_id())
+            .ok()
+            .and_then(|record| record.resume_state)
+            .and_then(|state| state.previous_response_id);
+        (Some(handle), previous)
+    } else {
+        (
+            store
+                .start_session(SessionMetadata::new(&config, provider.name()))
+                .ok(),
+            None,
+        )
+    };
     let mut redactions: u64 = 0;
     let redacted_prompt = redactor.redact(&prompt);
     redactions = redactions.saturating_add(redacted_prompt.redactions);
@@ -1828,7 +1953,7 @@ async fn run_prompt(
         max_output_tokens: config.max_output_tokens,
         response_verbosity: request_response_verbosity(&config, provider.name()),
         reasoning_effort: request_reasoning_effort(&config, provider.name()),
-        previous_response_id: None,
+        previous_response_id,
         cache_key: session
             .as_ref()
             .map(|session| format!("squeezy::{}", session.session_id())),

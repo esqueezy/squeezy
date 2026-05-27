@@ -235,6 +235,12 @@ pub struct StartupProfile {
     /// transcript quiet. The TUI flushes this through `push_log` at
     /// startup so it lands above the first agent turn.
     pub update_banner: Option<String>,
+    /// Pre-resolved session id to resume directly without showing the
+    /// picker. Populated by the CLI when `--continue` or
+    /// `--session <id>` selected an explicit target; behaves like a
+    /// `squeezy sessions resume <id>` invocation but keeps the rest of
+    /// the startup banner pipeline intact.
+    pub resume_session_id: Option<String>,
 }
 
 /// Maximum draw rate enforced by the event loop. 60 FPS keeps animations
@@ -295,6 +301,7 @@ pub async fn run_with_onboarding(
             languages: String::new(),
             skip_resume_picker: false,
             update_banner: None,
+            resume_session_id: None,
         },
     )
     .await
@@ -305,7 +312,12 @@ pub async fn run_with_startup_profile(
     provider: Arc<dyn LlmProvider>,
     startup: StartupProfile,
 ) -> Result<()> {
-    run_inner(config, provider, None, startup).await
+    // Resume target carried inside the profile (`--continue` /
+    // `--session`) wins over the picker; surface it to `run_inner` as
+    // the canonical resume id so the rest of the boot path is identical
+    // to `squeezy_tui::resume`.
+    let resume = startup.resume_session_id.clone();
+    run_inner(config, provider, resume, startup).await
 }
 
 pub async fn resume(
@@ -8827,6 +8839,7 @@ impl TuiApp {
                 languages: String::new(),
                 skip_resume_picker: false,
                 update_banner: None,
+                resume_session_id: None,
             },
             clipboard,
         )
