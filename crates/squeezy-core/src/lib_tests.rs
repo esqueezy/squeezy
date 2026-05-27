@@ -2412,6 +2412,19 @@ fn tui_theme_parses_lowercase_and_aliases_auto_to_system() {
     assert_eq!(TuiTheme::parse("light"), Some(TuiTheme::Light));
     // `auto` is the historical / config-screen equivalent of "system".
     assert_eq!(TuiTheme::parse("auto"), Some(TuiTheme::System));
+    // Named themes with distinct accent identities; aliases keep the slash
+    // command forgiving when users guess hyphen / underscore variants.
+    assert_eq!(TuiTheme::parse("catppuccin"), Some(TuiTheme::Catppuccin));
+    assert_eq!(TuiTheme::parse("mauve"), Some(TuiTheme::Catppuccin));
+    assert_eq!(
+        TuiTheme::parse("high-contrast"),
+        Some(TuiTheme::HighContrast),
+    );
+    assert_eq!(
+        TuiTheme::parse("high_contrast"),
+        Some(TuiTheme::HighContrast),
+    );
+    assert_eq!(TuiTheme::parse("hc"), Some(TuiTheme::HighContrast));
     // Whitespace and uppercase are tolerated so users typing `/theme Dark`
     // hit the same branch as the canonical `/theme dark` form.
     assert_eq!(TuiTheme::parse("  Dark  "), Some(TuiTheme::Dark));
@@ -2442,6 +2455,24 @@ theme = "dark"
     let reparsed = SettingsFile::from_toml_str(&emitted, "round trip").expect("inspect re-parse");
     let reloaded = AppConfig::from_settings_and_env_vars(reparsed, |_| None);
     assert_eq!(reloaded.tui.theme, TuiTheme::Dark);
+}
+
+#[test]
+fn tui_theme_as_str_round_trips_through_parse_for_every_variant() {
+    for theme in [
+        TuiTheme::System,
+        TuiTheme::Dark,
+        TuiTheme::Light,
+        TuiTheme::Catppuccin,
+        TuiTheme::HighContrast,
+    ] {
+        let s = theme.as_str();
+        assert_eq!(
+            TuiTheme::parse(s),
+            Some(theme),
+            "as_str→parse must round-trip for {theme:?} (got {s:?})",
+        );
+    }
 }
 
 #[test]

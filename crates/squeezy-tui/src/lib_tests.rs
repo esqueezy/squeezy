@@ -6713,6 +6713,70 @@ async fn slash_theme_without_arg_shows_usage() {
     );
 }
 
+/// `/theme catppuccin` pins the Dark tone *and* flips the accent variant
+/// so the working-shimmer and prompt cursor render in mauve. Verifies that
+/// each named theme drives both the tone and the accent override — the two
+/// must move together or the result is a mismatched palette.
+#[tokio::test]
+async fn slash_theme_catppuccin_pins_dark_tone_and_mauve_accent() {
+    use crate::render::palette;
+
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("theme_catppuccin");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme catppuccin").await;
+    assert!(ran, "/theme catppuccin should dispatch");
+    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
+    assert_eq!(
+        palette::accent_variant(),
+        palette::AccentVariant::Catppuccin
+    );
+    assert_ne!(
+        palette::accent_primary(),
+        palette::AMBER,
+        "catppuccin must override the amber default to the mauve accent",
+    );
+    assert_eq!(
+        agent.config_snapshot().tui.theme,
+        squeezy_core::TuiTheme::Catppuccin
+    );
+}
+
+/// `/theme high-contrast` pins the Light tone with a bright accessibility
+/// accent. Validates the hyphenated-argument path users will type and that
+/// the accent override flips to HighContrast independently of `dark`/
+/// `light` so reverting via `/theme system` restores the default.
+#[tokio::test]
+async fn slash_theme_high_contrast_pins_light_tone_and_yellow_accent() {
+    use crate::render::palette;
+
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("theme_hc");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme high-contrast").await;
+    assert!(ran);
+    assert_eq!(palette::palette_tone(), palette::PaletteTone::Light);
+    assert_eq!(
+        palette::accent_variant(),
+        palette::AccentVariant::HighContrast
+    );
+    assert_eq!(
+        agent.config_snapshot().tui.theme,
+        squeezy_core::TuiTheme::HighContrast,
+    );
+
+    // Reverting clears both overrides so the next session paints the
+    // detector-derived tone with the amber/gold default again.
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme system").await;
+    assert!(ran);
+    assert_eq!(palette::accent_variant(), palette::AccentVariant::Default);
+    assert_eq!(palette::accent_primary(), palette::AMBER);
+}
+
 /// `/keymap` lists the current bindings — even with no overrides it
 /// must surface every action plus the persisted-defaults hint so a
 /// fresh install can be inspected.
@@ -6857,6 +6921,7 @@ impl ScopedSettingsPath {
         // Start every theme test from a known palette state — even if a
         // previous test left an override behind.
         crate::render::palette::set_palette_tone_override(None);
+        crate::render::palette::set_accent_variant(crate::render::palette::AccentVariant::Default);
         let previous = std::env::var_os("SQUEEZY_SETTINGS_PATH");
         // SAFETY: the global mutex above ensures no other theme test is
         // mutating this env var at the same time.
@@ -6876,6 +6941,7 @@ impl Drop for ScopedSettingsPath {
             None => unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") },
         }
         crate::render::palette::set_palette_tone_override(None);
+        crate::render::palette::set_accent_variant(crate::render::palette::AccentVariant::Default);
     }
 }
 

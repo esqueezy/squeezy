@@ -346,7 +346,7 @@ async fn run_inner(
     // initial paint already reflects the user's choice — without this the
     // first frame uses the auto-detected tone and pops to the override on
     // the next redraw.
-    render::palette::set_palette_tone_override(theme_to_tone_override(config.tui.theme));
+    apply_theme_overrides(config.tui.theme);
     let mut terminal = TerminalGuard::enter(config.tui.alternate_screen)?;
     let resume_session_id =
         match maybe_pick_resume_session(&mut terminal, &config, resume_session_id, &startup)? {
@@ -733,7 +733,7 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     // Mirror an external theme edit into the runtime palette override
     // immediately — the agent's config_snapshot already carries the new
     // value, but the palette layer reads the override directly.
-    render::palette::set_palette_tone_override(theme_to_tone_override(new_cfg.tui.theme));
+    apply_theme_overrides(new_cfg.tui.theme);
     let old_provider = agent.provider_name();
     let new_provider = squeezy_llm::provider_name(&new_cfg.provider);
     if old_provider == new_provider {
@@ -1396,13 +1396,34 @@ fn toggle_status_line_setup(app: &mut TuiApp) {
 }
 
 /// Convert a [`TuiTheme`] preference into the runtime palette tone override.
-/// `System` clears the override so terminal detection (`COLORFGBG`) wins.
+/// `System` clears the override so terminal detection (`COLORFGBG`) wins;
+/// `Catppuccin` pins Dark and `HighContrast` pins Light because each named
+/// theme expects a specific background tone for its accent palette to read
+/// correctly.
 fn theme_to_tone_override(theme: TuiTheme) -> Option<render::palette::PaletteTone> {
     match theme {
         TuiTheme::System => None,
-        TuiTheme::Dark => Some(render::palette::PaletteTone::Dark),
-        TuiTheme::Light => Some(render::palette::PaletteTone::Light),
+        TuiTheme::Dark | TuiTheme::Catppuccin => Some(render::palette::PaletteTone::Dark),
+        TuiTheme::Light | TuiTheme::HighContrast => Some(render::palette::PaletteTone::Light),
     }
+}
+
+/// Map a [`TuiTheme`] to the accent family it owns. The amber/gold default
+/// is shared by `System`, `Dark`, and `Light`; only the named themes flip
+/// the accent.
+fn theme_to_accent_variant(theme: TuiTheme) -> render::palette::AccentVariant {
+    match theme {
+        TuiTheme::Catppuccin => render::palette::AccentVariant::Catppuccin,
+        TuiTheme::HighContrast => render::palette::AccentVariant::HighContrast,
+        _ => render::palette::AccentVariant::Default,
+    }
+}
+
+/// Apply both the tone and accent overrides for `theme` in one shot so
+/// callers don't accidentally update one and forget the other.
+fn apply_theme_overrides(theme: TuiTheme) {
+    render::palette::set_palette_tone_override(theme_to_tone_override(theme));
+    render::palette::set_accent_variant(theme_to_accent_variant(theme));
 }
 
 /// Apply a `/theme` switch: flip the runtime palette override, mirror the
@@ -1413,7 +1434,7 @@ fn theme_to_tone_override(theme: TuiTheme) -> Option<render::palette::PaletteTon
 fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: TuiTheme) {
     use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
 
-    render::palette::set_palette_tone_override(theme_to_tone_override(theme));
+    apply_theme_overrides(theme);
 
     let mut next = agent.config_snapshot();
     next.tui.theme = theme;
@@ -1835,11 +1856,14 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         }
         "/theme" => {
             let Some(raw) = parts.next() else {
-                app.status = "usage: /theme [system|dark|light]".to_string();
+                app.status =
+                    "usage: /theme [system|dark|light|catppuccin|high-contrast]".to_string();
                 return true;
             };
             let Some(theme) = TuiTheme::parse(raw) else {
-                app.status = format!("unknown theme {raw:?}; expected system, dark, or light");
+                app.status = format!(
+                    "unknown theme {raw:?}; expected system, dark, light, catppuccin, or high-contrast",
+                );
                 return true;
             };
             apply_theme_change(app, agent, theme);
@@ -4127,7 +4151,11 @@ fn turn_in_progress(app: &TuiApp) -> bool {
 
 fn working_line(app: &TuiApp) -> Line<'static> {
     let interrupting = app.status == "interrupting";
-    let activity_color = if interrupting { ERROR_RED } else { AMBER };
+    let activity_color = if interrupting {
+        ERROR_RED
+    } else {
+        render::palette::accent_primary()
+    };
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
@@ -4194,7 +4222,11 @@ fn shimmer_word_spans(text: &'static str, elapsed_ms: u64) -> Vec<Span<'static>>
                 0.0
             };
             let style = Style::default()
-                .fg(blend_color(AMBER, WORKING_SHIMMER_HIGHLIGHT, intensity))
+                .fg(blend_color(
+                    render::palette::accent_primary(),
+                    render::palette::accent_working_highlight(),
+                    intensity,
+                ))
                 .add_modifier(Modifier::BOLD);
             Span::styled(ch.to_string(), style)
         })

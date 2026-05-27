@@ -378,7 +378,7 @@ pub const TOOL_OUTPUT_VERBOSITY_OPTIONS: &[&str] = &["compact", "normal", "verbo
 pub const TRANSCRIPT_DEFAULT_OPTIONS: &[&str] = &["compact", "expanded"];
 pub const ALTERNATE_SCREEN_OPTIONS: &[&str] = &["auto", "never", "always"];
 pub const PERMISSION_MODE_OPTIONS: &[&str] = &["allow", "ask", "deny"];
-pub const THEME_OPTIONS: &[&str] = &["system", "dark", "light"];
+pub const THEME_OPTIONS: &[&str] = &["system", "dark", "light", "catppuccin", "high-contrast"];
 
 pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
     ConfigSectionMeta {
@@ -735,7 +735,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_theme,
                 default_display: "system",
                 default: || FieldValue::Enum("system"),
-                help: "Palette tone (system follows the terminal). Configure via /theme.",
+                help: "Theme + palette tone. `system` follows the terminal, `dark`/`light` pin the tone with the default amber/gold accents, `catppuccin` and `high-contrast` swap accent identities. Configure via /theme.",
                 env_override: None,
                 secret: false,
             },

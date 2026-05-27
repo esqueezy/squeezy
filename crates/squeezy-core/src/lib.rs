@@ -5934,15 +5934,19 @@ impl TuiAlternateScreen {
     }
 }
 
-/// User-controlled palette tone for the TUI. `System` defers to the
-/// existing terminal-tone detection (`COLORFGBG`); `Dark` and `Light`
-/// pin the tone regardless of what the terminal reports.
+/// User-controlled palette for the TUI. `System` defers to terminal-tone
+/// detection (`COLORFGBG`); `Dark` and `Light` pin the tone but keep the
+/// default amber/gold accent identity; `Catppuccin` swaps to mauve accents
+/// on a dark background; `HighContrast` pins a light tone with a black/
+/// yellow accent profile for accessibility-strict configs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TuiTheme {
     System,
     Dark,
     Light,
+    Catppuccin,
+    HighContrast,
 }
 
 impl TuiTheme {
@@ -5951,6 +5955,8 @@ impl TuiTheme {
             Self::System => "system",
             Self::Dark => "dark",
             Self::Light => "light",
+            Self::Catppuccin => "catppuccin",
+            Self::HighContrast => "high-contrast",
         }
     }
 
@@ -5959,6 +5965,8 @@ impl TuiTheme {
             "system" | "auto" => Some(Self::System),
             "dark" => Some(Self::Dark),
             "light" => Some(Self::Light),
+            "catppuccin" | "mauve" => Some(Self::Catppuccin),
+            "high-contrast" | "high_contrast" | "highcontrast" | "hc" => Some(Self::HighContrast),
             _ => None,
         }
     }

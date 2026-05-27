@@ -312,9 +312,9 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     ),
     slash_args_caps(
         "/theme",
-        "switch palette tone (persists to settings)",
+        "switch theme (persists to settings)",
         true,
-        "[system|dark|light]",
+        "[system|dark|light|catppuccin|high-contrast]",
         &[PermissionCapability::Edit],
     ),
     slash("/keymap", "list current key bindings"),
