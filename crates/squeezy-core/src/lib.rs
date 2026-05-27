@@ -30,6 +30,38 @@ pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/api";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
 
+// Small-fast-model defaults per provider. Used for low-stakes background calls
+// (compaction summaries, classifier prompts, auto-approver) where flagship
+// quality is wasted spend. Anthropic Haiku 4.5 is ~15x cheaper than Opus 4.7
+// per input token; comparable shape on OpenAI Nano vs flagship.
+pub const ANTHROPIC_SMALL_FAST_MODEL: &str = "claude-haiku-4-5-20251001";
+pub const OPENAI_SMALL_FAST_MODEL: &str = "gpt-5.4-nano";
+pub const GOOGLE_SMALL_FAST_MODEL: &str = "gemini-2.5-flash-lite";
+pub const BEDROCK_SMALL_FAST_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
+pub const AZURE_OPENAI_SMALL_FAST_MODEL: &str = OPENAI_SMALL_FAST_MODEL;
+pub const OPENROUTER_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
+pub const VERCEL_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
+pub const PORTKEY_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
+
+/// Returns the built-in small-fast-model id for `provider`. `provider` is the
+/// canonical short name (`provider_kind`/`LlmProvider::name`). Returns `None`
+/// for providers that have no obvious cheaper tier (Ollama serves a single
+/// local model; OpenAI-compatible light presets don't ship a curated cheap
+/// model). Callers should treat `None` as "fall back to the parent model".
+pub fn small_fast_model_for_provider(provider: &str) -> Option<&'static str> {
+    match provider {
+        "anthropic" => Some(ANTHROPIC_SMALL_FAST_MODEL),
+        "openai" => Some(OPENAI_SMALL_FAST_MODEL),
+        "google" => Some(GOOGLE_SMALL_FAST_MODEL),
+        "azure_openai" => Some(AZURE_OPENAI_SMALL_FAST_MODEL),
+        "bedrock" => Some(BEDROCK_SMALL_FAST_MODEL),
+        "openrouter" => Some(OPENROUTER_SMALL_FAST_MODEL),
+        "vercel" => Some(VERCEL_SMALL_FAST_MODEL),
+        "portkey" => Some(PORTKEY_SMALL_FAST_MODEL),
+        _ => None,
+    }
+}
+
 // OpenAI-compatible aggregators (full preset tier — curated models in models.json, dedicated costly test).
 pub const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-opus-4-7";
@@ -238,6 +270,12 @@ pub const DEFAULT_CORE_TOOL_NAMES: &[&str] = &[
 pub struct AppConfig {
     pub provider: ProviderConfig,
     pub model: String,
+    /// Cheap model id used for low-stakes background calls: compaction
+    /// summary, AI reviewer classifier, auto-approver. `None` falls back to
+    /// `small_fast_model_for_provider(provider)`, then to `model` if the
+    /// provider has no curated cheap tier (e.g. Ollama). Configured via
+    /// `[model].small_fast_model` in TOML or `SQUEEZY_SMALL_FAST_MODEL`.
+    pub small_fast_model: Option<String>,
     pub profile: ModelProfile,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub instructions: String,
@@ -507,6 +545,10 @@ impl AppConfig {
             .or(settings.model)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(default_model);
+        let small_fast_model = get_var("SQUEEZY_SMALL_FAST_MODEL")
+            .or(model_settings.small_fast_model.clone())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         let reasoning_effort = model_settings.reasoning_effort;
         let max_output_tokens = get_var("SQUEEZY_MAX_OUTPUT_TOKENS")
             .and_then(|value| value.parse::<u32>().ok())
@@ -685,6 +727,7 @@ impl AppConfig {
         Ok(Self {
             provider,
             model,
+            small_fast_model,
             profile,
             reasoning_effort,
             instructions: DEFAULT_INSTRUCTIONS.to_string(),
@@ -746,6 +789,18 @@ impl AppConfig {
             .expect("built-in config defaults are valid")
     }
 
+    /// Resolves the small-fast-model id for background calls (compaction
+    /// summary, classifier, auto-approver). Returns the user-configured value
+    /// when set, then the provider built-in cheap default, then `None` when
+    /// the provider has no curated cheap tier — callers fall back to the
+    /// main model in that case.
+    pub fn resolved_small_fast_model(&self) -> Option<String> {
+        if let Some(model) = &self.small_fast_model {
+            return Some(model.clone());
+        }
+        small_fast_model_for_provider(provider_kind(&self.provider)).map(str::to_string)
+    }
+
     /// Returns `config_sources` with file paths reduced to short labels
     /// (`"user"`, `"project"`, `"repo"`) for display in narrow status lines. Full
     /// paths remain available on `config_sources` and via `config inspect`.
@@ -781,6 +836,13 @@ impl AppConfig {
             toml_string(provider_kind(&self.provider))
         ));
         output.push_str(&format!("model = {}\n", toml_string(&self.model)));
+        if let Some(small_fast) = &self.small_fast_model {
+            output.push_str(&format!("small_fast_model = {}\n", toml_string(small_fast)));
+        } else {
+            output.push_str(
+                "# small_fast_model = unset  # uses per-provider built-in cheap default\n",
+            );
+        }
         output.push_str(&format!(
             "profile = {}\n",
             toml_string(self.profile.as_str())
@@ -2330,6 +2392,10 @@ where
 pub struct ModelSettings {
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Cheap model id used for low-stakes background calls (compaction
+    /// summary, AI reviewer classifier, auto-approver). When `None` the
+    /// per-provider built-in (`small_fast_model_for_provider`) applies.
+    pub small_fast_model: Option<String>,
     pub profile: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_output_tokens: Option<u32>,
@@ -2353,6 +2419,7 @@ impl ModelSettings {
             &[
                 "provider",
                 "model",
+                "small_fast_model",
                 "profile",
                 "reasoning_effort",
                 "max_output_tokens",
@@ -2382,6 +2449,12 @@ impl ModelSettings {
         Ok(Self {
             provider: string_value(table, "provider", source, &field(path, "provider"))?,
             model: string_value(table, "model", source, &field(path, "model"))?,
+            small_fast_model: string_value(
+                table,
+                "small_fast_model",
+                source,
+                &field(path, "small_fast_model"),
+            )?,
             profile,
             reasoning_effort,
             max_output_tokens: u32_value(
@@ -2420,6 +2493,7 @@ impl ModelSettings {
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.provider, next.provider);
         replace_if_some(&mut self.model, next.model);
+        replace_if_some(&mut self.small_fast_model, next.small_fast_model);
         replace_if_some(&mut self.profile, next.profile);
         replace_if_some(&mut self.reasoning_effort, next.reasoning_effort);
         replace_if_some(&mut self.max_output_tokens, next.max_output_tokens);

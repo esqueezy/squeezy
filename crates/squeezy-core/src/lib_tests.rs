@@ -2596,3 +2596,93 @@ fn memory_scope_doc_records_deferred_tool_decision() {
         "scope doc must name the staged tool surface for future adoption"
     );
 }
+
+#[test]
+fn small_fast_model_resolves_per_provider_default() {
+    assert_eq!(
+        small_fast_model_for_provider("anthropic"),
+        Some(ANTHROPIC_SMALL_FAST_MODEL)
+    );
+    assert_eq!(
+        small_fast_model_for_provider("openai"),
+        Some(OPENAI_SMALL_FAST_MODEL)
+    );
+    assert_eq!(
+        small_fast_model_for_provider("google"),
+        Some(GOOGLE_SMALL_FAST_MODEL)
+    );
+    assert_eq!(
+        small_fast_model_for_provider("bedrock"),
+        Some(BEDROCK_SMALL_FAST_MODEL)
+    );
+    assert_eq!(
+        small_fast_model_for_provider("azure_openai"),
+        Some(AZURE_OPENAI_SMALL_FAST_MODEL)
+    );
+    assert_eq!(
+        small_fast_model_for_provider("openrouter"),
+        Some(OPENROUTER_SMALL_FAST_MODEL)
+    );
+    // Ollama serves a single local model; no separate cheap tier.
+    assert_eq!(small_fast_model_for_provider("ollama"), None);
+    assert_eq!(small_fast_model_for_provider("unknown"), None);
+}
+
+#[test]
+fn resolved_small_fast_model_prefers_config_override() {
+    let mut config = AppConfig::from_env_vars(Some("anthropic"), |_| None);
+    config.small_fast_model = Some("claude-haiku-custom".to_string());
+    assert_eq!(
+        config.resolved_small_fast_model().as_deref(),
+        Some("claude-haiku-custom")
+    );
+}
+
+#[test]
+fn resolved_small_fast_model_falls_back_to_provider_default() {
+    let config = AppConfig::from_env_vars(Some("anthropic"), |_| None);
+    assert_eq!(
+        config.resolved_small_fast_model().as_deref(),
+        Some(ANTHROPIC_SMALL_FAST_MODEL)
+    );
+}
+
+#[test]
+fn resolved_small_fast_model_returns_none_for_ollama_without_override() {
+    let config = AppConfig::from_env_vars(Some("ollama"), |_| None);
+    assert_eq!(config.resolved_small_fast_model(), None);
+}
+
+#[test]
+fn small_fast_model_reads_env_var() {
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "SQUEEZY_SMALL_FAST_MODEL".to_string(),
+        "haiku-from-env".to_string(),
+    );
+    overrides.insert("SQUEEZY_PROVIDER".to_string(), "anthropic".to_string());
+    let config = AppConfig::from_env_vars(None, |name| overrides.get(name).cloned());
+    assert_eq!(config.small_fast_model.as_deref(), Some("haiku-from-env"));
+    assert_eq!(
+        config.resolved_small_fast_model().as_deref(),
+        Some("haiku-from-env")
+    );
+}
+
+#[test]
+fn small_fast_model_reads_toml_setting() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "anthropic"
+small_fast_model = "claude-haiku-from-toml"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert_eq!(
+        config.small_fast_model.as_deref(),
+        Some("claude-haiku-from-toml")
+    );
+}

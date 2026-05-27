@@ -157,6 +157,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
     let model = reviewer
         .model
         .clone()
+        .or_else(|| input.config.resolved_small_fast_model())
         .unwrap_or_else(|| input.config.model.clone());
     let request = LlmRequest {
         model: Arc::from(model.as_str()),

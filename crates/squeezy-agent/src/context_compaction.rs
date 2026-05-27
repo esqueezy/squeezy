@@ -538,13 +538,22 @@ pub(crate) async fn compact_conversation_with_strategy(
     {
         return Some(report);
     }
-    let Some(model) = config.context_compaction.model_assisted_model.clone() else {
+    let Some(model) = config
+        .context_compaction
+        .model_assisted_model
+        .clone()
+        .or_else(|| config.resolved_small_fast_model())
+    else {
         log_session_event(
             session,
             redactor,
             "compaction_fallback",
             None,
-            Some("model_assisted_model not configured; using extractive output".to_string()),
+            Some(
+                "model_assisted_model not configured and no small_fast_model default; \
+                 using extractive output"
+                    .to_string(),
+            ),
             json!({ "reason": "missing_model", "strategy": strategy.as_str() }),
         );
         return Some(report);

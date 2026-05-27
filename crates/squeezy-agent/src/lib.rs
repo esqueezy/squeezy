@@ -18,14 +18,13 @@ use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentSource, ContextAttachmentStatus,
     ContextCompactionRecord, ContextCompactionState, ContextCompactionTrigger, ContextEstimate,
-    ContextPin, CostSnapshot, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL,
-    DEFAULT_BEDROCK_MODEL, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_GOOGLE_MODEL,
-    DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_MODEL, PROJECT_SETTINGS_FILE, PermissionAction,
-    PermissionCapability, PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope,
-    PermissionVerdict, ProviderConfig, Redactor, ResponseVerbosity, Role, SessionMetrics,
-    SessionMode, SqueezyError, StreamRedactor, SubagentConfig, TaskStateSnapshot, TaskStateStatus,
-    ToolSchemaConfig, TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
-    context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
+    ContextPin, CostSnapshot, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_OLLAMA_MODEL,
+    PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability, PermissionRequest,
+    PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict, ProviderConfig,
+    Redactor, ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError, StreamRedactor,
+    SubagentConfig, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig, TranscriptItem, TurnId,
+    TurnMetrics, context_attachment_preview, context_attachment_storage_text,
+    default_settings_path, detect_context_attachment_kind,
 };
 use squeezy_hooks::{HookEvent, HookRegistry};
 use squeezy_llm::{
@@ -6431,27 +6430,34 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
         .map(|role| role_config(role).model_policy)
         .unwrap_or(RoleModelPolicy::Parent);
     match (kind, policy) {
-        (SubagentKind::Explore, _) => config.subagents.explore_model.clone().unwrap_or_else(|| {
-            default_cheap_model_for_provider(provider)
-                .unwrap_or(&parent_model)
-                .to_string()
-        }),
+        (SubagentKind::Explore, _) => {
+            config.subagents.explore_model.clone().unwrap_or_else(|| {
+                cheap_model_for(provider, config).unwrap_or(parent_model.clone())
+            })
+        }
         (SubagentKind::DocHelp, _) => parent_model,
         (_, RoleModelPolicy::Parent) => parent_model,
-        (_, RoleModelPolicy::Cheap) => default_cheap_model_for_provider(provider)
-            .unwrap_or(&parent_model)
-            .to_string(),
+        (_, RoleModelPolicy::Cheap) => cheap_model_for(provider, config).unwrap_or(parent_model),
     }
 }
 
-fn default_cheap_model_for_provider(provider: &str) -> Option<&'static str> {
+/// Resolves the cheap-tier model for `provider`, honoring an explicit
+/// `[model].small_fast_model` config override before falling back to the
+/// per-provider built-in (Anthropic Haiku, OpenAI Nano, Gemini Flash Lite,
+/// etc.). Returns `None` when the provider has no curated cheap tier; the
+/// caller falls back to the parent model in that case. The Ollama default
+/// (`qwen3-coder`) is the only model a local Ollama install is guaranteed
+/// to have, so it is returned verbatim rather than pretending a separate
+/// cheap tier exists.
+fn cheap_model_for(provider: &str, config: &AppConfig) -> Option<String> {
+    if let Some(model) = config.small_fast_model.clone() {
+        return Some(model);
+    }
+    if let Some(model) = squeezy_core::small_fast_model_for_provider(provider) {
+        return Some(model.to_string());
+    }
     match provider {
-        "openai" => Some(DEFAULT_OPENAI_MODEL),
-        "anthropic" => Some(DEFAULT_ANTHROPIC_MODEL),
-        "google" => Some(DEFAULT_GOOGLE_MODEL),
-        "azure_openai" => Some(DEFAULT_AZURE_OPENAI_MODEL),
-        "bedrock" => Some(DEFAULT_BEDROCK_MODEL),
-        "ollama" => Some(DEFAULT_OLLAMA_MODEL),
+        "ollama" => Some(DEFAULT_OLLAMA_MODEL.to_string()),
         _ => None,
     }
 }
