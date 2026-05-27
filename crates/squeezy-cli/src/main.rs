@@ -8,7 +8,7 @@ use std::{
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 use squeezy_agent::Agent;
 use squeezy_core::{
@@ -40,6 +40,19 @@ use squeezy_telemetry::{
 use tokio_util::sync::CancellationToken;
 use toml_edit::{DocumentMut, Item, Table, Value as TomlValue};
 
+/// Output framing for `--prompt`. `Default` matches the historical
+/// human-readable text-delta stream; `Json` emits one
+/// `serde_json`-serialized `LlmEvent` per line so callers can pipe to `jq`
+/// or capture the per-event cost surface programmatically. The line schema
+/// follows the `LlmEvent` enum tag/data shape declared in
+/// `crates/squeezy-llm/src/lib.rs` (`type` + `data`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum PromptFormat {
+    Default,
+    Json,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "squeezy", version, about = "Cost-aware coding agent TUI")]
 struct Cli {
@@ -69,6 +82,13 @@ struct Cli {
     list_models: bool,
     #[arg(long, help = "Run one non-interactive prompt and print streamed text")]
     prompt: Option<String>,
+    #[arg(
+        long,
+        value_name = "FORMAT",
+        help = "Non-interactive output format for --prompt: 'default' (text deltas) or 'json' (one event per line). Experimental; schema may change.",
+        default_value = "default"
+    )]
+    format: PromptFormat,
     #[arg(
         long,
         help = "Ignore saved provider/model defaults and run startup selection again"
@@ -324,6 +344,12 @@ async fn main() -> squeezy_core::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if cli.format == PromptFormat::Json && cli.prompt.is_none() {
+        return Err(SqueezyError::Config(
+            "--format json requires --prompt; interactive sessions and subcommands only emit human-formatted output"
+                .to_string(),
+        ));
+    }
     match &cli.command {
         Some(Command::Config { command }) => return handle_config_command(command, &cli),
         Some(Command::Repo { command }) => return handle_repo_command(command, &cli),
@@ -417,7 +443,7 @@ async fn main() -> squeezy_core::Result<()> {
         if let Some(summary) = &onboarding.visible_summary {
             eprintln!("{summary}");
         }
-        let result = run_prompt(config, provider, prompt).await;
+        let result = run_prompt(config, provider, prompt, cli.format).await;
         let _ = telemetry.flush().await;
         return result;
     }
@@ -1774,6 +1800,7 @@ async fn run_prompt(
     config: AppConfig,
     provider: Arc<dyn LlmProvider>,
     prompt: String,
+    format: PromptFormat,
 ) -> squeezy_core::Result<()> {
     let redactor = config.redaction.redactor()?;
     let session = SessionStore::open(&config)
@@ -1816,24 +1843,44 @@ async fn run_prompt(
     let mut assistant = String::new();
 
     while let Some(event) = stream.next().await {
-        match event? {
+        let event = event?;
+        if format == PromptFormat::Json {
+            // Emit one JSON object per line for every event. The schema is
+            // `LlmEvent`'s serde tag/data form: `{"type":"text_delta",
+            // "data":"..."}`, `{"type":"completed","data":{...}}`, etc.
+            // Newline-delimited so callers can `jq -c` or `read -r` line
+            // by line; flushing on every line keeps the pipe responsive
+            // when the consumer is a long-running script.
+            let line = serde_json::to_string(&event).map_err(|err| {
+                SqueezyError::Parse(format!("failed to serialize prompt event: {err}"))
+            })?;
+            writeln!(stdout, "{line}")?;
+            stdout.flush()?;
+        }
+        match event {
             LlmEvent::Started => {}
             LlmEvent::TextDelta(delta) => {
                 assistant.push_str(&delta);
-                write!(stdout, "{delta}")?;
-                stdout.flush()?;
+                if format == PromptFormat::Default {
+                    write!(stdout, "{delta}")?;
+                    stdout.flush()?;
+                }
             }
             LlmEvent::ToolCall(tool_call) => {
-                eprintln!(
-                    "tool call requested but prompt mode has no tools: {}",
-                    tool_call.name
-                );
+                if format == PromptFormat::Default {
+                    eprintln!(
+                        "tool call requested but prompt mode has no tools: {}",
+                        tool_call.name
+                    );
+                }
             }
             LlmEvent::Completed {
                 response_id, cost, ..
             } => {
-                writeln!(stdout)?;
-                stdout.flush()?;
+                if format == PromptFormat::Default {
+                    writeln!(stdout)?;
+                    stdout.flush()?;
+                }
                 let redacted_assistant = redactor.redact(&assistant);
                 redactions = redactions.saturating_add(redacted_assistant.redactions);
                 let redacted_assistant = redacted_assistant.text;
@@ -1872,17 +1919,21 @@ async fn run_prompt(
                     let _ =
                         session.finish(SessionStatus::Completed, cost.clone(), metrics, redactions);
                 }
-                eprintln!(
-                    "tokens: input={} output={} cached={} cache_write={} cost_usd={}",
-                    format_token(cost.input_tokens),
-                    format_token(cost.output_tokens),
-                    format_token(cost.cached_input_tokens),
-                    format_token(cost.cache_write_input_tokens),
-                    format_usd_micros(cost.estimated_usd_micros)
-                );
+                if format == PromptFormat::Default {
+                    eprintln!(
+                        "tokens: input={} output={} cached={} cache_write={} cost_usd={}",
+                        format_token(cost.input_tokens),
+                        format_token(cost.output_tokens),
+                        format_token(cost.cached_input_tokens),
+                        format_token(cost.cache_write_input_tokens),
+                        format_usd_micros(cost.estimated_usd_micros)
+                    );
+                }
             }
             LlmEvent::Cancelled => {
-                eprintln!("cancelled");
+                if format == PromptFormat::Default {
+                    eprintln!("cancelled");
+                }
                 break;
             }
             LlmEvent::ReasoningDelta { .. } | LlmEvent::ReasoningDone(_) => {}

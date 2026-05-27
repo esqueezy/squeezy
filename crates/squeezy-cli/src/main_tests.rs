@@ -1,4 +1,6 @@
 use super::*;
+use clap::Parser;
+use squeezy_llm::LlmEvent;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
@@ -59,6 +61,66 @@ read = "deny"
     let settings = SettingsFile::from_toml_str(&text, "test").expect("round-trip");
     assert!(model_selection_state(&settings).complete());
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cli_prompt_format_defaults_to_text() {
+    let cli = Cli::try_parse_from(["squeezy", "--prompt", "hi"]).expect("parse");
+    assert_eq!(cli.format, PromptFormat::Default);
+    assert_eq!(cli.prompt.as_deref(), Some("hi"));
+}
+
+#[test]
+fn cli_prompt_format_json_is_accepted_lowercase() {
+    let cli =
+        Cli::try_parse_from(["squeezy", "--prompt", "hi", "--format", "json"]).expect("parse json");
+    assert_eq!(cli.format, PromptFormat::Json);
+}
+
+#[test]
+fn cli_prompt_format_rejects_unknown_value() {
+    let err = Cli::try_parse_from(["squeezy", "--prompt", "hi", "--format", "yaml"])
+        .expect_err("yaml is not a valid prompt format");
+    assert!(
+        err.to_string().to_lowercase().contains("yaml")
+            || err.to_string().to_lowercase().contains("invalid"),
+        "expected clap error to mention the bad value, got: {err}"
+    );
+}
+
+#[test]
+fn ask_format_json_emits_one_object_per_line() {
+    // Exercises the JSONL schema used by `squeezy --prompt ... --format json`.
+    // Each emitted line must parse as a single `LlmEvent`; the tag/content
+    // form (`type` + `data`) is the public contract callers pipe to `jq`.
+    let events = [
+        LlmEvent::Started,
+        LlmEvent::TextDelta("hello".to_string()),
+        LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: squeezy_core::CostSnapshot::default(),
+        },
+    ];
+    let mut buf = String::new();
+    for event in &events {
+        let line = serde_json::to_string(event).expect("serialize event");
+        assert!(
+            !line.contains('\n'),
+            "serialized event {line} contains an embedded newline; JSONL framing requires one object per line"
+        );
+        buf.push_str(&line);
+        buf.push('\n');
+    }
+    let lines: Vec<&str> = buf.lines().collect();
+    assert_eq!(lines.len(), 3);
+    let first: serde_json::Value = serde_json::from_str(lines[0]).expect("started parses");
+    assert_eq!(first["type"], "started");
+    let second: serde_json::Value = serde_json::from_str(lines[1]).expect("delta parses");
+    assert_eq!(second["type"], "text_delta");
+    assert_eq!(second["data"], "hello");
+    let third: serde_json::Value = serde_json::from_str(lines[2]).expect("completed parses");
+    assert_eq!(third["type"], "completed");
+    assert_eq!(third["data"]["response_id"], "resp_1");
 }
 
 fn temp_dir(name: &str) -> PathBuf {
