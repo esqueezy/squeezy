@@ -434,7 +434,7 @@ fn bounded_transcript(
         && index < recent_start
         && let Some(line) = format_transcript_line(index, &items[index], MAX_USER_TOKENS)
     {
-        total_tokens = total_tokens.saturating_add(approx_tokens(&line));
+        let _ = total_tokens.saturating_add(approx_tokens(&line));
         kept.push((index, line));
     }
 

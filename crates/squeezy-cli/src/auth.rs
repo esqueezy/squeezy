@@ -653,7 +653,7 @@ fn compute_status_row(
         .unwrap_or(false);
     let fallback_env_set = provider
         .fallback_env
-        .and_then(|name| env_lookup(name))
+        .and_then(env_lookup)
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
     StatusRow {

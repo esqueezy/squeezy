@@ -3572,13 +3572,15 @@ async fn pre_turn_compaction_dispatches_pre_and_post_compact_hooks() {
         ],
     ]));
 
-    let mut config = AppConfig::default();
-    config.context_compaction = ContextCompactionConfig {
-        enabled: true,
-        min_items: 1,
-        recent_items: 1,
-        estimated_tokens: 0,
-        ..ContextCompactionConfig::default()
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            enabled: true,
+            min_items: 1,
+            recent_items: 1,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
     };
 
     let mut agent = Agent::new(config, provider);

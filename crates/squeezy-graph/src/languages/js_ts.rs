@@ -135,6 +135,7 @@ impl JsTsResolverUpdate {
         self.inserted + self.rebuilt + self.removed > 0
     }
 
+    #[allow(dead_code)]
     pub(crate) fn parses(&self) -> usize {
         self.inserted + self.rebuilt
     }

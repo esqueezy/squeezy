@@ -297,7 +297,7 @@ fn lmstudio_message(item: &LlmInputItem) -> Option<Value> {
 }
 
 #[derive(Debug, Default)]
-struct StreamState {
+pub(crate) struct StreamState {
     response_id: Option<String>,
     cost: CostSnapshot,
     tool_calls: BTreeMap<usize, PartialToolCall>,

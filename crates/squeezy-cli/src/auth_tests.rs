@@ -54,6 +54,7 @@ fn synthetic_sources(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn env_from(pairs: &[(&str, &str)]) -> Box<dyn Fn(&str) -> Option<String>> {
     let map: HashMap<String, String> = pairs
         .iter()

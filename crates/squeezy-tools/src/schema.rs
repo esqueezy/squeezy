@@ -258,10 +258,10 @@ fn sanitize_object(map: &mut Map<String, Value>) {
             }
         }
     }
-    if let Some(additional) = map.get_mut("additionalProperties") {
-        if !matches!(additional, Value::Bool(_)) {
-            sanitize_value(additional);
-        }
+    if let Some(additional) = map.get_mut("additionalProperties")
+        && !matches!(additional, Value::Bool(_))
+    {
+        sanitize_value(additional);
     }
 }
 
@@ -351,10 +351,10 @@ fn prune_unreachable_definitions(schema: &mut JsonSchema) {
 }
 
 fn collect_refs_outside_defs(schema: &JsonSchema, out: &mut BTreeSet<String>) {
-    if let Some(reference) = schema.schema_ref.as_deref() {
-        if let Some(name) = ref_target_name(reference) {
-            out.insert(name.to_string());
-        }
+    if let Some(reference) = schema.schema_ref.as_deref()
+        && let Some(name) = ref_target_name(reference)
+    {
+        out.insert(name.to_string());
     }
     if let Some(properties) = schema.properties.as_ref() {
         for (_, child) in properties.iter() {
@@ -390,10 +390,10 @@ fn collect_refs_outside_defs(schema: &JsonSchema, out: &mut BTreeSet<String>) {
 }
 
 fn collect_refs(schema: &JsonSchema, out: &mut BTreeSet<String>) {
-    if let Some(reference) = schema.schema_ref.as_deref() {
-        if let Some(name) = ref_target_name(reference) {
-            out.insert(name.to_string());
-        }
+    if let Some(reference) = schema.schema_ref.as_deref()
+        && let Some(name) = ref_target_name(reference)
+    {
+        out.insert(name.to_string());
     }
     if let Some(properties) = schema.properties.as_ref() {
         for (_, child) in properties.iter() {
