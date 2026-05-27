@@ -1955,20 +1955,20 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             app.push_transcript_item(TranscriptItem::system(body));
             return true;
         }
-        "/jobs" => {
+        "/tasks" | "/jobs" => {
             sync_jobs_from_agent(app, agent);
-            let jobs = format_jobs_list(app);
-            app.status = format!("{} jobs", app.jobs.len());
-            app.push_transcript_item(TranscriptItem::system(jobs));
+            let body = format_tasks_list(app, agent);
+            app.status = format!("{} tasks", app.jobs.len());
+            app.push_transcript_item(TranscriptItem::system(body));
             return true;
         }
-        "/job" => {
+        "/task" | "/job" => {
             let Some(raw_id) = parts.next() else {
-                app.status = "usage: /job <job_id>".to_string();
+                app.status = format!("usage: {command} <id>");
                 return true;
             };
             let Some(id) = parse_job_id(raw_id) else {
-                app.status = "job id must be a number".to_string();
+                app.status = "task id must be a number".to_string();
                 return true;
             };
             sync_jobs_from_agent(app, agent);
@@ -1979,27 +1979,27 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 .or_else(|| agent.job_snapshot(id))
             {
                 Some(job) => {
-                    app.status = format!("job {} {}", job.id, job.status.as_str());
+                    app.status = format!("task {} {}", job.id, job.status.as_str());
                     app.push_transcript_item(TranscriptItem::system(format_job_detail(&job)));
                 }
-                None => app.status = format!("job {id} not found"),
+                None => app.status = format!("task {id} not found"),
             }
             return true;
         }
-        "/job-cancel" => {
+        "/task-cancel" | "/job-cancel" => {
             let Some(raw_id) = parts.next() else {
-                app.status = "usage: /job-cancel <job_id>".to_string();
+                app.status = format!("usage: {command} <id>");
                 return true;
             };
             let Some(id) = parse_job_id(raw_id) else {
-                app.status = "job id must be a number".to_string();
+                app.status = "task id must be a number".to_string();
                 return true;
             };
             if agent.cancel_job(id) {
-                app.status = format!("cancelling job {id}");
+                app.status = format!("cancelling task {id}");
                 sync_jobs_from_agent(app, agent);
             } else {
-                app.status = format!("job {id} not active");
+                app.status = format!("task {id} not active");
             }
             return true;
         }
@@ -2595,11 +2595,13 @@ fn parse_job_id(raw: &str) -> Option<JobId> {
     raw.parse().ok()
 }
 
-fn format_jobs_list(app: &TuiApp) -> String {
-    if app.jobs.is_empty() {
-        return "no jobs".to_string();
-    }
-    app.jobs
+/// Render the `/tasks` view: every background job followed by a `reviewer`
+/// line so the AI reviewer surfaces alongside ordinary jobs even though it
+/// does not yet have its own task type. Each line is "{id} {status} {kind}
+/// {title}"; reviewer uses `reviewer` for both id and kind.
+fn format_tasks_list(app: &TuiApp, agent: &Agent) -> String {
+    let mut lines: Vec<String> = app
+        .jobs
         .values()
         .rev()
         .take(MAX_JOB_NOTIFICATIONS)
@@ -2612,8 +2614,21 @@ fn format_jobs_list(app: &TuiApp) -> String {
                 sanitize_inline(&job.title)
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    lines.push(format_reviewer_task_line(agent));
+    lines.join("\n")
+}
+
+fn format_reviewer_task_line(agent: &Agent) -> String {
+    let entries = agent.reviewer_audit_snapshot();
+    if entries.is_empty() {
+        "reviewer idle ai-reviewer no decisions yet".to_string()
+    } else {
+        format!(
+            "reviewer ready ai-reviewer {} recent decision(s)",
+            entries.len()
+        )
+    }
 }
 
 fn format_job_detail(job: &JobSnapshot) -> String {

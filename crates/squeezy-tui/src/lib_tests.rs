@@ -5086,27 +5086,27 @@ async fn slash_jobs_lists_and_shows_jobs() {
     });
     app.jobs.insert(job.id, job.clone());
 
-    assert!(handle_slash_command(&mut app, &mut agent, "/jobs").await);
-    assert_eq!(app.status, "1 jobs");
+    assert!(handle_slash_command(&mut app, &mut agent, "/tasks").await);
+    assert_eq!(app.status, "1 tasks");
     assert!(
         last_message_content(&app).is_some_and(|content| content.contains("checkpoint_list")),
-        "expected jobs list to include checkpoint_list"
+        "expected tasks list to include checkpoint_list"
     );
 
-    assert!(handle_slash_command(&mut app, &mut agent, &format!("/job {}", job.id)).await);
-    assert!(app.status.starts_with(&format!("job {} ", job.id)));
+    assert!(handle_slash_command(&mut app, &mut agent, &format!("/task {}", job.id)).await);
+    assert!(app.status.starts_with(&format!("task {} ", job.id)));
     let detail = last_message_content(&app).unwrap_or_default().to_string();
     assert!(
         detail.contains("output_handle=-"),
-        "expected job detail to include output handle placeholder: {detail}"
+        "expected task detail to include output handle placeholder: {detail}"
     );
     assert!(
         detail.contains("tool=checkpoint_list"),
-        "expected job detail to include tool name: {detail}"
+        "expected task detail to include tool name: {detail}"
     );
     assert!(
         detail.contains("call_id=test-checkpoints"),
-        "expected job detail to include call_id: {detail}"
+        "expected task detail to include call_id: {detail}"
     );
 }
 
@@ -5121,10 +5121,10 @@ async fn slash_job_cancel_cancels_active_job() {
     });
     app.jobs.insert(job.id, job.clone());
 
-    assert!(handle_slash_command(&mut app, &mut agent, &format!("/job-cancel {}", job.id)).await);
+    assert!(handle_slash_command(&mut app, &mut agent, &format!("/task-cancel {}", job.id)).await);
     assert!(
-        app.status.starts_with("cancelling job ")
-            || app.status.starts_with(&format!("job {} ", job.id)),
+        app.status.starts_with("cancelling task ")
+            || app.status.starts_with(&format!("task {} ", job.id)),
         "expected cancel acknowledgement, got {}",
         app.status
     );
@@ -5134,9 +5134,9 @@ async fn slash_job_cancel_cancels_active_job() {
     let mut saw_inactive = false;
     for _ in 0..max_attempts {
         assert!(
-            handle_slash_command(&mut app, &mut agent, &format!("/job-cancel {}", job.id)).await
+            handle_slash_command(&mut app, &mut agent, &format!("/task-cancel {}", job.id)).await
         );
-        if app.status == format!("job {} not active", job.id) {
+        if app.status == format!("task {} not active", job.id) {
             saw_inactive = true;
             break;
         }
@@ -5144,7 +5144,7 @@ async fn slash_job_cancel_cancels_active_job() {
     }
     assert!(
         saw_inactive,
-        "job never reported as inactive: {}",
+        "task never reported as inactive: {}",
         app.status
     );
 }
@@ -5154,11 +5154,55 @@ async fn slash_job_cancel_rejects_non_numeric_id() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
 
-    assert!(handle_slash_command(&mut app, &mut agent, "/job-cancel abc").await);
-    assert_eq!(app.status, "job id must be a number");
+    assert!(handle_slash_command(&mut app, &mut agent, "/task-cancel abc").await);
+    assert_eq!(app.status, "task id must be a number");
 
-    assert!(handle_slash_command(&mut app, &mut agent, "/job-cancel").await);
-    assert_eq!(app.status, "usage: /job-cancel <job_id>");
+    assert!(handle_slash_command(&mut app, &mut agent, "/task-cancel").await);
+    assert_eq!(app.status, "usage: /task-cancel <id>");
+}
+
+// `/jobs`, `/job`, `/job-cancel` are kept as aliases for one release. The
+// canonical name is `/tasks` — see F07-cc-tasks-and-background-jobs.
+mod slash_commands {
+    pub(super) mod tasks {
+        use super::super::*;
+
+        #[tokio::test]
+        async fn lists_jobs_and_reviewer() {
+            let mut agent = test_agent(SessionMode::Build);
+            let mut app = test_app(SessionMode::Build);
+            // An in-flight (Queued / Running) job belongs to the listing.
+            let job = agent.start_local_tool_job(ToolCall {
+                call_id: "test-tasks".to_string(),
+                name: "checkpoint_list".to_string(),
+                arguments: serde_json::json!({}),
+            });
+            app.jobs.insert(job.id, job.clone());
+
+            assert!(handle_slash_command(&mut app, &mut agent, "/tasks").await);
+            let body = last_message_content(&app).unwrap_or_default().to_string();
+            assert!(
+                body.contains("checkpoint_list"),
+                "expected /tasks output to include the in-flight job: {body}"
+            );
+            assert!(
+                body.contains("reviewer"),
+                "expected /tasks output to include a reviewer line: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn jobs_alias_renders_same_surface() {
+            let mut agent = test_agent(SessionMode::Build);
+            let mut app = test_app(SessionMode::Build);
+            assert!(handle_slash_command(&mut app, &mut agent, "/jobs").await);
+            let body = last_message_content(&app).unwrap_or_default().to_string();
+            assert!(
+                body.contains("reviewer"),
+                "expected /jobs alias to render the /tasks surface: {body}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

@@ -2178,7 +2178,10 @@ impl Agent {
                     debug: format!("{:?}", snap),
                 }
             }
-            "jobs" => {
+            // `tasks` is the canonical name; `jobs` is kept as an alias for
+            // one release so eval traces with the old vocabulary still work.
+            // See F07-cc-tasks-and-background-jobs.
+            "tasks" | "jobs" => {
                 let jobs = self.jobs_snapshot();
                 CommandOutcome::JobsList { count: jobs.len() }
             }
