@@ -74,7 +74,7 @@ use cancel::{CancelErr, OrCancelExt};
 use context_compaction::{
     PendingToolResult, SeenToolOutputs, compact_conversation_with_strategy,
     drop_orphan_function_call_outputs, estimate_context, maybe_compact_conversation,
-    maybe_compact_mid_turn, next_context_pin_id, pack_tool_results,
+    maybe_compact_mid_turn, next_context_pin_id, pack_tool_results, repair_orphan_function_calls,
 };
 #[cfg(test)]
 use context_compaction::{build_compaction_summary, compact_conversation};
@@ -9067,20 +9067,25 @@ fn redact_reasoning_payload(payload: ReasoningPayload, redactor: &Redactor) -> R
 }
 
 /// Normalize a vector of `LlmInputItem`s so every entry satisfies the
-/// "already redacted" invariant and the conversation does not contain
-/// any orphan `FunctionCallOutput` whose declaring `FunctionCall` is
+/// "already redacted" invariant and the conversation has no orphan
+/// `FunctionCallOutput` whose declaring `FunctionCall` is missing AND
+/// no orphan `FunctionCall` whose answering `FunctionCallOutput` is
 /// missing. Used to upgrade conversation state loaded from a resume
 /// tape that may pre-date either invariant (insertion-time redaction
-/// or compaction's orphan-drop). The orphan check is a last-resort
-/// safety net: OpenAI 400s the whole turn with *"No tool call found
-/// for function call output with call_id …"* if an orphan reaches the
-/// provider, and the failure is sticky.
+/// or compaction's orphan-drop). The pairing checks are last-resort
+/// safety nets: OpenAI 400s the turn with *"No tool call found for
+/// function call output with call_id …"* on orphan outputs, and the
+/// Anthropic Messages API rejects the turn with *"tool_use blocks must
+/// be followed by a tool_result"* on orphan calls. Both failures are
+/// sticky — every retry hits the same wedged conversation until the
+/// user `/clear`s.
 fn redact_llm_input_items(input: Vec<LlmInputItem>, redactor: &Redactor) -> Vec<LlmInputItem> {
     let redacted: Vec<LlmInputItem> = input
         .into_iter()
         .map(|item| redact_input_item(item, redactor))
         .collect();
-    drop_orphan_function_call_outputs(redacted)
+    let without_orphan_outputs = drop_orphan_function_call_outputs(redacted);
+    repair_orphan_function_calls(without_orphan_outputs)
 }
 
 /// Scrub the user/UI-facing surfaces of a `PermissionRequest` so an approval

@@ -4327,6 +4327,96 @@ fn redact_llm_input_items_drops_orphan_function_call_outputs_defensively() {
     assert_eq!(prepared.len(), 3, "only the orphan should be removed");
 }
 
+#[test]
+fn tool_call_without_output_gets_synthetic_error_repair() {
+    // A cancel mid-tool-call or an executor panic can leave a bare
+    // `FunctionCall` in the conversation with no answering
+    // `FunctionCallOutput`. Anthropic's Messages API rejects the whole
+    // turn — *"tool_use blocks must be followed by a tool_result"* —
+    // and the failure is sticky until `/clear`. The redact pipeline
+    // must inject a synthetic error output so the orphan call is
+    // closed before the request reaches the provider.
+    let redactor = squeezy_core::Redactor::default();
+    let input = vec![
+        LlmInputItem::UserText("hi".to_string()),
+        LlmInputItem::FunctionCall {
+            call_id: "call_orphan".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({}),
+        },
+        LlmInputItem::UserText("continue".to_string()),
+    ];
+
+    let prepared = super::redact_llm_input_items(input, &redactor);
+
+    assert_eq!(prepared.len(), 4, "synthetic output should be inserted");
+    assert!(matches!(
+        &prepared[1],
+        LlmInputItem::FunctionCall { call_id, .. } if call_id == "call_orphan"
+    ));
+    match &prepared[2] {
+        LlmInputItem::FunctionCallOutput { call_id, output } => {
+            assert_eq!(call_id, "call_orphan");
+            assert!(
+                output.contains("interrupted"),
+                "synthetic output should advertise the repair: {output}"
+            );
+            assert!(output.contains("is_error"));
+        }
+        other => panic!("expected synthetic FunctionCallOutput, got {other:?}"),
+    }
+    assert!(matches!(
+        &prepared[3],
+        LlmInputItem::UserText(text) if text == "continue"
+    ));
+}
+
+#[test]
+fn mixed_orphan_call_and_orphan_output_both_repaired() {
+    // The two repair passes must compose: an orphan output (without a
+    // declaring call) is stripped while an orphan call (without an
+    // answering output) is closed with a synthetic error in the same
+    // pipeline run.
+    let redactor = squeezy_core::Redactor::default();
+    let input = vec![
+        LlmInputItem::UserText("hi".to_string()),
+        LlmInputItem::FunctionCall {
+            call_id: "call_orphan".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({}),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "output_orphan".to_string(),
+            output: "lingering output from a dropped call".to_string(),
+        },
+        LlmInputItem::UserText("continue".to_string()),
+    ];
+
+    let prepared = super::redact_llm_input_items(input, &redactor);
+
+    let call_ids: std::collections::BTreeSet<&str> = prepared
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let output_ids: std::collections::BTreeSet<&str> = prepared
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCallOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(call_ids, std::collections::BTreeSet::from(["call_orphan"]));
+    assert_eq!(
+        output_ids,
+        std::collections::BTreeSet::from(["call_orphan"]),
+        "orphan output should be stripped and orphan call answered"
+    );
+}
+
 #[tokio::test]
 async fn compact_with_strategy_uses_extractive_when_no_model_configured() {
     use squeezy_core::Redactor;

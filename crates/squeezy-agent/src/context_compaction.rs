@@ -282,6 +282,37 @@ pub(crate) fn drop_orphan_function_call_outputs(items: Vec<LlmInputItem>) -> Vec
         .collect()
 }
 
+/// Insert a synthetic `FunctionCallOutput` after any `FunctionCall`
+/// whose `call_id` is never answered by a later `FunctionCallOutput`.
+/// Mirrors `drop_orphan_function_call_outputs` in the opposite direction:
+/// a cancel mid-tool-call, an executor panic, or an externally-recorded
+/// resume tape can leave a bare `FunctionCall` in the conversation; the
+/// Anthropic Messages API then rejects the whole turn with
+/// *"tool_use blocks must be followed by a tool_result"* and the failure
+/// is sticky until `/clear`. Order is preserved.
+pub(crate) fn repair_orphan_function_calls(items: Vec<LlmInputItem>) -> Vec<LlmInputItem> {
+    let answered: BTreeSet<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCallOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut repaired = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        repaired.push(item.clone());
+        if let LlmInputItem::FunctionCall { call_id, .. } = item {
+            if !answered.contains(call_id.as_str()) {
+                repaired.push(LlmInputItem::FunctionCallOutput {
+                    call_id: call_id.clone(),
+                    output: "{\"error\":\"tool call interrupted\",\"is_error\":true}".to_string(),
+                });
+            }
+        }
+    }
+    repaired
+}
+
 pub(crate) fn estimate_context(conversation: &[LlmInputItem]) -> ContextEstimate {
     let bytes = conversation
         .iter()
