@@ -6953,7 +6953,7 @@ impl Drop for ScopedSettingsPath {
 fn mention_popup_opens_after_typing_at_word() {
     let mut app = test_app(SessionMode::Build);
     // Seed workspace files so the popup doesn't trigger a real crawl.
-    app.workspace_files = Some(Arc::new(vec![
+    app.workspace_file_cache = Some(mention::WorkspaceFileCache::from_paths_for_tests(vec![
         PathBuf::from("crates/squeezy-graph/src/lib.rs"),
         PathBuf::from("docs/readme.md"),
     ]));
@@ -6972,9 +6972,9 @@ fn mention_popup_opens_after_typing_at_word() {
 async fn mention_popup_inserts_path_on_enter() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    app.workspace_files = Some(Arc::new(vec![PathBuf::from(
-        "crates/squeezy-graph/src/lib.rs",
-    )]));
+    app.workspace_file_cache = Some(mention::WorkspaceFileCache::from_paths_for_tests(vec![
+        PathBuf::from("crates/squeezy-graph/src/lib.rs"),
+    ]));
 
     insert_input_text(&mut app, "@graph");
     assert!(app.mention_popup.is_some());
@@ -6995,9 +6995,9 @@ async fn mention_popup_inserts_path_on_enter() {
 async fn mention_popup_escapes_on_esc() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    app.workspace_files = Some(Arc::new(vec![PathBuf::from(
-        "crates/squeezy-graph/src/lib.rs",
-    )]));
+    app.workspace_file_cache = Some(mention::WorkspaceFileCache::from_paths_for_tests(vec![
+        PathBuf::from("crates/squeezy-graph/src/lib.rs"),
+    ]));
 
     insert_input_text(&mut app, "@graph");
     handle_key(

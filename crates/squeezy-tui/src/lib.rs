@@ -8667,7 +8667,7 @@ pub(crate) struct TuiApp {
     pub(crate) input_history_draft: String,
     pub(crate) slash_menu_index: usize,
     pub(crate) mention_popup: Option<mention::MentionPopup>,
-    pub(crate) workspace_files: Option<Arc<Vec<PathBuf>>>,
+    pub(crate) workspace_file_cache: Option<mention::WorkspaceFileCache>,
     pub(crate) overlay: Option<overlay::Overlay>,
     /// Full-screen transcript overlay (Ctrl+T) that renders every entry
     /// in its uncapped form. `None` = closed; `Some(state)` = open with
@@ -8914,7 +8914,7 @@ impl TuiApp {
             input_history_draft: String::new(),
             slash_menu_index: 0,
             mention_popup: None,
-            workspace_files: None,
+            workspace_file_cache: None,
             overlay: None,
             transcript_overlay: None,
             alternate_scroll_enabled: TerminalMode::from(config.tui.alternate_screen)

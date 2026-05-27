@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use squeezy_agent::RequestUserInputResponse;
@@ -375,15 +373,18 @@ pub(crate) fn refresh_mention_popup(app: &mut TuiApp) {
         app.mention_popup = None;
         return;
     };
-    if app.workspace_files.is_none() {
-        let root = std::path::Path::new(&app.directory).to_path_buf();
-        let files = mention::load_workspace_files(&root);
-        app.workspace_files = Some(Arc::new(files));
+    let root = std::path::Path::new(&app.directory);
+    let needs_build = app
+        .workspace_file_cache
+        .as_ref()
+        .is_none_or(|cache| cache.should_rebuild(root));
+    if needs_build {
+        app.workspace_file_cache = Some(mention::WorkspaceFileCache::build(root));
     }
     let matches = app
-        .workspace_files
+        .workspace_file_cache
         .as_ref()
-        .map(|files| mention::rank_files(&query.query, files))
+        .map(|cache| mention::rank_files(&query.query, cache.files()))
         .unwrap_or_default();
     if matches.is_empty() {
         app.mention_popup = None;

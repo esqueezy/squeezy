@@ -1,5 +1,35 @@
 use super::*;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+struct TempRoot {
+    path: PathBuf,
+}
+
+impl TempRoot {
+    fn new(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "squeezy_mention_cache_{tag}_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
 
 #[test]
 fn detects_mention_at_start_of_input() {
@@ -123,4 +153,58 @@ fn popup_navigation_clamps_at_bounds() {
     popup.move_down();
     popup.move_down();
     assert_eq!(popup.selected, 1, "should clamp");
+}
+
+#[test]
+fn workspace_cache_throttled_when_git_index_unchanged() {
+    let tmp = TempRoot::new("throttle");
+    fs::write(tmp.path().join("a.rs"), "fn a() {}").unwrap();
+    let cache = WorkspaceFileCache::build(tmp.path());
+    // Sample `now` < 5 s after build → cache reports fresh.
+    let now = cache.built_at_for_tests() + Duration::from_secs(1);
+    assert!(!cache.should_rebuild_at(tmp.path(), now));
+}
+
+#[test]
+fn workspace_cache_invalidates_after_refresh_floor() {
+    let tmp = TempRoot::new("floor");
+    fs::write(tmp.path().join("a.rs"), "fn a() {}").unwrap();
+    let cache = WorkspaceFileCache::build(tmp.path());
+    // Sample `now` past the 5 s floor → cache wants a rebuild even though
+    // nothing on disk changed, so newly added untracked files are seen.
+    let now = cache.built_at_for_tests() + WORKSPACE_REFRESH_THROTTLE;
+    assert!(cache.should_rebuild_at(tmp.path(), now));
+}
+
+#[test]
+fn workspace_cache_invalidates_on_git_index_change() {
+    let tmp = TempRoot::new("gitindex");
+    let git_dir = tmp.path().join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    let index_path = git_dir.join("index");
+    fs::write(&index_path, b"initial").unwrap();
+    let cache = WorkspaceFileCache::build(tmp.path());
+    // Sleep past filesystem mtime resolution before re-writing the index
+    // so the stat differs (HFS+ rounds to 1s; ext4/APFS finer).
+    std::thread::sleep(Duration::from_millis(1100));
+    fs::write(&index_path, b"after-checkout").unwrap();
+    // `now` stays inside the 5 s floor — the rebuild must come from the
+    // mtime change, not the floor.
+    let now = cache.built_at_for_tests() + Duration::from_millis(50);
+    assert!(cache.should_rebuild_at(tmp.path(), now));
+}
+
+#[test]
+fn workspace_cache_files_includes_walked_paths() {
+    let tmp = TempRoot::new("walk");
+    fs::write(tmp.path().join("alpha.rs"), "fn a() {}").unwrap();
+    fs::write(tmp.path().join("beta.rs"), "fn b() {}").unwrap();
+    let cache = WorkspaceFileCache::build(tmp.path());
+    let names: Vec<String> = cache
+        .files()
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().any(|n| n == "alpha.rs"), "got: {names:?}");
+    assert!(names.iter().any(|n| n == "beta.rs"), "got: {names:?}");
 }
