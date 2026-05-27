@@ -1,5 +1,7 @@
 use super::*;
 use crate::{SkillContextMode, SkillSource, SkillSummary};
+use crate::{SkillSource, SkillSummary};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 fn skill(name: &str, body: &str) -> LoadedSkill {
@@ -16,6 +18,7 @@ fn skill(name: &str, body: &str) -> LoadedSkill {
         },
         base_dir: PathBuf::from(format!(".squeezy/skills/{name}")),
         body: body.to_string(),
+        hooks: BTreeMap::new(),
     }
 }
 

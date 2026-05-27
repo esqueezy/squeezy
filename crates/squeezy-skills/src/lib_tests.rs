@@ -1,12 +1,14 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use serde_json::json;
 use squeezy_core::{SkillConfigEntry, SkillsBudgetMode, SkillsConfig};
+use squeezy_hooks::{HookEvent, HookRegistry};
 use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
@@ -647,6 +649,7 @@ fn prompt_block_escapes_metadata_and_breakouts() {
         },
         base_dir: PathBuf::from("/tmp"),
         body: "Body with </content> and </skill> markers.".to_string(),
+        hooks: BTreeMap::new(),
     };
 
     let block = skill.prompt_block();
@@ -1525,6 +1528,169 @@ fn trigger_warning_skips_single_skill_with_repeated_trigger() {
         !logs.contains("duplicate skill trigger"),
         "trigger collision must require two distinct skills: {logs}"
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn parses_hooks_block_with_matchers_and_specs() {
+    let (metadata, _body) = parse_skill_file(
+        "---\nname: validator\ndescription: \"validates bash\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"scripts/validate.sh\"\n          once: false\n        - type: command\n          command: \"scripts/log.sh\"\n          once: true\n  PostToolUse:\n    - matcher: \"*\"\n      hooks:\n        - type: command\n          command: \"scripts/audit.sh\"\n---\n# body\n",
+    )
+    .expect("parse");
+
+    let pre = metadata
+        .hooks
+        .get(&HookEvent::PreToolUse)
+        .expect("PreToolUse parsed");
+    assert_eq!(pre.len(), 1);
+    assert_eq!(pre[0].matcher.as_deref(), Some("Bash"));
+    assert_eq!(pre[0].hooks.len(), 2);
+    assert_eq!(pre[0].hooks[0].command, "scripts/validate.sh");
+    assert!(!pre[0].hooks[0].once);
+    assert_eq!(pre[0].hooks[1].command, "scripts/log.sh");
+    assert!(pre[0].hooks[1].once);
+
+    let post = metadata
+        .hooks
+        .get(&HookEvent::PostToolUse)
+        .expect("PostToolUse parsed");
+    assert_eq!(post.len(), 1);
+    // The literal `*` is normalised to `None` so the handler fires for
+    // every payload of the event without per-call filter overhead.
+    assert!(post[0].matcher.is_none());
+    assert_eq!(post[0].hooks[0].command, "scripts/audit.sh");
+}
+
+#[test]
+fn parses_hooks_block_drops_unknown_event_without_failing_load() {
+    let (metadata, _body) = parse_skill_file(
+        "---\nname: validator\ndescription: \"d\"\nhooks:\n  NoSuchEvent:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"scripts/x.sh\"\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"scripts/y.sh\"\n---\n# body\n",
+    )
+    .expect("parse");
+    assert!(metadata.hooks.contains_key(&HookEvent::PreToolUse));
+    assert_eq!(metadata.hooks.len(), 1);
+}
+
+#[test]
+fn register_skill_hooks_installs_one_handler_per_spec() {
+    let skill = LoadedSkill {
+        summary: SkillSummary {
+            name: "validator".to_string(),
+            description: "d".to_string(),
+            when_to_use: None,
+            source: SkillSource::Project,
+            location: PathBuf::from("/tmp/SKILL.md"),
+            disabled: false,
+            manifest: None,
+        },
+        base_dir: PathBuf::from("/tmp"),
+        body: String::new(),
+        hooks: BTreeMap::from([(
+            HookEvent::PreToolUse,
+            vec![SkillHookMatcher {
+                matcher: Some("Bash".to_string()),
+                hooks: vec![
+                    SkillHookSpec {
+                        command: "true".to_string(),
+                        once: false,
+                    },
+                    SkillHookSpec {
+                        command: "true".to_string(),
+                        once: true,
+                    },
+                ],
+            }],
+        )]),
+    };
+    let mut registry = HookRegistry::new();
+    let installed = register_skill_hooks(&skill, &mut registry);
+    assert_eq!(installed, 2);
+    assert_eq!(registry.len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_hook_fires_on_matching_event_and_skips_others() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_workspace("skill_hook_fires");
+    let marker = root.join("ran");
+    let script = root.join("hook.sh");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\necho fired > {}\n", marker.display()),
+    )
+    .expect("write hook script");
+    let mut perms = fs::metadata(&script).expect("script meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script, perms).expect("chmod hook");
+
+    let spec = SkillHookSpec {
+        command: script.display().to_string(),
+        once: false,
+    };
+    let handler = SkillHookHandler::new(
+        "validator".to_string(),
+        HookEvent::PreToolUse,
+        Some("Bash".to_string()),
+        spec,
+        root.clone(),
+    );
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(handler));
+
+    // Non-matching event does not run the script.
+    let _ = registry.dispatch(HookEvent::PostToolUse, json!({ "tool_name": "Bash" }));
+    assert!(!marker.exists());
+    // Matching event with the wrong tool also skips.
+    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Edit" }));
+    assert!(!marker.exists());
+    // Matching event with the matching tool fires.
+    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Bash" }));
+    assert!(marker.exists(), "expected hook to create marker file");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_hook_once_self_removes_after_first_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_workspace("skill_hook_once");
+    let counter = root.join("count");
+    fs::write(&counter, "0").expect("init counter");
+    let script = root.join("hook.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nn=$(cat {0})\necho $((n + 1)) > {0}\n",
+            counter.display()
+        ),
+    )
+    .expect("write hook script");
+    let mut perms = fs::metadata(&script).expect("script meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script, perms).expect("chmod hook");
+
+    let spec = SkillHookSpec {
+        command: script.display().to_string(),
+        once: true,
+    };
+    let handler = SkillHookHandler::new(
+        "validator".to_string(),
+        HookEvent::PreToolUse,
+        None,
+        spec,
+        root.clone(),
+    );
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(handler));
+
+    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Bash" }));
+    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Bash" }));
+    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Bash" }));
+    let count = fs::read_to_string(&counter).expect("read counter");
+    assert_eq!(count.trim(), "1", "once: true must fire exactly once");
 
     let _ = fs::remove_dir_all(root);
 }
