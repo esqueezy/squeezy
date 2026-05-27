@@ -202,6 +202,7 @@ fn state_store_check_opens_redb_in_tempdir() {
     assert!(check.detail.contains("opened"));
 }
 
+#[cfg(unix)]
 #[test]
 fn state_store_check_fails_when_path_unwritable() {
     // Pointing the cache at /dev/null forces SqueezyStore::open to fail.

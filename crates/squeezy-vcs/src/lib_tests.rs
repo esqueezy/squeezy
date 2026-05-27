@@ -703,6 +703,7 @@ fn shadow_repo_ignores_user_hooks() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
 #[test]
 fn shadow_repo_lock_is_created_on_open_and_removed_on_close() {
     let root = temp_repo("shadow_repo_lock_lifecycle");
@@ -755,6 +756,7 @@ fn shadow_repo_open_rejects_concurrent_process_lock() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
 #[test]
 fn shadow_repo_open_cleans_stale_orphan_dirs() {
     let root = temp_repo("shadow_repo_stale_cleanup");
