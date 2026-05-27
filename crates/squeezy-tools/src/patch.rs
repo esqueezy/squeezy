@@ -87,7 +87,7 @@ pub(crate) struct ApplyPatchArgs {
     #[serde(default)]
     pub(crate) patches: Vec<SearchReplacePatch>,
     #[serde(default)]
-    operations: Vec<ApplyPatchOperation>,
+    pub(crate) operations: Vec<ApplyPatchOperation>,
     impact_paths: Option<Vec<String>>,
     plan_id: Option<String>,
     dry_run: Option<bool>,
@@ -99,8 +99,8 @@ pub(crate) struct ApplyPatchArgs {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SearchReplacePatch {
     pub(crate) path: String,
-    search: String,
-    replace: String,
+    pub(crate) search: String,
+    pub(crate) replace: String,
     expected_sha256: Option<String>,
     allow_multiple: Option<bool>,
     #[serde(default)]

@@ -48,6 +48,7 @@ mod file_ops;
 mod graph_tools;
 mod ipc;
 mod patch;
+pub mod preview;
 mod safety;
 mod schema;
 mod shell;
@@ -1679,6 +1680,17 @@ impl ToolRegistry {
             metadata,
             suggested_rules,
         }
+    }
+
+    /// Per-tool preview lines for the approval dialog. See
+    /// [`preview::CatalogPreview`] for the dispatch table.
+    pub fn preview_for(
+        &self,
+        call: &ToolCall,
+        request: &PermissionRequest,
+    ) -> Vec<preview::PreviewLine> {
+        use preview::PermissionPreview;
+        preview::CatalogPreview.preview_lines(request, call, self.root.as_ref())
     }
 
     pub fn is_parallel_safe(&self, call: &ToolCall) -> bool {

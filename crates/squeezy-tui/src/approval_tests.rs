@@ -45,6 +45,7 @@ fn request_with(
         matched_rule: None,
         reason: "test".to_string(),
         context: None,
+        preview: Vec::new(),
     }
 }
 

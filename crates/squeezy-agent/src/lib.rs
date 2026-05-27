@@ -8006,6 +8006,7 @@ async fn permission_decision_for_request(
             let approval_context =
                 approval_context_from_state(context.conversation_state.as_ref(), &context.redactor)
                     .await;
+            let preview = context.tools.preview_for(call, &request);
             let approval_request = ToolApprovalRequest {
                 id: context.approval_ids.fetch_add(1, Ordering::Relaxed),
                 call_id: call.call_id.clone(),
@@ -8015,6 +8016,7 @@ async fn permission_decision_for_request(
                 matched_rule: verdict.matched_rule,
                 reason: context.redactor.redact(&verdict.reason).text,
                 context: approval_context,
+                preview,
             };
             log_session_event(
                 context.session_log.as_ref(),
@@ -9811,6 +9813,12 @@ pub struct ToolApprovalRequest {
     /// being run. `None` when no assistant message is available (e.g.
     /// the very first turn or subagent contexts without a transcript).
     pub context: Option<String>,
+    /// Per-tool structured preview lines (diff, syntax-highlighted command,
+    /// host vs URL, etc.) produced by `ToolRegistry::preview_for`. The TUI
+    /// renders each variant with its own style (Diff -> red/green,
+    /// Highlighted -> palette, Warning -> orange). Empty when no preview
+    /// is available for the tool.
+    pub preview: Vec<squeezy_tools::preview::PreviewLine>,
 }
 
 impl ToolApprovalRequest {
