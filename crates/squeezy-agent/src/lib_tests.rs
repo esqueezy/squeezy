@@ -3781,6 +3781,180 @@ async fn pre_turn_compaction_dispatches_pre_and_post_compact_hooks() {
     );
 }
 
+/// Stub `PreToolUse` handler that denies every call for a target tool
+/// name and lets other tools through. Used by
+/// `pretooluse_hook_denies_tool_call` to verify deny enforcement
+/// without needing a per-test config file.
+struct DenyToolByName {
+    tool_name: &'static str,
+    reason: &'static str,
+}
+
+impl squeezy_hooks::HookHandler for DenyToolByName {
+    fn handle(&self, ctx: &squeezy_hooks::HookContext) -> squeezy_hooks::HookResult {
+        if ctx.event != squeezy_hooks::HookEvent::PreToolUse {
+            return squeezy_hooks::HookResult::allow();
+        }
+        let payload_name = ctx
+            .payload
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if payload_name == self.tool_name {
+            squeezy_hooks::HookResult::deny(self.reason)
+        } else {
+            squeezy_hooks::HookResult::allow()
+        }
+    }
+}
+
+#[tokio::test]
+async fn pretooluse_hook_denies_tool_call() {
+    use squeezy_hooks::HookRegistry;
+
+    let root = temp_workspace("pretooluse_hook_denies_tool_call");
+    fs::write(root.join("README.md"), "hello\n").expect("write readme");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "README.md"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            read: PermissionMode::Allow,
+            ..Default::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut agent = Agent::new(config, provider);
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(DenyToolByName {
+        tool_name: "read_file",
+        reason: "blocked by org policy",
+    }));
+    agent.set_hooks(Some(Arc::new(registry)));
+
+    let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
+    let mut approvals_seen = 0usize;
+    let mut read_result = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ApprovalRequested { decision_tx, .. } => {
+                approvals_seen += 1;
+                let _ = decision_tx.send(ToolApprovalDecision::Denied);
+            }
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "read_1" => {
+                read_result = Some(result);
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        approvals_seen, 0,
+        "PreToolUse deny must short-circuit before the permission engine asks the user",
+    );
+    let read_result = read_result.expect("ToolCallCompleted with read_1 must arrive");
+    assert_eq!(read_result.status, ToolStatus::Denied);
+    let reason = read_result.content["reason"]
+        .as_str()
+        .expect("denied result carries a reason string");
+    assert_eq!(reason, "blocked by org policy");
+    assert_eq!(
+        read_result.content["permission_denied"],
+        json!(true),
+        "denied result must mark permission_denied for downstream consumers",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn pretooluse_hook_allow_lets_tool_run() {
+    use squeezy_hooks::HookRegistry;
+
+    let root = temp_workspace("pretooluse_hook_allow_lets_tool_run");
+    fs::write(root.join("README.md"), "hello\n").expect("write readme");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "README.md"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            read: PermissionMode::Allow,
+            ..Default::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut agent = Agent::new(config, provider);
+    // Handler denies a *different* tool, so the read_file call must run
+    // to completion. This guards against the change short-circuiting
+    // unrelated tool calls.
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(DenyToolByName {
+        tool_name: "shell",
+        reason: "shell blocked",
+    }));
+    agent.set_hooks(Some(Arc::new(registry)));
+
+    let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
+    let mut read_result = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ToolCallCompleted { result, .. } = event
+            && result.call_id == "read_1"
+        {
+            read_result = Some(result);
+        }
+    }
+
+    let read_result = read_result.expect("ToolCallCompleted with read_1 must arrive");
+    assert_eq!(
+        read_result.status,
+        ToolStatus::Success,
+        "deny aimed at another tool must not block read_file: {:?}",
+        read_result.content,
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn compaction_strategy_default_is_extractive() {
     assert_eq!(

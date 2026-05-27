@@ -7567,18 +7567,18 @@ async fn flush_parallel_batch(
 }
 
 /// Fan out a `HookEvent::PreToolUse` to every registered handler when
-/// a hook registry is installed. Mutation and deny replies are logged
-/// but not yet applied — mirrors the observational contract of
-/// [`TurnRuntime::dispatch_pre_turn`] so a follow-up commit can wire
-/// enforcement without changing the call site. Returns immediately
-/// when no registry is configured so the no-hooks path costs zero
+/// a hook registry is installed. Returns the first handler-supplied
+/// deny message (in registration order) so the caller can short-circuit
+/// the tool execution with `ToolStatus::Denied`. Mutation replies are
+/// still observational — applying them is left to a follow-up commit
+/// that wires the per-tool input pipeline. Returns `None` when no
+/// registry is configured, when the registry is empty, or when every
+/// handler returned `allow=true`, so the no-hooks path costs zero
 /// allocations.
-fn dispatch_pre_tool_use(context: &ToolExecutionContext<'_>, call: &ToolCall) {
-    let Some(registry) = context.hooks.as_ref() else {
-        return;
-    };
+fn dispatch_pre_tool_use(context: &ToolExecutionContext<'_>, call: &ToolCall) -> Option<String> {
+    let registry = context.hooks.as_ref()?;
     if registry.is_empty() {
-        return;
+        return None;
     }
     let payload = json!({
         "turn_id": context.turn_id.to_string(),
@@ -7586,6 +7586,7 @@ fn dispatch_pre_tool_use(context: &ToolExecutionContext<'_>, call: &ToolCall) {
         "call_id": call.call_id,
     });
     let results = registry.dispatch(HookEvent::PreToolUse, payload);
+    let mut deny_message: Option<String> = None;
     for (idx, result) in results.iter().enumerate() {
         if let Some(mutate) = result.mutate.as_ref() {
             tracing::debug!(
@@ -7598,18 +7599,24 @@ fn dispatch_pre_tool_use(context: &ToolExecutionContext<'_>, call: &ToolCall) {
                 "PreToolUse handler proposed a mutation (not yet applied)"
             );
         }
-        if !result.allow {
-            tracing::debug!(
+        if !result.allow && deny_message.is_none() {
+            let reason = result
+                .message
+                .clone()
+                .unwrap_or_else(|| "tool call denied by PreToolUse hook".to_string());
+            tracing::info!(
                 target: "squeezy::hooks",
                 turn_id = %context.turn_id,
                 tool_name = %call.name,
                 call_id = %call.call_id,
                 handler_index = idx,
-                message = result.message.as_deref().unwrap_or(""),
-                "PreToolUse handler returned allow=false (not yet enforced)"
+                message = %reason,
+                "PreToolUse handler denied tool call"
             );
+            deny_message = Some(reason);
         }
     }
+    deny_message
 }
 
 /// Fan out a `HookEvent::PostToolUse` to every registered handler after
@@ -7744,38 +7751,57 @@ async fn run_one_tool(
     let progress_call_id = call_for_telemetry.call_id.clone();
     let progress_tool_name = call_for_telemetry.name.clone();
     // Fire the PreToolUse hook once per executed tool call, immediately
-    // before the tool registry takes ownership of the call. Mutation /
-    // deny replies are currently observational — see
-    // `dispatch_pre_tool_use` for the contract that will tighten when
-    // enforcement lands.
-    dispatch_pre_tool_use(&context, &call_for_telemetry);
-    let exec_future = context.tools.execute_for_group_with_options(
-        call,
-        tracked_job
-            .as_ref()
-            .map(|(_, cancel)| cancel.clone())
-            .unwrap_or_else(|| context.cancel.clone()),
-        context.turn_id.to_string(),
-        ToolExecutionOptions { shell_ask_approver },
-    );
-    tokio::pin!(exec_future);
-    let mut progress_ticker = tokio::time::interval(TOOL_PROGRESS_INTERVAL);
-    // `interval` fires immediately on first poll; skip that tick so the
-    // heartbeat only fires once the tool has actually been running.
-    progress_ticker.tick().await;
-    let result = loop {
-        tokio::select! {
-            r = &mut exec_future => break r,
-            _ = progress_ticker.tick() => {
-                let _ = context
-                    .tx
-                    .send(AgentEvent::ToolProgress {
-                        turn_id: context.turn_id,
-                        call_id: progress_call_id.clone(),
-                        tool_name: progress_tool_name.clone(),
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                    })
-                    .await;
+    // before the tool registry takes ownership of the call. A handler
+    // returning `allow=false` short-circuits the execution with
+    // `ToolStatus::Denied`; the handler-supplied message becomes the
+    // denial reason surfaced to the model. Mutation replies remain
+    // observational for now.
+    let result = if let Some(reason) = dispatch_pre_tool_use(&context, &call_for_telemetry) {
+        log_session_event(
+            context.session_log.as_ref(),
+            &context.redactor,
+            "pretooluse_hook_denied",
+            Some(context.turn_id),
+            Some(format!(
+                "PreToolUse hook denied {} ({})",
+                call_for_telemetry.name, reason
+            )),
+            json!({
+                "tool_name": call_for_telemetry.name,
+                "call_id": call_for_telemetry.call_id,
+                "reason": reason,
+            }),
+        );
+        ToolResult::denied(&call_for_telemetry, reason)
+    } else {
+        let exec_future = context.tools.execute_for_group_with_options(
+            call,
+            tracked_job
+                .as_ref()
+                .map(|(_, cancel)| cancel.clone())
+                .unwrap_or_else(|| context.cancel.clone()),
+            context.turn_id.to_string(),
+            ToolExecutionOptions { shell_ask_approver },
+        );
+        tokio::pin!(exec_future);
+        let mut progress_ticker = tokio::time::interval(TOOL_PROGRESS_INTERVAL);
+        // `interval` fires immediately on first poll; skip that tick so the
+        // heartbeat only fires once the tool has actually been running.
+        progress_ticker.tick().await;
+        loop {
+            tokio::select! {
+                r = &mut exec_future => break r,
+                _ = progress_ticker.tick() => {
+                    let _ = context
+                        .tx
+                        .send(AgentEvent::ToolProgress {
+                            turn_id: context.turn_id,
+                            call_id: progress_call_id.clone(),
+                            tool_name: progress_tool_name.clone(),
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                        })
+                        .await;
+                }
             }
         }
     };
