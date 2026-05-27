@@ -646,11 +646,16 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
             none()
         }
         "message_stop" => {
-            if state.stop_reason.as_deref() == Some("max_tokens") {
-                return Err(SqueezyError::ProviderStream(
-                    "Anthropic response stopped after max_tokens".to_string(),
-                ));
-            }
+            // Surface `stop_reason` to the agent instead of converting
+            // `max_tokens` into a transport error here. The agent's turn
+            // loop branches on the normalized `StopReason` so all providers
+            // share one recovery path (max-tokens truncation, refusal,
+            // empty end_turn, etc.) rather than each provider failing in
+            // its own dialect.
+            let stop_reason = state
+                .stop_reason
+                .as_deref()
+                .map(crate::StopReason::from_anthropic);
             let mut events = Vec::new();
             if !state.finished_thinking.is_empty() && !state.emitted_reasoning_done {
                 let blocks = std::mem::take(&mut state.finished_thinking);
@@ -662,6 +667,7 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
             events.push(LlmEvent::Completed {
                 response_id: state.response_id.clone(),
                 cost: state.cost(),
+                stop_reason,
             });
             Ok(events)
         }

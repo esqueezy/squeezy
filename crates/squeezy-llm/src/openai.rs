@@ -351,25 +351,46 @@ fn parse_openai_event(
             }
         }
         "response.completed" => {
-            let response_id = value
-                .get("response")
+            let response = value.get("response");
+            let response_id = response
                 .and_then(|response| response.get("id"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            Ok(Some(LlmEvent::Completed {
-                response_id,
-                cost: parse_cost(value.get("response")),
-            }))
-        }
-        "response.incomplete" => {
-            let message = value
-                .get("response")
+            // Successful completions don't carry `incomplete_details`;
+            // treat their absence as `EndTurn` so the agent's turn loop
+            // sees a normalized stop reason on every provider event.
+            let stop_reason = response
                 .and_then(|response| response.get("incomplete_details"))
                 .and_then(|details| details.get("reason"))
                 .and_then(Value::as_str)
-                .map(|reason| format!("OpenAI response incomplete: {reason}"))
-                .unwrap_or_else(|| "OpenAI response incomplete".to_string());
-            Err(SqueezyError::ProviderStream(message))
+                .map(crate::StopReason::from_openai_incomplete)
+                .or(Some(crate::StopReason::EndTurn));
+            Ok(Some(LlmEvent::Completed {
+                response_id,
+                cost: parse_cost(response),
+                stop_reason,
+            }))
+        }
+        "response.incomplete" => {
+            // Surface incompletion to the agent instead of erroring here
+            // so max-output-tokens / content-filter cases reach the same
+            // recovery path as the other providers.
+            let response = value.get("response");
+            let response_id = response
+                .and_then(|response| response.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let stop_reason = response
+                .and_then(|response| response.get("incomplete_details"))
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str)
+                .map(crate::StopReason::from_openai_incomplete)
+                .or(Some(crate::StopReason::Other("incomplete".to_string())));
+            Ok(Some(LlmEvent::Completed {
+                response_id,
+                cost: parse_cost(response),
+                stop_reason,
+            }))
         }
         "error" | "response.failed" => {
             let message = value

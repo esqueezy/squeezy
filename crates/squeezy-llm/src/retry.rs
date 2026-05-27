@@ -262,9 +262,15 @@ impl SkipCursor {
                     Some(LlmEvent::ToolCall(call))
                 }
             }
-            LlmEvent::Completed { response_id, cost } => {
-                Some(LlmEvent::Completed { response_id, cost })
-            }
+            LlmEvent::Completed {
+                response_id,
+                cost,
+                stop_reason,
+            } => Some(LlmEvent::Completed {
+                response_id,
+                cost,
+                stop_reason,
+            }),
             LlmEvent::Cancelled => Some(LlmEvent::Cancelled),
         }
     }

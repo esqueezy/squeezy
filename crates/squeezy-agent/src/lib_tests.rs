@@ -20,6 +20,7 @@ use squeezy_core::{
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
+    StopReason,
 };
 use squeezy_tools::{ToolCall, ToolStatus, sha256_hex};
 use tracing_subscriber::fmt::MakeWriter;
@@ -269,6 +270,7 @@ async fn turn_stream_accumulates_assistant_text() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider);
@@ -348,6 +350,7 @@ async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -355,6 +358,7 @@ async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -504,6 +508,7 @@ async fn invalid_tool_arguments_are_returned_to_model_instead_of_failing_turn() 
             Ok(LlmEvent::Completed {
                 response_id: None,
                 cost: Default::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -512,6 +517,7 @@ async fn invalid_tool_arguments_are_returned_to_model_instead_of_failing_turn() 
             Ok(LlmEvent::Completed {
                 response_id: None,
                 cost: Default::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -564,6 +570,7 @@ async fn session_replay_replays_recorded_model_response() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_replay".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(config.clone(), provider);
@@ -614,6 +621,7 @@ async fn user_input_is_redacted_before_model_request_and_transcript() {
     let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
         response_id: Some("resp_1".to_string()),
         cost: CostSnapshot::default(),
+        stop_reason: None,
     })]]));
     let agent = Agent::new(AppConfig::default(), provider.clone());
 
@@ -645,6 +653,7 @@ async fn pasted_context_is_redacted_deduped_and_sent_as_reference() {
     let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
         response_id: Some("resp_1".to_string()),
         cost: CostSnapshot::default(),
+        stop_reason: None,
     })]]));
     let config = AppConfig {
         workspace_root: root.clone(),
@@ -730,6 +739,7 @@ async fn assistant_text_is_redacted_in_streamed_deltas_and_completed_message() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider);
@@ -778,6 +788,7 @@ async fn approval_summary_is_redacted_for_secret_bearing_shell_command() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let config = AppConfig {
@@ -941,6 +952,7 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
                     cache_write_input_tokens: None,
                     estimated_usd_micros: None,
                 },
+                stop_reason: None,
             }),
         ],
         vec![
@@ -956,6 +968,7 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
                     cache_write_input_tokens: None,
                     estimated_usd_micros: None,
                 },
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1009,11 +1022,13 @@ async fn shell_tool_emits_job_events_and_session_events() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![Ok(LlmEvent::Completed {
             response_id: Some("resp_2".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         })],
     ]));
     let config = AppConfig {
@@ -1090,6 +1105,7 @@ async fn asks_for_edit_permission_before_write_tool() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let config = AppConfig {
@@ -1139,6 +1155,7 @@ async fn session_approval_installs_in_memory_rule_without_persisting() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1147,6 +1164,7 @@ async fn session_approval_installs_in_memory_rule_without_persisting() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1201,6 +1219,7 @@ async fn ai_reviewer_allows_allowlisted_read_without_user_prompt() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1211,6 +1230,7 @@ async fn ai_reviewer_allows_allowlisted_read_without_user_prompt() {
             Ok(LlmEvent::Completed {
                 response_id: Some("reviewer".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1219,6 +1239,7 @@ async fn ai_reviewer_allows_allowlisted_read_without_user_prompt() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1280,6 +1301,7 @@ async fn ai_reviewer_denies_without_user_prompt() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1290,6 +1312,7 @@ async fn ai_reviewer_denies_without_user_prompt() {
             Ok(LlmEvent::Completed {
                 response_id: Some("reviewer".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1298,6 +1321,7 @@ async fn ai_reviewer_denies_without_user_prompt() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1356,6 +1380,7 @@ async fn ai_reviewer_allow_for_non_allowlisted_edit_escalates_to_user() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1366,6 +1391,7 @@ async fn ai_reviewer_allow_for_non_allowlisted_edit_escalates_to_user() {
             Ok(LlmEvent::Completed {
                 response_id: Some("reviewer".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1374,6 +1400,7 @@ async fn ai_reviewer_allow_for_non_allowlisted_edit_escalates_to_user() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1418,6 +1445,7 @@ async fn cancelling_turn_unblocks_pending_approval() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let config = AppConfig {
@@ -1488,6 +1516,7 @@ async fn tool_loop_can_edit_file_with_write_tool() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1496,6 +1525,7 @@ async fn tool_loop_can_edit_file_with_write_tool() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1540,6 +1570,7 @@ async fn inactive_skills_are_not_eagerly_added_to_instructions() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
@@ -1592,6 +1623,7 @@ async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider.clone());
@@ -1663,6 +1695,7 @@ async fn doc_help_subagent_gets_its_own_output_budget_not_summary_cap() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_doc_help_budget".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     // Construct a config where `max_summary_tokens` is deliberately tiny so
@@ -1750,6 +1783,7 @@ async fn natural_language_run_ls_phrase_goes_to_provider() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(
@@ -1907,6 +1941,7 @@ async fn unrelated_questions_still_call_provider() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider.clone());
@@ -1934,6 +1969,7 @@ async fn explicit_skill_activation_injects_body_and_rewrites_task() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
@@ -1969,6 +2005,7 @@ async fn trigger_skill_activation_injects_body() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
@@ -2008,6 +2045,7 @@ async fn shell_implicit_skill_activation_reaches_next_model_request() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2016,6 +2054,7 @@ async fn shell_implicit_skill_activation_reaches_next_model_request() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -2072,6 +2111,7 @@ async fn shell_approval_event_surfaces_new_sandbox_metadata() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_meta".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let config = AppConfig {
@@ -2143,11 +2183,13 @@ async fn network_shell_command_is_denied_by_network_permission_policy() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![Ok(LlmEvent::Completed {
             response_id: Some("resp_2".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         })],
     ]));
     let config = AppConfig {
@@ -2839,6 +2881,7 @@ async fn allow_project_rule_takes_effect_within_the_same_session_and_writes_sque
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2847,6 +2890,7 @@ async fn allow_project_rule_takes_effect_within_the_same_session_and_writes_sque
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -3465,6 +3509,7 @@ async fn mid_turn_compaction_fires_when_provider_reports_high_usage() {
                     cache_write_input_tokens: None,
                     estimated_usd_micros: None,
                 },
+                stop_reason: None,
             }),
         ],
         // Turn-loop round 2: assistant finalizes with plain text after the
@@ -3475,6 +3520,7 @@ async fn mid_turn_compaction_fires_when_provider_reports_high_usage() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -3655,6 +3701,7 @@ async fn pre_turn_compaction_dispatches_pre_and_post_compact_hooks() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -3663,6 +3710,7 @@ async fn pre_turn_compaction_dispatches_pre_and_post_compact_hooks() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -3881,6 +3929,7 @@ impl LlmProvider for SubagentTimeoutProvider {
                     Ok(LlmEvent::Completed {
                         response_id: Some("resp_parent_1".to_string()),
                         cost: CostSnapshot::default(),
+                        stop_reason: None,
                     }),
                 ];
                 let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
@@ -3907,6 +3956,7 @@ impl LlmProvider for SubagentTimeoutProvider {
                             estimated_usd_micros: Some(1_234),
                             ..CostSnapshot::default()
                         },
+                        stop_reason: None,
                     }),
                 ];
                 let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
@@ -4020,6 +4070,7 @@ impl LlmProvider for OneDelegateProvider {
                 Ok(LlmEvent::Completed {
                     response_id: Some("parent_tools".to_string()),
                     cost: CostSnapshot::default(),
+                    stop_reason: None,
                 }),
             ],
             _ => vec![
@@ -4028,6 +4079,7 @@ impl LlmProvider for OneDelegateProvider {
                 Ok(LlmEvent::Completed {
                     response_id: Some("parent_final".to_string()),
                     cost: CostSnapshot::default(),
+                    stop_reason: None,
                 }),
             ],
         };
@@ -4624,6 +4676,7 @@ async fn plan_subagent_parses_json_tail_into_structured_output() {
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         // Plan subagent: return text followed by a JSON tail.
@@ -4638,6 +4691,7 @@ async fn plan_subagent_parses_json_tail_into_structured_output() {
             Ok(LlmEvent::Completed {
                 response_id: Some("plan_subagent_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         // Parent turn 2: wrap up.
@@ -4647,6 +4701,7 @@ async fn plan_subagent_parses_json_tail_into_structured_output() {
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -4698,6 +4753,7 @@ async fn plan_subagent_falls_back_to_summary_when_json_missing() {
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         // Plan subagent: emits plain prose with no JSON tail.
@@ -4709,6 +4765,7 @@ async fn plan_subagent_falls_back_to_summary_when_json_missing() {
             Ok(LlmEvent::Completed {
                 response_id: Some("plan_subagent_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -4717,6 +4774,7 @@ async fn plan_subagent_falls_back_to_summary_when_json_missing() {
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -4832,6 +4890,7 @@ async fn drained_swap_makes_next_request_carry_new_model_id() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_swap".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let mut agent = Agent::new(AppConfig::default(), provider.clone());
@@ -4882,6 +4941,7 @@ async fn plan_mode_request_user_input_pauses_turn_and_resumes_with_choice() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -4890,6 +4950,7 @@ async fn plan_mode_request_user_input_pauses_turn_and_resumes_with_choice() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -4944,6 +5005,7 @@ async fn build_mode_refuses_request_user_input_call() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -4952,6 +5014,7 @@ async fn build_mode_refuses_request_user_input_call() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -5000,6 +5063,7 @@ async fn plan_mode_instructions_are_appended_to_request() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_plan".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let config = AppConfig {
@@ -5029,6 +5093,7 @@ async fn build_mode_instructions_omit_plan_overlay() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_build".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let config = AppConfig {
@@ -5362,4 +5427,97 @@ fn effective_tool_choice_passes_through_other_values_unchanged() {
         );
         assert_eq!(effective_tool_choice(None, round), None);
     }
+}
+
+#[tokio::test]
+async fn max_tokens_stop_reason_emits_failed_with_recovery_hint() {
+    // Provider stream completes cleanly but signals truncation via
+    // `StopReason::MaxTokens`. Before this change Anthropic raised an
+    // opaque `ProviderStream("Anthropic response stopped after
+    // max_tokens")` here; now the agent surfaces an `AgentEvent::Failed`
+    // with a descriptive error so the TUI can suggest /compact or
+    // raising `max_output_tokens`.
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("partial".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_trunc".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: Some(StopReason::MaxTokens),
+        }),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider);
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut failed_error: Option<String> = None;
+    let mut saw_success = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Failed { error, .. } => failed_error = Some(error.to_string()),
+            AgentEvent::Completed { .. } => saw_success = true,
+            _ => {}
+        }
+    }
+    let err = failed_error.expect("AgentEvent::Failed must fire for MaxTokens");
+    assert!(
+        err.contains("max_tokens"),
+        "error message should mention max_tokens, got: {err}"
+    );
+    assert!(
+        !saw_success,
+        "MaxTokens must not produce a successful Completed event"
+    );
+}
+
+#[tokio::test]
+async fn refusal_stop_reason_emits_failed_with_safety_hint() {
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_refusal".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: Some(StopReason::Refusal),
+        }),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider);
+    let mut rx = agent.start_turn("forbidden".to_string(), CancellationToken::new());
+    let mut failed_error: Option<String> = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Failed { error, .. } = event {
+            failed_error = Some(error.to_string());
+        }
+    }
+    let err = failed_error.expect("AgentEvent::Failed must fire for Refusal");
+    assert!(
+        err.contains("refused"),
+        "error message should mention refusal, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn end_turn_stop_reason_completes_successfully() {
+    // Regression guard for the audit's `end_turn_with_empty_content_is_success`
+    // case: a clean `EndTurn` with text content must still take the
+    // success path even now that explicit branches exist on stop_reason.
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("done".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_ok".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: Some(StopReason::EndTurn),
+        }),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider);
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut saw_success = false;
+    let mut saw_failure = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Completed { .. } => saw_success = true,
+            AgentEvent::Failed { .. } => saw_failure = true,
+            _ => {}
+        }
+    }
+    assert!(saw_success, "EndTurn must produce a successful Completed");
+    assert!(!saw_failure, "EndTurn must not produce a Failed event");
 }

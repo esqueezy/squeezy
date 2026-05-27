@@ -430,7 +430,10 @@ fn parse_chat_event_handles_done_sentinel() {
     };
     let events = parse_chat_event("[DONE]", &mut state).expect("done");
     assert_eq!(events.len(), 1);
-    let LlmEvent::Completed { response_id, cost } = &events[0] else {
+    let LlmEvent::Completed {
+        response_id, cost, ..
+    } = &events[0]
+    else {
         panic!("expected completed event");
     };
     assert_eq!(response_id.as_deref(), Some("resp_2"));

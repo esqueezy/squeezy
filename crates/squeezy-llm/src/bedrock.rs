@@ -166,6 +166,7 @@ impl LlmProvider for BedrockProvider {
             yield LlmEvent::Completed {
                 response_id: None,
                 cost: state.cost(),
+                stop_reason: state.stop_reason.clone(),
             };
         })
     }
@@ -193,6 +194,7 @@ struct BedrockStreamState {
     reasoning_blocks: HashMap<i32, AnthropicThinkingBlock>,
     finished_reasoning: Vec<AnthropicThinkingBlock>,
     saw_message_stop: bool,
+    stop_reason: Option<crate::StopReason>,
 }
 
 impl BedrockStreamState {
@@ -316,8 +318,9 @@ fn handle_bedrock_event(
                 arguments,
             })])
         }
-        ConverseStreamOutput::MessageStop(_) => {
+        ConverseStreamOutput::MessageStop(stop) => {
             state.saw_message_stop = true;
+            state.stop_reason = Some(crate::StopReason::from_bedrock(stop.stop_reason().as_str()));
             Ok(Vec::new())
         }
         ConverseStreamOutput::Metadata(meta) => {

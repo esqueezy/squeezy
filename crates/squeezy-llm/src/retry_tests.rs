@@ -88,6 +88,7 @@ fn full_event_sequence() -> Vec<LlmEvent> {
         LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         },
     ]
 }

@@ -313,6 +313,11 @@ fn parse_ollama_line(line: &str) -> Result<Vec<LlmEvent>> {
         }
     }
     if value.get("done").and_then(Value::as_bool) == Some(true) {
+        let stop_reason = value
+            .get("done_reason")
+            .and_then(Value::as_str)
+            .map(crate::StopReason::from_ollama)
+            .or(Some(crate::StopReason::EndTurn));
         events.push(LlmEvent::Completed {
             response_id: None,
             cost: CostSnapshot {
@@ -323,6 +328,7 @@ fn parse_ollama_line(line: &str) -> Result<Vec<LlmEvent>> {
                 cache_write_input_tokens: None,
                 estimated_usd_micros: Some(0),
             },
+            stop_reason,
         });
     }
     Ok(events)

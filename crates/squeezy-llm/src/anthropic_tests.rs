@@ -531,6 +531,7 @@ fn parser_extracts_completed_response_id_and_usage() {
                 cache_write_input_tokens: None,
                 estimated_usd_micros: None,
             },
+            stop_reason: Some(crate::StopReason::EndTurn),
         }]
     );
 }
@@ -578,6 +579,7 @@ fn parser_populates_both_cache_counters_from_usage() {
                 cache_write_input_tokens: Some(29),
                 estimated_usd_micros: None,
             },
+            stop_reason: Some(crate::StopReason::EndTurn),
         }]
     );
 }
@@ -603,10 +605,58 @@ fn parser_surfaces_max_tokens_stop() {
     )
     .expect("delta");
 
-    let err = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state)
-        .expect_err("max_tokens is a stream error");
+    let events = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect(
+        "message_stop is no longer an early stream error; stop_reason is surfaced to the agent",
+    );
 
-    assert!(err.to_string().contains("max_tokens"));
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            LlmEvent::Completed { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
+        })
+        .expect("Completed event emitted");
+    assert_eq!(completed, Some(crate::StopReason::MaxTokens));
+}
+
+#[test]
+fn parser_normalizes_end_turn_stop_reason() {
+    let mut state = AnthropicStreamState::default();
+    parse_anthropic_event(
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        &mut state,
+    )
+    .expect("delta");
+    let events =
+        parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop event");
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            LlmEvent::Completed { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
+        })
+        .expect("Completed event emitted");
+    assert_eq!(completed, Some(crate::StopReason::EndTurn));
+}
+
+#[test]
+fn parser_normalizes_refusal_stop_reason() {
+    let mut state = AnthropicStreamState::default();
+    parse_anthropic_event(
+        r#"{"type":"message_delta","delta":{"stop_reason":"refusal"}}"#,
+        &mut state,
+    )
+    .expect("delta");
+    let events =
+        parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop event");
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            LlmEvent::Completed { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
+        })
+        .expect("Completed event emitted");
+    assert_eq!(completed, Some(crate::StopReason::Refusal));
 }
 
 #[test]

@@ -109,10 +109,15 @@ fn parser_collects_text_deltas_into_completed() {
     let events = parse_chat_event("[DONE]", &mut state).expect("done");
     assert_eq!(events.len(), 1);
     match &events[0] {
-        LlmEvent::Completed { response_id, cost } => {
+        LlmEvent::Completed {
+            response_id,
+            cost,
+            stop_reason,
+        } => {
             assert_eq!(response_id.as_deref(), Some("chatcmpl-1"));
             assert_eq!(cost.input_tokens, Some(4));
             assert_eq!(cost.output_tokens, Some(2));
+            assert_eq!(stop_reason.as_ref(), Some(&crate::StopReason::EndTurn));
         }
         other => panic!("expected Completed, got {other:?}"),
     }

@@ -107,6 +107,10 @@ fn parser_extracts_text_tool_calls_and_usage() {
                 cache_write_input_tokens: None,
                 estimated_usd_micros: Some(0),
             },
+            // Ollama omits `done_reason` on natural completions; the
+            // provider falls back to `EndTurn` so the agent loop sees a
+            // populated stop reason on every Ollama turn.
+            stop_reason: Some(crate::StopReason::EndTurn),
         }
     );
 }

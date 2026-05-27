@@ -357,9 +357,11 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 );
             }
             if !state.completed_emitted {
+                let stop_reason = state.finish_reason.as_deref().map(chat_stop_reason);
                 yield LlmEvent::Completed {
                     response_id: state.response_id.take(),
                     cost: state.cost.clone(),
+                    stop_reason,
                 };
             }
         })
@@ -455,6 +457,10 @@ struct StreamState {
     cost: CostSnapshot,
     tool_calls: BTreeMap<usize, PartialToolCall>,
     completed_emitted: bool,
+    /// Captured OpenAI chat-completions `finish_reason` from the last
+    /// streamed choice, so the agent's turn loop sees a normalized
+    /// stop reason for compatibility providers too.
+    finish_reason: Option<String>,
     /// Accumulates `reasoning_content` / `reasoning` text streamed across
     /// chat-completions deltas. Drained into a `ReasoningDone` event when
     /// the stream finishes so the agent loop persists the segment to the
@@ -554,6 +560,19 @@ impl StreamState {
 /// a generic carrier — the chat-completions replay path drops
 /// `LlmInputItem::Reasoning` items entirely, so the variant choice only
 /// affects display, never the wire format on the next turn.
+/// Map OpenAI Chat-Completions `finish_reason` strings to the normalized
+/// [`crate::StopReason`]. Shared by the Responses-style streaming path and
+/// the legacy chat-completions path in this provider.
+fn chat_stop_reason(value: &str) -> crate::StopReason {
+    match value {
+        "stop" => crate::StopReason::EndTurn,
+        "tool_calls" | "function_call" => crate::StopReason::ToolUse,
+        "length" => crate::StopReason::MaxTokens,
+        "content_filter" => crate::StopReason::Refusal,
+        other => crate::StopReason::Other(other.to_string()),
+    }
+}
+
 fn drain_reasoning(state: &mut StreamState) -> Option<LlmEvent> {
     let text = std::mem::take(&mut state.reasoning_buf);
     if text.trim().is_empty() {
@@ -604,9 +623,11 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
             events.push(reasoning_done);
         }
         if !state.completed_emitted {
+            let stop_reason = state.finish_reason.as_deref().map(chat_stop_reason);
             events.push(LlmEvent::Completed {
                 response_id: state.response_id.take(),
                 cost: state.cost.clone(),
+                stop_reason,
             });
             state.completed_emitted = true;
         }
@@ -662,6 +683,7 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                 }
             }
             if let Some(finish_reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                state.finish_reason = Some(finish_reason.to_string());
                 match finish_reason {
                     "tool_calls" | "function_call" => {
                         events.extend(state.drain_tool_calls()?);

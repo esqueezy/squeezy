@@ -30,8 +30,8 @@ use squeezy_hooks::{HookEvent, HookRegistry};
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
-    ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate, capabilities_for, estimate_cost,
-    estimate_request_context_calibrated, fetch_ollama_context_window,
+    ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate, StopReason, capabilities_for,
+    estimate_cost, estimate_request_context_calibrated, fetch_ollama_context_window,
 };
 use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
@@ -279,7 +279,14 @@ impl ReplayRuntime {
                         event.payload.get("cost").cloned().unwrap_or(Value::Null),
                     )
                     .unwrap_or_default();
-                    events.push(LlmEvent::Completed { response_id, cost });
+                    // Replay logs predate the stop_reason surface; mark
+                    // replayed completions as `None` so consumers can tell
+                    // a synthesized completion from a fresh provider one.
+                    events.push(LlmEvent::Completed {
+                        response_id,
+                        cost,
+                        stop_reason: None,
+                    });
                     return Ok(events);
                 }
                 SessionReplayEventKind::ModelCancelled => {
@@ -4211,6 +4218,7 @@ impl TurnRuntime {
             let mut completed = false;
             let mut response_id = None;
             let mut completed_cost = CostSnapshot::default();
+            let mut stop_reason: Option<StopReason> = None;
 
             while let Some(event) =
                 next_llm_stream_event(&mut stream, &self.cancel, self.config.stream_idle_timeout)
@@ -4328,6 +4336,7 @@ impl TurnRuntime {
                     LlmEvent::Completed {
                         response_id: id,
                         mut cost,
+                        stop_reason: completion_stop_reason,
                     } => {
                         if cost.estimated_usd_micros.is_none() {
                             cost.estimated_usd_micros =
@@ -4351,6 +4360,7 @@ impl TurnRuntime {
                         merge_cost(&mut total_cost, &cost);
                         completed_cost = cost;
                         response_id = id;
+                        stop_reason = completion_stop_reason;
                         completed = true;
                         break;
                     }
@@ -4419,6 +4429,96 @@ impl TurnRuntime {
                     .await;
                 self.finish_turn(&broker.metrics).await;
                 return Ok(());
+            }
+
+            // Explicit `stop_reason` branches. Truncation (max-tokens,
+            // context-window-exceeded) and refusal previously surfaced
+            // either as a provider transport error (Anthropic raised
+            // `ProviderStream("max_tokens")` directly) or as a silent
+            // empty assistant message; either way the user lost the
+            // distinction. Route each through `AgentEvent::Failed` with a
+            // descriptive error so the TUI can render a recovery hint
+            // and future compaction-retry logic can hook in here without
+            // touching every provider. `EndTurn` and `ToolUse` fall
+            // through to the existing tool-calls / completion logic.
+            match &stop_reason {
+                Some(StopReason::MaxTokens) => {
+                    if let Some(tail) = self
+                        .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                        .await
+                    {
+                        self.record_replay_model_text_delta(&tail);
+                    }
+                    self.publish_terminal_task_state(
+                        TaskStateStatus::Failed,
+                        Some("response truncated by max_tokens".to_string()),
+                        &task_title,
+                    )
+                    .await;
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::Failed {
+                            turn_id: self.turn_id,
+                            error: SqueezyError::Agent(
+                                "model response stopped after max_tokens before completing; lower reasoning_effort, raise the provider's max_output_tokens, or run /compact and retry".to_string(),
+                            ),
+                        })
+                        .await;
+                    self.finish_turn(&broker.metrics).await;
+                    return Ok(());
+                }
+                Some(StopReason::ContextWindowExceeded) => {
+                    if let Some(tail) = self
+                        .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                        .await
+                    {
+                        self.record_replay_model_text_delta(&tail);
+                    }
+                    self.publish_terminal_task_state(
+                        TaskStateStatus::Failed,
+                        Some("context window exceeded".to_string()),
+                        &task_title,
+                    )
+                    .await;
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::Failed {
+                            turn_id: self.turn_id,
+                            error: SqueezyError::Agent(
+                                "model reported the context window was exceeded; run /compact and retry".to_string(),
+                            ),
+                        })
+                        .await;
+                    self.finish_turn(&broker.metrics).await;
+                    return Ok(());
+                }
+                Some(StopReason::Refusal) => {
+                    if let Some(tail) = self
+                        .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                        .await
+                    {
+                        self.record_replay_model_text_delta(&tail);
+                    }
+                    self.publish_terminal_task_state(
+                        TaskStateStatus::Failed,
+                        Some("model refused the request".to_string()),
+                        &task_title,
+                    )
+                    .await;
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::Failed {
+                            turn_id: self.turn_id,
+                            error: SqueezyError::Agent(
+                                "model refused to produce a response (provider safety filter)"
+                                    .to_string(),
+                            ),
+                        })
+                        .await;
+                    self.finish_turn(&broker.metrics).await;
+                    return Ok(());
+                }
+                _ => {}
             }
 
             if tool_calls.is_empty() {

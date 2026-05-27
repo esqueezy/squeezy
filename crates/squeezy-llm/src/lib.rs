@@ -157,6 +157,87 @@ pub struct LlmToolCall {
     pub arguments: Value,
 }
 
+/// Normalized completion cause. Each provider maps its native `stop_reason`
+/// (Anthropic), `finish_reason`/`incomplete_details.reason` (OpenAI),
+/// `finishReason` (Google), Bedrock `stopReason`, or Ollama `done_reason`
+/// into one of these variants so the agent can branch on a single shape.
+///
+/// `EndTurn` is the model voluntarily releasing the turn; `ToolUse` means
+/// the model wants to invoke tools; `MaxTokens` and `ContextWindowExceeded`
+/// are truncation signals the agent surfaces explicitly so the user (and
+/// future compaction-retry logic) can act on them instead of seeing a bare
+/// provider error; `StopSequence` and `Refusal` carry the remaining
+/// semantically distinct cases; `Other` keeps provider-specific strings
+/// reachable without forcing the registry to enumerate every value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum StopReason {
+    EndTurn,
+    ToolUse,
+    MaxTokens,
+    ContextWindowExceeded,
+    StopSequence,
+    Refusal,
+    Other(String),
+}
+
+impl StopReason {
+    /// Parse Anthropic Messages API `stop_reason` strings.
+    pub fn from_anthropic(value: &str) -> Self {
+        match value {
+            "end_turn" => Self::EndTurn,
+            "tool_use" => Self::ToolUse,
+            "max_tokens" => Self::MaxTokens,
+            "model_context_window_exceeded" => Self::ContextWindowExceeded,
+            "stop_sequence" => Self::StopSequence,
+            "refusal" => Self::Refusal,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// Parse OpenAI Responses API `incomplete_details.reason` strings.
+    pub fn from_openai_incomplete(value: &str) -> Self {
+        match value {
+            "max_output_tokens" => Self::MaxTokens,
+            "content_filter" => Self::Refusal,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// Parse Google `candidates[0].finishReason` strings.
+    pub fn from_google(value: &str) -> Self {
+        match value {
+            "STOP" => Self::EndTurn,
+            "MAX_TOKENS" => Self::MaxTokens,
+            "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY"
+            | "LANGUAGE" | "RECITATION" => Self::Refusal,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// Parse Bedrock Converse `stopReason` strings.
+    pub fn from_bedrock(value: &str) -> Self {
+        match value {
+            "end_turn" => Self::EndTurn,
+            "tool_use" => Self::ToolUse,
+            "max_tokens" => Self::MaxTokens,
+            "model_context_window_exceeded" => Self::ContextWindowExceeded,
+            "stop_sequence" => Self::StopSequence,
+            "guardrail_intervened" | "content_filtered" => Self::Refusal,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// Parse Ollama `done_reason` strings.
+    pub fn from_ollama(value: &str) -> Self {
+        match value {
+            "stop" => Self::EndTurn,
+            "length" => Self::MaxTokens,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LlmEvent {
@@ -171,6 +252,11 @@ pub enum LlmEvent {
     Completed {
         response_id: Option<String>,
         cost: CostSnapshot,
+        /// Normalized completion cause. `None` when the provider stream
+        /// closed without emitting one (e.g. transport truncation handled
+        /// elsewhere). Producers that have a native value MUST populate
+        /// this; the agent uses it to drive explicit recovery branches.
+        stop_reason: Option<StopReason>,
     },
     Cancelled,
 }

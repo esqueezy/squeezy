@@ -84,6 +84,7 @@ async fn parallel_read_and_search_outputs_return_to_model_by_call_id() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -92,6 +93,7 @@ async fn parallel_read_and_search_outputs_return_to_model_by_call_id() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -122,6 +124,7 @@ async fn plan_mode_advertises_only_read_only_tools() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_final".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let mut config = config_for(root.clone());
@@ -175,6 +178,7 @@ async fn exploration_compiler_prefetches_graph_context_before_model_request() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_final".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(config_for(root.clone()), provider.clone());
@@ -216,6 +220,7 @@ async fn cited_final_answer_is_preserved() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_final".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(config_for(root.clone()), provider);
@@ -245,6 +250,7 @@ async fn build_mode_advertises_core_tool_set_and_compact_index() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_final".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(config_for(root.clone()), provider.clone());
@@ -291,6 +297,7 @@ async fn discoverable_tool_schema_load_appends_full_schema_for_later_rounds() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_load".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -299,6 +306,7 @@ async fn discoverable_tool_schema_load_appends_full_schema_for_later_rounds() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -377,6 +385,7 @@ async fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs()
                     output_tokens: Some(10),
                     ..CostSnapshot::default()
                 },
+                stop_reason: None,
             }),
         ],
         vec![
@@ -393,6 +402,7 @@ async fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs()
                     output_tokens: Some(3),
                     ..CostSnapshot::default()
                 },
+                stop_reason: None,
             }),
         ],
         vec![
@@ -407,6 +417,7 @@ async fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs()
                     output_tokens: Some(5),
                     ..CostSnapshot::default()
                 },
+                stop_reason: None,
             }),
         ],
         vec![
@@ -415,6 +426,7 @@ async fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs()
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -494,6 +506,7 @@ async fn disabled_explore_subagent_returns_structured_failure_without_child_requ
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -502,6 +515,7 @@ async fn disabled_explore_subagent_returns_structured_failure_without_child_requ
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -549,6 +563,7 @@ async fn delegate_subagent_uses_parent_model_for_natural_research() {
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -561,6 +576,7 @@ async fn delegate_subagent_uses_parent_model_for_natural_research() {
                     output_tokens: Some(6),
                     ..CostSnapshot::default()
                 },
+                stop_reason: None,
             }),
         ],
         vec![
@@ -569,6 +585,7 @@ async fn delegate_subagent_uses_parent_model_for_natural_research() {
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -611,6 +628,7 @@ async fn mixed_subagent_kinds_track_cost_per_kind() {
             Ok(LlmEvent::Completed {
                 response_id: Some("turn1_parent_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         // Explore subagent final assistant message.
@@ -624,6 +642,7 @@ async fn mixed_subagent_kinds_track_cost_per_kind() {
                     output_tokens: Some(5),
                     ..CostSnapshot::default()
                 },
+                stop_reason: None,
             }),
         ],
         // Turn 1 parent final.
@@ -633,6 +652,7 @@ async fn mixed_subagent_kinds_track_cost_per_kind() {
             Ok(LlmEvent::Completed {
                 response_id: Some("turn1_parent_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         // Turn 2 parent: dispatch delegate subagent.
@@ -649,6 +669,7 @@ async fn mixed_subagent_kinds_track_cost_per_kind() {
             Ok(LlmEvent::Completed {
                 response_id: Some("turn2_parent_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         // Delegate subagent final assistant message.
@@ -662,6 +683,7 @@ async fn mixed_subagent_kinds_track_cost_per_kind() {
                     output_tokens: Some(60),
                     ..CostSnapshot::default()
                 },
+                stop_reason: None,
             }),
         ],
         // Turn 2 parent final.
@@ -671,6 +693,7 @@ async fn mixed_subagent_kinds_track_cost_per_kind() {
             Ok(LlmEvent::Completed {
                 response_id: Some("turn2_parent_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -733,6 +756,7 @@ async fn explore_subagent_with_many_parallel_tool_calls_does_not_deadlock() {
     sub_round.push(Ok(LlmEvent::Completed {
         response_id: Some("sub_tools".to_string()),
         cost: CostSnapshot::default(),
+        stop_reason: None,
     }));
     let provider = Arc::new(ScriptedProvider::new(vec![
         vec![
@@ -745,6 +769,7 @@ async fn explore_subagent_with_many_parallel_tool_calls_does_not_deadlock() {
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         sub_round,
@@ -754,6 +779,7 @@ async fn explore_subagent_with_many_parallel_tool_calls_does_not_deadlock() {
             Ok(LlmEvent::Completed {
                 response_id: Some("sub_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -762,6 +788,7 @@ async fn explore_subagent_with_many_parallel_tool_calls_does_not_deadlock() {
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -796,6 +823,7 @@ async fn loaded_tool_schemas_persist_across_turns() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_load".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -804,6 +832,7 @@ async fn loaded_tool_schemas_persist_across_turns() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_done1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -812,6 +841,7 @@ async fn loaded_tool_schemas_persist_across_turns() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_done2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -853,6 +883,7 @@ async fn lazy_schema_loading_disabled_sends_full_schema_set_without_tools_index(
         Ok(LlmEvent::Completed {
             response_id: Some("resp_final".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let mut config = config_for(root.clone());
@@ -907,6 +938,7 @@ async fn plan_mode_refuses_disallowed_discoverable_schema_loads() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_load".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -915,6 +947,7 @@ async fn plan_mode_refuses_disallowed_discoverable_schema_loads() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -962,6 +995,7 @@ async fn parallel_read_batch_denies_remaining_calls_after_byte_budget() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -970,6 +1004,7 @@ async fn parallel_read_batch_denies_remaining_calls_after_byte_budget() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1024,6 +1059,7 @@ async fn glob_and_count_search_outputs_return_to_model() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1032,6 +1068,7 @@ async fn glob_and_count_search_outputs_return_to_model() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1066,6 +1103,7 @@ async fn denied_write_is_reported_to_model_and_does_not_touch_disk() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1074,6 +1112,7 @@ async fn denied_write_is_reported_to_model_and_does_not_touch_disk() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1113,6 +1152,7 @@ async fn plan_mode_write_is_denied_without_approval_prompt() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1121,6 +1161,7 @@ async fn plan_mode_write_is_denied_without_approval_prompt() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1198,6 +1239,7 @@ async fn plan_mode_denies_hidden_shell_verify_and_webfetch_without_approval() {
                 Ok(LlmEvent::Completed {
                     response_id: Some("resp_tools".to_string()),
                     cost: CostSnapshot::default(),
+                    stop_reason: None,
                 }),
             ],
             vec![
@@ -1206,6 +1248,7 @@ async fn plan_mode_denies_hidden_shell_verify_and_webfetch_without_approval() {
                 Ok(LlmEvent::Completed {
                     response_id: Some("resp_final".to_string()),
                     cost: CostSnapshot::default(),
+                    stop_reason: None,
                 }),
             ],
         ]));
@@ -1271,6 +1314,7 @@ async fn approved_write_edits_real_workspace_file() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1279,6 +1323,7 @@ async fn approved_write_edits_real_workspace_file() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1311,6 +1356,7 @@ async fn large_read_result_returns_spill_handle_to_model() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1319,6 +1365,7 @@ async fn large_read_result_returns_spill_handle_to_model() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1354,6 +1401,7 @@ async fn repeated_read_result_returns_receipt_stub_to_model() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_first".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1366,6 +1414,7 @@ async fn repeated_read_result_returns_receipt_stub_to_model() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_second".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1374,6 +1423,7 @@ async fn repeated_read_result_returns_receipt_stub_to_model() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1413,6 +1463,7 @@ async fn successful_read_result_persists_model_visible_snapshot() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1421,6 +1472,7 @@ async fn successful_read_result_persists_model_visible_snapshot() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1460,6 +1512,7 @@ async fn repeated_read_result_returns_receipt_stub_across_sessions() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_first_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1468,6 +1521,7 @@ async fn repeated_read_result_returns_receipt_stub_across_sessions() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_first_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1486,6 +1540,7 @@ async fn repeated_read_result_returns_receipt_stub_across_sessions() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_second_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1494,6 +1549,7 @@ async fn repeated_read_result_returns_receipt_stub_across_sessions() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_second_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1538,6 +1594,7 @@ async fn agent_shares_state_store_with_tool_registry_for_graph_persistence() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_only".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(config_for(root.clone()), provider);
@@ -1576,6 +1633,7 @@ async fn repeated_read_result_in_same_round_returns_receipt_stub_to_model() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1584,6 +1642,7 @@ async fn repeated_read_result_in_same_round_returns_receipt_stub_to_model() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1627,6 +1686,7 @@ async fn repeated_spilled_read_result_returns_receipt_stub_to_model() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1635,6 +1695,7 @@ async fn repeated_spilled_read_result_returns_receipt_stub_to_model() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1684,6 +1745,7 @@ async fn changed_read_result_is_not_receipt_stubbed() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_first".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1700,6 +1762,7 @@ async fn changed_read_result_is_not_receipt_stubbed() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_write".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1712,6 +1775,7 @@ async fn changed_read_result_is_not_receipt_stubbed() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_second".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1720,6 +1784,7 @@ async fn changed_read_result_is_not_receipt_stubbed() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1762,6 +1827,7 @@ async fn aggregate_tool_result_budget_compacts_later_outputs() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1770,6 +1836,7 @@ async fn aggregate_tool_result_budget_compacts_later_outputs() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1816,6 +1883,7 @@ async fn aggregate_budget_omission_is_not_remembered_as_seen_output() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1828,6 +1896,7 @@ async fn aggregate_budget_omission_is_not_remembered_as_seen_output() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_retry".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1836,6 +1905,7 @@ async fn aggregate_budget_omission_is_not_remembered_as_seen_output() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1883,6 +1953,7 @@ async fn denied_webfetch_is_reported_and_does_not_open_network_connection() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1891,6 +1962,7 @@ async fn denied_webfetch_is_reported_and_does_not_open_network_connection() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1937,6 +2009,7 @@ async fn disabled_web_permission_returns_denied_tool_result() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1945,6 +2018,7 @@ async fn disabled_web_permission_returns_denied_tool_result() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1977,6 +2051,7 @@ async fn blocked_web_domain_rule_returns_denied_tool_result() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1985,6 +2060,7 @@ async fn blocked_web_domain_rule_returns_denied_tool_result() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -2026,6 +2102,7 @@ async fn approved_webfetch_validation_error_returns_to_model_and_web_tools_are_i
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2034,6 +2111,7 @@ async fn approved_webfetch_validation_error_returns_to_model_and_web_tools_are_i
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -2079,6 +2157,7 @@ async fn resumed_session_restores_prior_conversation() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_first".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let first_agent = Agent::new(config_for(root.clone()), first_provider);
@@ -2091,6 +2170,7 @@ async fn resumed_session_restores_prior_conversation() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_second".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let (second_agent, transcript) = Agent::resume(
@@ -2131,6 +2211,7 @@ async fn resumed_session_preserves_cumulative_cost_and_metrics() {
                 output_tokens: Some(50),
                 ..CostSnapshot::default()
             },
+            stop_reason: None,
         }),
     ]]));
     let first_agent = Agent::new(config_for(root.clone()), first_provider);
@@ -2155,6 +2236,7 @@ async fn resumed_session_preserves_cumulative_cost_and_metrics() {
                 output_tokens: Some(20),
                 ..CostSnapshot::default()
             },
+            stop_reason: None,
         }),
     ]]));
     let (second_agent, _) = Agent::resume(
@@ -2219,6 +2301,7 @@ async fn automatic_context_compaction_replaces_old_raw_history() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_first".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2227,6 +2310,7 @@ async fn automatic_context_compaction_replaces_old_raw_history() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_second".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -2289,6 +2373,7 @@ async fn store_responses_accounting_marks_provider_stored_context_gap() {
                     output_tokens: Some(25),
                     ..CostSnapshot::default()
                 },
+                stop_reason: None,
             }),
         ]],
     ));
@@ -2334,6 +2419,7 @@ async fn manual_context_compaction_preserves_pins_in_resume_state() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_first".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let mut config = config_for(root.clone());
@@ -2391,6 +2477,7 @@ async fn auto_compaction_does_not_orphan_function_call_output() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tool".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2402,6 +2489,7 @@ async fn auto_compaction_does_not_orphan_function_call_output() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_first".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2410,6 +2498,7 @@ async fn auto_compaction_does_not_orphan_function_call_output() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_second".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -2466,6 +2555,7 @@ async fn pinned_context_is_visible_to_model_before_compaction() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_first".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2474,6 +2564,7 @@ async fn pinned_context_is_visible_to_model_before_compaction() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_second".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -2566,6 +2657,7 @@ async fn pre_and_post_tool_use_hooks_fire_around_each_tool_call() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2574,6 +2666,7 @@ async fn pre_and_post_tool_use_hooks_fire_around_each_tool_call() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -2628,6 +2721,7 @@ async fn session_cost_cap_blocks_further_calls_once_exceeded() {
                     estimated_usd_micros: Some(60),
                     ..CostSnapshot::default()
                 },
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2639,6 +2733,7 @@ async fn session_cost_cap_blocks_further_calls_once_exceeded() {
                     estimated_usd_micros: Some(60),
                     ..CostSnapshot::default()
                 },
+                stop_reason: None,
             }),
         ],
     ]));
@@ -2695,6 +2790,7 @@ async fn session_cost_warning_fires_once_at_threshold() {
                     estimated_usd_micros: Some(60),
                     ..CostSnapshot::default()
                 },
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2706,6 +2802,7 @@ async fn session_cost_warning_fires_once_at_threshold() {
                     estimated_usd_micros: Some(30),
                     ..CostSnapshot::default()
                 },
+                stop_reason: None,
             }),
         ],
     ]));
@@ -2762,6 +2859,7 @@ async fn cancelled_turn_persists_partial_cost_and_metrics() {
                     estimated_usd_micros: Some(415_300),
                     ..CostSnapshot::default()
                 },
+                stop_reason: None,
             }),
         ],
         vec![Ok(LlmEvent::Started), Ok(LlmEvent::Cancelled)],

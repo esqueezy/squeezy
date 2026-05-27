@@ -1821,7 +1821,9 @@ async fn run_prompt(
                     tool_call.name
                 );
             }
-            LlmEvent::Completed { response_id, cost } => {
+            LlmEvent::Completed {
+                response_id, cost, ..
+            } => {
                 writeln!(stdout)?;
                 stdout.flush()?;
                 let redacted_assistant = redactor.redact(&assistant);

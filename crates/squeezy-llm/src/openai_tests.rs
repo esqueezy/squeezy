@@ -329,6 +329,11 @@ fn parser_extracts_completed_response_id_and_usage() {
                 cache_write_input_tokens: None,
                 estimated_usd_micros: None,
             },
+            // `response.completed` without `incomplete_details` is a
+            // successful end-of-turn signal in the Responses API; the
+            // provider normalizes this to `EndTurn` so the agent's loop
+            // sees a uniform stop reason across providers.
+            stop_reason: Some(crate::StopReason::EndTurn),
         })
     );
 }
