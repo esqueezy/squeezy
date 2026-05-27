@@ -6044,6 +6044,13 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
     if !matches!(kind, SubagentKind::Explore) && thoroughness.is_some() {
         return Err(format!("{} does not accept thoroughness", kind.as_str()));
     }
+    // Tool-shy models (Qwen3, smaller MoEs) sometimes emit a delegate /
+    // explore / doc_help call with no `prompt` field at all on simple
+    // conversational turns. The old error message was a raw serde-style
+    // line — `"missing required string field: prompt"` — which is
+    // grammatically backwards and hard for the model to act on.
+    // Returning the missing field, the kind, and an actionable hint
+    // gives the next round's retry a concrete recipe.
     let prompt = match kind {
         SubagentKind::Plan => call
             .arguments
@@ -6051,7 +6058,12 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| "missing required string field: goal".to_string())?
+            .ok_or_else(|| {
+                "plan subagent requires a non-empty `goal` string argument. \
+                 Set `goal` to a one-sentence description of what to plan, \
+                 or answer the user directly without calling plan."
+                    .to_string()
+            })?
             .to_string(),
         SubagentKind::Review => call
             .arguments
@@ -6069,7 +6081,14 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| "missing required string field: prompt".to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "{kind} subagent requires a non-empty `prompt` string argument. \
+                     Set `prompt` to a concrete instruction for the subagent, \
+                     or answer the user directly without calling {kind}.",
+                    kind = kind.as_str()
+                )
+            })?
             .to_string(),
     };
     Ok(SubagentRequest {
@@ -9120,14 +9139,19 @@ fn delegate_advertised_tool() -> AdvertisedTool {
         capability: PermissionCapability::Read,
         spec: Arc::new(LlmToolSpec {
             name: DELEGATE_TOOL_NAME.to_string(),
-            description: "Delegate broad research to an isolated subagent. The parent receives only a structured summary, supporting receipts, and separate spend metrics.".to_string(),
+            description: "Delegate broad research to an isolated subagent. \
+                          Use only when the user explicitly asks for non-trivial research, code mapping, or refactoring help — \
+                          NOT for greetings, casual replies, or simple questions the parent can answer directly. \
+                          The `prompt` field is required; calling without a concrete instruction will be rejected. \
+                          The parent receives only a structured summary, supporting receipts, and separate spend metrics."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Natural language research task for the subagent."
+                        "description": "Required: a concrete natural-language research instruction for the subagent. Must be present and non-empty."
                     },
                     "scope": {
                         "type": ["string", "null"],
@@ -9249,14 +9273,18 @@ fn explore_advertised_tool() -> AdvertisedTool {
         capability: PermissionCapability::Read,
         spec: Arc::new(LlmToolSpec {
             name: EXPLORE_TOOL_NAME.to_string(),
-            description: "Ask a cheaper read-only exploration subagent to scan the codebase with Squeezy semantic tools and return a compact briefing before planning or executing.".to_string(),
+            description: "Ask a cheaper read-only exploration subagent to scan the codebase with Squeezy semantic tools. \
+                          Use only when the user asks a non-trivial codebase question — \
+                          NOT for greetings, chitchat, or questions the parent can answer directly from context. \
+                          The `prompt` field is required and must contain a concrete codebase question."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Codebase question or task context to investigate."
+                        "description": "Required: a concrete codebase question or task context to investigate. Must be present and non-empty."
                     },
                     "scope": {
                         "type": ["string", "null"],
