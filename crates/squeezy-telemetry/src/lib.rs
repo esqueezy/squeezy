@@ -962,6 +962,8 @@ pub enum ProviderKind {
     Together,
     Fireworks,
     Cerebras,
+    DeepInfra,
+    Baseten,
     OpenAiCompatible,
 }
 
@@ -987,6 +989,8 @@ impl ProviderKind {
                 OpenAiCompatiblePreset::Together => Self::Together,
                 OpenAiCompatiblePreset::Fireworks => Self::Fireworks,
                 OpenAiCompatiblePreset::Cerebras => Self::Cerebras,
+                OpenAiCompatiblePreset::DeepInfra => Self::DeepInfra,
+                OpenAiCompatiblePreset::Baseten => Self::Baseten,
                 OpenAiCompatiblePreset::Custom => Self::OpenAiCompatible,
             },
         }

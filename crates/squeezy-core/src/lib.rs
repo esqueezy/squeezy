@@ -58,6 +58,10 @@ pub const DEFAULT_FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference
 pub const DEFAULT_FIREWORKS_MODEL: &str = "accounts/fireworks/models/llama-v3p3-70b-instruct";
 pub const DEFAULT_CEREBRAS_BASE_URL: &str = "https://api.cerebras.ai/v1";
 pub const DEFAULT_CEREBRAS_MODEL: &str = "llama-3.3-70b";
+pub const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
+pub const DEFAULT_DEEPINFRA_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct";
+pub const DEFAULT_BASETEN_BASE_URL: &str = "https://inference.baseten.co/v1";
+pub const DEFAULT_BASETEN_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct";
 
 /// Vertex AI's OpenAI-compatible chat completions endpoint lives behind a
 /// regional URL that names the project. Returns the resolved base URL for a
@@ -1489,6 +1493,8 @@ pub enum OpenAiCompatiblePreset {
     Together,
     Fireworks,
     Cerebras,
+    DeepInfra,
+    Baseten,
     Custom,
 }
 
@@ -1508,6 +1514,8 @@ impl OpenAiCompatiblePreset {
             Self::Together => "together",
             Self::Fireworks => "fireworks",
             Self::Cerebras => "cerebras",
+            Self::DeepInfra => "deepinfra",
+            Self::Baseten => "baseten",
             Self::Custom => "openai_compatible",
         }
     }
@@ -1526,6 +1534,8 @@ impl OpenAiCompatiblePreset {
             Self::Together => "Together AI",
             Self::Fireworks => "Fireworks AI",
             Self::Cerebras => "Cerebras",
+            Self::DeepInfra => "DeepInfra",
+            Self::Baseten => "Baseten",
             Self::Custom => "OpenAI-compatible (custom)",
         }
     }
@@ -1563,6 +1573,8 @@ impl OpenAiCompatiblePreset {
             Self::Together => DEFAULT_TOGETHER_BASE_URL,
             Self::Fireworks => DEFAULT_FIREWORKS_BASE_URL,
             Self::Cerebras => DEFAULT_CEREBRAS_BASE_URL,
+            Self::DeepInfra => DEFAULT_DEEPINFRA_BASE_URL,
+            Self::Baseten => DEFAULT_BASETEN_BASE_URL,
             Self::Custom => "",
         }
     }
@@ -1584,6 +1596,8 @@ impl OpenAiCompatiblePreset {
             Self::Together => "TOGETHER_API_KEY",
             Self::Fireworks => "FIREWORKS_API_KEY",
             Self::Cerebras => "CEREBRAS_API_KEY",
+            Self::DeepInfra => "DEEPINFRA_API_KEY",
+            Self::Baseten => "BASETEN_API_KEY",
             Self::Custom => "",
         }
     }
@@ -1601,6 +1615,8 @@ impl OpenAiCompatiblePreset {
             Self::Together => DEFAULT_TOGETHER_MODEL,
             Self::Fireworks => DEFAULT_FIREWORKS_MODEL,
             Self::Cerebras => DEFAULT_CEREBRAS_MODEL,
+            Self::DeepInfra => DEFAULT_DEEPINFRA_MODEL,
+            Self::Baseten => DEFAULT_BASETEN_MODEL,
             Self::Custom => "",
         }
     }
@@ -1621,6 +1637,8 @@ impl OpenAiCompatiblePreset {
             "together" | "together_ai" => Some(Self::Together),
             "fireworks" | "fireworks_ai" => Some(Self::Fireworks),
             "cerebras" => Some(Self::Cerebras),
+            "deepinfra" | "deep_infra" => Some(Self::DeepInfra),
+            "baseten" => Some(Self::Baseten),
             "openai_compatible" | "custom" => Some(Self::Custom),
             _ => None,
         }
@@ -1628,7 +1646,7 @@ impl OpenAiCompatiblePreset {
 
     /// Every preset that ships with `cargo run -p squeezy -- --list-providers`.
     /// Used by the CLI to enumerate options without hard-coding the list.
-    pub fn all() -> [Self; 12] {
+    pub fn all() -> [Self; 14] {
         [
             Self::OpenRouter,
             Self::Vercel,
@@ -1641,6 +1659,8 @@ impl OpenAiCompatiblePreset {
             Self::Together,
             Self::Fireworks,
             Self::Cerebras,
+            Self::DeepInfra,
+            Self::Baseten,
             Self::Custom,
         ]
     }
@@ -6702,6 +6722,8 @@ fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] 
             OpenAiCompatiblePreset::Together => &["together"],
             OpenAiCompatiblePreset::Fireworks => &["fireworks"],
             OpenAiCompatiblePreset::Cerebras => &["cerebras"],
+            OpenAiCompatiblePreset::DeepInfra => &["deepinfra"],
+            OpenAiCompatiblePreset::Baseten => &["baseten"],
             OpenAiCompatiblePreset::Custom => &["openai_compatible"],
         },
     }
