@@ -4210,6 +4210,7 @@ impl TurnRuntime {
             let mut completed = false;
             let mut response_id = None;
             let mut completed_cost = CostSnapshot::default();
+            let mut round_text_started = false;
 
             while let Some(event) =
                 next_llm_stream_event(&mut stream, &self.cancel, self.config.stream_idle_timeout)
@@ -4244,6 +4245,37 @@ impl TurnRuntime {
                         if chunk.text.is_empty() {
                             continue;
                         }
+                        // Each tool-call round runs the model again and its text deltas
+                        // flow into the same `assistant_message` buffer. Without a break,
+                        // the prior round's text (often a short "I'm about to do X."
+                        // preamble with no trailing newline) glues onto this round's
+                        // first chunk in both the live TUI buffer and the final stored
+                        // message. Inject a paragraph break before the first text chunk
+                        // of any round after the first.
+                        if !round_text_started && round > 0 && !assistant_message.is_empty() {
+                            let separator = if assistant_message.ends_with("\n\n") {
+                                ""
+                            } else if assistant_message.ends_with('\n') {
+                                "\n"
+                            } else {
+                                "\n\n"
+                            };
+                            if !separator.is_empty() {
+                                assistant_message.push_str(separator);
+                                if self
+                                    .tx
+                                    .send(AgentEvent::AssistantDelta {
+                                        turn_id: self.turn_id,
+                                        delta: separator.to_string(),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        round_text_started = true;
                         self.record_replay_model_text_delta(&chunk.text);
                         assistant_message.push_str(&chunk.text);
                         if self
