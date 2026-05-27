@@ -3238,6 +3238,101 @@ async fn agent_build_stitches_agents_md_into_instructions() {
     );
 }
 
+// AGENTS.md is workspace-level prose for the user-facing agent. A spawned
+// subagent has its own narrow role instructions (`subagent_instructions`)
+// and must not inherit the parent's AGENTS.md preamble — it would burn
+// context on conventions the read-only research role can't act on. Regress
+// the property that the subagent's LlmRequest.instructions is the per-kind
+// briefing only, never the parent's stitched `config.instructions`.
+#[tokio::test]
+async fn subagent_request_instructions_omit_agents_md() {
+    let root = temp_workspace("subagent_omits_agents_md");
+    fs::create_dir_all(root.join(".git")).expect("create .git marker");
+    let marker = "PARENT-ONLY-AGENTS-MD-SENTINEL";
+    fs::write(root.join("AGENTS.md"), marker).expect("write AGENTS.md");
+    let provider = Arc::new(MockProvider::new(vec![
+        // Parent round 1: spawn a `delegate` subagent.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "del_omit_1".to_string(),
+                name: "delegate".to_string(),
+                arguments: json!({"prompt": "investigate something"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_omit_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        // Subagent round 1: end immediately with a short text answer.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_sub_omit_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        // Parent round 2: close the turn after consuming the subagent result.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("noted".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_omit_2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+    assert!(
+        agent.config().instructions.contains(marker),
+        "precondition: parent must have AGENTS.md stitched in"
+    );
+
+    let mut rx = agent.start_turn("delegate then close".to_string(), CancellationToken::new());
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed { .. } | AgentEvent::Failed { .. } = event {
+            break;
+        }
+    }
+
+    let requests = provider.requests();
+    assert!(
+        requests.len() >= 2,
+        "expected at least parent + subagent requests, got {}",
+        requests.len()
+    );
+    // Subagent request is the second stream the provider serves. Its
+    // instructions field must contain the per-kind delegate briefing and
+    // must not carry the parent's AGENTS.md sentinel.
+    let subagent_request = &requests[1];
+    assert!(
+        subagent_request
+            .instructions
+            .contains("isolated Squeezy research subagent"),
+        "subagent request must use the per-kind delegate instructions: {:?}",
+        subagent_request.instructions
+    );
+    assert!(
+        !subagent_request.instructions.contains(marker),
+        "subagent must not inherit AGENTS.md from parent.config.instructions: {:?}",
+        subagent_request.instructions
+    );
+    assert!(
+        !subagent_request
+            .instructions
+            .contains("Project conventions from AGENTS.md"),
+        "subagent must not inherit the AGENTS.md preamble header: {:?}",
+        subagent_request.instructions
+    );
+}
+
 fn mid_turn_test_conversation() -> Vec<LlmInputItem> {
     let mut items = Vec::new();
     for n in 0..16 {
