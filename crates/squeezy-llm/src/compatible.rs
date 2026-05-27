@@ -165,6 +165,17 @@ impl OpenAiCompatibleProvider {
             body["reasoning_effort"] = json!(effort_str);
             body["reasoning"] = json!({ "effort": effort_str });
         }
+        if let Some(cache_key) = &request.cache_key {
+            // OpenAI's Chat Completions / Responses APIs honor a top-level
+            // `prompt_cache_key` that groups requests for prompt-cache
+            // affinity. OpenRouter forwards the field verbatim to OpenAI-
+            // hosted models (`openai/*`), and other aggregator routes ignore
+            // unknown body fields, so emitting it unconditionally costs
+            // nothing and recovers cached-input billing for OpenAI-via-
+            // OpenRouter traffic that the Anthropic-only `cache_control`
+            // path above does not cover.
+            body["prompt_cache_key"] = json!(cache_key);
+        }
         if !request.tools.is_empty() {
             body["tools"] = json!(
                 request

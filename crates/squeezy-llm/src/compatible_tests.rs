@@ -550,6 +550,42 @@ fn request_body_skips_cache_control_when_no_cache_key() {
 }
 
 #[test]
+fn request_body_forwards_prompt_cache_key_to_openai_via_openrouter() {
+    // OpenAI-via-OpenRouter (and any aggregator that forwards body fields
+    // verbatim) honors the top-level `prompt_cache_key` for OpenAI's
+    // prompt-cache layer. The Anthropic-only `cache_control` markers above
+    // do not cover this case; `prompt_cache_key` carries the affinity hint
+    // through to OpenAI-hosted models so cached-input billing applies.
+    let mut request = sample_request();
+    request.model = "openai/gpt-5.5".to_string().into();
+    request.cache_key = Some("repo-context".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["prompt_cache_key"], "repo-context");
+}
+
+#[test]
+fn request_body_forwards_prompt_cache_key_alongside_anthropic_cache_control() {
+    // Anthropic-via-OpenRouter gets the ephemeral `cache_control` markers,
+    // and `prompt_cache_key` rides along as a top-level hint. Aggregators
+    // that ignore unknown fields drop it harmlessly; OpenAI receives it.
+    let mut request = sample_request();
+    request.model = "anthropic/claude-opus-4-7".to_string().into();
+    request.cache_key = Some("repo-context".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["prompt_cache_key"], "repo-context");
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"]["type"],
+        "ephemeral",
+    );
+}
+
+#[test]
+fn request_body_omits_prompt_cache_key_when_unset() {
+    let body = OpenAiCompatibleProvider::request_body(&sample_request());
+    assert!(body.get("prompt_cache_key").is_none());
+}
+
+#[test]
 fn preset_full_tier_matches_documented_set() {
     let full: Vec<_> = OpenAiCompatiblePreset::all()
         .iter()
