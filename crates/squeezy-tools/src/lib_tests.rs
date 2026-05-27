@@ -323,6 +323,122 @@ fn write_file_permission_request_target_matches_suggested_rule_target() {
 }
 
 #[test]
+fn session_approval_extends_to_edit_family_on_optin() {
+    // F04-permission-scope-collapse-edit-family (squeezy-1ro.57): once the
+    // user opts into a session rule from one edit-family tool on a given
+    // path, the same rule must cover the rest of the family (write_file
+    // <-> apply_patch) for that path without re-prompting. The mechanism
+    // is the shared capability ("edit") + target ("path:<file>") shape
+    // both arms register; this test pins that contract so any future
+    // refactor that drifts apply_patch or write_file off `path:<file>`
+    // fails loudly.
+    use squeezy_core::{PermissionAction, PermissionPolicy};
+    let root = temp_workspace("permission_edit_family_optin");
+    let registry = registry_with_shell_sandbox_off(&root);
+    let policy = PermissionPolicy {
+        edit: PermissionMode::Ask,
+        ..PermissionPolicy::default()
+    };
+
+    let write_request = registry.permission_request(&ToolCall {
+        call_id: "write".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": "src/foo.rs",
+            "content": "fn main() {}",
+            "expected_sha256": "deadbeef",
+        }),
+    });
+    let patch_request = registry.permission_request(&ToolCall {
+        call_id: "patch".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({
+            "patches": [{
+                "path": "src/foo.rs",
+                "search": "fn main() {}",
+                "replace": "fn main() { println!(\"hi\"); }",
+            }],
+        }),
+    });
+    assert_eq!(
+        patch_request.target, write_request.target,
+        "apply_patch and write_file on the same path must produce identical \
+         permission targets so a session rule from one covers the other",
+    );
+
+    // Default Ask + no rules: every edit-family call must still prompt.
+    let baseline_write = policy.evaluate(&write_request);
+    let baseline_patch = policy.evaluate(&patch_request);
+    assert_eq!(baseline_write.action, PermissionAction::Ask);
+    assert_eq!(baseline_patch.action, PermissionAction::Ask);
+
+    // After the user picks AllowSession on the write_file prompt, that
+    // single suggested rule must extend to the apply_patch sibling.
+    let write_session_rule = write_request
+        .suggested_rules
+        .first()
+        .expect("write_file should suggest a session rule")
+        .clone();
+    assert_eq!(write_session_rule.capability, "edit");
+    assert_eq!(write_session_rule.source, PermissionRuleSource::Session);
+    let extended_patch =
+        policy.evaluate_with_extra(&patch_request, std::slice::from_ref(&write_session_rule));
+    assert_eq!(
+        extended_patch.action,
+        PermissionAction::Allow,
+        "approving write_file for path:src/foo.rs must auto-allow apply_patch \
+         on the same path",
+    );
+    assert_eq!(
+        extended_patch
+            .matched_rule
+            .as_ref()
+            .map(|rule| rule.target.as_str()),
+        Some("path:src/foo.rs"),
+    );
+
+    // And the reverse: a session rule installed via apply_patch must
+    // cover a subsequent write_file on the same path. Without this, the
+    // user has to approve each tool variant separately, defeating the
+    // edit-family collapse.
+    let patch_session_rule = patch_request
+        .suggested_rules
+        .first()
+        .expect("apply_patch should suggest a session rule")
+        .clone();
+    assert_eq!(patch_session_rule.capability, "edit");
+    assert_eq!(patch_session_rule.target, "path:src/foo.rs");
+    let extended_write =
+        policy.evaluate_with_extra(&write_request, std::slice::from_ref(&patch_session_rule));
+    assert_eq!(
+        extended_write.action,
+        PermissionAction::Allow,
+        "approving apply_patch for path:src/foo.rs must auto-allow write_file \
+         on the same path",
+    );
+
+    // Opt-in narrowness: the rule is path-scoped, so a sibling path is
+    // still gated. This pins that the collapse never widens beyond the
+    // approved target.
+    let other_patch = registry.permission_request(&ToolCall {
+        call_id: "patch_other".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({
+            "patches": [{
+                "path": "src/bar.rs",
+                "search": "x",
+                "replace": "y",
+            }],
+        }),
+    });
+    let other_verdict =
+        policy.evaluate_with_extra(&other_patch, std::slice::from_ref(&write_session_rule));
+    assert_eq!(other_verdict.action, PermissionAction::Ask);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn webfetch_and_websearch_requests_carry_expected_targets() {
     let root = temp_workspace("permission_web_targets");
     let registry = registry_with_shell_sandbox_off(&root);
