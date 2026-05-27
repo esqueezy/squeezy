@@ -1,6 +1,6 @@
 use super::*;
 use crate::{LlmEvent, LlmInputItem, LlmToolSpec};
-use serde_json::json;
+use serde_json::{Value, json};
 use squeezy_core::OpenAiCompatiblePreset;
 use std::sync::Arc;
 
@@ -446,12 +446,46 @@ fn parse_chat_event_handles_done_sentinel() {
 fn parse_chat_event_propagates_stream_error() {
     let mut state = StreamState::default();
     let err = parse_chat_event(
-        r#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#,
+        r#"{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#,
         &mut state,
     )
     .expect_err("must surface error");
     let message = err.to_string();
     assert!(message.contains("rate limited"), "got: {message}");
+    assert!(
+        message.contains("type=rate_limit_error"),
+        "must surface error.type for callers distinguishing retryable failures from auth bugs: {message}"
+    );
+    assert!(
+        message.contains("code=rate_limit_exceeded"),
+        "must surface error.code: {message}"
+    );
+}
+
+#[test]
+fn format_chat_error_handles_partial_envelopes() {
+    let only_message: Value = serde_json::from_str(r#"{"error":{"message":"boom"}}"#).unwrap();
+    assert_eq!(format_chat_error(&only_message, "fallback"), "boom");
+
+    let only_type: Value =
+        serde_json::from_str(r#"{"error":{"type":"invalid_request_error"}}"#).unwrap();
+    assert_eq!(
+        format_chat_error(&only_type, "fallback"),
+        "fallback (type=invalid_request_error)"
+    );
+
+    let numeric_code: Value =
+        serde_json::from_str(r#"{"error":{"message":"nope","code":429}}"#).unwrap();
+    assert_eq!(
+        format_chat_error(&numeric_code, "fallback"),
+        "nope (code=429)"
+    );
+
+    let bare_string: Value = serde_json::from_str(r#"{"error":"insufficient quota"}"#).unwrap();
+    assert_eq!(
+        format_chat_error(&bare_string, "fallback"),
+        "insufficient quota"
+    );
 }
 
 #[test]

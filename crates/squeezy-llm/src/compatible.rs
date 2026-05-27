@@ -263,10 +263,16 @@ impl LlmProvider for OpenAiCompatibleProvider {
             let response = if status == StatusCode::OK {
                 response
             } else {
-                let message = response
+                let raw_body = response
                     .text()
                     .await
                     .unwrap_or_else(|_| "failed to read error response".to_string());
+                let message = match serde_json::from_str::<Value>(&raw_body) {
+                    Ok(value) if value.get("error").is_some() => {
+                        format_chat_error(&value, &raw_body)
+                    }
+                    _ => raw_body.clone(),
+                };
                 // PortKey returns 400 about `x-portkey-*` whenever it
                 // can't figure out which upstream to dial. The most
                 // common cause on integration-style PortKey accounts is
@@ -616,6 +622,36 @@ fn collect_delta_text(value: Option<&Value>) -> String {
     }
 }
 
+/// Format a Chat-Completions `{ "error": { message, type, code, … } }` envelope
+/// into a single human-readable string. Surfaces `type` and `code` (Anthropic's
+/// `rate_limit_error`, OpenAI's `invalid_request_error` / `context_length_exceeded`,
+/// OpenRouter / aggregator-specific codes) which the upstream caller needs to
+/// distinguish retryable failures from auth failures from prompt-shape bugs.
+/// Falls back to `default_message` only when `error` is missing or empty.
+fn format_chat_error(value: &Value, default_message: &str) -> String {
+    let error = value.get("error");
+    let message = error
+        .and_then(|err| err.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| error.and_then(Value::as_str))
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .unwrap_or(default_message);
+    let kind = error
+        .and_then(|err| err.get("type"))
+        .and_then(Value::as_str);
+    let code = error.and_then(|err| err.get("code")).and_then(|c| {
+        c.as_str()
+            .map(str::to_string)
+            .or_else(|| c.as_i64().map(|n| n.to_string()))
+    });
+    match (kind, code.as_deref()) {
+        (Some(kind), Some(code)) => format!("{message} (type={kind}, code={code})"),
+        (Some(kind), None) => format!("{message} (type={kind})"),
+        (None, Some(code)) => format!("{message} (code={code})"),
+        (None, None) => message.to_string(),
+    }
+}
+
 fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>> {
     if data == "[DONE]" {
         let mut events = state.drain_tool_calls()?;
@@ -637,14 +673,11 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
     let value: Value = serde_json::from_str(data)
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid SSE JSON: {err}")))?;
 
-    if let Some(error) = value.get("error") {
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .or_else(|| error.as_str())
-            .unwrap_or("chat completions stream error")
-            .to_string();
-        return Err(SqueezyError::ProviderStream(message));
+    if value.get("error").is_some() {
+        return Err(SqueezyError::ProviderStream(format_chat_error(
+            &value,
+            "chat completions stream error",
+        )));
     }
 
     if let Some(id) = value.get("id").and_then(Value::as_str) {
