@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env, fmt,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -79,7 +79,7 @@ pub use streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
 
 #[cfg(test)]
 pub(crate) use events::apply_mcp_status_update;
-pub(crate) use events::{drain_agent_events, drain_job_events};
+pub(crate) use events::{drain_agent_events, drain_job_events, drain_pending_diff};
 #[cfg(test)]
 pub(crate) use input::set_input;
 pub(crate) use input::{HistoryDirection, SLASH_COMMANDS, SelectionDirection, SlashCommand};
@@ -95,11 +95,11 @@ use input::{
 
 use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
 use render::palette::{
-    AMBER, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN,
+    self, AMBER, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN,
     blend_color,
 };
 #[cfg(test)]
-use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG, WORKING_SHIMMER_HIGHLIGHT};
+use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG};
 use toast::ToastQueue;
 
 const INLINE_PASTE_MAX_BYTES: usize = 512;
@@ -438,6 +438,7 @@ async fn run_inner(
         // therefore coalesces into a single frame.
         drain_job_events(&mut app);
         drain_agent_events(&mut app).await;
+        drain_pending_diff(&mut app);
 
         app.animation_tick = app.animation_tick.wrapping_add(1);
         if app.app_notifications.tick() {
@@ -647,7 +648,7 @@ async fn apply_plan_choice(
                     app.context_compaction.history.push(report.record.clone());
                     app.context_estimate = report.record.after.clone();
                     app.context_compaction_nudge_shown = false;
-                    app.push_log(format!(
+                    app.push_status(format!(
                         "compacted prior context before executing plan {}",
                         pending.plan_id
                     ));
@@ -1603,6 +1604,27 @@ fn save_status_line(
     }
 }
 
+/// Whether the transcript should show a styled banner for this slash
+/// command's invocation. Commands that open their own UI overlay
+/// (`/config`, `/statusline`, …) are silenced — the overlay is the
+/// affordance. Commands that route through `start_user_turn` and
+/// already produce a user-message bubble (`/help`) are also silenced
+/// to avoid duplication. `/verbosity` and `/tool-verbosity` open a UI
+/// when called bare but silently apply a value when given an arg —
+/// echo only the second form. Unrecognized commands are not echoed:
+/// they fall through to be sent as regular user prompts.
+fn should_echo_slash_command(command: &str, rest: &str) -> bool {
+    if !SLASH_COMMANDS.iter().any(|spec| spec.name == command) {
+        return false;
+    }
+    match command {
+        "/config" | "/statusline" | "/model" | "/permissions" | "/copy" | "/collapse"
+        | "/expand" | "/help" => false,
+        "/verbosity" | "/tool-verbosity" => !rest.trim().is_empty(),
+        _ => true,
+    }
+}
+
 async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
     let mut parts = input.split_whitespace();
     let Some(command) = parts.next() else {
@@ -1618,6 +1640,9 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
     {
         app.status = format!("{command} unavailable during turn");
         return true;
+    }
+    if should_echo_slash_command(command, rest) {
+        app.push_slash_command_echo(input);
     }
     match command {
         "/config" => {
@@ -2593,8 +2618,8 @@ fn pin_source(app: &TuiApp, target: &str) -> PinSourceResult {
         "selected" => app
             .selected_entry
             .and_then(|index| app.transcript.get(index))
-            .or_else(|| app.transcript.last()),
-        "last" => app.transcript.last(),
+            .or_else(|| last_pinnable_entry(app)),
+        "last" => last_pinnable_entry(app),
         _ => return PinSourceResult::UnknownTarget,
     };
     match entry {
@@ -2604,6 +2629,13 @@ fn pin_source(app: &TuiApp, target: &str) -> PinSourceResult {
         }
         None => PinSourceResult::NoEntry,
     }
+}
+
+fn last_pinnable_entry(app: &TuiApp) -> Option<&TranscriptEntry> {
+    app.transcript
+        .iter()
+        .rev()
+        .find(|entry| !matches!(entry.kind, TranscriptEntryKind::SlashEcho(_)))
 }
 
 fn sync_jobs_from_agent(app: &mut TuiApp, agent: &Agent) {
@@ -3026,6 +3058,48 @@ fn start_user_turn(app: &mut TuiApp, agent: &mut Agent, input: String) {
 /// (issue 16). The handoff is cleared automatically when the file is
 /// missing; routine clears (Build→Plan, discard, successful apply_patch)
 /// happen elsewhere.
+/// Strip the plan-handoff prefix that [`take_pending_plan_prefix`] prepended
+/// to the user-typed text. The agent still receives the full wrapped body —
+/// this only hides the duplicate echo in the rendered transcript, because the
+/// Plan card a few entries above already shows the same body. Returns `None`
+/// when the message has no plan-handoff prefix.
+pub(crate) fn strip_plan_handoff_prefix(content: &str) -> Option<String> {
+    let mut rest = content;
+    let mut changed = false;
+
+    if let Some(after) = rest.strip_prefix("[resuming from plan ")
+        && let Some(end) = after.find("]\n")
+    {
+        rest = &after[end + 2..];
+        changed = true;
+    }
+
+    if let Some(after) = rest.strip_prefix("[plan from previous session — ")
+        && let Some(header_end) = after.find("]\n")
+    {
+        let body_start = &after[header_end + 2..];
+        if let Some(close) = body_start.find("\n[end plan]\n") {
+            let mut tail = &body_start[close + "\n[end plan]\n".len()..];
+            tail = tail.strip_prefix('\n').unwrap_or(tail);
+            rest = tail;
+            changed = true;
+        }
+    } else if let Some(after) = rest.strip_prefix("[plan still in effect — ")
+        && let Some(end) = after.find("]\n")
+    {
+        let mut tail = &after[end + 2..];
+        tail = tail.strip_prefix('\n').unwrap_or(tail);
+        rest = tail;
+        changed = true;
+    }
+
+    if changed {
+        Some(rest.to_string())
+    } else {
+        None
+    }
+}
+
 fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
     let plan_path = app.pending_plan_handoff.clone()?;
     if app.plan_handoff_turns_seen > 0 {
@@ -3087,7 +3161,7 @@ fn switch_mode(
             .current_plan_id
             .clone()
             .map(|plan_id| PlanPauseState { plan_id });
-        app.push_log("plan execution paused (Shift+Tab)".to_string());
+        app.push_status("plan execution paused (Shift+Tab)".to_string());
     }
 
     if !is_build_to_plan_pause
@@ -3138,7 +3212,7 @@ fn switch_mode(
                             };
                             app.plan_resume_marker = Some(note);
                         }
-                        app.push_log(format!(
+                        app.push_status(format!(
                             "plan attached for next Build turn: {}",
                             compact_path(&plan_path)
                         ));
@@ -4241,7 +4315,14 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 /// actionable to show. Returns `None` when the spinner alone suffices —
 /// keeps the working cell single-row in the common case.
 fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
-    // Highest priority: MCP startup in progress.
+    // Highest priority: a `/diff` snapshot is running on the blocking
+    // pool. The user typed `/diff` and is waiting for git to finish.
+    if app.pending_diff.is_some() {
+        return Some(Line::from(Span::styled(
+            "    ↳ computing diff…",
+            Style::default().fg(QUIET),
+        )));
+    }
     if let Some(snapshot) = app.mcp_status.as_ref() {
         let mut starting = 0usize;
         let mut total = 0usize;
@@ -4280,6 +4361,7 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
 fn turn_in_progress(app: &TuiApp) -> bool {
     app.turn_rx.is_some()
         || app.cancel.is_some()
+        || app.pending_diff.is_some()
         || (app.last_turn_duration.is_none()
             && app
                 .task_state
@@ -4373,6 +4455,7 @@ fn shimmer_word_spans(text: &'static str, elapsed_ms: u64) -> Vec<Span<'static>>
 
 fn current_turn_duration(app: &TuiApp) -> Duration {
     app.turn_started_at
+        .or(app.pending_diff_started_at)
         .map(|started_at| started_at.elapsed())
         .unwrap_or_default()
 }
@@ -4551,6 +4634,24 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (index, entry) in app.transcript.iter().enumerate() {
+        match reasoning_run_info(&app.transcript, index) {
+            Some(ReasoningRun::Suppressed) => continue,
+            Some(ReasoningRun::Lead { extras }) => {
+                if app.show_reasoning_usage
+                    && let TranscriptEntryKind::Reasoning(snapshot) = &entry.kind
+                {
+                    lines.extend(reasoning_block_lines_with_extras(
+                        &snapshot.display_text,
+                        false,
+                        app.selected_entry == Some(index),
+                        extras,
+                    ));
+                    lines.push(Line::from(""));
+                }
+                continue;
+            }
+            None => {}
+        }
         lines.extend(format_transcript_entry_expanded(
             entry,
             app.selected_entry == Some(index),
@@ -4578,7 +4679,7 @@ fn format_transcript_entry_expanded(
         TranscriptEntryKind::ToolResult(tool) => {
             format_tool_result_entry(tool, false, selected, tool_output_verbosity, width)
         }
-        TranscriptEntryKind::Log(message) => format_log_entry(message, false, selected),
+        TranscriptEntryKind::Log(entry) => format_log_entry(entry, false, selected),
         TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, false),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, false, selected),
         TranscriptEntryKind::Reasoning(snapshot) => {
@@ -4590,6 +4691,7 @@ fn format_transcript_entry_expanded(
                 Vec::new()
             }
         }
+        TranscriptEntryKind::SlashEcho(data) => vec![format_slash_echo_line(data, selected)],
     }
 }
 
@@ -4605,6 +4707,24 @@ fn transcript_lines_for_render(
         lines.push(Line::from(""));
     }
     for (index, item) in app.transcript.iter().enumerate() {
+        match reasoning_run_info(&app.transcript, index) {
+            Some(ReasoningRun::Suppressed) => continue,
+            Some(ReasoningRun::Lead { extras }) => {
+                if app.show_reasoning_usage
+                    && let TranscriptEntryKind::Reasoning(snapshot) = &item.kind
+                {
+                    lines.extend(reasoning_block_lines_with_extras(
+                        &snapshot.display_text,
+                        item.collapsed,
+                        app.selected_entry == Some(index),
+                        extras,
+                    ));
+                    lines.push(Line::from(""));
+                }
+                continue;
+            }
+            None => {}
+        }
         lines.extend(format_transcript_entry_with_width(
             item,
             app.selected_entry == Some(index),
@@ -4871,7 +4991,9 @@ fn format_transcript_entry_with_width(
             tool_output_verbosity,
             width,
         ),
-        TranscriptEntryKind::Log(message) => format_log_entry(message, entry.collapsed, selected),
+        TranscriptEntryKind::Log(entry_log) => {
+            format_log_entry(entry_log, entry.collapsed, selected)
+        }
         TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, entry.collapsed),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, entry.collapsed, selected),
         TranscriptEntryKind::Reasoning(snapshot) => {
@@ -4884,7 +5006,28 @@ fn format_transcript_entry_with_width(
                 Vec::new()
             }
         }
+        TranscriptEntryKind::SlashEcho(data) => vec![format_slash_echo_line(data, selected)],
     }
+}
+
+fn format_slash_echo_line(data: &SlashEchoData, selected: bool) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let mut spans = vec![
+        Span::raw(marker),
+        Span::styled(
+            "›  ",
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            data.cmd.clone(),
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !data.args.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(data.args.clone(), Style::default().fg(QUIET)));
+    }
+    Line::from(spans)
 }
 
 fn format_plan_card_entry(
@@ -4907,12 +5050,34 @@ fn format_plan_card_entry(
 /// `disable_output_cap` UX — never truncated, always renderable via the
 /// existing `render::diff` helpers.
 fn handle_slash_diff(app: &mut TuiApp) {
+    if app.pending_diff.is_some() {
+        app.push_log("/diff: already computing — please wait".to_string());
+        return;
+    }
     let workspace_root = app.workspace_root.clone();
-    let vcs = match GitVcs::open(&workspace_root) {
+    let (tx, rx) = oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let result = compute_diff_snapshot(&workspace_root);
+        let _ = tx.send(result);
+    });
+    app.pending_diff = Some(rx);
+    app.pending_diff_started_at = Some(Instant::now());
+    app.needs_redraw = true;
+}
+
+/// Synchronous diff snapshot used by the background task. Returns either
+/// a renderable card or a list of log lines (errors / "no changes" /
+/// "not a git repo"). Kept off the input thread because `vcs.snapshot()`
+/// shells out to `git status` + `git diff` and iterates every changed
+/// file — fine for a background worker, fatal for the UI thread.
+fn compute_diff_snapshot(workspace_root: &Path) -> PendingDiffResult {
+    let vcs = match GitVcs::open(workspace_root) {
         Ok(vcs) => vcs,
         Err(err) => {
-            app.push_log(format!("/diff failed to open workspace VCS: {err}"));
-            return;
+            return PendingDiffResult {
+                logs: vec![format!("/diff failed to open workspace VCS: {err}")],
+                card: None,
+            };
         }
     };
     let snapshot = vcs.snapshot(
@@ -4923,20 +5088,24 @@ fn handle_slash_diff(app: &mut TuiApp) {
         },
     );
     if snapshot.vcs.kind != VcsKind::Git {
-        app.push_log("/diff: workspace is not a git repository".to_string());
-        return;
+        return PendingDiffResult {
+            logs: vec!["/diff: workspace is not a git repository".to_string()],
+            card: None,
+        };
     }
-    if !snapshot.errors.is_empty() {
-        for error in &snapshot.errors {
-            app.push_log(format!("/diff git error: {error}"));
-        }
-    }
+    let mut logs: Vec<String> = snapshot
+        .errors
+        .iter()
+        .map(|e| format!("/diff git error: {e}"))
+        .collect();
     if snapshot.files.is_empty() {
-        app.push_log("/diff: no uncommitted changes".to_string());
-        return;
+        logs.push("/diff: no uncommitted changes".to_string());
+        return PendingDiffResult { logs, card: None };
     }
-    let card = build_diff_card(&snapshot);
-    app.push_diff_card(card);
+    PendingDiffResult {
+        logs,
+        card: Some(build_diff_card(&snapshot)),
+    }
 }
 
 /// Build a renderable diff card from a worktree snapshot. Files are
@@ -5048,7 +5217,7 @@ fn message_outcome(entries: &[TranscriptEntry], index: usize) -> MessageOutcome 
 
     for entry in entries.iter().skip(index + 1) {
         match &entry.kind {
-            TranscriptEntryKind::Log(message) if is_failure_log(message) => {
+            TranscriptEntryKind::Log(entry_log) if is_failure_log(entry_log.message()) => {
                 return MessageOutcome::Failed;
             }
             TranscriptEntryKind::Message(_) => return MessageOutcome::Normal,
@@ -5647,7 +5816,21 @@ fn format_assistant_message_entry(
 }
 
 fn reasoning_block_lines(text: &str, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
-    let style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
+    reasoning_block_lines_with_extras(text, collapsed, selected, 0)
+}
+
+/// `extras` is the number of additional adjacent reasoning entries this chip
+/// stands in for. When `> 0`, the collapsed chip header gains a `· +N more`
+/// suffix so the run reads as one item.
+fn reasoning_block_lines_with_extras(
+    text: &str,
+    collapsed: bool,
+    selected: bool,
+    extras: usize,
+) -> Vec<Line<'static>> {
+    let style = Style::default()
+        .fg(palette::muted_fg())
+        .add_modifier(Modifier::ITALIC);
     let marker = if selected { "> " } else { "" };
     let mut lines = Vec::new();
     let body_lines: Vec<&str> = text.lines().collect();
@@ -5657,25 +5840,76 @@ fn reasoning_block_lines(text: &str, collapsed: bool, selected: bool) -> Vec<Lin
             .copied()
             .map(|first| compact_text(first, 120))
             .unwrap_or_default();
-        let suffix = if body_lines.len() > 1 {
+        let mut suffix = if body_lines.len() > 1 {
             format!(" … +{} lines (Ctrl-E to expand)", body_lines.len() - 1)
         } else {
             String::new()
         };
+        if extras > 0 {
+            suffix.push_str(&format!(" · +{extras} more"));
+        }
         lines.push(Line::from(Span::styled(
             format!("{marker}▸ reasoning: {summary}{suffix}"),
             style,
         )));
     } else {
-        lines.push(Line::from(Span::styled(
-            format!("{marker}▾ reasoning ({} lines)", body_lines.len().max(1)),
-            style,
-        )));
+        let header = if extras > 0 {
+            format!(
+                "{marker}▾ reasoning ({} lines · +{extras} more)",
+                body_lines.len().max(1)
+            )
+        } else {
+            format!("{marker}▾ reasoning ({} lines)", body_lines.len().max(1))
+        };
+        lines.push(Line::from(Span::styled(header, style)));
         for raw in body_lines {
             lines.push(Line::from(Span::styled(format!("▏ {}", raw), style)));
         }
     }
     lines
+}
+
+/// Outcome of inspecting a reasoning entry's neighborhood for coalescing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningRun {
+    /// Lead of a run of ≥2 adjacent reasoning entries. `extras` is the
+    /// number of *additional* entries this lead absorbs.
+    Lead { extras: usize },
+    /// A non-lead member of a run — caller should render nothing.
+    Suppressed,
+}
+
+/// If `index` is a `Reasoning` entry, classify how it should render given
+/// its neighborhood. Returns `None` for non-reasoning entries or singletons,
+/// in which case the caller renders normally.
+fn reasoning_run_info(transcript: &[TranscriptEntry], index: usize) -> Option<ReasoningRun> {
+    let entry = transcript.get(index)?;
+    if !matches!(entry.kind, TranscriptEntryKind::Reasoning(_)) {
+        return None;
+    }
+    let prev_is_reasoning = index > 0
+        && matches!(
+            transcript[index - 1].kind,
+            TranscriptEntryKind::Reasoning(_)
+        );
+    if prev_is_reasoning {
+        return Some(ReasoningRun::Suppressed);
+    }
+    let mut extras = 0usize;
+    let mut j = index + 1;
+    while let Some(next) = transcript.get(j) {
+        if matches!(next.kind, TranscriptEntryKind::Reasoning(_)) {
+            extras += 1;
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    if extras == 0 {
+        None
+    } else {
+        Some(ReasoningRun::Lead { extras })
+    }
 }
 
 fn collapsed_content_summary(content: &str) -> String {
@@ -5702,22 +5936,29 @@ fn format_tool_result_entry(
     let (marker, action) = tool_result_action(tool);
     let color = tool_result_display_color(tool);
     let summary_spans = tool_result_summary_spans(tool);
-    let mut lines = vec![action_line_spans(
-        selected,
-        marker,
-        color,
-        action,
-        color,
-        summary_spans,
-    )];
-    if collapsed {
-        lines.extend(collapsed_tool_preview_lines(
-            tool,
-            tool_output_verbosity,
-            width,
-        ));
+    let header = action_line_spans(selected, marker, color, action, color, summary_spans);
+    let body = if collapsed {
+        collapsed_tool_preview_lines(tool, tool_output_verbosity, width)
     } else {
-        lines.extend(expanded_tool_detail_lines(tool, tool_output_verbosity));
+        expanded_tool_detail_lines(tool, tool_output_verbosity)
+    };
+    // Visually group the action header with its detail rows by tinting
+    // both with a subtle card surface. Bail out gracefully on terminals
+    // that can't render bg blends — `card_background_style()` returns
+    // `None` and the layout falls back to today's flat row stack.
+    let bg = render::card::card_background_style();
+    if bg.is_none() {
+        let mut lines = vec![header];
+        lines.extend(body);
+        return lines;
+    }
+    let mut lines = vec![render::card::apply_background(header, bg)];
+    lines.extend(
+        body.into_iter()
+            .map(|line| render::card::apply_background(line, bg)),
+    );
+    if let Some(trailer) = render::card::blank_card_line(bg) {
+        lines.push(trailer);
     }
     lines
 }
@@ -5806,7 +6047,22 @@ fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'
     out
 }
 
-fn format_log_entry(message: &str, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
+fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
+    let message = entry.message.as_str();
+    if entry.kind == LogKind::Operational {
+        // Operational chrome: dim italic line with no bullet so it visually
+        // sinks below content. Always one line; selection inherits the
+        // standard marker so keyboard nav still highlights the entry.
+        let marker = if selected { "> " } else { "  " };
+        let style = Style::default()
+            .fg(palette::footer_fg())
+            .add_modifier(Modifier::ITALIC);
+        let preview = compact_text(message, 200);
+        return vec![Line::from(vec![
+            Span::raw(marker),
+            Span::styled(preview, style),
+        ])];
+    }
     let color = log_color(message);
     if collapsed && !is_failure_log(message) {
         let preview = compact_text(message, 140);
@@ -5905,10 +6161,10 @@ fn detail_line(selected: bool, color: Color, content: impl Into<String>) -> Line
     Line::from(vec![
         Span::raw(marker),
         Span::styled(
-            "└ ",
+            "│ ",
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(content.into(), Style::default().fg(QUIET)),
+        Span::styled(content.into(), Style::default().fg(palette::muted_fg())),
     ])
 }
 
@@ -6725,11 +6981,76 @@ fn expanded_tool_detail_lines(
         "diff_context" => expanded_diff_context_detail_lines(tool),
         "plan_patch" => expanded_plan_patch_detail_lines(tool),
         "apply_patch" | "write_file" => expanded_edit_detail_lines(tool, verbosity),
+        "symbol_context" => expanded_symbol_context_detail_lines(tool, verbosity),
         "grep" | "glob" | "read_file" | "read_slice" | "read_tool_output" => {
             expanded_read_search_detail_lines(tool, verbosity)
         }
         _ => expanded_generic_tool_detail_lines(tool, verbosity),
     }
+}
+
+fn expanded_symbol_context_detail_lines(
+    tool: &ToolTranscript,
+    verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    let packet_cap = match verbosity {
+        ToolOutputVerbosity::Compact => 3,
+        ToolOutputVerbosity::Normal => 5,
+        ToolOutputVerbosity::Verbose => usize::MAX,
+    };
+    let mut lines = Vec::new();
+    if let Some(call) = tool.call.as_ref()
+        && let Some(query) = string_arg(&call.arguments, "query")
+    {
+        lines.push(detail_line(false, QUIET, format!("query `{query}`")));
+    }
+    let packets = tool.result.content["packets"].as_array();
+    let total = packets.map(|p| p.len()).unwrap_or(0);
+    if total == 0 {
+        if let Some(reason) = string_arg(&tool.result.content, "reason") {
+            lines.push(detail_line(false, QUIET, reason));
+        } else {
+            lines.push(detail_line(false, QUIET, "no symbols matched".to_string()));
+        }
+        return lines;
+    }
+    lines.push(detail_line(false, QUIET, format!("packets {total}")));
+    if let Some(packets) = packets {
+        for packet in packets.iter().take(packet_cap) {
+            let name = packet["name"].as_str().unwrap_or("?");
+            let kind = packet["kind"].as_str().unwrap_or("");
+            let path = packet["path"].as_str().unwrap_or("?");
+            let line = packet["span"]["start_line"].as_u64().unwrap_or(0);
+            let refs = packet["references"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let callers = packet["callers"].as_array().map(|a| a.len()).unwrap_or(0);
+            let kind_suffix = if kind.is_empty() {
+                String::new()
+            } else {
+                format!(" ({kind})")
+            };
+            let counts = if refs == 0 && callers == 0 {
+                String::new()
+            } else {
+                format!(" · refs {refs} · callers {callers}")
+            };
+            lines.push(detail_line(
+                false,
+                QUIET,
+                format!("{path}:{line} {name}{kind_suffix}{counts}"),
+            ));
+        }
+    }
+    if total > packet_cap {
+        lines.push(detail_line(
+            false,
+            QUIET,
+            format!("+{} more packets (Ctrl-E to expand)", total - packet_cap),
+        ));
+    }
+    lines
 }
 
 fn expanded_shell_detail_lines(
@@ -6817,7 +7138,7 @@ fn shell_output_title_line(command: &str, workdir: &str) -> Line<'static> {
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
-            "└ ",
+            "│ ",
             Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
         ),
     ];
@@ -7006,8 +7327,8 @@ fn expanded_read_search_detail_lines(
     verbosity: ToolOutputVerbosity,
 ) -> Vec<Line<'static>> {
     let lines = match tool.result.tool_name.as_str() {
-        "glob" => expanded_glob_detail_lines(tool),
-        "grep" => expanded_grep_detail_lines(tool),
+        "glob" => expanded_glob_detail_lines_v(tool, verbosity),
+        "grep" => expanded_grep_detail_lines_v(tool, verbosity),
         "read_file" | "read_slice" => expanded_read_file_detail_lines(tool, verbosity),
         "read_tool_output" => expanded_read_tool_output_detail_lines(tool, verbosity),
         _ => expanded_generic_tool_detail_lines(tool, verbosity),
@@ -7019,17 +7340,26 @@ fn expanded_read_search_detail_lines(
     }
 }
 
-fn expanded_glob_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
+fn expanded_glob_detail_lines_v(
+    tool: &ToolTranscript,
+    verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    let path_cap = match verbosity {
+        ToolOutputVerbosity::Compact => 3,
+        _ => 8,
+    };
     let mut lines = Vec::new();
     if let Some(pattern) = string_arg(&tool.result.content["metadata"], "pattern") {
         lines.push(detail_line(false, QUIET, format!("pattern {pattern}")));
     }
-    if let Some(path) = string_arg(&tool.result.content["metadata"], "path") {
+    if !matches!(verbosity, ToolOutputVerbosity::Compact)
+        && let Some(path) = string_arg(&tool.result.content["metadata"], "path")
+    {
         lines.push(detail_line(false, QUIET, format!("root {path}")));
     }
     if let Some(paths) = tool.result.content["paths"].as_array() {
         lines.push(detail_line(false, QUIET, format!("paths {}", paths.len())));
-        lines.extend(paths.iter().take(8).filter_map(|path| {
+        lines.extend(paths.iter().take(path_cap).filter_map(|path| {
             path.as_str()
                 .map(|path| detail_line(false, QUIET, format!("path {path}")))
         }));
@@ -7037,20 +7367,37 @@ fn expanded_glob_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
     lines
 }
 
-fn expanded_grep_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
+fn expanded_grep_detail_lines_v(
+    tool: &ToolTranscript,
+    verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    let match_cap = match verbosity {
+        ToolOutputVerbosity::Compact => 3,
+        _ => 6,
+    };
+    let path_cap = match verbosity {
+        ToolOutputVerbosity::Compact => 3,
+        _ => 8,
+    };
     let mut lines = Vec::new();
     if let Some(pattern) = string_arg(&tool.result.content["metadata"], "pattern") {
         lines.push(detail_line(false, QUIET, format!("pattern {pattern}")));
     }
-    if let Some(path) = string_arg(&tool.result.content["metadata"], "path") {
+    if !matches!(verbosity, ToolOutputVerbosity::Compact)
+        && let Some(path) = string_arg(&tool.result.content["metadata"], "path")
+    {
         lines.push(detail_line(false, QUIET, format!("root {path}")));
     }
     if let Some(count) = number_field(&tool.result.content, "count") {
         lines.push(detail_line(false, QUIET, format!("matches {count}")));
     }
-    lines.extend(path_detail_lines(&tool.result.content["paths"], "", 8));
+    lines.extend(path_detail_lines(
+        &tool.result.content["paths"],
+        "",
+        path_cap,
+    ));
     if let Some(matches) = tool.result.content["matches"].as_array() {
-        for item in matches.iter().take(6) {
+        for item in matches.iter().take(match_cap) {
             let path = item["path"].as_str().unwrap_or("?");
             let line = item["line"].as_u64().unwrap_or(0);
             let text = item["text"].as_str().unwrap_or_default();
@@ -7068,24 +7415,48 @@ fn expanded_read_file_detail_lines(
     tool: &ToolTranscript,
     verbosity: ToolOutputVerbosity,
 ) -> Vec<Line<'static>> {
+    let path = string_arg(&tool.result.content, "path");
+    let bytes = number_field(&tool.result.content, "bytes_returned");
+    let total = number_field(&tool.result.content, "total_bytes");
+    let ranges = tool.result.content["ranges"]
+        .as_array()
+        .map(|r| r.len())
+        .unwrap_or(0);
+
+    // Compact mode: a single chip summarising the read. The content body
+    // and per-field chips dominate transcripts otherwise — and Read's full
+    // text is already what the agent acted on, not something the user
+    // needs to re-read here.
+    if matches!(verbosity, ToolOutputVerbosity::Compact) {
+        let mut summary = path.clone().unwrap_or_else(|| "?".to_string());
+        if let Some(bytes) = bytes {
+            let total = total.unwrap_or(bytes);
+            summary.push_str(&format!(
+                " · {} of {}",
+                format_bytes(bytes),
+                format_bytes(total)
+            ));
+        }
+        if ranges > 1 {
+            summary.push_str(&format!(" · {ranges} ranges"));
+        }
+        return vec![detail_line(false, QUIET, summary)];
+    }
+
     let mut lines = Vec::new();
-    if let Some(path) = string_arg(&tool.result.content, "path") {
+    if let Some(path) = path {
         lines.push(detail_line(false, QUIET, format!("path {path}")));
     }
-    if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
-        let total = number_field(&tool.result.content, "total_bytes").unwrap_or(bytes);
+    if let Some(bytes) = bytes {
+        let total = total.unwrap_or(bytes);
         lines.push(detail_line(
             false,
             QUIET,
             format!("bytes {} of {}", format_bytes(bytes), format_bytes(total)),
         ));
     }
-    if let Some(ranges) = tool.result.content["ranges"].as_array() {
-        lines.push(detail_line(
-            false,
-            QUIET,
-            format!("ranges {}", ranges.len()),
-        ));
+    if ranges > 0 {
+        lines.push(detail_line(false, QUIET, format!("ranges {ranges}")));
     }
     if let Some(content) = string_arg(&tool.result.content, "content") {
         lines.extend(output_block_lines("content", &content, verbosity));
@@ -7119,8 +7490,87 @@ fn expanded_generic_tool_detail_lines(
     tool: &ToolTranscript,
     verbosity: ToolOutputVerbosity,
 ) -> Vec<Line<'static>> {
-    let preview = preview_tool_result(&tool.result, verbosity);
-    output_block_lines("details", &preview, verbosity)
+    // Verbose mode preserves the legacy `details {...}` JSON dump so users
+    // who really want the raw payload (debugging a new tool, comparing two
+    // runs) can still get it via `/verbosity verbose`.
+    if matches!(verbosity, ToolOutputVerbosity::Verbose) {
+        let preview = preview_tool_result(&tool.result, verbosity);
+        return output_block_lines("details", &preview, verbosity);
+    }
+
+    // 1. If the tool surfaces plain stdout/stderr/output, render that —
+    //    walls of JSON aren't useful when the tool already gives us text.
+    if let Some(text) = tool_result_output_text(&tool.result) {
+        let preview = truncate_bytes(&text, TOOL_PREVIEW_COMPACT_BYTES);
+        return output_block_lines("output", &preview, verbosity);
+    }
+
+    // 2. Otherwise summarise the top-level keys of the result. Each value
+    //    gets at most one chip; the entry caps at 3 chips total so the
+    //    summary stays scannable. Full JSON is one verbosity flip away.
+    let Some(object) = tool.result.content.as_object() else {
+        let preview = preview_tool_result(&tool.result, verbosity);
+        return output_block_lines("details", &preview, verbosity);
+    };
+    if object.is_empty() {
+        return Vec::new();
+    }
+    let max_chips = if matches!(verbosity, ToolOutputVerbosity::Compact) {
+        3
+    } else {
+        6
+    };
+    let mut lines = Vec::new();
+    let mut shown = 0usize;
+    let total_keys = object.len();
+    for (key, value) in object {
+        if shown >= max_chips {
+            break;
+        }
+        let summary = summarize_json_value(value);
+        lines.push(detail_line(false, QUIET, format!("{key} {summary}")));
+        shown += 1;
+    }
+    if total_keys > shown {
+        lines.push(detail_line(
+            false,
+            QUIET,
+            format!("+{} more fields (Ctrl-E to expand)", total_keys - shown),
+        ));
+    }
+    lines
+}
+
+/// One-line summary of a JSON value, used by the generic tool renderer.
+/// Strings get inline-quoted (truncated); arrays/objects collapse to a
+/// count; scalars print as-is.
+fn summarize_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => format!("\"{}\"", compact_text(s, 80)),
+        serde_json::Value::Array(items) => {
+            if items.is_empty() {
+                "[]".to_string()
+            } else {
+                format!("{} items", items.len())
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                "{}".to_string()
+            } else {
+                let keys = map.keys().take(3).cloned().collect::<Vec<_>>().join(", ");
+                let suffix = if map.len() > 3 {
+                    format!(", +{}", map.len() - 3)
+                } else {
+                    String::new()
+                };
+                format!("{{{keys}{suffix}}}")
+            }
+        }
+    }
 }
 
 fn render_diff_patch_full_lines(patch: &str, path: &str) -> Vec<Line<'static>> {
@@ -7207,7 +7657,7 @@ fn detail_spans_line(content: Vec<Span<'static>>) -> Line<'static> {
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
-            "└ ",
+            "│ ",
             Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
         ),
     ];
@@ -7219,7 +7669,7 @@ fn detail_rendered_line(line: Line<'static>) -> Line<'static> {
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
-            "└ ",
+            "│ ",
             Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
         ),
     ];
@@ -8966,6 +9416,22 @@ pub(crate) struct TuiApp {
     /// here and `handle_key` consults it before dispatching to the
     /// legacy hardcoded handlers.
     pub(crate) keymap: keymap::KeymapResolver,
+    /// In-flight `/diff` snapshot work. `vcs.snapshot()` shells out to
+    /// blocking git subprocesses and iterates every changed file, which
+    /// can take seconds on a busy worktree. We offload it to
+    /// `spawn_blocking` and poll this receiver each frame so the input
+    /// loop stays responsive. Drives the working spinner while set.
+    pub(crate) pending_diff: Option<oneshot::Receiver<PendingDiffResult>>,
+    /// Wall-clock anchor for the in-flight `/diff` snapshot. Drives the
+    /// elapsed-time counter on the Working row so the user can see the
+    /// command is making progress even though the foreground UI is idle.
+    pub(crate) pending_diff_started_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PendingDiffResult {
+    pub(crate) logs: Vec<String>,
+    pub(crate) card: Option<DiffCardData>,
 }
 
 impl TuiApp {
@@ -9127,6 +9593,8 @@ impl TuiApp {
             status_line_setup: None,
             latest_plan_progress: None,
             keymap: keymap::KeymapResolver::from_overrides(&config.tui.keymap),
+            pending_diff: None,
+            pending_diff_started_at: None,
         }
     }
 
@@ -9204,6 +9672,7 @@ impl TuiApp {
     pub(crate) fn has_active_animation(&self) -> bool {
         matches!(self.turn_visual, TurnVisualState::Running)
             || self.terminal_title_state == TerminalTitleState::Working
+            || self.pending_diff.is_some()
     }
 
     pub(crate) fn push_transcript_item(&mut self, item: TranscriptItem) {
@@ -9273,6 +9742,19 @@ impl TuiApp {
         self.push_entry(TranscriptEntry::log(id, message, self.transcript_default));
     }
 
+    /// Append a transcript entry tagged as operational chrome — used for
+    /// turn-complete markers, compaction notices, and plan-handoff state
+    /// that should fade to the periphery rather than read as content.
+    pub(crate) fn push_status(&mut self, message: String) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::log_with_kind(
+            id,
+            message,
+            LogKind::Operational,
+            self.transcript_default,
+        ));
+    }
+
     pub(crate) fn push_plan_card(&mut self, data: render::plan_card::PlanCardData) {
         let id = self.next_id();
         self.push_entry(TranscriptEntry::plan_card(
@@ -9285,6 +9767,24 @@ impl TuiApp {
     pub(crate) fn push_diff_card(&mut self, data: DiffCardData) {
         let id = self.next_id();
         self.push_entry(TranscriptEntry::diff_card(id, data));
+    }
+
+    /// Echo the slash command the user just ran into the transcript as a
+    /// styled banner. Used by commands that produce in-transcript output
+    /// (cards, logs) so the history retains the invocation that triggered
+    /// them. Skipped for commands that open their own UI overlay — the
+    /// overlay itself is the affordance.
+    pub(crate) fn push_slash_command_echo(&mut self, raw: &str) {
+        let trimmed = raw.trim_start();
+        if trimmed.is_empty() {
+            return;
+        }
+        let (cmd, args) = match trimmed.split_once(char::is_whitespace) {
+            Some((cmd, args)) => (cmd.to_string(), args.trim().to_string()),
+            None => (trimmed.to_string(), String::new()),
+        };
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::slash_echo(id, SlashEchoData { cmd, args }));
     }
 
     pub(crate) fn push_reasoning_segment(&mut self, snapshot: squeezy_core::ReasoningSnapshot) {
@@ -9371,10 +9871,22 @@ impl TranscriptEntry {
     }
 
     fn log(id: u64, message: String, transcript_default: TranscriptDefault) -> Self {
+        Self::log_with_kind(id, message, LogKind::Normal, transcript_default)
+    }
+
+    fn log_with_kind(
+        id: u64,
+        message: String,
+        kind: LogKind,
+        transcript_default: TranscriptDefault,
+    ) -> Self {
         Self {
             id,
-            kind: TranscriptEntryKind::Log(message),
-            collapsed: transcript_default == TranscriptDefault::Compact,
+            kind: TranscriptEntryKind::Log(LogEntry { message, kind }),
+            // Operational chrome never benefits from being collapsed —
+            // it's already a single dim line.
+            collapsed: kind != LogKind::Operational
+                && transcript_default == TranscriptDefault::Compact,
         }
     }
 
@@ -9398,6 +9910,14 @@ impl TranscriptEntry {
             kind: TranscriptEntryKind::Diff(Box::new(data)),
             // Mirror codex's `/diff`: never truncated by default. The
             // user can still Ctrl-E to fold the body if it's huge.
+            collapsed: false,
+        }
+    }
+
+    fn slash_echo(id: u64, data: SlashEchoData) -> Self {
+        Self {
+            id,
+            kind: TranscriptEntryKind::SlashEcho(data),
             collapsed: false,
         }
     }
@@ -9427,6 +9947,7 @@ impl TranscriptEntry {
                 TranscriptEntryKind::Log(_) => true,
                 TranscriptEntryKind::Message(item) => item.role == Role::System,
                 TranscriptEntryKind::PlanCard(_) => true,
+                TranscriptEntryKind::SlashEcho(_) => true,
                 _ => false,
             },
             TranscriptCategory::Diffs => match &self.kind {
@@ -9455,7 +9976,7 @@ impl TranscriptEntry {
             TranscriptEntryKind::ToolResult(tool) => {
                 vec![format!("tool result: {}", tool_result_summary(tool))]
             }
-            TranscriptEntryKind::Log(message) => vec![format!("log: {message}")],
+            TranscriptEntryKind::Log(entry) => vec![format!("log: {}", entry.message)],
             TranscriptEntryKind::PlanCard(data) => {
                 let body = proposed_plan::read_plan_body(&data.path).unwrap_or_default();
                 vec![format!("plan {}\n{body}", data.plan_id)]
@@ -9465,6 +9986,14 @@ impl TranscriptEntry {
             }
             TranscriptEntryKind::Reasoning(snapshot) => {
                 vec![format!("reasoning: {}", snapshot.display_text)]
+            }
+            TranscriptEntryKind::SlashEcho(data) => {
+                let body = if data.args.is_empty() {
+                    data.cmd.clone()
+                } else {
+                    format!("{} {}", data.cmd, data.args)
+                };
+                vec![format!("slash: {body}")]
             }
         }
     }
@@ -9486,10 +10015,13 @@ impl TranscriptEntry {
                 item.role != Role::User && text_has_collapsible_content(&item.content)
             }
             TranscriptEntryKind::ToolResult(_) => true,
-            TranscriptEntryKind::Log(message) => text_has_collapsible_content(message),
+            TranscriptEntryKind::Log(entry) => {
+                entry.kind == LogKind::Normal && text_has_collapsible_content(&entry.message)
+            }
             TranscriptEntryKind::PlanCard(_) => true,
             TranscriptEntryKind::Diff(_) => true,
             TranscriptEntryKind::Reasoning(_) => true,
+            TranscriptEntryKind::SlashEcho(_) => false,
         }
     }
 
@@ -9505,9 +10037,9 @@ impl TranscriptEntry {
                 tool_result_summary(tool),
                 format!("transcript:{}", self.id),
             ),
-            TranscriptEntryKind::Log(message) => (
+            TranscriptEntryKind::Log(entry) => (
                 "log entry".to_string(),
-                message.clone(),
+                entry.message.clone(),
                 format!("transcript:{}", self.id),
             ),
             TranscriptEntryKind::PlanCard(data) => (
@@ -9525,7 +10057,41 @@ impl TranscriptEntry {
                 snapshot.display_text.clone(),
                 format!("transcript:{}", self.id),
             ),
+            TranscriptEntryKind::SlashEcho(data) => {
+                let body = if data.args.is_empty() {
+                    data.cmd.clone()
+                } else {
+                    format!("{} {}", data.cmd, data.args)
+                };
+                (
+                    "slash command".to_string(),
+                    body,
+                    format!("transcript:{}", self.id),
+                )
+            }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogKind {
+    /// Standard log line — rendered with `└` and a status-color marker.
+    Normal,
+    /// Operational chrome (turn-complete markers, compaction notices,
+    /// plan-handoff state) — rendered dim/italic with no bullet so it
+    /// fades to the periphery instead of looking like a content event.
+    Operational,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LogEntry {
+    pub(crate) message: String,
+    pub(crate) kind: LogKind,
+}
+
+impl LogEntry {
+    fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -9533,7 +10099,7 @@ impl TranscriptEntry {
 enum TranscriptEntryKind {
     Message(TranscriptItem),
     ToolResult(Box<ToolTranscript>),
-    Log(String),
+    Log(LogEntry),
     /// Plan-mode v3 (PR-F): a styled card pointing at the persisted
     /// plan file. The body is loaded from disk at render time so the
     /// cell tracks in-place refinements and survives compaction.
@@ -9547,6 +10113,17 @@ enum TranscriptEntryKind {
     /// so each reasoning block becomes its own grey collapsible entry
     /// instead of being pinned to the next assistant message.
     Reasoning(Box<squeezy_core::ReasoningSnapshot>),
+    /// Echo of the slash command the user typed (e.g. `/diff`, `/plan rewrite foo`).
+    /// Renders as a one-line styled banner so the transcript history shows
+    /// the invocation that produced the next card / log entry. Inserted only
+    /// for commands that don't open their own UI overlay.
+    SlashEcho(SlashEchoData),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SlashEchoData {
+    pub(crate) cmd: String,
+    pub(crate) args: String,
 }
 
 /// Frozen snapshot of `/diff` output. Lines are pre-rendered with the
@@ -9946,6 +10523,24 @@ fn inline_history_lines_for_flush(
         lines.push(Line::from(""));
     }
     for (index, item) in app.transcript.iter().enumerate().skip(transcript_from) {
+        match reasoning_run_info(&app.transcript, index) {
+            Some(ReasoningRun::Suppressed) => continue,
+            Some(ReasoningRun::Lead { extras }) => {
+                if app.show_reasoning_usage
+                    && let TranscriptEntryKind::Reasoning(snapshot) = &item.kind
+                {
+                    lines.extend(reasoning_block_lines_with_extras(
+                        &snapshot.display_text,
+                        item.collapsed,
+                        false,
+                        extras,
+                    ));
+                    lines.push(Line::from(""));
+                }
+                continue;
+            }
+            None => {}
+        }
         lines.extend(format_transcript_entry_with_width(
             item,
             false,

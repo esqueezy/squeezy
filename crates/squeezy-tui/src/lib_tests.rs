@@ -425,7 +425,7 @@ async fn plan_choice_execute_clean_starts_turn_and_records_compaction_attempt() 
     assert!(
         app.transcript.iter().any(|entry| matches!(
             &entry.kind,
-            TranscriptEntryKind::Log(msg) if msg.contains("execute-clean") || msg.contains("compacted prior context")
+            TranscriptEntryKind::Log(LogEntry { message: msg, .. }) if msg.contains("execute-clean") || msg.contains("compacted prior context")
         )),
         "expected an execute-clean log line; transcript={:?}",
         app.transcript
@@ -508,7 +508,7 @@ async fn plan_choice_view_keeps_prompt_open_and_logs_path() {
     assert!(
         app.transcript.iter().any(|entry| matches!(
             &entry.kind,
-            TranscriptEntryKind::Log(message) if message.contains(&plan_id)
+            TranscriptEntryKind::Log(LogEntry { message, .. }) if message.contains(&plan_id)
         )),
         "expected a 'plan {plan_id} file:' log entry"
     );
@@ -650,7 +650,7 @@ async fn plan_to_build_switch_queues_plan_handoff_when_plan_file_exists() {
     assert!(
         app.transcript.iter().any(|entry| matches!(
             &entry.kind,
-            TranscriptEntryKind::Log(message) if message.contains("plan attached for next Build turn")
+            TranscriptEntryKind::Log(LogEntry { message, .. }) if message.contains("plan attached for next Build turn")
         )),
         "expected handoff log entry; transcript={:?}",
         app.transcript
@@ -779,7 +779,7 @@ async fn take_pending_plan_prefix_drops_handoff_when_file_missing() {
     assert!(
         app.transcript.iter().any(|entry| matches!(
             &entry.kind,
-            TranscriptEntryKind::Log(message) if message.contains("could not read plan file")
+            TranscriptEntryKind::Log(LogEntry { message, .. }) if message.contains("could not read plan file")
         )),
         "expected a recovery log line for the missing plan file; transcript={:?}",
         app.transcript
@@ -2473,11 +2473,12 @@ async fn slash_fork_branches_into_sibling_session_with_same_transcript() {
     );
     // Visible transcript stays in place — the new session inherits the
     // existing turns rather than the user losing their context. The fork
-    // pushes one announcement on top, so the new length is `before + 1`.
+    // pushes a slash-command echo plus the announcement, so the new
+    // length is `before + 2`.
     assert_eq!(
         app.transcript.len(),
-        transcript_before + 1,
-        "fork preserves prior entries and adds exactly the announcement",
+        transcript_before + 2,
+        "fork preserves prior entries and adds the slash echo plus the announcement",
     );
     let announce = last_message_content(&app).expect("fork announcement");
     assert!(
@@ -2704,7 +2705,7 @@ fn shell_tool_rows_show_command_and_highlight_output() {
         "{output}"
     );
     assert!(
-        output.contains("└ cargo test -p squeezy-tui in .:"),
+        output.contains("│ cargo test -p squeezy-tui in .:"),
         "{output}"
     );
     assert!(
@@ -2744,7 +2745,7 @@ fn read_only_shell_rows_render_codex_style_output_block() {
         "{output}"
     );
     assert!(
-        output.contains("└ inspect workspace --details in /tmp/project:"),
+        output.contains("│ inspect workspace --details in /tmp/project:"),
         "{output}"
     );
     assert!(
@@ -4488,7 +4489,7 @@ fn failure_log_renders_as_detail_under_user_turn() {
     let output = render_to_string(&app, 120, 16);
     assert!(output.contains("> hi"), "{output}");
     assert!(
-        output.contains("└ turn failed: provider stream failed"),
+        output.contains("│ turn failed: provider stream failed"),
         "{output}"
     );
     assert!(!output.contains("chars  turn failed"), "{output}");
@@ -5338,7 +5339,7 @@ async fn successful_edit_turn_pushes_diff_undo_hint() {
     drain_agent_events(&mut app).await;
 
     let hint = app.transcript.iter().find_map(|entry| match &entry.kind {
-        TranscriptEntryKind::Log(message)
+        TranscriptEntryKind::Log(LogEntry { message, .. })
             if message.contains("/diff") && message.contains("/undo") =>
         {
             Some(message.clone())
@@ -5386,7 +5387,7 @@ async fn readonly_turn_does_not_push_undo_hint() {
         .transcript
         .iter()
         .filter(|entry| {
-            matches!(&entry.kind, TranscriptEntryKind::Log(message)
+            matches!(&entry.kind, TranscriptEntryKind::Log(LogEntry { message, .. })
                 if message.contains("/diff") && message.contains("/undo"))
         })
         .count();
@@ -5596,7 +5597,7 @@ fn count_auto_compact_nudges(app: &TuiApp) -> usize {
     app.transcript
         .iter()
         .filter(|entry| {
-            matches!(&entry.kind, TranscriptEntryKind::Log(message)
+            matches!(&entry.kind, TranscriptEntryKind::Log(LogEntry { message, .. })
                 if message.contains("auto-compact"))
         })
         .count()
@@ -5693,7 +5694,11 @@ async fn pre_compaction_nudge_fires_at_seventy_percent_of_threshold() {
         .transcript
         .iter()
         .find_map(|entry| match &entry.kind {
-            TranscriptEntryKind::Log(text) if text.contains("auto-compact") => Some(text.clone()),
+            TranscriptEntryKind::Log(LogEntry { message: text, .. })
+                if text.contains("auto-compact") =>
+            {
+                Some(text.clone())
+            }
             _ => None,
         })
         .expect("nudge must fire at 70% of the auto-compact threshold");
@@ -7591,7 +7596,7 @@ async fn shell_sandbox_best_effort_fallback_warns_user_once_per_session() {
         .iter()
         .filter(|entry| match &entry.kind {
             TranscriptEntryKind::Message(item) => item.content.contains(needle),
-            TranscriptEntryKind::Log(message) => message.contains(needle),
+            TranscriptEntryKind::Log(LogEntry { message, .. }) => message.contains(needle),
             _ => false,
         })
         .count();
@@ -7630,7 +7635,7 @@ async fn cost_warning_event_renders_exactly_once() {
         .iter()
         .filter(|entry| match &entry.kind {
             TranscriptEntryKind::Message(item) => item.content.contains(needle),
-            TranscriptEntryKind::Log(message) => message.contains(needle),
+            TranscriptEntryKind::Log(LogEntry { message, .. }) => message.contains(needle),
             _ => false,
         })
         .count();
