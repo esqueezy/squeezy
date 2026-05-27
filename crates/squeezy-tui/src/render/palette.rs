@@ -227,3 +227,69 @@ fn perceptual_distance(a: (u8, u8, u8), b: (u8, u8, u8)) -> f32 {
     let db = a.2 as f32 - b.2 as f32;
     (0.30 * dr * dr) + (0.59 * dg * dg) + (0.11 * db * db)
 }
+
+/// Approximate foreground color for the current terminal tone. Used as the
+/// base for [`muted_fg`] / [`footer_fg`] blending — terminals don't expose
+/// their actual fg/bg, so we use a representative value per tone.
+fn tone_fg_base() -> (u8, u8, u8) {
+    match palette_tone() {
+        PaletteTone::Dark => (220, 220, 220),
+        PaletteTone::Light => (40, 40, 40),
+    }
+}
+
+/// Approximate background color for the current terminal tone.
+fn tone_bg_base() -> (u8, u8, u8) {
+    match palette_tone() {
+        PaletteTone::Dark => (24, 24, 28),
+        PaletteTone::Light => (250, 250, 250),
+    }
+}
+
+/// Tone-aware muted foreground for tool-call body lines and other secondary
+/// text. Drops below `QUIET` (which is a flat `DarkGray`) on TrueColor
+/// terminals; falls back to `QUIET` when the terminal can't render arbitrary
+/// RGB cleanly.
+pub(crate) fn muted_fg() -> Color {
+    match color_level() {
+        ColorLevel::TrueColor | ColorLevel::Ansi256 => {
+            let fg = tone_fg_base();
+            let bg = tone_bg_base();
+            blend_color(
+                Color::Rgb(fg.0, fg.1, fg.2),
+                Color::Rgb(bg.0, bg.1, bg.2),
+                0.45,
+            )
+        }
+        _ => QUIET,
+    }
+}
+
+/// Even dimmer than [`muted_fg`] — for operational chrome (compaction
+/// notices, turn-complete markers) that should fade into the periphery.
+pub(crate) fn footer_fg() -> Color {
+    match color_level() {
+        ColorLevel::TrueColor | ColorLevel::Ansi256 => {
+            let fg = tone_fg_base();
+            let bg = tone_bg_base();
+            blend_color(
+                Color::Rgb(fg.0, fg.1, fg.2),
+                Color::Rgb(bg.0, bg.1, bg.2),
+                0.65,
+            )
+        }
+        _ => QUIET,
+    }
+}
+
+/// Subtle card-surface background — `Some(color)` only when the terminal can
+/// render a faint tint without banding. Returns `None` on Ansi16 / NoColor
+/// where blended bg cells look uniformly muddy.
+#[allow(dead_code)]
+pub(crate) fn surface_bg(accent: Color) -> Option<Color> {
+    if !matches!(color_level(), ColorLevel::TrueColor) {
+        return None;
+    }
+    let bg = tone_bg_base();
+    Some(blend_color(Color::Rgb(bg.0, bg.1, bg.2), accent, 0.08))
+}
