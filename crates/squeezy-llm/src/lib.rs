@@ -29,6 +29,7 @@ mod registry;
 mod retry;
 mod sse;
 pub mod tokens;
+mod xai;
 pub use tokens::{
     DEFAULT_BYTES_PER_TOKEN, DEFAULT_EMA_ALPHA, ProviderCalibration, TokenCalibration,
     default_bytes_per_token, estimate_tokens,
@@ -55,6 +56,7 @@ pub use registry::{
     estimate_request_context, estimate_request_context_calibrated, model_info_for,
     models_for_provider, provider_from_config, provider_name,
 };
+pub use xai::XaiProvider;
 
 pub type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>;
 

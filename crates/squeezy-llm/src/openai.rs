@@ -3,8 +3,8 @@ use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use squeezy_core::{
-    AzureOpenAiConfig, CostSnapshot, OpenAiConfig, ProviderTransportConfig, ResponseVerbosity,
-    Result, SqueezyError,
+    AzureOpenAiConfig, CostSnapshot, OpenAiCompatibleConfig, OpenAiCompatiblePreset, OpenAiConfig,
+    ProviderTransportConfig, ResponseVerbosity, Result, SqueezyError,
 };
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -69,6 +69,33 @@ impl OpenAiProvider {
             api_key,
             base_url: config.base_url.trim_end_matches('/').to_string(),
             api_version: Some(config.api_version.clone()),
+            transport: config.transport,
+        })
+    }
+
+    /// Build an OpenAI Responses-API client targeting xAI's `/responses`
+    /// endpoint. Reuses the OpenAI request body and SSE parser because xAI
+    /// implements the Responses wire as a near-drop-in for Grok 3 and Grok 4
+    /// (see `https://docs.x.ai/docs/api-reference/responses`). The
+    /// `OpenAiCompatibleConfig::extra_headers` map is intentionally ignored
+    /// here — those headers (HTTP-Referer, X-Title, x-portkey-*) are
+    /// chat-completions aggregator concerns and have no analogue on a
+    /// dedicated vendor Responses endpoint.
+    pub fn from_xai_config(config: &OpenAiCompatibleConfig) -> Result<Self> {
+        debug_assert_eq!(config.preset, OpenAiCompatiblePreset::XAi);
+        if config.base_url.trim().is_empty() {
+            return Err(SqueezyError::ProviderNotConfigured(
+                "providers.xai.base_url is required for the xAI Responses route".to_string(),
+            ));
+        }
+        let api_key =
+            resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
+        Ok(Self {
+            name: "xai",
+            client: reqwest::Client::new(),
+            api_key,
+            base_url: config.base_url.trim_end_matches('/').to_string(),
+            api_version: None,
             transport: config.transport,
         })
     }
