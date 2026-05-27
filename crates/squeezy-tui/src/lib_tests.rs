@@ -8070,3 +8070,127 @@ fn frame_rate_limiter_coalesces_burst_into_one_emit() {
         "all five follow-up events inside the budget must be denied"
     );
 }
+
+#[tokio::test]
+async fn alt_one_resumes_most_recent_non_active_session() {
+    // Seed two extra sessions for the workspace and assert Alt+1 lands on
+    // the more recently started one (the active session is excluded so
+    // slot 1 picks the next-newest peer).
+    let root = temp_workspace("quick_switch");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let store = squeezy_store::SessionStore::open(&config);
+
+    let older = store
+        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .expect("seed older session");
+    let newer = store
+        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .expect("seed newer session");
+    // Force an explicit ordering so the test does not depend on
+    // back-to-back `now_ms()` calls landing on different millisecond
+    // boundaries.
+    older
+        .update_metadata(|metadata| metadata.started_at_ms = 1_000)
+        .expect("backdate older");
+    newer
+        .update_metadata(|metadata| metadata.started_at_ms = 2_000)
+        .expect("backdate newer");
+
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    assert!(
+        handle_session_quick_switch(&mut app, &mut agent, 1).await,
+        "Alt+1 should claim the press when a peer session exists"
+    );
+    assert_eq!(
+        agent.session_id().as_deref(),
+        Some(newer.session_id()),
+        "Alt+1 must land on the newer peer; status={}",
+        app.status,
+    );
+    assert!(
+        app.status.contains("resumed session"),
+        "status should report the resume: {}",
+        app.status,
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn alt_nine_reports_no_session_when_slot_is_empty() {
+    // With only one peer session in the store, Alt+9 has nothing to land
+    // on; the handler still claims the keypress (so it doesn't fall
+    // through to other Alt handlers) but reports the empty slot.
+    let root = temp_workspace("quick_switch_empty");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let store = squeezy_store::SessionStore::open(&config);
+    let only = store
+        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .expect("seed only peer");
+    let only_id = only.session_id().to_string();
+
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let active_before = agent.session_id();
+
+    assert!(
+        handle_session_quick_switch(&mut app, &mut agent, 9).await,
+        "Alt+9 must claim the press even when no slot 9 exists"
+    );
+    assert_eq!(
+        agent.session_id(),
+        active_before,
+        "agent must stay on its current session when slot 9 is empty",
+    );
+    assert!(
+        app.status.contains("no recent session"),
+        "status should surface the empty-slot message: {}",
+        app.status,
+    );
+    // Sanity check that the seeded peer actually exists; otherwise the
+    // empty-slot assertion would pass for the wrong reason.
+    let listed = agent
+        .list_sessions(&squeezy_store::SessionQuery::default())
+        .expect("list sessions");
+    assert!(
+        listed.iter().any(|meta| meta.session_id == only_id),
+        "seeded peer must appear in list",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn alt_one_skips_when_an_approval_is_pending() {
+    // Modal-blocking states (approval, plan choice, config screen, …)
+    // must not consume the Alt+1 press so the user can still type into
+    // the prompt; the handler returns `false` and leaves status alone.
+    let root = temp_workspace("quick_switch_blocked");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let store = squeezy_store::SessionStore::open(&config);
+    store
+        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .expect("seed peer session");
+
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let (decision_tx, _decision_rx) = tokio::sync::oneshot::channel();
+    app.pending_approval = Some(PendingApproval {
+        request: sample_approval_request(),
+        decision_tx,
+    });
+    let status_before = app.status.clone();
+
+    assert!(
+        !handle_session_quick_switch(&mut app, &mut agent, 1).await,
+        "Alt+1 must fall through while an approval is pending",
+    );
+    assert_eq!(
+        app.status, status_before,
+        "blocked Alt+1 must not overwrite status"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

@@ -779,6 +779,68 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     }
 }
 
+/// Pick the `slot`-th (1-based) most recent session for this workspace,
+/// excluding the active session, and resume into it. Returns `false` when
+/// the press should fall through to other key handlers (modals/active
+/// turn block the switch); status messages are written for every other
+/// outcome including "no session at this slot" so the user sees feedback.
+async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: usize) -> bool {
+    if app.turn_rx.is_some()
+        || app.pending_approval.is_some()
+        || app.pending_mcp_elicitation.is_some()
+        || app.pending_plan_choice.is_some()
+        || app.config_screen.is_some()
+        || app.status_line_setup.is_some()
+        || app.overlay.is_some()
+        || app.transcript_overlay.is_some()
+    {
+        return false;
+    }
+    let sessions = match agent.list_sessions(&SessionQuery::default()) {
+        Ok(list) => list,
+        Err(error) => {
+            app.status = format!("session quick-switch failed: {error}");
+            return true;
+        }
+    };
+    let active = agent.session_id();
+    let target = sessions
+        .into_iter()
+        .filter(|meta| active.as_deref() != Some(meta.session_id.as_str()))
+        .nth(slot - 1);
+    let Some(target) = target else {
+        app.status = format!("no recent session at slot {slot}");
+        return true;
+    };
+    let session_id = target.session_id.clone();
+    switch_to_session(app, agent, &session_id).await;
+    true
+}
+
+/// Replace the current session with `session_id` and rebuild the in-memory
+/// transcript from the persisted log. Used by both `/resume` and the
+/// Alt+1-9 quick-switch handler so the two paths stay in lockstep.
+async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str) {
+    match agent.resume_current(session_id) {
+        Ok(transcript) => {
+            app.transcript.clear();
+            app.selected_entry = None;
+            app.next_entry_id = 0;
+            for item in transcript {
+                app.push_transcript_item(item);
+            }
+            app.attachments = agent.context_attachments_snapshot().await;
+            app.pending_assistant.clear();
+            app.task_state = None;
+            app.task_panel_collapsed = false;
+            app.turn_rx = None;
+            app.cancel = None;
+            app.status = format!("resumed session {session_id}");
+        }
+        Err(error) => app.status = format!("resume failed: {error}"),
+    }
+}
+
 async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) -> Result<bool> {
     if !event::poll(tick_rate).map_err(|err| SqueezyError::Terminal(err.to_string()))? {
         return Ok(false);
@@ -999,6 +1061,15 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
 
     if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('d') {
         delete_next_word(app);
+        return Ok(false);
+    }
+
+    if key.modifiers == KeyModifiers::ALT
+        && let KeyCode::Char(ch) = key.code
+        && let Some(slot) = ch.to_digit(10)
+        && (1..=9).contains(&slot)
+        && handle_session_quick_switch(app, agent, slot as usize).await
+    {
         return Ok(false);
     }
 
@@ -2005,24 +2076,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 app.status = "usage: /resume <session_id>".to_string();
                 return true;
             };
-            match agent.resume_current(session_id) {
-                Ok(transcript) => {
-                    app.transcript.clear();
-                    app.selected_entry = None;
-                    app.next_entry_id = 0;
-                    for item in transcript {
-                        app.push_transcript_item(item);
-                    }
-                    app.attachments = agent.context_attachments_snapshot().await;
-                    app.pending_assistant.clear();
-                    app.task_state = None;
-                    app.task_panel_collapsed = false;
-                    app.turn_rx = None;
-                    app.cancel = None;
-                    app.status = format!("resumed session {session_id}");
-                }
-                Err(error) => app.status = format!("resume failed: {error}"),
-            }
+            switch_to_session(app, agent, session_id).await;
             return true;
         }
         "/session-export" => {
