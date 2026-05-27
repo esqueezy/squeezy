@@ -22,6 +22,7 @@ mod credentials;
 mod google;
 mod lmstudio;
 pub mod model_discovery;
+pub mod models_dev;
 mod ollama;
 mod openai;
 mod registry;
