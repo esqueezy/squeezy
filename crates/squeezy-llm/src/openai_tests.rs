@@ -438,7 +438,7 @@ fn request_body_emits_text_format_when_output_schema_set() {
             schema: schema.clone(),
             strict: true,
         }),
-            tool_choice: None,
+        tool_choice: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -466,7 +466,7 @@ fn request_body_omits_text_format_when_output_schema_unset() {
         store: false,
         output_schema: None,
         parallel_tool_calls: None,
-            tool_choice: None,
+        tool_choice: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -498,7 +498,7 @@ fn request_body_emits_text_format_without_verbosity_when_only_schema_set() {
             strict: false,
         }),
         parallel_tool_calls: None,
-            tool_choice: None,
+        tool_choice: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -522,7 +522,7 @@ fn request_body_emits_parallel_tool_calls_false_when_disabled() {
         store: false,
         output_schema: None,
         parallel_tool_calls: Some(false),
-            tool_choice: None,
+        tool_choice: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -545,7 +545,7 @@ fn request_body_omits_parallel_tool_calls_when_unset_or_default_true() {
             store: false,
             output_schema: None,
             parallel_tool_calls: value,
-                    tool_choice: None,
+            tool_choice: None,
         };
 
         let body = OpenAiProvider::request_body(&request, "openai");

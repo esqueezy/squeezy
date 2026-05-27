@@ -62,7 +62,6 @@ def main() -> int:
         "--doc",
         default="crates/squeezy-skills/external-docs/LANGUAGES.md",
     )
-    parser.add_argument("--doc", default="crates/squeezy-skills/external-docs/LANGUAGES.md")
     args = parser.parse_args()
 
     bench = Path(args.bench)
