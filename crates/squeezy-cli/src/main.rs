@@ -24,9 +24,11 @@ use squeezy_llm::{
 
 mod auth;
 mod doctor;
+mod providers;
 mod update;
 use auth::handle_auth_command;
 use doctor::DoctorArgs;
+use providers::{ProvidersCommand, handle_providers_command};
 use squeezy_store::{
     BugReportOptions, RepoProfileLoad, ResumeItem, SemanticSupport, SessionEvent, SessionMetadata,
     SessionQuery, SessionResumeState, SessionStatus, SessionStore, default_bug_report_path,
@@ -118,6 +120,11 @@ enum Command {
         about = "Refresh the cached live model catalog from one or more OpenAI-compatible providers"
     )]
     RefreshModels(RefreshModelsArgs),
+    #[command(about = "List and inspect the built-in provider registry")]
+    Providers {
+        #[command(subcommand)]
+        command: ProvidersCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -339,6 +346,7 @@ async fn main() -> squeezy_core::Result<()> {
         Some(Command::RefreshModels(args)) => {
             return handle_refresh_models(args).await;
         }
+        Some(Command::Providers { command }) => return handle_providers_command(command),
         None => {}
     }
 
