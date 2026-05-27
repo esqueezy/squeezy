@@ -4697,6 +4697,51 @@ fn user_prompt_text_is_highlighted_in_transcript() {
 }
 
 #[test]
+fn submitted_bang_prompt_marks_first_nonempty_bang_dark_red() {
+    let item = TranscriptItem::user("  !ls");
+
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let bang = lines[1]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "!")
+        .expect("bang marker span");
+    let rest = lines[1]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "ls")
+        .expect("command body span");
+
+    assert_eq!(bang.style.fg, Some(BANG_RED));
+    assert_eq!(bang.style.bg, Some(PROMPT_BG));
+    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(rest.style.bg, Some(PROMPT_BG));
+}
+
+#[test]
+fn live_prompt_marks_first_nonempty_bang_dark_red() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "  !ls".to_string());
+
+    let lines = prompt_input_content_lines(&app);
+    let bang = lines[0]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "!")
+        .expect("bang marker span");
+    let rest = lines[0]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "ls")
+        .expect("command body span");
+
+    assert_eq!(bang.style.fg, Some(BANG_RED));
+    assert_eq!(bang.style.bg, Some(PROMPT_BG));
+    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(rest.style.bg, Some(PROMPT_BG));
+}
+
+#[test]
 fn prompt_height_grows_for_multiline_input() {
     let mut app = test_app(SessionMode::Build);
     assert_eq!(input_panel_height(&app, 100), 3);
@@ -5392,6 +5437,61 @@ async fn readonly_turn_does_not_push_undo_hint() {
         })
         .count();
     assert_eq!(hint_count, 0, "read-only turn must not produce /undo hint");
+}
+
+#[tokio::test]
+async fn repeated_raw_shell_output_is_not_rendered_as_assistant_reply() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    let output = "about.hbs\nabout.toml\nCargo.toml";
+
+    let mut shell_result = sample_tool_result("shell", output);
+    shell_result.content = serde_json::json!({
+        "command": "ls",
+        "stdout": output,
+        "stderr": "",
+        "exit_code": 0,
+    });
+    tx.send(AgentEvent::ToolCallCompleted {
+        turn_id: TurnId::new(1),
+        result: shell_result,
+    })
+    .await
+    .expect("send tool result");
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant(output),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let assistant_count = app
+        .transcript
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.kind, TranscriptEntryKind::Message(item)
+                if item.role == Role::Assistant)
+        })
+        .count();
+    let tool_count = app
+        .transcript
+        .iter()
+        .filter(|entry| matches!(&entry.kind, TranscriptEntryKind::ToolResult(_)))
+        .count();
+
+    assert_eq!(tool_count, 1, "shell tool card should remain visible");
+    assert_eq!(
+        assistant_count, 0,
+        "assistant duplicate should be dropped: {:?}",
+        app.transcript
+    );
 }
 
 #[tokio::test]

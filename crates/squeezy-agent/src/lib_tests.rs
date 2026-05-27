@@ -1747,8 +1747,10 @@ async fn bang_command_completes_locally_without_provider_request() {
     let mut completed = None;
     let mut tool_result = None;
     let mut queued_tools = Vec::new();
+    let mut assistant_deltas = Vec::new();
     while let Some(event) = rx.recv().await {
         match event {
+            AgentEvent::AssistantDelta { delta, .. } => assistant_deltas.push(delta),
             AgentEvent::ToolCallQueued { call, .. } => queued_tools.push(call),
             AgentEvent::ToolCallCompleted { result, .. } => tool_result = Some(result),
             AgentEvent::Completed { message, .. } => completed = Some(message.content),
@@ -1757,6 +1759,10 @@ async fn bang_command_completes_locally_without_provider_request() {
     }
 
     assert!(provider.requests().is_empty());
+    assert!(
+        assistant_deltas.is_empty(),
+        "local bang commands should not stream assistant text: {assistant_deltas:?}"
+    );
     assert_eq!(queued_tools.len(), 1);
     assert_eq!(queued_tools[0].arguments["command"], "ls");
     let tool_result = tool_result.expect("ls should run through the shell tool");
