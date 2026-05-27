@@ -93,7 +93,17 @@ impl AnthropicProvider {
                 })
                 .collect();
             if prompt_caching && policy.tools {
-                json_markers::mark_last_tool(&mut tool_values);
+                let breakpoint_idx = request
+                    .tools
+                    .iter()
+                    .rposition(|tool| !tool.name.starts_with("mcp__"))
+                    .unwrap_or(request.tools.len().saturating_sub(1));
+                if let Some(obj) = tool_values
+                    .get_mut(breakpoint_idx)
+                    .and_then(Value::as_object_mut)
+                {
+                    obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+                }
             }
             body["tools"] = Value::Array(tool_values);
         }

@@ -1262,7 +1262,19 @@ impl ToolRegistry {
         // `mcp_tool_spec` already compacts at construction; append after the
         // first-party loop to avoid double work.
         specs.extend(self.mcp.tools().into_iter().map(mcp_tool_spec));
-        specs.sort_by(|left, right| left.name.cmp(&right.name));
+        // Partition first-party before MCP, alphabetic within each group. The
+        // contiguous first-party prefix lets the Anthropic adapter place its
+        // tools-array `cache_control` breakpoint on the last first-party tool
+        // (clear-code's `assembleToolPool` invariant in `src/tools.ts:345-367`),
+        // so a mid-session MCP `tools/list` refresh churns only bytes after the
+        // breakpoint instead of invalidating the cached prefix for every turn.
+        specs.sort_by(|left, right| {
+            let left_mcp = left.name.starts_with("mcp__");
+            let right_mcp = right.name.starts_with("mcp__");
+            left_mcp
+                .cmp(&right_mcp)
+                .then_with(|| left.name.cmp(&right.name))
+        });
         specs
     }
 

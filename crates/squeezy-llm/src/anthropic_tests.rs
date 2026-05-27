@@ -255,6 +255,114 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
 }
 
 #[test]
+fn request_body_places_tool_cache_control_on_last_first_party_tool_when_mcp_tools_trail() {
+    // Two first-party tools followed by two MCP tools (the partition the
+    // tool registry enforces). The breakpoint must sit on the last first
+    // -party tool so the cached prefix survives an MCP `tools/list`
+    // refresh that mutates only the trailing MCP block.
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system prompt".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some("squeezy::session-1".to_string()),
+        tools: Arc::from(vec![
+            LlmToolSpec {
+                name: "apply_patch".to_string(),
+                description: "edit".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+            LlmToolSpec {
+                name: "read_file".to_string(),
+                description: "read".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+            LlmToolSpec {
+                name: "mcp__linear__create_issue".to_string(),
+                description: "create issue".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+            LlmToolSpec {
+                name: "mcp__linear__list_issues".to_string(),
+                description: "list issues".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+        ]),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+    };
+
+    let body = AnthropicProvider::request_body(&request);
+    let tools = body["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 4);
+    assert!(tools[0].get("cache_control").is_none());
+    assert_eq!(
+        tools[1]["cache_control"]["type"], "ephemeral",
+        "breakpoint must sit on the last first-party tool"
+    );
+    assert!(tools[2].get("cache_control").is_none());
+    assert!(tools[3].get("cache_control").is_none());
+}
+
+#[test]
+fn request_body_falls_back_to_last_tool_when_all_advertised_tools_are_mcp() {
+    // Edge case: only MCP tools are advertised (no stable first-party
+    // prefix to anchor). Fall back to the unconditional last tool so
+    // caching is still attempted — losing the cache on every MCP refresh
+    // is no worse than the pre-change behavior, but caching the prefix
+    // when MCP tools are stable for many turns is still a win.
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system prompt".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some("squeezy::session-1".to_string()),
+        tools: Arc::from(vec![
+            LlmToolSpec {
+                name: "mcp__linear__create_issue".to_string(),
+                description: "create issue".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+            LlmToolSpec {
+                name: "mcp__linear__list_issues".to_string(),
+                description: "list issues".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+        ]),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+    };
+
+    let body = AnthropicProvider::request_body(&request);
+    let tools = body["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 2);
+    assert!(tools[0].get("cache_control").is_none());
+    assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+}
+
+#[test]
 fn request_body_omits_tool_cache_control_when_caching_disabled() {
     let request = LlmRequest {
         model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
