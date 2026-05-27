@@ -154,6 +154,8 @@ default_model = "google/gemini-2.5-pro"
 [providers.ollama]
 base_url = "http://localhost:11434/api"
 default_model = "qwen3-coder"
+# route_style = "native"            # default; uses /api/chat NDJSON.
+# route_style = "openai_compatible" # switches to /v1/chat/completions SSE.
 
 # ── Single-vendor OpenAI-compatible (full preset) ─────────────────────────
 
@@ -287,7 +289,7 @@ until added to the registry or reported by the local provider.
 - `anthropic`: Anthropic Messages streaming, function tools, cache read/write usage.
 - `google`: Gemini `streamGenerateContent` SSE streaming, function declarations, function calls, usage metadata.
 - `azure_openai`: Azure OpenAI Responses-compatible streaming with `api-key` auth and `api-version`.
-- `ollama`: Local `/api/chat` NDJSON streaming with function tool schemas and zero-dollar pricing.
+- `ollama`: Local `/api/chat` NDJSON streaming with function tool schemas and zero-dollar pricing. Set `route_style = "openai_compatible"` to switch to Ollama's `/v1/chat/completions` SSE endpoint for portable tooling.
 - `bedrock`: AWS SDK Bedrock Runtime `ConverseStream` transport, AWS default credential chain, region/base-url configuration, text streaming, tool use/tool results, and usage metadata.
 - `openrouter` / `vercel` / `portkey` / `groq` / `xai` / `deepseek` / `mistral` / `together` / `fireworks` / `cerebras` / `openai_compatible`: OpenAI-compatible `POST /chat/completions` streaming with Bearer auth, function-tool schemas, and `usage` extraction. OpenRouter ships default `HTTP-Referer` / `X-Title` headers for traffic attribution.
 

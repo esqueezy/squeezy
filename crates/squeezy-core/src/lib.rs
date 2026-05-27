@@ -525,6 +525,11 @@ impl AppConfig {
                 base_url: get_var("OLLAMA_BASE_URL")
                     .or_else(|| provider_setting(&providers, "ollama", "base_url"))
                     .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string()),
+                route_style: get_var("OLLAMA_ROUTE_STYLE")
+                    .or_else(|| provider_setting(&providers, "ollama", "route_style"))
+                    .as_deref()
+                    .and_then(OllamaRoute::parse)
+                    .unwrap_or_default(),
                 transport: provider_transport_settings(&providers, &["ollama"]),
             }),
             "openai" => ProviderConfig::OpenAi(OpenAiConfig {
@@ -1915,7 +1920,36 @@ pub struct BedrockConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OllamaConfig {
     pub base_url: String,
+    /// Wire route for `POST <model>` traffic. `Native` keeps the proprietary
+    /// `/api/chat` NDJSON path (default; exposes `keep_alive` + `num_ctx`);
+    /// `OpenAiCompatible` rewrites the request to `/v1/chat/completions` SSE
+    /// so users with portable tooling can pin Ollama to a uniform contract.
+    #[serde(default)]
+    pub route_style: OllamaRoute,
     pub transport: ProviderTransportConfig,
+}
+
+/// Selects which HTTP route the Ollama provider uses to stream completions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OllamaRoute {
+    /// Ollama's native NDJSON endpoint (`<base>/chat`). Preserves Ollama
+    /// extensions like `keep_alive` and `num_ctx` for local hardware tuning.
+    #[default]
+    Native,
+    /// OpenAI-compatible Chat Completions SSE endpoint (`<root>/v1/chat/completions`).
+    /// Portable wire shape; loses Ollama-specific options.
+    OpenAiCompatible,
+}
+
+impl OllamaRoute {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "native" | "api" | "default" => Some(Self::Native),
+            "openai_compatible" | "openai" | "v1" | "compat" => Some(Self::OpenAiCompatible),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2333,6 +2367,9 @@ pub struct ProviderSettings {
     pub stream_max_retries: Option<u8>,
     pub stream_idle_timeout_ms: Option<u64>,
     pub headers: Option<BTreeMap<String, String>>,
+    /// Ollama-only: `"native"` (default) or `"openai_compatible"` to pin the
+    /// provider to `/v1/chat/completions` SSE instead of `/api/chat` NDJSON.
+    pub route_style: Option<String>,
 }
 
 impl ProviderSettings {
@@ -2353,6 +2390,7 @@ impl ProviderSettings {
                 "stream_max_retries",
                 "stream_idle_timeout_ms",
                 "headers",
+                "route_style",
             ],
             source,
             path,
@@ -2423,6 +2461,7 @@ impl ProviderSettings {
                 &field(path, "stream_idle_timeout_ms"),
             )?,
             headers,
+            route_style: string_value(table, "route_style", source, &field(path, "route_style"))?,
         })
     }
 
@@ -6980,6 +7019,7 @@ fn provider_setting(
         "preset" => settings.preset.as_ref(),
         "vertex_project" => settings.vertex_project.as_ref(),
         "vertex_location" => settings.vertex_location.as_ref(),
+        "route_style" => settings.route_style.as_ref(),
         _ => None,
     }?;
     Some(value.clone())

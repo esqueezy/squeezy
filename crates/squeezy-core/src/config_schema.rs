@@ -1502,6 +1502,7 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
         }),
         "ollama" => ProviderConfig::Ollama(OllamaConfig {
             base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
+            route_style: Default::default(),
             transport,
         }),
         other => {
