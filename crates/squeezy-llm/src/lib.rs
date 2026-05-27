@@ -46,6 +46,10 @@ pub use google::GoogleProvider;
 pub use lmstudio::{
     DEFAULT_LMSTUDIO_BASE_URL, LMStudioConfig, LMStudioProvider, fetch_lmstudio_model_names,
 };
+pub use model_discovery::{
+    CONSERVATIVE_FALLBACK_CAPABILITIES, CapabilitySource, ResolvedCapabilities,
+    resolve_capabilities, resolve_capabilities_with,
+};
 pub use ollama::{
     OllamaProvider, PullEvent, PullStream, fetch_ollama_context_window, fetch_ollama_model_names,
     pull_model,
