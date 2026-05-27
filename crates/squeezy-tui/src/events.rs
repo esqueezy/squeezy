@@ -352,6 +352,10 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // mid-turn we shouldn't snap them down on completion.
                     app.cancel = None;
                     keep_rx = false;
+                    // Signal the main loop to drain the next queued prompt
+                    // (if any) outside this function — we don't have an
+                    // `Agent` handle here.
+                    app.auto_drain_queue = !app.prompt_queue.is_empty();
                     break;
                 }
                 AgentEvent::CostWarning { status, .. } => {

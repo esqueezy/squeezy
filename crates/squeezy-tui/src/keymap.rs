@@ -55,6 +55,11 @@ pub(crate) enum Action {
     /// Jump to the bottom of the transcript when the composer is
     /// empty (`End` default; falls through to line-end otherwise).
     TranscriptEnd,
+    /// Open / close the queued-prompt overlay (`Ctrl+Q` default).
+    ToggleQueueOverlay,
+    /// Pop the next queued prompt and start it (`Ctrl+G` default).
+    /// Only fires when no turn is running and the queue is non-empty.
+    ResumeQueue,
 }
 
 impl Action {
@@ -69,6 +74,8 @@ impl Action {
             Self::ScrollTranscriptPageDown => "page_down",
             Self::TranscriptHome => "transcript_home",
             Self::TranscriptEnd => "transcript_end",
+            Self::ToggleQueueOverlay => "toggle_queue_overlay",
+            Self::ResumeQueue => "resume_queue",
         }
     }
 
@@ -82,6 +89,8 @@ impl Action {
         Action::ScrollTranscriptPageDown,
         Action::TranscriptHome,
         Action::TranscriptEnd,
+        Action::ToggleQueueOverlay,
+        Action::ResumeQueue,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -108,6 +117,8 @@ impl Action {
             }
             Self::TranscriptHome => KeyBinding::new(KeyCode::Home, KeyModifiers::NONE),
             Self::TranscriptEnd => KeyBinding::new(KeyCode::End, KeyModifiers::NONE),
+            Self::ToggleQueueOverlay => KeyBinding::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            Self::ResumeQueue => KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
         }
     }
 }

@@ -65,6 +65,7 @@ mod keymap;
 mod mention;
 mod notification;
 mod overlay;
+mod prompt_queue;
 mod proposed_plan;
 mod render;
 mod resume_picker;
@@ -424,6 +425,20 @@ async fn run_inner(
         // therefore coalesces into a single frame.
         drain_job_events(&mut app);
         drain_agent_events(&mut app).await;
+        if app.auto_drain_queue {
+            app.auto_drain_queue = false;
+            if app.turn_rx.is_none()
+                && let Some(next) = app.prompt_queue.pop_front()
+            {
+                let remaining = app.prompt_queue.len();
+                app.status = if remaining == 0 {
+                    "running queued prompt".to_string()
+                } else {
+                    format!("running queued prompt ({remaining} more queued)")
+                };
+                start_user_turn(&mut app, &mut agent, next);
+            }
+        }
         drain_pending_diff(&mut app);
 
         app.animation_tick = app.animation_tick.wrapping_add(1);
@@ -897,6 +912,13 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
+    // Prompt-queue reorder overlay: same pattern. Routed before the
+    // Esc-cancel-turn shortcut so Esc-in-overlay closes the overlay
+    // rather than interrupting the running turn.
+    if app.prompt_queue_overlay.is_some() && handle_prompt_queue_overlay_key(app, key) {
+        return Ok(false);
+    }
+
     if handle_mcp_elicitation_key(app, key) {
         return Ok(false);
     }
@@ -1068,10 +1090,6 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             Ok(false)
         }
         KeyCode::Enter => {
-            if app.turn_rx.is_some() {
-                app.status = "turn already running; press Ctrl-C to cancel".to_string();
-                return Ok(false);
-            }
             if complete_selected_slash_command(app) {
                 return Ok(false);
             }
@@ -1085,6 +1103,9 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
                 app.status = "enter a prompt first".to_string();
                 return Ok(false);
             }
+            // Slash commands always execute immediately — they're UI
+            // actions, not turn-equivalent prompts, so they shouldn't
+            // queue behind a running turn.
             if handle_slash_command(app, agent, &input).await {
                 clear_input(app);
                 app.input_history_index = None;
@@ -1093,6 +1114,13 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
                 return Ok(false);
             }
             if reject_unknown_slash_command(app, &input) {
+                return Ok(false);
+            }
+            if app.turn_rx.is_some() {
+                app.prompt_queue.push_back(input.clone());
+                clear_input(app);
+                push_input_history(app, input);
+                app.status = format!("queued ({})", app.prompt_queue.len());
                 return Ok(false);
             }
             // Stash the typed prompt before clearing so that a Ctrl-C/Esc
@@ -1163,15 +1191,16 @@ async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Resu
         insert_input_text(app, &normalized);
         return Ok(());
     }
+    if is_inline_paste(&normalized) {
+        insert_input_text(app, &normalized);
+        return Ok(());
+    }
     if app.turn_rx.is_some()
         || app.pending_approval.is_some()
         || app.pending_mcp_elicitation.is_some()
     {
-        app.status = "paste unavailable during active turn".to_string();
-        return Ok(());
-    }
-    if is_inline_paste(&normalized) {
-        insert_input_text(app, &normalized);
+        app.status = "paste-as-attachment unavailable mid-turn; queue the prompt and retry after"
+            .to_string();
         return Ok(());
     }
     match agent.attach_pasted_context(normalized).await {
@@ -1292,6 +1321,42 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             } else {
                 false
             }
+        }
+        keymap::Action::ToggleQueueOverlay => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            app.prompt_queue_overlay = if app.prompt_queue_overlay.is_some() {
+                None
+            } else {
+                Some(prompt_queue::PromptQueueState::new())
+            };
+            app.status = if app.prompt_queue_overlay.is_some() {
+                format!("prompt queue ({} queued)", app.prompt_queue.len())
+            } else {
+                "prompt queue closed".to_string()
+            };
+            true
+        }
+        keymap::Action::ResumeQueue => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            if app.turn_rx.is_some() {
+                return false;
+            }
+            let Some(next) = app.prompt_queue.pop_front() else {
+                app.status = "no queued prompts".to_string();
+                return true;
+            };
+            let remaining = app.prompt_queue.len();
+            app.status = if remaining == 0 {
+                "running queued prompt".to_string()
+            } else {
+                format!("running queued prompt ({remaining} more queued)")
+            };
+            start_user_turn(app, agent, next);
+            true
         }
     }
 }
@@ -2745,6 +2810,21 @@ fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     }
 }
 
+fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    let Some(state) = app.prompt_queue_overlay.as_mut() else {
+        return false;
+    };
+    match state.dispatch(&mut app.prompt_queue, key) {
+        prompt_queue::QueueDispatch::Handled => true,
+        prompt_queue::QueueDispatch::Close => {
+            app.prompt_queue_overlay = None;
+            app.status = "prompt queue closed".to_string();
+            true
+        }
+        prompt_queue::QueueDispatch::Ignored => true, // stay modal
+    }
+}
+
 fn toggle_selected_transcript_entry(app: &mut TuiApp) {
     let selected = app.selected_entry.filter(|index| {
         app.transcript
@@ -2821,7 +2901,7 @@ fn latest_collapsed_transcript_entry(app: &TuiApp) -> Option<usize> {
 /// the resulting prompt to the agent. Used by the Enter key handler and
 /// by the post-plan Execute action so both paths share the same plan
 /// prefix and turn-state bookkeeping.
-fn start_user_turn(app: &mut TuiApp, agent: &mut Agent, input: String) {
+pub(crate) fn start_user_turn(app: &mut TuiApp, agent: &mut Agent, input: String) {
     if let Some(swap) = agent.drain_pending_swap() {
         let note = swap
             .display_note
@@ -7965,28 +8045,46 @@ fn truncate_bytes(text: &str, limit: usize) -> String {
 }
 
 fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
-    let overlay_lines = app
-        .overlay
+    let queue_overlay_lines = app
+        .prompt_queue_overlay
         .as_ref()
-        .map(|o| o.render_lines().len())
+        .map(|state| prompt_queue::render_lines(state, &app.prompt_queue).len())
         .unwrap_or(0);
-    let mention_lines = app
-        .mention_popup
-        .as_ref()
-        .map(|p| p.matches.len().min(5))
-        .unwrap_or(0);
-    let suggestion_lines = if overlay_lines == 0 && mention_lines == 0 {
+    let overlay_lines = if queue_overlay_lines > 0 {
+        0
+    } else {
+        app.overlay
+            .as_ref()
+            .map(|o| o.render_lines().len())
+            .unwrap_or(0)
+    };
+    let mention_lines = if queue_overlay_lines == 0 {
+        app.mention_popup
+            .as_ref()
+            .map(|p| p.matches.len().min(5))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let suggestion_lines = if queue_overlay_lines == 0 && overlay_lines == 0 && mention_lines == 0 {
         slash_suggestions(&app.input).len()
     } else {
         0
     };
-    let popup_height = overlay_lines + mention_lines;
+    let indicator_lines = if queue_overlay_lines == 0 && !app.prompt_queue.is_empty() {
+        1
+    } else {
+        0
+    };
+    let popup_height = queue_overlay_lines + overlay_lines + mention_lines + indicator_lines;
     let max_height = (PROMPT_MAX_HEIGHT as usize).max(popup_height + PROMPT_MIN_HEIGHT as usize);
     prompt_visual_line_count(&app.input, width)
         .saturating_add(2)
+        .saturating_add(queue_overlay_lines)
         .saturating_add(overlay_lines)
         .saturating_add(mention_lines)
         .saturating_add(suggestion_lines)
+        .saturating_add(indicator_lines)
         .clamp(PROMPT_MIN_HEIGHT as usize, max_height) as u16
 }
 
@@ -8225,20 +8323,43 @@ fn visible_slash_suggestions(suggestions: &[SlashCommand], selected: usize) -> &
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let overlay_lines = overlay_picker_lines(app);
-    let mention_lines = if overlay_lines.is_empty() {
+    let queue_overlay_lines: Vec<Line<'static>> = app
+        .prompt_queue_overlay
+        .as_ref()
+        .map(|state| prompt_queue::render_lines(state, &app.prompt_queue))
+        .unwrap_or_default();
+    let queue_open = !queue_overlay_lines.is_empty();
+    let overlay_lines = if queue_open {
+        Vec::new()
+    } else {
+        overlay_picker_lines(app)
+    };
+    let mention_lines = if queue_open || !overlay_lines.is_empty() {
+        Vec::new()
+    } else {
         mention_popup_lines(app)
-    } else {
-        Vec::new()
     };
-    let suggestion_lines = if overlay_lines.is_empty() && mention_lines.is_empty() {
+    let suggestion_lines = if queue_open || !overlay_lines.is_empty() || !mention_lines.is_empty() {
+        Vec::new()
+    } else {
         slash_suggestion_lines(app)
-    } else {
-        Vec::new()
     };
-    let overlay_height = overlay_lines.len() + mention_lines.len() + suggestion_lines.len();
-    let prompt_height = area.height.saturating_sub(overlay_height as u16);
+    let indicator_line = if queue_open {
+        None
+    } else {
+        prompt_queue::indicator_line(&app.prompt_queue, app.turn_rx.is_some())
+    };
+    let extra_height = queue_overlay_lines.len()
+        + overlay_lines.len()
+        + mention_lines.len()
+        + suggestion_lines.len()
+        + indicator_line.iter().count();
+    let prompt_height = area.height.saturating_sub(extra_height as u16);
     let mut lines = prompt_input_lines(app, prompt_height);
+    if let Some(line) = indicator_line {
+        lines.push(line);
+    }
+    lines.extend(queue_overlay_lines);
     lines.extend(overlay_lines);
     lines.extend(mention_lines);
     lines.extend(suggestion_lines);
@@ -8581,8 +8702,13 @@ fn format_status_hints(app: &TuiApp) -> String {
         return "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Esc cancel"
             .to_string();
     } else if app.cancel.is_some() {
-        return "Ctrl-C/Esc interrupt · Ctrl+J newline · Ctrl-P task · Ctrl-E expand · Ctrl-T transcript · Ctrl-Y copy · /help"
-            .to_string();
+        let mut hint = String::from(
+            "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-E expand · Ctrl-T transcript · Ctrl-Y copy · /help",
+        );
+        if !app.prompt_queue.is_empty() {
+            hint.push_str(&format!(" · Ctrl+Q reorder ({})", app.prompt_queue.len()));
+        }
+        return hint;
     } else if app.exit_confirm_armed {
         return "Ctrl+C or Y to exit · any other key to cancel".to_string();
     }
@@ -8605,6 +8731,12 @@ fn format_status_hints(app: &TuiApp) -> String {
         ) >= CONTEXT_BUDGET_HINT_PCT
     {
         base.push_str(" · /pin to keep important context · /compact to summarize");
+    }
+    if !app.prompt_queue.is_empty() {
+        base.push_str(&format!(
+            " · queued: {} · Ctrl+G resume · Ctrl+Q reorder",
+            app.prompt_queue.len()
+        ));
     }
     base
 }
@@ -9167,6 +9299,19 @@ pub(crate) struct TuiApp {
     /// elapsed-time counter on the Working row so the user can see the
     /// command is making progress even though the foreground UI is idle.
     pub(crate) pending_diff_started_at: Option<Instant>,
+    /// FIFO of prompts the user typed while a turn was running. Drained
+    /// one-at-a-time as each turn completes; preserved on cancel.
+    pub(crate) prompt_queue: VecDeque<String>,
+    /// Open reorder overlay state. `None` when the overlay is closed;
+    /// the queue itself lives on `prompt_queue` regardless.
+    pub(crate) prompt_queue_overlay: Option<prompt_queue::PromptQueueState>,
+    /// Set true when a turn just completed successfully and the queue is
+    /// non-empty. The main loop reads this immediately after
+    /// `drain_agent_events` returns, pops the next prompt, and calls
+    /// `start_user_turn`. Cleared each time the main loop reads it.
+    /// Cancelled and Failed turns deliberately do NOT set this flag —
+    /// the user is in the driver's seat on cancellation.
+    pub(crate) auto_drain_queue: bool,
 }
 
 #[derive(Debug, Default)]
@@ -9334,6 +9479,9 @@ impl TuiApp {
             keymap: keymap::KeymapResolver::from_overrides(&config.tui.keymap),
             pending_diff: None,
             pending_diff_started_at: None,
+            prompt_queue: VecDeque::new(),
+            prompt_queue_overlay: None,
+            auto_drain_queue: false,
         }
     }
 
