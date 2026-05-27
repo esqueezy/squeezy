@@ -425,6 +425,7 @@ fn request_body_emits_text_format_when_output_schema_set() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        parallel_tool_calls: None,
         output_schema: Some(LlmOutputSchema {
             name: "answer_with_confidence".to_string(),
             schema: schema.clone(),
@@ -447,10 +448,6 @@ fn request_body_omits_text_format_when_output_schema_unset() {
     let request = LlmRequest {
         model: "gpt-test".to_string().into(),
         instructions: "hi".to_string().into(),
-fn request_body_emits_parallel_tool_calls_false_when_disabled() {
-    let request = LlmRequest {
-        model: "gpt-test".to_string().into(),
-        instructions: "be brief".to_string().into(),
         input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: None,
         response_verbosity: None,
@@ -460,6 +457,7 @@ fn request_body_emits_parallel_tool_calls_false_when_disabled() {
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -490,12 +488,29 @@ fn request_body_emits_text_format_without_verbosity_when_only_schema_set() {
             schema,
             strict: false,
         }),
+        parallel_tool_calls: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
     assert_eq!(body["text"]["format"]["type"], "json_schema");
     assert_eq!(body["text"]["format"]["strict"], false);
     assert!(body["text"].get("verbosity").is_none());
+}
+
+#[test]
+fn request_body_emits_parallel_tool_calls_false_when_disabled() {
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        output_schema: None,
         parallel_tool_calls: Some(false),
     };
 
@@ -517,6 +532,7 @@ fn request_body_omits_parallel_tool_calls_when_unset_or_default_true() {
             cache_key: None,
             tools: Arc::from(Vec::new()),
             store: false,
+            output_schema: None,
             parallel_tool_calls: value,
         };
 

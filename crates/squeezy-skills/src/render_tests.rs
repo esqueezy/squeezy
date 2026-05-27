@@ -11,6 +11,7 @@ fn skill(name: &str, body: &str) -> LoadedSkill {
             source: SkillSource::Project,
             location: PathBuf::from(format!(".squeezy/skills/{name}/SKILL.md")),
             disabled: false,
+            manifest: None,
         },
         base_dir: PathBuf::from(format!(".squeezy/skills/{name}")),
         body: body.to_string(),

@@ -34,6 +34,8 @@ fn sample_request() -> LlmRequest {
             .into(),
         ]),
         store: false,
+        output_schema: None,
+        parallel_tool_calls: None,
     }
 }
 

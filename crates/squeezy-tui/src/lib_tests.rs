@@ -3310,7 +3310,10 @@ fn highlight_yaml_code_block() {
         "yaml key should be styled, got {:?}",
         key.style.fg
     );
-    assert_eq!(number.style.fg, Some(render::highlight::NUMBER_COLOR));
+    assert_eq!(
+        number.style.fg,
+        Some(render::highlight::HighlightPalette::current().number)
+    );
 }
 
 #[test]
@@ -3331,8 +3334,14 @@ fn highlight_bash_code_block() {
         .iter()
         .find(|span| span.content.as_ref() == "if")
         .expect("bash keyword span");
-    assert_eq!(comment.style.fg, Some(render::highlight::COMMENT_COLOR));
-    assert_eq!(keyword.style.fg, Some(render::highlight::KEYWORD_COLOR));
+    assert_eq!(
+        comment.style.fg,
+        Some(render::highlight::HighlightPalette::current().comment)
+    );
+    assert_eq!(
+        keyword.style.fg,
+        Some(render::highlight::HighlightPalette::current().keyword)
+    );
 }
 
 #[test]

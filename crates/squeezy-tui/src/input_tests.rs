@@ -150,6 +150,8 @@ fn capability_badge_labels_are_stable() {
         let label = capability_badge_label(cap);
         assert!(!label.is_empty(), "{cap:?} produced an empty badge");
     }
+}
+
 #[test]
 fn slash_suggestions_match_substring_not_just_prefix() {
     // Substring after `/` should match — `/com` resolves `/compact`.

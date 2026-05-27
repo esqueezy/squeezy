@@ -50,6 +50,8 @@ fn mcp_fixture(enabled: bool, transport: McpTransport) -> McpServerConfig {
         args: Vec::new(),
         url: None,
         timeout_ms: None,
+        discovery_timeout_ms: None,
+        tool_call_timeout_ms: None,
         enabled_tools: None,
         disabled_tools: Vec::new(),
         env: BTreeMap::new(),

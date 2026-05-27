@@ -2729,6 +2729,7 @@ async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy(
             None,
         ))),
         subagents: SubagentRegistry::default(),
+        hooks: None,
     };
 
     let approver = shell_ask_approver_for_context(&context);

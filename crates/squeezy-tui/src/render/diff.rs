@@ -451,7 +451,7 @@ mod tests {
             .expect("`fn` keyword span on the added line");
         assert_eq!(
             add_fn_span.style.fg,
-            Some(highlight::KEYWORD_COLOR),
+            Some(highlight::HighlightPalette::current().keyword),
             "`fn` should be coloured by the highlighter, not the diff fg",
         );
         // Highlighted spans on added lines inherit the add-line bg tint.
