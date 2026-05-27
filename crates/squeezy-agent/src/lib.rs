@@ -8107,7 +8107,7 @@ async fn permission_decision_for_request(
     );
     if let Some(verdict) = mode_permission_verdict(active_mode, &request, active_plan.as_deref()) {
         log_permission_verdict(&request, &verdict);
-        return ApprovalDecision::Denied(context.redactor.redact(&verdict.reason).text);
+        return ApprovalDecision::Denied(verdict_deny_reason_for_model(context, &verdict));
     }
     let session_rules = snapshot_session_rules(&context.session_rules);
     let mut verdict = context
@@ -8254,7 +8254,10 @@ async fn permission_decision_for_request(
     match verdict.action {
         PermissionAction::Allow => ApprovalDecision::Approved,
         PermissionAction::Deny => {
-            ApprovalDecision::Denied(context.redactor.redact(&verdict.reason).text)
+            if verdict.silent {
+                log_silent_deny(context, &request, &verdict);
+            }
+            ApprovalDecision::Denied(verdict_deny_reason_for_model(context, &verdict))
         }
         PermissionAction::Ask => {
             let (decision_tx, decision_rx) = oneshot::channel();
@@ -8545,6 +8548,7 @@ pub(crate) fn mode_permission_verdict(
         action: PermissionAction::Deny,
         matched_rule: None,
         reason,
+        silent: false,
     })
 }
 
@@ -8616,10 +8620,63 @@ fn log_permission_verdict(request: &PermissionRequest, verdict: &PermissionVerdi
         target = %request.target,
         risk = %request.risk.as_str(),
         action = %verdict.action.as_str(),
+        silent = verdict.silent,
         matched_source,
         matched_target,
         reason = %verdict.reason,
         "permission verdict",
+    );
+}
+
+/// Static placeholder sent to the model when a silent-deny rule fires. Kept
+/// deliberately short so boilerplate policy denials (e.g. an absolute deny
+/// rule for `rm -rf /`) do not burn tool-result tokens with a structured
+/// `capability=...; target=...; risk=...` line on every retry. The audit
+/// JSONL still receives the full `verdict.reason` via [`log_silent_deny`].
+const SILENT_DENY_MODEL_MESSAGE: &str = "action denied by policy";
+
+/// Build the deny reason the model sees on its tool-result message. For
+/// silent rules, returns the minimal [`SILENT_DENY_MODEL_MESSAGE`]; otherwise
+/// returns the redacted full reason. The full reason is preserved in the
+/// audit JSONL by [`log_silent_deny`] before this returns.
+fn verdict_deny_reason_for_model(
+    context: &PermissionDecisionContext,
+    verdict: &PermissionVerdict,
+) -> String {
+    if verdict.silent {
+        SILENT_DENY_MODEL_MESSAGE.to_string()
+    } else {
+        context.redactor.redact(&verdict.reason).text
+    }
+}
+
+/// Write a `permission_denied_silent` audit event with the full reason and
+/// matched-rule shape. The model only sees `SILENT_DENY_MODEL_MESSAGE`, so
+/// this is the only place the rich diagnostics land for these rules.
+fn log_silent_deny(
+    context: &PermissionDecisionContext,
+    request: &PermissionRequest,
+    verdict: &PermissionVerdict,
+) {
+    let matched = verdict.matched_rule.as_ref();
+    log_session_event(
+        context.session_log.as_ref(),
+        &context.redactor,
+        "permission_denied_silent",
+        Some(context.turn_id),
+        Some(verdict.reason.clone()),
+        json!({
+            "reason": verdict.reason.clone(),
+            "tool": request.tool_name.clone(),
+            "capability": request.capability.as_str(),
+            "target": request.target.clone(),
+            "risk": request.risk.as_str(),
+            "matched_rule": matched.map(|rule| json!({
+                "capability": rule.capability.clone(),
+                "target": rule.target.clone(),
+                "source": rule.source.as_str(),
+            })),
+        }),
     );
 }
 
@@ -8702,6 +8759,7 @@ pub(crate) fn parse_classifier_verdict(text: &str) -> PermissionVerdict {
             action: PermissionAction::Deny,
             matched_rule: None,
             reason: format!("shell classifier denied command: {reason_excerpt}"),
+            silent: false,
         },
         // Allow from the classifier is intentionally disallowed - we keep the
         // verdict at Ask so a human still confirms.
@@ -8709,6 +8767,7 @@ pub(crate) fn parse_classifier_verdict(text: &str) -> PermissionVerdict {
             action: PermissionAction::Ask,
             matched_rule: None,
             reason: format!("shell classifier requires approval: {reason_excerpt}"),
+            silent: false,
         },
     }
 }

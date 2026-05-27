@@ -1064,6 +1064,111 @@ fn permission_policy_downgrades_allow_on_bare_star_runtime_safety_net() {
     );
 }
 
+#[test]
+fn silent_rule_evaluates_to_silent_deny() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[[permissions.rules]]
+capability = "destructive"
+target = "rm:-rf:/"
+action = "deny"
+source = "user"
+silent = true
+reason = "absolute deny rule for rm -rf /"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    let request = PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Destructive,
+        target: "rm:-rf:/".to_string(),
+        risk: PermissionRisk::High,
+        summary: "rm -rf /".to_string(),
+        metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    };
+
+    let verdict = config.permissions.evaluate(&request);
+    assert_eq!(verdict.action, PermissionAction::Deny);
+    assert!(verdict.silent, "silent rule must produce silent verdict");
+    assert_eq!(
+        verdict.matched_rule.as_ref().map(|rule| rule.silent),
+        Some(true),
+    );
+    assert!(
+        verdict.reason.contains("absolute deny"),
+        "verdict reason should retain rule reason: {}",
+        verdict.reason,
+    );
+}
+
+#[test]
+fn non_silent_deny_rule_leaves_verdict_silent_false() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[[permissions.rules]]
+capability = "shell"
+target = "cargo test:*"
+action = "deny"
+source = "user"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    let verdict = config.permissions.evaluate(&shell_request("cargo test:*"));
+    assert_eq!(verdict.action, PermissionAction::Deny);
+    assert!(
+        !verdict.silent,
+        "deny rule without silent=true must not produce a silent verdict",
+    );
+}
+
+#[test]
+fn silent_true_on_non_deny_rule_is_rejected_at_load_time() {
+    let result = SettingsFile::from_toml_str(
+        r#"
+[[permissions.rules]]
+capability = "shell"
+target = "ls:*"
+action = "ask"
+source = "user"
+silent = true
+"#,
+        "test",
+    );
+    let err = result.expect_err("silent=true on ask rule must fail to load");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("silent = true is only valid on Deny rules"),
+        "unexpected message: {msg}",
+    );
+}
+
+#[test]
+fn silent_deny_propagates_via_session_layer_in_evaluate_with_extra() {
+    let policy = PermissionPolicy::default();
+    let session_rule = PermissionRule::new(
+        "shell",
+        "shred:*",
+        PermissionAction::Deny,
+        PermissionRuleSource::Session,
+        Some("policy: shred is forbidden".to_string()),
+    )
+    .with_silent(true);
+    let verdict = policy.evaluate_with_extra(
+        &shell_request("shred:*"),
+        std::slice::from_ref(&session_rule),
+    );
+    assert_eq!(verdict.action, PermissionAction::Deny);
+    assert!(verdict.silent);
+}
+
 fn try_app_config(toml: &str) -> Result<AppConfig> {
     let settings = SettingsFile::from_toml_str(toml, "test").expect("settings parse");
     AppConfig::try_from_settings_and_env_vars(settings, None, |_| None)

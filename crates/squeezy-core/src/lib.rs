@@ -3937,6 +3937,21 @@ pub struct PermissionRule {
     pub action: PermissionAction,
     pub source: PermissionRuleSource,
     pub reason: Option<String>,
+    /// When `true` and `action == Deny`, the matching verdict suppresses the
+    /// per-call narrative on the tool-result string sent back to the model
+    /// (the audit JSONL still records the full reason). Only meaningful for
+    /// `Deny` rules; loaders reject `silent = true` on `Allow`/`Ask` to keep
+    /// the field's semantics narrow. The use case is boilerplate policy: an
+    /// absolute deny rule like `rm -rf /` or writes to `.git/config` does not
+    /// need to spell out `capability=...; target=...; risk=...` to the model
+    /// on every retry — the model only needs to know the call is rejected and
+    /// move on. Auditability stays in the JSONL log.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub silent: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl PermissionRule {
@@ -3953,7 +3968,18 @@ impl PermissionRule {
             action,
             source,
             reason,
+            silent: false,
         }
+    }
+
+    /// Mark this rule as silent. Only meaningful for `Deny` rules; the loader
+    /// rejects `silent = true` on `Allow`/`Ask`, but this setter does not
+    /// re-check because in-memory builders may compose pieces in either order.
+    /// Callers responsible for upholding the invariant are the TOML loader and
+    /// any future builders that synthesize rules from typed sources.
+    pub fn with_silent(mut self, silent: bool) -> Self {
+        self.silent = silent;
+        self
     }
 }
 
@@ -3974,6 +4000,12 @@ pub struct PermissionVerdict {
     pub action: PermissionAction,
     pub matched_rule: Option<PermissionRule>,
     pub reason: String,
+    /// True when this verdict came from a `silent` deny rule. The agent uses
+    /// this to send a minimal `"action denied by policy"` to the model in place
+    /// of the structured `reason`, while the audit JSONL still receives the
+    /// full reason via `log_permission_verdict`. Only set when `action` is
+    /// `Deny`; other actions ignore the flag.
+    pub silent: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -4873,10 +4905,17 @@ impl PermissionPolicy {
                     .clone()
                     .unwrap_or_else(|| format!("matched {} permission rule", rule.source.as_str()))
             });
+            // Silent is honored only when the resolved action is Deny: a
+            // downgraded Allow that survives with silent=true would be outside
+            // the documented policy shape (the loader already refuses silent
+            // on non-Deny rules), and a Deny that was downgraded would also
+            // drop silent.
+            let silent = rule.silent && action == PermissionAction::Deny;
             return PermissionVerdict {
                 action,
                 reason,
                 matched_rule: Some(rule),
+                silent,
             };
         }
         let action = self.mode_for(legacy_scope_for_capability(request.capability));
@@ -4888,6 +4927,7 @@ impl PermissionPolicy {
                 request.capability.as_str(),
                 action.as_str()
             ),
+            silent: false,
         }
     }
 }
@@ -8074,7 +8114,7 @@ fn permission_rules_value(
                 .ok_or_else(|| type_error(source, &rule_path, "table"))?;
             reject_unknown_keys(
                 table,
-                &["capability", "target", "action", "source", "reason"],
+                &["capability", "target", "action", "source", "reason", "silent"],
                 source,
                 &rule_path,
             )?;
@@ -8120,13 +8160,16 @@ fn permission_rules_value(
                 .and_then(PermissionRuleSource::parse)
                 .unwrap_or_else(|| default_permission_rule_source(source));
             let reason = string_value(table, "reason", source, &field(&rule_path, "reason"))?;
-            Ok(PermissionRule::new(
-                capability,
-                target,
-                action,
-                source_value,
-                reason,
-            ))
+            let silent =
+                bool_value(table, "silent", source, &field(&rule_path, "silent"))?.unwrap_or(false);
+            if silent && action != PermissionAction::Deny {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {rule_path}: silent = true is only valid on Deny rules; \
+                     remove `silent` or set `action = \"deny\"`"
+                )));
+            }
+            Ok(PermissionRule::new(capability, target, action, source_value, reason)
+                .with_silent(silent))
         })
         .collect()
 }
@@ -8153,7 +8196,7 @@ fn mcp_permission_rules_value(
                 .ok_or_else(|| type_error(source, &rule_path, "table"))?;
             reject_unknown_keys(
                 table,
-                &["target", "action", "source", "reason"],
+                &["target", "action", "source", "reason", "silent"],
                 source,
                 &rule_path,
             )?;
@@ -8182,13 +8225,16 @@ fn mcp_permission_rules_value(
                 .and_then(PermissionRuleSource::parse)
                 .unwrap_or_else(|| default_permission_rule_source(source));
             let reason = string_value(table, "reason", source, &field(&rule_path, "reason"))?;
-            Ok(PermissionRule::new(
-                "mcp",
-                target,
-                action,
-                source_value,
-                reason,
-            ))
+            let silent =
+                bool_value(table, "silent", source, &field(&rule_path, "silent"))?.unwrap_or(false);
+            if silent && action != PermissionAction::Deny {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {rule_path}: silent = true is only valid on Deny rules; \
+                     remove `silent` or set `action = \"deny\"`"
+                )));
+            }
+            Ok(PermissionRule::new("mcp", target, action, source_value, reason)
+                .with_silent(silent))
         })
         .collect()
 }

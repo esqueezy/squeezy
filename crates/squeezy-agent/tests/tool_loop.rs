@@ -2089,6 +2089,193 @@ async fn blocked_web_domain_rule_returns_denied_tool_result() {
 }
 
 #[tokio::test]
+async fn silent_deny_omits_reason_from_tool_result() {
+    // F04-cc-permission-decision-silent-vs-explained (squeezy-4b7.17):
+    // a deny rule with `silent = true` must replace the structured
+    // `capability=...; target=...; risk=...` line in the tool-result with the
+    // static `action denied by policy` placeholder. The model's tool-result
+    // payload is the only place we assert here; the audit log is covered by
+    // the unit-level test below in lib_tests.rs.
+    let root = temp_workspace("silent_deny_omits_reason");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "web_call".to_string(),
+                name: "webfetch".to_string(),
+                arguments: serde_json::json!({"url": "https://example.com/docs"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("ok".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.web = PermissionMode::Allow;
+    config.permissions.rules.push(
+        PermissionRule::new(
+            "network",
+            "domain:example.com",
+            PermissionAction::Deny,
+            PermissionRuleSource::Project,
+            Some("absolute deny: example.com is forbidden by policy".to_string()),
+        )
+        .with_silent(true),
+    );
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("fetch blocked domain".to_string(), CancellationToken::new()))
+        .await;
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "web_call");
+    assert_eq!(outputs[0].1["status"], "Denied");
+    let reason = outputs[0].1["content"]["reason"]
+        .as_str()
+        .expect("reason on tool result");
+    assert_eq!(
+        reason, "action denied by policy",
+        "silent rule must replace the structured reason on the tool-result",
+    );
+    assert!(
+        !reason.contains("capability="),
+        "model-facing reason must not include the structured per-call narrative",
+    );
+    assert!(
+        !reason.contains("absolute deny"),
+        "model-facing reason must not include the rule's own reason text",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn non_silent_deny_rule_still_carries_explanation_to_the_model() {
+    // Counterpoint to silent_deny_omits_reason_from_tool_result: when the
+    // rule does NOT set `silent = true`, the model still receives the rule's
+    // reason text. This is the existing behavior; the test pins it so a
+    // future change cannot silently flip the default.
+    let root = temp_workspace("explained_deny_keeps_reason");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "web_call".to_string(),
+                name: "webfetch".to_string(),
+                arguments: serde_json::json!({"url": "https://example.com/docs"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("ok".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.web = PermissionMode::Allow;
+    config.permissions.rules.push(PermissionRule::new(
+        "network",
+        "domain:example.com",
+        PermissionAction::Deny,
+        PermissionRuleSource::Project,
+        Some("explained: example.com is for staging only".to_string()),
+    ));
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("fetch explained".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    let reason = outputs[0].1["content"]["reason"]
+        .as_str()
+        .expect("reason on tool result");
+    assert!(
+        reason.contains("explained"),
+        "non-silent rule must keep the rule's reason on the tool-result; got: {reason}",
+    );
+    assert_ne!(
+        reason, "action denied by policy",
+        "non-silent rule must NOT use the silent placeholder",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn silent_deny_does_not_emit_approval_requested() {
+    // A silent deny is still a Deny verdict, so the user must not be
+    // prompted via AgentEvent::ApprovalRequested. The test asserts the
+    // approval channel is never woken for the silent-deny call.
+    let root = temp_workspace("silent_deny_no_approval");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "web_call".to_string(),
+                name: "webfetch".to_string(),
+                arguments: serde_json::json!({"url": "https://example.com/x"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("ok".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.web = PermissionMode::Allow;
+    config.permissions.rules.push(
+        PermissionRule::new(
+            "network",
+            "domain:example.com",
+            PermissionAction::Deny,
+            PermissionRuleSource::Project,
+            Some("boilerplate".to_string()),
+        )
+        .with_silent(true),
+    );
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("trigger silent deny".to_string(), CancellationToken::new());
+    let mut saw_approval_request = false;
+    while let Some(event) = rx.recv().await {
+        if matches!(event, AgentEvent::ApprovalRequested { .. }) {
+            saw_approval_request = true;
+        }
+    }
+    assert!(
+        !saw_approval_request,
+        "silent-deny rules must not surface an approval prompt",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn approved_webfetch_validation_error_returns_to_model_and_web_tools_are_indexed() {
     let root = temp_workspace("approved_webfetch_validation");
     let provider = Arc::new(ScriptedProvider::new(vec![
