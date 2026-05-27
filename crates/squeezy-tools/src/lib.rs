@@ -2626,6 +2626,47 @@ impl ToolRegistry {
                 }
                 let matches = state.current.match_indices(search.as_str()).count();
                 if matches == 0 {
+                    // Quote-normalize fallback (F14-cc): the byte-exact search
+                    // failed, retry after collapsing curly quotes on both
+                    // sides. Common case: the file has `don\u{2019}t` but the
+                    // model emitted ASCII `don't`. Deterministic and free —
+                    // the sha256 staleness gate above stays in place because
+                    // we still hash the final file in the commit phase. Only
+                    // rescue single-match cases so the multi-match safeguard
+                    // below still applies; the unified-diff path remains for
+                    // wider drift the model opts into explicitly.
+                    if let Some((qstart, qend, qcount)) =
+                        find_with_quote_normalization(&state.current, search)
+                        && qcount == 1
+                    {
+                        let original_slice = &state.current[qstart..qend];
+                        let replacement = preserve_quote_style(replace, original_slice);
+                        let before_len = state.current.len();
+                        let mut new_contents = String::with_capacity(
+                            state.current.len() - (qend - qstart) + replacement.len(),
+                        );
+                        new_contents.push_str(&state.current[..qstart]);
+                        new_contents.push_str(&replacement);
+                        new_contents.push_str(&state.current[qend..]);
+                        state.current = new_contents;
+                        let after_len = state.current.len();
+                        staged.mark_last_op_inexact(Some("quote_normalize"));
+                        preview_ops.push(json!({
+                            "patch_index": index,
+                            "kind": "search_replace",
+                            "path": rel,
+                            "matches": qcount,
+                            "allow_multiple": allow_multiple.unwrap_or(false),
+                            "bytes_delta": after_len as i64 - before_len as i64,
+                            "fallback": "quote_normalize",
+                            "exact": false,
+                            "preview": {
+                                "search": truncate_text(search, PATCH_SNIPPET_MAX_CHARS),
+                                "replace": truncate_text(replace, PATCH_SNIPPET_MAX_CHARS),
+                            }
+                        }));
+                        return Ok(());
+                    }
                     // Optional unified-diff fallback (F89): the search body is
                     // a unified diff; preflight against the live worktree, and
                     // if it would apply, materialise the result by reading the
@@ -2648,7 +2689,7 @@ impl ToolRegistry {
                                     }
                                 };
                                 state.current = new_contents;
-                                staged.mark_last_op_inexact();
+                                staged.mark_last_op_inexact(Some("unified_diff"));
                                 preview_ops.push(json!({
                                     "patch_index": index,
                                     "kind": "search_replace",
@@ -3808,6 +3849,11 @@ pub(crate) enum StagedOp {
         rel: String,
         file_index: usize,
         exact: bool,
+        /// Audit tag describing which rescue path matched the search when the
+        /// byte-exact lookup failed. `None` for verbatim matches; `Some` for
+        /// `unified_diff` / `quote_normalize` so the post-apply `delta` and
+        /// log can attribute the inexact apply.
+        fallback: Option<&'static str>,
     },
     CreateFile {
         rel: String,
@@ -3841,6 +3887,7 @@ impl StagedApply {
                 rel: rel.to_string(),
                 file_index: idx,
                 exact: true,
+                fallback: None,
             });
             return Ok(idx);
         }
@@ -3859,15 +3906,24 @@ impl StagedApply {
             rel: rel.to_string(),
             file_index: idx,
             exact: true,
+            fallback: None,
         });
         Ok(idx)
     }
 
-    /// Mark the most-recently staged op as non-exact (e.g., the search-replace
-    /// matched only via the `unified_diff` fallback rather than verbatim).
-    fn mark_last_op_inexact(&mut self) {
-        if let Some(StagedOp::SearchReplace { exact, .. }) = self.ops.last_mut() {
+    /// Mark the most-recently staged op as non-exact and stamp the fallback
+    /// tag (e.g., the search-replace matched only via `unified_diff` or
+    /// `quote_normalize` rather than verbatim). Both flags surface in
+    /// `applied_delta` so the audit log captures the rescue.
+    fn mark_last_op_inexact(&mut self, fallback_tag: Option<&'static str>) {
+        if let Some(StagedOp::SearchReplace {
+            exact, fallback, ..
+        }) = self.ops.last_mut()
+        {
             *exact = false;
+            if fallback_tag.is_some() {
+                *fallback = fallback_tag;
+            }
         }
     }
 
@@ -4070,6 +4126,12 @@ impl StagedOp {
                 obj.insert("error".to_string(), json!(message));
             }
             match self {
+                StagedOp::SearchReplace {
+                    fallback: Some(tag),
+                    ..
+                } => {
+                    obj.insert("fallback".to_string(), json!(tag));
+                }
                 StagedOp::SearchReplace { .. } => {}
                 StagedOp::CreateFile { contents, .. } => {
                     obj.insert(
@@ -4612,6 +4674,123 @@ pub(crate) fn truncate_text(value: &str, max_chars: usize) -> String {
     output
 }
 
+/// Curly-quote → straight-quote map used by the apply_patch search fallback.
+/// Mirrors clear-code's `normalizeQuotes` (`src/tools/FileEditTool/utils.ts:31`).
+/// Each curly quote in UTF-8 is 3 bytes; the straight counterpart is 1 byte —
+/// so a normalized copy of any string is at most the same byte length as the
+/// original, never longer. That lets us safely index normalized offsets back
+/// into the original via a per-character byte map.
+fn map_curly_to_straight(ch: char) -> Option<char> {
+    match ch {
+        '\u{2018}' | '\u{2019}' => Some('\''),
+        '\u{201C}' | '\u{201D}' => Some('"'),
+        _ => None,
+    }
+}
+fn normalize_quotes(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        output.push(map_curly_to_straight(ch).unwrap_or(ch));
+    }
+    output
+}
+/// Locate `search` inside `content` after collapsing curly quotes to their
+/// straight ASCII counterparts on both sides. Returns `(byte_start, byte_end)`
+/// pointing at the matched slice in the *original* `content`, plus the number
+/// of normalized matches — so the caller can refuse to apply when the
+/// normalized search matched more than once. Returns `None` when no normalized
+/// match exists. Used only after `match_indices(search)` returned zero; never
+/// shadows an exact hit.
+fn find_with_quote_normalization(content: &str, search: &str) -> Option<(usize, usize, usize)> {
+    let normalized_search = normalize_quotes(search);
+    if normalized_search.is_empty() {
+        return None;
+    }
+    // Build a per-byte map from normalized-content byte offsets back to
+    // original-content byte offsets. We push one entry per byte produced into
+    // the normalized buffer; the curly-quote case shrinks 3 bytes → 1.
+    let mut normalized = String::with_capacity(content.len());
+    let mut byte_map: Vec<usize> = Vec::with_capacity(content.len());
+    for (orig_idx, ch) in content.char_indices() {
+        let mapped = map_curly_to_straight(ch).unwrap_or(ch);
+        let pre_len = normalized.len();
+        normalized.push(mapped);
+        for _ in 0..(normalized.len() - pre_len) {
+            byte_map.push(orig_idx);
+        }
+    }
+    // Map for the byte just past the end so `match_end` can resolve.
+    byte_map.push(content.len());
+    let mut matches = Vec::new();
+    let mut scan_from = 0;
+    while let Some(rel) = normalized[scan_from..].find(normalized_search.as_str()) {
+        let n_start = scan_from + rel;
+        let n_end = n_start + normalized_search.len();
+        matches.push((n_start, n_end));
+        scan_from = n_start + 1;
+    }
+    if matches.is_empty() {
+        return None;
+    }
+    let (n_start, n_end) = matches[0];
+    let orig_start = *byte_map.get(n_start)?;
+    let orig_end = *byte_map.get(n_end)?;
+    Some((orig_start, orig_end, matches.len()))
+}
+/// Re-emit curly quotes in `replace` whenever the matched original slice used
+/// them, so a quote-normalized edit preserves the file's typography. Mirrors
+/// clear-code's `preserveQuoteStyle` (`src/tools/FileEditTool/utils.ts:104`)
+/// with the same open/close heuristic plus the apostrophe-in-contraction
+/// special case so `"don't" → "don't"` round-trips correctly.
+fn preserve_quote_style(replace: &str, original_slice: &str) -> String {
+    let has_curly_double =
+        original_slice.contains('\u{201C}') || original_slice.contains('\u{201D}');
+    let has_curly_single =
+        original_slice.contains('\u{2018}') || original_slice.contains('\u{2019}');
+    if !has_curly_double && !has_curly_single {
+        return replace.to_string();
+    }
+    let chars: Vec<char> = replace.chars().collect();
+    let mut output = String::with_capacity(replace.len());
+    for (idx, ch) in chars.iter().enumerate() {
+        match ch {
+            '"' if has_curly_double => {
+                output.push(if is_opening_quote_context(&chars, idx) {
+                    '\u{201C}'
+                } else {
+                    '\u{201D}'
+                });
+            }
+            '\'' if has_curly_single => {
+                let prev = idx.checked_sub(1).and_then(|i| chars.get(i)).copied();
+                let next = chars.get(idx + 1).copied();
+                let prev_is_letter = prev.map(|c| c.is_alphabetic()).unwrap_or(false);
+                let next_is_letter = next.map(|c| c.is_alphabetic()).unwrap_or(false);
+                if prev_is_letter && next_is_letter {
+                    // Contraction (e.g. "don't") — always the right curly.
+                    output.push('\u{2019}');
+                } else {
+                    output.push(if is_opening_quote_context(&chars, idx) {
+                        '\u{2018}'
+                    } else {
+                        '\u{2019}'
+                    });
+                }
+            }
+            _ => output.push(*ch),
+        }
+    }
+    output
+}
+fn is_opening_quote_context(chars: &[char], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    matches!(
+        chars[index - 1],
+        ' ' | '\t' | '\n' | '\r' | '(' | '[' | '{' | '\u{2014}' | '\u{2013}'
+    )
+}
 fn patch_match_contexts(content: &str, search: &str, max_matches: usize) -> Vec<Value> {
     content
         .match_indices(search)

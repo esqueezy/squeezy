@@ -2150,6 +2150,112 @@ async fn apply_patch_unified_diff_fallback_applies_via_git_apply_3way() {
 }
 
 #[tokio::test]
+async fn apply_patch_recovers_from_curly_quote_drift() {
+    // Audit F14-cc: the file uses a curly apostrophe (U+2019) but the model
+    // emits ASCII `'` in both `search` and `replace`. The byte-exact lookup
+    // misses, the quote-normalize fallback locates the slice, and the
+    // replacement re-emits the curly apostrophe via `preserve_quote_style`
+    // so the file's typography survives the edit. The applied_delta surfaces
+    // the `fallback: "quote_normalize"` tag for the audit log.
+    let root = temp_workspace("apply_patch_curly_quote");
+    let initial = "We don\u{2019}t fly.\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_curly".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "search_replace",
+                        "path": "doc.txt",
+                        "search": "don't fly",
+                        "replace": "don't run",
+                        "expected_sha256": on_disk_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-curly".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let final_doc = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert_eq!(
+        final_doc, "We don\u{2019}t run.\n",
+        "curly apostrophe must survive the edit",
+    );
+    let applied_delta = result
+        .content
+        .get("applied_delta")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(applied_delta["exact"], false);
+    assert_eq!(applied_delta["operations"][0]["exact"], false);
+    assert_eq!(
+        applied_delta["operations"][0]["fallback"],
+        "quote_normalize"
+    );
+    let operations = result
+        .content
+        .get("operations")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .expect("operations preview");
+    assert_eq!(operations[0]["fallback"], "quote_normalize");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_does_not_levenshtein_match() {
+    // Audit F14-cc anti-pattern guard: the quote-normalize fallback must be
+    // narrow. A 3-character-different search (no quote drift, just a typo)
+    // must NOT be rescued — keep the fallback deterministic, no fuzzy creep.
+    let root = temp_workspace("apply_patch_no_levenshtein");
+    let initial = "hello world\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    // Three characters off ('helo wrld!' vs 'hello world') — no curly drift,
+    // just a typo. Quote-normalize must NOT rescue this.
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_fuzzy".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "search_replace",
+                        "path": "doc.txt",
+                        "search": "helo wrld!",
+                        "replace": "hi there",
+                        "expected_sha256": on_disk_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-fuzzy".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Stale, "{:?}", result.content);
+    assert_eq!(
+        result.content["error"], "search text was not found",
+        "no fuzzy match: must surface the exact error so the model re-reads"
+    );
+    let unchanged = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert_eq!(unchanged, initial);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn apply_patch_returns_per_op_delta_with_exact_flag_on_success() {
     // Audit F14: a multi-op apply_patch success must expose a per-op `delta`
     // array — one entry per requested op, each `applied` and `exact=true`
