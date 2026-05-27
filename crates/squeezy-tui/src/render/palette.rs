@@ -21,6 +21,7 @@ pub(crate) const MODE_PURPLE: Color = Color::Rgb(216, 180, 254);
 pub(crate) const SUCCESS_GREEN: Color = Color::Rgb(22, 101, 52);
 pub(crate) const MODE_BUILD_GREEN: Color = Color::Rgb(34, 117, 64);
 pub(crate) const ERROR_RED: Color = Color::Rgb(248, 113, 113);
+pub(crate) const BANG_RED: Color = Color::Rgb(153, 27, 27);
 pub(crate) const QUIET: Color = Color::DarkGray;
 pub(crate) const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
 pub(crate) const WORKING_SHIMMER_HIGHLIGHT: Color = Color::Rgb(255, 251, 235);
