@@ -1752,6 +1752,10 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             handle_slash_diff(app);
             return true;
         }
+        "/effort" => {
+            handle_slash_effort(app, agent, parts.next());
+            return true;
+        }
         "/verbosity" => {
             // Back-compat: `/verbosity concise|normal|verbose` still works as
             // a quick set. Without an arg, opens the config screen on the
@@ -2615,6 +2619,55 @@ fn parse_tool_output_verbosity(value: &str) -> Option<ToolOutputVerbosity> {
         "normal" => Some(ToolOutputVerbosity::Normal),
         "verbose" => Some(ToolOutputVerbosity::Verbose),
         _ => None,
+    }
+}
+
+/// `/effort` sets `model.reasoning_effort` in the live in-memory config so the
+/// next turn picks it up via `request_reasoning_effort`. `auto` (or `clear`,
+/// `unset`, `none`) drops the override and falls back to the model default. The
+/// command is session-scoped — to persist across runs, edit `model.reasoning_effort`
+/// via `/config`. `SQUEEZY_REASONING_EFFORT` env var still wins on next load, so
+/// surface that fact when set.
+fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
+    let Some(raw) = value else {
+        let current = agent.config_snapshot().reasoning_effort.map_or_else(
+            || "unset (model default)".to_string(),
+            |e| e.as_str().to_string(),
+        );
+        app.status = format!("reasoning effort: {current}");
+        app.push_transcript_item(TranscriptItem::system(format!(
+            "reasoning effort = {current}\nusage: /effort [low|medium|high|xhigh|auto]"
+        )));
+        return;
+    };
+    let next_effort = match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" | "clear" | "unset" | "none" => None,
+        other => match squeezy_core::ReasoningEffort::parse(other) {
+            Some(effort) => Some(effort),
+            None => {
+                app.status =
+                    format!("unknown effort {raw:?}; expected low, medium, high, xhigh, or auto");
+                return;
+            }
+        },
+    };
+    let mut next = agent.config_snapshot();
+    next.reasoning_effort = next_effort;
+    agent.replace_config(next);
+    let label = next_effort.map_or_else(
+        || "auto (model default)".to_string(),
+        |e| e.as_str().to_string(),
+    );
+    app.app_notifications.push(
+        format!("reasoning effort → {label}"),
+        NotifySeverity::Success,
+    );
+    app.status = format!("reasoning effort → {label}");
+    if std::env::var("SQUEEZY_REASONING_EFFORT").is_ok() {
+        app.app_notifications.push(
+            "SQUEEZY_REASONING_EFFORT overrides this on next load".to_string(),
+            NotifySeverity::Warn,
+        );
     }
 }
 

@@ -283,6 +283,13 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         ],
     },
     slash_args_caps(
+        "/effort",
+        "set reasoning effort for this session (or `auto` to clear)",
+        false,
+        "[low|medium|high|xhigh|auto]",
+        &[PermissionCapability::Edit],
+    ),
+    slash_args_caps(
         "/verbosity",
         "open config focused on response verbosity (or set inline)",
         false,

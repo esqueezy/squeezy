@@ -6518,6 +6518,58 @@ async fn slash_verbosity_with_inline_arg_applies_immediately() {
     );
 }
 
+// ---- /effort session-level reasoning-effort setter ----
+
+#[tokio::test]
+async fn slash_effort_low_sets_session_reasoning_effort() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(agent.config_snapshot().reasoning_effort.is_none());
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/effort low").await;
+    assert!(ran);
+    assert_eq!(
+        agent.config_snapshot().reasoning_effort,
+        Some(squeezy_core::ReasoningEffort::Low),
+    );
+}
+
+#[tokio::test]
+async fn slash_effort_auto_clears_session_reasoning_effort() {
+    let mut agent = test_agent(SessionMode::Build);
+    // Pre-seed a value so `auto` has something to clear.
+    let mut seeded = agent.config_snapshot();
+    seeded.reasoning_effort = Some(squeezy_core::ReasoningEffort::High);
+    agent.replace_config(seeded);
+    let mut app = test_app(SessionMode::Build);
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/effort auto").await;
+    assert!(ran);
+    assert!(agent.config_snapshot().reasoning_effort.is_none());
+}
+
+#[tokio::test]
+async fn slash_effort_rejects_unknown_value() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut seeded = agent.config_snapshot();
+    seeded.reasoning_effort = Some(squeezy_core::ReasoningEffort::Medium);
+    agent.replace_config(seeded);
+    let mut app = test_app(SessionMode::Build);
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/effort bogus").await;
+    assert!(ran);
+    // Original value preserved on bad input.
+    assert_eq!(
+        agent.config_snapshot().reasoning_effort,
+        Some(squeezy_core::ReasoningEffort::Medium),
+    );
+    assert!(
+        app.status.contains("unknown effort"),
+        "expected error status, got {}",
+        app.status,
+    );
+}
+
 #[tokio::test]
 async fn slash_verbosity_opens_config_when_called_without_arg() {
     let mut agent = test_agent(SessionMode::Build);
