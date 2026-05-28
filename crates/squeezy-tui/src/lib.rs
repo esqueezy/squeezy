@@ -78,6 +78,7 @@ mod status;
 mod status_line_setup;
 mod streaming;
 mod streaming_patch;
+mod terminal_writer;
 mod toast;
 pub use render::markdown::render_markdown;
 pub use streaming_patch::{
@@ -107,6 +108,7 @@ use render::palette::{
 };
 #[cfg(test)]
 use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG, WORKING_SHIMMER_HIGHLIGHT};
+use terminal_writer::TerminalWriter;
 use toast::ToastQueue;
 
 const INLINE_PASTE_MAX_BYTES: usize = 512;
@@ -11491,7 +11493,7 @@ impl From<TuiAlternateScreen> for TerminalMode {
 }
 
 struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: Terminal<CrosstermBackend<TerminalWriter>>,
     mode: TerminalMode,
     exit_hint: Option<String>,
     startup_flushed: bool,
@@ -11511,9 +11513,14 @@ impl TerminalGuard {
         let mode = TerminalMode::from(alternate_screen);
         let synchronized_output = resolve_synchronized_output(synchronized_output);
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        let mut stdout = io::stdout();
+        // Wrap stdout in the env-gated debug-tap writer so every
+        // subsequent ANSI sequence — startup setup, draw bytes, and
+        // teardown — is mirrored to the log when
+        // `SQUEEZY_TUI_WRITE_LOG` is set. When unset the wrapper is a
+        // thin pass-through.
+        let mut writer = TerminalWriter::from_env(io::stdout());
         let _ = execute!(
-            stdout,
+            writer,
             DisableModifyOtherKeys,
             PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
@@ -11530,7 +11537,7 @@ impl TerminalGuard {
         match mode {
             TerminalMode::Inline => {
                 execute!(
-                    stdout,
+                    writer,
                     Print(CLEAR_SCROLLBACK_AND_VISIBLE),
                     Print(DISABLE_MOUSE_MODES),
                     DisableAlternateScroll,
@@ -11538,13 +11545,13 @@ impl TerminalGuard {
                 )
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
                 if mouse_capture {
-                    execute!(stdout, Print(ENABLE_MOUSE_CLICK_CAPTURE))
+                    execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))
                         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
                 }
             }
             TerminalMode::AlternateScreen => {
                 execute!(
-                    stdout,
+                    writer,
                     EnterAlternateScreen,
                     Print(DISABLE_MOUSE_MODES),
                     EnableAlternateScroll,
@@ -11554,12 +11561,12 @@ impl TerminalGuard {
                 )
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
                 if mouse_capture {
-                    execute!(stdout, Print(ENABLE_MOUSE_CLICK_CAPTURE))
+                    execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))
                         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
                 }
             }
         }
-        let backend = CrosstermBackend::new(stdout);
+        let backend = CrosstermBackend::new(writer);
         let terminal = match mode {
             TerminalMode::Inline => Terminal::with_options(
                 backend,
