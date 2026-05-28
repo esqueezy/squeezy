@@ -18,6 +18,7 @@ use crate::{
     oauth::{anthropic_oauth_beta_header, is_anthropic_oauth_token},
     retry::{RetryPolicy, idle_timeout, send_with_auth_retry, with_stream_retry},
     sse::SseDecoder,
+    transport::shared_client,
 };
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -76,7 +77,7 @@ impl AnthropicProvider {
         transport: ProviderTransportConfig,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: shared_client(&transport),
             api_key,
             base_url,
             transport,

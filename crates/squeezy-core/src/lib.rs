@@ -196,6 +196,17 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_PROVIDER_REQUEST_MAX_RETRIES: u8 = 4;
 pub const DEFAULT_PROVIDER_STREAM_MAX_RETRIES: u8 = 5;
 pub const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
+/// Default idle timeout (ms) for sockets parked in the shared HTTP
+/// pool before reqwest evicts them. Matches reqwest's own default so
+/// the centralized factory preserves pre-F08 per-provider behavior
+/// when the user has not set a custom `[transport]` knob.
+pub const DEFAULT_PROVIDER_POOL_IDLE_TIMEOUT_MS: u64 = 90_000;
+/// Default cap on idle TCP connections kept per origin in the shared
+/// HTTP pool. `u32::MAX` is effectively unbounded (mirrors reqwest's
+/// `usize::MAX` default) so existing per-provider workloads keep
+/// reusing as many warmed sockets as they did before the dispatcher
+/// was centralized.
+pub const DEFAULT_PROVIDER_POOL_MAX_IDLE_PER_HOST: u32 = u32::MAX;
 pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
 // Per-subagent-invocation budgets. No peer agent has any equivalent —
 // codex, CC, and opencode bound work per single tool call,
@@ -2049,11 +2060,21 @@ impl OllamaRoute {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProviderTransportConfig {
     pub request_max_retries: u8,
     pub stream_max_retries: u8,
     pub stream_idle_timeout_ms: u64,
+    /// Idle timeout (ms) for TCP connections sitting in the shared
+    /// HTTP pool. `0` disables eviction entirely (connections live
+    /// until the remote closes them). Mirrors pi's
+    /// `HTTP_IDLE_TIMEOUT_MS` knob — but note this controls pool
+    /// eviction; per-event SSE idle gating stays governed by
+    /// [`Self::stream_idle_timeout_ms`].
+    pub pool_idle_timeout_ms: u64,
+    /// Maximum idle TCP connections kept per origin in the shared
+    /// HTTP pool. `u32::MAX` is effectively unbounded.
+    pub pool_max_idle_per_host: u32,
 }
 
 impl Default for ProviderTransportConfig {
@@ -2062,6 +2083,8 @@ impl Default for ProviderTransportConfig {
             request_max_retries: DEFAULT_PROVIDER_REQUEST_MAX_RETRIES,
             stream_max_retries: DEFAULT_PROVIDER_STREAM_MAX_RETRIES,
             stream_idle_timeout_ms: DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_MS,
+            pool_idle_timeout_ms: DEFAULT_PROVIDER_POOL_IDLE_TIMEOUT_MS,
+            pool_max_idle_per_host: DEFAULT_PROVIDER_POOL_MAX_IDLE_PER_HOST,
         }
     }
 }

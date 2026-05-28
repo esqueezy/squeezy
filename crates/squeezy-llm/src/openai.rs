@@ -18,6 +18,7 @@ use crate::{
     credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
     retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
     sse::SseDecoder,
+    transport::shared_client,
 };
 
 #[derive(Clone)]
@@ -112,7 +113,7 @@ impl OpenAiProvider {
     ) -> Self {
         Self {
             name,
-            client: reqwest::Client::new(),
+            client: shared_client(&transport),
             api_key,
             base_url,
             api_version,

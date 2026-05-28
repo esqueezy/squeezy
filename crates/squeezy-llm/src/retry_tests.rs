@@ -24,6 +24,7 @@ fn provider_requests_policy_inherits_transport_max_retries() {
         request_max_retries: 7,
         stream_max_retries: 3,
         stream_idle_timeout_ms: 1_000,
+        ..ProviderTransportConfig::default()
     };
     let policy = RetryPolicy::provider_requests(transport);
     assert_eq!(policy.max_retries, 7);
@@ -39,6 +40,7 @@ fn provider_stream_policy_inherits_transport_stream_retries() {
         request_max_retries: 1,
         stream_max_retries: 4,
         stream_idle_timeout_ms: 1_000,
+        ..ProviderTransportConfig::default()
     };
     let policy = RetryPolicy::provider_stream(transport);
     assert_eq!(policy.max_retries, 4);
@@ -53,6 +55,7 @@ fn idle_timeout_reflects_transport_setting() {
         request_max_retries: 0,
         stream_max_retries: 0,
         stream_idle_timeout_ms: 250,
+        ..ProviderTransportConfig::default()
     };
     assert_eq!(idle_timeout(transport), Duration::from_millis(250));
 }

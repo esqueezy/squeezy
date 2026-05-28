@@ -158,6 +158,7 @@ fn provider_for(addr: SocketAddr, stream_max_retries: u8) -> AnthropicProvider {
             request_max_retries: 0,
             stream_max_retries,
             stream_idle_timeout_ms: 5_000,
+            ..ProviderTransportConfig::default()
         },
     };
     AnthropicProvider::from_config(&config).expect("provider")
