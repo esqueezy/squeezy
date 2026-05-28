@@ -1508,9 +1508,9 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
         AnthropicConfig, AzureOpenAiConfig, BedrockConfig, DEFAULT_ANTHROPIC_BASE_URL,
         DEFAULT_AZURE_OPENAI_API_VERSION, DEFAULT_AZURE_OPENAI_BASE_URL, DEFAULT_BEDROCK_REGION,
         DEFAULT_GOOGLE_BASE_URL, DEFAULT_OLLAMA_BASE_URL, DEFAULT_OPENAI_BASE_URL,
-        DEFAULT_OPENAI_CODEX_BASE_URL, DEFAULT_OPENAI_CODEX_ORIGINATOR, GoogleConfig, OllamaConfig,
-        OpenAiCodexConfig, OpenAiCompatibleConfig, OpenAiCompatiblePreset, OpenAiConfig,
-        ProviderTransportConfig,
+        DEFAULT_OPENAI_CODEX_BASE_URL, DEFAULT_OPENAI_CODEX_ORIGINATOR, FauxConfig, GoogleConfig,
+        OllamaConfig, OpenAiCodexConfig, OpenAiCompatibleConfig, OpenAiCompatiblePreset,
+        OpenAiConfig, ProviderTransportConfig,
     };
     let transport = ProviderTransportConfig::default();
     cfg.provider = match s {
@@ -1559,6 +1559,11 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
             route_style: Default::default(),
             transport,
         }),
+        "faux" | "mock" => ProviderConfig::Faux(FauxConfig {
+            script: None,
+            name: None,
+            transport,
+        }),
         other => {
             let preset = OpenAiCompatiblePreset::parse(other).ok_or("unknown provider")?;
             ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
@@ -1587,6 +1592,7 @@ fn provider_to_str(p: &ProviderConfig) -> &'static str {
         ProviderConfig::Ollama(_) => "ollama",
         ProviderConfig::OpenAiCodex(_) => "openai_codex",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
+        ProviderConfig::Faux(_) => "faux",
     }
 }
 
@@ -1599,6 +1605,7 @@ pub fn default_model_for(provider: &str) -> &'static str {
         "bedrock" => DEFAULT_BEDROCK_MODEL,
         "ollama" => DEFAULT_OLLAMA_MODEL,
         "openai_codex" | "openai-codex" | "chatgpt" => DEFAULT_OPENAI_CODEX_MODEL,
+        "faux" | "mock" => crate::DEFAULT_FAUX_MODEL,
         other => match OpenAiCompatiblePreset::parse(other) {
             Some(preset) => preset.default_model(),
             None => DEFAULT_OPENAI_MODEL,

@@ -40,6 +40,10 @@ pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
 pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/api";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
+/// Synthetic model id for the in-process faux provider. The faux
+/// provider does not consult model registries during a request — this
+/// is purely a label that flows through cost/logging surfaces.
+pub const DEFAULT_FAUX_MODEL: &str = "faux-1";
 
 // Small-fast-model defaults per provider. Used for low-stakes background calls
 // (compaction summaries, classifier prompts, auto-approver) where flagship
@@ -630,6 +634,12 @@ impl AppConfig {
                     transport: provider_transport_settings(&providers, &["openai_codex"]),
                 })
             }
+            "faux" | "mock" => ProviderConfig::Faux(FauxConfig {
+                script: get_var("SQUEEZY_FAUX_SCRIPT")
+                    .or_else(|| provider_setting(&providers, "faux", "script")),
+                name: None,
+                transport: provider_transport_settings(&providers, &["faux"]),
+            }),
             other if OpenAiCompatiblePreset::parse(other).is_some() => {
                 let preset =
                     OpenAiCompatiblePreset::parse(other).expect("guarded by match condition");
@@ -668,6 +678,8 @@ impl AppConfig {
                 provider_setting(&providers, config.preset.as_str(), "default_model")
                     .unwrap_or_else(|| config.preset.default_model().to_string())
             }
+            ProviderConfig::Faux(_) => provider_setting(&providers, "faux", "default_model")
+                .unwrap_or_else(|| DEFAULT_FAUX_MODEL.to_string()),
         };
         let profile = get_var("SQUEEZY_PROFILE")
             .or(model_settings.profile)
@@ -693,6 +705,7 @@ impl AppConfig {
             ProviderConfig::Ollama(_) => "ollama",
             ProviderConfig::OpenAiCodex(_) => "openai_codex",
             ProviderConfig::OpenAiCompatible(_) => "",
+            ProviderConfig::Faux(_) => "faux",
         };
         let model = resolve_model_alias(provider_slug, &raw_model)
             .map(str::to_string)
@@ -1656,6 +1669,7 @@ fn provider_kind(provider: &ProviderConfig) -> &'static str {
         ProviderConfig::Ollama(_) => "ollama",
         ProviderConfig::OpenAiCodex(_) => "openai_codex",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
+        ProviderConfig::Faux(_) => "faux",
     }
 }
 
@@ -1754,6 +1768,13 @@ pub enum ProviderConfig {
     /// key. The credential is never carried inline in the TOML — the
     /// settings only describe the endpoint and originator.
     OpenAiCodex(OpenAiCodexConfig),
+    /// Deterministic in-process faux provider for tests and the eval
+    /// harness. The wire protocol is local: each `stream_response` call
+    /// pops the next scripted response from an internal queue and replays
+    /// it as a synthetic event stream. No outbound HTTP. See
+    /// `squeezy-llm`'s `FauxProvider` for the runtime behaviour and
+    /// script format.
+    Faux(FauxConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2133,6 +2154,47 @@ pub struct OllamaConfig {
     /// so users with portable tooling can pin Ollama to a uniform contract.
     #[serde(default)]
     pub route_style: OllamaRoute,
+    pub transport: ProviderTransportConfig,
+}
+
+/// Configuration for the in-process faux provider used by tests and the
+/// eval harness. The provider is wired through [`ProviderConfig::Faux`]
+/// so eval / integration tests can target it with a `[providers.faux]`
+/// TOML section instead of plumbing a bespoke mock through every entry
+/// point.
+///
+/// Example settings:
+///
+/// ```toml
+/// [model]
+/// provider = "faux"
+///
+/// [providers.faux]
+/// # Optional path to a TOML script file. When omitted the provider
+/// # starts empty and callers must push responses programmatically.
+/// script = "tests/fixtures/faux-script.toml"
+/// # Optional override for the provider name reported by
+/// # `LlmProvider::name` (defaults to "faux").
+/// default_model = "faux-1"
+/// ```
+///
+/// `script` is read by `squeezy-llm`'s `FauxProvider::from_config`; see
+/// that crate for the script schema (a list of `[[turn]]` entries with
+/// `text` / `thinking` / `tool_calls` / `error` / token-usage fields).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FauxConfig {
+    /// Path to a TOML file describing the scripted responses. Resolved
+    /// relative to the process working directory when the provider is
+    /// constructed.
+    #[serde(default)]
+    pub script: Option<String>,
+    /// Optional override for the provider name returned by
+    /// `LlmProvider::name`. Falls back to `"faux"` when unset.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Retry / timeout knobs are accepted for surface symmetry with the
+    /// real providers but ignored by the in-process faux implementation.
+    #[serde(default)]
     pub transport: ProviderTransportConfig,
 }
 
@@ -2609,6 +2671,9 @@ pub struct ProviderSettings {
     /// Ollama-only: `"native"` (default) or `"openai_compatible"` to pin the
     /// provider to `/v1/chat/completions` SSE instead of `/api/chat` NDJSON.
     pub route_style: Option<String>,
+    /// Faux-only: path to a TOML script file consumed by the in-process
+    /// faux provider. Other providers ignore this field.
+    pub script: Option<String>,
 }
 
 impl ProviderSettings {
@@ -2634,6 +2699,7 @@ impl ProviderSettings {
                 "request_metadata",
                 "deployment_name_map",
                 "route_style",
+                "script",
             ],
             source,
             path,
@@ -2742,6 +2808,7 @@ impl ProviderSettings {
             request_metadata: None,
             deployment_name_map,
             route_style: string_value(table, "route_style", source, &field(path, "route_style"))?,
+            script: string_value(table, "script", source, &field(path, "script"))?,
         })
     }
 
@@ -2764,7 +2831,8 @@ impl ProviderSettings {
             next.stream_idle_timeout_ms,
         );
         replace_if_some(&mut self.headers, next.headers);
-        replace_if_some(&mut self.deployment_name_map, next.deployment_name_map);
+        replace_if_some(&mut self.route_style, next.route_style);
+        replace_if_some(&mut self.script, next.script);
     }
 }
 
@@ -7509,6 +7577,7 @@ fn provider_setting(
         "route_style" => settings.route_style.as_ref(),
         "cloudflare_account_id" => settings.cloudflare_account_id.as_ref(),
         "cloudflare_gateway_id" => settings.cloudflare_gateway_id.as_ref(),
+        "script" => settings.script.as_ref(),
         _ => None,
     }?;
     Some(value.clone())
@@ -7563,6 +7632,9 @@ fn validate_provider_base_urls(provider: &ProviderConfig) -> Result<()> {
             Some(url) => check_base_url_scheme(url, "bedrock"),
             None => Ok(()),
         },
+        // The faux provider runs entirely in-process; no base URL to
+        // validate.
+        ProviderConfig::Faux(_) => Ok(()),
     }
 }
 
@@ -7764,6 +7836,7 @@ fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] 
             OpenAiCompatiblePreset::CloudflareAiGateway => &["cloudflare_ai_gateway"],
             OpenAiCompatiblePreset::Custom => &["openai_compatible"],
         },
+        ProviderConfig::Faux(_) => &["faux"],
     }
 }
 
