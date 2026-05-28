@@ -764,16 +764,13 @@ fn is_word_separator(ch: char) -> bool {
 }
 
 pub(crate) fn push_input_history(app: &mut TuiApp, input: String) {
-    if input.trim().is_empty() || input.starts_with('/') {
-        return;
-    }
-    if app.input_history.last().is_some_and(|last| last == &input) {
+    // Slash commands are UI actions, not prompts the user would want to
+    // recall via Up/Down — keep them out of the ring at the TUI seam so
+    // the storage layer stays agnostic of squeezy's command vocabulary.
+    if input.starts_with('/') {
         return;
     }
     app.input_history.push(input);
-    if app.input_history.len() > 100 {
-        app.input_history.remove(0);
-    }
 }
 
 pub(crate) fn reject_unknown_slash_command(app: &mut TuiApp, input: &str) -> bool {
@@ -815,7 +812,9 @@ pub(crate) fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirectio
         (Some(index), HistoryDirection::Next) => Some(index + 1),
     };
     if let Some(index) = next {
-        set_input(app, app.input_history[index].clone());
+        if let Some(entry) = app.input_history.get(index) {
+            set_input(app, entry.to_string());
+        }
         app.input_history_index = Some(index);
         app.selected_entry = None;
         app.slash_menu_index = 0;
