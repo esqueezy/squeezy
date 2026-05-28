@@ -22,11 +22,13 @@ use squeezy_llm::{
 };
 
 mod auth;
+mod config_browse;
 mod doctor;
 mod print_mode;
 mod providers;
 mod update;
 use auth::handle_auth_command;
+use config_browse::handle_browse_command;
 use doctor::DoctorArgs;
 use providers::{ProvidersCommand, handle_providers_command};
 use squeezy_store::{
@@ -135,7 +137,7 @@ enum Command {
     #[command(about = "Inspect or initialize Squeezy configuration")]
     Config {
         #[command(subcommand)]
-        command: ConfigCommand,
+        command: Option<ConfigCommand>,
     },
     #[command(about = "Inspect or refresh the local generated repo profile")]
     Repo {
@@ -197,6 +199,10 @@ struct AskArgs {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    #[command(
+        about = "List discoverable resources (skills, providers, sessions, prompt templates)"
+    )]
+    Browse(ConfigBrowseArgs),
     #[command(about = "Print the effective merged configuration with secrets redacted")]
     Inspect,
     #[command(about = "Create a default user or project settings file")]
@@ -206,6 +212,12 @@ enum ConfigCommand {
         #[arg(long, help = "Overwrite an existing file")]
         force: bool,
     },
+}
+
+#[derive(Debug, Args, Default)]
+pub(crate) struct ConfigBrowseArgs {
+    #[arg(long, help = "Emit machine-readable JSON instead of the human listing")]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -445,7 +457,9 @@ async fn main() -> squeezy_core::Result<()> {
         ));
     }
     match &cli.command {
-        Some(Command::Config { command }) => return handle_config_command(command, &cli),
+        Some(Command::Config { command }) => {
+            return handle_config_command(command.as_ref(), &cli);
+        }
         Some(Command::Repo { command }) => return handle_repo_command(command, &cli),
         Some(Command::Sessions { command }) => {
             return handle_sessions_command(command, &cli).await;
@@ -688,14 +702,24 @@ fn config_from_cli(cli: &Cli) -> squeezy_core::Result<AppConfig> {
     Ok(config)
 }
 
-fn handle_config_command(command: &ConfigCommand, cli: &Cli) -> squeezy_core::Result<()> {
+fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_core::Result<()> {
     match command {
-        ConfigCommand::Inspect => {
+        // `squeezy config` with no subcommand mirrors pi's `pi config browse`
+        // and lands on the resource picker.
+        None => {
+            let config = config_from_cli(cli)?;
+            handle_browse_command(&config, &ConfigBrowseArgs::default())
+        }
+        Some(ConfigCommand::Browse(args)) => {
+            let config = config_from_cli(cli)?;
+            handle_browse_command(&config, args)
+        }
+        Some(ConfigCommand::Inspect) => {
             let config = config_from_cli(cli)?;
             print!("{}", config.inspect_redacted());
             Ok(())
         }
-        ConfigCommand::Init { scope, force } => {
+        Some(ConfigCommand::Init { scope, force }) => {
             let (path, template) = if scope.user {
                 (default_settings_path(), user_settings_template())
             } else {
