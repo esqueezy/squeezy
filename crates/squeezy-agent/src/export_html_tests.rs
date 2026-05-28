@@ -1,10 +1,13 @@
 use super::*;
 use serde_json::json;
 use squeezy_core::SessionMode;
-use squeezy_store::{SessionEvent, SessionMetadata, SessionRecord, SessionStatus};
+use squeezy_store::{
+    SESSION_METADATA_SCHEMA_VERSION, SessionEvent, SessionMetadata, SessionRecord, SessionStatus,
+};
 
 fn meta(id: &str) -> SessionMetadata {
     SessionMetadata {
+        schema_version: SESSION_METADATA_SCHEMA_VERSION,
         session_id: id.to_string(),
         started_at_ms: 1_700_000_000_000,
         ended_at_ms: Some(1_700_000_120_000),
