@@ -1,7 +1,10 @@
 use super::*;
 use crate::{CacheSpec, LlmEvent, LlmInputItem, LlmToolSpec};
 use serde_json::{Value, json};
-use squeezy_core::OpenAiCompatiblePreset;
+use squeezy_core::{
+    DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL, DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL,
+    OpenAiCompatibleConfig, OpenAiCompatiblePreset, ProviderTransportConfig,
+};
 use std::sync::Arc;
 
 fn sample_request() -> LlmRequest {
@@ -980,4 +983,107 @@ fn request_body_encodes_image_as_image_url_data_url() {
         .decode(encoded)
         .expect("valid base64");
     assert_eq!(decoded.as_slice(), bytes.as_ref());
+}
+
+#[test]
+fn cloudflare_presets_substitute_account_and_gateway_placeholders_in_base_url() {
+    // Both Cloudflare presets ship templated default base URLs so the
+    // configuration layer can flow `account_id` / `gateway_id` through
+    // verbatim and let `OpenAiCompatibleProvider::from_config` resolve
+    // the per-account / per-gateway path right before requests fire.
+    // The resolved URL on the constructed provider must reflect every
+    // placeholder having been replaced — including a trailing-slash
+    // trim — so the chat-completions request format string in
+    // `stream_response` produces a clean URL.
+    let workers_ai = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::CloudflareWorkersAi,
+        api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+        api_key: Some("inline-key".to_string()),
+        base_url: DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL.to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: Some("acct-abc".to_string()),
+        gateway_id: None,
+    })
+    .expect("workers AI provider builds with account_id");
+    assert_eq!(
+        workers_ai.base_url(),
+        "https://api.cloudflare.com/client/v4/accounts/acct-abc/ai/v1",
+        "the {{account_id}} placeholder must be substituted into the Workers AI URL",
+    );
+
+    let gateway = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::CloudflareAiGateway,
+        api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+        api_key: Some("inline-key".to_string()),
+        base_url: DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL.to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: Some("acct-abc".to_string()),
+        gateway_id: Some("my-gateway".to_string()),
+    })
+    .expect("AI Gateway provider builds with account_id + gateway_id");
+    assert_eq!(
+        gateway.base_url(),
+        "https://gateway.ai.cloudflare.com/v1/acct-abc/my-gateway/compat",
+        "both {{account_id}} and {{gateway_id}} must be substituted into the AI Gateway URL",
+    );
+}
+
+#[test]
+fn cloudflare_workers_ai_missing_account_id_fails_with_clear_error() {
+    // Misconfiguration guard: when the base URL still contains a
+    // placeholder but the corresponding `OpenAiCompatibleConfig` field
+    // is unset, `from_config` must surface a `ProviderNotConfigured`
+    // error that names both the offending placeholder and the
+    // TOML / env-var the user has to set. Anything less and the
+    // request would fire against a literal `{account_id}` URL and the
+    // user would see only a 404 from Cloudflare's edge.
+    let error = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::CloudflareWorkersAi,
+        api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+        api_key: Some("inline-key".to_string()),
+        base_url: DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL.to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: None,
+        gateway_id: None,
+    })
+    .expect_err("missing account_id must fail provider construction");
+    assert!(
+        matches!(error, SqueezyError::ProviderNotConfigured(_)),
+        "missing placeholder must map to ProviderNotConfigured, got: {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("{account_id}"),
+        "error must name the offending placeholder so the user knows what to set: {message}"
+    );
+    assert!(
+        message.contains("cloudflare_account_id"),
+        "error must point at the TOML field the user can populate: {message}"
+    );
+    assert!(
+        message.contains("CLOUDFLARE_ACCOUNT_ID"),
+        "error must point at the env var the user can populate: {message}"
+    );
+
+    // Whitespace-only `account_id` is treated the same as missing —
+    // `Some(\"   \")` would silently produce a URL with an empty
+    // account segment otherwise.
+    let whitespace_error = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::CloudflareWorkersAi,
+        api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+        api_key: Some("inline-key".to_string()),
+        base_url: DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL.to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: Some("   ".to_string()),
+        gateway_id: None,
+    })
+    .expect_err("whitespace-only account_id must also fail");
+    assert!(
+        whitespace_error.to_string().contains("{account_id}"),
+        "whitespace error must also name the placeholder: {whitespace_error}"
+    );
 }

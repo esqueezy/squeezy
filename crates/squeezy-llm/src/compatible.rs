@@ -67,6 +67,19 @@ impl OpenAiCompatibleProvider {
                 config.preset.display_name(),
             )));
         }
+        // Substitute `{account_id}` / `{gateway_id}` placeholders in the
+        // base URL before the provider locks it in. The Cloudflare presets
+        // ship templated defaults so the LLM client is the single place
+        // that knows how to resolve them; user overrides that keep the
+        // placeholder syntax (e.g. routing through a reverse proxy that
+        // mirrors the Cloudflare path shape) get the same treatment for
+        // free.
+        let resolved_base_url = substitute_url_placeholders(
+            config.base_url.trim_end_matches('/'),
+            config.preset,
+            config.account_id.as_deref(),
+            config.gateway_id.as_deref(),
+        )?;
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
         let mut headers = preset_default_headers(config.preset);
@@ -78,10 +91,15 @@ impl OpenAiCompatibleProvider {
         Ok(Self::with_api_key_source(
             config.preset,
             static_api_key_source(api_key, config.preset.as_str()),
-            config.base_url.trim_end_matches('/').to_string(),
+            resolved_base_url,
             headers,
             config.transport,
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Construct the provider against an already-built credential
@@ -660,6 +678,71 @@ fn chat_message(item: &LlmInputItem, cache_control: Option<&Value>) -> Option<Va
         // items are rendered in the UI but skipped when replaying.
         LlmInputItem::Reasoning(_) => return None,
     })
+}
+
+/// Resolve `{account_id}` / `{gateway_id}` placeholders in an
+/// OpenAI-compatible base URL.
+///
+/// The Cloudflare Workers AI and AI Gateway presets ship base URL
+/// templates with these placeholders so the configuration layer can
+/// flow the per-account / per-gateway values through verbatim and
+/// defer substitution until the LLM client is constructed (see
+/// [`OpenAiCompatibleProvider::from_config`]). Keeping substitution
+/// here — instead of building the URL eagerly in config land — lets a
+/// user override `base_url` to point at a reverse proxy that mirrors
+/// the Cloudflare path shape without re-implementing the substitution.
+///
+/// Returns the resolved URL when every placeholder present in
+/// `template` has a corresponding non-empty value, or a
+/// [`SqueezyError::ProviderNotConfigured`] error naming the missing
+/// placeholder and the config field/env-var the user needs to set.
+/// Templates that carry no placeholders are returned unchanged, which
+/// keeps every non-Cloudflare preset on its existing zero-overhead
+/// path.
+pub(crate) fn substitute_url_placeholders(
+    template: &str,
+    preset: OpenAiCompatiblePreset,
+    account_id: Option<&str>,
+    gateway_id: Option<&str>,
+) -> Result<String> {
+    // Required-vs-optional is structural: a placeholder is "required"
+    // exactly when it appears in the template, regardless of preset.
+    // This keeps the substitution table preset-agnostic so a custom
+    // base URL with `{account_id}` on a non-Cloudflare preset still
+    // gets a helpful error instead of a literal `{account_id}` reaching
+    // the wire.
+    let section = preset.as_str();
+    let preset_label = preset.display_name();
+    let substitutions: [(&str, Option<&str>, &str, &str); 2] = [
+        (
+            "{account_id}",
+            account_id.map(str::trim).filter(|value| !value.is_empty()),
+            "cloudflare_account_id",
+            "CLOUDFLARE_ACCOUNT_ID",
+        ),
+        (
+            "{gateway_id}",
+            gateway_id.map(str::trim).filter(|value| !value.is_empty()),
+            "cloudflare_gateway_id",
+            "CLOUDFLARE_AI_GATEWAY_ID",
+        ),
+    ];
+    let mut resolved = template.to_string();
+    for (placeholder, value, field, env_var) in substitutions {
+        if !resolved.contains(placeholder) {
+            continue;
+        }
+        let Some(value) = value else {
+            return Err(SqueezyError::ProviderNotConfigured(format!(
+                "providers.{section}.base_url contains the {placeholder} \
+                 placeholder but providers.{section}.{field} (or {env_var}) \
+                 is unset; the {preset_label} preset cannot resolve a request \
+                 URL without it"
+            )));
+        };
+        resolved = resolved.replace(placeholder, value);
+    }
+    Ok(resolved)
 }
 
 fn portkey_routing_header_present(headers: &BTreeMap<String, String>) -> bool {
