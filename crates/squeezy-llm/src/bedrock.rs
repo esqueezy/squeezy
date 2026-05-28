@@ -94,7 +94,17 @@ impl LlmProvider for BedrockProvider {
             for block in system_blocks(&request.instructions, prompt_caching)? {
                 builder = builder.system(block);
             }
-            for message in conversation_messages(&request.input, prompt_caching)? {
+            // Canonicalize cross-provider tool-call ids and
+            // synthesize placeholders for orphan tool results before
+            // building Bedrock `toolUse` / `toolResult` blocks.
+            // Bedrock's Converse API enforces the same Anthropic
+            // pairing rules (every `toolResult.toolUseId` must match
+            // a prior `toolUse.toolUseId` in the conversation) so a
+            // mid-session swap from a non-Anthropic provider can
+            // produce ids Bedrock either rejects on shape or fails
+            // to match.
+            let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
+            for message in conversation_messages(&normalized_input, prompt_caching)? {
                 builder = builder.messages(message);
             }
             if let Some(config) = tool_configuration(&request.tools, prompt_caching)? {

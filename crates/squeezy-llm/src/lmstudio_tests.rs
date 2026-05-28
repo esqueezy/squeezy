@@ -7,6 +7,10 @@ fn sample_request() -> LlmRequest {
     LlmRequest {
         model: "openai/gpt-oss-20b".to_string().into(),
         instructions: "be brief".to_string().into(),
+        // Orphan `FunctionCallOutput` — `normalize_tool_ids_for_replay`
+        // synthesizes a placeholder `model_switched` `FunctionCall`
+        // ahead of it so the chat-completions wire format remains
+        // valid for cross-model replay. See F11.
         input: Arc::from(vec![
             LlmInputItem::UserText("hello".to_string()),
             LlmInputItem::AssistantText("hi".to_string()),
@@ -51,15 +55,28 @@ fn request_body_uses_chat_completions_shape() {
     assert_eq!(body["max_tokens"], 128);
 
     let messages = body["messages"].as_array().expect("messages array");
-    assert_eq!(messages.len(), 4, "system + 3 input items");
+    // The orphan tool result picks up a synthesized assistant
+    // tool-call ahead of it, so the body now carries system + user +
+    // assistant text + synthetic assistant tool_calls + tool result.
+    assert_eq!(
+        messages.len(),
+        5,
+        "system + 3 input items + synthetic tool call"
+    );
     assert_eq!(messages[0]["role"], "system");
     assert_eq!(messages[0]["content"], "be brief");
     assert_eq!(messages[1]["role"], "user");
     assert_eq!(messages[1]["content"], "hello");
     assert_eq!(messages[2]["role"], "assistant");
     assert_eq!(messages[2]["content"], "hi");
-    assert_eq!(messages[3]["role"], "tool");
-    assert_eq!(messages[3]["tool_call_id"], "call_1");
+    assert_eq!(messages[3]["role"], "assistant");
+    assert_eq!(
+        messages[3]["tool_calls"][0]["function"]["name"],
+        crate::MODEL_SWITCHED_PLACEHOLDER_NAME,
+    );
+    assert_eq!(messages[3]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(messages[4]["role"], "tool");
+    assert_eq!(messages[4]["tool_call_id"], "call_1");
 
     let tools = body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 1);
@@ -74,7 +91,9 @@ fn request_body_skips_empty_system_message() {
     let body = LMStudioProvider::request_body(&request);
 
     let messages = body["messages"].as_array().expect("messages array");
-    assert_eq!(messages.len(), 3);
+    // No system + 3 input items + synthetic assistant tool_calls
+    // standing in for the orphan tool result = 4 messages.
+    assert_eq!(messages.len(), 4);
     assert_eq!(messages[0]["role"], "user");
 }
 

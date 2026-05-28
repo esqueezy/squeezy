@@ -8,6 +8,15 @@ fn sample_request() -> LlmRequest {
     LlmRequest {
         model: "anthropic/claude-opus-4-7".to_string().into(),
         instructions: "be brief".to_string().into(),
+        // The orphan `FunctionCallOutput` (no preceding
+        // `FunctionCall` with the same `call_id`) is the cross-model
+        // hazard the F11 normalization handles: after the
+        // `request_body` runs the input through
+        // `normalize_tool_ids_for_replay`, a placeholder
+        // `model_switched` `FunctionCall` is synthesized in front of
+        // this output so the wire format stays well-formed for every
+        // destination provider. Tests assert on the *normalized*
+        // shape (4 input messages, with `tool_call_id = "call_1"`).
         input: Arc::from(vec![
             LlmInputItem::UserText("hello".to_string()),
             LlmInputItem::AssistantText("hi there".to_string()),
@@ -93,16 +102,30 @@ fn request_body_uses_chat_completions_shape() {
     assert_eq!(body["stream_options"]["include_usage"], true);
 
     let messages = body["messages"].as_array().expect("messages array");
-    assert_eq!(messages.len(), 4, "system + 3 input items");
+    // Normalization inserts a synthetic `model_switched` assistant
+    // tool_call ahead of the orphan tool result, so the body now
+    // carries system + user + assistant text + synthetic assistant
+    // tool_calls + tool result = 5 messages.
+    assert_eq!(
+        messages.len(),
+        5,
+        "system + 3 input items + synthetic tool call"
+    );
     assert_eq!(messages[0]["role"], "system");
     assert_eq!(messages[0]["content"], "be brief");
     assert_eq!(messages[1]["role"], "user");
     assert_eq!(messages[1]["content"], "hello");
     assert_eq!(messages[2]["role"], "assistant");
     assert_eq!(messages[2]["content"], "hi there");
-    assert_eq!(messages[3]["role"], "tool");
-    assert_eq!(messages[3]["tool_call_id"], "call_42");
-    assert_eq!(messages[3]["content"], r#"{"result":"ok"}"#);
+    assert_eq!(messages[3]["role"], "assistant");
+    assert_eq!(
+        messages[3]["tool_calls"][0]["function"]["name"],
+        crate::MODEL_SWITCHED_PLACEHOLDER_NAME,
+    );
+    assert_eq!(messages[3]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(messages[4]["role"], "tool");
+    assert_eq!(messages[4]["tool_call_id"], "call_1");
+    assert_eq!(messages[4]["content"], r#"{"result":"ok"}"#);
 
     let tools = body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 1);
@@ -122,7 +145,10 @@ fn request_body_skips_empty_system_message() {
     let body = OpenAiCompatibleProvider::request_body(&request);
 
     let messages = body["messages"].as_array().expect("messages array");
-    assert_eq!(messages.len(), 3);
+    // No system message + 3 original input items + 1 synthetic
+    // `model_switched` assistant tool_call inserted ahead of the
+    // orphan tool result = 4 messages.
+    assert_eq!(messages.len(), 4);
     assert_eq!(messages[0]["role"], "user");
 }
 
@@ -153,7 +179,12 @@ fn request_body_serialises_assistant_function_call_history() {
     let assistant_call = &messages[1];
     assert_eq!(assistant_call["role"], "assistant");
     let tool_call = &assistant_call["tool_calls"][0];
-    assert_eq!(tool_call["id"], "call_99");
+    // The original `call_99` is canonicalized to `call_1` so a
+    // mid-session model switch can replay this turn against a
+    // provider with stricter id-shape rules (Anthropic regex,
+    // Bedrock pairing, etc.) without rewriting the persisted
+    // history.
+    assert_eq!(tool_call["id"], "call_1");
     assert_eq!(tool_call["type"], "function");
     assert_eq!(tool_call["function"]["name"], "grep");
     let arguments_text = tool_call["function"]["arguments"]

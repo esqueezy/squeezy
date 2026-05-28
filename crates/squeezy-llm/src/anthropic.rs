@@ -100,6 +100,15 @@ impl AnthropicProvider {
                     .map(|limits| limits.max_output_tokens)
             })
             .unwrap_or(DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS);
+        // Canonicalize cross-provider tool-call ids and synthesize
+        // placeholders for orphan tool results BEFORE the
+        // Anthropic-specific message rewrite. Anthropic rejects raw
+        // OpenAI Responses `fc_…|…` ids (regex + length cap) and
+        // rejects `tool_result` blocks whose `tool_use_id` has no
+        // matching `tool_use` earlier in the same conversation; both
+        // failure modes are common after a mid-session
+        // `anthropic/claude-X → openai/gpt-Y → anthropic/...` swap.
+        let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
         let mut body = json!({
             "model": request.model,
             "system": anthropic_system(
@@ -107,7 +116,7 @@ impl AnthropicProvider {
                 prompt_caching && policy.system,
                 auth,
             ),
-            "messages": anthropic_messages(&request.input, prompt_caching, policy),
+            "messages": anthropic_messages(&normalized_input, prompt_caching, policy),
             "max_tokens": max_tokens,
             "stream": true,
         });

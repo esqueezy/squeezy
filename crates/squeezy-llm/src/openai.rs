@@ -121,10 +121,20 @@ impl OpenAiProvider {
     }
 
     pub(crate) fn request_body(request: &LlmRequest, provider_name: &str) -> Value {
+        // Canonicalize cross-provider tool-call ids and synthesize
+        // placeholders for orphan tool results BEFORE projecting to
+        // the Responses-API `input` array. The Responses backend
+        // matches `function_call_output.call_id` against the prior
+        // `function_call.call_id` in the input slice; if the user
+        // switched from Anthropic/Google/Bedrock mid-session those
+        // ids carry the upstream's shape (`toolu_…`,
+        // `google_call_…`, `tooluse_…`) and the pairing breaks even
+        // though OpenAI itself accepts the id shape.
+        let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
         let mut body = json!({
             "model": request.model,
             "instructions": request.instructions,
-            "input": openai_input(&request.input),
+            "input": openai_input(&normalized_input),
             "stream": true,
             "store": request.store,
         });
