@@ -29,10 +29,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use squeezy_core::{Result, SqueezyError};
+use squeezy_core::{ProviderTransportConfig, Result, SqueezyError};
 use tokio::sync::RwLock;
 
 use crate::credentials::{ApiKeyFuture, ApiKeySource, TokenState};
+use crate::transport::shared_client;
 
 use super::pkce::PkceCodes;
 
@@ -471,7 +472,7 @@ impl AnthropicOAuthSource {
             tokens,
             storage_path,
             AnthropicLoginConfig::default(),
-            reqwest::Client::new(),
+            shared_client(&ProviderTransportConfig::default()),
         )
     }
 

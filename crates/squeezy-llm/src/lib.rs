@@ -31,6 +31,7 @@ mod registry;
 mod retry;
 mod sse;
 pub mod tokens;
+mod transport;
 mod xai;
 pub use tokens::{
     DEFAULT_BYTES_PER_TOKEN, DEFAULT_EMA_ALPHA, ProviderCalibration, TokenCalibration,

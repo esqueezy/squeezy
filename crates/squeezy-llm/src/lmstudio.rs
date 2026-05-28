@@ -24,6 +24,7 @@ use crate::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
     sse::SseDecoder,
+    transport::shared_client,
 };
 
 /// Default base URL for a freshly installed LM Studio server. The desktop
@@ -77,7 +78,7 @@ impl std::fmt::Debug for LMStudioProvider {
 impl LMStudioProvider {
     pub fn from_config(config: &LMStudioConfig) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: shared_client(&config.transport),
             base_url: config.base_url.trim_end_matches('/').to_string(),
             api_key: config.api_key.clone(),
             transport: config.transport,

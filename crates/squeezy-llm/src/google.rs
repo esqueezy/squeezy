@@ -15,6 +15,7 @@ use crate::{
     credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
     retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
     sse::SseDecoder,
+    transport::shared_client,
 };
 
 #[derive(Clone)]
@@ -41,7 +42,7 @@ impl GoogleProvider {
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: shared_client(&config.transport),
             api_key: static_api_key_source(api_key, "google"),
             base_url: config.base_url.trim_end_matches('/').to_string(),
             transport: config.transport,

@@ -48,6 +48,7 @@ use crate::credentials::{ApiKeyFuture, ApiKeySource};
 use crate::openai::{ReasoningAccumulator, parse_openai_event};
 use crate::retry::{RetryPolicy, idle_timeout, send_with_auth_retry};
 use crate::sse::SseDecoder;
+use crate::transport::shared_client;
 use crate::{LlmEvent, LlmProvider, LlmRequest, LlmStream, OpenAiProvider};
 
 // ─── Public OAuth constants ────────────────────────────────────────────────
@@ -588,7 +589,7 @@ where
 
     let code = wait_for_callback_code(listener, &state).await?;
 
-    let client = reqwest::Client::new();
+    let client = shared_client(&ProviderTransportConfig::default());
     let token = exchange_authorization_code(
         &client,
         OPENAI_CODEX_TOKEN_URL,
@@ -787,7 +788,7 @@ impl OpenAiCodexOAuthSource {
             state: Arc::new(RwLock::new(token)),
             auth_path,
             token_url: OPENAI_CODEX_TOKEN_URL.to_string(),
-            http_client: reqwest::Client::new(),
+            http_client: shared_client(&ProviderTransportConfig::default()),
             label: "openai_codex".to_string(),
         }
     }
@@ -806,7 +807,7 @@ impl OpenAiCodexOAuthSource {
             state: Arc::new(RwLock::new(token)),
             auth_path,
             token_url: token_url.into(),
-            http_client: reqwest::Client::new(),
+            http_client: shared_client(&ProviderTransportConfig::default()),
             label: "openai_codex".to_string(),
         }
     }
@@ -929,7 +930,7 @@ impl OpenAiCodexProvider {
         let source = OpenAiCodexOAuthSource::new(token, auth_path);
         Ok(Self {
             name: "openai_codex",
-            client: reqwest::Client::new(),
+            client: shared_client(&config.transport),
             source: Arc::new(source),
             account_id,
             originator: if config.originator.trim().is_empty() {
@@ -954,7 +955,7 @@ impl OpenAiCodexProvider {
     ) -> Self {
         Self {
             name: "openai_codex",
-            client: reqwest::Client::new(),
+            client: shared_client(&transport),
             source,
             account_id: account_id.into(),
             originator: originator.into(),

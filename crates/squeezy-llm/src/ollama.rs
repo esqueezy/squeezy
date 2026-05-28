@@ -14,6 +14,7 @@ use crate::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
     lmstudio::{LMStudioConfig, LMStudioProvider},
     retry::{RetryPolicy, idle_timeout, send_with_retry},
+    transport::shared_client,
 };
 
 #[derive(Debug, Clone)]
@@ -36,7 +37,7 @@ impl OllamaProvider {
             })),
         };
         Self {
-            client: reqwest::Client::new(),
+            client: shared_client(&config.transport),
             base_url,
             transport: config.transport,
             compat,
