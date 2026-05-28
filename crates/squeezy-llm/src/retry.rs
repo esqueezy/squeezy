@@ -25,6 +25,10 @@ pub struct RetryPolicy {
     pub retry_429: bool,
     pub retry_5xx: bool,
     pub retry_transport: bool,
+    /// Hard ceiling on any single inter-retry sleep, including a
+    /// `Retry-After` hint from the upstream. Defends against a
+    /// hostile or buggy header pinning the agent for hours.
+    pub max_retry_delay: Duration,
 }
 
 impl RetryPolicy {
@@ -35,6 +39,7 @@ impl RetryPolicy {
             retry_429: true,
             retry_5xx: true,
             retry_transport: true,
+            max_retry_delay: Duration::from_millis(config.max_retry_delay_ms),
         }
     }
 
@@ -45,6 +50,7 @@ impl RetryPolicy {
             retry_429: false,
             retry_5xx: false,
             retry_transport: true,
+            max_retry_delay: Duration::from_millis(config.max_retry_delay_ms),
         }
     }
 }
@@ -116,11 +122,13 @@ pub async fn send_with_retry(
                     && attempt < policy.max_retries =>
             {
                 let retry_after = retry_after_delay(&response).await;
-                sleep_or_cancel(
-                    cancel,
-                    retry_after.unwrap_or_else(|| backoff(policy.base_delay, attempt)),
-                )
-                .await?;
+                // Clamp the chosen delay to `policy.max_retry_delay`
+                // so a malicious or buggy `Retry-After: 999999` from
+                // the upstream cannot pin the agent for hours.
+                let delay = retry_after
+                    .unwrap_or_else(|| backoff(policy.base_delay, attempt))
+                    .min(policy.max_retry_delay);
+                sleep_or_cancel(cancel, delay).await?;
             }
             Ok(response) => return Ok(response),
             Err(error) if policy.retry_transport && attempt < policy.max_retries => {
