@@ -1025,6 +1025,94 @@ fn token_calibration_round_trips_through_metadata_and_global_file() {
     assert_eq!(record.metadata.token_calibration, calibration);
 }
 
+#[test]
+fn session_metadata_v0_file_reads_as_v1() {
+    // Pre-versioning `metadata.json` files are missing the
+    // `schema_version` field. The reader migration framework must treat
+    // them as v0, run any registered v0 -> v1 migrations, and stamp
+    // SESSION_METADATA_SCHEMA_VERSION onto the deserialized struct so
+    // the rest of the binary sees a fully migrated value. Sibling
+    // fields must survive untouched.
+    let (_root, store, _) = open_test_store("metadata-v0-reads-as-v1");
+    let session_dir = store.root().join("v0-session");
+    fs::create_dir_all(&session_dir).expect("create session dir");
+    let v0_json = json!({
+        "session_id": "v0-session",
+        "started_at_ms": 1_700_000_000_000_u64,
+        "ended_at_ms": null,
+        "cwd": "/tmp/work",
+        "workspace_root": "/tmp/work",
+        "repo_root": null,
+        "branch": null,
+        "provider": "openai",
+        "model": "test-model",
+        "mode": "build",
+        "status": "completed",
+        "first_user_task": "hello",
+        "latest_summary": null,
+        "cost": CostSnapshot::default(),
+        "metrics": SessionMetrics::default(),
+        "redactions": 0,
+        "resume_available": false,
+        "resume_unavailable_reason": null,
+        "event_count": 7,
+        // intentionally missing: schema_version
+    });
+    assert!(
+        v0_json.get("schema_version").is_none(),
+        "v0 fixture must omit schema_version",
+    );
+    fs::write(
+        session_dir.join("metadata.json"),
+        serde_json::to_vec_pretty(&v0_json).expect("encode v0 json"),
+    )
+    .expect("write v0 metadata.json");
+
+    let record = store.show("v0-session").expect("show v0 session");
+    assert_eq!(
+        record.metadata.schema_version, SESSION_METADATA_SCHEMA_VERSION,
+        "migration must stamp the current version onto v0 payloads"
+    );
+    assert_eq!(record.metadata.session_id, "v0-session");
+    assert_eq!(record.metadata.first_user_task.as_deref(), Some("hello"));
+    assert_eq!(record.metadata.event_count, 7);
+    assert_eq!(record.metadata.provider, "openai");
+    assert_eq!(record.metadata.model, "test-model");
+}
+
+#[test]
+fn session_metadata_v1_file_reads_unchanged() {
+    // A `metadata.json` already written at the current schema version
+    // must round-trip without the migration chain mutating its payload:
+    // `apply_session_metadata_migrations` short-circuits when the
+    // incoming version already matches SESSION_METADATA_SCHEMA_VERSION,
+    // so deserialization sees the on-disk bytes as-is.
+    let (_root, store, config) = open_test_store("metadata-v1-reads-unchanged");
+    let session_dir = store.root().join("v1-session");
+    fs::create_dir_all(&session_dir).expect("create session dir");
+    let mut metadata = SessionMetadata::new(&config, "openai");
+    metadata.session_id = "v1-session".to_string();
+    metadata.started_at_ms = 1_700_000_100_000;
+    metadata.first_user_task = Some("plan the rollout".to_string());
+    metadata.event_count = 3;
+    assert_eq!(metadata.schema_version, SESSION_METADATA_SCHEMA_VERSION);
+    fs::write(
+        session_dir.join("metadata.json"),
+        serde_json::to_vec_pretty(&metadata).expect("encode v1"),
+    )
+    .expect("write v1 metadata.json");
+
+    let record = store.show("v1-session").expect("show v1 session");
+    assert_eq!(
+        record.metadata.schema_version,
+        SESSION_METADATA_SCHEMA_VERSION
+    );
+    assert_eq!(record.metadata.session_id, metadata.session_id);
+    assert_eq!(record.metadata.first_user_task, metadata.first_user_task);
+    assert_eq!(record.metadata.event_count, metadata.event_count);
+    assert_eq!(record.metadata.started_at_ms, metadata.started_at_ms);
+}
+
 fn temp_root(name: &str) -> PathBuf {
     let root =
         std::env::temp_dir().join(format!("squeezy-store-test-{name}-{}", std::process::id()));

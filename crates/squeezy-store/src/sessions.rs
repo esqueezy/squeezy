@@ -29,6 +29,13 @@ pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
 /// `events.jsonl` + `replay.jsonl`, so bumping this only requires changing
 /// the merge logic or the wire shape of `RolloutEvent` itself.
 pub const ROLLOUT_TRACE_SCHEMA_VERSION: u32 = 1;
+/// Schema version stamped onto every `SessionMetadata` written via the
+/// store. A missing `schema_version` field on disk is treated as v0 (the
+/// pre-versioning shape); the reader runs [`SESSION_METADATA_MIGRATIONS`]
+/// over the raw JSON before deserialization so older `metadata.json`
+/// files keep loading after future schema changes without filename
+/// sniffing.
+pub const SESSION_METADATA_SCHEMA_VERSION: u32 = 1;
 /// Subdirectory under the session root that holds archived sessions.
 /// Sibling to live session ids; never used as a session id itself.
 pub const ARCHIVED_SUBDIR: &str = "archived";
@@ -321,7 +328,7 @@ impl SessionStore {
         // for a session that already recorded it.
         let counters = HandleCounters::default();
         if let Ok(metadata) =
-            read_json::<SessionMetadata>(&self.session_dir(&session_id).join("metadata.json"))
+            read_session_metadata(&self.session_dir(&session_id).join("metadata.json"))
         {
             counters
                 .event_count
@@ -429,7 +436,7 @@ impl SessionStore {
             let Ok(text) = fs::read_to_string(path) else {
                 continue;
             };
-            let Ok(metadata) = serde_json::from_str::<SessionMetadata>(&text) else {
+            let Ok(metadata) = deserialize_session_metadata(&text) else {
                 continue;
             };
             if query.matches(&metadata) {
@@ -448,7 +455,7 @@ impl SessionStore {
                     let Ok(text) = fs::read_to_string(path) else {
                         continue;
                     };
-                    let Ok(metadata) = serde_json::from_str::<SessionMetadata>(&text) else {
+                    let Ok(metadata) = deserialize_session_metadata(&text) else {
                         continue;
                     };
                     if query.matches(&metadata) {
@@ -486,7 +493,7 @@ impl SessionStore {
         fs::rename(&src, &dest)?;
         let metadata_path = dest.join("metadata.json");
         if let Ok(text) = fs::read_to_string(&metadata_path)
-            && let Ok(mut metadata) = serde_json::from_str::<SessionMetadata>(&text)
+            && let Ok(mut metadata) = deserialize_session_metadata(&text)
         {
             let stamp = now_ms();
             metadata.status = SessionStatus::Archived;
@@ -519,7 +526,7 @@ impl SessionStore {
         fs::rename(&src, &dest)?;
         let metadata_path = dest.join("metadata.json");
         if let Ok(text) = fs::read_to_string(&metadata_path)
-            && let Ok(mut metadata) = serde_json::from_str::<SessionMetadata>(&text)
+            && let Ok(mut metadata) = deserialize_session_metadata(&text)
         {
             metadata.status = SessionStatus::Completed;
             metadata.archived_at_ms = None;
@@ -544,7 +551,7 @@ impl SessionStore {
                 metadata_path.display(),
             )));
         }
-        let metadata = read_json(&metadata_path)?;
+        let metadata = read_session_metadata(&metadata_path)?;
         let (events, event_warnings) = read_jsonl(&dir.join("events.jsonl"))?;
         let resume_state = read_json(&dir.join("resume_state.json")).ok();
         let attachments = read_context_attachments(&dir.join("attachments"))?;
@@ -1156,7 +1163,7 @@ fn append_payload_once(
 
 fn update_metadata_file(dir: &Path, update: impl FnOnce(&mut SessionMetadata)) -> Result<()> {
     let path = dir.join("metadata.json");
-    let mut metadata: SessionMetadata = read_json(&path)?;
+    let mut metadata = read_session_metadata(&path)?;
     update(&mut metadata);
     write_json(&path, &metadata)
 }
@@ -1179,7 +1186,7 @@ impl SessionHandle {
         };
         let mut metadata = match pending_snapshot {
             Some(metadata) => metadata,
-            None => read_json(&self.dir().join("metadata.json"))?,
+            None => read_session_metadata(&self.dir().join("metadata.json"))?,
         };
         // Surface the in-memory event_count even when we have intentionally
         // skipped writing metadata.json for routine events.
@@ -1639,7 +1646,7 @@ impl GlobalSessionIndexEntry {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMetadata {
     pub session_id: String,
     pub started_at_ms: u64,
@@ -1682,6 +1689,46 @@ pub struct SessionMetadata {
     /// pre-fork `metadata.json` files keep deserializing.
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// Version of the on-disk `metadata.json` shape. Missing on
+    /// pre-versioning files, so the serde default is the legacy v0
+    /// sentinel and [`read_session_metadata`] / [`deserialize_session_metadata`]
+    /// upgrade the payload through [`SESSION_METADATA_MIGRATIONS`]
+    /// before deserializing. Fresh in-memory values (from
+    /// [`SessionMetadata::default`] or [`SessionMetadata::new`]) carry
+    /// [`SESSION_METADATA_SCHEMA_VERSION`] so writes always emit the
+    /// current shape.
+    #[serde(default = "legacy_session_metadata_schema_version")]
+    pub schema_version: u32,
+}
+
+impl Default for SessionMetadata {
+    fn default() -> Self {
+        Self {
+            session_id: String::new(),
+            started_at_ms: 0,
+            ended_at_ms: None,
+            archived_at_ms: None,
+            cwd: String::new(),
+            workspace_root: String::new(),
+            repo_root: None,
+            branch: None,
+            provider: String::new(),
+            model: String::new(),
+            mode: SessionMode::default(),
+            status: SessionStatus::default(),
+            first_user_task: None,
+            latest_summary: None,
+            cost: CostSnapshot::default(),
+            metrics: SessionMetrics::default(),
+            redactions: 0,
+            resume_available: false,
+            resume_unavailable_reason: None,
+            event_count: 0,
+            token_calibration: squeezy_llm::TokenCalibration::default(),
+            parent_id: None,
+            schema_version: SESSION_METADATA_SCHEMA_VERSION,
+        }
+    }
 }
 
 impl SessionMetadata {
@@ -2544,6 +2591,70 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let text = fs::read_to_string(path)?;
     serde_json::from_str(&text).map_err(json_error)
+}
+
+/// Serde default for [`SessionMetadata::schema_version`]. Returns 0 — the
+/// pre-versioning ("v0") sentinel — so files written before the field
+/// existed land in [`apply_session_metadata_migrations`] at the bottom of
+/// the migration chain rather than being misread as the current version.
+fn legacy_session_metadata_schema_version() -> u32 {
+    0
+}
+
+/// Reader-side migrations applied in order. `MIGRATIONS[i]` upgrades a
+/// session metadata payload from schema version `i` to `i + 1`.
+/// [`apply_session_metadata_migrations`] reads the incoming
+/// `schema_version` (treating a missing field as 0) and runs every
+/// migration in `[from .. SESSION_METADATA_SCHEMA_VERSION)` before the
+/// final deserialization step.
+///
+/// The v0 → v1 entry is a no-op because v1 is byte-for-byte compatible
+/// with the pre-versioning shape; only the new `schema_version` field
+/// itself is added, and the reader stamps that onto the payload after
+/// the chain runs. The slot still exists so future migrations have a
+/// clear chain to extend and so the "treat missing field as v0" rule
+/// has a concrete code path.
+const SESSION_METADATA_MIGRATIONS: &[fn(&mut Value)] = &[migrate_session_metadata_v0_to_v1];
+
+fn migrate_session_metadata_v0_to_v1(_value: &mut Value) {}
+
+/// Migrate `value` in place from whatever `schema_version` it carries on
+/// disk up to [`SESSION_METADATA_SCHEMA_VERSION`], then stamp the
+/// post-migration version onto the payload so the deserialized struct
+/// reflects the upgraded shape. Forward-compatible: a payload that
+/// already declares the current (or a future) version is left alone so
+/// an older binary does not corrupt a newer file.
+fn apply_session_metadata_migrations(value: &mut Value) {
+    let from = value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .map(|version| version as u32)
+        .unwrap_or(0);
+    if from >= SESSION_METADATA_SCHEMA_VERSION {
+        return;
+    }
+    let start = from as usize;
+    let end = SESSION_METADATA_SCHEMA_VERSION as usize;
+    for migration in &SESSION_METADATA_MIGRATIONS[start..end] {
+        migration(value);
+    }
+    if let Value::Object(map) = value {
+        map.insert(
+            "schema_version".to_string(),
+            Value::from(SESSION_METADATA_SCHEMA_VERSION),
+        );
+    }
+}
+
+fn deserialize_session_metadata(text: &str) -> Result<SessionMetadata> {
+    let mut value: Value = serde_json::from_str(text).map_err(json_error)?;
+    apply_session_metadata_migrations(&mut value);
+    serde_json::from_value(value).map_err(json_error)
+}
+
+fn read_session_metadata(path: &Path) -> Result<SessionMetadata> {
+    let text = fs::read_to_string(path)?;
+    deserialize_session_metadata(&text)
 }
 
 fn read_context_attachments(dir: &Path) -> Result<Vec<ContextAttachment>> {
