@@ -118,8 +118,9 @@ fn unrelated_keys_are_ignored() {
 #[test]
 fn indicator_line_present_when_queue_non_empty() {
     let queue = queue_of(&["a", "b"]);
-    assert!(indicator_line(&queue, true).is_some());
-    assert!(indicator_line(&VecDeque::new(), true).is_none());
+    assert!(indicator_line(&queue, true, false).is_some());
+    assert!(indicator_line(&queue, true, true).is_some());
+    assert!(indicator_line(&VecDeque::new(), true, false).is_none());
 }
 
 #[test]

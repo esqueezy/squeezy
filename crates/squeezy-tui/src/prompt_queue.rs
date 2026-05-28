@@ -15,6 +15,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::render::button::{ButtonState, button_spans};
 use crate::{GOLD, QUIET};
 
 #[derive(Debug, Clone, Default)]
@@ -181,28 +182,36 @@ pub(crate) fn render_lines(
 #[path = "prompt_queue_tests.rs"]
 mod tests;
 
-/// One-line "↳ queued: N · Ctrl+Q reorder · Esc cancel current" strip
-/// shown above the composer whenever the queue is non-empty.
+/// One-line clickable strip shown above the composer whenever the queue
+/// is non-empty. The leading `>` / `v` glyph is rendered in a strong
+/// dark blue so the row reads as a disclosure button — `>` when the
+/// reorder overlay is closed (click to expand), `v` when it's open
+/// (click to collapse).
 pub(crate) fn indicator_line(
     queue: &VecDeque<String>,
     turn_running: bool,
+    overlay_open: bool,
 ) -> Option<Line<'static>> {
     if queue.is_empty() {
         return None;
     }
     let n = queue.len();
-    let hint = if turn_running {
-        "Ctrl+Q reorder · Esc cancel current"
+    let state = if overlay_open {
+        ButtonState::Expanded
     } else {
-        "Ctrl+G resume · Ctrl+Q reorder"
+        ButtonState::Collapsed
     };
-    Some(Line::from(vec![
-        Span::styled("↳ queued: ", Style::default().fg(QUIET)),
-        Span::styled(
-            n.to_string(),
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(hint, Style::default().fg(QUIET)),
-    ]))
+    let hint = if overlay_open {
+        "click to close"
+    } else if turn_running {
+        "click to reorder · Esc cancels current (queue keeps draining)"
+    } else {
+        "click to reorder"
+    };
+    let mut spans = button_spans(&format!("queued: {n}"), state);
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(hint, Style::default().fg(QUIET)));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("(Ctrl+X Q)", Style::default().fg(QUIET)));
+    Some(Line::from(spans))
 }

@@ -104,28 +104,6 @@ fn invalid_entries_surface_in_diagnostics() {
 }
 
 #[test]
-fn queue_actions_have_default_bindings() {
-    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
-    assert_eq!(
-        resolver.lookup(KeyCode::Char('q'), KeyModifiers::CONTROL),
-        Some(Action::ToggleQueueOverlay),
-    );
-    assert_eq!(
-        resolver.lookup(KeyCode::Char('g'), KeyModifiers::CONTROL),
-        Some(Action::ResumeQueue),
-    );
-}
-
-#[test]
-fn queue_action_slugs_round_trip() {
-    assert_eq!(
-        Action::from_slug("toggle_queue_overlay"),
-        Some(Action::ToggleQueueOverlay),
-    );
-    assert_eq!(Action::from_slug("resume_queue"), Some(Action::ResumeQueue),);
-}
-
-#[test]
 fn keymap_report_includes_overrides_and_warnings() {
     let mut overrides = BTreeMap::new();
     overrides.insert("transcript_overlay".to_string(), "Ctrl+o".to_string());

@@ -123,6 +123,17 @@ const PROMPT_MAX_HEIGHT: u16 = 8;
 const INLINE_VIEWPORT_HEIGHT: u16 = 18;
 const SLASH_MENU_MAX_ITEMS: usize = 5;
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
+/// Enable basic button-press/release reporting (1000) with SGR
+/// coordinate encoding (1006). Required for the clickable queue
+/// indicator strip to receive `MouseEventKind::Down(Left)` events.
+/// Note: while this is enabled, native text selection in the terminal
+/// requires holding `Shift` on most emulators — the standard tradeoff
+/// when a TUI takes over mouse input (htop / codex / vim-with-mouse
+/// all do the same).
+const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1006h";
+// The matching disable sequence (1000l, 1006l) is already part of
+// `DISABLE_MOUSE_MODES`, so the Drop tear-down covers undoing this
+// without needing a dedicated constant.
 const CLEAR_SCROLLBACK_AND_VISIBLE: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H";
 const RESET_KEYBOARD_ENHANCEMENT_FLAGS: &str = "\x1b[<u";
 const TITLE_SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -874,7 +885,7 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
     match event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))? {
         Event::Key(key) => handle_key(app, agent, key).await,
         Event::Mouse(mouse) => {
-            handle_mouse(app, mouse.kind);
+            handle_mouse(app, mouse);
             Ok(false)
         }
         Event::Paste(text) => {
@@ -889,11 +900,22 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
     }
 }
 
-fn handle_mouse(app: &mut TuiApp, kind: MouseEventKind) {
-    if !app.alternate_scroll_enabled {
+fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
+    // Left-click is dispatched via the per-frame click registry so any
+    // render path can add new buttons by pushing a `Clickable` — no
+    // edits to this fn are needed when new buttons land.
+    if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some(action) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
         return;
     }
-    match kind {
+    // Wheel scroll always scrolls the transcript. The previous
+    // `alternate_scroll_enabled` gate dropped wheel events in
+    // inline-viewport mode (where the terminal's native
+    // wheel-to-arrow translation is disabled), which left the user
+    // with no way to scroll at all once mouse capture was on.
+    match mouse.kind {
         MouseEventKind::ScrollUp => scroll_transcript_up(app, 3),
         MouseEventKind::ScrollDown => scroll_transcript_down(app, 3),
         _ => {}
@@ -910,6 +932,50 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
     // emulator's tab/window stops showing the bulb glyph.
     if app.terminal_title_state == TerminalTitleState::Notification {
         app.terminal_title_state = TerminalTitleState::Cleared;
+    }
+
+    // Chord follow-ups run BEFORE any single-key dispatch so the second
+    // stroke of a chord never accidentally fires a normal keybinding.
+    if let Some(prefix) = app.pending_chord.take() {
+        // Permissive guard: `Q` may arrive as `Char('q')` or `Char('Q')`
+        // and may carry stray SHIFT / CAPS_LOCK / KEYPAD bits depending
+        // on the kitty keyboard protocol level the terminal advertises.
+        // Only `CONTROL` and `ALT` should disqualify the chord (e.g.
+        // `Ctrl+X` then `Ctrl+Q` is a different key combo).
+        let blocking = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let is_chord_q = matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+            && !key.modifiers.intersects(blocking);
+        if prefix == ChordPrefix::CtrlX && is_chord_q {
+            toggle_prompt_queue_overlay(app);
+            return Ok(false);
+        }
+        if key.code == KeyCode::Esc {
+            app.status = "chord cancelled".to_string();
+            return Ok(false);
+        }
+        // Anything else: the chord is already cleared via `.take()`; the
+        // keystroke falls through to its normal handler.
+        app.status.clear();
+    }
+
+    // `Ctrl+X` starts the queue-overlay chord. Accept *three* shapes
+    // because terminals disagree on how they encode `Ctrl+letter`:
+    //   - Modern (kitty `DISAMBIGUATE_ESCAPE_CODES` honoured):
+    //     `KeyCode::Char('x')` + `KeyModifiers::CONTROL`.
+    //   - Legacy fallback (terminal ignores or partially honours kitty
+    //     flags): the raw ASCII control byte `\x18` arrives as
+    //     `KeyCode::Char('\x18')` with `KeyModifiers::NONE`. This is
+    //     what bit me earlier — `Ctrl+X` set nothing and the next `Q`
+    //     leaked into the composer.
+    //   - SHIFT held: `KeyCode::Char('X')` + `CONTROL` (+ optional SHIFT).
+    // `ALT` disqualifies (we don't want to grab `Ctrl+Alt+X`).
+    let is_ctrl_x_modern = matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X'))
+        && key.modifiers.contains(KeyModifiers::CONTROL);
+    let is_ctrl_x_raw = matches!(key.code, KeyCode::Char('\u{18}'));
+    if (is_ctrl_x_modern || is_ctrl_x_raw) && !key.modifiers.contains(KeyModifiers::ALT) {
+        app.pending_chord = Some(ChordPrefix::CtrlX);
+        app.status = "Ctrl+X… (Q opens queue · Esc cancels)".to_string();
+        return Ok(false);
     }
 
     // Rebindable actions (F11/Ctrl+T/Ctrl+P/Ctrl+Y/Ctrl+R/PageUp/PageDown/
@@ -1430,42 +1496,35 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 false
             }
         }
-        keymap::Action::ToggleQueueOverlay => {
-            if app.config_screen.is_some() || app.status_line_setup.is_some() {
-                return false;
-            }
-            app.prompt_queue_overlay = if app.prompt_queue_overlay.is_some() {
-                None
-            } else {
-                Some(prompt_queue::PromptQueueState::new())
-            };
-            app.status = if app.prompt_queue_overlay.is_some() {
-                format!("prompt queue ({} queued)", app.prompt_queue.len())
-            } else {
-                "prompt queue closed".to_string()
-            };
-            true
-        }
-        keymap::Action::ResumeQueue => {
-            if app.config_screen.is_some() || app.status_line_setup.is_some() {
-                return false;
-            }
-            if app.turn_rx.is_some() {
-                return false;
-            }
-            let Some(next) = app.prompt_queue.pop_front() else {
-                app.status = "no queued prompts".to_string();
-                return true;
-            };
-            let remaining = app.prompt_queue.len();
-            app.status = if remaining == 0 {
-                "running queued prompt".to_string()
-            } else {
-                format!("running queued prompt ({remaining} more queued)")
-            };
-            start_user_turn(app, agent, next);
-            true
-        }
+    }
+}
+
+/// Toggle the prompt-queue reorder overlay. Hard-coded as a chord
+/// (`Ctrl+X` then `Q`) rather than a rebindable keymap action because
+/// single-Ctrl-letter defaults collide with terminal flow control
+/// (`Ctrl+Q` = `XON`, `Ctrl+S` = `XOFF`) and with macOS shortcuts.
+fn toggle_prompt_queue_overlay(app: &mut TuiApp) {
+    if app.config_screen.is_some() || app.status_line_setup.is_some() {
+        return;
+    }
+    app.prompt_queue_overlay = if app.prompt_queue_overlay.is_some() {
+        None
+    } else {
+        Some(prompt_queue::PromptQueueState::new())
+    };
+    app.status = if app.prompt_queue_overlay.is_some() {
+        format!("prompt queue ({} queued)", app.prompt_queue.len())
+    } else {
+        "prompt queue closed".to_string()
+    };
+}
+
+/// Dispatch a click on a registered `Clickable`. Single source of truth
+/// for what each `ClickAction` variant does. Adding a new button means
+/// adding a variant to `ClickAction` and one arm here.
+fn dispatch_click_action(app: &mut TuiApp, action: ClickAction) {
+    match action {
+        ClickAction::ToggleQueueOverlay => toggle_prompt_queue_overlay(app),
     }
 }
 
@@ -3956,15 +4015,35 @@ fn format_request_user_input_menu_lines(
         lines.push(Line::from(spans));
     }
     if request.allow_freeform {
-        let preview = if input.trim().is_empty() {
-            "(type in the prompt below)".to_string()
+        // Dedicated answer-entry box. Lives inside the modal area so the
+        // main composer below stays untouched for the user's next prompt.
+        let entry_style = Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD);
+        let label_style = Style::default()
+            .fg(Color::Indexed(33))
+            .add_modifier(Modifier::BOLD);
+        let cursor_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Indexed(33))
+            .add_modifier(Modifier::BOLD);
+        let mut spans = vec![Span::raw("  "), Span::styled("Answer › ", label_style)];
+        if input.is_empty() {
+            spans.push(Span::styled(
+                "(type your answer · Enter sends · Esc cancels)",
+                Style::default().fg(QUIET),
+            ));
         } else {
-            compact_text(input.trim(), 180)
-        };
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("freeform: {preview}"), Style::default().fg(QUIET)),
-        ]));
+            // Render the answer with an inline cursor block. The cursor
+            // sits at `answer_cursor` bytes, which we don't have here —
+            // approximate by drawing the whole answer followed by a
+            // block. Accurate cursor placement is the caller's job; for
+            // now this gives the user a visible "I'm typing in the right
+            // box" affordance.
+            spans.push(Span::styled(compact_text(input, 200), entry_style));
+            spans.push(Span::styled("▌", cursor_style));
+        }
+        lines.push(Line::from(spans));
     }
     lines
 }
@@ -3997,6 +4076,7 @@ fn format_approval_menu_lines(
 }
 
 fn render(frame: &mut Frame<'_>, app: &TuiApp) {
+    app.begin_frame_clickables();
     let area = frame.area();
     if app.transcript_overlay.is_some() {
         render_transcript_overlay(frame, area, app);
@@ -4222,6 +4302,7 @@ fn render_toast_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
+    app.begin_frame_clickables();
     let area = frame.area();
     if app.transcript_overlay.is_some() {
         render_transcript_overlay(frame, area, app);
@@ -4631,8 +4712,12 @@ fn approval_menu_height(app: &TuiApp) -> u16 {
             }
         }
     } else if let Some(pending) = app.pending_request_user_input.as_ref() {
-        format_request_user_input_menu_lines(&pending.request, pending.selection_index, &app.input)
-            .len() as u16
+        format_request_user_input_menu_lines(
+            &pending.request,
+            pending.selection_index,
+            &pending.answer,
+        )
+        .len() as u16
     } else if let Some(pending) = app.pending_plan_choice.as_ref() {
         format_plan_choice_menu_lines(pending).len() as u16
     } else {
@@ -4657,7 +4742,11 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
             &app.input,
         )
     } else if let Some(pending) = app.pending_request_user_input.as_ref() {
-        format_request_user_input_menu_lines(&pending.request, pending.selection_index, &app.input)
+        format_request_user_input_menu_lines(
+            &pending.request,
+            pending.selection_index,
+            &pending.answer,
+        )
     } else if let Some(pending) = app.pending_plan_choice.as_ref() {
         format_plan_choice_menu_lines(pending)
     } else {
@@ -4889,6 +4978,12 @@ fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
             "languages",
             app.language_summary.clone(),
             Style::default().fg(Color::White),
+        ),
+        startup_card_row(
+            inner,
+            "mouse",
+            "Shift+drag to select · Shift+wheel for scrollback".to_string(),
+            Style::default().fg(QUIET),
         ),
         Line::from(Span::styled(
             format!("╰{border}╯"),
@@ -6139,6 +6234,18 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
         return vec![Line::from(vec![
             Span::raw(marker),
             Span::styled(preview, style),
+        ])];
+    }
+    if entry.kind == LogKind::Warn {
+        // Single-line `⚠ message` rendering for turn-end signals so the
+        // user can spot a cancel/fail at a glance instead of scanning a
+        // `│`-prefixed body that visually matches every other log row.
+        let marker = if selected { "> " } else { "  " };
+        let preview = compact_text(message, 200);
+        return vec![Line::from(vec![
+            Span::raw(marker),
+            Span::styled("⚠ ", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
+            Span::styled(preview, Style::default().fg(palette::muted_fg())),
         ])];
     }
     let color = log_color(message);
@@ -8322,11 +8429,10 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
     } else {
         0
     };
-    let indicator_lines = if queue_overlay_lines == 0 && !app.prompt_queue.is_empty() {
-        1
-    } else {
-        0
-    };
+    // The indicator strip is always reserved 1 row when the queue is
+    // non-empty so the click target stays put whether the reorder
+    // overlay is open or closed.
+    let indicator_lines = if app.prompt_queue.is_empty() { 0 } else { 1 };
     let popup_height = queue_overlay_lines + overlay_lines + mention_lines + indicator_lines;
     let max_height = (PROMPT_MAX_HEIGHT as usize).max(popup_height + PROMPT_MIN_HEIGHT as usize);
     prompt_visual_line_count(&app.input, width)
@@ -8595,11 +8701,11 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     } else {
         slash_suggestion_lines(app)
     };
-    let indicator_line = if queue_open {
-        None
-    } else {
-        prompt_queue::indicator_line(&app.prompt_queue, app.turn_rx.is_some())
-    };
+    // Keep the indicator visible even when the overlay is open so the
+    // same row stays clickable to toggle it back closed. The glyph
+    // switches between `>` and `v` to reflect state.
+    let indicator_line =
+        prompt_queue::indicator_line(&app.prompt_queue, app.turn_rx.is_some(), queue_open);
     let extra_height = queue_overlay_lines.len()
         + overlay_lines.len()
         + mention_lines.len()
@@ -8607,8 +8713,27 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         + indicator_line.iter().count();
     let prompt_height = area.height.saturating_sub(extra_height as u16);
     let mut lines = prompt_input_lines(app, prompt_height);
+    let indicator_row_offset = lines.len() as u16;
+    let indicator_present = indicator_line.is_some();
     if let Some(line) = indicator_line {
         lines.push(line);
+    }
+    if indicator_present {
+        // Indicator sits on `area.y + indicator_row_offset`, spanning
+        // the full width. Registered with the per-frame click registry
+        // so `handle_mouse` hit-tests it on left-click.
+        let row = area.y.saturating_add(indicator_row_offset);
+        if row < area.y.saturating_add(area.height) {
+            app.register_click(
+                Rect {
+                    x: area.x,
+                    y: row,
+                    width: area.width,
+                    height: 1,
+                },
+                ClickAction::ToggleQueueOverlay,
+            );
+        }
     }
     lines.extend(queue_overlay_lines);
     lines.extend(overlay_lines);
@@ -8957,7 +9082,7 @@ fn format_status_hints(app: &TuiApp) -> String {
             "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-E expand · Ctrl-T transcript · Ctrl-Y copy · /help",
         );
         if !app.prompt_queue.is_empty() {
-            hint.push_str(&format!(" · Ctrl+Q reorder ({})", app.prompt_queue.len()));
+            hint.push_str(&format!(" · Ctrl+X Q reorder ({})", app.prompt_queue.len()));
         }
         return hint;
     } else if app.exit_confirm_armed {
@@ -8985,7 +9110,7 @@ fn format_status_hints(app: &TuiApp) -> String {
     }
     if !app.prompt_queue.is_empty() {
         base.push_str(&format!(
-            " · queued: {} · Ctrl+G resume · Ctrl+Q reorder",
+            " · queued: {} · Ctrl+X Q reorder",
             app.prompt_queue.len()
         ));
     }
@@ -9562,13 +9687,45 @@ pub(crate) struct TuiApp {
     /// Open reorder overlay state. `None` when the overlay is closed;
     /// the queue itself lives on `prompt_queue` regardless.
     pub(crate) prompt_queue_overlay: Option<prompt_queue::PromptQueueState>,
-    /// Set true when a turn just completed successfully and the queue is
-    /// non-empty. The main loop reads this immediately after
-    /// `drain_agent_events` returns, pops the next prompt, and calls
-    /// `start_user_turn`. Cleared each time the main loop reads it.
-    /// Cancelled and Failed turns deliberately do NOT set this flag —
-    /// the user is in the driver's seat on cancellation.
+    /// Set true when a turn just completed (success, cancel, or fail)
+    /// and the queue is non-empty. The main loop reads this immediately
+    /// after `drain_agent_events` returns, pops the next prompt, and
+    /// calls `start_user_turn`. Cleared each time the main loop reads
+    /// it. To stop the auto-drain, open the queue overlay and delete
+    /// the entries you don't want.
     pub(crate) auto_drain_queue: bool,
+    /// Pending multi-key chord (`Ctrl+X` leader). Set when the user
+    /// types the leader; cleared either by the matching follow-up key
+    /// or by any other keystroke (which then falls through normally).
+    pub(crate) pending_chord: Option<ChordPrefix>,
+    /// Per-frame click-target registry. Render fns push `Clickable`
+    /// entries here (through `&TuiApp` thanks to interior mutability);
+    /// `handle_mouse` iterates the Vec in reverse on left-click so
+    /// the topmost (later-rendered) hit wins. Cleared at the start of
+    /// every draw via `begin_frame_clickables`.
+    pub(crate) clickables: std::cell::RefCell<Vec<Clickable>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChordPrefix {
+    /// `Ctrl+X` — Emacs-style extended-command leader. Currently only
+    /// used by `Ctrl+X Q` (toggle the prompt-queue overlay).
+    CtrlX,
+}
+
+/// What a click on a registered `Clickable` should do. Add a variant
+/// when a new button lands; add the matching arm in
+/// `dispatch_click_action` next to the existing handlers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClickAction {
+    /// Open / close the prompt-queue reorder overlay.
+    ToggleQueueOverlay,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Clickable {
+    pub(crate) rect: Rect,
+    pub(crate) action: ClickAction,
 }
 
 #[derive(Debug, Default)]
@@ -9578,6 +9735,39 @@ pub(crate) struct PendingDiffResult {
 }
 
 impl TuiApp {
+    /// Clear the click-target registry at the start of each frame.
+    /// Called from `render` / `render_inline` before any widget draws.
+    pub(crate) fn begin_frame_clickables(&self) {
+        self.clickables.borrow_mut().clear();
+    }
+
+    /// Record a click target for the frame currently being drawn.
+    /// Render fns hold only `&TuiApp`, so the registry lives in a
+    /// `RefCell` to allow `push` through a shared reference.
+    pub(crate) fn register_click(&self, rect: Rect, action: ClickAction) {
+        self.clickables
+            .borrow_mut()
+            .push(Clickable { rect, action });
+    }
+
+    /// Topmost click target containing `(column, row)`, if any.
+    /// Iterates the registry in reverse so later-rendered widgets
+    /// (overlays, modals) take precedence over earlier ones at the
+    /// same screen cell.
+    pub(crate) fn click_target_at(&self, column: u16, row: u16) -> Option<ClickAction> {
+        self.clickables
+            .borrow()
+            .iter()
+            .rev()
+            .find(|c| {
+                column >= c.rect.x
+                    && column < c.rect.x.saturating_add(c.rect.width)
+                    && row >= c.rect.y
+                    && row < c.rect.y.saturating_add(c.rect.height)
+            })
+            .map(|c| c.action)
+    }
+
     /// Session id to use for plan IO. Falls back to
     /// [`proposed_plan::FALLBACK_SESSION_ID`] when the agent has not yet
     /// handed one back so plan-mode IO can still proceed during the
@@ -9741,6 +9931,8 @@ impl TuiApp {
             prompt_queue: VecDeque::new(),
             prompt_queue_overlay: None,
             auto_drain_queue: false,
+            pending_chord: None,
+            clickables: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -9886,6 +10078,27 @@ impl TuiApp {
     pub(crate) fn push_log(&mut self, message: String) {
         let id = self.next_id();
         self.push_entry(TranscriptEntry::log(id, message, self.transcript_default));
+    }
+
+    /// Push a turn-ending warning log (⚠ prefix). Suppresses the push when
+    /// the most recent transcript entry is already a `⚠ Cancelled` / `⚠ Denied`
+    /// tool card — the card already communicates the turn-end at a glance,
+    /// and a trailing `⚠ turn cancelled` line is just noise. Returns whether
+    /// the entry was actually pushed.
+    pub(crate) fn push_warn(&mut self, message: String) -> bool {
+        if let Some(last) = self.transcript.last()
+            && last.is_cancel_terminated_tool_card()
+        {
+            return false;
+        }
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::log_with_kind(
+            id,
+            message,
+            LogKind::Warn,
+            self.transcript_default,
+        ));
+        true
     }
 
     /// Append a transcript entry tagged as operational chrome — used for
@@ -10171,6 +10384,20 @@ impl TranscriptEntry {
         }
     }
 
+    /// True when the entry is a tool-result card whose status already
+    /// communicates a turn-ending cancellation (rendered with `⚠`).
+    /// Used to suppress the redundant `⚠ turn cancelled` log that the
+    /// `AgentEvent::Cancelled` arm would otherwise push.
+    fn is_cancel_terminated_tool_card(&self) -> bool {
+        let TranscriptEntryKind::ToolResult(tool) = &self.kind else {
+            return false;
+        };
+        matches!(
+            tool.result.status,
+            ToolStatus::Cancelled | ToolStatus::Denied,
+        )
+    }
+
     fn pin_payload(&self) -> (String, String, String) {
         match &self.kind {
             TranscriptEntryKind::Message(item) => (
@@ -10227,6 +10454,9 @@ pub(crate) enum LogKind {
     /// plan-handoff state) — rendered dim/italic with no bullet so it
     /// fades to the periphery instead of looking like a content event.
     Operational,
+    /// Warning chrome — turn cancellations, turn failures. Rendered with
+    /// a `⚠ ` prefix so the user can spot turn-ending events at a glance.
+    Warn,
 }
 
 #[derive(Debug, Clone)]
@@ -10365,6 +10595,13 @@ pub(crate) struct PendingRequestUserInput {
     pub(crate) request: RequestUserInputRequest,
     pub(crate) response_tx: oneshot::Sender<RequestUserInputResponse>,
     pub(crate) selection_index: usize,
+    /// Free-form answer typed inside the modal. Kept separate from
+    /// `TuiApp::input` so the user's pending next-prompt draft is not
+    /// hijacked by the modal — the previous design routed every char
+    /// into the composer, which then looked like a leaked next prompt.
+    pub(crate) answer: String,
+    /// Byte cursor into `answer`.
+    pub(crate) answer_cursor: usize,
 }
 
 /// Interactive prompt that appears after a `<proposed_plan>` block lands
@@ -10481,6 +10718,7 @@ impl TerminalGuard {
                     stdout,
                     Print(CLEAR_SCROLLBACK_AND_VISIBLE),
                     Print(DISABLE_MOUSE_MODES),
+                    Print(ENABLE_MOUSE_CLICK_CAPTURE),
                     DisableAlternateScroll,
                     EnableBracketedPaste
                 )
@@ -10491,6 +10729,7 @@ impl TerminalGuard {
                     stdout,
                     EnterAlternateScreen,
                     Print(DISABLE_MOUSE_MODES),
+                    Print(ENABLE_MOUSE_CLICK_CAPTURE),
                     EnableAlternateScroll,
                     Clear(ClearType::All),
                     MoveTo(0, 0),
