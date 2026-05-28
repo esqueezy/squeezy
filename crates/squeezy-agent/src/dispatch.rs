@@ -46,51 +46,124 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "args", rename_all = "kebab-case")]
 pub enum DispatchCommand {
-    Help { topic: Option<String> },
-    Config { section: Option<String> },
+    Help {
+        topic: Option<String>,
+    },
+    Config {
+        section: Option<String>,
+    },
     Model,
     Permissions,
-    Plan { prompt: Option<String> },
-    Build { prompt: Option<String> },
-    Plans { args: String },
+    Plan {
+        prompt: Option<String>,
+    },
+    Build {
+        prompt: Option<String>,
+    },
+    Plans {
+        args: String,
+    },
     Cost,
     Context,
     Reviewer,
-    Attach { path: String },
+    Attach {
+        path: String,
+    },
     Attachments,
-    Copy { target: Option<String> },
-    Compact { undo: bool },
-    Collapse { category: Option<String> },
-    Expand { category: Option<String> },
+    Copy {
+        target: Option<String>,
+    },
+    Compact {
+        undo: bool,
+    },
+    Collapse {
+        category: Option<String>,
+    },
+    Expand {
+        category: Option<String>,
+    },
     Diff,
     Tasks,
-    Task { id: String },
-    TaskCancel { id: String },
+    Task {
+        id: String,
+    },
+    TaskCancel {
+        id: String,
+    },
     Jobs,
-    Job { id: String },
-    JobCancel { id: String },
-    Pin { target: Option<String> },
+    Job {
+        id: String,
+    },
+    JobCancel {
+        id: String,
+    },
+    Pin {
+        target: Option<String>,
+    },
     Pins,
-    Unpin { id: String },
-    Feedback { args: String },
-    Report { args: String },
+    Unpin {
+        id: String,
+    },
+    Feedback {
+        args: String,
+    },
+    Report {
+        args: String,
+    },
     Sessions,
-    Session { id: String },
-    Resume { id: String },
+    Session {
+        id: String,
+    },
+    /// `/session rename <name>` — set the active session's
+    /// `display_name`. An empty `name` clears the field so the picker
+    /// falls back to the inferred title.
+    SessionRename {
+        name: String,
+    },
+    /// `/session label <name>` — append a free-form label to the
+    /// active session's `labels` list. Duplicates are suppressed by the
+    /// agent so the wire shape stays small.
+    SessionLabel {
+        name: String,
+    },
+    Resume {
+        id: String,
+    },
     Fork,
-    SessionExport { id: String },
-    SessionExportHtml { id: String, path: Option<String> },
-    SessionCleanup { args: String },
+    SessionExport {
+        id: String,
+    },
+    SessionExportHtml {
+        id: String,
+        path: Option<String>,
+    },
+    SessionCleanup {
+        args: String,
+    },
     Checkpoints,
-    Checkpoint { id: String },
+    Checkpoint {
+        id: String,
+    },
     Undo,
-    RevertTurn { group_id: String },
-    Effort { value: Option<String> },
-    Verbosity { value: Option<String> },
-    ToolVerbosity { value: Option<String> },
-    Detach { id: String },
+    RevertTurn {
+        group_id: String,
+    },
+    Effort {
+        value: Option<String>,
+    },
+    Verbosity {
+        value: Option<String>,
+    },
+    ToolVerbosity {
+        value: Option<String>,
+    },
+    Detach {
+        id: String,
+    },
     Statusline,
-    Theme { theme: String },
+    Theme {
+        theme: String,
+    },
     Keymap,
 }
 
@@ -130,6 +203,8 @@ impl DispatchCommand {
             Self::Report { .. } => "/report",
             Self::Sessions => "/sessions",
             Self::Session { .. } => "/session",
+            Self::SessionRename { .. } => "/session",
+            Self::SessionLabel { .. } => "/session",
             Self::Resume { .. } => "/resume",
             Self::Fork => "/fork",
             Self::SessionExport { .. } => "/session-export",
@@ -261,9 +336,37 @@ impl DispatchCommand {
                 args: rest.to_string(),
             },
             "/sessions" => Self::Sessions,
-            "/session" => Self::Session {
-                id: require_id(head, rest, "<session_id>")?,
-            },
+            "/session" => {
+                // `/session rename <name>` and `/session label <name>`
+                // mutate the active session's metadata; everything else
+                // continues to be `/session <session_id>` (lookup-by-id).
+                // `rename` and `label` are reserved subcommands and
+                // therefore not usable as raw session ids, which is fine
+                // because session ids in the wild are timestamped
+                // hex-suffixed slugs (e.g. `session-1700000000-ab12cd`).
+                let trimmed = rest.trim_start();
+                let (first, remainder) = trimmed
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((trimmed, ""));
+                match first {
+                    "rename" => Self::SessionRename {
+                        name: remainder.trim().to_string(),
+                    },
+                    "label" => {
+                        let name = remainder.trim().to_string();
+                        if name.is_empty() {
+                            return Err(DispatchCommandParseError::Usage {
+                                command: head.to_string(),
+                                hint: "usage: /session label <name>".to_string(),
+                            });
+                        }
+                        Self::SessionLabel { name }
+                    }
+                    _ => Self::Session {
+                        id: require_id(head, rest, "<session_id> | rename <name> | label <name>")?,
+                    },
+                }
+            }
             "/resume" => Self::Resume {
                 id: require_id(head, rest, "<session_id>")?,
             },
@@ -422,6 +525,22 @@ pub enum DispatchOutcome {
     SessionsList { count: usize },
     /// `/session <id>` — whether the session exists in the store.
     SessionDetail { session_id: String, exists: bool },
+    /// `/session rename <name>` — the active session's `display_name`
+    /// was updated. `display_name` is `None` when the user passed an
+    /// empty argument to clear the field.
+    SessionRenamed {
+        session_id: String,
+        display_name: Option<String>,
+    },
+    /// `/session label <name>` — `label` was added to the active
+    /// session's `labels` list. `added` is `false` when the label was
+    /// already present, so the agent did not rewrite metadata.
+    SessionLabelled {
+        session_id: String,
+        label: String,
+        added: bool,
+        labels: Vec<String>,
+    },
     /// `/session-export <id>` — number of bytes in the JSON export.
     SessionExported { session_id: String, bytes: usize },
     /// `/session-export-html <id> [path]` — bytes written.

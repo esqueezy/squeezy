@@ -107,6 +107,8 @@ fn summary_at(id: &str, cwd: &str) -> SessionSummary {
         turn_count: 0,
         cwd: cwd.to_string(),
         repo_root: None,
+        display_name: None,
+        labels: Vec::new(),
         branches: Vec::new(),
     }
 }
@@ -201,11 +203,47 @@ fn session_summary_label_truncates_long_prompts() {
         turn_count: 0,
         cwd: "/work/repo".to_string(),
         repo_root: None,
+        display_name: None,
+        labels: Vec::new(),
         branches: Vec::new(),
     };
     let label = summary.label();
     assert!(label.chars().count() <= 80, "label too long: {label}");
     assert!(label.ends_with('…'), "expected ellipsis: {label}");
+}
+
+#[test]
+fn session_summary_label_prefers_display_name_when_set() {
+    // The user-set display name beats the inferred first-user-task label
+    // so memorable sessions stay easy to spot in the picker.
+    let mut summary = summary("x");
+    summary.display_name = Some("payments-refactor".to_string());
+    summary.first_user_task = Some("debug why /checkout 500s".to_string());
+    assert_eq!(summary.label(), "payments-refactor");
+}
+
+#[test]
+fn session_summary_label_falls_back_to_task_when_display_name_is_blank() {
+    // A whitespace-only display name (the user typed `/session rename
+    // "   "`) must not silently blank the row label — fall back to the
+    // inferred task instead.
+    let mut summary = summary("x");
+    summary.display_name = Some("   ".to_string());
+    summary.first_user_task = Some("inferred prompt".to_string());
+    assert_eq!(summary.label(), "inferred prompt");
+}
+
+#[test]
+fn session_summary_label_hint_renders_labels_as_hashtags() {
+    let mut summary = summary("x");
+    summary.labels = vec!["bugfix".to_string(), "payments".to_string()];
+    assert_eq!(summary.label_hint(), "#bugfix #payments");
+}
+
+#[test]
+fn session_summary_label_hint_is_empty_when_no_labels() {
+    let summary = summary("x");
+    assert!(summary.label_hint().is_empty());
 }
 
 #[test]
@@ -271,6 +309,8 @@ fn project_hint_prefers_repo_root_basename() {
         turn_count: 0,
         cwd: "/work/other/src/deep".to_string(),
         repo_root: Some("/work/other".to_string()),
+        display_name: None,
+        labels: Vec::new(),
         branches: Vec::new(),
     };
     assert_eq!(s.project_hint(), "other");
@@ -286,6 +326,8 @@ fn project_hint_falls_back_to_cwd_tail() {
         turn_count: 0,
         cwd: "/work/sibling".to_string(),
         repo_root: None,
+        display_name: None,
+        labels: Vec::new(),
         branches: Vec::new(),
     };
     assert_eq!(s.project_hint(), "sibling");

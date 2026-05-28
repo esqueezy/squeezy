@@ -57,6 +57,14 @@ pub(crate) struct SessionSummary {
     /// Optional repo-root label shown alongside cross-project entries so
     /// the user can disambiguate sibling clones with similar prompts.
     pub(crate) repo_root: Option<String>,
+    /// User-set name (`/session rename <name>`). When present the picker
+    /// uses it as the row's primary title in place of the inferred task
+    /// label, so memorable sessions stay easy to spot.
+    pub(crate) display_name: Option<String>,
+    /// User-set labels (`/session label <name>`). Rendered after the row
+    /// title as compact `#labels`. Empty for sessions the user has not
+    /// tagged yet.
+    pub(crate) labels: Vec<String>,
     /// Branch tips discovered in the session's `events.jsonl`. Empty for
     /// linear sessions (the common case); populated when the session log
     /// contains at least two branches because the user re-prompted from
@@ -75,6 +83,8 @@ impl SessionSummary {
             turn_count: metadata.metrics.turns,
             cwd: metadata.cwd.clone(),
             repo_root: metadata.repo_root.clone(),
+            display_name: metadata.display_name.clone(),
+            labels: metadata.labels.clone(),
             branches: Vec::new(),
         }
     }
@@ -82,7 +92,10 @@ impl SessionSummary {
     /// Build a summary from a cross-project index entry. The global index
     /// only persists a single `title` field — surface it as
     /// `first_user_task` so the picker label code (which prefers
-    /// `first_user_task` over `latest_summary`) reads naturally.
+    /// `first_user_task` over `latest_summary`) reads naturally. Labels
+    /// are not persisted on the index entry: cross-project rows show the
+    /// row's `display_name` (when set) and otherwise behave the same as
+    /// per-project rows.
     fn from_global_index_entry(entry: &GlobalSessionIndexEntry) -> Self {
         Self {
             session_id: entry.session_id.clone(),
@@ -92,6 +105,8 @@ impl SessionSummary {
             turn_count: entry.turn_count,
             cwd: entry.cwd.clone(),
             repo_root: entry.repo_root.clone(),
+            display_name: entry.display_name.clone(),
+            labels: Vec::new(),
             branches: Vec::new(),
         }
     }
@@ -106,7 +121,17 @@ impl SessionSummary {
         }
     }
 
+    /// Primary row title. Prefers the user-set `display_name` from
+    /// `/session rename <name>` so memorable sessions stay easy to spot;
+    /// falls back to the inferred first-user-task / latest-summary pair
+    /// for sessions the user has not renamed yet.
     pub(crate) fn label(&self) -> String {
+        if let Some(name) = self.display_name.as_deref() {
+            let line = name.lines().next().unwrap_or(name);
+            if !line.trim().is_empty() {
+                return truncate(line, 80);
+            }
+        }
         let task = self
             .first_user_task
             .as_deref()
@@ -116,6 +141,23 @@ impl SessionSummary {
             .next()
             .unwrap_or("(no prompt recorded)");
         truncate(task, 80)
+    }
+
+    /// Compact `#label1 #label2` hint rendered after the row title when
+    /// the user has tagged the session via `/session label <name>`. Empty
+    /// for untagged sessions so the picker layout stays unchanged for
+    /// the default case.
+    pub(crate) fn label_hint(&self) -> String {
+        if self.labels.is_empty() {
+            return String::new();
+        }
+        let joined = self
+            .labels
+            .iter()
+            .map(|label| format!("#{label}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        truncate(&joined, 40)
     }
 
     /// Short directory hint shown when the entry lives outside the current
@@ -627,6 +669,11 @@ fn render_candidate_row(
     ];
     if let Some(marker) = branch_marker {
         spans.push(Span::styled(marker, Style::default().fg(MODE_PURPLE)));
+    }
+    let label_hint = summary.label_hint();
+    if !label_hint.is_empty() {
+        spans.push(Span::styled("  ", Style::default()));
+        spans.push(Span::styled(label_hint, Style::default().fg(GOLD)));
     }
     if cross_project {
         spans.push(Span::styled("  · ", Style::default().fg(QUIET)));

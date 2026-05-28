@@ -27,6 +27,8 @@ fn meta(id: &str) -> SessionMetadata {
         event_count: 0,
         token_calibration: Default::default(),
         parent_id: None,
+        display_name: None,
+        labels: Vec::new(),
     }
 }
 

@@ -273,7 +273,7 @@ impl SessionStore {
     /// `~/.squeezy/sessions/index.jsonl`; tests that want to exercise
     /// the global index redirect HOME explicitly so the destination
     /// also lives under temp, and the guard becomes a no-op.
-    fn record_global_index(metadata: &SessionMetadata) {
+    pub(crate) fn record_global_index(metadata: &SessionMetadata) {
         if skip_global_index_for_test_workspace(&metadata.workspace_root) {
             return;
         }
@@ -1205,6 +1205,29 @@ impl SessionHandle {
         write_json(&self.dir().join("metadata.json"), &metadata)
     }
 
+    /// Like [`Self::update_metadata`] but also refreshes the
+    /// cross-project global index entry so user-facing fields
+    /// (`display_name`, `labels`, …) become visible to the resume
+    /// picker without waiting for the next session to start. Returns
+    /// the post-update metadata snapshot. Used by user-initiated
+    /// metadata mutations (`/session rename`, `/session label`) where
+    /// the picker UX depends on the change propagating immediately.
+    ///
+    /// Internal lifecycle writes that mutate metadata as a side effect
+    /// (status transitions, calibration EMA updates, …) keep calling
+    /// [`Self::update_metadata`] directly: the global index refresh
+    /// pattern only matters when the new value affects the cross-project
+    /// picker's row label.
+    pub fn update_metadata_and_index(
+        &self,
+        update: impl FnOnce(&mut SessionMetadata),
+    ) -> Result<SessionMetadata> {
+        self.update_metadata(update)?;
+        let snapshot = self.metadata()?;
+        SessionStore::record_global_index(&snapshot);
+        Ok(snapshot)
+    }
+
     pub fn flush_events(&self) -> Result<()> {
         let writer = {
             let guard = self.state.inner.lock().expect("session handle state");
@@ -1605,6 +1628,13 @@ pub struct GlobalSessionIndexEntry {
     /// a placeholder label once any assistant turn completes.
     #[serde(default)]
     pub title: Option<String>,
+    /// Mirrors `SessionMetadata::display_name` so cross-project resume
+    /// picker entries (which read this index, not the per-project
+    /// `metadata.json`) can still surface the user-chosen name. Legacy
+    /// index files predate this field — `serde(default)` keeps them
+    /// loadable; the picker falls back to `title` when this is `None`.
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub started_at_ms: u64,
     pub last_event_at_ms: u64,
     #[serde(default)]
@@ -1631,6 +1661,7 @@ impl GlobalSessionIndexEntry {
             workspace_root: metadata.workspace_root.clone(),
             repo_root: metadata.repo_root.clone(),
             title,
+            display_name: metadata.display_name.clone(),
             started_at_ms: metadata.started_at_ms,
             last_event_at_ms,
             turn_count: metadata.metrics.turns,
@@ -1682,6 +1713,22 @@ pub struct SessionMetadata {
     /// pre-fork `metadata.json` files keep deserializing.
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// Human-friendly name set by the user via `/session rename <name>`.
+    /// When present, the resume picker prefers it over the inferred
+    /// `first_user_task` / `latest_summary` label so memorable sessions
+    /// stay easy to find. `serde(default)` keeps pre-rename
+    /// `metadata.json` files loadable; the absent-field case continues
+    /// to fall back to the inferred label.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Free-form labels attached by the user via `/session label <name>`.
+    /// Multiple labels coexist (`bugfix`, `payments`, `wip`, …) so the
+    /// user can group sessions across projects without renaming them.
+    /// Persisted as a `Vec<String>` so the wire shape is trivially
+    /// extensible; legacy `metadata.json` files deserialise with an
+    /// empty vec.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 impl SessionMetadata {

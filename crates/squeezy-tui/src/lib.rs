@@ -2353,6 +2353,51 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             }
             Err(error) => app.status = format!("session show failed: {error}"),
         },
+        DispatchCommand::SessionRename { name } => {
+            let parameter = if name.trim().is_empty() {
+                None
+            } else {
+                Some(name.clone())
+            };
+            match agent.set_session_display_name(parameter) {
+                Ok(metadata) => match metadata.display_name {
+                    Some(display) => {
+                        app.status = format!("renamed session → {display}");
+                        app.push_transcript_item(TranscriptItem::system(format!(
+                            "session {} renamed to {display}",
+                            metadata.session_id
+                        )));
+                    }
+                    None => {
+                        app.status = format!("cleared session name ({})", metadata.session_id);
+                        app.push_transcript_item(TranscriptItem::system(format!(
+                            "session {} display_name cleared",
+                            metadata.session_id
+                        )));
+                    }
+                },
+                Err(error) => app.status = format!("rename failed: {error}"),
+            }
+        }
+        DispatchCommand::SessionLabel { name } => match agent.add_session_label(name.clone()) {
+            Ok((metadata, added)) => {
+                let label_list = if metadata.labels.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    metadata.labels.join(", ")
+                };
+                if added {
+                    app.status = format!("labelled session #{name}");
+                    app.push_transcript_item(TranscriptItem::system(format!(
+                        "session {} labels: {label_list}",
+                        metadata.session_id
+                    )));
+                } else {
+                    app.status = format!("label #{name} already on session");
+                }
+            }
+            Err(error) => app.status = format!("label failed: {error}"),
+        },
         DispatchCommand::Fork => match agent.fork_current().await {
             Ok(new_id) => {
                 app.status = format!("forked session → {new_id}");
