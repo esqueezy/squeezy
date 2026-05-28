@@ -3115,6 +3115,7 @@ fn set_transcript_collapsed(
     for entry in &mut app.transcript {
         if entry.matches_category(category) && entry.collapsed != collapsed {
             entry.collapsed = collapsed;
+            entry.bump_revision();
             changed += 1;
         }
     }
@@ -3235,6 +3236,7 @@ fn toggle_selected_transcript_entry(app: &mut TuiApp) {
         return;
     };
     entry.collapsed = !entry.collapsed;
+    entry.bump_revision();
     app.status = format!(
         "{} transcript entry {} · Alt+E expand all",
         if entry.collapsed {
@@ -3279,6 +3281,7 @@ fn toggle_expand_all_transcript_entries(app: &mut TuiApp) {
         }
         if entry.collapsed != target_collapsed {
             entry.collapsed = target_collapsed;
+            entry.bump_revision();
             changed += 1;
         }
     }
@@ -5011,13 +5014,15 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             }
             None => {}
         }
-        lines.extend(format_transcript_entry_expanded(
+        lines.extend(cached_transcript_entry_lines(
+            app.render_cache_session,
             entry,
             app.selected_entry == Some(index),
             app.tool_output_verbosity,
             message_outcome(&app.transcript, index),
             width,
             app.show_reasoning_usage,
+            true,
         ));
     }
     lines
@@ -5052,6 +5057,128 @@ fn format_transcript_entry_expanded(
         }
         TranscriptEntryKind::SlashEcho(data) => vec![format_slash_echo_line(data, selected)],
     }
+}
+
+/// Memoise the line list for a single transcript entry across redraws.
+///
+/// Wraps the underlying `format_transcript_entry_with_width` /
+/// `format_transcript_entry_expanded` formatters with the per-entry LRU
+/// cache in `render::cache`. The cache key is `(session_id, entry_id)`;
+/// validation tags are the entry's content `revision`, the live
+/// `palette_generation`, and a fingerprint of the per-render context
+/// (selected flag, width, verbosity, outcome, show-reasoning toggle,
+/// expanded-vs-normal). On cache hit this skips re-rendering markdown,
+/// re-running tree-sitter for fenced blocks, and re-walking the entry
+/// kind — the dominant per-frame cost for a long transcript.
+///
+/// `expanded = true` selects the overlay (`Ctrl+T`) variant which
+/// forces `entry.collapsed = false`; `expanded = false` honours
+/// `entry.collapsed`. The flag is folded into `context_hash` so the
+/// overlay's expanded copy and the inline collapsed copy live as
+/// separate cache lines under the same entry id.
+///
+/// The 8 parameters mirror the surface of the two underlying formatters
+/// plus the `session_id` discriminator and the `expanded` switch; we
+/// allow `clippy::too_many_arguments` rather than introduce a struct
+/// purely as a clippy workaround.
+#[allow(clippy::too_many_arguments)]
+fn cached_transcript_entry_lines(
+    session_id: u64,
+    entry: &TranscriptEntry,
+    selected: bool,
+    tool_output_verbosity: ToolOutputVerbosity,
+    outcome: MessageOutcome,
+    width: Option<u16>,
+    show_reasoning: bool,
+    expanded: bool,
+) -> Vec<Line<'static>> {
+    let palette_generation = render::palette::palette_generation();
+    let context_hash = render_context_hash(
+        selected,
+        tool_output_verbosity,
+        outcome,
+        width,
+        show_reasoning,
+        expanded,
+    );
+    render::cache::get_or_compute_entry(
+        session_id,
+        entry.id,
+        entry.revision,
+        palette_generation,
+        context_hash,
+        || {
+            if expanded {
+                format_transcript_entry_expanded(
+                    entry,
+                    selected,
+                    tool_output_verbosity,
+                    outcome,
+                    width,
+                    show_reasoning,
+                )
+            } else {
+                format_transcript_entry_with_width(
+                    entry,
+                    selected,
+                    tool_output_verbosity,
+                    outcome,
+                    width,
+                    show_reasoning,
+                )
+            }
+        },
+    )
+}
+
+/// Pack the per-render context bits into a single `u64` for the entry
+/// cache's validity check. Bits are deliberately laid out non-overlap so
+/// flipping any single dimension produces a distinct hash without a
+/// hashing pass (the cache only needs equality, not uniform
+/// distribution).
+///
+/// Layout:
+/// - bit 0:      selected
+/// - bit 1:      show_reasoning
+/// - bit 2:      expanded (overlay vs inline)
+/// - bits 4-5:   tool_output_verbosity (Compact=0, Normal=1, Verbose=2)
+/// - bit 8:      message outcome (Normal=0, Failed=1)
+/// - bits 16-31: width (0 when absent)
+/// - bit 32:     width-present sentinel (distinguishes `Some(0)` from `None`)
+fn render_context_hash(
+    selected: bool,
+    verbosity: ToolOutputVerbosity,
+    outcome: MessageOutcome,
+    width: Option<u16>,
+    show_reasoning: bool,
+    expanded: bool,
+) -> u64 {
+    let mut h: u64 = 0;
+    if selected {
+        h |= 1 << 0;
+    }
+    if show_reasoning {
+        h |= 1 << 1;
+    }
+    if expanded {
+        h |= 1 << 2;
+    }
+    let v: u64 = match verbosity {
+        ToolOutputVerbosity::Compact => 0,
+        ToolOutputVerbosity::Normal => 1,
+        ToolOutputVerbosity::Verbose => 2,
+    };
+    h |= v << 4;
+    let o: u64 = match outcome {
+        MessageOutcome::Normal => 0,
+        MessageOutcome::Failed => 1,
+    };
+    h |= o << 8;
+    if let Some(w) = width {
+        h |= (w as u64) << 16;
+        h |= 1u64 << 32;
+    }
+    h
 }
 
 fn transcript_lines_for_render(
@@ -5099,13 +5226,15 @@ fn transcript_lines_for_render(
             }
             None => {}
         }
-        lines.extend(format_transcript_entry_with_width(
+        lines.extend(cached_transcript_entry_lines(
+            app.render_cache_session,
             item,
             app.selected_entry == Some(index),
             app.tool_output_verbosity,
             message_outcome(&app.transcript, index),
             width,
             app.show_reasoning_usage,
+            false,
         ));
     }
     if app.show_reasoning_usage && !app.pending_reasoning.trim().is_empty() {
@@ -9988,6 +10117,13 @@ pub(crate) struct TuiApp {
     pub(crate) transcript: Vec<TranscriptEntry>,
     pub(crate) selected_entry: Option<usize>,
     pub(crate) next_entry_id: u64,
+    /// Per-app discriminator for the global entry render cache. Allocated
+    /// once at `TuiApp::new`; every cache lookup is `(session, entry_id)`
+    /// so two `TuiApp` instances that share the process (most notably
+    /// parallel `cargo test` runs that share the static cache) cannot
+    /// clobber each other's entries through the colliding `entry_id = 0`
+    /// they both restart from.
+    pub(crate) render_cache_session: u64,
     pub(crate) transcript_scroll_from_bottom: u16,
     pub(crate) pending_assistant: streaming::StreamingController,
     /// Streaming buffer for reasoning/thinking deltas emitted during the
@@ -10325,6 +10461,7 @@ impl TuiApp {
             transcript,
             selected_entry: None,
             next_entry_id,
+            render_cache_session: render::cache::next_session_id(),
             transcript_scroll_from_bottom: 0,
             pending_assistant: streaming::StreamingController::new(),
             pending_reasoning: String::new(),
@@ -10652,9 +10789,31 @@ struct TranscriptEntry {
     id: u64,
     kind: TranscriptEntryKind,
     collapsed: bool,
+    /// Per-entry monotonic content revision. Starts at 0 on creation
+    /// and bumps via [`Self::bump_revision`] every time the entry's
+    /// payload or collapsed state mutates. The transcript render-line
+    /// cache (`render::cache::get_or_compute_entry`) uses this value as
+    /// the entry's invalidation tag, so streaming chunks, tool-call
+    /// coalescing, and collapse toggles all transparently invalidate
+    /// the entry's cached lines without forcing a full clear.
+    ///
+    /// All mutations of `TranscriptEntry` past initial construction
+    /// MUST call `bump_revision`; the cache's correctness contract
+    /// depends on it (F09 finding).
+    revision: u64,
 }
 
 impl TranscriptEntry {
+    /// Bump the per-entry revision. Wrapping is fine because the cache
+    /// only ever compares for equality against a previously stored
+    /// snapshot — the live counter overlapping with a long-ago value
+    /// after 2^64 mutations is not a realistic concern in a TUI
+    /// session and would, in any case, produce only a stale-cache
+    /// false-hit, not a memory-safety issue.
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     fn message(id: u64, item: TranscriptItem, transcript_default: TranscriptDefault) -> Self {
         let collapsed = transcript_default == TranscriptDefault::Compact
             && item.role != Role::Assistant
@@ -10663,6 +10822,7 @@ impl TranscriptEntry {
             id,
             kind: TranscriptEntryKind::Message(item),
             collapsed,
+            revision: 0,
         }
     }
 
@@ -10694,6 +10854,7 @@ impl TranscriptEntry {
                 repeat_count: 1,
             })),
             collapsed: collapsed_default,
+            revision: 0,
         }
     }
 
@@ -10714,6 +10875,7 @@ impl TranscriptEntry {
             // it's already a single dim line.
             collapsed: kind != LogKind::Operational
                 && transcript_default == TranscriptDefault::Compact,
+            revision: 0,
         }
     }
 
@@ -10728,6 +10890,7 @@ impl TranscriptEntry {
             // Plan cards default to fully expanded even in Compact mode
             // — the whole point of the card is to show the plan body.
             collapsed: false,
+            revision: 0,
         }
     }
 
@@ -10738,6 +10901,7 @@ impl TranscriptEntry {
             // Mirror codex's `/diff`: never truncated by default. The
             // user can still Ctrl-E to fold the body if it's huge.
             collapsed: false,
+            revision: 0,
         }
     }
 
@@ -10746,6 +10910,7 @@ impl TranscriptEntry {
             id,
             kind: TranscriptEntryKind::SlashEcho(data),
             collapsed: false,
+            revision: 0,
         }
     }
 
@@ -10763,6 +10928,7 @@ impl TranscriptEntry {
             // vanished. Users on `transcript_default = "compact"` keep the
             // collapsed shape, and Ctrl-E still toggles it either way.
             collapsed: transcript_default == TranscriptDefault::Compact,
+            revision: 0,
         }
     }
 
@@ -11002,6 +11168,11 @@ fn coalesce_tool_transcript_entry(existing: &mut TranscriptEntry, next: &Transcr
         existing_tool.repeat_count += next_tool.repeat_count;
         existing_tool.result = next_tool.result.clone();
         existing_tool.call = next_tool.call.clone();
+        // Coalesce mutates the visible payload (repeat_count badge + the
+        // most recent result body), so the cached line list for this
+        // entry is now stale. The revision bump invalidates it on the
+        // next render cycle.
+        existing.bump_revision();
         true
     } else {
         false
