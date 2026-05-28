@@ -45,6 +45,7 @@ use tokio_util::sync::CancellationToken;
 use unicode_normalization::UnicodeNormalization;
 
 mod checkpoints;
+mod file_mutation_queue;
 mod file_ops;
 mod graph_tools;
 mod ipc;
@@ -3350,6 +3351,12 @@ impl ToolRegistry {
             );
         }
 
+        // F01: serialise the read+validate+write sequence per-realpath so
+        // two concurrent `write_file` (or `apply_patch`) calls against the
+        // same file cannot interleave their sha256 check and `fs::write`,
+        // while writes to distinct files still proceed in parallel.
+        let _mutation_guard = file_mutation_queue::lock_paths_for_mutation([&path]).await;
+
         let checkpoint_before = match self.track_checkpoint_tree() {
             Ok(snapshot) => snapshot,
             Err(err) => return tool_error(call, err),
@@ -3457,6 +3464,12 @@ impl ToolRegistry {
                 None,
             );
         }
+
+        // F01: share the per-realpath mutex with `write_file`/`apply_patch`
+        // so a concurrent `apply_patch` on the same notebook (rejected at
+        // the redirect, but still possible in flight) cannot race with this
+        // edit.
+        let _mutation_guard = file_mutation_queue::lock_paths_for_mutation([&path]).await;
 
         let mode = args.edit_mode.unwrap_or_default();
         let before = match fs::read(&path) {

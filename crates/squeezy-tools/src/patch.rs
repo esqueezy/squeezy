@@ -727,6 +727,18 @@ impl ToolRegistry {
             }
         }
 
+        // F01: acquire the per-realpath mutex for every path this call will
+        // touch before reading anything off disk. Locks are taken in sorted
+        // realpath order inside the helper so two concurrent `apply_patch`
+        // calls whose touch sets overlap cannot deadlock; calls whose touch
+        // sets are disjoint proceed in parallel. We lock for `dry_run` too
+        // so the preview stages against a consistent on-disk snapshot, even
+        // though no `fs::write` follows.
+        let _mutation_guard = crate::file_mutation_queue::lock_paths_for_mutation(
+            touched_paths.iter().map(|rel| self.root.join(rel)),
+        )
+        .await;
+
         // Capture the checkpoint snapshot before validation. The
         // `unified_diff` fallback (F89) shells out to `git apply` during
         // validation, which mutates the worktree directly — without an

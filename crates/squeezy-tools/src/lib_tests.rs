@@ -3614,6 +3614,110 @@ async fn absolute_output_dir_overrides_workspace_root() {
     let _ = fs::remove_dir_all(&absolute_dir);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_file_concurrent_distinct_paths_run_in_parallel() {
+    // F01: two `write_file` calls against distinct files must not
+    // serialise. We hold the per-realpath lock for path B externally,
+    // which would block any `write_file` keyed on B; the call against
+    // path A must still complete promptly because the locks are keyed
+    // per-realpath rather than process-wide.
+    let root = temp_workspace("write_file_concurrent_distinct");
+    fs::write(root.join("a.txt"), b"a-before").expect("write a");
+    fs::write(root.join("b.txt"), b"b-before").expect("write b");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let blocked_path = root.join("b.txt");
+    let parked_guard = file_mutation_queue::lock_paths_for_mutation([&blocked_path]).await;
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        registry
+            .execute(
+                ToolCall {
+                    call_id: "write_a".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({
+                        "path": "a.txt",
+                        "content": "a-after",
+                        "expected_sha256": sha256_hex(b"a-before"),
+                    }),
+                },
+                CancellationToken::new(),
+            )
+            .await
+    })
+    .await
+    .expect("write_file against a.txt must not be blocked by an unrelated lock on b.txt");
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(
+        fs::read_to_string(root.join("a.txt")).unwrap(),
+        "a-after",
+        "a.txt should have been written while b.txt's lock was held"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("b.txt")).unwrap(),
+        "b-before",
+        "b.txt must remain untouched because no writer ran against it"
+    );
+
+    drop(parked_guard);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_file_concurrent_same_path_serialises_on_realpath() {
+    // F01: a `write_file` against path P must wait if the per-realpath
+    // lock for P is already held. We park the lock externally, kick off
+    // the writer, observe that it does not complete, then release the
+    // lock and confirm it then completes.
+    let root = temp_workspace("write_file_concurrent_same");
+    fs::write(root.join("shared.txt"), b"v0").expect("write shared");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let blocked_path = root.join("shared.txt");
+    let parked_guard = file_mutation_queue::lock_paths_for_mutation([&blocked_path]).await;
+
+    let registry_clone = registry.clone();
+    let mut writer = tokio::spawn(async move {
+        registry_clone
+            .execute(
+                ToolCall {
+                    call_id: "write_shared".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({
+                        "path": "shared.txt",
+                        "content": "v1",
+                        "expected_sha256": sha256_hex(b"v0"),
+                    }),
+                },
+                CancellationToken::new(),
+            )
+            .await
+    });
+
+    // The writer must still be blocked on the per-realpath lock.
+    let race = tokio::time::timeout(std::time::Duration::from_millis(150), &mut writer).await;
+    assert!(
+        race.is_err(),
+        "write_file should block while the per-realpath lock is held"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("shared.txt")).unwrap(),
+        "v0",
+        "file must not have been overwritten while the lock was held"
+    );
+
+    drop(parked_guard);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+        .await
+        .expect("writer must complete once the lock is released")
+        .expect("writer task join");
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(fs::read_to_string(root.join("shared.txt")).unwrap(), "v1");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn write_file_rejects_stale_expected_hash() {
     let root = temp_workspace("write_file");
