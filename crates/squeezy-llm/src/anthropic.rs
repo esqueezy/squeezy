@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
@@ -13,8 +14,8 @@ use crate::{
     LlmStream, LlmToolCall, ReasoningKind, ReasoningPayload,
     anthropic_betas::anthropic_header_value,
     cache_policy::{CachePolicy, json_markers, should_apply_caching},
-    credentials::resolve_api_key_with_inline,
-    retry::{RetryPolicy, idle_timeout, send_with_retry, with_stream_retry},
+    credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
+    retry::{RetryPolicy, idle_timeout, send_with_auth_retry, with_stream_retry},
     sse::SseDecoder,
 };
 
@@ -24,7 +25,7 @@ const DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 64_000;
 #[derive(Clone)]
 pub struct AnthropicProvider {
     client: reqwest::Client,
-    api_key: String,
+    api_key: Arc<dyn ApiKeySource>,
     base_url: String,
     transport: ProviderTransportConfig,
 }
@@ -33,7 +34,7 @@ impl std::fmt::Debug for AnthropicProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnthropicProvider")
             .field("client", &self.client)
-            .field("api_key", &"<redacted>")
+            .field("api_key", &self.api_key)
             .field("base_url", &self.base_url)
             .field("transport", &self.transport)
             .finish()
@@ -44,12 +45,28 @@ impl AnthropicProvider {
     pub fn from_config(config: &AnthropicConfig) -> Result<Self> {
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
-        Ok(Self {
+        Ok(Self::with_api_key_source(
+            static_api_key_source(api_key, "anthropic"),
+            config.base_url.trim_end_matches('/').to_string(),
+            config.transport,
+        ))
+    }
+
+    /// Construct the provider against an already-built credential
+    /// source. Used by the OAuth subscription providers (Claude
+    /// Pro/Max) so a rotating access token can flow through the same
+    /// HTTP path without rebuilding the client on every refresh.
+    pub fn with_api_key_source(
+        api_key: Arc<dyn ApiKeySource>,
+        base_url: String,
+        transport: ProviderTransportConfig,
+    ) -> Self {
+        Self {
             client: reqwest::Client::new(),
             api_key,
-            base_url: config.base_url.trim_end_matches('/').to_string(),
-            transport: config.transport,
-        })
+            base_url,
+            transport,
+        }
     }
 
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
@@ -255,7 +272,7 @@ impl LlmProvider for AnthropicProvider {
 
 fn anthropic_stream_attempt(
     client: reqwest::Client,
-    api_key: String,
+    api_key: Arc<dyn ApiKeySource>,
     url: String,
     body: Value,
     beta_header: Option<String>,
@@ -263,16 +280,21 @@ fn anthropic_stream_attempt(
     cancel: CancellationToken,
 ) -> LlmStream {
     Box::pin(try_stream! {
-        let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
-            let mut builder = client
-                .post(&url)
-                .header("x-api-key", api_key.clone())
-                .header("anthropic-version", ANTHROPIC_VERSION);
-            if let Some(value) = beta_header.as_deref() {
-                builder = builder.header("anthropic-beta", value);
-            }
-            builder.json(&body)
-        }).await?;
+        let response = send_with_auth_retry(
+            &api_key,
+            RetryPolicy::provider_requests(transport),
+            &cancel,
+            |key| {
+                let mut builder = client
+                    .post(&url)
+                    .header("x-api-key", key)
+                    .header("anthropic-version", ANTHROPIC_VERSION);
+                if let Some(value) = beta_header.as_deref() {
+                    builder = builder.header("anthropic-beta", value);
+                }
+                builder.json(&body)
+            },
+        ).await?;
 
         let status = response.status();
         let response = if status == StatusCode::OK {

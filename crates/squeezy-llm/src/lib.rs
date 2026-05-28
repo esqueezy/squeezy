@@ -40,7 +40,8 @@ pub use anthropic::AnthropicProvider;
 pub use bedrock::BedrockProvider;
 pub use compatible::OpenAiCompatibleProvider;
 pub use credentials::{
-    KeySource, ResolvedKey, delete_api_key, resolve_api_key, resolve_api_key_with_inline,
+    ApiKeyFuture, ApiKeySource, KeySource, RefreshableToken, ResolvedKey, StaticApiKey, TokenState,
+    delete_api_key, resolve_api_key, resolve_api_key_with_inline, static_api_key_source,
 };
 pub use google::GoogleProvider;
 pub use lmstudio::{

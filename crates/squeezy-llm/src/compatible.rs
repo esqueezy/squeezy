@@ -8,6 +8,7 @@
 //! routed through here.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
@@ -24,8 +25,8 @@ use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
     ReasoningPayload,
-    credentials::resolve_api_key_with_inline,
-    retry::{RetryPolicy, idle_timeout, send_with_retry},
+    credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
+    retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
     sse::SseDecoder,
 };
 
@@ -33,7 +34,7 @@ use crate::{
 pub struct OpenAiCompatibleProvider {
     preset: OpenAiCompatiblePreset,
     client: reqwest::Client,
-    api_key: String,
+    api_key: Arc<dyn ApiKeySource>,
     base_url: String,
     extra_headers: BTreeMap<String, String>,
     transport: ProviderTransportConfig,
@@ -44,7 +45,7 @@ impl std::fmt::Debug for OpenAiCompatibleProvider {
         f.debug_struct("OpenAiCompatibleProvider")
             .field("preset", &self.preset)
             .field("client", &self.client)
-            .field("api_key", &"<redacted>")
+            .field("api_key", &self.api_key)
             .field("base_url", &self.base_url)
             .field("extra_headers", &self.extra_headers)
             .field("transport", &self.transport)
@@ -69,14 +70,34 @@ impl OpenAiCompatibleProvider {
         for (key, value) in &config.extra_headers {
             headers.insert(key.clone(), value.clone());
         }
-        Ok(Self {
-            preset: config.preset,
+        Ok(Self::with_api_key_source(
+            config.preset,
+            static_api_key_source(api_key, config.preset.as_str()),
+            config.base_url.trim_end_matches('/').to_string(),
+            headers,
+            config.transport,
+        ))
+    }
+
+    /// Construct the provider against an already-built credential
+    /// source. The GitHub Copilot OAuth provider uses this path so a
+    /// rotating Bearer token can flow through the Chat-Completions
+    /// route without rebuilding the client.
+    pub fn with_api_key_source(
+        preset: OpenAiCompatiblePreset,
+        api_key: Arc<dyn ApiKeySource>,
+        base_url: String,
+        extra_headers: BTreeMap<String, String>,
+        transport: ProviderTransportConfig,
+    ) -> Self {
+        Self {
+            preset,
             client: reqwest::Client::new(),
             api_key,
-            base_url: config.base_url.trim_end_matches('/').to_string(),
-            extra_headers: headers,
-            transport: config.transport,
-        })
+            base_url,
+            extra_headers,
+            transport,
+        }
     }
 
     pub fn preset(&self) -> OpenAiCompatiblePreset {
@@ -246,13 +267,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let provider_label = self.preset.display_name();
 
         Box::pin(try_stream! {
-            let response = send_with_retry(
+            let response = send_with_auth_retry(
+                &api_key,
                 RetryPolicy::provider_requests(transport),
                 &cancel,
-                || {
-                    let mut builder = client.post(&url).bearer_auth(api_key.clone());
-                    for (key, value) in &extra_headers {
-                        builder = builder.header(key.as_str(), value.as_str());
+                |key| {
+                    let mut builder = client.post(&url).bearer_auth(key);
+                    for (header_key, header_value) in &extra_headers {
+                        builder = builder.header(header_key.as_str(), header_value.as_str());
                     }
                     builder.json(&body)
                 },
