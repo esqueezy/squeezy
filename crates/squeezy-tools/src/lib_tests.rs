@@ -2778,6 +2778,68 @@ async fn apply_patch_returns_per_op_delta_with_exact_flag_on_success() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn apply_patch_returns_unified_diff_with_hunk_header_and_markers() {
+    // F14 (unified_diff): a successful apply_patch must surface a
+    // `unified_diff` string the caller can pipe through `git apply` to
+    // reconstruct the edit. For a 2-line search/replace the diff must carry
+    // the standard `--- a/<path>` / `+++ b/<path>` headers, a `@@` hunk
+    // header, and matched `-`/`+` line markers around the change.
+    let root = temp_workspace("apply_patch_unified_diff_output");
+    let before = "line-one\nline-two\nline-three\n";
+    fs::write(root.join("sample.txt"), before).expect("write sample");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_unified_diff".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "line-one\nline-two\n",
+                        "replace": "line-one-new\nline-two-new\n",
+                        "expected_sha256": sha256_hex(before.as_bytes()),
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-unified-diff".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let unified = result
+        .content
+        .get("unified_diff")
+        .and_then(Value::as_str)
+        .expect("unified_diff string");
+    assert!(
+        unified.contains("--- a/sample.txt"),
+        "missing old-file header: {unified}"
+    );
+    assert!(
+        unified.contains("+++ b/sample.txt"),
+        "missing new-file header: {unified}"
+    );
+    assert!(unified.contains("@@"), "missing hunk header: {unified}");
+    assert!(
+        unified.contains("-line-one\n"),
+        "missing `-` marker for removed line: {unified}"
+    );
+    assert!(
+        unified.contains("+line-one-new\n"),
+        "missing `+` marker for added line: {unified}"
+    );
+    assert!(
+        unified.contains("-line-two\n") && unified.contains("+line-two-new\n"),
+        "second changed line should appear as -/+: {unified}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn apply_patch_delta_reports_per_op_failure_with_error() {

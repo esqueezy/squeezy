@@ -3130,7 +3130,14 @@ impl ToolRegistry {
                         )?;
                     }
                 }
-                staged.push_delete(rel.clone(), abs_path, current_sha256, existing.len());
+                let before_contents = std::str::from_utf8(&existing).ok().map(str::to_string);
+                staged.push_delete(
+                    rel.clone(),
+                    abs_path,
+                    current_sha256,
+                    existing.len(),
+                    before_contents,
+                );
                 preview_ops.push(json!({
                     "patch_index": index,
                     "kind": "delete_file",
@@ -4373,9 +4380,9 @@ pub(crate) fn diff_status_str(status: DiffFileStatus) -> &'static str {
 #[derive(Debug)]
 pub(crate) struct PatchFileState {
     path: PathBuf,
-    rel: String,
-    before: String,
-    current: String,
+    pub(crate) rel: String,
+    pub(crate) before: String,
+    pub(crate) current: String,
     before_sha256: String,
 }
 
@@ -4411,6 +4418,11 @@ pub(crate) enum StagedOp {
         abs_path: PathBuf,
         before_sha256: String,
         before_len: usize,
+        /// Pre-delete file contents when the file was valid UTF-8. Used by
+        /// the unified-diff output to render the deletion's `-` lines; left
+        /// as `None` for binary files (we still delete them, but they don't
+        /// appear in the textual diff).
+        before_contents: Option<String>,
     },
     MoveFile {
         rel_from: String,
@@ -4487,12 +4499,14 @@ impl StagedApply {
         abs_path: PathBuf,
         before_sha256: String,
         before_len: usize,
+        before_contents: Option<String>,
     ) {
         self.ops.push(StagedOp::DeleteFile {
             rel,
             abs_path,
             before_sha256,
             before_len,
+            before_contents,
         });
     }
 
