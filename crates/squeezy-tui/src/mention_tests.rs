@@ -71,7 +71,7 @@ fn ranks_prefix_match_above_subsequence() {
         PathBuf::from("crates/graph/lib.rs"),
         PathBuf::from("readme.md"),
     ];
-    let out = rank_files("gra", &files);
+    let (out, _) = rank_files("gra", &files);
     assert_eq!(out.first().unwrap(), &PathBuf::from("crates/graph/lib.rs"));
 }
 
@@ -81,7 +81,7 @@ fn ranks_filename_prefix_above_path_substring() {
         PathBuf::from("crates/squeezy-graph/src/lib.rs"),
         PathBuf::from("graph_helpers.rs"),
     ];
-    let out = rank_files("graph", &files);
+    let (out, _) = rank_files("graph", &files);
     assert_eq!(out[0], PathBuf::from("graph_helpers.rs"));
 }
 
@@ -90,8 +90,23 @@ fn rank_empty_query_returns_first_n_paths() {
     let files: Vec<PathBuf> = (0..20)
         .map(|i| PathBuf::from(format!("file{i}.rs")))
         .collect();
-    let out = rank_files("", &files);
+    let (out, total) = rank_files("", &files);
     assert_eq!(out.len(), MAX_MATCHES);
+    // Total exposes the un-truncated candidate count so the popup
+    // footer can show e.g. `1/20`.
+    assert_eq!(total, files.len());
+}
+
+#[test]
+fn rank_reports_total_candidates_above_max_matches() {
+    // Twelve files all share the `gra` subsequence; only `MAX_MATCHES`
+    // are returned but the popup must still know the full count.
+    let files: Vec<PathBuf> = (0..12)
+        .map(|i| PathBuf::from(format!("graph_{i}.rs")))
+        .collect();
+    let (out, total) = rank_files("gra", &files);
+    assert_eq!(out.len(), MAX_MATCHES);
+    assert_eq!(total, 12);
 }
 
 #[test]
@@ -101,7 +116,8 @@ fn apply_inserts_path_and_returns_new_cursor() {
         end: 10,
         query: "gra".to_string(),
     };
-    let popup = MentionPopup::from_query(q, vec![PathBuf::from("crates/squeezy-graph/src/lib.rs")]);
+    let popup =
+        MentionPopup::from_query(q, vec![PathBuf::from("crates/squeezy-graph/src/lib.rs")], 1);
     let (new_input, cursor) = popup.apply("hello @gra").expect("apply");
     assert_eq!(new_input, "hello crates/squeezy-graph/src/lib.rs ");
     assert_eq!(cursor, new_input.len());
@@ -112,7 +128,7 @@ fn mention_rank_uses_subsequence_for_abbreviations() {
     // A camel/snake abbreviation like `grphmgr` should still match
     // `graph_manager.rs` via the case-insensitive subsequence matcher.
     let files = vec![PathBuf::from("src/graph_manager.rs")];
-    let out = rank_files("grphmgr", &files);
+    let (out, _) = rank_files("grphmgr", &files);
     assert_eq!(out.first(), Some(&PathBuf::from("src/graph_manager.rs")));
 }
 
@@ -124,7 +140,7 @@ fn mention_rank_keeps_filename_prefix_priority() {
         PathBuf::from("crates/squeezy-graph/src/lib.rs"),
         PathBuf::from("lib.rs"),
     ];
-    let out = rank_files("lib", &files);
+    let (out, _) = rank_files("lib", &files);
     assert_eq!(out.first(), Some(&PathBuf::from("lib.rs")));
 }
 
@@ -135,7 +151,7 @@ fn popup_navigation_clamps_at_bounds() {
         end: 4,
         query: "a".to_string(),
     };
-    let mut popup = MentionPopup::from_query(q, vec![PathBuf::from("a"), PathBuf::from("b")]);
+    let mut popup = MentionPopup::from_query(q, vec![PathBuf::from("a"), PathBuf::from("b")], 2);
     popup.move_up();
     assert_eq!(popup.selected, 0);
     popup.move_down();

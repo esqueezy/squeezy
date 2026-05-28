@@ -9378,10 +9378,9 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
     if popup.is_empty() {
         return Vec::new();
     }
-    popup
+    let mut lines: Vec<Line<'static>> = popup
         .matches
         .iter()
-        .take(5)
         .enumerate()
         .map(|(index, path)| {
             let selected = index == popup.selected;
@@ -9400,7 +9399,17 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
                 Span::styled(display, style),
             ])
         })
-        .collect()
+        .collect();
+    // `(idx/total)` footer. `total` is the pre-truncation candidate
+    // count so the user can see when more matches exist beyond the
+    // displayed window (capped at `MAX_MATCHES`).
+    let total = popup.total.max(popup.matches.len());
+    let footer = format!("  {}/{}", popup.selected + 1, total);
+    lines.push(Line::from(Span::styled(
+        footer,
+        Style::default().fg(QUIET).add_modifier(Modifier::DIM),
+    )));
+    lines
 }
 
 fn format_status_overview_line(app: &TuiApp, width: u16) -> Line<'static> {
