@@ -494,6 +494,16 @@ pub trait AgentHook: Send + Sync {
     fn after_tool_result<'a>(&'a self, _result: &'a mut ToolResultView) -> HookFuture<'a, ()> {
         Box::pin(async {})
     }
+
+    /// Fires before the agent swaps the active session for `target_id`
+    /// (resume / quick-switch). Handlers can veto the swap by returning
+    /// [`Decision::Deny`] — typical use is an "unsaved work" guard that
+    /// blocks a switch while the user has a pending edit. The default
+    /// implementation allows the switch. The bus short-circuits on the
+    /// first deny, mirroring [`AgentHook::before_tool_call`].
+    fn before_session_switch<'a>(&'a self, _target_id: &'a str) -> HookFuture<'a, Decision> {
+        Box::pin(async { Decision::Allow })
+    }
 }
 
 /// Sequential dispatcher for [`AgentHook`] implementations.
@@ -563,6 +573,22 @@ impl AgentHookBus {
         for hook in &self.hooks {
             hook.after_tool_result(result).await;
         }
+    }
+
+    /// Fan out `before_session_switch` and short-circuit on the first
+    /// [`Decision::Deny`]. The agent's session-switch path consults this
+    /// before swapping the active session so handlers (e.g. an
+    /// "unsaved work" guard) can veto the swap. Later hooks after the
+    /// deny are not invoked, matching the
+    /// [`AgentHookBus::before_tool_call`] contract.
+    pub async fn before_session_switch(&self, target_id: &str) -> Decision {
+        for hook in &self.hooks {
+            match hook.before_session_switch(target_id).await {
+                Decision::Allow => continue,
+                deny @ Decision::Deny { .. } => return deny,
+            }
+        }
+        Decision::Allow
     }
 }
 
