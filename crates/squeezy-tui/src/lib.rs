@@ -2378,6 +2378,35 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             }
             return true;
         }
+        "/session-export-html" => {
+            let Some(session_id) = parts.next() else {
+                app.status = "usage: /session-export-html <session_id> [path]".to_string();
+                return true;
+            };
+            let target = parts
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(format!("squeezy-session-{session_id}.html")));
+            match agent.show_session(session_id).and_then(|record| {
+                squeezy_agent::export_session_to_html(
+                    &record,
+                    &squeezy_agent::ExportOpts::default(),
+                )
+                .map_err(|err| {
+                    squeezy_core::SqueezyError::Tool(format!("failed to render html: {err}"))
+                })
+                .and_then(|html| {
+                    std::fs::write(&target, &html).map_err(squeezy_core::SqueezyError::from)?;
+                    Ok(html.len())
+                })
+            }) {
+                Ok(len) => {
+                    app.status = format!("wrote {} ({} bytes)", target.display(), len);
+                }
+                Err(error) => app.status = format!("session export html failed: {error}"),
+            }
+            return true;
+        }
         "/session-cleanup" => {
             // Pull the mode flag out of the args before the id list so
             // `--archive` / `--purge` can appear anywhere on the line.

@@ -255,6 +255,13 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "<id>",
         &[PermissionCapability::Read, PermissionCapability::Edit],
     ),
+    slash_args_caps(
+        "/session-export-html",
+        "export a saved session as self-contained HTML",
+        false,
+        "<id> [path]",
+        &[PermissionCapability::Read, PermissionCapability::Edit],
+    ),
     // Locked + destructive: archives or purges sessions on disk.
     SlashCommand {
         name: "/session-cleanup",

@@ -282,8 +282,10 @@ enum SessionsCommand {
         #[arg(long, help = "Print replay report as JSON")]
         json: bool,
     },
-    #[command(about = "Export a redacted local session bundle as JSON")]
-    Export { id: String },
+    #[command(
+        about = "Export a redacted local session bundle (JSON by default, --html for shareable HTML)"
+    )]
+    Export(SessionExportArgs),
     #[command(about = "Preview, save, or send a redacted bug-report archive")]
     Report(SessionReportArgs),
     #[command(
@@ -343,6 +345,48 @@ struct FeedbackArgs {
     preview: bool,
     #[arg(long, help = "Send without an interactive confirmation prompt")]
     yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct SessionExportArgs {
+    /// Session id to export. The session must exist either under the live
+    /// session root or in the `archived/` tree.
+    id: String,
+    /// Render a self-contained HTML document (inline CSS, no external
+    /// resources) instead of the default JSON bundle. The output is
+    /// safe to share over email or attach to a bug report.
+    #[arg(long)]
+    html: bool,
+    /// Optional output path. When omitted JSON goes to stdout; HTML
+    /// goes to `squeezy-session-<id>.html` in the current directory.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Color theme baked into the exported HTML. Defaults to dark.
+    /// Ignored unless `--html` is set.
+    #[arg(long, value_enum, default_value_t = HtmlThemeArg::Dark)]
+    theme: HtmlThemeArg,
+    /// Drop tool calls and tool outputs from the export. Useful when
+    /// the conversation is the interesting part and the tool output
+    /// would otherwise dominate the document. Ignored unless `--html`
+    /// is set.
+    #[arg(long = "no-tool-outputs", default_value_t = false)]
+    no_tool_outputs: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum HtmlThemeArg {
+    Dark,
+    Light,
+}
+
+impl HtmlThemeArg {
+    fn to_theme(self) -> squeezy_agent::ExportTheme {
+        match self {
+            Self::Dark => squeezy_agent::ExportTheme::Dark,
+            Self::Light => squeezy_agent::ExportTheme::Light,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -1112,16 +1156,7 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             }
             Ok(())
         }
-        SessionsCommand::Export { id } => {
-            let value = store.export(id)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&value).map_err(|err| {
-                    SqueezyError::Tool(format!("failed to serialize session export: {err}"))
-                })?
-            );
-            Ok(())
-        }
+        SessionsCommand::Export(args) => handle_session_export_command(&store, args),
         SessionsCommand::Report(args) => handle_session_report_command(args, &config).await,
         SessionsCommand::Cleanup {
             ids,
@@ -1177,6 +1212,38 @@ async fn handle_feedback_command(args: &FeedbackArgs, cli: &Cli) -> squeezy_core
         .await
         .map_err(|error| SqueezyError::Tool(error.to_string()))?;
     println!("feedback sent: {}", result.id);
+    Ok(())
+}
+
+fn handle_session_export_command(
+    store: &SessionStore,
+    args: &SessionExportArgs,
+) -> squeezy_core::Result<()> {
+    if args.html {
+        let record = store.show(&args.id)?;
+        let opts = squeezy_agent::ExportOpts {
+            include_tool_outputs: !args.no_tool_outputs,
+            theme: args.theme.to_theme(),
+        };
+        let html = squeezy_agent::export_session_to_html(&record, &opts)
+            .map_err(|err| SqueezyError::Tool(format!("failed to render session html: {err}")))?;
+        let target = args
+            .output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("squeezy-session-{}.html", args.id)));
+        fs::write(&target, &html)?;
+        println!("wrote {} ({} bytes)", target.display(), html.len());
+        return Ok(());
+    }
+    let value = store.export(&args.id)?;
+    let json = serde_json::to_string_pretty(&value)
+        .map_err(|err| SqueezyError::Tool(format!("failed to serialize session export: {err}")))?;
+    if let Some(target) = args.output.as_ref() {
+        fs::write(target, json.as_bytes())?;
+        println!("wrote {} ({} bytes)", target.display(), json.len());
+    } else {
+        println!("{json}");
+    }
     Ok(())
 }
 
