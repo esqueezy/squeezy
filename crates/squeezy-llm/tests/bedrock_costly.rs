@@ -27,7 +27,7 @@ async fn bedrock_converse_streaming_costly() -> Result<()> {
     let provider = BedrockProvider::from_config(&BedrockConfig {
         region,
         base_url: env::var("BEDROCK_BASE_URL").ok(),
-        request_metadata: BTreeMap::new(),
+        bearer_token: env::var("AWS_BEARER_TOKEN_BEDROCK").ok(),
         transport: ProviderTransportConfig::default(),
     })?;
     let model = env::var(MODEL_ENV)

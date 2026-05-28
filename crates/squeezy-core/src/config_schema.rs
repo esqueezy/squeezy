@@ -1550,6 +1550,7 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
         "bedrock" => ProviderConfig::Bedrock(BedrockConfig {
             region: DEFAULT_BEDROCK_REGION.to_string(),
             base_url: None,
+            bearer_token: None,
             request_metadata: BTreeMap::new(),
             transport,
         }),

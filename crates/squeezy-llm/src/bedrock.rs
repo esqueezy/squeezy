@@ -8,7 +8,7 @@ use aws_config::{BehaviorVersion, SdkConfig};
 use aws_sdk_bedrockruntime::types::ConverseStreamOutput;
 use aws_sdk_bedrockruntime::{
     Client as BedrockClient,
-    config::Region,
+    config::{Region, Token as BedrockToken},
     error::SdkError,
     primitives::event_stream::EventReceiver,
     types::{
@@ -36,11 +36,10 @@ use crate::{
 pub struct BedrockProvider {
     region: String,
     base_url: Option<String>,
-    /// Cost-allocation tags forwarded as `ConverseStream.requestMetadata`
-    /// on every invocation. Stored as a `BTreeMap` to keep the in-memory
-    /// representation stable for snapshot/debug output; converted to the
-    /// SDK's `HashMap` shape only when we attach it to the request.
-    request_metadata: BTreeMap<String, String>,
+    bearer_token: Option<String>,
+    /// Operator-defined cost-allocation tags forwarded on every
+    /// ConverseStream invocation (F16pi-bedrock-request-metadata-tags).
+    request_metadata: std::collections::BTreeMap<String, String>,
     transport: ProviderTransportConfig,
     shared: Arc<tokio::sync::OnceCell<SdkConfig>>,
 }
@@ -50,6 +49,7 @@ impl BedrockProvider {
         Ok(Self {
             region: config.region.clone(),
             base_url: config.base_url.clone(),
+            bearer_token: config.bearer_token.clone(),
             request_metadata: config.request_metadata.clone(),
             transport: config.transport,
             shared: Arc::new(tokio::sync::OnceCell::new()),
@@ -63,22 +63,58 @@ impl BedrockProvider {
             .shared
             .get_or_init(|| async move { load_aws_config(region, base_url).await })
             .await;
-        if shared.credentials_provider().is_none() {
-            return Err(SqueezyError::ProviderNotConfigured(
-                "AWS credentials not found; configure with `aws configure`, AWS_PROFILE, or environment variables"
-                    .to_string(),
-            ));
-        }
-        Ok(BedrockClient::new(shared))
+        build_bedrock_client(shared, self.bearer_token.as_deref())
     }
 }
 
 async fn load_aws_config(region: String, base_url: Option<String>) -> SdkConfig {
+    // `aws_config::defaults` already wires the standard credential
+    // provider chain (env → ~/.aws/credentials → IMDS / container
+    // roles). We only override region + optional endpoint here so the
+    // chain itself is whatever the AWS SDK ships as best practice.
     let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(Region::new(region));
     if let Some(url) = base_url {
         loader = loader.endpoint_url(url);
     }
     loader.load().await
+}
+
+/// Choose between bearer-token auth and the AWS default credential
+/// chain when constructing a Bedrock Runtime client.
+///
+/// * When `bearer_token` is `Some(non_empty)` we route through Bedrock's
+///   HTTP bearer-auth scheme — clearing any inherited SigV4 credentials
+///   from the shared `SdkConfig` so the auth-scheme resolver cannot
+///   silently fall back to SigV4 when both routes are present.
+/// * Otherwise we trust whatever `aws_config::defaults` resolved into
+///   the shared config and only surface a `ProviderNotConfigured` error
+///   when the SDK was unable to install a credentials provider at all.
+pub(crate) fn build_bedrock_client(
+    shared: &SdkConfig,
+    bearer_token: Option<&str>,
+) -> Result<BedrockClient> {
+    if let Some(raw) = bearer_token {
+        let token = raw.trim();
+        if token.is_empty() {
+            return Err(SqueezyError::ProviderNotConfigured(
+                "AWS_BEARER_TOKEN_BEDROCK is set but empty; unset it or provide a non-empty token"
+                    .to_string(),
+            ));
+        }
+        let mut builder = aws_sdk_bedrockruntime::config::Builder::from(shared);
+        builder.set_credentials_provider(None);
+        let client_config = builder
+            .bearer_token(BedrockToken::new(token.to_string(), None))
+            .build();
+        return Ok(BedrockClient::from_conf(client_config));
+    }
+    if shared.credentials_provider().is_none() {
+        return Err(SqueezyError::ProviderNotConfigured(
+            "AWS credentials not found; set AWS_BEARER_TOKEN_BEDROCK for bearer auth, run `aws configure`, set AWS_PROFILE, or provide AWS environment variables"
+                .to_string(),
+        ));
+    }
+    Ok(BedrockClient::new(shared))
 }
 
 impl LlmProvider for BedrockProvider {
