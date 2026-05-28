@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use async_stream::try_stream;
 use aws_config::{BehaviorVersion, SdkConfig};
@@ -33,6 +36,11 @@ use crate::{
 pub struct BedrockProvider {
     region: String,
     base_url: Option<String>,
+    /// Cost-allocation tags forwarded as `ConverseStream.requestMetadata`
+    /// on every invocation. Stored as a `BTreeMap` to keep the in-memory
+    /// representation stable for snapshot/debug output; converted to the
+    /// SDK's `HashMap` shape only when we attach it to the request.
+    request_metadata: BTreeMap<String, String>,
     transport: ProviderTransportConfig,
     shared: Arc<tokio::sync::OnceCell<SdkConfig>>,
 }
@@ -42,6 +50,7 @@ impl BedrockProvider {
         Ok(Self {
             region: config.region.clone(),
             base_url: config.base_url.clone(),
+            request_metadata: config.request_metadata.clone(),
             transport: config.transport,
             shared: Arc::new(tokio::sync::OnceCell::new()),
         })
@@ -148,6 +157,9 @@ impl LlmProvider for BedrockProvider {
             if !extra_fields.is_empty() {
                 builder =
                     builder.additional_model_request_fields(Document::Object(extra_fields));
+            }
+            if let Some(metadata) = bedrock_request_metadata_map(&provider.request_metadata) {
+                builder = builder.set_request_metadata(Some(metadata));
             }
 
             let send_result = tokio::select! {
@@ -661,6 +673,27 @@ pub(crate) fn json_to_document(value: &Value) -> Document {
                 .collect(),
         ),
     }
+}
+
+/// Convert configured cost-allocation tags into the SDK shape the
+/// Converse builder accepts. Returns `None` for an empty map so the
+/// provider omits the `requestMetadata` field entirely instead of
+/// sending an empty object — Bedrock treats absent and empty
+/// equivalently, but skipping the field keeps the wire payload
+/// minimal and makes the "no tags configured" case observable in
+/// request logs.
+pub(crate) fn bedrock_request_metadata_map(
+    metadata: &BTreeMap<String, String>,
+) -> Option<HashMap<String, String>> {
+    if metadata.is_empty() {
+        return None;
+    }
+    Some(
+        metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    )
 }
 
 fn sdk_error_to_squeezy<E: std::fmt::Display, R>(error: SdkError<E, R>) -> SqueezyError {

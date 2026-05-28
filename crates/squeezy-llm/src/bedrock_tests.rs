@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use aws_sdk_bedrockruntime::operation::converse_stream::builders::ConverseStreamInputBuilder;
 use aws_sdk_bedrockruntime::types::{
     CachePointType, ContentBlock, ConversationRole, ConverseStreamMetadataEvent,
     ConverseStreamOutput, MessageStopEvent, StopReason, SystemContentBlock, TokenUsage,
@@ -7,10 +9,11 @@ use aws_sdk_bedrockruntime::types::{
 };
 use aws_smithy_types::{Document, Number};
 use serde_json::json;
+use squeezy_core::{BedrockConfig, ProviderTransportConfig};
 
 use super::{
-    BedrockStreamState, conversation_messages, handle_bedrock_event, json_to_document,
-    system_blocks, tool_configuration,
+    BedrockProvider, BedrockStreamState, bedrock_request_metadata_map, conversation_messages,
+    handle_bedrock_event, json_to_document, system_blocks, tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{LlmInputItem, LlmToolSpec};
@@ -360,6 +363,47 @@ fn conversation_messages_emit_image_content_block() {
     let source = image.source().expect("image source");
     let blob = source.as_bytes().expect("Bytes source");
     assert_eq!(blob.as_ref(), bytes.as_ref());
+}
+
+#[test]
+fn config_request_metadata_appears_on_converse_stream_input() {
+    // Cost-allocation tags supplied on `BedrockConfig.request_metadata`
+    // must round-trip through `BedrockProvider` and land on
+    // `ConverseStreamInput.request_metadata` so AWS billing can group
+    // invocations by the operator's chosen labels. Empty maps stay
+    // unset on the wire (the helper returns `None`) so we keep the
+    // request payload minimal when no tags are configured.
+    let mut tags = BTreeMap::new();
+    tags.insert("team".to_string(), "platform".to_string());
+    tags.insert("env".to_string(), "prod".to_string());
+
+    let provider = BedrockProvider::from_config(&BedrockConfig {
+        region: "us-east-1".to_string(),
+        base_url: None,
+        request_metadata: tags.clone(),
+        transport: ProviderTransportConfig::default(),
+    })
+    .expect("provider builds from config with request_metadata");
+
+    let sdk_map = bedrock_request_metadata_map(&provider.request_metadata)
+        .expect("non-empty config tags must produce a HashMap, not None");
+    let input = ConverseStreamInputBuilder::default()
+        .model_id("test-model")
+        .set_request_metadata(Some(sdk_map))
+        .build()
+        .expect("ConverseStreamInputBuilder::build is infallible for valid inputs");
+
+    let echoed = input
+        .request_metadata()
+        .expect("request_metadata must be set on the input");
+    assert_eq!(echoed.len(), 2);
+    assert_eq!(echoed.get("team").map(String::as_str), Some("platform"));
+    assert_eq!(echoed.get("env").map(String::as_str), Some("prod"));
+
+    assert!(
+        bedrock_request_metadata_map(&BTreeMap::new()).is_none(),
+        "empty config tags must skip the field entirely so unconfigured callers don't ship an empty object"
+    );
 }
 
 #[test]

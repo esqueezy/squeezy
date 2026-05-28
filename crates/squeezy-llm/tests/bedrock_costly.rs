@@ -1,5 +1,6 @@
 mod common;
 
+use std::collections::BTreeMap;
 use std::env;
 use std::sync::Arc;
 
@@ -26,6 +27,7 @@ async fn bedrock_converse_streaming_costly() -> Result<()> {
     let provider = BedrockProvider::from_config(&BedrockConfig {
         region,
         base_url: env::var("BEDROCK_BASE_URL").ok(),
+        request_metadata: BTreeMap::new(),
         transport: ProviderTransportConfig::default(),
     })?;
     let model = env::var(MODEL_ENV)
