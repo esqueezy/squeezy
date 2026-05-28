@@ -248,6 +248,12 @@ fn write_messages(
             SessionEventKind::Failed { error } => {
                 write_lifecycle(out, "failed", &error)?;
             }
+            SessionEventKind::Custom { .. } => {
+                // Extension-authored sidecar data: the export is a
+                // user-facing transcript, not a debug dump, so we skip
+                // these silently rather than surfacing arbitrary
+                // extension payloads to the reader.
+            }
             SessionEventKind::Unknown => {
                 // Skip silently: an Unknown variant came from a future
                 // Squeezy version writing an event kind this binary

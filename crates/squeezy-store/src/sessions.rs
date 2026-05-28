@@ -2311,6 +2311,20 @@ pub enum SessionEventKind {
         error: String,
     },
     SessionResumed,
+    /// Extension-authored sidecar event. The outer `SessionEvent.kind` is
+    /// the fixed sentinel `"custom"` so core readers can match on it and
+    /// skip the event without having to know every extension's
+    /// discriminator. `kind` carries the extension's own free-form
+    /// discriminator (e.g. `"telemetry"`, `"my_org.audit_log"`) and
+    /// `payload` is the opaque JSON the extension wants to round-trip
+    /// through `events.jsonl`. Renamed wire-side to avoid colliding
+    /// with the enum's `tag = "kind"` discriminator.
+    Custom {
+        #[serde(rename = "custom_kind")]
+        kind: String,
+        #[serde(default, rename = "custom_payload")]
+        payload: Value,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -2334,6 +2348,7 @@ impl SessionEventKind {
             Self::Cancelled => "cancelled",
             Self::Failed { .. } => "failed",
             Self::SessionResumed => "session_resumed",
+            Self::Custom { .. } => "custom",
             Self::Unknown => "unknown",
         }
     }
@@ -2836,6 +2851,9 @@ fn apply_event_to_replay(
         // than conversation items; they do not modify the resume state's
         // conversation/transcript but still need to be enumerated so the
         // match is exhaustive (catches future kinds at compile time).
+        // Custom events are extension-authored sidecar data — core
+        // replay must ignore them so an extension cannot corrupt the
+        // reconstructed conversation by writing arbitrary payloads.
         SessionEventKind::ApprovalRequested { .. }
         | SessionEventKind::ApprovalDecided { .. }
         | SessionEventKind::SessionStarted
@@ -2843,6 +2861,7 @@ fn apply_event_to_replay(
         | SessionEventKind::Cancelled
         | SessionEventKind::Failed { .. }
         | SessionEventKind::SessionResumed
+        | SessionEventKind::Custom { .. }
         | SessionEventKind::Unknown => {}
     }
 }

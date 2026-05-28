@@ -2918,3 +2918,149 @@ fn global_session_index_entry_propagates_display_name() {
     assert_eq!(entry.display_name.as_deref(), Some("nice name"));
     assert_eq!(entry.title.as_deref(), Some("inferred task"));
 }
+
+#[test]
+fn custom_session_event_round_trips_through_event_log() {
+    // Acceptance for the extension-author surface: a `Custom` event
+    // appended via the typed API must survive the full
+    // append -> events.jsonl -> show() -> try_from_event loop with its
+    // extension-supplied `kind` discriminator and `payload` intact.
+    // Without this, any sidecar telemetry / audit data an extension
+    // attaches to a session would be silently corrupted on every reload.
+    let root = temp_root("custom-event-roundtrip");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+
+    let custom = SessionEventKind::Custom {
+        kind: "my_org.audit_log".to_string(),
+        payload: json!({
+            "actor": "alice",
+            "tokens": 42,
+            "tags": ["billing", "qa"],
+            "nested": {"flag": true}
+        }),
+    };
+    handle
+        .append_typed_event(custom.clone(), Some("turn-1".to_string()), None)
+        .expect("append custom event");
+    handle.flush_events().expect("flush events");
+
+    let record = store.show(handle.session_id()).expect("show");
+    let event = record
+        .events
+        .iter()
+        .find(|event| event.kind == "custom")
+        .expect("custom event present in events.jsonl");
+    assert_eq!(event.kind, custom.discriminator());
+    let typed = SessionEventKind::try_from_event(event).expect("typed view");
+    assert_eq!(typed, custom);
+}
+
+#[test]
+fn custom_session_events_are_ignored_by_core_readers() {
+    // Acceptance: extension-authored Custom events must not influence
+    // the conversation replay reducer or the session enumeration
+    // surface. A Custom event sitting between a user message and an
+    // assistant reply must be enumerated by `show()` (no data loss)
+    // and listed by `list()` (no broken discovery), but the replay
+    // fallback must reconstruct the conversation as if the Custom
+    // event were not there — otherwise an extension could poison the
+    // resume payload by appending arbitrary JSON.
+    let root = temp_root("custom-event-ignored");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+
+    handle
+        .append_typed_event(
+            SessionEventKind::UserMessage {
+                text: "kick it off".to_string(),
+            },
+            None,
+            None,
+        )
+        .expect("user message");
+    handle
+        .append_typed_event(
+            SessionEventKind::Custom {
+                kind: "telemetry".to_string(),
+                payload: json!({"latency_ms": 7, "model": "test"}),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("custom event");
+    handle
+        .append_typed_event(
+            SessionEventKind::AssistantCompleted {
+                text: "done".to_string(),
+                response_id: Some("resp-1".to_string()),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("assistant completion");
+    handle.flush_events().expect("flush events");
+
+    let listed = store.list(&SessionQuery::default()).expect("list");
+    assert!(
+        listed
+            .iter()
+            .any(|metadata| metadata.session_id == handle.session_id()),
+        "list() must still surface the session even when Custom events are interleaved",
+    );
+
+    let record = store.show(handle.session_id()).expect("show");
+    assert_eq!(
+        record.events.len(),
+        3,
+        "show() must return every appended event, including the Custom one",
+    );
+    let custom_event = record
+        .events
+        .iter()
+        .find(|event| event.kind == "custom")
+        .expect("custom event must round-trip through show()");
+    assert!(matches!(
+        SessionEventKind::try_from_event(custom_event),
+        Some(SessionEventKind::Custom { .. })
+    ));
+
+    let session_dir = store.root().join(handle.session_id());
+    fs::remove_file(session_dir.join("resume_state.json"))
+        .expect("delete resume_state.json to force the events.jsonl fallback");
+    let replayed = handle
+        .replay_resume_state()
+        .expect("replay reconstructs from events.jsonl");
+    assert_eq!(
+        replayed.conversation,
+        vec![
+            ResumeItem::UserText {
+                text: "kick it off".to_string(),
+            },
+            ResumeItem::AssistantText {
+                text: "done".to_string(),
+            },
+        ],
+        "Custom events must be ignored by the replay reducer",
+    );
+}
