@@ -65,6 +65,7 @@ mod ai_reviewer;
 mod cancel;
 mod context_compaction;
 mod cost_broker;
+pub mod dispatch;
 mod exploration_compiler;
 pub mod export_html;
 mod micro_compaction;
@@ -72,6 +73,10 @@ mod permission_persist;
 mod plan_mode;
 mod roles;
 pub mod subagent_catalog;
+
+pub use dispatch::{
+    DispatchCommand, DispatchCommandKind, DispatchCommandParseError, DispatchOutcome,
+};
 
 use cancel::{CancelErr, OrCancelExt};
 use context_compaction::{
@@ -2248,56 +2253,208 @@ impl Agent {
         Ok(report)
     }
 
-    /// Dispatch an agent-side slash command (e.g. from a non-TUI
-    /// driver such as `squeezy-eval`). Only commands whose behavior
-    /// lives wholly inside `Agent` are handled here — TUI-only
-    /// commands (overlays, help text) return `Unsupported`.
-    ///
-    /// The structured outcome is suitable for embedding in JSON
-    /// transcripts; the TUI is free to render its own variant on top.
-    pub async fn dispatch_command(&self, name: &str, _args: &str) -> CommandOutcome {
-        let normalized = name.trim().trim_start_matches('/').to_ascii_lowercase();
-        match normalized.as_str() {
-            "compact" => match self.compact_context_manual().await {
-                Ok(_) => CommandOutcome::Compacted,
-                Err(err) => CommandOutcome::Error {
-                    command: normalized,
-                    message: format!("{err}"),
-                },
-            },
-            "plan" => {
+    /// Dispatch a typed slash command. Every entry in
+    /// `squeezy-tui`'s `SLASH_COMMANDS` table maps to a
+    /// [`DispatchCommand`] variant; variants whose action lives wholly
+    /// in `Agent` execute here, while variants whose effect lives in
+    /// the TUI renderer (overlays, transcript pushes, clipboard, …)
+    /// return [`DispatchOutcome::TuiOnly`] so the TUI can run its
+    /// existing helper while RPC/eval drivers see a structured value.
+    pub async fn dispatch_command(&self, cmd: DispatchCommand) -> DispatchOutcome {
+        match cmd {
+            DispatchCommand::Compact { undo } => {
+                if undo {
+                    match self.compact_context_undo().await {
+                        Ok(Some(_)) => DispatchOutcome::CompactedUndo { restored: true },
+                        Ok(None) => DispatchOutcome::CompactedUndo { restored: false },
+                        Err(err) => DispatchOutcome::Error {
+                            command: "/compact".into(),
+                            message: format!("{err}"),
+                        },
+                    }
+                } else {
+                    match self.compact_context_manual().await {
+                        Ok(_) => DispatchOutcome::Compacted,
+                        Err(err) => DispatchOutcome::Error {
+                            command: "/compact".into(),
+                            message: format!("{err}"),
+                        },
+                    }
+                }
+            }
+            DispatchCommand::Plan { .. } => {
                 let changed = self.set_session_mode(SessionMode::Plan, "dispatch_command");
-                CommandOutcome::ModeChanged {
+                DispatchOutcome::ModeChanged {
                     mode: "plan".into(),
                     changed,
                 }
             }
-            "build" => {
+            DispatchCommand::Build { .. } => {
                 let changed = self.set_session_mode(SessionMode::Build, "dispatch_command");
-                CommandOutcome::ModeChanged {
+                DispatchOutcome::ModeChanged {
                     mode: "build".into(),
                     changed,
                 }
             }
-            "cost" => {
+            DispatchCommand::Cost => {
                 let snap = self.session_accounting_snapshot().await;
-                CommandOutcome::CostSnapshot {
-                    debug: format!("{:?}", snap),
+                DispatchOutcome::CostSnapshot {
+                    debug: format!("{snap:?}"),
                 }
             }
-            // `tasks` is the canonical name; `jobs` is kept as an alias for
-            // one release so eval traces with the old vocabulary still work.
-            // See F07-cc-tasks-and-background-jobs.
-            "tasks" | "jobs" => {
+            DispatchCommand::Context => {
+                let snap = self.session_accounting_snapshot().await;
+                DispatchOutcome::ContextSnapshot {
+                    debug: format!("{snap:?}"),
+                }
+            }
+            DispatchCommand::Reviewer => {
+                let entries = self.reviewer_audit_snapshot();
+                DispatchOutcome::ReviewerSnapshot {
+                    count: entries.len(),
+                }
+            }
+            DispatchCommand::Tasks | DispatchCommand::Jobs => {
                 let jobs = self.jobs_snapshot();
-                CommandOutcome::JobsList { count: jobs.len() }
+                DispatchOutcome::JobsList { count: jobs.len() }
             }
-            "permissions" => {
+            DispatchCommand::Task { id } | DispatchCommand::Job { id } => {
+                let job_id = id.parse::<JobId>().ok();
+                let found = job_id.and_then(|id| self.job_snapshot(id)).is_some();
+                DispatchOutcome::TaskDetail { id, found }
+            }
+            DispatchCommand::TaskCancel { id } | DispatchCommand::JobCancel { id } => {
+                let cancelled = id
+                    .parse::<JobId>()
+                    .ok()
+                    .map(|id| self.cancel_job(id))
+                    .unwrap_or(false);
+                DispatchOutcome::TaskCancel { id, cancelled }
+            }
+            DispatchCommand::Permissions => {
                 let rules = self.session_rules_snapshot();
-                CommandOutcome::PermissionsList { count: rules.len() }
+                DispatchOutcome::PermissionsList { count: rules.len() }
             }
-            other => CommandOutcome::Unsupported {
-                command: other.to_string(),
+            DispatchCommand::Attach { path } => {
+                match self.attach_file_context(PathBuf::from(&path)).await {
+                    Ok(update) => DispatchOutcome::Attached {
+                        id: update.attachment.id.clone(),
+                    },
+                    Err(err) => DispatchOutcome::Error {
+                        command: "/attach".into(),
+                        message: format!("{err}"),
+                    },
+                }
+            }
+            DispatchCommand::Detach { id } => match self.detach_context_attachment(&id).await {
+                Ok(attachment) => DispatchOutcome::Detached {
+                    id: attachment.id.clone(),
+                },
+                Err(err) => DispatchOutcome::Error {
+                    command: "/detach".into(),
+                    message: format!("{err}"),
+                },
+            },
+            DispatchCommand::Attachments => {
+                let count = self.context_attachments_snapshot().await.len();
+                DispatchOutcome::AttachmentsList { count }
+            }
+            DispatchCommand::Pins => {
+                let count = self.context_compaction_snapshot().await.pinned.len();
+                DispatchOutcome::PinsList { count }
+            }
+            DispatchCommand::Unpin { id } => match self.unpin_context_entry(&id).await {
+                Ok(pin) => DispatchOutcome::Unpinned { id: pin.id },
+                Err(err) => DispatchOutcome::Error {
+                    command: "/unpin".into(),
+                    message: format!("{err}"),
+                },
+            },
+            DispatchCommand::Sessions => match self.list_sessions(&SessionQuery::default()) {
+                Ok(sessions) => DispatchOutcome::SessionsList {
+                    count: sessions.len(),
+                },
+                Err(err) => DispatchOutcome::Error {
+                    command: "/sessions".into(),
+                    message: format!("{err}"),
+                },
+            },
+            DispatchCommand::Session { id } => {
+                let exists = self.show_session(&id).is_ok();
+                DispatchOutcome::SessionDetail {
+                    session_id: id,
+                    exists,
+                }
+            }
+            DispatchCommand::SessionExport { id } => match self.export_session(&id) {
+                Ok(value) => DispatchOutcome::SessionExported {
+                    session_id: id,
+                    bytes: serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0),
+                },
+                Err(err) => DispatchOutcome::Error {
+                    command: "/session-export".into(),
+                    message: format!("{err}"),
+                },
+            },
+            // `/fork`, `/resume`, `/session-export-html`, `/session-cleanup`,
+            // `/pin`, `/checkpoint*`, `/undo`, `/revert-turn` require &mut
+            // self or interact with TUI-owned state (clipboard, transcript
+            // selection, vcs background job). The TUI keeps running those
+            // through its existing helpers; the agent dispatch records the
+            // typed entry point via `TuiOnly` so RPC drivers still see the
+            // command they invoked.
+            cmd @ (DispatchCommand::Fork
+            | DispatchCommand::Resume { .. }
+            | DispatchCommand::SessionExportHtml { .. }
+            | DispatchCommand::SessionCleanup { .. }
+            | DispatchCommand::Pin { .. }
+            | DispatchCommand::Checkpoints
+            | DispatchCommand::Checkpoint { .. }
+            | DispatchCommand::Undo
+            | DispatchCommand::RevertTurn { .. }
+            | DispatchCommand::Help { .. }
+            | DispatchCommand::Config { .. }
+            | DispatchCommand::Model
+            | DispatchCommand::Plans { .. }
+            | DispatchCommand::Copy { .. }
+            | DispatchCommand::Collapse { .. }
+            | DispatchCommand::Expand { .. }
+            | DispatchCommand::Diff
+            | DispatchCommand::Feedback { .. }
+            | DispatchCommand::Report { .. }
+            | DispatchCommand::Effort { .. }
+            | DispatchCommand::Verbosity { .. }
+            | DispatchCommand::ToolVerbosity { .. }
+            | DispatchCommand::Statusline
+            | DispatchCommand::Theme { .. }
+            | DispatchCommand::Keymap) => DispatchOutcome::TuiOnly {
+                command: cmd.slash_name().trim_start_matches('/').to_string(),
+            },
+        }
+    }
+
+    /// Convenience wrapper that parses a raw slash-prefixed string into
+    /// a [`DispatchCommand`] and dispatches it. Returns
+    /// [`DispatchOutcome::Unsupported`] for unrecognised heads (so the
+    /// eval `unsupported_slash_command` rule keeps firing) and
+    /// [`DispatchOutcome::Error`] for usage failures.
+    pub async fn dispatch_command_raw(&self, raw: &str) -> DispatchOutcome {
+        match DispatchCommand::parse(raw) {
+            Ok(cmd) => self.dispatch_command(cmd).await,
+            Err(DispatchCommandParseError::Unknown { command }) => {
+                DispatchOutcome::Unsupported { command }
+            }
+            Err(DispatchCommandParseError::Empty) => DispatchOutcome::Error {
+                command: String::new(),
+                message: "empty command".to_string(),
+            },
+            Err(DispatchCommandParseError::NotASlashCommand) => DispatchOutcome::Error {
+                command: raw.to_string(),
+                message: "expected a slash command".to_string(),
+            },
+            Err(DispatchCommandParseError::Usage { command, hint }) => DispatchOutcome::Error {
+                command,
+                message: hint,
             },
         }
     }
@@ -11067,21 +11224,6 @@ impl RequestUserInputResponse {
             freeform: None,
         }
     }
-}
-
-/// Structured result of [`Agent::dispatch_command`]. Designed to be
-/// serializable for non-TUI consumers (e.g. eval traces); the TUI is
-/// free to render its own version on top.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CommandOutcome {
-    Compacted,
-    ModeChanged { mode: String, changed: bool },
-    CostSnapshot { debug: String },
-    JobsList { count: usize },
-    PermissionsList { count: usize },
-    Unsupported { command: String },
-    Error { command: String, message: String },
 }
 
 pub enum AgentEvent {

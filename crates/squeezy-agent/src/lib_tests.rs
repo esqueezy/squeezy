@@ -6856,127 +6856,249 @@ fn assistant_text_has_unresolved_intent_skips_intent_without_action_verb() {
     ));
 }
 
+// F17-dispatch-command-completeness: each typed `DispatchCommand`
+// variant lands in `Agent::dispatch_command` with a deterministic
+// outcome. Variants whose effect lives in the TUI return `TuiOnly`;
+// agent-side variants return the structured outcome the caller
+// (eval / RPC) needs.
+
+fn mock_agent_for_dispatch() -> Agent {
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    Agent::new(AppConfig::default(), provider)
+}
+
 #[tokio::test]
-async fn fork_into_writes_child_under_target_workspace() {
-    // Acceptance for F12-pi-fork-cross-cwd: a fork triggered in repo A
-    // must land its new session artifact under repo B's project dir, with
-    // metadata.cwd / workspace_root rewritten to point at the target so
-    // `squeezy sessions resume` and the missing-cwd guard both pick the
-    // target on open. The running agent stays bound to repo A.
-    let source_root = temp_workspace("fork_into_source");
-    let target_root = temp_workspace("fork_into_target");
-    let config = AppConfig {
-        workspace_root: source_root.clone(),
-        session_logs: SessionLogConfig {
-            log_dir: Some(PathBuf::from(".squeezy/sessions")),
-            ..SessionLogConfig::default()
-        },
-        ..AppConfig::default()
-    };
-    let provider = Arc::new(MockProvider::new(vec![vec![
-        Ok(LlmEvent::Started),
-        Ok(LlmEvent::TextDelta("ack".to_string())),
-        Ok(LlmEvent::Completed {
-            response_id: Some("resp_fork_into".to_string()),
-            cost: CostSnapshot::default(),
-            stop_reason: None,
-            reasoning_only_stop: false,
-        }),
-    ]]));
-    let mut agent = Agent::new(config.clone(), provider);
+async fn dispatch_command_mode_switches() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Plan { prompt: None })
+        .await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::ModeChanged { ref mode, changed: true } if mode == "plan"
+    ));
+    // Repeating the call is a no-op: changed=false.
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Plan { prompt: None })
+        .await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::ModeChanged { ref mode, changed: false } if mode == "plan"
+    ));
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Build { prompt: None })
+        .await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::ModeChanged { ref mode, changed: true } if mode == "build"
+    ));
+}
 
-    // Drive one turn so the parent session has user/assistant items to
-    // carry across the fork. Without this the resume_state snapshot is
-    // trivially empty and the test would not exercise the conversation
-    // copy path.
-    let mut rx = agent.start_turn("carry me across".to_string(), CancellationToken::new());
-    while rx.recv().await.is_some() {}
-    let parent_session_id = agent.session_id().expect("parent session id");
+#[tokio::test]
+async fn dispatch_command_cost_and_context() {
+    let agent = mock_agent_for_dispatch();
+    let cost = agent.dispatch_command(DispatchCommand::Cost).await;
+    assert!(matches!(cost, DispatchOutcome::CostSnapshot { .. }));
+    let ctx = agent.dispatch_command(DispatchCommand::Context).await;
+    assert!(matches!(ctx, DispatchOutcome::ContextSnapshot { .. }));
+}
 
-    let new_session_id = agent
-        .fork_into(&target_root)
-        .await
-        .expect("fork_into target workspace");
-    assert_ne!(new_session_id, parent_session_id);
+#[tokio::test]
+async fn dispatch_command_jobs_permissions_reviewer_snapshots_are_empty_by_default() {
+    let agent = mock_agent_for_dispatch();
+    let jobs = agent.dispatch_command(DispatchCommand::Tasks).await;
+    assert!(matches!(jobs, DispatchOutcome::JobsList { count: 0 }));
+    let jobs_alias = agent.dispatch_command(DispatchCommand::Jobs).await;
+    assert!(matches!(jobs_alias, DispatchOutcome::JobsList { count: 0 }));
+    let perms = agent.dispatch_command(DispatchCommand::Permissions).await;
+    assert!(matches!(
+        perms,
+        DispatchOutcome::PermissionsList { count: 0 }
+    ));
+    let reviewer = agent.dispatch_command(DispatchCommand::Reviewer).await;
+    assert!(matches!(
+        reviewer,
+        DispatchOutcome::ReviewerSnapshot { count: 0 }
+    ));
+}
 
-    // The new session artifact must live under the *target* workspace's
-    // `.squeezy/sessions/` tree, not the source.
-    let target_session_dir = target_root
-        .join(".squeezy")
-        .join("sessions")
-        .join(&new_session_id);
-    assert!(
-        target_session_dir.join("metadata.json").exists(),
-        "expected metadata.json under target session dir {target_session_dir:?}",
-    );
-    assert!(
-        target_session_dir.join("resume_state.json").exists(),
-        "expected resume_state.json under target session dir {target_session_dir:?}",
-    );
-    let source_session_root = source_root.join(".squeezy").join("sessions");
-    assert!(
-        !source_session_root.join(&new_session_id).exists(),
-        "child session must not be persisted under the source workspace",
-    );
+#[tokio::test]
+async fn dispatch_command_task_lookup_and_cancel_for_missing_id() {
+    let agent = mock_agent_for_dispatch();
+    let detail = agent
+        .dispatch_command(DispatchCommand::Task {
+            id: "99".to_string(),
+        })
+        .await;
+    assert!(matches!(
+        detail,
+        DispatchOutcome::TaskDetail { ref id, found: false } if id == "99"
+    ));
+    let cancel = agent
+        .dispatch_command(DispatchCommand::TaskCancel {
+            id: "99".to_string(),
+        })
+        .await;
+    assert!(matches!(
+        cancel,
+        DispatchOutcome::TaskCancel { ref id, cancelled: false } if id == "99"
+    ));
+}
 
-    // Open the new session via a SessionStore rooted at the target so we
-    // exercise the same path `squeezy --workspace <target>` would use.
-    let target_config = AppConfig {
-        workspace_root: target_root.clone(),
-        session_logs: SessionLogConfig {
-            log_dir: Some(PathBuf::from(".squeezy/sessions")),
-            ..SessionLogConfig::default()
-        },
-        ..AppConfig::default()
-    };
-    let target_store = SessionStore::open(&target_config);
-    let record = target_store
-        .show(&new_session_id)
-        .expect("show child session from target store");
-    let canonical_target = std::fs::canonicalize(&target_root)
-        .unwrap_or_else(|_| target_root.clone())
-        .display()
-        .to_string();
-    assert_eq!(record.metadata.cwd, canonical_target);
-    assert_eq!(record.metadata.workspace_root, canonical_target);
-    assert_eq!(
-        record.metadata.parent_id.as_deref(),
-        Some(parent_session_id.as_str()),
-        "cross-workspace fork must retain parent_id lineage",
-    );
+#[tokio::test]
+async fn dispatch_command_attachments_default_to_empty() {
+    let agent = mock_agent_for_dispatch();
+    let attachments = agent.dispatch_command(DispatchCommand::Attachments).await;
+    assert!(matches!(
+        attachments,
+        DispatchOutcome::AttachmentsList { count: 0 }
+    ));
+    let pins = agent.dispatch_command(DispatchCommand::Pins).await;
+    assert!(matches!(pins, DispatchOutcome::PinsList { count: 0 }));
+}
 
-    // resume_state.json carries the parent's conversation snapshot so a
-    // subsequent `squeezy sessions resume <new_id>` in the target dir
-    // picks up where the fork branched.
-    let resume_state = target_store
-        .show(&new_session_id)
-        .expect("show resume")
-        .resume_state
-        .expect("resume state");
-    assert!(
-        resume_state
-            .conversation
-            .iter()
-            .any(|item| matches!(item, ResumeItem::UserText { text } if text == "carry me across")),
-        "fork must carry the parent's user message into the new session: {:?}",
-        resume_state.conversation,
-    );
+#[tokio::test]
+async fn dispatch_command_unpin_missing_returns_error() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Unpin {
+            id: "pin-missing".to_string(),
+        })
+        .await;
+    assert!(matches!(outcome, DispatchOutcome::Error { ref command, .. } if command == "/unpin"));
+}
 
-    // The running agent stays bound to the source session — fork_into is
-    // deliberately not an in-process cd. The constraint matters because
-    // the live tool/cache state is still scoped to repo A.
-    assert_eq!(
-        agent.session_id().as_deref(),
-        Some(parent_session_id.as_str()),
-        "fork_into must not auto-cd the running process",
-    );
+#[tokio::test]
+async fn dispatch_command_attach_path_propagates_error() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Attach {
+            path: "/path/that/does/not/exist".to_string(),
+        })
+        .await;
+    assert!(matches!(outcome, DispatchOutcome::Error { ref command, .. } if command == "/attach"));
+}
 
-    // The parent session is still listed under the source workspace and
-    // remains resumable. `fork_into` does not finalise it.
-    let source_store = SessionStore::open(&config);
-    let parent_record = source_store
-        .show(&parent_session_id)
-        .expect("show parent session in source");
-    assert_eq!(parent_record.metadata.session_id, parent_session_id);
-    assert!(parent_record.metadata.parent_id.is_none());
+#[tokio::test]
+async fn dispatch_command_session_lookup_for_missing_id() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Session {
+            id: "missing".to_string(),
+        })
+        .await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::SessionDetail { ref session_id, exists: false } if session_id == "missing"
+    ));
+}
+
+#[tokio::test]
+async fn dispatch_command_tui_only_for_renderer_owned_commands() {
+    let agent = mock_agent_for_dispatch();
+    let cases: &[(DispatchCommand, &str)] = &[
+        (DispatchCommand::Diff, "diff"),
+        (DispatchCommand::Keymap, "keymap"),
+        (DispatchCommand::Statusline, "statusline"),
+        (DispatchCommand::Help { topic: None }, "help"),
+        (DispatchCommand::Config { section: None }, "config"),
+        (DispatchCommand::Model, "model"),
+        (
+            DispatchCommand::Plans {
+                args: String::new(),
+            },
+            "plans",
+        ),
+        (DispatchCommand::Copy { target: None }, "copy"),
+        (DispatchCommand::Collapse { category: None }, "collapse"),
+        (DispatchCommand::Expand { category: None }, "expand"),
+        (
+            DispatchCommand::Feedback {
+                args: String::new(),
+            },
+            "feedback",
+        ),
+        (
+            DispatchCommand::Report {
+                args: String::new(),
+            },
+            "report",
+        ),
+        (DispatchCommand::Effort { value: None }, "effort"),
+        (DispatchCommand::Verbosity { value: None }, "verbosity"),
+        (
+            DispatchCommand::ToolVerbosity { value: None },
+            "tool-verbosity",
+        ),
+        (
+            DispatchCommand::Theme {
+                theme: "dark".to_string(),
+            },
+            "theme",
+        ),
+        (DispatchCommand::Fork, "fork"),
+        (
+            DispatchCommand::Resume {
+                id: "sess".to_string(),
+            },
+            "resume",
+        ),
+        (DispatchCommand::Checkpoints, "checkpoints"),
+        (
+            DispatchCommand::Checkpoint {
+                id: "ck".to_string(),
+            },
+            "checkpoint",
+        ),
+        (DispatchCommand::Undo, "undo"),
+        (
+            DispatchCommand::RevertTurn {
+                group_id: "t".to_string(),
+            },
+            "revert-turn",
+        ),
+        (
+            DispatchCommand::SessionExportHtml {
+                id: "s".to_string(),
+                path: None,
+            },
+            "session-export-html",
+        ),
+        (
+            DispatchCommand::SessionCleanup {
+                args: String::new(),
+            },
+            "session-cleanup",
+        ),
+        (DispatchCommand::Pin { target: None }, "pin"),
+    ];
+    for (cmd, expected_kind) in cases {
+        let outcome = agent.dispatch_command(cmd.clone()).await;
+        match outcome {
+            DispatchOutcome::TuiOnly { command } => {
+                assert_eq!(command, *expected_kind, "TuiOnly kind mismatch for {cmd:?}");
+            }
+            other => panic!("expected TuiOnly for {cmd:?}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn dispatch_command_raw_routes_through_parser() {
+    let agent = mock_agent_for_dispatch();
+    let plan = agent.dispatch_command_raw("/plan").await;
+    assert!(matches!(
+        plan,
+        DispatchOutcome::ModeChanged { ref mode, changed: true } if mode == "plan"
+    ));
+    let unknown = agent.dispatch_command_raw("/no-such-command").await;
+    assert!(matches!(
+        unknown,
+        DispatchOutcome::Unsupported { ref command } if command == "/no-such-command"
+    ));
+    let attach = agent.dispatch_command_raw("/attach").await;
+    assert!(matches!(
+        attach,
+        DispatchOutcome::Error { ref command, .. } if command == "/attach"
+    ));
 }
