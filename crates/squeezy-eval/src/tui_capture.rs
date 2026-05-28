@@ -260,7 +260,7 @@ pub fn render_markdown_to_grid(
                 .fg(cell.fg)
                 .bg(cell.bg)
                 .add_modifier(cell.modifier);
-            let style_changed = last_style.map_or(true, |s| s != style);
+            let style_changed = last_style != Some(style);
             if style_changed {
                 if last_style.is_some() {
                     ansi.push_str("\x1b[0m");

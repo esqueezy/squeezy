@@ -1292,12 +1292,7 @@ impl Rule for PlatformMismatch {
         let Some(expected) = scenario.platform.as_deref() else {
             return Vec::new();
         };
-        let actual = match std::env::consts::OS {
-            "linux" => "linux",
-            "macos" => "macos",
-            "windows" => "windows",
-            other => other,
-        };
+        let actual = std::env::consts::OS;
         if !expected.eq_ignore_ascii_case(actual) {
             vec![Finding {
                 rule_id: "platform_mismatch".into(),
