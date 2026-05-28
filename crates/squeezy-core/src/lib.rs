@@ -568,6 +568,8 @@ impl AppConfig {
                         .unwrap_or_else(|| DEFAULT_BEDROCK_REGION.to_string()),
                     base_url: get_var("BEDROCK_BASE_URL")
                         .or_else(|| provider_setting(&providers, "bedrock", "base_url")),
+                    request_metadata: provider_setting_request_metadata(&providers, "bedrock")
+                        .unwrap_or_default(),
                     transport: provider_transport_settings(&providers, &["bedrock"]),
                 })
             }
@@ -2052,6 +2054,13 @@ pub struct AzureOpenAiConfig {
 pub struct BedrockConfig {
     pub region: String,
     pub base_url: Option<String>,
+    /// AWS cost-allocation tags forwarded as
+    /// `ConverseStream.requestMetadata` on every invocation so the
+    /// caller can group spend by team/env/project in CloudWatch +
+    /// Cost Explorer. Empty by default — when empty the provider
+    /// omits the field entirely instead of sending an empty map.
+    #[serde(default)]
+    pub request_metadata: BTreeMap<String, String>,
     pub transport: ProviderTransportConfig,
 }
 
@@ -2526,6 +2535,10 @@ pub struct ProviderSettings {
     pub stream_max_retries: Option<u8>,
     pub stream_idle_timeout_ms: Option<u64>,
     pub headers: Option<BTreeMap<String, String>>,
+    /// Bedrock-only: AWS cost-allocation tags forwarded as
+    /// `ConverseStream.requestMetadata` on every invocation. Other
+    /// providers ignore this setting.
+    pub request_metadata: Option<BTreeMap<String, String>>,
     /// Ollama-only: `"native"` (default) or `"openai_compatible"` to pin the
     /// provider to `/v1/chat/completions` SSE instead of `/api/chat` NDJSON.
     pub route_style: Option<String>,
@@ -2551,6 +2564,7 @@ impl ProviderSettings {
                 "stream_max_retries",
                 "stream_idle_timeout_ms",
                 "headers",
+                "request_metadata",
                 "route_style",
             ],
             source,
@@ -2576,6 +2590,29 @@ impl ProviderSettings {
                 return Err(SqueezyError::Config(format!(
                     "{source}: {} must be a TOML table of string values",
                     field(path, "headers"),
+                )));
+            }
+        };
+        let request_metadata = match table.get("request_metadata") {
+            None => None,
+            Some(toml::Value::Table(table)) => {
+                let mut map = BTreeMap::new();
+                for (key, value) in table {
+                    let entry_path = field(path, &format!("request_metadata.{key}"));
+                    let toml::Value::String(value) = value else {
+                        return Err(SqueezyError::Config(format!(
+                            "{source}: {entry_path} must map to string values"
+                        )));
+                    };
+                    let resolved = resolve_shell_escape(value.clone(), source, &entry_path)?;
+                    map.insert(key.clone(), resolved);
+                }
+                Some(map)
+            }
+            Some(_) => {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {} must be a TOML table of string values",
+                    field(path, "request_metadata"),
                 )));
             }
         };
@@ -2635,6 +2672,7 @@ impl ProviderSettings {
                 &field(path, "stream_idle_timeout_ms"),
             )?,
             headers,
+            request_metadata,
             route_style: string_value(table, "route_style", source, &field(path, "route_style"))?,
         })
     }
@@ -2658,6 +2696,7 @@ impl ProviderSettings {
             next.stream_idle_timeout_ms,
         );
         replace_if_some(&mut self.headers, next.headers);
+        replace_if_some(&mut self.request_metadata, next.request_metadata);
     }
 }
 
@@ -7412,6 +7451,13 @@ fn provider_setting_headers(
     provider: &str,
 ) -> Option<BTreeMap<String, String>> {
     providers.get(provider)?.headers.clone()
+}
+
+fn provider_setting_request_metadata(
+    providers: &BTreeMap<String, ProviderSettings>,
+    provider: &str,
+) -> Option<BTreeMap<String, String>> {
+    providers.get(provider)?.request_metadata.clone()
 }
 
 fn validate_provider_base_urls(provider: &ProviderConfig) -> Result<()> {
