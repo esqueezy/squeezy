@@ -2,8 +2,9 @@
 //!
 //! Detects an `@`-prefixed token at the cursor and lists matching
 //! workspace files ranked by a simple subsequence/prefix scorer. The
-//! popup is small (10 entries) and dismisses on Esc or when the
-//! cursor leaves the `@<word>` token.
+//! popup shows up to `MAX_MATCHES` (10) entries plus an `(idx/total)`
+//! footer that reflects the pre-truncation candidate count, and
+//! dismisses on Esc or when the cursor leaves the `@<word>` token.
 
 #![allow(dead_code)]
 
@@ -171,7 +172,10 @@ fn git_index_mtime(root: &Path) -> Option<SystemTime> {
         .and_then(|m| m.modified().ok())
 }
 
-/// Rank `files` against `query`. Returns up to `MAX_MATCHES` paths.
+/// Rank `files` against `query`. Returns up to `MAX_MATCHES` paths
+/// plus the total candidate count *before* truncation so the popup
+/// can render a `(idx/total)` footer that still reflects how many
+/// matches exist beyond the displayed window.
 ///
 /// Delegates to [`crate::fuzzy::score`] (higher is better) so the
 /// composer typeahead shares the same word-boundary / consecutive-run
@@ -179,13 +183,14 @@ fn git_index_mtime(root: &Path) -> Option<SystemTime> {
 /// naturally — `@lib` matched against `lib.rs` earns word-boundary
 /// bonuses on every char and ties with `crates/.../lib.rs` are broken
 /// by the shorter-path rule below.
-pub(crate) fn rank_files(query: &str, files: &[PathBuf]) -> Vec<PathBuf> {
+pub(crate) fn rank_files(query: &str, files: &[PathBuf]) -> (Vec<PathBuf>, usize) {
     if query.is_empty() {
-        return files
+        let matches: Vec<PathBuf> = files
             .iter()
             .take(MAX_MATCHES)
             .map(|p| p.to_path_buf())
             .collect();
+        return (matches, files.len());
     }
     let query_lower = query.to_ascii_lowercase();
     let mut scored: Vec<(i32, &Path)> = files
@@ -196,17 +201,19 @@ pub(crate) fn rank_files(query: &str, files: &[PathBuf]) -> Vec<PathBuf> {
             Some((score, path.as_path()))
         })
         .collect();
+    let total = scored.len();
     // Higher score first; on tie shorter path first since it is
     // usually closer to what the user meant.
     scored.sort_by(|a, b| {
         b.0.cmp(&a.0)
             .then(a.1.as_os_str().len().cmp(&b.1.as_os_str().len()))
     });
-    scored
+    let matches: Vec<PathBuf> = scored
         .into_iter()
         .take(MAX_MATCHES)
         .map(|(_, p)| p.to_path_buf())
-        .collect()
+        .collect();
+    (matches, total)
 }
 
 /// Popup state attached to the app.
@@ -217,16 +224,21 @@ pub(crate) struct MentionPopup {
     pub end: usize,
     pub matches: Vec<PathBuf>,
     pub selected: usize,
+    /// Total candidates that matched `query` *before* truncation to
+    /// `MAX_MATCHES`. Drives the `(idx/total)` footer so the user can
+    /// see when more matches exist than the popup shows.
+    pub total: usize,
 }
 
 impl MentionPopup {
-    pub(crate) fn from_query(q: MentionQuery, matches: Vec<PathBuf>) -> Self {
+    pub(crate) fn from_query(q: MentionQuery, matches: Vec<PathBuf>, total: usize) -> Self {
         Self {
             query: q.query,
             start: q.start,
             end: q.end,
             matches,
             selected: 0,
+            total,
         }
     }
 

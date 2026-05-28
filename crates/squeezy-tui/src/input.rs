@@ -396,7 +396,7 @@ pub(crate) fn refresh_mention_popup(app: &mut TuiApp) {
     if needs_build {
         app.workspace_file_cache = Some(mention::WorkspaceFileCache::build(root));
     }
-    let matches = app
+    let (matches, total) = app
         .workspace_file_cache
         .as_ref()
         .map(|cache| mention::rank_files(&query.query, cache.files()))
@@ -405,7 +405,7 @@ pub(crate) fn refresh_mention_popup(app: &mut TuiApp) {
         app.mention_popup = None;
         return;
     }
-    app.mention_popup = Some(mention::MentionPopup::from_query(query, matches));
+    app.mention_popup = Some(mention::MentionPopup::from_query(query, matches, total));
 }
 
 pub(crate) fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
