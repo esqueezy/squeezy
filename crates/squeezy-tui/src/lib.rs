@@ -6302,7 +6302,7 @@ fn format_user_prompt_entry(
     _selected: bool,
     width: Option<u16>,
 ) -> Vec<Line<'static>> {
-    let bang_offset = bang_command_marker_offset(&item.content);
+    let bang_range = bang_command_marker_range(&item.content);
     let mut content = item.content.split('\n').collect::<Vec<_>>();
     if content.is_empty() {
         content.push("");
@@ -6312,7 +6312,8 @@ fn format_user_prompt_entry(
     let mut line_start = 0usize;
     lines.extend(content.into_iter().enumerate().map(|(index, line)| {
         let marker = if index == 0 { "> " } else { "  " };
-        let rendered = user_prompt_content_line(marker, line, line_start, bang_offset, width);
+        let rendered =
+            user_prompt_content_line(marker, line, line_start, bang_range.as_ref(), width);
         line_start = line_start.saturating_add(line.len()).saturating_add(1);
         rendered
     }));
@@ -6334,7 +6335,7 @@ fn user_prompt_content_line(
     marker: &'static str,
     line: &str,
     line_start: usize,
-    bang_offset: Option<usize>,
+    bang_range: Option<&std::ops::Range<usize>>,
     width: Option<u16>,
 ) -> Line<'static> {
     let text_width = line.chars().count();
@@ -6351,7 +6352,7 @@ fn user_prompt_content_line(
         .flatten();
     let style_text_at = |abs_offset: usize| -> Style {
         let base = Style::default().bg(PROMPT_BG);
-        if Some(abs_offset) == bang_offset {
+        if bang_range.is_some_and(|range| range.contains(&abs_offset)) {
             base.fg(BANG_RED)
         } else if let Some(len) = slash_len {
             if marker == "> " && abs_offset < len {
@@ -6368,10 +6369,24 @@ fn user_prompt_content_line(
     Line::from(spans)
 }
 
-fn bang_command_marker_offset(text: &str) -> Option<usize> {
-    text.char_indices()
-        .find(|(_, ch)| !ch.is_whitespace())
-        .and_then(|(offset, ch)| (ch == '!').then_some(offset))
+/// Byte range covering the leading `!` (single-bang) or `!!`
+/// (double-bang, runs locally but skips LLM context) marker after any
+/// leading whitespace, or `None` if the line is not a bang command.
+/// Returned as a range — rather than the previous single offset — so the
+/// prompt renderer can paint both bangs in `BANG_RED` for `!!cmd`.
+fn bang_command_marker_range(text: &str) -> Option<std::ops::Range<usize>> {
+    let mut chars = text.char_indices().skip_while(|(_, ch)| ch.is_whitespace());
+    let (start, first) = chars.next()?;
+    if first != '!' {
+        return None;
+    }
+    let mut end = start + first.len_utf8();
+    if let Some((_, next)) = chars.next()
+        && next == '!'
+    {
+        end += next.len_utf8();
+    }
+    Some(start..end)
 }
 
 fn user_prompt_surface_width(marker: &str, width: Option<u16>) -> Option<usize> {
@@ -9135,7 +9150,7 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     let slash_len = parts
         .first()
         .and_then(|first| input::match_slash_command_prefix(first));
-    let bang_offset = bang_command_marker_offset(&app.input);
+    let bang_range = bang_command_marker_range(&app.input);
     let mut line_start = 0usize;
     parts
         .iter()
@@ -9158,7 +9173,10 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
             let slash_split = if index == 0 { slash_len } else { None };
             let style_text_at = |abs_offset: usize| -> Style {
                 let base = Style::default().bg(PROMPT_BG);
-                if Some(abs_offset) == bang_offset {
+                if bang_range
+                    .as_ref()
+                    .is_some_and(|range| range.contains(&abs_offset))
+                {
                     base.fg(BANG_RED)
                 } else {
                     match slash_split {

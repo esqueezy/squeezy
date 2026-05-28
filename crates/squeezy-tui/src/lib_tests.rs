@@ -5563,6 +5563,61 @@ fn live_prompt_marks_first_nonempty_bang_dark_red() {
 }
 
 #[test]
+fn submitted_double_bang_prompt_marks_both_bangs_dark_red() {
+    // `!!cmd` runs locally but skips the LLM context (F01). Both bangs
+    // need to glow `BANG_RED` so the user can tell quiet bangs apart from
+    // the regular single-bang at a glance.
+    let item = TranscriptItem::user("  !!git status");
+
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let bang = lines[1]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "!!")
+        .expect("double-bang marker span");
+    let rest = lines[1]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "git status")
+        .expect("command body span");
+
+    assert_eq!(bang.style.fg, Some(BANG_RED));
+    assert_eq!(bang.style.bg, Some(PROMPT_BG));
+    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(rest.style.bg, Some(PROMPT_BG));
+    assert!(
+        lines[1]
+            .spans
+            .iter()
+            .all(|span| span.content.as_ref() != "!"),
+        "the two `!` chars should merge into a single `!!` red span",
+    );
+}
+
+#[test]
+fn live_double_bang_prompt_marks_both_bangs_dark_red() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "  !!git status".to_string());
+
+    let lines = prompt_input_content_lines(&app);
+    let bang = lines[0]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "!!")
+        .expect("double-bang marker span");
+    let rest = lines[0]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "git status")
+        .expect("command body span");
+
+    assert_eq!(bang.style.fg, Some(BANG_RED));
+    assert_eq!(bang.style.bg, Some(PROMPT_BG));
+    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(rest.style.bg, Some(PROMPT_BG));
+}
+
+#[test]
 fn prompt_height_grows_for_multiline_input() {
     let mut app = test_app(SessionMode::Build);
     assert_eq!(input_panel_height(&app, 100), 3);
