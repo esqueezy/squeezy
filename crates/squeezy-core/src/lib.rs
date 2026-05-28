@@ -568,6 +568,15 @@ impl AppConfig {
                         .unwrap_or_else(|| DEFAULT_BEDROCK_REGION.to_string()),
                     base_url: get_var("BEDROCK_BASE_URL")
                         .or_else(|| provider_setting(&providers, "bedrock", "base_url")),
+                    // Pick up `AWS_BEARER_TOKEN_BEDROCK` exactly like
+                    // boto3 / aws-sdk-js do; an empty string is treated
+                    // as "unset" so a shell that exports the var but
+                    // leaves it blank falls through to the default
+                    // credential chain instead of failing with
+                    // "empty bearer token".
+                    bearer_token: get_var("AWS_BEARER_TOKEN_BEDROCK")
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty()),
                     transport: provider_transport_settings(&providers, &["bedrock"]),
                 })
             }
@@ -2052,6 +2061,16 @@ pub struct AzureOpenAiConfig {
 pub struct BedrockConfig {
     pub region: String,
     pub base_url: Option<String>,
+    /// Optional short-lived bearer token sourced from
+    /// `AWS_BEARER_TOKEN_BEDROCK`. When present the provider routes
+    /// requests through the Bedrock HTTP bearer-auth scheme instead of
+    /// the standard AWS SigV4 credential chain — matching the
+    /// long-term "Amazon Bedrock API keys" feature that AWS's other
+    /// SDKs (boto3, JS, Java) auto-detect from the same env var. Kept
+    /// out of serialized config dumps via `redact_secret_opt` so it
+    /// never lands in TOML logs alongside the rest of `[providers.bedrock]`.
+    #[serde(default, serialize_with = "redact_secret_opt")]
+    pub bearer_token: Option<String>,
     pub transport: ProviderTransportConfig,
 }
 

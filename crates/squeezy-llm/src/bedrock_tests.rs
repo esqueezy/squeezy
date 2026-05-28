@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use aws_config::{BehaviorVersion, SdkConfig};
+use aws_sdk_bedrockruntime::config::{Credentials, Region, SharedCredentialsProvider};
 use aws_sdk_bedrockruntime::types::{
     CachePointType, ContentBlock, ConversationRole, ConverseStreamMetadataEvent,
     ConverseStreamOutput, MessageStopEvent, StopReason, SystemContentBlock, TokenUsage,
@@ -7,10 +9,11 @@ use aws_sdk_bedrockruntime::types::{
 };
 use aws_smithy_types::{Document, Number};
 use serde_json::json;
+use squeezy_core::SqueezyError;
 
 use super::{
-    BedrockStreamState, conversation_messages, handle_bedrock_event, json_to_document,
-    system_blocks, tool_configuration,
+    BedrockStreamState, build_bedrock_client, conversation_messages, handle_bedrock_event,
+    json_to_document, system_blocks, tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{LlmInputItem, LlmToolSpec};
@@ -377,5 +380,97 @@ fn conversation_messages_reject_unknown_image_mime() {
     assert!(
         message.contains("image/avif"),
         "error must mention the unsupported MIME: {message}"
+    );
+}
+
+#[test]
+fn aws_bearer_token_env_routes_through_bedrock_bearer_auth() {
+    // BedrockConfig carries the `AWS_BEARER_TOKEN_BEDROCK` env-var
+    // value once squeezy-core has lifted it (squeezy-core owns env
+    // discovery; squeezy-llm owns the auth wiring). With a bearer
+    // token in hand the provider must build a Bedrock client even
+    // when the shared SdkConfig has no SigV4 credentials at all —
+    // that is the whole point of the bearer route. We deliberately
+    // build a credential-less SdkConfig so a regression that ignores
+    // the bearer token would surface as the explicit
+    // `ProviderNotConfigured` error rather than an Ok client.
+    let bedrock = squeezy_core::BedrockConfig {
+        region: squeezy_core::DEFAULT_BEDROCK_REGION.to_string(),
+        base_url: None,
+        bearer_token: Some("bedrock-api-key-test".to_string()),
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    };
+    let provider = crate::BedrockProvider::from_config(&bedrock)
+        .expect("BedrockProvider::from_config must accept a bearer-token-only config");
+    drop(provider);
+
+    let shared = SdkConfig::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .build();
+    assert!(
+        shared.credentials_provider().is_none(),
+        "test SdkConfig is intentionally credential-less",
+    );
+    let client = build_bedrock_client(&shared, bedrock.bearer_token.as_deref())
+        .expect("bearer-token path must not require AWS credentials");
+    drop(client);
+
+    // Leading/trailing whitespace from a shell heredoc must not
+    // poison the bearer header — `build_bedrock_client` trims before
+    // wrapping the token in the SDK identity type. An all-whitespace
+    // bearer is treated as "missing token" and surfaces a clean error
+    // instead of an unauthenticated request.
+    let trimmed = build_bedrock_client(&shared, Some("  bedrock-api-key-test\n"))
+        .expect("whitespace-padded bearer token must be normalised, not rejected");
+    drop(trimmed);
+    let empty = build_bedrock_client(&shared, Some("   "))
+        .expect_err("an all-whitespace bearer token must be rejected explicitly");
+    assert!(
+        matches!(&empty, SqueezyError::ProviderNotConfigured(message)
+            if message.contains("AWS_BEARER_TOKEN_BEDROCK")),
+        "empty bearer must surface ProviderNotConfigured mentioning the env var: {empty:?}",
+    );
+}
+
+#[test]
+fn missing_bearer_token_falls_back_to_default_credential_chain() {
+    // Without a bearer token the provider trusts whatever the AWS
+    // default credential chain resolved (env → ~/.aws/credentials →
+    // IMDS / container roles). We exercise both legs of that branch:
+    //
+    // 1. A credential-bearing SdkConfig must yield Ok(client) so the
+    //    SDK can sign with SigV4 the way it always has.
+    // 2. A credential-less SdkConfig must surface ProviderNotConfigured
+    //    with a message that points operators at the recovery paths
+    //    (bearer token env, `aws configure`, AWS_PROFILE, raw env
+    //    vars) — silently returning an unusable client would mask the
+    //    misconfiguration until the first network request.
+    let creds = Credentials::new("AKIDEXAMPLE", "SECRETEXAMPLE", None, None, "squeezy-test");
+    let with_creds = SdkConfig::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .credentials_provider(SharedCredentialsProvider::new(creds))
+        .build();
+    let client = build_bedrock_client(&with_creds, None)
+        .expect("default chain with credentials must build a client");
+    drop(client);
+
+    let without_creds = SdkConfig::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .build();
+    let err = build_bedrock_client(&without_creds, None)
+        .expect_err("default chain with no credentials must surface ProviderNotConfigured");
+    let SqueezyError::ProviderNotConfigured(message) = &err else {
+        panic!("expected ProviderNotConfigured, got {err:?}");
+    };
+    assert!(
+        message.contains("AWS_BEARER_TOKEN_BEDROCK"),
+        "error must point operators at the bearer-token recovery path: {message}",
+    );
+    assert!(
+        message.contains("aws configure") || message.contains("AWS_PROFILE"),
+        "error must also point at the standard credential-chain recovery paths: {message}",
     );
 }
