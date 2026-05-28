@@ -437,6 +437,33 @@ impl SkillCatalog {
             &workspace_root.join(PROJECT_SKILLS_DIR),
             SkillSource::Project,
         );
+        // Monorepo support: walk strict ancestors of `workspace_root`
+        // looking for sibling project skill roots. Inner-scope skills
+        // already loaded above shadow any same-name skill discovered in
+        // an outer ancestor; the walk stops at the first ancestor that
+        // contains a `.git` entry (a file for git worktrees, a directory
+        // for vanilla checkouts) or at the filesystem root if no marker
+        // is found. The shadow set grows as each ancestor contributes
+        // new skills so closer ancestors always win over farther ones.
+        let mut shadow_set: BTreeSet<String> = catalog.skills.keys().cloned().collect();
+        for ancestor in ancestor_project_roots(workspace_root) {
+            let before: BTreeSet<String> = catalog.skills.keys().cloned().collect();
+            catalog.discover_dir_filtered(
+                &ancestor.join(COMPAT_PROJECT_SKILLS_DIR),
+                SkillSource::CompatProject,
+                Some(&shadow_set),
+            );
+            catalog.discover_dir_filtered(
+                &ancestor.join(PROJECT_SKILLS_DIR),
+                SkillSource::Project,
+                Some(&shadow_set),
+            );
+            for name in catalog.skills.keys() {
+                if !before.contains(name) {
+                    shadow_set.insert(name.clone());
+                }
+            }
+        }
         catalog.apply_config_rules(workspace_root, &config.config);
         catalog.warn_trigger_collisions();
         catalog.rebuild_implicit_indexes();
@@ -629,6 +656,24 @@ impl SkillCatalog {
     }
 
     fn discover_dir(&mut self, dir: &Path, source: SkillSource) {
+        self.discover_dir_filtered(dir, source, None);
+    }
+
+    /// Like [`Self::discover_dir`] but optionally skips skills whose
+    /// `name` appears in `shadow_set`.
+    ///
+    /// Used by the ancestor walk in [`Self::discover`] to enforce
+    /// "inner-scope skills win over outer ancestors on same-name
+    /// collision" without dragging that policy into the cwd-local
+    /// discovery path. Shadowed skills are logged at debug level rather
+    /// than warn — being hidden by an inner copy is the expected
+    /// monorepo behavior, not a misconfiguration.
+    fn discover_dir_filtered(
+        &mut self,
+        dir: &Path,
+        source: SkillSource,
+        shadow_set: Option<&BTreeSet<String>>,
+    ) {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
@@ -705,6 +750,17 @@ impl SkillCatalog {
                     path = %skill_path.display(),
                     name = %metadata.name,
                     "skipping SKILL.md with invalid name"
+                );
+                continue;
+            }
+            if let Some(set) = shadow_set
+                && set.contains(&metadata.name)
+            {
+                tracing::debug!(
+                    target: "squeezy_skills",
+                    name = %metadata.name,
+                    path = %skill_path.display(),
+                    "ancestor skill shadowed by inner-scope skill of same name"
                 );
                 continue;
             }
@@ -1276,6 +1332,54 @@ fn input_matches_trigger(lowered_input: &str, trigger: &str) -> bool {
 
 fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Strict ancestors of `workspace_root` that should be scanned for
+/// monorepo sibling skill roots.
+///
+/// Walks from `workspace_root`'s parent up until the first directory
+/// that contains a `.git` entry (file for git worktrees and submodules,
+/// directory for vanilla checkouts) is reached, or until the filesystem
+/// root is hit when no marker is found. The returned list is in
+/// inner-to-outer order so callers can register a closer ancestor's
+/// skills before a farther ancestor's same-name copy can shadow them.
+///
+/// Returns an empty vector when `workspace_root` is itself a git root —
+/// at that point all project skills already live under cwd and there is
+/// no parent repository to pick up siblings from.
+fn ancestor_project_roots(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if is_git_root(workspace_root) {
+        return roots;
+    }
+    let mut current = workspace_root.to_path_buf();
+    while let Some(parent) = current.parent().map(Path::to_path_buf) {
+        // `Path::parent` returns `None` at the filesystem root, but
+        // canonicalization edge cases on Windows can yield a self-parent
+        // entry — bail explicitly so the walk always terminates.
+        if parent == current {
+            break;
+        }
+        let stop = is_git_root(&parent);
+        roots.push(parent.clone());
+        if stop {
+            break;
+        }
+        current = parent;
+    }
+    roots
+}
+
+/// True when `dir` looks like a git repository checkout root.
+///
+/// Accepts both the standard `.git/` directory layout and the worktree
+/// or submodule `.git` *file* form so the ancestor walk halts at either
+/// flavour. Uses `try_exists` so a transient I/O error doesn't fall
+/// through to "no marker"; on failure the walk treats the directory as
+/// non-root and keeps climbing, which is the conservative choice when
+/// the alternative is to halt early and lose a sibling skill set.
+fn is_git_root(dir: &Path) -> bool {
+    dir.join(".git").try_exists().unwrap_or(false)
 }
 
 fn config_selector_path(workspace_root: &Path, selector: &Path) -> PathBuf {
