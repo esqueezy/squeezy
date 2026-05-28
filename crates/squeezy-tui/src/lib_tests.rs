@@ -9283,10 +9283,10 @@ async fn alt_one_resumes_most_recent_non_active_session() {
     let store = squeezy_store::SessionStore::open(&config);
 
     let older = store
-        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .start_session_eager(squeezy_store::SessionMetadata::new(&config, "scripted"))
         .expect("seed older session");
     let newer = store
-        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .start_session_eager(squeezy_store::SessionMetadata::new(&config, "scripted"))
         .expect("seed newer session");
     // Force an explicit ordering so the test does not depend on
     // back-to-back `now_ms()` calls landing on different millisecond
@@ -9329,7 +9329,7 @@ async fn alt_nine_reports_no_session_when_slot_is_empty() {
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let store = squeezy_store::SessionStore::open(&config);
     let only = store
-        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .start_session_eager(squeezy_store::SessionMetadata::new(&config, "scripted"))
         .expect("seed only peer");
     let only_id = only.session_id().to_string();
 
@@ -9461,7 +9461,7 @@ async fn alt_one_skips_when_an_approval_is_pending() {
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let store = squeezy_store::SessionStore::open(&config);
     store
-        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .start_session_eager(squeezy_store::SessionMetadata::new(&config, "scripted"))
         .expect("seed peer session");
 
     let mut agent = test_agent_with_config(config.clone());

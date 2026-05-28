@@ -29,7 +29,7 @@ fn session_store_lists_filters_and_exports_sessions() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(
@@ -72,7 +72,7 @@ fn fork_creates_child_with_parent_id() {
     };
     let store = SessionStore::open(&config);
     let parent = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start parent");
     parent
         .write_resume_state(&SessionResumeState {
@@ -117,7 +117,7 @@ fn session_export_preserves_task_state_events() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(
@@ -157,7 +157,7 @@ fn session_resume_state_preserves_context_compaction() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     let compaction = ContextCompactionState {
         generation: 2,
@@ -224,7 +224,7 @@ fn malformed_event_lines_are_counted_as_warnings() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     // Lazy materialisation defers the on-disk session dir until a
     // substantive event arrives. Seed one so the test can overwrite
@@ -250,7 +250,7 @@ fn replay_tape_round_trips_and_exports() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
 
     handle
@@ -292,7 +292,7 @@ fn replay_tape_counts_tampered_lines_as_warnings() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     materialise_session(&handle);
     fs::write(
@@ -319,7 +319,7 @@ fn bug_report_redacts_replay_tape() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_replay_event(SessionReplayEvent::new(
@@ -359,7 +359,7 @@ fn bug_report_archive_redacts_events_and_records_exclusions() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(
@@ -427,7 +427,7 @@ fn context_attachments_store_redacted_text_and_export_metadata() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     let attachment = ContextAttachment {
         id: "att-0001".to_string(),
@@ -476,7 +476,7 @@ fn finish_preserves_terminal_status_set_by_earlier_events() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
 
     handle
@@ -592,7 +592,7 @@ fn session_log_writer_flushes_concurrent_events() {
     let store = SessionStore::open(&config);
     let handle = Arc::new(
         store
-            .start_session(SessionMetadata::new(&config, "test-provider"))
+            .start_session_eager(SessionMetadata::new(&config, "test-provider"))
             .expect("start session"),
     );
 
@@ -631,7 +631,7 @@ async fn append_event_does_not_block_tokio_reactor() {
     let store = SessionStore::open(&config);
     let handle = Arc::new(
         store
-            .start_session(SessionMetadata::new(&config, "test-provider"))
+            .start_session_eager(SessionMetadata::new(&config, "test-provider"))
             .expect("start session"),
     );
     let canary = tokio::spawn(async {
@@ -675,7 +675,7 @@ fn cleanup_does_not_sweep_running_sessions_via_retention() {
     };
     let store = SessionStore::open(&config);
     let running = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start running");
     // Both sessions need to be materialised on disk so the retention
     // sweep can find them by reading `metadata.json`. Lazy materialisation
@@ -690,7 +690,7 @@ fn cleanup_does_not_sweep_running_sessions_via_retention() {
         })
         .expect("backdate running session");
     let completed = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start completed");
     materialise_session(&completed);
     completed
@@ -751,10 +751,10 @@ fn cleanup_excluding_skips_protected_session() {
     };
     let store = SessionStore::open(&config);
     let protected = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start protected");
     let collateral = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start collateral");
     // Lazy materialisation means cleanup_excluding cannot find a session
     // until it has materialised to disk. Seed both with a substantive
@@ -1374,7 +1374,7 @@ fn replay_resume_state_without_resume_json() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(
@@ -1422,7 +1422,7 @@ fn replay_snaps_to_compaction_checkpoint() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(
@@ -1504,7 +1504,7 @@ fn typed_session_events_round_trip_through_event_log() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
 
     let expected = vec![
@@ -1582,7 +1582,7 @@ fn replay_resume_state_falls_back_when_resume_json_deleted() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
 
     // A full turn: user prompt -> tool call -> tool result -> assistant
@@ -1681,7 +1681,7 @@ fn replay_resume_state_round_trips_reasoning_items() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
 
     let openai_reasoning = ReasoningPayload::OpenAi {
@@ -1784,7 +1784,7 @@ fn open_test_store(label: &str) -> (PathBuf, SessionStore, AppConfig) {
 fn archive_excludes_session_from_default_list() {
     let (_root, store, config) = open_test_store("archive-excludes");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     materialise_session(&handle);
     let session_id = handle.session_id().to_string();
@@ -1815,7 +1815,7 @@ fn archive_excludes_session_from_default_list() {
 fn cleanup_skips_archived_sessions() {
     let (_root, store, config) = open_test_store("cleanup-skips-archived");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     materialise_session(&handle);
     let session_id = handle.session_id().to_string();
@@ -1869,7 +1869,7 @@ fn cleanup_deletes_archived_sessions_past_archive_retention() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     materialise_session(&handle);
     let session_id = handle.session_id().to_string();
@@ -1926,7 +1926,7 @@ fn cleanup_with_archive_retention_disabled_keeps_archived_sessions() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     materialise_session(&handle);
     let session_id = handle.session_id().to_string();
@@ -1960,7 +1960,7 @@ fn cleanup_with_archive_retention_disabled_keeps_archived_sessions() {
 fn remove_session_archives_live_session() {
     let (_root, store, config) = open_test_store("remove-session-archives");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     materialise_session(&handle);
     let session_id = handle.session_id().to_string();
@@ -1990,7 +1990,7 @@ fn remove_session_archives_live_session() {
 fn archived_session_remains_readable_via_show() {
     let (_root, store, config) = open_test_store("archived-readable");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(
@@ -2023,7 +2023,7 @@ fn archived_session_remains_readable_via_show() {
 fn unarchive_round_trip_restores_session() {
     let (_root, store, config) = open_test_store("unarchive-round-trip");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     materialise_session(&handle);
     let session_id = handle.session_id().to_string();
@@ -2053,7 +2053,7 @@ fn unarchive_round_trip_restores_session() {
 fn archived_session_excluded_from_list_default() {
     let (_root, store, config) = open_test_store("archived-excluded-default");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     materialise_session(&handle);
     let session_id = handle.session_id().to_string();
@@ -2092,14 +2092,14 @@ fn archived_session_excluded_from_list_default() {
 fn cleanup_with_purge_hard_deletes_live_and_archived_sessions() {
     let (_root, store, config) = open_test_store("cleanup-purge");
     let live = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start live session");
     materialise_session(&live);
     let live_id = live.session_id().to_string();
     drop(live);
 
     let archived = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start archived session");
     materialise_session(&archived);
     let archived_id = archived.session_id().to_string();
@@ -2149,7 +2149,7 @@ fn cleanup_with_purge_hard_deletes_live_and_archived_sessions() {
 fn bundle_rollout_trace_is_empty_when_no_logs_exist() {
     let (_root, store, config) = open_test_store("rollout-trace-empty");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     let bundle = store
         .bundle_rollout_trace(handle.session_id())
@@ -2161,7 +2161,7 @@ fn bundle_rollout_trace_is_empty_when_no_logs_exist() {
 fn bundle_rollout_trace_preserves_event_order_when_no_replay() {
     let (_root, store, config) = open_test_store("rollout-trace-events-only");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(
@@ -2216,7 +2216,7 @@ fn bundle_rollout_trace_preserves_event_order_when_no_replay() {
 fn bundle_rollout_trace_emits_replay_when_no_events() {
     let (_root, store, config) = open_test_store("rollout-trace-replay-only");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_replay_event(SessionReplayEvent::new(
@@ -2275,7 +2275,7 @@ fn bundle_rollout_trace_emits_replay_when_no_events() {
 fn bundle_rollout_trace_merges_events_and_replay_by_timestamp() {
     let (_root, store, config) = open_test_store("rollout-trace-merge");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     // The test fabricates events.jsonl + replay.jsonl with fixed
     // timestamps by writing the files directly. Lazy materialisation
@@ -2874,7 +2874,7 @@ fn update_metadata_and_index_persists_display_name_to_metadata_json() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(

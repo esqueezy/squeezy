@@ -2190,6 +2190,12 @@ impl Agent {
         if let Some(session) = &self.session_log
             && session.session_id() == session_id
         {
+            // The active session may still be in the lazy-F12 Pending
+            // state if no substantive event has been appended yet.
+            // Materialise so `SessionStore::show(...)` sees a real
+            // metadata.json on disk; flush_events then catches anything
+            // buffered in the writer.
+            let _ = session.materialize_now();
             let _ = session.flush_events();
         }
     }

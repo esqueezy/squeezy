@@ -301,6 +301,17 @@ impl SessionStore {
     /// before the model loop runs — therefore leave no on-disk stub
     /// behind, while any real interaction materialises the session in
     /// place before the first substantive event is recorded.
+    /// Start a session AND immediately materialise it to disk. Test
+    /// fixtures and any caller that expects `list_sessions` /
+    /// `SessionStore::show` to see the new session right away should
+    /// use this instead of [`SessionStore::start_session`] (which is
+    /// lazy per F12-pi-lazy-session-file-creation).
+    pub fn start_session_eager(&self, metadata: SessionMetadata) -> Result<SessionHandle> {
+        let handle = self.start_session(metadata)?;
+        handle.materialize_now()?;
+        Ok(handle)
+    }
+
     pub fn start_session(&self, mut metadata: SessionMetadata) -> Result<SessionHandle> {
         metadata.session_id = next_session_id();
         metadata.started_at_ms = now_ms();
@@ -1277,6 +1288,16 @@ impl SessionHandle {
     ///
     /// Returns an Arc clone of the writer so the caller can immediately
     /// queue further appends without re-locking the state mutex.
+    /// Materialise a pending session to disk (writes `metadata.json` +
+    /// `resume_state.json`, records the global index entry, spawns the
+    /// writer). Idempotent on already-live sessions. Use this when a
+    /// caller wants `SessionStore::show(...)` to succeed before any
+    /// substantive event has been appended (e.g., the agent's
+    /// `show_session` API surface).
+    pub fn materialize_now(&self) -> Result<()> {
+        self.ensure_live().map(|_| ())
+    }
+
     fn ensure_live(&self) -> Result<Arc<SessionLogWriter>> {
         let mut guard = self.state.inner.lock().expect("session handle state");
         match &*guard {
