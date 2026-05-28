@@ -2751,6 +2751,71 @@ impl Agent {
         format!("att-{next:04}")
     }
 
+    /// Start a fresh user turn with `input` as the first user message.
+    ///
+    /// This is the "next_turn" leg of the three-way user-input surface:
+    ///
+    /// - [`Agent::next_turn`] — start a new user turn from scratch (this
+    ///   method). Equivalent to [`Agent::start_turn`]; kept as a typed
+    ///   alias so callers can express intent ("I am starting a new turn")
+    ///   without leaking the internal `start_turn` name into call sites.
+    /// - [`Agent::follow_up`] — append an additional user message to the
+    ///   conversation without starting a new turn. Used when the user
+    ///   wants to extend the current turn with more context.
+    /// - [`Agent::steer`] — interrupt the running turn with new input.
+    ///   See the doc comment on `steer` for the current behavior.
+    ///
+    /// Returns the same [`mpsc::Receiver<AgentEvent>`] stream that
+    /// [`Agent::start_turn`] returns; callers drive the turn by
+    /// consuming events from the receiver until the turn terminates.
+    pub fn next_turn(
+        &self,
+        input: String,
+        cancel: CancellationToken,
+    ) -> mpsc::Receiver<AgentEvent> {
+        self.start_turn(input, cancel)
+    }
+
+    /// Append an additional user message to the in-flight (or next)
+    /// turn's conversation without starting a fresh turn.
+    ///
+    /// This is the "follow_up" leg of the three-way user-input surface
+    /// (see [`Agent::next_turn`] for the full taxonomy). It pushes
+    /// `text` onto the live conversation transcript so the message is
+    /// visible to the model on the *current* turn's next provider call
+    /// (or on the next turn, if no turn is currently running).
+    ///
+    /// Internally this dispatches through the same conversation-queue
+    /// path as [`Agent::queue_user_message`], which the eval driver
+    /// uses to script "interrupting user" behavior. The typed name is
+    /// preferred at new call sites because it makes the intent
+    /// ("continue the current turn") explicit.
+    pub async fn follow_up(&self, text: String) {
+        self.queue_user_message(text).await;
+    }
+
+    /// Interrupt the running turn with new user input and start a new
+    /// turn from `input`.
+    ///
+    /// This is the "steer" leg of the three-way user-input surface
+    /// (see [`Agent::next_turn`] for the full taxonomy). Semantically,
+    /// `steer` should cancel the in-flight turn (if any) and replace
+    /// it with a fresh turn whose first user message is `input`.
+    ///
+    /// TODO: mid-turn interrupt-with-new-input is not yet implemented.
+    /// The agent currently has no built-in mechanism to cancel the
+    /// running turn from inside this call; cancellation is owned by
+    /// the caller-supplied [`CancellationToken`] for the previous
+    /// `start_turn`/`next_turn` invocation, not by the agent.
+    /// Until that wiring lands, `steer` aliases [`Agent::next_turn`]:
+    /// it starts a new turn but does *not* cancel an in-flight one.
+    /// The caller remains responsible for cancelling the previous
+    /// turn's token before calling `steer` if it wants
+    /// interrupt-then-replace behavior.
+    pub fn steer(&self, input: String, cancel: CancellationToken) -> mpsc::Receiver<AgentEvent> {
+        self.next_turn(input, cancel)
+    }
+
     pub fn start_turn(
         &self,
         input: String,

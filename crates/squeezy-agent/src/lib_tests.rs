@@ -7103,3 +7103,145 @@ async fn dispatch_command_raw_routes_through_parser() {
         DispatchOutcome::Error { ref command, .. } if command == "/attach"
     ));
 }
+
+fn completed_turn_response(text: &str, response_id: &str) -> Vec<Result<LlmEvent>> {
+    vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(text.to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some(response_id.to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]
+}
+
+#[tokio::test]
+async fn next_turn_dispatches_through_start_turn() {
+    // `next_turn` is the typed entry point for "start a fresh user
+    // turn". It must run the full LLM-turn loop and surface the same
+    // event stream as `start_turn`, with the supplied input reaching
+    // the provider as a `UserText` item.
+    let provider = Arc::new(MockProvider::new(vec![completed_turn_response(
+        "ok",
+        "resp_next",
+    )]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut rx = agent.next_turn("kick off a new turn".to_string(), CancellationToken::new());
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed {
+            message,
+            response_id,
+            ..
+        } = event
+        {
+            completed = Some((message.content, response_id));
+        }
+    }
+
+    assert_eq!(
+        completed,
+        Some(("ok".to_string(), Some("resp_next".to_string()))),
+        "next_turn should drive the LLM loop to completion just like start_turn"
+    );
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "next_turn should issue exactly one provider request"
+    );
+    assert!(
+        requests[0].input.iter().any(|item| matches!(
+            item,
+            LlmInputItem::UserText(text) if text == "kick off a new turn"
+        )),
+        "next_turn input should reach the provider as a UserText item, got {:?}",
+        requests[0].input
+    );
+}
+
+#[tokio::test]
+async fn follow_up_appends_user_text_without_running_a_turn() {
+    // `follow_up` is the typed entry point for "extend the current
+    // turn with another user message". It must push the text onto the
+    // conversation queue (the same path as `queue_user_message`) and
+    // it must NOT spawn a new turn — the provider should see zero
+    // requests until a turn is started.
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    agent
+        .follow_up("more context for the running turn".to_string())
+        .await;
+
+    let conversation = agent.conversation_state.lock().await.conversation.clone();
+    assert_eq!(
+        conversation.len(),
+        1,
+        "follow_up should push exactly one item onto the conversation queue"
+    );
+    assert!(
+        matches!(
+            &conversation[0],
+            LlmInputItem::UserText(text) if text == "more context for the running turn"
+        ),
+        "follow_up should dispatch through the conversation-queue path as a UserText item, got {:?}",
+        conversation[0]
+    );
+    assert!(
+        provider.requests().is_empty(),
+        "follow_up must not start a new turn"
+    );
+}
+
+#[tokio::test]
+async fn steer_aliases_next_turn_until_interrupt_semantics_land() {
+    // `steer` is the typed entry point for "interrupt the running
+    // turn with new input". The agent has no mid-turn-interrupt
+    // primitive yet, so `steer` is documented as an alias for
+    // `next_turn`: it must drive a fresh turn to completion and
+    // surface the input to the provider exactly like `next_turn`
+    // does, so call sites can adopt the typed name today and pick up
+    // real interrupt semantics for free when they land.
+    let provider = Arc::new(MockProvider::new(vec![completed_turn_response(
+        "steered",
+        "resp_steer",
+    )]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut rx = agent.steer("change direction".to_string(), CancellationToken::new());
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed {
+            message,
+            response_id,
+            ..
+        } = event
+        {
+            completed = Some((message.content, response_id));
+        }
+    }
+
+    assert_eq!(
+        completed,
+        Some(("steered".to_string(), Some("resp_steer".to_string()))),
+        "steer should currently behave like next_turn and run a turn to completion"
+    );
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "steer should issue exactly one provider request via the next_turn path"
+    );
+    assert!(
+        requests[0].input.iter().any(|item| matches!(
+            item,
+            LlmInputItem::UserText(text) if text == "change direction"
+        )),
+        "steer input should reach the provider as a UserText item, got {:?}",
+        requests[0].input
+    );
+}
