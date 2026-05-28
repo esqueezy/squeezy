@@ -34,9 +34,9 @@ use ratatui::{
 #[cfg(test)]
 use squeezy_agent::RequestUserInputChoice;
 use squeezy_agent::{
-    Agent, AgentEvent, JobEvent, JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS,
-    PendingConfigSwap, RequestUserInputRequest, RequestUserInputResponse, ToolApprovalDecision,
-    ToolApprovalRequest,
+    Agent, AgentEvent, DispatchCommand, DispatchCommandParseError, JobEvent, JobId,
+    JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS, PendingConfigSwap,
+    RequestUserInputRequest, RequestUserInputResponse, ToolApprovalDecision, ToolApprovalRequest,
 };
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
@@ -1878,81 +1878,88 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
 }
 
 async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
-    let mut parts = input.split_whitespace();
-    let Some(command) = parts.next() else {
-        return false;
+    let cmd = match DispatchCommand::parse(input) {
+        Ok(cmd) => cmd,
+        // Unknown heads fall through so the input is treated as a
+        // normal user prompt (echoed as a slash echo upstream by
+        // `reject_unknown_slash_command`).
+        Err(DispatchCommandParseError::Unknown { .. })
+        | Err(DispatchCommandParseError::NotASlashCommand)
+        | Err(DispatchCommandParseError::Empty) => return false,
+        // Required-arg failures preserve the pre-refactor `usage:`
+        // strings so the visible affordance is unchanged.
+        Err(DispatchCommandParseError::Usage { hint, .. }) => {
+            app.status = hint;
+            return true;
+        }
     };
-    let rest = input
-        .strip_prefix(command)
-        .map(str::trim)
-        .unwrap_or_default();
-    if let Some(spec) = SLASH_COMMANDS.iter().find(|spec| spec.name == command)
+
+    let slash = cmd.slash_name();
+    if let Some(spec) = SLASH_COMMANDS.iter().find(|spec| spec.name == slash)
         && !spec.available_during_task
         && turn_in_progress(app)
     {
-        app.status = format!("{command} unavailable during turn");
+        app.status = format!("{slash} unavailable during turn");
         return true;
     }
-    if should_echo_slash_command(command, rest) {
+
+    let rest = input.strip_prefix(slash).map(str::trim).unwrap_or_default();
+    if should_echo_slash_command(slash, rest) {
         app.push_slash_command_echo(input);
     }
-    match command {
-        "/config" => {
-            let section = if rest.is_empty() {
-                None
-            } else {
-                squeezy_core::config_schema::section_from_slug(rest)
-            };
-            toggle_config_screen(app, agent, section);
-            return true;
+
+    apply_dispatch_command(app, agent, cmd).await;
+    true
+}
+
+/// Run the typed slash-command on the TUI. The parsing is done by
+/// [`DispatchCommand::parse`] in [`handle_slash_command`]; this
+/// function only routes to the existing helpers that own the TUI
+/// state. Agent-only dispatch lives on [`Agent::dispatch_command`] and
+/// is invoked by non-TUI drivers (eval, RPC).
+async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: DispatchCommand) {
+    match cmd {
+        DispatchCommand::Config { section } => {
+            let id = section
+                .as_deref()
+                .and_then(squeezy_core::config_schema::section_from_slug);
+            toggle_config_screen(app, agent, id);
         }
-        "/statusline" => {
-            toggle_status_line_setup(app);
-            return true;
-        }
-        "/plan" => {
+        DispatchCommand::Statusline => toggle_status_line_setup(app),
+        DispatchCommand::Plan { prompt } => {
             switch_mode(app, agent, Some(SessionMode::Plan), "tui_command");
-            if !rest.is_empty() {
-                let prompt = rest.to_string();
+            if let Some(prompt) = prompt {
                 app.cancelled_prompt = Some(prompt.clone());
                 clear_input(app);
                 push_input_history(app, prompt.clone());
                 start_user_turn(app, agent, prompt);
             }
-            return true;
         }
-        "/build" => {
+        DispatchCommand::Build { prompt } => {
             switch_mode(app, agent, Some(SessionMode::Build), "tui_command");
-            if !rest.is_empty() {
-                let prompt = rest.to_string();
+            if let Some(prompt) = prompt {
                 app.cancelled_prompt = Some(prompt.clone());
                 clear_input(app);
                 push_input_history(app, prompt.clone());
                 start_user_turn(app, agent, prompt);
             }
-            return true;
         }
-        "/plans" => {
-            handle_plans_command(app, rest);
-            return true;
-        }
-        "/cost" => {
+        DispatchCommand::Plans { args } => handle_plans_command(app, &args),
+        DispatchCommand::Cost => {
             let snapshot = agent.session_accounting_snapshot().await;
             app.status = "cost snapshot".to_string();
             app.push_transcript_item(TranscriptItem::system(commands::format_cost_command(
                 &snapshot,
             )));
-            return true;
         }
-        "/context" => {
+        DispatchCommand::Context => {
             let snapshot = agent.session_accounting_snapshot().await;
             app.status = "context snapshot".to_string();
             app.push_transcript_item(TranscriptItem::system(commands::format_context_command(
                 &snapshot,
             )));
-            return true;
         }
-        "/reviewer" => {
+        DispatchCommand::Reviewer => {
             let entries = agent.reviewer_audit_snapshot();
             if entries.is_empty() {
                 app.status = "no AI reviewer decisions recorded yet".to_string();
@@ -1963,52 +1970,40 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 &entries,
                 std::time::SystemTime::now(),
             )));
-            return true;
         }
-        "/help" => {
-            handle_help_command(app, agent, rest);
-            return true;
+        DispatchCommand::Help { topic } => {
+            handle_help_command(app, agent, topic.as_deref().unwrap_or(""));
         }
-        "/model" => {
+        DispatchCommand::Model => {
             toggle_config_screen(
                 app,
                 agent,
                 Some(squeezy_core::config_schema::SectionId::Models),
             );
-            return true;
         }
-        "/permissions" => {
+        DispatchCommand::Permissions => {
             toggle_config_screen(
                 app,
                 agent,
                 Some(squeezy_core::config_schema::SectionId::Permissions),
             );
-            return true;
         }
-        "/feedback" => {
-            handle_feedback_command(app, agent, rest).await;
-            return true;
+        DispatchCommand::Feedback { args } => {
+            handle_feedback_command(app, agent, &args).await;
         }
-        "/report" => {
-            handle_report_command(app, agent, rest).await;
-            return true;
+        DispatchCommand::Report { args } => {
+            handle_report_command(app, agent, &args).await;
         }
-        "/attach" => {
-            let path = input.trim_start_matches("/attach").trim();
-            if path.is_empty() {
-                app.status = "usage: /attach <path>".to_string();
-                return true;
-            }
-            match agent.attach_file_context(PathBuf::from(path)).await {
+        DispatchCommand::Attach { path } => {
+            match agent.attach_file_context(PathBuf::from(&path)).await {
                 Ok(update) => {
                     app.attachments = agent.context_attachments_snapshot().await;
                     app.status = attachment_update_status("file", &update);
                 }
                 Err(error) => app.status = format!("attach failed: {error}"),
             }
-            return true;
         }
-        "/attachments" => {
+        DispatchCommand::Attachments => {
             app.attachments = agent.context_attachments_snapshot().await;
             if app.attachments.is_empty() {
                 app.status = "no attached context".to_string();
@@ -2018,25 +2013,16 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                     &app.attachments,
                 )));
             }
-            return true;
         }
-        "/detach" => {
-            let Some(id) = parts.next() else {
-                app.status = "usage: /detach <attachment_id>".to_string();
-                return true;
-            };
-            match agent.detach_context_attachment(id).await {
-                Ok(attachment) => {
-                    app.attachments = agent.context_attachments_snapshot().await;
-                    app.status = format!("detached {}", attachment.id);
-                }
-                Err(error) => app.status = format!("detach failed: {error}"),
+        DispatchCommand::Detach { id } => match agent.detach_context_attachment(&id).await {
+            Ok(attachment) => {
+                app.attachments = agent.context_attachments_snapshot().await;
+                app.status = format!("detached {}", attachment.id);
             }
-            return true;
-        }
-        "/compact" => {
-            let subcommand = parts.next().map(str::trim).unwrap_or("");
-            if subcommand.eq_ignore_ascii_case("undo") {
+            Err(error) => app.status = format!("detach failed: {error}"),
+        },
+        DispatchCommand::Compact { undo } => {
+            if undo {
                 match agent.compact_context_undo().await {
                     Ok(Some(record)) => {
                         app.context_compaction = agent.context_compaction_snapshot().await;
@@ -2055,33 +2041,32 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                     }
                     Err(error) => app.status = format!("compact undo failed: {error}"),
                 }
-                return true;
-            }
-            match agent.compact_context_manual().await {
-                Ok(report) => {
-                    app.context_compaction = agent.context_compaction_snapshot().await;
-                    app.context_estimate = report.record.after.clone();
-                    app.status = compaction_status_line(&report.record);
-                    app.push_log(format!(
-                        "context compacted gen={} items={} tok {}->{}",
-                        report.record.generation,
-                        report.record.dropped_items,
-                        report.record.before.estimated_tokens,
-                        report.record.after.estimated_tokens
-                    ));
-                    app.push_transcript_item(TranscriptItem::system(format!(
-                        "/compact discarded {dropped} item(s); context {before}→{after} tokens. \
-                         Run `/compact undo` to restore.",
-                        dropped = report.record.dropped_items,
-                        before = report.record.before.estimated_tokens,
-                        after = report.record.after.estimated_tokens,
-                    )));
+            } else {
+                match agent.compact_context_manual().await {
+                    Ok(report) => {
+                        app.context_compaction = agent.context_compaction_snapshot().await;
+                        app.context_estimate = report.record.after.clone();
+                        app.status = compaction_status_line(&report.record);
+                        app.push_log(format!(
+                            "context compacted gen={} items={} tok {}->{}",
+                            report.record.generation,
+                            report.record.dropped_items,
+                            report.record.before.estimated_tokens,
+                            report.record.after.estimated_tokens
+                        ));
+                        app.push_transcript_item(TranscriptItem::system(format!(
+                            "/compact discarded {dropped} item(s); context {before}→{after} tokens. \
+                             Run `/compact undo` to restore.",
+                            dropped = report.record.dropped_items,
+                            before = report.record.before.estimated_tokens,
+                            after = report.record.after.estimated_tokens,
+                        )));
+                    }
+                    Err(error) => app.status = format!("compact failed: {error}"),
                 }
-                Err(error) => app.status = format!("compact failed: {error}"),
             }
-            return true;
         }
-        "/pins" => {
+        DispatchCommand::Pins => {
             app.context_compaction = agent.context_compaction_snapshot().await;
             if app.context_compaction.pinned.is_empty() {
                 app.status = "no pinned context".to_string();
@@ -2094,11 +2079,10 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                     &app.context_compaction,
                 )));
             }
-            return true;
         }
-        "/pin" => {
-            let target = parts.next().unwrap_or("selected");
-            match pin_source(app, target) {
+        DispatchCommand::Pin { target } => {
+            let target_str = target.as_deref().unwrap_or("selected");
+            match pin_source(app, target_str) {
                 PinSourceResult::Found(label, summary, source) => {
                     match agent.pin_context_entry(label, summary, source).await {
                         Ok(pin) => {
@@ -2115,60 +2099,25 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                     app.status = "usage: /pin selected|last".to_string();
                 }
             }
-            return true;
         }
-        "/unpin" => {
-            let id = parts.next().map(str::trim).filter(|raw| !raw.is_empty());
-            let Some(id) = id else {
-                app.status = "usage: /unpin <pin_id>".to_string();
-                return true;
-            };
-            match agent.unpin_context_entry(id).await {
-                Ok(pin) => {
-                    app.context_compaction = agent.context_compaction_snapshot().await;
-                    app.status = format!("unpinned {}", pin.id);
-                }
-                Err(error) => app.status = format!("unpin failed: {error}"),
+        DispatchCommand::Unpin { id } => match agent.unpin_context_entry(&id).await {
+            Ok(pin) => {
+                app.context_compaction = agent.context_compaction_snapshot().await;
+                app.status = format!("unpinned {}", pin.id);
             }
-            return true;
+            Err(error) => app.status = format!("unpin failed: {error}"),
+        },
+        DispatchCommand::Collapse { category } => {
+            apply_collapse_expand(app, "/collapse", category.as_deref(), true);
         }
-        "/collapse" | "/expand" => {
-            let category = match parts.next() {
-                Some(value) => match parse_transcript_category(value) {
-                    Some(category) => category,
-                    None => {
-                        app.status = format!(
-                            "usage: {command} [all|tools|logs|diffs|receipts|assistant|reasoning]"
-                        );
-                        return true;
-                    }
-                },
-                None => TranscriptCategory::All,
-            };
-            let collapsed = command == "/collapse";
-            let changed = set_transcript_collapsed(app, category, collapsed);
-            app.status = format!(
-                "{} {} transcript entr{}",
-                if collapsed { "collapsed" } else { "expanded" },
-                changed,
-                if changed == 1 { "y" } else { "ies" }
-            );
-            return true;
+        DispatchCommand::Expand { category } => {
+            apply_collapse_expand(app, "/expand", category.as_deref(), false);
         }
-        "/diff" => {
-            handle_slash_diff(app);
-            return true;
-        }
-        "/effort" => {
-            handle_slash_effort(app, agent, parts.next());
-            return true;
-        }
-        "/verbosity" => {
-            // Back-compat: `/verbosity concise|normal|verbose` still works as
-            // a quick set. Without an arg, opens the config screen on the
-            // Verbosity section.
-            if let Some(value) = parts.next()
-                && let Some(verbosity) = parse_response_verbosity(value)
+        DispatchCommand::Diff => handle_slash_diff(app),
+        DispatchCommand::Effort { value } => handle_slash_effort(app, agent, value.as_deref()),
+        DispatchCommand::Verbosity { value } => {
+            if let Some(value) = value
+                && let Some(verbosity) = parse_response_verbosity(&value)
             {
                 app.response_verbosity = verbosity;
                 let mut next = agent.config_snapshot();
@@ -2178,18 +2127,17 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                     format!("response verbosity → {}", verbosity.as_str()),
                     NotifySeverity::Success,
                 );
-                return true;
+                return;
             }
             toggle_config_screen(
                 app,
                 agent,
                 Some(squeezy_core::config_schema::SectionId::Verbosity),
             );
-            return true;
         }
-        "/tool-verbosity" => {
-            if let Some(value) = parts.next()
-                && let Some(verbosity) = parse_tool_output_verbosity(value)
+        DispatchCommand::ToolVerbosity { value } => {
+            if let Some(value) = value
+                && let Some(verbosity) = parse_tool_output_verbosity(&value)
             {
                 app.tool_output_verbosity = verbosity;
                 let mut next = agent.config_snapshot();
@@ -2199,31 +2147,24 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                     format!("tool output verbosity → {}", verbosity.as_str()),
                     NotifySeverity::Success,
                 );
-                return true;
+                return;
             }
             toggle_config_screen(
                 app,
                 agent,
                 Some(squeezy_core::config_schema::SectionId::Verbosity),
             );
-            return true;
         }
-        "/theme" => {
-            let Some(raw) = parts.next() else {
-                app.status =
-                    "usage: /theme [system|dark|light|catppuccin|high-contrast]".to_string();
-                return true;
-            };
-            let Some(theme) = TuiTheme::parse(raw) else {
+        DispatchCommand::Theme { theme } => {
+            let Some(parsed) = TuiTheme::parse(&theme) else {
                 app.status = format!(
-                    "unknown theme {raw:?}; expected system, dark, light, catppuccin, or high-contrast",
+                    "unknown theme {theme:?}; expected system, dark, light, catppuccin, or high-contrast",
                 );
-                return true;
+                return;
             };
-            apply_theme_change(app, agent, theme);
-            return true;
+            apply_theme_change(app, agent, parsed);
         }
-        "/keymap" => {
+        DispatchCommand::Keymap => {
             let body = keymap::format_keymap_command(&app.keymap);
             let overrides = keymap::Action::ALL
                 .iter()
@@ -2236,158 +2177,89 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 format!("keymap ({overrides} override(s))")
             };
             app.push_transcript_item(TranscriptItem::system(body));
-            return true;
         }
-        "/tasks" | "/jobs" => {
+        DispatchCommand::Tasks | DispatchCommand::Jobs => {
             sync_jobs_from_agent(app, agent);
             let body = format_tasks_list(app, agent);
             app.status = format!("{} tasks", app.jobs.len());
             app.push_transcript_item(TranscriptItem::system(body));
-            return true;
         }
-        "/task" | "/job" => {
-            let Some(raw_id) = parts.next() else {
-                app.status = format!("usage: {command} <id>");
-                return true;
-            };
-            let Some(id) = parse_job_id(raw_id) else {
-                app.status = "task id must be a number".to_string();
-                return true;
-            };
-            sync_jobs_from_agent(app, agent);
-            match app
-                .jobs
-                .get(&id)
-                .cloned()
-                .or_else(|| agent.job_snapshot(id))
-            {
-                Some(job) => {
-                    app.status = format!("task {} {}", job.id, job.status.as_str());
-                    app.push_transcript_item(TranscriptItem::system(format_job_detail(&job)));
-                }
-                None => app.status = format!("task {id} not found"),
+        DispatchCommand::Task { id } | DispatchCommand::Job { id } => {
+            apply_task_detail(app, agent, &id);
+        }
+        DispatchCommand::TaskCancel { id } | DispatchCommand::JobCancel { id } => {
+            apply_task_cancel(app, agent, &id);
+        }
+        DispatchCommand::Sessions => match agent.list_sessions(&SessionQuery::default()) {
+            Ok(sessions) => {
+                app.status = format!("{} sessions", sessions.len());
+                app.push_transcript_item(TranscriptItem::system(
+                    sessions
+                        .into_iter()
+                        .take(10)
+                        .map(|session| {
+                            format!(
+                                "{} {} {}",
+                                session.session_id,
+                                session.status.as_str(),
+                                session
+                                    .first_user_task
+                                    .or(session.latest_summary)
+                                    .unwrap_or_default()
+                                    .replace('\n', " ")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ));
             }
-            return true;
-        }
-        "/task-cancel" | "/job-cancel" => {
-            let Some(raw_id) = parts.next() else {
-                app.status = format!("usage: {command} <id>");
-                return true;
-            };
-            let Some(id) = parse_job_id(raw_id) else {
-                app.status = "task id must be a number".to_string();
-                return true;
-            };
-            if agent.cancel_job(id) {
-                app.status = format!("cancelling task {id}");
-                sync_jobs_from_agent(app, agent);
-            } else {
-                app.status = format!("task {id} not active");
+            Err(error) => app.status = format!("session list failed: {error}"),
+        },
+        DispatchCommand::Session { id } => match agent.show_session(&id) {
+            Ok(record) => {
+                app.status = format!(
+                    "session {}: {} events={} redactions={}",
+                    record.metadata.session_id,
+                    record.metadata.status.as_str(),
+                    record.metadata.event_count,
+                    record.metadata.redactions
+                );
+                app.push_transcript_item(TranscriptItem::system(format!(
+                    "{}\nstatus={} started={} branch={} task={}",
+                    record.metadata.session_id,
+                    record.metadata.status.as_str(),
+                    record.metadata.started_at_ms,
+                    record.metadata.branch.unwrap_or_else(|| "-".to_string()),
+                    record.metadata.first_user_task.unwrap_or_default()
+                )));
             }
-            return true;
-        }
-        "/sessions" => {
-            match agent.list_sessions(&SessionQuery::default()) {
-                Ok(sessions) => {
-                    app.status = format!("{} sessions", sessions.len());
-                    app.push_transcript_item(TranscriptItem::system(
-                        sessions
-                            .into_iter()
-                            .take(10)
-                            .map(|session| {
-                                format!(
-                                    "{} {} {}",
-                                    session.session_id,
-                                    session.status.as_str(),
-                                    session
-                                        .first_user_task
-                                        .or(session.latest_summary)
-                                        .unwrap_or_default()
-                                        .replace('\n', " ")
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    ));
-                }
-                Err(error) => app.status = format!("session list failed: {error}"),
+            Err(error) => app.status = format!("session show failed: {error}"),
+        },
+        DispatchCommand::Fork => match agent.fork_current().await {
+            Ok(new_id) => {
+                app.status = format!("forked session → {new_id}");
+                app.push_transcript_item(TranscriptItem::system(format!(
+                    "/fork started session {new_id}; the original session is saved and \
+                     remains resumable via /resume."
+                )));
             }
-            return true;
-        }
-        "/session" => {
-            let Some(session_id) = parts.next() else {
-                app.status = "usage: /session <session_id>".to_string();
-                return true;
-            };
-            match agent.show_session(session_id) {
-                Ok(record) => {
-                    app.status = format!(
-                        "session {}: {} events={} redactions={}",
-                        record.metadata.session_id,
-                        record.metadata.status.as_str(),
-                        record.metadata.event_count,
-                        record.metadata.redactions
-                    );
-                    app.push_transcript_item(TranscriptItem::system(format!(
-                        "{}\nstatus={} started={} branch={} task={}",
-                        record.metadata.session_id,
-                        record.metadata.status.as_str(),
-                        record.metadata.started_at_ms,
-                        record.metadata.branch.unwrap_or_else(|| "-".to_string()),
-                        record.metadata.first_user_task.unwrap_or_default()
-                    )));
-                }
-                Err(error) => app.status = format!("session show failed: {error}"),
+            Err(error) => app.status = format!("fork failed: {error}"),
+        },
+        DispatchCommand::Resume { id } => switch_to_session(app, agent, &id).await,
+        DispatchCommand::SessionExport { id } => match agent.export_session(&id) {
+            Ok(value) => {
+                app.status = format!(
+                    "session export {} bytes",
+                    serde_json::to_string(&value).map_or(0, |text| text.len())
+                );
             }
-            return true;
-        }
-        "/fork" => {
-            match agent.fork_current().await {
-                Ok(new_id) => {
-                    app.status = format!("forked session → {new_id}");
-                    app.push_transcript_item(TranscriptItem::system(format!(
-                        "/fork started session {new_id}; the original session is saved and \
-                         remains resumable via /resume."
-                    )));
-                }
-                Err(error) => app.status = format!("fork failed: {error}"),
-            }
-            return true;
-        }
-        "/resume" => {
-            let Some(session_id) = parts.next() else {
-                app.status = "usage: /resume <session_id>".to_string();
-                return true;
-            };
-            switch_to_session(app, agent, session_id).await;
-            return true;
-        }
-        "/session-export" => {
-            let Some(session_id) = parts.next() else {
-                app.status = "usage: /session-export <session_id>".to_string();
-                return true;
-            };
-            match agent.export_session(session_id) {
-                Ok(value) => {
-                    app.status = format!(
-                        "session export {} bytes",
-                        serde_json::to_string(&value).map_or(0, |text| text.len())
-                    );
-                }
-                Err(error) => app.status = format!("session export failed: {error}"),
-            }
-            return true;
-        }
-        "/session-export-html" => {
-            let Some(session_id) = parts.next() else {
-                app.status = "usage: /session-export-html <session_id> [path]".to_string();
-                return true;
-            };
-            let target = parts
-                .next()
+            Err(error) => app.status = format!("session export failed: {error}"),
+        },
+        DispatchCommand::SessionExportHtml { id, path } => {
+            let target = path
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(format!("squeezy-session-{session_id}.html")));
-            match agent.show_session(session_id).and_then(|record| {
+                .unwrap_or_else(|| PathBuf::from(format!("squeezy-session-{id}.html")));
+            match agent.show_session(&id).and_then(|record| {
                 squeezy_agent::export_session_to_html(
                     &record,
                     &squeezy_agent::ExportOpts::default(),
@@ -2405,9 +2277,8 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 }
                 Err(error) => app.status = format!("session export html failed: {error}"),
             }
-            return true;
         }
-        "/session-cleanup" => {
+        DispatchCommand::SessionCleanup { args } => {
             // Pull the mode flag out of the args before the id list so
             // `--archive` / `--purge` can appear anywhere on the line.
             // `--archive` is the default; `--purge` switches to
@@ -2415,7 +2286,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             // already-archived ids named here are removed immediately).
             let mut mode = CleanupMode::Archive;
             let mut ids = Vec::new();
-            for token in parts {
+            for token in args.split_whitespace() {
                 match token {
                     "--archive" => mode = CleanupMode::Archive,
                     "--purge" => mode = CleanupMode::Purge,
@@ -2432,43 +2303,96 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 }
                 Err(error) => app.status = format!("session cleanup failed: {error}"),
             }
-            return true;
         }
-        "/copy" => {
-            match parts.next() {
-                None => copy_to_clipboard(app, ClipboardTarget::LastAssistant),
-                Some("transcript") => copy_to_clipboard(app, ClipboardTarget::Transcript),
-                Some(_) => app.status = "usage: /copy [transcript]".to_string(),
-            }
-            return true;
+        DispatchCommand::Copy { target } => match target.as_deref() {
+            None => copy_to_clipboard(app, ClipboardTarget::LastAssistant),
+            Some("transcript") => copy_to_clipboard(app, ClipboardTarget::Transcript),
+            // `DispatchCommand::parse` already rejects other values
+            // with `Usage`, but keep the arm for forward compatibility
+            // — a future variant of `/copy` would land here.
+            Some(_) => app.status = "usage: /copy [transcript]".to_string(),
+        },
+        DispatchCommand::Checkpoints => {
+            start_local_checkpoint_job(app, agent, "checkpoint_list", serde_json::json!({}))
         }
-        _ => {}
+        DispatchCommand::Undo => {
+            start_local_checkpoint_job(app, agent, "checkpoint_undo", serde_json::json!({}))
+        }
+        DispatchCommand::Checkpoint { id } => start_local_checkpoint_job(
+            app,
+            agent,
+            "checkpoint_show",
+            serde_json::json!({ "checkpoint_id": id }),
+        ),
+        DispatchCommand::RevertTurn { group_id } => start_local_checkpoint_job(
+            app,
+            agent,
+            "checkpoint_revert",
+            serde_json::json!({ "group_id": group_id }),
+        ),
     }
-    let (name, arguments) = match command {
-        "/checkpoints" => ("checkpoint_list", serde_json::json!({})),
-        "/undo" => ("checkpoint_undo", serde_json::json!({})),
-        "/checkpoint" => {
-            let Some(checkpoint_id) = parts.next() else {
-                app.status = "usage: /checkpoint <checkpoint_id>".to_string();
-                return true;
-            };
-            (
-                "checkpoint_show",
-                serde_json::json!({ "checkpoint_id": checkpoint_id }),
-            )
-        }
-        "/revert-turn" => {
-            let Some(group_id) = parts.next() else {
-                app.status = "usage: /revert-turn <turn_id>".to_string();
-                return true;
-            };
-            (
-                "checkpoint_revert",
-                serde_json::json!({ "group_id": group_id }),
-            )
-        }
-        _ => return false,
+}
+
+fn apply_collapse_expand(app: &mut TuiApp, command: &str, category: Option<&str>, collapsed: bool) {
+    let category = match category {
+        Some(value) => match parse_transcript_category(value) {
+            Some(category) => category,
+            None => {
+                app.status =
+                    format!("usage: {command} [all|tools|logs|diffs|receipts|assistant|reasoning]");
+                return;
+            }
+        },
+        None => TranscriptCategory::All,
     };
+    let changed = set_transcript_collapsed(app, category, collapsed);
+    app.status = format!(
+        "{} {} transcript entr{}",
+        if collapsed { "collapsed" } else { "expanded" },
+        changed,
+        if changed == 1 { "y" } else { "ies" }
+    );
+}
+
+fn apply_task_detail(app: &mut TuiApp, agent: &Agent, raw_id: &str) {
+    let Some(id) = parse_job_id(raw_id) else {
+        app.status = "task id must be a number".to_string();
+        return;
+    };
+    sync_jobs_from_agent(app, agent);
+    match app
+        .jobs
+        .get(&id)
+        .cloned()
+        .or_else(|| agent.job_snapshot(id))
+    {
+        Some(job) => {
+            app.status = format!("task {} {}", job.id, job.status.as_str());
+            app.push_transcript_item(TranscriptItem::system(format_job_detail(&job)));
+        }
+        None => app.status = format!("task {id} not found"),
+    }
+}
+
+fn apply_task_cancel(app: &mut TuiApp, agent: &Agent, raw_id: &str) {
+    let Some(id) = parse_job_id(raw_id) else {
+        app.status = "task id must be a number".to_string();
+        return;
+    };
+    if agent.cancel_job(id) {
+        app.status = format!("cancelling task {id}");
+        sync_jobs_from_agent(app, agent);
+    } else {
+        app.status = format!("task {id} not active");
+    }
+}
+
+fn start_local_checkpoint_job(
+    app: &mut TuiApp,
+    agent: &Agent,
+    name: &'static str,
+    arguments: serde_json::Value,
+) {
     let job = agent.start_local_tool_job(ToolCall {
         call_id: format!("tui-{name}"),
         name: name.to_string(),
@@ -2476,7 +2400,6 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
     });
     app.jobs.insert(job.id, job.clone());
     app.status = format!("started job {} {}", job.id, job.title);
-    true
 }
 
 /// Dispatch for `/plans [list|show|delete|set-active|open] [<id>]`.

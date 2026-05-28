@@ -6427,3 +6427,250 @@ fn assistant_text_has_unresolved_intent_skips_intent_without_action_verb() {
         "Let me think about this. The answer depends on what you mean by X.",
     ));
 }
+
+// F17-dispatch-command-completeness: each typed `DispatchCommand`
+// variant lands in `Agent::dispatch_command` with a deterministic
+// outcome. Variants whose effect lives in the TUI return `TuiOnly`;
+// agent-side variants return the structured outcome the caller
+// (eval / RPC) needs.
+
+fn mock_agent_for_dispatch() -> Agent {
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    Agent::new(AppConfig::default(), provider)
+}
+
+#[tokio::test]
+async fn dispatch_command_mode_switches() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Plan { prompt: None })
+        .await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::ModeChanged { ref mode, changed: true } if mode == "plan"
+    ));
+    // Repeating the call is a no-op: changed=false.
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Plan { prompt: None })
+        .await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::ModeChanged { ref mode, changed: false } if mode == "plan"
+    ));
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Build { prompt: None })
+        .await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::ModeChanged { ref mode, changed: true } if mode == "build"
+    ));
+}
+
+#[tokio::test]
+async fn dispatch_command_cost_and_context() {
+    let agent = mock_agent_for_dispatch();
+    let cost = agent.dispatch_command(DispatchCommand::Cost).await;
+    assert!(matches!(cost, DispatchOutcome::CostSnapshot { .. }));
+    let ctx = agent.dispatch_command(DispatchCommand::Context).await;
+    assert!(matches!(ctx, DispatchOutcome::ContextSnapshot { .. }));
+}
+
+#[tokio::test]
+async fn dispatch_command_jobs_permissions_reviewer_snapshots_are_empty_by_default() {
+    let agent = mock_agent_for_dispatch();
+    let jobs = agent.dispatch_command(DispatchCommand::Tasks).await;
+    assert!(matches!(jobs, DispatchOutcome::JobsList { count: 0 }));
+    let jobs_alias = agent.dispatch_command(DispatchCommand::Jobs).await;
+    assert!(matches!(jobs_alias, DispatchOutcome::JobsList { count: 0 }));
+    let perms = agent.dispatch_command(DispatchCommand::Permissions).await;
+    assert!(matches!(
+        perms,
+        DispatchOutcome::PermissionsList { count: 0 }
+    ));
+    let reviewer = agent.dispatch_command(DispatchCommand::Reviewer).await;
+    assert!(matches!(
+        reviewer,
+        DispatchOutcome::ReviewerSnapshot { count: 0 }
+    ));
+}
+
+#[tokio::test]
+async fn dispatch_command_task_lookup_and_cancel_for_missing_id() {
+    let agent = mock_agent_for_dispatch();
+    let detail = agent
+        .dispatch_command(DispatchCommand::Task {
+            id: "99".to_string(),
+        })
+        .await;
+    assert!(matches!(
+        detail,
+        DispatchOutcome::TaskDetail { ref id, found: false } if id == "99"
+    ));
+    let cancel = agent
+        .dispatch_command(DispatchCommand::TaskCancel {
+            id: "99".to_string(),
+        })
+        .await;
+    assert!(matches!(
+        cancel,
+        DispatchOutcome::TaskCancel { ref id, cancelled: false } if id == "99"
+    ));
+}
+
+#[tokio::test]
+async fn dispatch_command_attachments_default_to_empty() {
+    let agent = mock_agent_for_dispatch();
+    let attachments = agent.dispatch_command(DispatchCommand::Attachments).await;
+    assert!(matches!(
+        attachments,
+        DispatchOutcome::AttachmentsList { count: 0 }
+    ));
+    let pins = agent.dispatch_command(DispatchCommand::Pins).await;
+    assert!(matches!(pins, DispatchOutcome::PinsList { count: 0 }));
+}
+
+#[tokio::test]
+async fn dispatch_command_unpin_missing_returns_error() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Unpin {
+            id: "pin-missing".to_string(),
+        })
+        .await;
+    assert!(matches!(outcome, DispatchOutcome::Error { ref command, .. } if command == "/unpin"));
+}
+
+#[tokio::test]
+async fn dispatch_command_attach_path_propagates_error() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Attach {
+            path: "/path/that/does/not/exist".to_string(),
+        })
+        .await;
+    assert!(matches!(outcome, DispatchOutcome::Error { ref command, .. } if command == "/attach"));
+}
+
+#[tokio::test]
+async fn dispatch_command_session_lookup_for_missing_id() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Session {
+            id: "missing".to_string(),
+        })
+        .await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::SessionDetail { ref session_id, exists: false } if session_id == "missing"
+    ));
+}
+
+#[tokio::test]
+async fn dispatch_command_tui_only_for_renderer_owned_commands() {
+    let agent = mock_agent_for_dispatch();
+    let cases: &[(DispatchCommand, &str)] = &[
+        (DispatchCommand::Diff, "diff"),
+        (DispatchCommand::Keymap, "keymap"),
+        (DispatchCommand::Statusline, "statusline"),
+        (DispatchCommand::Help { topic: None }, "help"),
+        (DispatchCommand::Config { section: None }, "config"),
+        (DispatchCommand::Model, "model"),
+        (
+            DispatchCommand::Plans {
+                args: String::new(),
+            },
+            "plans",
+        ),
+        (DispatchCommand::Copy { target: None }, "copy"),
+        (DispatchCommand::Collapse { category: None }, "collapse"),
+        (DispatchCommand::Expand { category: None }, "expand"),
+        (
+            DispatchCommand::Feedback {
+                args: String::new(),
+            },
+            "feedback",
+        ),
+        (
+            DispatchCommand::Report {
+                args: String::new(),
+            },
+            "report",
+        ),
+        (DispatchCommand::Effort { value: None }, "effort"),
+        (DispatchCommand::Verbosity { value: None }, "verbosity"),
+        (
+            DispatchCommand::ToolVerbosity { value: None },
+            "tool-verbosity",
+        ),
+        (
+            DispatchCommand::Theme {
+                theme: "dark".to_string(),
+            },
+            "theme",
+        ),
+        (DispatchCommand::Fork, "fork"),
+        (
+            DispatchCommand::Resume {
+                id: "sess".to_string(),
+            },
+            "resume",
+        ),
+        (DispatchCommand::Checkpoints, "checkpoints"),
+        (
+            DispatchCommand::Checkpoint {
+                id: "ck".to_string(),
+            },
+            "checkpoint",
+        ),
+        (DispatchCommand::Undo, "undo"),
+        (
+            DispatchCommand::RevertTurn {
+                group_id: "t".to_string(),
+            },
+            "revert-turn",
+        ),
+        (
+            DispatchCommand::SessionExportHtml {
+                id: "s".to_string(),
+                path: None,
+            },
+            "session-export-html",
+        ),
+        (
+            DispatchCommand::SessionCleanup {
+                args: String::new(),
+            },
+            "session-cleanup",
+        ),
+        (DispatchCommand::Pin { target: None }, "pin"),
+    ];
+    for (cmd, expected_kind) in cases {
+        let outcome = agent.dispatch_command(cmd.clone()).await;
+        match outcome {
+            DispatchOutcome::TuiOnly { command } => {
+                assert_eq!(command, *expected_kind, "TuiOnly kind mismatch for {cmd:?}");
+            }
+            other => panic!("expected TuiOnly for {cmd:?}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn dispatch_command_raw_routes_through_parser() {
+    let agent = mock_agent_for_dispatch();
+    let plan = agent.dispatch_command_raw("/plan").await;
+    assert!(matches!(
+        plan,
+        DispatchOutcome::ModeChanged { ref mode, changed: true } if mode == "plan"
+    ));
+    let unknown = agent.dispatch_command_raw("/no-such-command").await;
+    assert!(matches!(
+        unknown,
+        DispatchOutcome::Unsupported { ref command } if command == "/no-such-command"
+    ));
+    let attach = agent.dispatch_command_raw("/attach").await;
+    assert!(matches!(
+        attach,
+        DispatchOutcome::Error { ref command, .. } if command == "/attach"
+    ));
+}
