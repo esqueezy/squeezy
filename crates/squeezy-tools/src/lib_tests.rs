@@ -2389,6 +2389,277 @@ async fn apply_patch_does_not_levenshtein_match() {
 }
 
 #[tokio::test]
+async fn apply_patch_recovers_from_nfkc_ligature_drift() {
+    // F01: the file uses the NFKC-decomposable ligature `ﬁ` (U+FB01) but the
+    // model emits ASCII `fi`. The byte-exact lookup misses, the quote-only
+    // fallback also misses (no curly quotes), and the broader
+    // unicode-normalize fallback locates the slice by running NFKC on both
+    // sides. The applied_delta surfaces `fallback: "unicode_normalize"` for
+    // the audit log so the operator can distinguish quote drift from the
+    // wider unicode chain.
+    let root = temp_workspace("apply_patch_nfkc_ligature");
+    let initial = "let con\u{FB01}g = load();\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_nfkc".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "search_replace",
+                        "path": "doc.txt",
+                        "search": "let config = load();",
+                        "replace": "let config = fetch();",
+                        "expected_sha256": on_disk_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-nfkc".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let final_doc = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert_eq!(
+        final_doc, "let config = fetch();\n",
+        "NFKC fallback should replace the entire ligature-containing slice with the model's ASCII replacement",
+    );
+    let applied_delta = result
+        .content
+        .get("applied_delta")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(applied_delta["exact"], false);
+    assert_eq!(applied_delta["operations"][0]["exact"], false);
+    assert_eq!(
+        applied_delta["operations"][0]["fallback"],
+        "unicode_normalize"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_recovers_from_em_dash_drift() {
+    // F01: the file has an em-dash (U+2014) but the model emitted ASCII
+    // `--`. The unicode-normalize fallback collapses em-dashes to `--` on
+    // both sides and finds the slice. The original em-dash is replaced by
+    // the model's ASCII text verbatim; we do not try to re-emit the
+    // typographic dash because the broader fallback intentionally tolerates
+    // lossy unicode→ASCII edits.
+    let root = temp_workspace("apply_patch_em_dash");
+    let initial = "see chapter 3\u{2014}intro\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_em_dash".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "search_replace",
+                        "path": "doc.txt",
+                        "search": "chapter 3--intro",
+                        "replace": "chapter 4 -- intro",
+                        "expected_sha256": on_disk_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-em-dash".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let final_doc = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert_eq!(final_doc, "see chapter 4 -- intro\n");
+    let applied_delta = result
+        .content
+        .get("applied_delta")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        applied_delta["operations"][0]["fallback"],
+        "unicode_normalize"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_recovers_from_nbsp_drift() {
+    // F01: the file has a non-breaking space (U+00A0) where the model
+    // emitted a regular space. Common when prose was pasted from a Word
+    // doc or a CMS that auto-inserts NBSP between a number and a unit. The
+    // unicode-normalize fallback should bridge that gap.
+    let root = temp_workspace("apply_patch_nbsp");
+    let initial = "size\u{00A0}10 MB\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_nbsp".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "search_replace",
+                        "path": "doc.txt",
+                        "search": "size 10 MB",
+                        "replace": "size 20 MB",
+                        "expected_sha256": on_disk_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-nbsp".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let final_doc = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert_eq!(final_doc, "size 20 MB\n");
+    let applied_delta = result
+        .content
+        .get("applied_delta")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        applied_delta["operations"][0]["fallback"],
+        "unicode_normalize"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_batched_edits_same_file_apply_in_order() {
+    // F01: the batched form (multiple operations targeting the same file)
+    // must apply edits in array order — each subsequent search_replace runs
+    // against the staged state produced by the previous edit, not the
+    // pristine file. Cheap to verify by chaining two transformations that
+    // are only reachable when the first one already landed.
+    let root = temp_workspace("apply_patch_batch_order");
+    let initial = "alpha\nbeta\ngamma\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_batch_order".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [
+                        {
+                            "kind": "search_replace",
+                            "path": "doc.txt",
+                            "search": "alpha\n",
+                            "replace": "ALPHA-step1\n",
+                            "expected_sha256": on_disk_hash,
+                        },
+                        {
+                            "kind": "search_replace",
+                            "path": "doc.txt",
+                            "search": "ALPHA-step1\n",
+                            "replace": "ALPHA-step2\n",
+                            "expected_sha256": on_disk_hash,
+                        }
+                    ]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-batch-order".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let final_doc = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert_eq!(
+        final_doc, "ALPHA-step2\nbeta\ngamma\n",
+        "second edit must see the first edit's output, not the pristine file",
+    );
+    let delta = result
+        .content
+        .get("delta")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .expect("top-level delta array");
+    assert_eq!(delta.len(), 2);
+    assert_eq!(delta[0]["status"], "applied");
+    assert_eq!(delta[1]["status"], "applied");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_batched_edits_fail_atomically_on_missing_search() {
+    // F01: when one edit in a batch fails because its search text is not
+    // found, the whole batch must be rejected and earlier edits must not
+    // touch disk. The error must point at the offending index so the model
+    // can re-emit the right slice without re-deriving which patch was bad.
+    let root = temp_workspace("apply_patch_batch_fail");
+    let initial = "alpha\nbeta\ngamma\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_batch_fail".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [
+                        {
+                            "kind": "search_replace",
+                            "path": "doc.txt",
+                            "search": "alpha\n",
+                            "replace": "ALPHA\n",
+                            "expected_sha256": on_disk_hash,
+                        },
+                        {
+                            "kind": "search_replace",
+                            "path": "doc.txt",
+                            "search": "this-text-is-not-in-the-file\n",
+                            "replace": "anything\n",
+                            "expected_sha256": on_disk_hash,
+                        }
+                    ]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-batch-fail".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Stale, "{:?}", result.content);
+    assert_eq!(result.content["error"], "search text was not found");
+    assert_eq!(
+        result.content["patch_index"], 1,
+        "error must point at the offending batch index",
+    );
+    let unchanged = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert_eq!(
+        unchanged, initial,
+        "batched edits must roll back atomically — first edit's staged write must not hit disk when a later edit fails",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn apply_patch_returns_per_op_delta_with_exact_flag_on_success() {
     // Audit F14: a multi-op apply_patch success must expose a per-op `delta`
     // array — one entry per requested op, each `applied` and `exact=true`
