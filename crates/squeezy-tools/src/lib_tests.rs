@@ -3900,6 +3900,112 @@ async fn checkpointing_is_disabled_by_default_for_mutations() {
 }
 
 #[tokio::test]
+async fn write_file_identical_content_is_noop_and_preserves_mtime() {
+    // F14: writing the same bytes that are already on disk must
+    // short-circuit. The tool result signals `noop=true`, no `fs::write`
+    // occurs (verified by mtime preservation), and the checkpoint layer
+    // does not record a change because the worktree tree is unchanged.
+    let root = temp_workspace("write_file_noop_identical");
+    let target = root.join("sample.txt");
+    fs::write(&target, "same").expect("write sample");
+    let mtime_before = fs::metadata(&target)
+        .expect("metadata")
+        .modified()
+        .expect("mtime supported");
+
+    // Push past the filesystem's mtime resolution so a real write would
+    // land on a strictly later instant. Modern macOS/Linux give sub-ms
+    // precision; the small sleep absorbs the rare low-resolution case
+    // without bloating overall test runtime.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let registry = registry_with_checkpoints(&root);
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "noop-write".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "content": "same",
+                    "expected_sha256": sha256_hex(b"same"),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-noop".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["noop"], json!(true));
+    assert_eq!(result.content["bytes_written"], json!(0));
+    let expected_sha = sha256_hex(b"same");
+    assert_eq!(result.content["before_sha256"], json!(&expected_sha));
+    assert_eq!(result.content["after_sha256"], json!(&expected_sha));
+    assert!(
+        result.content.get("checkpoint").is_none(),
+        "noop write must not emit a checkpoint, got {:?}",
+        result.content.get("checkpoint")
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "same");
+
+    let mtime_after = fs::metadata(&target)
+        .expect("metadata")
+        .modified()
+        .expect("mtime supported");
+    assert_eq!(
+        mtime_before, mtime_after,
+        "noop write must not touch the file (mtime should be unchanged)"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn write_file_changed_content_marks_noop_false_and_writes() {
+    // F14 counterpart: a real edit must still proceed and the tool
+    // result must explicitly mark `noop=false` so downstream layers know
+    // a change really did land on disk.
+    let root = temp_workspace("write_file_noop_changed");
+    let target = root.join("sample.txt");
+    fs::write(&target, "before").expect("write sample");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "real-write".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "content": "after",
+                    "expected_sha256": sha256_hex(b"before"),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-real".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["noop"], json!(false));
+    assert_eq!(result.content["bytes_written"], json!("after".len()));
+    assert_eq!(
+        result.content["before_sha256"],
+        json!(sha256_hex(b"before"))
+    );
+    assert_eq!(result.content["after_sha256"], json!(sha256_hex(b"after")));
+    assert!(
+        result.content["checkpoint"]["group_id"].is_string(),
+        "real edit must emit a checkpoint, got {:?}",
+        result.content.get("checkpoint")
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "after");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn shell_created_file_is_checkpointed_and_deleted_on_undo() {
     let root = temp_workspace("checkpoint_shell_undo");
     // Disable the OS sandbox so this test focuses on checkpoint behavior;
