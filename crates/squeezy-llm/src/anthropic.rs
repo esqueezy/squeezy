@@ -16,10 +16,13 @@ use crate::{
     cache_policy::{CachePolicy, json_markers, should_apply_caching},
     credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
     oauth::{anthropic_oauth_beta_header, is_anthropic_oauth_token},
+    overflow::{OverflowSignal, Usage as OverflowUsage, classify_terminal},
     retry::{RetryPolicy, idle_timeout, send_with_auth_retry, with_stream_retry},
     sse::SseDecoder,
     transport::shared_client,
 };
+
+const ANTHROPIC_PROVIDER_NAME: &str = "anthropic";
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 64_000;
@@ -404,7 +407,24 @@ fn anthropic_stream_attempt(
                 .text()
                 .await
                 .unwrap_or_else(|_| "failed to read error response".to_string());
-            Err(SqueezyError::ProviderRequest(format!("{status}: {message}")))?;
+            let formatted = format!("{status}: {message}");
+            // Pre-stream HTTP error path. Anthropic surfaces overflow as a
+            // 400 with `prompt is too long: …` in the body; emit the
+            // classifier signal additively before propagating the error
+            // so the agent can react instead of looping into the same call.
+            if let Some(signal) = classify_terminal(
+                ANTHROPIC_PROVIDER_NAME,
+                None,
+                Some(&formatted),
+                None,
+                true,
+            ) {
+                yield LlmEvent::ContextOverflow {
+                    provider: ANTHROPIC_PROVIDER_NAME.to_string(),
+                    signal,
+                };
+            }
+            Err(SqueezyError::ProviderRequest(formatted))?;
             unreachable!("provider error returned above");
         };
 
@@ -413,6 +433,13 @@ fn anthropic_stream_attempt(
         let mut decoder = SseDecoder::default();
         let mut state = AnthropicStreamState::default();
         let mut saw_completed = false;
+        let mut saw_visible_output = false;
+        // Resolved context window for the SilentUsage path. `None` when the
+        // model is unknown to the local registry (e.g. an aggregator alias);
+        // the classifier just skips the usage path in that case.
+        let max_window = crate::model_info_for(ANTHROPIC_PROVIDER_NAME, &request.model)
+            .and_then(|info| info.limits)
+            .map(|limits| limits.context_window_tokens);
         let mut bytes = response.bytes_stream();
         loop {
             let polled = tokio::select! {
@@ -429,8 +456,22 @@ fn anthropic_stream_attempt(
             let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
             for event in decoder.push(&chunk) {
                 for llm_event in parse_anthropic_event(&event, &mut state)? {
-                    if matches!(llm_event, LlmEvent::Completed { .. }) {
-                        saw_completed = true;
+                    match &llm_event {
+                        LlmEvent::TextDelta(text) if !text.is_empty() => {
+                            saw_visible_output = true;
+                        }
+                        LlmEvent::ToolCall(_) => {
+                            saw_visible_output = true;
+                        }
+                        LlmEvent::Completed { .. } => {
+                            saw_completed = true;
+                            if let Some(event) =
+                                overflow_event_for_completed(&state, max_window, saw_visible_output)
+                            {
+                                yield event;
+                            }
+                        }
+                        _ => {}
                     }
                     yield llm_event;
                 }
@@ -439,8 +480,22 @@ fn anthropic_stream_attempt(
 
         for event in decoder.finish() {
             for llm_event in parse_anthropic_event(&event, &mut state)? {
-                if matches!(llm_event, LlmEvent::Completed { .. }) {
-                    saw_completed = true;
+                match &llm_event {
+                    LlmEvent::TextDelta(text) if !text.is_empty() => {
+                        saw_visible_output = true;
+                    }
+                    LlmEvent::ToolCall(_) => {
+                        saw_visible_output = true;
+                    }
+                    LlmEvent::Completed { .. } => {
+                        saw_completed = true;
+                        if let Some(event) =
+                            overflow_event_for_completed(&state, max_window, saw_visible_output)
+                        {
+                            yield event;
+                        }
+                    }
+                    _ => {}
                 }
                 yield llm_event;
             }
@@ -451,6 +506,38 @@ fn anthropic_stream_attempt(
                 "Anthropic stream ended without message_stop".to_string(),
             ))?;
         }
+    })
+}
+
+/// Run the triple-path overflow classifier against the Anthropic
+/// stream state at `message_stop`. Returns an additive
+/// [`LlmEvent::ContextOverflow`] when any path fires; the caller
+/// yields it immediately before the canonical [`LlmEvent::Completed`].
+///
+/// `used` totals reported `input_tokens + output_tokens` so a turn
+/// that fills the prompt budget *or* spends the budget on output
+/// can both surface as `SilentUsage` when the result equals or
+/// exceeds the model's context window.
+fn overflow_event_for_completed(
+    state: &AnthropicStreamState,
+    max_window: Option<u64>,
+    saw_visible_output: bool,
+) -> Option<LlmEvent> {
+    let used = state
+        .input_tokens
+        .unwrap_or(0)
+        .saturating_add(state.output_tokens.unwrap_or(0));
+    let usage = max_window.map(|max| OverflowUsage { used, max });
+    let signal: OverflowSignal = classify_terminal(
+        ANTHROPIC_PROVIDER_NAME,
+        state.stop_reason.as_deref(),
+        None,
+        usage.as_ref(),
+        !saw_visible_output,
+    )?;
+    Some(LlmEvent::ContextOverflow {
+        provider: ANTHROPIC_PROVIDER_NAME.to_string(),
+        signal,
     })
 }
 

@@ -99,7 +99,9 @@ pub async fn collect_text(mut stream: LlmStream, label: &str) -> Result<String> 
                     "{label} costly smoke test was cancelled"
                 )));
             }
-            LlmEvent::ReasoningDelta { .. } | LlmEvent::ReasoningDone(_) => {}
+            LlmEvent::ReasoningDelta { .. }
+            | LlmEvent::ReasoningDone(_)
+            | LlmEvent::ContextOverflow { .. } => {}
         }
     }
     Ok(output)

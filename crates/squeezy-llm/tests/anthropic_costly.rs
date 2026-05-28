@@ -69,7 +69,9 @@ async fn anthropic_messages_streaming_costly() -> Result<()> {
                     "costly Anthropic smoke test was cancelled".to_string(),
                 ));
             }
-            LlmEvent::ReasoningDelta { .. } | LlmEvent::ReasoningDone(_) => {}
+            LlmEvent::ReasoningDelta { .. }
+            | LlmEvent::ReasoningDone(_)
+            | LlmEvent::ContextOverflow { .. } => {}
         }
     }
 

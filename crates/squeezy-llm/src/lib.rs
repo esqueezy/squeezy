@@ -28,6 +28,7 @@ pub mod models_dev;
 pub mod oauth;
 mod ollama;
 mod openai;
+pub mod overflow;
 mod registry;
 mod retry;
 mod sse;
@@ -75,6 +76,7 @@ pub use ollama::{
     pull_model,
 };
 pub use openai::OpenAiProvider;
+pub use overflow::{OverflowSignal, Usage as OverflowUsage, classify_terminal};
 pub use registry::{
     MODEL_REGISTRY, ModelCapabilities, ModelInfo, ModelLifecycle, ModelLimits, PROVIDERS,
     RequestTokenEstimate, TokenPricing, TokenizerKind, capabilities_for, estimate_cost,
@@ -292,6 +294,19 @@ pub enum LlmEvent {
     },
     ReasoningDone(ReasoningPayload),
     ToolCall(LlmToolCall),
+    /// Triple-path overflow detector classified this turn's terminal
+    /// shape as a context-window overflow. See
+    /// [`crate::overflow::classify_terminal`] for the three shapes the
+    /// signal can carry. Emitted additively right before
+    /// [`LlmEvent::Completed`] (or the provider's terminal error) so
+    /// consumers that only care about the canonical event stream can
+    /// ignore it. The agent's turn loop reacts to the signal once —
+    /// compact, surface the upstream message, or stop the loop —
+    /// instead of replaying the same overflowing call.
+    ContextOverflow {
+        provider: String,
+        signal: OverflowSignal,
+    },
     Completed {
         response_id: Option<String>,
         cost: CostSnapshot,

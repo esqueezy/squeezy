@@ -85,7 +85,9 @@ async fn ollama_local_streaming_smoke() -> Result<()> {
                     "ollama smoke was cancelled".to_string(),
                 ));
             }
-            LlmEvent::ReasoningDelta { .. } | LlmEvent::ReasoningDone(_) => {}
+            LlmEvent::ReasoningDelta { .. }
+            | LlmEvent::ReasoningDone(_)
+            | LlmEvent::ContextOverflow { .. } => {}
         }
     }
 
