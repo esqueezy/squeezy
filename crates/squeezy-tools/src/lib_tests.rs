@@ -840,6 +840,112 @@ async fn grep_files_with_matches_mode_returns_unique_paths() {
 }
 
 #[tokio::test]
+async fn grep_context_two_emits_five_line_window_around_match() {
+    let root = temp_workspace("grep_context_two");
+    fs::write(
+        root.join("notes.txt"),
+        "alpha\nbeta\ngamma\nneedle\ndelta\nepsilon\nzeta\n",
+    )
+    .expect("write notes");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_context".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle", "context": 2}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["metadata"]["context"], json!(2));
+    let matches = result.content["matches"].as_array().expect("matches");
+    assert_eq!(matches.len(), 1);
+
+    let entry = &matches[0];
+    assert_eq!(entry["path"], json!("notes.txt"));
+    assert_eq!(entry["line"], json!(4));
+    assert_eq!(entry["text"], json!("needle"));
+
+    let before = entry["context_before"].as_array().expect("context_before");
+    let after = entry["context_after"].as_array().expect("context_after");
+    assert_eq!(before.len(), 2);
+    assert_eq!(after.len(), 2);
+    let window_len = before.len() + 1 + after.len();
+    assert_eq!(window_len, 5, "context=2 must emit a 5-line window");
+
+    assert_eq!(before[0], json!({"line": 2, "text": "beta"}));
+    assert_eq!(before[1], json!({"line": 3, "text": "gamma"}));
+    assert_eq!(after[0], json!({"line": 5, "text": "delta"}));
+    assert_eq!(after[1], json!({"line": 6, "text": "epsilon"}));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_context_zero_preserves_pre_f13_match_shape() {
+    let root = temp_workspace("grep_context_zero");
+    fs::write(
+        root.join("notes.txt"),
+        "alpha\nbeta\nneedle\ndelta\nepsilon\n",
+    )
+    .expect("write notes");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let explicit_zero = registry
+        .execute(
+            ToolCall {
+                call_id: "call_zero".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle", "context": 0}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    let default = registry
+        .execute(
+            ToolCall {
+                call_id: "call_default".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(explicit_zero.status, ToolStatus::Success);
+    assert_eq!(default.status, ToolStatus::Success);
+    assert_eq!(explicit_zero.content["metadata"]["context"], json!(0));
+    assert_eq!(default.content["metadata"]["context"], json!(0));
+    assert_eq!(
+        explicit_zero.content["matches"], default.content["matches"],
+        "context=0 must match the omitted-arg default"
+    );
+
+    let matches = explicit_zero.content["matches"]
+        .as_array()
+        .expect("matches");
+    assert_eq!(matches.len(), 1);
+    let entry = &matches[0];
+    assert_eq!(entry["path"], json!("notes.txt"));
+    assert_eq!(entry["line"], json!(3));
+    assert_eq!(entry["text"], json!("needle"));
+    assert!(
+        entry.get("context_before").is_none(),
+        "context=0 must not emit context_before; got: {entry}"
+    );
+    assert!(
+        entry.get("context_after").is_none(),
+        "context=0 must not emit context_after; got: {entry}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn grep_keeps_scanning_after_large_truncated_file() {
     let root = temp_workspace("grep_large_first");
     fs::write(

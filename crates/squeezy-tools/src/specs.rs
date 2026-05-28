@@ -240,7 +240,8 @@ pub(crate) fn grep_spec() -> ToolSpec {
                 "max_bytes_per_file": {"type": "integer", "minimum": 1, "maximum": DEFAULT_MAX_BYTES_PER_FILE},
                 "max_matches": {"type": "integer", "minimum": 1, "maximum": 1000},
                 "output_byte_cap": {"type": "integer", "minimum": 1, "maximum": 128000},
-                "offset": {"type": "integer", "minimum": 0, "description": "Number of matching lines to skip for pagination."}
+                "offset": {"type": "integer", "minimum": 0, "description": "Number of matching lines to skip for pagination."},
+                "context": {"type": "integer", "minimum": 0, "maximum": 50, "description": "Number of leading + trailing context lines to emit around each match (like rg -C N). Default 0. Only affects output_mode=content."}
             },
             "required": ["pattern"]
         })),

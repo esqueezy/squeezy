@@ -71,7 +71,18 @@ pub(crate) struct GrepArgs {
     max_matches: Option<usize>,
     output_byte_cap: Option<usize>,
     offset: Option<usize>,
+    /// F13: optional number of leading + trailing context lines to emit
+    /// around each match (like `rg -C N`). 0 (default) preserves the
+    /// pre-F13 behavior of returning only the matching line. Clamped to
+    /// `MAX_GREP_CONTEXT` defensively in case a non-spec caller sends a
+    /// larger value.
+    context: Option<u32>,
 }
+
+/// Hard cap on grep `context` to keep per-match windows bounded even if
+/// a caller bypasses the JSON-schema `maximum` (e.g. an external client
+/// that does not re-validate). Mirrors the schema's `"maximum": 50`.
+pub(crate) const MAX_GREP_CONTEXT: u32 = 50;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -293,6 +304,7 @@ impl ToolRegistry {
             .output_byte_cap
             .unwrap_or(DEFAULT_OUTPUT_BYTE_CAP)
             .min(128_000);
+        let context = args.context.unwrap_or(0).min(MAX_GREP_CONTEXT) as usize;
 
         let mut builder = WalkBuilder::new(&start);
         builder
@@ -377,7 +389,12 @@ impl ToolRegistry {
             }
 
             let text = String::from_utf8_lossy(&bytes);
-            for (line_index, line) in text.lines().enumerate() {
+            // F13: collect lines once so we can window into `[i-N, i+N]`
+            // when `context > 0`. Allocating a `Vec<&str>` per file is
+            // cheap relative to the regex scan, and only the
+            // `Content` mode pays for context window construction.
+            let lines: Vec<&str> = text.lines().collect();
+            for (line_index, line) in lines.iter().enumerate() {
                 if !regex.is_match(line) {
                     continue;
                 }
@@ -388,12 +405,41 @@ impl ToolRegistry {
                 count += 1;
                 match output_mode {
                     GrepOutputMode::Content => {
-                        let line = truncate_text(line, 500);
-                        let next = json!({
-                            "path": &rel_str,
-                            "line": line_index + 1,
-                            "text": line,
-                        });
+                        let line_text = truncate_text(line, 500);
+                        let mut next = serde_json::Map::new();
+                        next.insert("path".to_string(), json!(&rel_str));
+                        next.insert("line".to_string(), json!(line_index + 1));
+                        next.insert("text".to_string(), json!(line_text));
+                        if context > 0 {
+                            let before_start = line_index.saturating_sub(context);
+                            let before_lines: Vec<Value> = lines[before_start..line_index]
+                                .iter()
+                                .enumerate()
+                                .map(|(offset_idx, ctx_line)| {
+                                    json!({
+                                        "line": before_start + offset_idx + 1,
+                                        "text": truncate_text(ctx_line, 500),
+                                    })
+                                })
+                                .collect();
+                            let after_end = line_index
+                                .saturating_add(1)
+                                .saturating_add(context)
+                                .min(lines.len());
+                            let after_lines: Vec<Value> = lines[line_index + 1..after_end]
+                                .iter()
+                                .enumerate()
+                                .map(|(offset_idx, ctx_line)| {
+                                    json!({
+                                        "line": line_index + 2 + offset_idx,
+                                        "text": truncate_text(ctx_line, 500),
+                                    })
+                                })
+                                .collect();
+                            next.insert("context_before".to_string(), Value::Array(before_lines));
+                            next.insert("context_after".to_string(), Value::Array(after_lines));
+                        }
+                        let next = Value::Object(next);
                         let next_len = serde_json::to_string(&next).map_or(0, |text| text.len());
                         if cost.output_bytes + next_len as u64 > output_byte_cap as u64 {
                             cost.truncated = true;
@@ -434,6 +480,7 @@ impl ToolRegistry {
         metadata.insert("diff_only".to_string(), json!(diff_only));
         metadata.insert("output_mode".to_string(), json!(output_mode.as_str()));
         metadata.insert("offset".to_string(), json!(offset));
+        metadata.insert("context".to_string(), json!(context));
         metadata.insert(
             "skipped_secret_files".to_string(),
             json!(skipped_secret_files),
