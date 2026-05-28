@@ -3176,6 +3176,11 @@ fn config_with_skill_dirs(root: &Path) -> AppConfig {
         skills: SkillsConfig {
             user_dir: root.join("user-skills"),
             compat_user_dir: root.join("compat-skills"),
+            // Skill-activation tests below assert the full skill body
+            // reaches the system prompt; opt into the inline render so
+            // those assertions keep exercising the legacy path now that
+            // metadata-only is the default.
+            inline: true,
             ..Default::default()
         },
         ..Default::default()

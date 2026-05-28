@@ -281,6 +281,48 @@ impl LoadedSkill {
             escape_body_breakouts(self.body.trim())
         )
     }
+
+    /// Metadata-only counterpart to [`Self::prompt_block`].
+    ///
+    /// Emits the same outer `<skill>` shape (name, source, description,
+    /// optional `when_to_use`, `location`, `base_directory`, manifest)
+    /// but omits the skill body. A short `<instruction>` tells the model
+    /// to call `load_skill` when the full instructions are needed. This
+    /// is the default rendering path for active skills; the legacy
+    /// inline-body form is gated behind `[skills] inline = true`.
+    pub fn metadata_block(&self) -> String {
+        let SkillSummary {
+            name,
+            description,
+            when_to_use,
+            source,
+            location,
+            disabled: _,
+            manifest,
+            context_mode: _,
+        } = &self.summary;
+        let when_to_use = when_to_use
+            .as_ref()
+            .map(|value| format!("\n<when_to_use>{}</when_to_use>", xml_escape(value)))
+            .unwrap_or_default();
+        let manifest_block = manifest
+            .as_ref()
+            .map(render_manifest_block)
+            .unwrap_or_default();
+        let instruction = format!(
+            "Skill body omitted; call load_skill with name \"{}\" to load the full instructions.",
+            name
+        );
+        format!(
+            "<skill name=\"{}\" source=\"{}\" body=\"omitted\">\n<description>{}</description>{when_to_use}\n<location>{}</location>\n<base_directory>{}</base_directory>{manifest_block}\n<instruction>{}</instruction>\n</skill>",
+            xml_escape(name),
+            source.as_str(),
+            xml_escape(description),
+            location.display(),
+            self.base_dir.display(),
+            xml_escape(&instruction),
+        )
+    }
 }
 
 fn render_manifest_block(manifest: &SkillManifest) -> String {
@@ -327,6 +369,11 @@ pub struct SkillCatalog {
     active_body_cap_chars: usize,
     preamble_enabled: bool,
     preamble_budget_chars: usize,
+    /// When `true`, [`SkillCatalog::render_active_skills`] uses the
+    /// legacy inline-body render; when `false` (the default) it emits
+    /// metadata-only blocks and relies on the `load_skill` tool to fetch
+    /// the body on demand.
+    inline: bool,
 }
 
 impl Default for SkillCatalog {
@@ -342,6 +389,7 @@ impl Default for SkillCatalog {
             active_body_cap_chars: defaults.active_body_cap_chars,
             preamble_enabled: defaults.preamble_enabled,
             preamble_budget_chars: defaults.preamble_budget_effective_chars(),
+            inline: defaults.inline,
         }
     }
 }
@@ -361,6 +409,7 @@ impl SkillCatalog {
             active_body_cap_chars: config.active_body_cap_chars,
             preamble_enabled: config.preamble_enabled,
             preamble_budget_chars: config.preamble_budget_effective_chars(),
+            inline: config.inline,
             ..Self::default()
         };
         catalog.discover_dir(&config.compat_user_dir, SkillSource::CompatUser);
@@ -481,7 +530,19 @@ impl SkillCatalog {
     }
 
     pub fn render_active_skills(&self, skills: &[LoadedSkill]) -> Option<String> {
-        render::render_active_skills(skills, self.active_budget_chars, self.active_body_cap_chars)
+        if self.inline {
+            // Legacy behavior: inline each activated skill's full body
+            // into the system prompt, with budget-aware stub fallback.
+            render::render_active_skills(
+                skills,
+                self.active_budget_chars,
+                self.active_body_cap_chars,
+            )
+        } else {
+            // Default behavior: emit metadata-only blocks. The model
+            // calls `load_skill` when it needs the body.
+            render::render_active_skills_metadata(skills, self.active_budget_chars)
+        }
     }
 
     pub fn render_preamble(&self) -> Option<SkillPreambleRender> {
@@ -768,6 +829,7 @@ impl Clone for SkillCatalog {
             active_body_cap_chars: self.active_body_cap_chars,
             preamble_enabled: self.preamble_enabled,
             preamble_budget_chars: self.preamble_budget_chars,
+            inline: self.inline,
         }
     }
 }
