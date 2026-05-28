@@ -74,6 +74,43 @@ pub(crate) fn ephemeral_marker() -> Value {
     json!({ "type": "ephemeral" })
 }
 
+/// Tool-name prefix the agent reserves for dynamically advertised MCP
+/// tools. The tool registry pushes any tool whose name starts with this
+/// to the *end* of the advertised list, so the cache breakpoint must
+/// land before them — otherwise an MCP `tools/list` refresh that
+/// reorders or replaces dynamic tools would invalidate the cached
+/// prompt prefix on every turn.
+pub(crate) const DYNAMIC_TOOL_NAME_PREFIX: &str = "mcp__";
+
+/// Pick the index of the last *stable* (non-mcp__-prefixed) tool to
+/// anchor the cache breakpoint on. Falls back to the literal last
+/// index when every advertised tool is dynamic so callers still place a
+/// breakpoint somewhere when caching is enabled. Returns `None` only on
+/// an empty iterator.
+///
+/// Centralizing this decision means the Anthropic JSON path, the
+/// OpenAI-compatible aggregator path (Anthropic-flavoured), and any
+/// future protocol adapter all agree on which tool entry receives the
+/// marker. Each adapter still owns the marker insertion in its own
+/// wire shape (`cache_control` on the chosen JSON object, or a typed
+/// `CachePoint` block for Bedrock).
+pub(crate) fn last_stable_tool_index<'a, I>(names: I) -> Option<usize>
+where
+    I: IntoIterator<Item = &'a str>,
+    I::IntoIter: DoubleEndedIterator + ExactSizeIterator,
+{
+    let iter = names.into_iter();
+    let len = iter.len();
+    if len == 0 {
+        return None;
+    }
+    let stable = iter
+        .enumerate()
+        .rev()
+        .find_map(|(idx, name)| (!name.starts_with(DYNAMIC_TOOL_NAME_PREFIX)).then_some(idx));
+    Some(stable.unwrap_or(len - 1))
+}
+
 /// Helpers that operate on the Anthropic Messages JSON wire format. The
 /// OpenAI-compatible aggregator path (when the destination is an Anthropic
 /// model) re-uses the same content shape, so it shares these helpers.
@@ -109,11 +146,21 @@ pub(crate) mod json_markers {
         }
     }
 
-    /// Attach a marker to the final tool definition.
-    #[cfg(test)]
-    pub(crate) fn mark_last_tool(tool_values: &mut [Value]) {
-        if let Some(obj) = tool_values.last_mut().and_then(Value::as_object_mut) {
-            obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+    /// Attach the cache breakpoint to the last *stable* tool definition in
+    /// the Anthropic Messages tool shape (`{"name": ..., ...}`). Reads
+    /// the `name` field directly off each JSON value and delegates the
+    /// breakpoint-index decision to [`super::last_stable_tool_index`].
+    /// No-op on an empty slice.
+    pub(crate) fn mark_last_stable_tool(tool_values: &mut [Value]) {
+        let Some(idx) = super::last_stable_tool_index(
+            tool_values
+                .iter()
+                .map(|tool| tool.get("name").and_then(Value::as_str).unwrap_or("")),
+        ) else {
+            return;
+        };
+        if let Some(obj) = tool_values.get_mut(idx).and_then(Value::as_object_mut) {
+            obj.insert("cache_control".to_string(), super::ephemeral_marker());
         }
     }
 }

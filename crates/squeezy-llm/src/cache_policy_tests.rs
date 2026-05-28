@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use super::{CachePolicy, MessageStrategy, json_markers, should_apply_caching};
+use super::{
+    CachePolicy, MessageStrategy, json_markers, last_stable_tool_index, should_apply_caching,
+};
 use crate::{LlmInputItem, LlmRequest};
 
 fn request_with_cache_key(model: &str, cache_key: Option<&str>) -> LlmRequest {
@@ -112,14 +114,14 @@ fn mark_last_user_block_is_noop_when_no_user_message() {
 }
 
 #[test]
-fn mark_last_tool_marks_trailing_tool_definition_only() {
+fn mark_last_stable_tool_marks_trailing_tool_definition_only() {
     let mut tools: Vec<Value> = vec![
         json!({ "name": "first" }),
         json!({ "name": "second" }),
         json!({ "name": "third" }),
     ];
 
-    json_markers::mark_last_tool(&mut tools);
+    json_markers::mark_last_stable_tool(&mut tools);
 
     assert!(
         tools[0].get("cache_control").is_none(),
@@ -127,4 +129,76 @@ fn mark_last_tool_marks_trailing_tool_definition_only() {
     );
     assert!(tools[1].get("cache_control").is_none());
     assert_eq!(tools[2]["cache_control"]["type"], "ephemeral");
+}
+
+#[test]
+fn mark_last_stable_tool_skips_trailing_dynamic_tools() {
+    // Tool registry orders first-party tools before MCP-sourced ones. The
+    // breakpoint must sit on the last first-party tool so the cached
+    // prefix survives an MCP `tools/list` refresh that reorders or
+    // replaces the trailing dynamic entries.
+    let mut tools: Vec<Value> = vec![
+        json!({ "name": "grep" }),
+        json!({ "name": "read" }),
+        json!({ "name": "mcp__github__list_issues" }),
+        json!({ "name": "mcp__linear__create" }),
+    ];
+
+    json_markers::mark_last_stable_tool(&mut tools);
+
+    assert!(tools[0].get("cache_control").is_none());
+    assert_eq!(
+        tools[1]["cache_control"]["type"], "ephemeral",
+        "breakpoint must sit on the last first-party tool, not on an MCP tool"
+    );
+    assert!(tools[2].get("cache_control").is_none());
+    assert!(tools[3].get("cache_control").is_none());
+}
+
+#[test]
+fn mark_last_stable_tool_falls_back_to_literal_last_when_only_dynamic_tools_present() {
+    // Degenerate case: every advertised tool is dynamic. We still need a
+    // breakpoint somewhere when caching is enabled, so anchor to the
+    // literal last entry. The next turn that re-advertises the same set
+    // will hit the cache; a turn that mutates the dynamic set will miss
+    // (acceptable — there is no stable suffix to anchor to).
+    let mut tools: Vec<Value> = vec![
+        json!({ "name": "mcp__github__list_issues" }),
+        json!({ "name": "mcp__linear__create" }),
+    ];
+
+    json_markers::mark_last_stable_tool(&mut tools);
+
+    assert!(tools[0].get("cache_control").is_none());
+    assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+}
+
+#[test]
+fn mark_last_stable_tool_is_noop_on_empty_slice() {
+    let mut tools: Vec<Value> = Vec::new();
+    json_markers::mark_last_stable_tool(&mut tools);
+    assert!(tools.is_empty());
+}
+
+#[test]
+fn last_stable_tool_index_picks_trailing_first_party_index() {
+    // The primitive every adapter routes through: take an iterator of
+    // tool names, return the index where the cache breakpoint belongs.
+    // Adapters with non-Anthropic JSON shapes (Chat Completions nests
+    // `name` under `function.name`) call this directly so they don't
+    // have to round-trip through a JSON projection.
+    let names = ["grep", "read", "mcp__github__list_issues"];
+    assert_eq!(last_stable_tool_index(names.iter().copied()), Some(1));
+}
+
+#[test]
+fn last_stable_tool_index_falls_back_to_last_when_all_dynamic() {
+    let names = ["mcp__a__one", "mcp__b__two"];
+    assert_eq!(last_stable_tool_index(names.iter().copied()), Some(1));
+}
+
+#[test]
+fn last_stable_tool_index_returns_none_on_empty_iterator() {
+    let names: [&str; 0] = [];
+    assert_eq!(last_stable_tool_index(names.iter().copied()), None);
 }

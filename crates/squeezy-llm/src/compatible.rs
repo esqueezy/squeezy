@@ -24,6 +24,7 @@ use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
     ReasoningPayload,
+    cache_policy::{ephemeral_marker, json_markers, last_stable_tool_index},
     credentials::resolve_api_key_with_inline,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
     sse::SseDecoder,
@@ -90,18 +91,21 @@ impl OpenAiCompatibleProvider {
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
         // Anthropic-via-aggregator routes accept the same ephemeral
         // cache_control markers as the native Anthropic API. We attach them
-        // when the caller has supplied a cache_key and the destination
-        // model classifies as an Anthropic-compatible flavor in the
+        // when the caller has supplied a cache_key and the destination model
+        // classifies as an Anthropic-compatible flavor in the
         // [`COMPAT_TABLE`] (covers OpenRouter, Vercel AI Gateway, and any
         // other aggregator that exposes the `anthropic/` namespace).
         // Without this the aggregator route reports zero cached tokens,
         // which silently inflates cost vs. a direct vendor call.
-        let cache_control =
-            if request.cache_key.is_some() && supports_anthropic_caching(&request.model) {
-                Some(json!({ "type": "ephemeral" }))
-            } else {
-                None
-            };
+        //
+        // Marker placement (system tail / last user block / last stable
+        // tool) is decided centrally in `crate::cache_policy`; this
+        // adapter only emits the protocol-specific shape (`cache_control`
+        // objects on JSON content blocks and tool entries) at the spots
+        // that policy module identifies.
+        let anthropic_caching =
+            request.cache_key.is_some() && supports_anthropic_caching(&request.model);
+        let cache_control = anthropic_caching.then(ephemeral_marker);
         // Find the last user-text turn so we can mark it as the cache
         // breakpoint. Anthropic caches everything *before* a marker, so the
         // last user message is the natural place.
@@ -119,16 +123,10 @@ impl OpenAiCompatibleProvider {
         let mut messages = Vec::with_capacity(request.input.len() + 1);
         let trimmed_instructions = request.instructions.trim();
         if !trimmed_instructions.is_empty() {
-            if let Some(cc) = &cache_control {
+            if anthropic_caching {
                 messages.push(json!({
                     "role": "system",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": &*request.instructions,
-                            "cache_control": cc,
-                        }
-                    ],
+                    "content": json_markers::system_array_with_marker(&request.instructions),
                 }));
             } else {
                 messages.push(json!({
@@ -178,22 +176,38 @@ impl OpenAiCompatibleProvider {
             body["prompt_cache_key"] = json!(cache_key);
         }
         if !request.tools.is_empty() {
-            body["tools"] = json!(
-                request
-                    .tools
-                    .iter()
-                    .map(|tool| {
-                        json!({
-                            "type": "function",
-                            "function": {
-                                "name": tool.name,
-                                "description": tool.description,
-                                "parameters": tool.parameters,
-                            }
-                        })
+            let mut tool_values: Vec<Value> = request
+                .tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        }
                     })
-                    .collect::<Vec<_>>()
-            );
+                })
+                .collect();
+            if anthropic_caching {
+                // Anthropic-via-aggregator caches the tool prefix the same
+                // way the native Anthropic API does. Without this marker
+                // the aggregator route reports zero cached tokens on
+                // every turn that re-sends the same tool list — the
+                // common multi-turn coding case. The shared cache-policy
+                // helper picks the breakpoint index (skipping any
+                // mcp__-prefixed dynamic tools the registry pushed to
+                // the tail) so this adapter and the native Anthropic
+                // adapter cannot drift on which entry gets the marker.
+                if let Some(idx) =
+                    last_stable_tool_index(request.tools.iter().map(|tool| tool.name.as_str()))
+                    && let Some(obj) = tool_values.get_mut(idx).and_then(Value::as_object_mut)
+                {
+                    obj.insert("cache_control".to_string(), ephemeral_marker());
+                }
+            }
+            body["tools"] = Value::Array(tool_values);
             // Forward `tool_choice` when the caller set one. Omitting the
             // field leaves the provider's default in place (typically
             // `auto`), which preserves historical behavior for working
