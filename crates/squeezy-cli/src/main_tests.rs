@@ -386,6 +386,7 @@ fn config_from_cli_session_dir_falls_back_to_default_without_flag_or_env() {
 struct PrintModeScriptedProvider {
     name: &'static str,
     responses: std::sync::Mutex<std::collections::VecDeque<Vec<squeezy_llm::LlmEvent>>>,
+    captured_requests: std::sync::Mutex<Vec<squeezy_llm::LlmRequest>>,
 }
 
 impl PrintModeScriptedProvider {
@@ -393,7 +394,38 @@ impl PrintModeScriptedProvider {
         Self {
             name: "print-mode-scripted",
             responses: std::sync::Mutex::new(responses.into()),
+            captured_requests: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn captured_request_count(&self) -> usize {
+        self.captured_requests
+            .lock()
+            .expect("captured requests")
+            .len()
+    }
+
+    /// Concatenate every user-text input item from every captured request
+    /// into one string. The bang-bang regression test uses this to assert
+    /// that the suppressed `!!cmd` body never travels to the LLM, even as
+    /// quoted history attached to a later turn.
+    fn captured_user_text(&self) -> String {
+        self.captured_requests
+            .lock()
+            .expect("captured requests")
+            .iter()
+            .flat_map(|request| {
+                request
+                    .input
+                    .iter()
+                    .filter_map(|item| match item {
+                        squeezy_llm::LlmInputItem::UserText(text) => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -404,9 +436,13 @@ impl squeezy_llm::LlmProvider for PrintModeScriptedProvider {
 
     fn stream_response(
         &self,
-        _request: squeezy_llm::LlmRequest,
+        request: squeezy_llm::LlmRequest,
         _cancel: tokio_util::sync::CancellationToken,
     ) -> squeezy_llm::LlmStream {
+        self.captured_requests
+            .lock()
+            .expect("captured requests")
+            .push(request);
         let events = self
             .responses
             .lock()
@@ -657,4 +693,211 @@ async fn print_mode_auto_approves_ask_capability_so_ci_does_not_hang() {
         stderr_text.contains("auto-approving shell"),
         "stderr should announce the auto-approval; got: {stderr_text:?}"
     );
+}
+
+#[tokio::test]
+async fn pump_prompts_skips_agent_for_bang_bang_prompt_in_text_mode() {
+    // Load-bearing regression for F07-print-mode-exclude-from-context:
+    // a `--prompt "!!cmd"` value must never enter the agent transcript
+    // that follow-on prompts will see. We bake exactly one scripted
+    // response for the *normal* prompt; if the `!!ls ~/.ssh` body
+    // accidentally drove `Agent::start_turn`, the second prompt would
+    // panic in the scripted provider for "scripted response present".
+    // Test passing therefore proves the bang-bang prompt was suppressed
+    // before it reached the agent loop.
+    let root = temp_dir("pump-prompts-bang");
+
+    let provider = Arc::new(PrintModeScriptedProvider::new(vec![vec![
+        squeezy_llm::LlmEvent::Started,
+        squeezy_llm::LlmEvent::TextDelta("normal answer".to_string()),
+        squeezy_llm::LlmEvent::completed(
+            Some("resp_normal".to_string()),
+            squeezy_core::CostSnapshot::default(),
+        ),
+    ]]));
+
+    let config = print_mode_test_config(root.clone());
+    let agent = Agent::new(config, provider.clone());
+    let prompts = vec![
+        print_mode::PromptInput {
+            content: "ls ~/.ssh".to_string(),
+            exclude_from_context: true,
+        },
+        print_mode::PromptInput {
+            content: "explain README".to_string(),
+            exclude_from_context: false,
+        },
+    ];
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    pump_prompts(
+        &agent,
+        prompts,
+        PromptFormat::Default,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("pump completes");
+
+    let stdout_text = String::from_utf8(stdout).expect("utf-8 stdout");
+    let stderr_text = String::from_utf8(stderr).expect("utf-8 stderr");
+
+    assert!(
+        stdout_text.contains("normal answer"),
+        "stdout should still stream the non-! prompt's answer; got: {stdout_text:?}"
+    );
+    assert!(
+        stderr_text.contains("exclude-from-context prompt acknowledged"),
+        "stderr should announce the !! deferral; got: {stderr_text:?}"
+    );
+    assert!(
+        stderr_text.contains("ls ~/.ssh"),
+        "stderr should echo the suppressed command so the operator sees what was held back; got: {stderr_text:?}"
+    );
+    assert!(
+        stderr_text.contains("F01-bang"),
+        "stderr should name the gating sibling so callers know where the runtime is tracked; got: {stderr_text:?}"
+    );
+    assert_eq!(
+        provider.captured_request_count(),
+        1,
+        "the scripted provider should have been driven exactly once (for the normal prompt only)",
+    );
+    let user_text = provider.captured_user_text();
+    assert!(
+        !user_text.contains("ls ~/.ssh"),
+        "the suppressed `!!cmd` body must never reach the LLM transcript; observed user text: {user_text:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn pump_prompts_emits_excluded_from_context_wire_event_in_json_mode() {
+    // The JSON wire schema is the public contract callers consume when
+    // they pipe `--prompt --format json`. A `!!cmd` prompt must surface
+    // exactly one `excluded_from_context` event for that index, with the
+    // command body and the deferral note attached, so consumers can
+    // tell "this prompt was intentionally suppressed" apart from
+    // "this prompt completed normally".
+    let root = temp_dir("pump-prompts-bang-json");
+
+    let provider = Arc::new(PrintModeScriptedProvider::new(Vec::new()));
+    let config = print_mode_test_config(root.clone());
+    let agent = Agent::new(config, provider.clone());
+    let prompts = vec![print_mode::PromptInput {
+        content: "echo secret".to_string(),
+        exclude_from_context: true,
+    }];
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    pump_prompts(
+        &agent,
+        prompts,
+        PromptFormat::Json,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("pump completes");
+
+    let stdout_text = String::from_utf8(stdout).expect("utf-8 stdout");
+    let mut saw_excluded = false;
+    for line in stdout_text.lines() {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|err| panic!("non-JSON line {line:?}: {err}"));
+        if value["type"] == "excluded_from_context" {
+            saw_excluded = true;
+            assert_eq!(value["data"]["command"], "echo secret");
+            assert!(
+                value["data"]["note"]
+                    .as_str()
+                    .is_some_and(|note| note.contains("F01-bang")),
+                "wire event should name the gating sibling so RPC callers can key off it; got: {value:?}"
+            );
+        }
+    }
+    assert!(
+        saw_excluded,
+        "expected a single `excluded_from_context` event for the !! prompt; raw stdout: {stdout_text:?}"
+    );
+    assert_eq!(
+        provider.captured_request_count(),
+        0,
+        "no normal prompts were queued, so the provider must never be called",
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn pump_prompts_runs_normal_prompts_unchanged_when_no_bang_bang_present() {
+    // Guardrail: the new pump_prompts helper must be a drop-in for the
+    // pre-F07 loop when nothing is suppressed. Two ordinary prompts
+    // should consume two scripted responses, in order, and surface both
+    // assistant tokens on stdout.
+    let root = temp_dir("pump-prompts-normal");
+
+    let provider = Arc::new(PrintModeScriptedProvider::new(vec![
+        vec![
+            squeezy_llm::LlmEvent::Started,
+            squeezy_llm::LlmEvent::TextDelta("first ".to_string()),
+            squeezy_llm::LlmEvent::completed(
+                Some("resp_a".to_string()),
+                squeezy_core::CostSnapshot::default(),
+            ),
+        ],
+        vec![
+            squeezy_llm::LlmEvent::Started,
+            squeezy_llm::LlmEvent::TextDelta("second".to_string()),
+            squeezy_llm::LlmEvent::completed(
+                Some("resp_b".to_string()),
+                squeezy_core::CostSnapshot::default(),
+            ),
+        ],
+    ]));
+    let config = print_mode_test_config(root.clone());
+    let agent = Agent::new(config, provider.clone());
+    let prompts = vec![
+        print_mode::PromptInput {
+            content: "first prompt".to_string(),
+            exclude_from_context: false,
+        },
+        print_mode::PromptInput {
+            content: "second prompt".to_string(),
+            exclude_from_context: false,
+        },
+    ];
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    pump_prompts(
+        &agent,
+        prompts,
+        PromptFormat::Default,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("pump completes");
+
+    let stdout_text = String::from_utf8(stdout).expect("utf-8 stdout");
+    assert!(
+        stdout_text.contains("first "),
+        "stdout should carry the first turn's text; got: {stdout_text:?}"
+    );
+    assert!(
+        stdout_text.contains("second"),
+        "stdout should carry the second turn's text; got: {stdout_text:?}"
+    );
+    assert_eq!(
+        provider.captured_request_count(),
+        2,
+        "both non-! prompts should have driven the provider exactly once each",
+    );
+
+    let _ = fs::remove_dir_all(&root);
 }

@@ -15,6 +15,57 @@ use std::{
 
 use squeezy_core::SqueezyError;
 
+/// Resolved print-mode prompt body plus the per-prompt exclude-from-context
+/// flag derived from the `!!` prefix.
+///
+/// The double-bang escape mirrors pi's interactive-mode UX — see
+/// `packages/coding-agent/src/modes/interactive/interactive-mode.ts:5435-5500`
+/// (`handleBashCommand(command, excludeFromContext = true)`) — and the RPC
+/// `bash` command's `excludeFromContext` field
+/// (`packages/coding-agent/src/modes/rpc/rpc-types.ts:52`). Print mode is the
+/// CLI sibling: the user can run `squeezy --prompt "!!cmd"` to get the same
+/// "execute but do not feed the output back into the LLM transcript"
+/// semantic that the TUI bang-bang shortcut will eventually offer.
+///
+/// Today the runtime that actually executes `cmd` lives behind the
+/// F01-exclude-from-context-bang-bang sibling work; until that lands, the
+/// parser still recognises the prefix here and the print-mode pump
+/// announces the deferral instead of forwarding `!!cmd` verbatim into the
+/// agent transcript. That keeps the flag's user-visible promise — "this
+/// prompt does not pollute the conversation context" — intact even on the
+/// minimum surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptInput {
+    pub content: String,
+    pub exclude_from_context: bool,
+}
+
+/// Strip the optional `!!` exclude-from-context prefix from a resolved
+/// prompt body and return a structured input that captures both the
+/// content and the flag.
+///
+/// Detection is intentionally narrow: only a literal `"!!"` at the very
+/// start of the resolved prompt counts. A single leading `!` is **not**
+/// recognised — that's pi's "include-in-context" bash escape, which
+/// Squeezy does not yet expose as a top-level shortcut and which would
+/// otherwise collide with prompts that legitimately begin with an
+/// exclamation mark (e.g. "!important: …"). Whitespace before the
+/// double-bang is preserved as content so callers can't accidentally
+/// hide the prefix behind a leading newline.
+pub(crate) fn classify_prompt(content: String) -> PromptInput {
+    if let Some(rest) = content.strip_prefix("!!") {
+        PromptInput {
+            content: rest.to_string(),
+            exclude_from_context: true,
+        }
+    } else {
+        PromptInput {
+            content,
+            exclude_from_context: false,
+        }
+    }
+}
+
 /// Resolve repeated `--prompt` values plus any piped stdin into the
 /// ordered list of prompts that print mode should dispatch.
 ///
