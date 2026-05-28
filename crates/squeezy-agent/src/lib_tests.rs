@@ -1970,6 +1970,180 @@ async fn bang_command_completes_locally_without_provider_request() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn local_shell_command_parses_single_and_double_bang_prefixes() {
+    let single = local_shell_command("!ls").expect("`!ls` parses as a local shell command");
+    assert_eq!(single.command, "ls");
+    assert!(
+        !single.exclude_from_context,
+        "single-bang must keep the exchange in LLM context",
+    );
+
+    let single_with_lead =
+        local_shell_command("   !git status   ").expect("leading/trailing whitespace ok");
+    assert_eq!(single_with_lead.command, "git status");
+    assert!(!single_with_lead.exclude_from_context);
+
+    let double = local_shell_command("!!git status").expect("`!!git status` is a quiet bang");
+    assert_eq!(double.command, "git status");
+    assert!(
+        double.exclude_from_context,
+        "double-bang must skip the LLM context",
+    );
+
+    let double_with_lead =
+        local_shell_command("  !!  echo hi ").expect("leading/inner whitespace ok");
+    assert_eq!(double_with_lead.command, "echo hi");
+    assert!(double_with_lead.exclude_from_context);
+
+    assert!(local_shell_command("ls").is_none(), "no bang prefix");
+    assert!(local_shell_command("!").is_none(), "bare bang");
+    assert!(local_shell_command("!!").is_none(), "bare double bang");
+    assert!(
+        local_shell_command("!!  ").is_none(),
+        "double bang with no command",
+    );
+    assert!(
+        local_shell_command("!ls\nrm -rf /").is_none(),
+        "multi-line prompts are not local shell commands",
+    );
+}
+
+#[tokio::test]
+async fn double_bang_command_runs_locally_and_skips_llm_context() {
+    let root = temp_workspace("agent_local_double_bang");
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("write cargo");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("acknowledged".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+
+    // Quiet bang still runs through the shell tool and renders in the TUI…
+    let mut quiet_rx = agent.start_turn("!!ls".to_string(), CancellationToken::new());
+    let mut quiet_tool_result = None;
+    let mut quiet_completed = None;
+    while let Some(event) = quiet_rx.recv().await {
+        match event {
+            AgentEvent::ToolCallCompleted { result, .. } => quiet_tool_result = Some(result),
+            AgentEvent::Completed { message, .. } => quiet_completed = Some(message.content),
+            _ => {}
+        }
+    }
+    let quiet_tool_result =
+        quiet_tool_result.expect("!!ls should still execute the shell tool locally");
+    assert_eq!(quiet_tool_result.status, ToolStatus::Success);
+    assert_eq!(
+        quiet_tool_result.content["policy"]["direct_user_shell"], true,
+        "double-bang must keep the direct-user-shell sandbox bypass",
+    );
+    assert!(
+        quiet_completed
+            .as_deref()
+            .is_some_and(|text| text.contains("Cargo.toml")),
+        "!!ls output must still surface in the TUI transcript: {quiet_completed:?}",
+    );
+    assert!(
+        provider.requests().is_empty(),
+        "!!ls must not trigger an LLM round itself",
+    );
+
+    // …but the next LLM turn must not replay the quiet exchange.
+    let mut llm_rx = agent.start_turn("summarise".to_string(), CancellationToken::new());
+    while llm_rx.recv().await.is_some() {}
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "follow-up turn should hit the provider");
+    let input_texts: Vec<&str> = requests[0]
+        .input
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::UserText(text) | LlmInputItem::AssistantText(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        input_texts.contains(&"summarise"),
+        "follow-up user prompt must reach the LLM: {input_texts:?}",
+    );
+    assert!(
+        input_texts.iter().all(|text| !text.contains("!!ls")),
+        "double-bang prompt must not appear in the LLM input: {input_texts:?}",
+    );
+    assert!(
+        input_texts.iter().all(|text| !text.contains("Cargo.toml")),
+        "double-bang shell output must not appear in the LLM input: {input_texts:?}",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn single_bang_command_records_exchange_in_llm_context() {
+    let root = temp_workspace("agent_local_single_bang_context");
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("write cargo");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+
+    let mut bang_rx = agent.start_turn("!ls".to_string(), CancellationToken::new());
+    while bang_rx.recv().await.is_some() {}
+    assert!(
+        provider.requests().is_empty(),
+        "single-bang itself does not call the model",
+    );
+
+    let mut next_rx = agent.start_turn("recap".to_string(), CancellationToken::new());
+    while next_rx.recv().await.is_some() {}
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let input_texts: Vec<&str> = requests[0]
+        .input
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::UserText(text) | LlmInputItem::AssistantText(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        input_texts.contains(&"!ls"),
+        "single-bang prompt must be replayed in the LLM input: {input_texts:?}",
+    );
+    assert!(
+        input_texts.iter().any(|text| text.contains("Cargo.toml")),
+        "single-bang shell output must be replayed in the LLM input: {input_texts:?}",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn natural_language_run_ls_phrase_goes_to_provider() {
     let root = temp_workspace("agent_natural_run_ls");

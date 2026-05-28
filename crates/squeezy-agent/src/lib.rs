@@ -2821,12 +2821,13 @@ impl Agent {
                 {
                     return;
                 }
-                if let Some(call) = local_shell_command_call(&task_title) {
+                if let Some((call, exclude_from_context)) = local_shell_command_call(&task_title) {
                     complete_local_tool_turn(
                         turn_id,
                         task_title,
                         call,
                         redacted_input.redactions,
+                        exclude_from_context,
                         LocalToolTurnDeps {
                             tx: tx.clone(),
                             provider: provider.clone(),
@@ -3423,6 +3424,7 @@ async fn complete_local_tool_turn(
     task_title: String,
     call: ToolCall,
     seed_redactions: u64,
+    exclude_from_context: bool,
     deps: LocalToolTurnDeps,
 ) {
     let LocalToolTurnDeps {
@@ -3549,10 +3551,16 @@ async fn complete_local_tool_turn(
 
     {
         let mut state = conversation_state.lock().await;
-        state.conversation.push(user_item);
-        state
-            .conversation
-            .push(LlmInputItem::AssistantText(message.content.clone()));
+        // `!!cmd` (exclude_from_context) keeps the exchange visible in the
+        // TUI transcript and the durable session log, but skips the
+        // LLM-facing `conversation` so the next model round will not
+        // replay the ad-hoc check (mirrors pi's `!!` head-commit feature).
+        if !exclude_from_context {
+            state.conversation.push(user_item);
+            state
+                .conversation
+                .push(LlmInputItem::AssistantText(message.content.clone()));
+        }
         state.transcript.push(user_transcript);
         state.transcript.push(message.clone());
         merge_cost(&mut state.cost, &cost);
@@ -3652,9 +3660,22 @@ fn refresh_mcp_tools_in_background(
     });
 }
 
-fn local_shell_command_call(input: &str) -> Option<ToolCall> {
-    let command = local_shell_command(input)?;
-    Some(ToolCall {
+/// Parsed `!cmd` or `!!cmd` prompt. The second form runs identically to the
+/// first (same direct-user shell call, same sandbox bypass) but its
+/// transcript and tool output are kept out of the LLM-facing
+/// `conversation` so ad-hoc checks like `!!git status` do not bloat
+/// future requests or the prompt cache.
+struct LocalShellCommand {
+    command: String,
+    exclude_from_context: bool,
+}
+
+fn local_shell_command_call(input: &str) -> Option<(ToolCall, bool)> {
+    let LocalShellCommand {
+        command,
+        exclude_from_context,
+    } = local_shell_command(input)?;
+    let call = ToolCall {
         call_id: "local-shell-1".to_string(),
         name: "shell".to_string(),
         arguments: json!({
@@ -3670,15 +3691,25 @@ fn local_shell_command_call(input: &str) -> Option<ToolCall> {
             // toggling `direct_user_shell` alone.
             "direct_user_shell_nonce": squeezy_tools::direct_user_shell_nonce(),
         }),
-    })
+    };
+    Some((call, exclude_from_context))
 }
 
-fn local_shell_command(input: &str) -> Option<String> {
+fn local_shell_command(input: &str) -> Option<LocalShellCommand> {
     let trimmed = input.trim();
     if trimmed.is_empty() || trimmed.lines().count() > 1 {
         return None;
     }
-    trimmed.strip_prefix('!').and_then(nonempty_shell_command)
+    let after_first = trimmed.strip_prefix('!')?;
+    let (rest, exclude_from_context) = match after_first.strip_prefix('!') {
+        Some(stripped) => (stripped, true),
+        None => (after_first, false),
+    };
+    let command = nonempty_shell_command(rest)?;
+    Some(LocalShellCommand {
+        command,
+        exclude_from_context,
+    })
 }
 
 fn nonempty_shell_command(command: &str) -> Option<String> {
