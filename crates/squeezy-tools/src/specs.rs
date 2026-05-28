@@ -262,18 +262,22 @@ pub(crate) fn read_tool_output_spec() -> ToolSpec {
     ToolSpec {
         name: "read_tool_output".to_string(),
         description:
-            "Read a bounded byte range from a spilled tool-output handle returned by another tool."
+            "Read a bounded byte range from a spilled tool-output. Pass exactly one of `handle` (sha256 minted when a generic tool result overflows the spill threshold) or `path` (per-session spillover tempfile minted by the shell tool when its raw stdout/stderr exceeds the truncation budget)."
                 .to_string(),
         capability: PermissionCapability::Read,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "handle": {"type": "string", "description": "Tool output handle from a spilled result."},
+                "handle": {"type": "string", "description": "Tool output handle from a spilled generic-tool result."},
+                "path": {"type": "string", "description": "Absolute path to a shell spillover tempfile under $TMPDIR/squeezy-spillover/<session>/. Must be the path returned by an earlier shell result; arbitrary filesystem paths are rejected."},
                 "offset": {"type": "integer", "minimum": 0, "description": "Byte offset to start reading from."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LIMIT, "description": "Maximum bytes to return."}
             },
-            "required": ["handle"]
+            "oneOf": [
+                {"required": ["handle"]},
+                {"required": ["path"]}
+            ]
         }),
     }
 }

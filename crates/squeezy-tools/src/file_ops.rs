@@ -88,7 +88,15 @@ pub(crate) struct ReadFileArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadToolOutputArgs {
-    pub(crate) handle: String,
+    /// sha256-keyed handle minted by [`ToolOutputStore::maybe_spill`] for
+    /// any oversized tool result. Mutually exclusive with `path`.
+    pub(crate) handle: Option<String>,
+    /// Spillover tempfile path minted by the shell tool when its
+    /// in-memory output overflows the truncation budget. Must point
+    /// inside the per-session spillover directory; arbitrary
+    /// filesystem locations are rejected. Mutually exclusive with
+    /// `handle`.
+    pub(crate) path: Option<String>,
     offset: Option<usize>,
     limit: Option<usize>,
 }
@@ -569,11 +577,30 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
-        let output = match self.output_store.read(
-            &args.handle,
-            args.offset.unwrap_or(0),
-            args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT),
-        ) {
+        let offset = args.offset.unwrap_or(0);
+        let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT);
+        match (args.handle.as_deref(), args.path.as_deref()) {
+            (Some(handle), None) => self.read_tool_output_by_handle(call, handle, offset, limit),
+            (None, Some(path)) => self.read_tool_output_by_path(call, path, offset, limit),
+            (Some(_), Some(_)) => tool_error(
+                call,
+                "invalid tool arguments: read_tool_output accepts exactly one of `handle` or `path`",
+            ),
+            (None, None) => tool_error(
+                call,
+                "invalid tool arguments: read_tool_output requires either `handle` or `path`",
+            ),
+        }
+    }
+
+    fn read_tool_output_by_handle(
+        &self,
+        call: &ToolCall,
+        handle: &str,
+        offset: usize,
+        limit: usize,
+    ) -> ToolResult {
+        let output = match self.output_store.read(handle, offset, limit) {
             Ok(output) => output,
             Err(err) => return tool_error(call, err),
         };
@@ -588,7 +615,41 @@ impl ToolRegistry {
             call,
             ToolStatus::Success,
             json!({
-                "handle": args.handle,
+                "handle": handle,
+                "offset": output.offset,
+                "bytes_returned": output.bytes_returned,
+                "total_bytes": output.total_bytes,
+                "sha256": output.sha256,
+                "truncated": output.truncated,
+                "content": output.content,
+            }),
+            cost,
+            None,
+        )
+    }
+
+    fn read_tool_output_by_path(
+        &self,
+        call: &ToolCall,
+        path: &str,
+        offset: usize,
+        limit: usize,
+    ) -> ToolResult {
+        let output = match self.shell_spillover.read_range(path, offset, limit) {
+            Ok(output) => output,
+            Err(err) => return tool_error(call, err),
+        };
+        let cost = ToolCostHint {
+            bytes_read: output.bytes_returned as u64,
+            output_bytes: output.content.len() as u64,
+            truncated: output.truncated,
+            ..ToolCostHint::default()
+        };
+        make_result(
+            call,
+            ToolStatus::Success,
+            json!({
+                "path": output.path.to_string_lossy(),
                 "offset": output.offset,
                 "bytes_returned": output.bytes_returned,
                 "total_bytes": output.total_bytes,

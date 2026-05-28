@@ -57,6 +57,7 @@ mod shell_output;
 mod shell_parse;
 mod shell_program;
 mod shell_sandbox;
+mod shell_spillover;
 mod specs;
 mod truncate;
 mod web;
@@ -656,6 +657,7 @@ impl ToolResult {
 pub struct ToolRegistry {
     pub(crate) root: Arc<PathBuf>,
     pub(crate) output_store: Arc<ToolOutputStore>,
+    pub(crate) shell_spillover: Arc<shell_spillover::ShellSpilloverStore>,
     pub(crate) web_config: Arc<WebToolConfig>,
     pub(crate) http: Arc<dyn WebHttpClient>,
     pub(crate) graph: Arc<StdMutex<Option<GraphManager>>>,
@@ -954,6 +956,7 @@ impl ToolRegistry {
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
+            shell_spillover: Arc::new(shell_spillover::ShellSpilloverStore::new()),
             web_config: Arc::new(config.web.normalized()),
             http,
             graph: Arc::new(StdMutex::new(graph)),
@@ -1000,6 +1003,7 @@ impl ToolRegistry {
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
+            shell_spillover: Arc::new(shell_spillover::ShellSpilloverStore::new()),
             web_config: Arc::new(web_config.normalized()),
             http,
             graph: Arc::new(StdMutex::new(graph)),
@@ -1861,11 +1865,13 @@ impl ToolRegistry {
             "read_tool_output" => {
                 let args =
                     serde_json::from_value::<ReadToolOutputArgs>(call.arguments.clone()).ok();
-                let handle = args
-                    .as_ref()
-                    .map(|args| args.handle.as_str())
-                    .unwrap_or("?");
-                format!("read_tool_output handle={handle:?}")
+                let handle = args.as_ref().and_then(|args| args.handle.as_deref());
+                let path = args.as_ref().and_then(|args| args.path.as_deref());
+                match (handle, path) {
+                    (Some(handle), _) => format!("read_tool_output handle={handle:?}"),
+                    (None, Some(path)) => format!("read_tool_output path={path:?}"),
+                    (None, None) => "read_tool_output target=?".to_string(),
+                }
             }
             "symbol_context" => {
                 let args = serde_json::from_value::<SymbolContextArgs>(call.arguments.clone()).ok();

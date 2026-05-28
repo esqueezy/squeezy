@@ -5092,6 +5092,242 @@ async fn shaped_shell_spill_handle_reads_raw_unshaped_output() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn shell_truncation_spills_full_output_to_tempfile_and_round_trips_via_read_tool_output() {
+    let root = temp_workspace("shell_truncation_tempfile_spill");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    // 200000 bytes of `x\n` capped at 4096 ensures the captured raw
+    // stream both fills the entire byte budget and ALSO drops bytes
+    // past the cap, i.e. the path that the F01 spillover-to-tempfile
+    // finding is asked to preserve.
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_spillover".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "yes x | head -c 200000",
+                    "output_byte_cap": 4096,
+                    "description": "exercise tempfile spillover"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["truncated"], true);
+    let spillover = result
+        .content
+        .get("spillover")
+        .expect("truncated shell result must carry spillover metadata");
+    let spill_path = spillover["path"].as_str().expect("spillover.path");
+    let spill_bytes = spillover["bytes"]
+        .as_u64()
+        .expect("spillover.bytes must be numeric");
+    assert!(spill_bytes > 0, "spillover must record non-zero bytes");
+
+    let shaped_stdout = result.content["stdout"].as_str().expect("stdout");
+    let expected_footer = format!("[truncated; full output: {spill_path} ({spill_bytes} bytes)]");
+    assert!(
+        shaped_stdout.contains(&expected_footer),
+        "shaped stdout must surface the spillover path footer; got: {shaped_stdout:?}",
+    );
+
+    // Path must live under $TMPDIR/squeezy-spillover/<session>/.
+    let tmp_base = std::env::temp_dir().join("squeezy-spillover");
+    let tmp_canon = tmp_base.canonicalize().expect("canonical tempdir base");
+    let spill_canon = PathBuf::from(spill_path)
+        .canonicalize()
+        .expect("canonical spillover path");
+    assert!(
+        spill_canon.starts_with(&tmp_canon),
+        "spillover path {spill_path:?} must live under {tmp_base:?}",
+    );
+
+    // Roundtrip the spillover via read_tool_output { path }.
+    let fetched = registry
+        .execute(
+            ToolCall {
+                call_id: "call_read_spillover".to_string(),
+                name: "read_tool_output".to_string(),
+                arguments: json!({
+                    "path": spill_path,
+                    "offset": 0,
+                    "limit": spill_bytes as usize,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(fetched.status, ToolStatus::Success);
+    assert_eq!(fetched.content["bytes_returned"], spill_bytes);
+    assert_eq!(fetched.content["total_bytes"], spill_bytes);
+    let content = fetched.content["content"].as_str().expect("content");
+    let on_disk_bytes = fs::read(spill_path).expect("spillover file readable");
+    assert_eq!(
+        content.as_bytes(),
+        on_disk_bytes.as_slice(),
+        "read_tool_output content must match the spillover file byte-for-byte",
+    );
+    let raw_captured = result.content.get("output_shape").and_then(|shape| {
+        shape
+            .get("raw_stdout_bytes")
+            .and_then(serde_json::Value::as_u64)
+    });
+    if let Some(raw_bytes) = raw_captured {
+        assert_eq!(
+            content.len() as u64,
+            raw_bytes,
+            "spillover size must match the raw captured stdout (stderr is empty for `yes` output)",
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_truncation_records_spillover_path_under_session_dir_for_raw_output_mode() {
+    let root = temp_workspace("shell_truncation_raw_mode_spill");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_raw_spill".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf 'A%.0s' $(seq 1 4096)",
+                    "output_byte_cap": 256,
+                    "output_mode": "raw",
+                    "description": "raw spillover sanity"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["truncated"], true);
+    let spillover = result
+        .content
+        .get("spillover")
+        .expect("raw-mode truncation must also surface a spillover path");
+    let spill_path = spillover["path"].as_str().expect("spillover.path");
+    assert!(
+        PathBuf::from(spill_path).is_file(),
+        "spillover file must exist on disk: {spill_path:?}",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_non_truncated_runs_do_not_spill_to_tempfile() {
+    let root = temp_workspace("shell_no_spill_on_clean_run");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_clean".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf 'hello\\n'",
+                    "description": "tiny output that fits"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["truncated"], false);
+    assert!(
+        result.content.get("spillover").is_none(),
+        "spillover field must be absent when truncation did not fire: {:?}",
+        result.content,
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_tool_output_rejects_spillover_paths_outside_the_session_dir() {
+    let root = temp_workspace("read_tool_output_path_safety");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let outside = root.join("not-a-spillover.txt");
+    fs::write(&outside, b"forbidden bytes").expect("write outside file");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_escape".to_string(),
+                name: "read_tool_output".to_string(),
+                arguments: json!({
+                    "path": outside.to_string_lossy(),
+                    "offset": 0,
+                    "limit": 16,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Error);
+    let err = result.content["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("outside the session directory") || err.contains("not found"),
+        "expected path-safety rejection, got: {err}",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_tool_output_rejects_calls_with_both_handle_and_path() {
+    let root = temp_workspace("read_tool_output_arg_validation");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_both".to_string(),
+                name: "read_tool_output".to_string(),
+                arguments: json!({
+                    "handle": "a".repeat(64),
+                    "path": "/tmp/somewhere",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Error);
+    let err = result.content["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("exactly one of `handle` or `path`"),
+        "expected mutual-exclusion error, got: {err}",
+    );
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_neither".to_string(),
+                name: "read_tool_output".to_string(),
+                arguments: json!({"offset": 0, "limit": 16}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Error);
+    let err = result.content["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("requires either `handle` or `path`"),
+        "expected missing-arg error, got: {err}",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn shell_call_description_summary_carries_only_description() {
     // The shell `describe_call` summary intentionally surfaces ONLY the
