@@ -399,11 +399,15 @@ fn active_skill_render_respects_budget_and_uses_stub() {
         &[],
         &"Use the graph carefully. ".repeat(200),
     );
+    // Inline mode is the only render path that can produce a budget
+    // stub; the metadata-only default never emits the skill body so
+    // there's nothing to truncate.
     let config = SkillsConfig {
         user_dir: root.join("user"),
         compat_user_dir: root.join("compat"),
         active_budget_chars: 700,
         active_body_cap_chars: 100,
+        inline: true,
         ..Default::default()
     };
 
@@ -418,6 +422,134 @@ fn active_skill_render_respects_budget_and_uses_stub() {
     assert!(rendered.chars().count() <= config.active_budget_chars);
     assert!(rendered.contains("truncated=\"true\""));
     assert!(rendered.contains("load_skill"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn active_skills_default_to_metadata_only_render() {
+    // Snapshot the active-skills block in the default (metadata-only)
+    // render mode and assert: (a) every skill appears as a metadata
+    // block, (b) no skill body leaks into the system prompt, (c) the
+    // model is pointed at `load_skill` for each name. This is the
+    // F03-skill-metadata-only-default contract: bodies are paid for
+    // only when the model explicitly fetches them.
+    let root = temp_workspace("skills_metadata_only_render");
+    let skills = [
+        (
+            "alpha-nav",
+            "Alpha skill description",
+            "ALPHA_BODY_MARKER must never appear in the system prompt by default.",
+        ),
+        (
+            "beta-nav",
+            "Beta skill description",
+            "BETA_BODY_MARKER must never appear in the system prompt by default.",
+        ),
+        (
+            "gamma-nav",
+            "Gamma skill description",
+            "GAMMA_BODY_MARKER must never appear in the system prompt by default.",
+        ),
+    ];
+    for (name, description, body) in &skills {
+        write_skill_with_body(
+            &root.join(".squeezy/skills").join(name),
+            name,
+            description,
+            &[],
+            body,
+        );
+    }
+
+    // Default mode: `inline` is not set, so the catalog must emit
+    // metadata-only blocks.
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        active_budget_chars: 16_000,
+        active_body_cap_chars: 16_000,
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+    let loaded = skills
+        .iter()
+        .map(|(name, _, _)| catalog.load(name).expect("load"))
+        .collect::<Vec<_>>();
+    let rendered = catalog
+        .render_active_skills(&loaded)
+        .expect("metadata-only render");
+
+    // Outer wrapper and per-skill name attributes are present.
+    assert!(
+        rendered.starts_with("<active_skills>"),
+        "missing <active_skills> wrapper: {rendered}"
+    );
+    assert!(
+        rendered.ends_with("</active_skills>"),
+        "missing </active_skills> wrapper: {rendered}"
+    );
+    for (name, description, body) in &skills {
+        assert!(
+            rendered.contains(&format!("name=\"{name}\"")),
+            "missing skill metadata for {name}: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("<description>{description}</description>")),
+            "missing description for {name}: {rendered}"
+        );
+        // The body must NOT appear; the model is expected to fetch it
+        // via the `load_skill` tool when needed.
+        assert!(
+            !rendered.contains(body),
+            "body marker for {name} leaked into metadata-only render: {rendered}"
+        );
+        // Instruction text references the same skill name (escaped by
+        // `xml_escape`, so quotes become `&quot;`).
+        assert!(
+            rendered.contains(&format!("name &quot;{name}&quot;")),
+            "missing load_skill instruction for {name}: {rendered}"
+        );
+    }
+    // The metadata mode marker keeps the body explicitly absent rather
+    // than relying on a truncation reason borrowed from the inline path.
+    assert!(
+        rendered.contains("body=\"omitted\""),
+        "metadata-only mode must flag bodies as omitted: {rendered}"
+    );
+    assert!(
+        !rendered.contains("<content>"),
+        "metadata-only mode must not emit any <content> body slot: {rendered}"
+    );
+    assert!(
+        rendered.contains("load_skill"),
+        "metadata-only mode must instruct the model to call load_skill: {rendered}"
+    );
+
+    // Flip the knob: with `[skills] inline = true` the legacy render
+    // must re-inline each body verbatim.
+    let inline_config = SkillsConfig {
+        inline: true,
+        ..config.clone()
+    };
+    let inline_catalog = SkillCatalog::discover(&root, &inline_config);
+    let inline_loaded = skills
+        .iter()
+        .map(|(name, _, _)| inline_catalog.load(name).expect("load"))
+        .collect::<Vec<_>>();
+    let inline_rendered = inline_catalog
+        .render_active_skills(&inline_loaded)
+        .expect("inline render");
+    for (_, _, body) in &skills {
+        assert!(
+            inline_rendered.contains(body),
+            "inline mode must keep injecting bodies: {inline_rendered}"
+        );
+    }
+    assert!(
+        inline_rendered.contains("<content>"),
+        "inline mode must keep emitting <content>: {inline_rendered}"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -448,7 +580,9 @@ fn active_skill_render_redistributes_descriptions_to_preserve_roster() {
     // Compute the minimum-stub floor at runtime so the test budget is robust
     // against temp-path length variation across hosts. The full-description
     // aggregate is the floor plus the description chars themselves — sit
-    // between the two so the redistribute step is required.
+    // between the two so the redistribute step is required. The
+    // redistribute path is inline-mode only; the metadata-only default
+    // never falls back to per-skill description budgeting.
     let catalog = SkillCatalog::discover(
         &root,
         &SkillsConfig {
@@ -456,6 +590,7 @@ fn active_skill_render_redistributes_descriptions_to_preserve_roster() {
             compat_user_dir: root.join("compat"),
             active_budget_chars: usize::MAX,
             active_body_cap_chars: 100,
+            inline: true,
             ..Default::default()
         },
     );
@@ -484,6 +619,7 @@ fn active_skill_render_redistributes_descriptions_to_preserve_roster() {
         compat_user_dir: root.join("compat"),
         active_budget_chars,
         active_body_cap_chars: 100,
+        inline: true,
         ..Default::default()
     };
 
@@ -1141,13 +1277,16 @@ fn discover_applies_context_percent_budget_to_catalog() {
         &"x".repeat(20_000),
     );
     // 32K-token model gets a 2_560-char active budget; the 20K-char body
-    // can't fit so the catalog should emit a stub.
+    // can't fit so the catalog should emit a stub. The inline-mode opt
+    // in keeps this test exercising the legacy body+stub path; the
+    // metadata-only default never emits the body in the first place.
     let config = SkillsConfig {
         user_dir: root.join("user"),
         compat_user_dir: root.join("compat"),
         active_body_cap_chars: 64_000,
         active_budget_mode: SkillsBudgetMode::ContextPercent { percent: 2.0 },
         model_context_window: Some(32_000),
+        inline: true,
         ..Default::default()
     };
 
