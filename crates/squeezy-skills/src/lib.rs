@@ -1283,9 +1283,9 @@ impl HookHandler for SkillHookHandler {
         if ctx.event != self.event {
             return HookResult::allow();
         }
+        let payload_json = ctx.payload_json();
         if let Some(needle) = self.matcher.as_deref() {
-            let tool = ctx
-                .payload
+            let tool = payload_json
                 .get("tool_name")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
@@ -1303,7 +1303,8 @@ impl HookHandler for SkillHookHandler {
         }
 
         // Resolve the command path against the skill's base_dir when
-        // relative. The payload is piped on stdin as JSON, matching the
+        // relative. The payload is piped through `SQUEEZY_HOOK_PAYLOAD`
+        // as JSON projected from the typed `HookPayload`, matching the
         // hook-engine contract documented on `HookContext`.
         let trimmed = self.spec.command.trim();
         if trimmed.is_empty() {
@@ -1314,7 +1315,7 @@ impl HookHandler for SkillHookHandler {
             );
             return HookResult::allow();
         }
-        let payload = ctx.payload.to_string();
+        let payload = payload_json.to_string();
         let mut command = Command::new("sh");
         command
             .arg("-c")

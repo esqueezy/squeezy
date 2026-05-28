@@ -3732,7 +3732,7 @@ impl squeezy_hooks::HookHandler for CompactionHookRecorderRef {
                 self.0
                     .post_count
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                *self.0.last_post_payload.lock().unwrap() = Some(ctx.payload.clone());
+                *self.0.last_post_payload.lock().unwrap() = Some(ctx.payload_json());
             }
             _ => {}
         }
@@ -3851,19 +3851,12 @@ struct DenyToolByName {
 
 impl squeezy_hooks::HookHandler for DenyToolByName {
     fn handle(&self, ctx: &squeezy_hooks::HookContext) -> squeezy_hooks::HookResult {
-        if ctx.event != squeezy_hooks::HookEvent::PreToolUse {
-            return squeezy_hooks::HookResult::allow();
+        if let squeezy_hooks::HookPayload::PreToolUse { tool_name, .. } = &ctx.payload
+            && tool_name == self.tool_name
+        {
+            return squeezy_hooks::HookResult::deny(self.reason);
         }
-        let payload_name = ctx
-            .payload
-            .get("tool_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if payload_name == self.tool_name {
-            squeezy_hooks::HookResult::deny(self.reason)
-        } else {
-            squeezy_hooks::HookResult::allow()
-        }
+        squeezy_hooks::HookResult::allow()
     }
 }
 
@@ -4017,6 +4010,274 @@ async fn pretooluse_hook_allow_lets_tool_run() {
         ToolStatus::Success,
         "deny aimed at another tool must not block read_file: {:?}",
         read_result.content,
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Counts every `HookEvent` variant the registry observed. Used by
+/// the expanded-dispatch tests below to assert each new call site
+/// fires the documented variant without coupling to the per-variant
+/// typed payload fields (those are exercised in `squeezy-hooks`).
+struct EventCounter {
+    counts: std::sync::Mutex<BTreeMap<squeezy_hooks::HookEvent, usize>>,
+}
+
+impl EventCounter {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            counts: std::sync::Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    fn count(&self, event: squeezy_hooks::HookEvent) -> usize {
+        self.counts
+            .lock()
+            .unwrap()
+            .get(&event)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+struct EventCounterRef(Arc<EventCounter>);
+
+impl squeezy_hooks::HookHandler for EventCounterRef {
+    fn handle(&self, ctx: &squeezy_hooks::HookContext) -> squeezy_hooks::HookResult {
+        *self.0.counts.lock().unwrap().entry(ctx.event).or_insert(0) += 1;
+        squeezy_hooks::HookResult::allow()
+    }
+}
+
+/// End-to-end check that a clean tool-less turn fans out the new
+/// session-lifecycle hooks: `Setup` + `SessionStart` fire exactly
+/// once on the first turn (after hooks installed via
+/// [`Agent::set_hooks`]), `UserPromptSubmit` fires per turn, and
+/// `Stop` fires once the turn yields back to the user. Guards
+/// against future refactors regressing any of those four call sites
+/// silently.
+#[tokio::test]
+async fn session_lifecycle_hooks_fire_around_clean_turn() {
+    use squeezy_hooks::{HookEvent, HookRegistry};
+
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("hello".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("again".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+
+    let mut agent = Agent::new(AppConfig::default(), provider);
+    let counter = EventCounter::new();
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(EventCounterRef(counter.clone())));
+    agent.set_hooks(Some(Arc::new(registry)));
+
+    let mut rx = agent.start_turn("first turn".to_string(), CancellationToken::new());
+    while let Some(_event) = rx.recv().await {}
+
+    assert_eq!(
+        counter.count(HookEvent::Setup),
+        1,
+        "Setup must fire exactly once on the first turn after hooks install",
+    );
+    assert_eq!(
+        counter.count(HookEvent::SessionStart),
+        1,
+        "SessionStart must fire exactly once on the first turn",
+    );
+    assert_eq!(
+        counter.count(HookEvent::UserPromptSubmit),
+        1,
+        "UserPromptSubmit must fire once per turn",
+    );
+    assert_eq!(
+        counter.count(HookEvent::Stop),
+        1,
+        "Stop must fire once at the end of a clean turn",
+    );
+
+    let mut rx = agent.start_turn("second turn".to_string(), CancellationToken::new());
+    while let Some(_event) = rx.recv().await {}
+
+    assert_eq!(
+        counter.count(HookEvent::Setup),
+        1,
+        "Setup must not fire again on subsequent turns",
+    );
+    assert_eq!(
+        counter.count(HookEvent::SessionStart),
+        1,
+        "SessionStart must not fire again on subsequent turns",
+    );
+    assert_eq!(
+        counter.count(HookEvent::UserPromptSubmit),
+        2,
+        "UserPromptSubmit must fire per turn",
+    );
+    assert_eq!(counter.count(HookEvent::Stop), 2, "Stop must fire per turn",);
+}
+
+/// Verifies the post-tool dispatch sites: every tool call produces
+/// one `PostToolUse` and one `PostTool` event, and a failed tool
+/// status additionally fires `PostToolUseFailure` while leaving the
+/// "result was appended to the conversation" `PostTool` semantics
+/// untouched. The provider drives one happy-path read and a
+/// guaranteed failure (path that does not exist) so the same
+/// registry observes both shapes inside a single turn.
+#[tokio::test]
+async fn post_tool_and_failure_hooks_split_success_and_failure_paths() {
+    use squeezy_hooks::{HookEvent, HookRegistry};
+
+    let root = temp_workspace("post_tool_and_failure_hooks");
+    fs::write(root.join("README.md"), "hi\n").expect("write readme");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "ok_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+            })),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "fail_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "does-not-exist.txt" }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            read: PermissionMode::Allow,
+            ..Default::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut agent = Agent::new(config, provider);
+    let counter = EventCounter::new();
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(EventCounterRef(counter.clone())));
+    agent.set_hooks(Some(Arc::new(registry)));
+
+    let mut rx = agent.start_turn(
+        "read README and a missing file".to_string(),
+        CancellationToken::new(),
+    );
+    while let Some(_event) = rx.recv().await {}
+
+    assert_eq!(
+        counter.count(HookEvent::PostToolUse),
+        2,
+        "PostToolUse must fire for every tool call regardless of status",
+    );
+    assert_eq!(
+        counter.count(HookEvent::PostTool),
+        2,
+        "PostTool must fire once per FunctionCallOutput appended to the conversation",
+    );
+    assert_eq!(
+        counter.count(HookEvent::PostToolUseFailure),
+        1,
+        "PostToolUseFailure must fire exactly once, for the failed tool call",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// `PermissionRequest` must fire on every permission evaluation, and
+/// `PermissionDenied` must fire whenever the eventual decision is a
+/// deny. We deny via a deny-by-default permission policy so the
+/// evaluator short-circuits to `ApprovalDecision::Denied` without
+/// going through the user-approval round-trip.
+#[tokio::test]
+async fn permission_request_and_denied_hooks_fire_on_policy_deny() {
+    use squeezy_hooks::{HookEvent, HookRegistry};
+
+    let root = temp_workspace("permission_request_denied_hooks");
+    fs::write(root.join("README.md"), "hi\n").expect("write readme");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            read: PermissionMode::Deny,
+            ..Default::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut agent = Agent::new(config, provider);
+    let counter = EventCounter::new();
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(EventCounterRef(counter.clone())));
+    agent.set_hooks(Some(Arc::new(registry)));
+
+    let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
+    while let Some(_event) = rx.recv().await {}
+
+    assert!(
+        counter.count(HookEvent::PermissionRequest) >= 1,
+        "PermissionRequest must fire at least once before the policy evaluation runs",
+    );
+    assert!(
+        counter.count(HookEvent::PermissionDenied) >= 1,
+        "PermissionDenied must fire when the policy resolves the request as a deny",
     );
 
     let _ = fs::remove_dir_all(root);

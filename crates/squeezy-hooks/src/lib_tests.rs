@@ -13,7 +13,8 @@ impl HookHandler for NoopHandler {
 
 /// A handler that proposes a mutation. Used to verify that the
 /// dispatch contract propagates `mutate` back to the caller even
-/// though the agent does not yet apply mutations.
+/// though most legacy sites still treat the proposed mutation as
+/// advisory.
 struct MutatingHandler {
     replacement: Value,
 }
@@ -33,7 +34,9 @@ fn dispatch_preturn_with_noop_handler_returns_single_allow() {
     let mut registry = HookRegistry::new();
     registry.register(Box::new(NoopHandler));
 
-    let results = registry.dispatch(HookEvent::PreTurn, json!({ "turn_index": 0 }));
+    let results = registry.dispatch(HookPayload::PreTurn {
+        turn_id: "0".to_string(),
+    });
 
     assert_eq!(results.len(), 1);
     assert!(results[0].allow);
@@ -44,7 +47,9 @@ fn dispatch_preturn_with_noop_handler_returns_single_allow() {
 #[test]
 fn empty_registry_dispatches_to_no_handlers() {
     let registry = HookRegistry::new();
-    let results = registry.dispatch(HookEvent::PreTurn, json!({}));
+    let results = registry.dispatch(HookPayload::PreTurn {
+        turn_id: "0".to_string(),
+    });
     assert!(results.is_empty());
     assert!(registry.is_empty());
 }
@@ -53,14 +58,16 @@ fn empty_registry_dispatches_to_no_handlers() {
 fn handlers_can_propose_mutations_visible_to_callers() {
     let mut registry = HookRegistry::new();
     registry.register(Box::new(MutatingHandler {
-        replacement: json!({ "preamble": "extra instructions" }),
+        replacement: json!({ "extra_instructions": "Be terse." }),
     }));
 
-    let results = registry.dispatch(HookEvent::PreTurn, json!({ "turn_index": 1 }));
+    let results = registry.dispatch(HookPayload::PreTurn {
+        turn_id: "1".to_string(),
+    });
     assert_eq!(results.len(), 1);
     assert_eq!(
         results[0].mutate.as_ref().unwrap(),
-        &json!({ "preamble": "extra instructions" })
+        &json!({ "extra_instructions": "Be terse." })
     );
 }
 
@@ -100,19 +107,23 @@ fn dispatch_context_preserves_event_and_payload() {
     let mut registry = HookRegistry::new();
     registry.register(Box::new(RecorderRef(recorder.clone())));
 
-    let payload = json!({ "turn_index": 42 });
-    let _ = registry.dispatch(HookEvent::PreTurn, payload.clone());
+    let _ = registry.dispatch(HookPayload::PreTurn {
+        turn_id: "42".to_string(),
+    });
 
     let captured = recorder.seen.lock().unwrap().clone().expect("handler ran");
     assert_eq!(captured.event, HookEvent::PreTurn);
-    assert_eq!(captured.payload, payload);
+    match captured.payload {
+        HookPayload::PreTurn { turn_id } => assert_eq!(turn_id, "42"),
+        other => panic!("unexpected payload {other:?}"),
+    }
 }
 
 #[test]
 fn enum_variants_are_distinct() {
-    // Smoke test that every reserved variant survives the round trip
-    // through equality and the dispatch path. Cheap insurance against
-    // accidentally collapsing a variant during a future refactor.
+    // Smoke test that every variant survives the round trip through
+    // equality. Cheap insurance against accidentally collapsing a
+    // variant during a future refactor.
     let events = [
         HookEvent::PreTurn,
         HookEvent::PreToolUse,
@@ -138,10 +149,143 @@ fn enum_variants_are_distinct() {
 }
 
 #[test]
+fn payload_event_discriminant_matches_variant() {
+    let cases: Vec<(HookPayload, HookEvent)> = vec![
+        (
+            HookPayload::PreTurn {
+                turn_id: "1".into(),
+            },
+            HookEvent::PreTurn,
+        ),
+        (
+            HookPayload::PreToolUse {
+                turn_id: "1".into(),
+                tool_name: "read_file".into(),
+                call_id: "c".into(),
+            },
+            HookEvent::PreToolUse,
+        ),
+        (
+            HookPayload::PostToolUse {
+                turn_id: "1".into(),
+                tool_name: "read_file".into(),
+                call_id: "c".into(),
+                status: "success".into(),
+            },
+            HookEvent::PostToolUse,
+        ),
+        (
+            HookPayload::PostToolUseFailure {
+                turn_id: "1".into(),
+                tool_name: "read_file".into(),
+                call_id: "c".into(),
+                status: "error".into(),
+                error: Some("boom".into()),
+            },
+            HookEvent::PostToolUseFailure,
+        ),
+        (
+            HookPayload::PostTool {
+                turn_id: "1".into(),
+                tool_name: "read_file".into(),
+                call_id: "c".into(),
+                status: "success".into(),
+            },
+            HookEvent::PostTool,
+        ),
+        (
+            HookPayload::PreCompact {
+                turn_id: "1".into(),
+                before_tokens: 100,
+            },
+            HookEvent::PreCompact,
+        ),
+        (
+            HookPayload::PostCompact {
+                turn_id: "1".into(),
+                before_tokens: 100,
+                after_tokens: 50,
+            },
+            HookEvent::PostCompact,
+        ),
+        (
+            HookPayload::SubagentStart {
+                subagent_id: "s1".into(),
+                kind: "explore".into(),
+                parent_turn_id: "1".into(),
+            },
+            HookEvent::SubagentStart,
+        ),
+        (
+            HookPayload::SubagentStop {
+                subagent_id: "s1".into(),
+                kind: "explore".into(),
+                parent_turn_id: "1".into(),
+                status: "success".into(),
+            },
+            HookEvent::SubagentStop,
+        ),
+        (
+            HookPayload::PermissionRequest {
+                capability: "read".into(),
+                tool_name: "read_file".into(),
+                turn_id: "1".into(),
+                call_id: "c".into(),
+                target: None,
+            },
+            HookEvent::PermissionRequest,
+        ),
+        (
+            HookPayload::PermissionDenied {
+                capability: "read".into(),
+                tool_name: "read_file".into(),
+                turn_id: "1".into(),
+                call_id: "c".into(),
+                target: None,
+                reason: "policy".into(),
+            },
+            HookEvent::PermissionDenied,
+        ),
+        (
+            HookPayload::UserPromptSubmit {
+                prompt: "hello".into(),
+                turn_id: "1".into(),
+            },
+            HookEvent::UserPromptSubmit,
+        ),
+        (
+            HookPayload::SessionStart {
+                session_id: "s".into(),
+                reason: "boot".into(),
+            },
+            HookEvent::SessionStart,
+        ),
+        (
+            HookPayload::Stop {
+                turn_id: "1".into(),
+            },
+            HookEvent::Stop,
+        ),
+        (
+            HookPayload::Setup {
+                workspace: "/tmp/ws".into(),
+                reason: "boot".into(),
+            },
+            HookEvent::Setup,
+        ),
+    ];
+    for (payload, expected) in cases {
+        let ctx = HookContext::new(payload.clone());
+        assert_eq!(ctx.event, expected, "ctx.event mismatch for {payload:?}");
+        assert_eq!(payload.event(), expected, "payload.event() mismatch");
+    }
+}
+
+#[test]
 fn dispatch_pre_and_post_tool_use_round_trip_payloads() {
-    /// Captures each `(event, payload)` pair so the test can assert the
-    /// dispatcher forwarded both variants without dropping or
-    /// reordering payload keys.
+    /// Captures the JSON projection of each payload the handler sees
+    /// so the test can verify the dispatcher forwarded variants in
+    /// order without dropping fields.
     struct Recorder {
         seen: std::sync::Mutex<Vec<(HookEvent, Value)>>,
     }
@@ -151,7 +295,7 @@ fn dispatch_pre_and_post_tool_use_round_trip_payloads() {
             self.seen
                 .lock()
                 .unwrap()
-                .push((ctx.event, ctx.payload.clone()));
+                .push((ctx.event, ctx.payload_json()));
             HookResult::allow()
         }
     }
@@ -169,24 +313,26 @@ fn dispatch_pre_and_post_tool_use_round_trip_payloads() {
     let mut registry = HookRegistry::new();
     registry.register(Box::new(RecorderRef(recorder.clone())));
 
-    let pre_payload = json!({ "tool_name": "read_file", "call_id": "c1", "turn_id": "7" });
-    let post_payload = json!({
-        "tool_name": "read_file",
-        "call_id": "c1",
-        "turn_id": "7",
-        "status": "success"
+    let _ = registry.dispatch(HookPayload::PreToolUse {
+        turn_id: "7".to_string(),
+        tool_name: "read_file".to_string(),
+        call_id: "c1".to_string(),
     });
-    let _ = registry.dispatch(HookEvent::PreToolUse, pre_payload.clone());
-    let _ = registry.dispatch(HookEvent::PostToolUse, post_payload.clone());
+    let _ = registry.dispatch(HookPayload::PostToolUse {
+        turn_id: "7".to_string(),
+        tool_name: "read_file".to_string(),
+        call_id: "c1".to_string(),
+        status: "success".to_string(),
+    });
 
     let seen = recorder.seen.lock().unwrap().clone();
-    assert_eq!(
-        seen,
-        vec![
-            (HookEvent::PreToolUse, pre_payload),
-            (HookEvent::PostToolUse, post_payload),
-        ]
-    );
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].0, HookEvent::PreToolUse);
+    assert_eq!(seen[0].1["tool_name"], "read_file");
+    assert_eq!(seen[0].1["call_id"], "c1");
+    assert_eq!(seen[0].1["turn_id"], "7");
+    assert_eq!(seen[1].0, HookEvent::PostToolUse);
+    assert_eq!(seen[1].1["status"], "success");
 }
 
 mod agent_hook_tests {
@@ -374,7 +520,7 @@ mod agent_hook_tests {
             self.seen
                 .lock()
                 .unwrap()
-                .push((ctx.event, ctx.payload.clone()));
+                .push((ctx.event, ctx.payload_json()));
             HookResult::allow()
         }
     }
@@ -416,26 +562,16 @@ mod agent_hook_tests {
         let observed = seen.lock().unwrap().clone();
         assert_eq!(observed.len(), 3);
         assert_eq!(observed[0].0, HookEvent::PreTurn);
-        assert_eq!(observed[0].1, json!({ "turn_index": "turn-7" }));
+        assert_eq!(observed[0].1["turn_id"], "turn-7");
         assert_eq!(observed[1].0, HookEvent::PreToolUse);
-        assert_eq!(
-            observed[1].1,
-            json!({
-                "turn_id": "turn-7",
-                "tool_name": "read",
-                "call_id": "call-1",
-            })
-        );
+        assert_eq!(observed[1].1["turn_id"], "turn-7");
+        assert_eq!(observed[1].1["tool_name"], "read");
+        assert_eq!(observed[1].1["call_id"], "call-1");
         assert_eq!(observed[2].0, HookEvent::PostToolUse);
-        assert_eq!(
-            observed[2].1,
-            json!({
-                "turn_id": "turn-7",
-                "tool_name": "read",
-                "call_id": "call-1",
-                "status": "success",
-            })
-        );
+        assert_eq!(observed[2].1["turn_id"], "turn-7");
+        assert_eq!(observed[2].1["tool_name"], "read");
+        assert_eq!(observed[2].1["call_id"], "call-1");
+        assert_eq!(observed[2].1["status"], "success");
     }
 
     #[tokio::test]

@@ -2981,12 +2981,14 @@ async fn pre_and_post_tool_use_hooks_fire_around_each_tool_call() {
         "expected one PreToolUse and one PostToolUse for the single read_file call: {captured:?}"
     );
     assert_eq!(tool_events[0].event, HookEvent::PreToolUse);
-    assert_eq!(tool_events[0].payload["tool_name"], "read_file");
-    assert_eq!(tool_events[0].payload["call_id"], "read_call");
+    let pre = tool_events[0].payload_json();
+    assert_eq!(pre["tool_name"], "read_file");
+    assert_eq!(pre["call_id"], "read_call");
     assert_eq!(tool_events[1].event, HookEvent::PostToolUse);
-    assert_eq!(tool_events[1].payload["tool_name"], "read_file");
-    assert_eq!(tool_events[1].payload["call_id"], "read_call");
-    assert_eq!(tool_events[1].payload["status"], "success");
+    let post = tool_events[1].payload_json();
+    assert_eq!(post["tool_name"], "read_file");
+    assert_eq!(post["call_id"], "read_call");
+    assert_eq!(post["status"], "success");
 
     let _ = fs::remove_dir_all(root);
 }
