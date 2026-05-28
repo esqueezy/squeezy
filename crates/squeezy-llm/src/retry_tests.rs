@@ -12,8 +12,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    JITTER_FRACTION, RetryPolicy, apply_jitter, backoff, idle_timeout, jitter_sample,
-    parse_retry_after, send_with_auth_retry, send_with_retry, with_stream_retry,
+    JITTER_FRACTION, RetryPolicy, apply_jitter, backoff, idle_timeout, is_terminal_quota_error,
+    jitter_sample, parse_retry_after, send_with_auth_retry, send_with_retry, with_stream_retry,
 };
 use crate::credentials::{ApiKeyFuture, ApiKeySource};
 use crate::{LlmEvent, LlmStream};
@@ -715,5 +715,208 @@ async fn send_with_auth_retry_bubbles_up_persistent_401() {
         source.invalidate_calls(),
         1,
         "invalidate fires exactly once even when the refresh did not help"
+    );
+}
+
+// --- terminal quota classifier -------------------------------------------
+
+/// Spin a loopback TCP server that responds to each POST with a fixed
+/// `(status, body)` pair. Used to verify that `send_with_retry` reads the
+/// body, runs the terminal-quota classifier, and either short-circuits
+/// retries or falls through to the existing backoff path.
+async fn spawn_body_server(
+    responses: Vec<(u16, String)>,
+) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_clone = attempts.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let attempt = attempts_clone.fetch_add(1, Ordering::SeqCst);
+            let (status, body) = responses
+                .get(attempt)
+                .cloned()
+                .unwrap_or_else(|| responses.last().cloned().expect("non-empty response list"));
+
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+            let reason = match status {
+                200 => "OK",
+                429 => "Too Many Requests",
+                500 => "Internal Server Error",
+                _ => "Status",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    (addr, attempts)
+}
+
+fn quota_retry_policy() -> RetryPolicy {
+    // `max_retries` is intentionally generous so a regression that fails to
+    // short-circuit terminal quotas would manifest as many attempts and a
+    // long-running test rather than a silent pass.
+    RetryPolicy {
+        max_retries: 5,
+        base_delay: Duration::from_millis(1),
+        retry_429: true,
+        retry_5xx: false,
+        retry_transport: false,
+        max_retry_delay: Duration::from_secs(60),
+    }
+}
+
+#[tokio::test]
+async fn send_with_retry_skips_retry_on_anthropic_permission_error() {
+    // Anthropic returns "monthly usage limit reached" as a 429 wrapping a
+    // `permission_error` envelope. The retry layer must read the body, run
+    // the JSON-shape pass of the classifier, and surface the response to
+    // the caller without burning the rest of the attempt budget on sleeps.
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "permission_error",
+            "message": "Monthly usage limit reached"
+        }
+    })
+    .to_string();
+    let (addr, attempts) = spawn_body_server(vec![(429, body)]).await;
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_retry(quota_retry_policy(), &cancel, || client.post(&url))
+        .await
+        .expect("send");
+
+    assert_eq!(response.status().as_u16(), 429);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "Anthropic permission_error must short-circuit retries",
+    );
+    let body_text = response.text().await.expect("body");
+    assert!(
+        body_text.contains("permission_error"),
+        "reconstructed response must preserve the body so the provider error \
+         formatter can surface the upstream message (saw: {body_text:?})",
+    );
+}
+
+#[tokio::test]
+async fn send_with_retry_skips_retry_on_openai_insufficient_quota() {
+    // OpenAI 429s for billing exhaustion carry `code = "insufficient_quota"`
+    // in an error envelope. The classifier recognizes both the literal
+    // substring and the JSON shape; either match must skip retries.
+    let body = serde_json::json!({
+        "error": {
+            "message": "You exceeded your current quota, please check your plan.",
+            "type": "insufficient_quota",
+            "param": null,
+            "code": "insufficient_quota",
+        }
+    })
+    .to_string();
+    let (addr, attempts) = spawn_body_server(vec![(429, body)]).await;
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_retry(quota_retry_policy(), &cancel, || client.post(&url))
+        .await
+        .expect("send");
+
+    assert_eq!(response.status().as_u16(), 429);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "OpenAI insufficient_quota must short-circuit retries",
+    );
+}
+
+#[tokio::test]
+async fn send_with_retry_skips_retry_on_generic_monthly_usage_limit_body() {
+    // Some upstreams (and gateway shims) return a plain-text body with the
+    // marketing-friendly "Monthly usage limit reached" phrase instead of a
+    // structured error envelope. The substring pass of the classifier must
+    // catch this so the agent stops looping on a body it cannot retry past.
+    let body = "Monthly usage limit reached. Upgrade your plan to continue.";
+    let (addr, attempts) = spawn_body_server(vec![(429, body.to_string())]).await;
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_retry(quota_retry_policy(), &cancel, || client.post(&url))
+        .await
+        .expect("send");
+
+    assert_eq!(response.status().as_u16(), 429);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "generic monthly_usage_limit body must short-circuit retries",
+    );
+
+    // Sanity-check the classifier in isolation so a future change that
+    // moves the keyword list cannot silently regress this path.
+    assert!(is_terminal_quota_error(body.as_bytes()));
+}
+
+#[tokio::test]
+async fn send_with_retry_still_retries_a_regular_transient_429() {
+    // A plain rate-limit 429 with no terminal markers in the body must
+    // still take the existing backoff/retry path. Verifies the classifier
+    // doesn't accidentally widen its match window and starve the agent of
+    // legitimate retries.
+    let transient_body = serde_json::json!({
+        "error": {
+            "message": "Rate limit exceeded, please slow down.",
+            "type": "rate_limit_error"
+        }
+    })
+    .to_string();
+    let (addr, attempts) =
+        spawn_body_server(vec![(429, transient_body), (200, "{}".to_string())]).await;
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let policy = RetryPolicy {
+        max_retries: 3,
+        base_delay: Duration::from_millis(1),
+        retry_429: true,
+        retry_5xx: false,
+        retry_transport: false,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let response = send_with_retry(policy, &cancel, || client.post(&url))
+        .await
+        .expect("send");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "non-terminal 429 must retry exactly once before succeeding",
     );
 }
