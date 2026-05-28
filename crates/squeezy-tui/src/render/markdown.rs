@@ -214,9 +214,12 @@ impl Writer {
                 self.finish_line();
             }
             Event::TaskListMarker(checked) => {
+                // Checkboxes are structural markers, not content. Use the
+                // muted tone so a checklist doesn't dominate the eye
+                // even when half a turn is `[ ]` / `[x]` rows.
                 self.push_text(
                     if checked { "[x] " } else { "[ ] " },
-                    Style::default().fg(palette::GOLD),
+                    Style::default().fg(palette::QUIET),
                 );
             }
             Event::InlineMath(text) | Event::DisplayMath(text) | Event::FootnoteReference(text) => {
@@ -369,7 +372,11 @@ impl Writer {
         } else {
             "- ".to_string()
         };
-        self.push_text(&marker, Style::default().fg(palette::GOLD));
+        // List markers (`- ` / `1. `) are structural punctuation. Painting
+        // them in `GOLD` made a long numbered list read as "entirely
+        // yellow" because there's a bright marker on every line. Use
+        // the muted/QUIET tone so the content carries the visual weight.
+        self.push_text(&marker, Style::default().fg(palette::QUIET));
     }
 
     fn push_style(&mut self, style: Style) {
@@ -474,7 +481,11 @@ fn heading_style(level: HeadingLevel) -> Style {
 }
 
 fn inline_code_style() -> Style {
-    Style::default().fg(Color::Cyan)
+    // Inline code (`` `foo` ``) used to render in bright `Color::Cyan`,
+    // which turned any list of backticked identifiers into a wall of
+    // blue. The italic modifier + default foreground still distinguishes
+    // code from prose without painting it.
+    Style::default().add_modifier(Modifier::ITALIC)
 }
 
 /// Graph confidence labels squeezy emits in assistant prose

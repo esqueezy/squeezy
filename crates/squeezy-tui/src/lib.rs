@@ -6225,11 +6225,13 @@ fn wrap_tool_card(header: Line<'static>, body: Vec<Line<'static>>) -> Vec<Line<'
 }
 
 /// Render a `ToolRun::Lead { extras }` as a single grouped card spanning
-/// `extras + 1` consecutive same-tool same-status entries. Collapsed: the
-/// header reads `"Read 3 files"` etc., body is one summary row per
-/// member + a `(Ctrl-E to expand all)` affordance row. Expanded: header
-/// + each member's normal tool-card body rendered inline so the user can
-/// scan their full output.
+/// `extras + 1` consecutive same-tool same-status entries.
+///
+/// In collapsed form the header reads `"Read 3 files"` etc., the body is
+/// one summary row per member followed by a `(Ctrl-E to expand all)`
+/// affordance row. In expanded form the header is followed by each
+/// member's normal tool-card body rendered inline so the user can scan
+/// their full output.
 fn format_grouped_tool_result_entry(
     members: &[&ToolTranscript],
     collapsed: bool,
