@@ -10174,6 +10174,14 @@ pub(crate) struct TuiApp {
     pub(crate) mention_popup: Option<mention::MentionPopup>,
     pub(crate) workspace_file_cache: Option<mention::WorkspaceFileCache>,
     pub(crate) overlay: Option<overlay::Overlay>,
+    /// Per-app generation counter for [`overlay::DialogHandle::open`]. Bumped
+    /// on every open so stale handles for replaced dialogs become no-ops.
+    pub(crate) overlay_next_id: u64,
+    /// Generation id of the dialog currently occupying `overlay`. `None`
+    /// when `overlay` is `None`. Maintained alongside `overlay` so the
+    /// handle pattern can distinguish "my dialog is still open" from
+    /// "someone else replaced my dialog".
+    pub(crate) overlay_active_id: Option<u64>,
     /// Full-screen transcript overlay (Ctrl+T) that renders every entry
     /// in its uncapped form. `None` = closed; `Some(state)` = open with
     /// a scroll offset. Mirrors codex's `open_transcript_overlay` as the
@@ -10566,6 +10574,8 @@ impl TuiApp {
             mention_popup: None,
             workspace_file_cache: None,
             overlay: None,
+            overlay_next_id: 0,
+            overlay_active_id: None,
             transcript_overlay: None,
             alternate_scroll_enabled: TerminalMode::from(config.tui.alternate_screen)
                 == TerminalMode::AlternateScreen,
@@ -10647,6 +10657,27 @@ impl TuiApp {
             clickables: std::cell::RefCell::new(Vec::new()),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
         }
+    }
+
+    /// Open `content` as a typed slash-command overlay and return a
+    /// [`overlay::DialogHandle`] for later manipulation. Thin convenience
+    /// wrapper around [`overlay::DialogHandle::open`] that threads
+    /// `self.overlay`, `self.overlay_next_id`, and `self.overlay_active_id`
+    /// in a single call so slash-command handlers don't need to touch
+    /// the underlying state directly.
+    #[allow(dead_code)]
+    pub(crate) fn open_overlay(
+        &mut self,
+        content: overlay::Overlay,
+        prior_focus: overlay::PriorFocus,
+    ) -> overlay::DialogHandle {
+        overlay::DialogHandle::open(
+            &mut self.overlay,
+            &mut self.overlay_next_id,
+            &mut self.overlay_active_id,
+            content,
+            prior_focus,
+        )
     }
 
     pub(crate) fn note_turn_started(&mut self) {

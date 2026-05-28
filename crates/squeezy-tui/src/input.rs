@@ -414,7 +414,7 @@ pub(crate) fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     };
     match key.code {
         KeyCode::Esc => {
-            app.overlay = None;
+            close_overlay(app);
             app.status = "overlay cancelled".to_string();
             true
         }
@@ -434,10 +434,19 @@ pub(crate) fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     }
 }
 
+/// Close the slash-command overlay and clear the matching dialog-handle
+/// bookkeeping. Centralised so the `overlay` / `overlay_active_id` pair
+/// stays invariant: `active_id` is `Some` iff `overlay` is `Some`.
+pub(crate) fn close_overlay(app: &mut TuiApp) {
+    app.overlay = None;
+    app.overlay_active_id = None;
+}
+
 pub(crate) fn apply_overlay_selection(app: &mut TuiApp) {
     let Some(overlay) = app.overlay.take() else {
         return;
     };
+    app.overlay_active_id = None;
     match overlay {
         overlay::Overlay::Model(picker) => {
             if let Some(entry) = picker.selected() {
