@@ -4548,6 +4548,7 @@ impl TurnRuntime {
                         .await;
                         return Ok(());
                     }
+                    LlmEvent::ContextOverflow { .. } => {}
                 }
             }
 
@@ -6698,6 +6699,7 @@ async fn run_subagent_rounds(
                         transcript: Vec::new(),
                     };
                 }
+                LlmEvent::ContextOverflow { .. } => {}
             }
         }
 
@@ -9108,7 +9110,8 @@ Working target: {:?}",
             LlmEvent::Started
             | LlmEvent::ToolCall(_)
             | LlmEvent::ReasoningDelta { .. }
-            | LlmEvent::ReasoningDone(_) => {}
+            | LlmEvent::ReasoningDone(_)
+            | LlmEvent::ContextOverflow { .. } => {}
         }
     }
     Some(parse_classifier_verdict(&text))

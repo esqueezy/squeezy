@@ -325,7 +325,8 @@ async fn collect_reviewer_text(
             LlmEvent::Started
             | LlmEvent::ToolCall(_)
             | LlmEvent::ReasoningDelta { .. }
-            | LlmEvent::ReasoningDone(_) => {}
+            | LlmEvent::ReasoningDone(_)
+            | LlmEvent::ContextOverflow { .. } => {}
         }
     }
     Ok(text)

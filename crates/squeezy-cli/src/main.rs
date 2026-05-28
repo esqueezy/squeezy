@@ -2045,12 +2045,15 @@ async fn run_prompts(
     } else {
         Agent::new(config, provider)
     };
-    let rx = agent.start_turn(prompt, CancellationToken::new());
     let stdout = io::stdout();
     let stderr = io::stderr();
     let mut stdout = stdout.lock();
     let mut stderr = stderr.lock();
-    pump_prompt_events(rx, format, &mut stdout, &mut stderr).await
+    for prompt in prompts {
+        let rx = agent.start_turn(prompt, CancellationToken::new());
+        pump_prompt_events(rx, format, &mut stdout, &mut stderr).await?;
+    }
+    Ok(())
 }
 
 /// Drive a single `Agent::start_turn` mpsc receiver to completion and
@@ -2197,7 +2200,7 @@ where
                     let _ = writeln!(stderr, "cancelled");
                     let _ = stderr.flush();
                 }
-                LlmEvent::ReasoningDelta { .. } | LlmEvent::ReasoningDone(_) => {}
+                break;
             }
             // Bookkeeping events (job notifications, MCP status, cost
             // updates, context compactions, sub-agent lifecycle, etc.)
