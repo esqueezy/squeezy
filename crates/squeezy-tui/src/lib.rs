@@ -552,7 +552,15 @@ fn maybe_pick_resume_session(
     .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
     match choice {
         resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
-        resume_picker::ResumeChoice::Resume(id) => Ok(ResumeStartup::Use(id)),
+        // `branch_tip` is captured by the picker but not yet wired through
+        // the resume flow — the agent restarts at the most recent event in
+        // the session log. Branch-aware resume is a follow-up; the
+        // schema/picker landing first lets future producers populate
+        // `parent_event_sequence` without churn here.
+        resume_picker::ResumeChoice::Resume {
+            session_id,
+            branch_tip: _,
+        } => Ok(ResumeStartup::Use(session_id)),
         resume_picker::ResumeChoice::CrossProject {
             session_id,
             target_cwd,

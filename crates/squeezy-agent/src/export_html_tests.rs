@@ -37,6 +37,7 @@ fn event(kind: &str, summary: Option<&str>, payload: serde_json::Value) -> Sessi
         turn_id: None,
         summary: summary.map(str::to_string),
         payload,
+        parent_event_sequence: None,
     }
 }
 
