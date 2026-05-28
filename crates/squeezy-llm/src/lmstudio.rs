@@ -86,7 +86,16 @@ impl LMStudioProvider {
     }
 
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
-        let mut messages = Vec::with_capacity(request.input.len() + 1);
+        // Canonicalize cross-provider tool-call ids and synthesize
+        // placeholders for orphan tool results so a session that
+        // started on a hosted provider and resumed on the local
+        // LM Studio server still gets a well-formed
+        // `tool_calls`/`tool` pairing. LM Studio echoes whatever id
+        // it sees back to the model, so a 450-char OpenAI Responses
+        // id (or an `ollama_call_N` synthetic) flowing through here
+        // confuses smaller local models.
+        let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
+        let mut messages = Vec::with_capacity(normalized_input.len() + 1);
         let trimmed_instructions = request.instructions.trim();
         if !trimmed_instructions.is_empty() {
             messages.push(json!({
@@ -94,7 +103,7 @@ impl LMStudioProvider {
                 "content": &*request.instructions,
             }));
         }
-        for item in request.input.iter() {
+        for item in normalized_input.iter() {
             if let Some(msg) = lmstudio_message(item) {
                 messages.push(msg);
             }

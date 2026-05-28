@@ -152,14 +152,19 @@ fn request_body_maps_tool_roundtrip_messages() {
     assert_eq!(body["messages"][0]["content"][0]["text"], "read config");
     assert_eq!(body["messages"][1]["role"], "assistant");
     assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
-    assert_eq!(body["messages"][1]["content"][0]["id"], "toolu_1");
+    // Tool-call ids get canonicalized to `call_<N>` (1-indexed by
+    // first occurrence) so a mid-session model switch can replay
+    // them on any provider — the original `toolu_…` shape would
+    // be rejected by OpenAI/Google, and a 450-char OpenAI id would
+    // be rejected by Anthropic.
+    assert_eq!(body["messages"][1]["content"][0]["id"], "call_1");
     assert_eq!(
         body["messages"][1]["content"][0]["input"]["path"],
         "squeezy.toml"
     );
     assert_eq!(body["messages"][2]["role"], "user");
     assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
-    assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "toolu_1");
+    assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call_1");
 }
 
 #[test]

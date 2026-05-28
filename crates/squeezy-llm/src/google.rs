@@ -50,11 +50,22 @@ impl GoogleProvider {
     }
 
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
+        // Canonicalize tool-call ids and synthesize placeholders for
+        // orphan tool results BEFORE projecting to Google's
+        // `contents` array. Google identifies tool calls by `name`
+        // (no explicit id) and pairs `functionResponse` to the
+        // preceding `functionCall` by name; cross-provider replay
+        // can leave `FunctionCallOutput` items whose `call_id`
+        // doesn't appear in any prior `FunctionCall`, in which case
+        // the response gets dropped to a generic `"tool"` name and
+        // the model can't follow the conversation. Synthesizing a
+        // placeholder call keeps the pairing intact.
+        let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
         let mut body = json!({
             "systemInstruction": {
                 "parts": [{"text": request.instructions}]
             },
-            "contents": google_contents(&request.input),
+            "contents": google_contents(&normalized_input),
             "generationConfig": {},
         });
         if let Some(max_output_tokens) = request.max_output_tokens {

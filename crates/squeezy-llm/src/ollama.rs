@@ -45,9 +45,19 @@ impl OllamaProvider {
     }
 
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
+        // Canonicalize tool-call ids and synthesize placeholders for
+        // orphan tool results before building Ollama's `messages`
+        // array. Ollama's native route drops the `call_id` on the
+        // wire entirely (it pairs by surrounding role/tool blocks),
+        // but normalization still synthesizes the assistant
+        // tool-call message that an orphan tool-result needs to sit
+        // after — without that the `role:"tool"` message appears in
+        // the chat with no preceding assistant call and the model
+        // gets confused about the conversation order.
+        let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
         let mut body = json!({
             "model": request.model,
-            "messages": ollama_messages(&request.instructions, &request.input),
+            "messages": ollama_messages(&request.instructions, &normalized_input),
             "stream": true,
         });
         if let Some(max_output_tokens) = request.max_output_tokens {

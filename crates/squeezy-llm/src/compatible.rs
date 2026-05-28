@@ -128,12 +128,22 @@ impl OpenAiCompatibleProvider {
         let anthropic_caching =
             request.cache_key.is_some() && supports_anthropic_caching(&request.model);
         let cache_control = anthropic_caching.then(ephemeral_marker);
+        // Canonicalize cross-provider tool-call ids and synthesize
+        // placeholders for orphan tool results BEFORE the
+        // chat-completions message rewrite. Aggregator routes (PortKey
+        // + OpenRouter especially) frequently see mixed-provider ids
+        // when the user swaps models mid-session, and Anthropic-via-
+        // aggregator routes reject `tool_call_id`s that don't match
+        // the Anthropic regex + length cap. Indices computed below
+        // (cache-control breakpoint) are over the *normalized* slice
+        // so the synthetic placeholder shifts later positions
+        // accordingly.
+        let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
         // Find the last user-text turn so we can mark it as the cache
         // breakpoint. Anthropic caches everything *before* a marker, so the
         // last user message is the natural place.
         let last_user_text_index = cache_control.as_ref().and_then(|_| {
-            request
-                .input
+            normalized_input
                 .iter()
                 .enumerate()
                 .rev()
@@ -142,7 +152,7 @@ impl OpenAiCompatibleProvider {
                 })
         });
 
-        let mut messages = Vec::with_capacity(request.input.len() + 1);
+        let mut messages = Vec::with_capacity(normalized_input.len() + 1);
         let trimmed_instructions = request.instructions.trim();
         if !trimmed_instructions.is_empty() {
             if anthropic_caching {
@@ -157,7 +167,7 @@ impl OpenAiCompatibleProvider {
                 }));
             }
         }
-        for (index, item) in request.input.iter().enumerate() {
+        for (index, item) in normalized_input.iter().enumerate() {
             let attach_cache_control = if Some(index) == last_user_text_index {
                 cache_control.as_ref()
             } else {

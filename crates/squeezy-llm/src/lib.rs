@@ -14,6 +14,15 @@ pub const INVALID_TOOL_ARGUMENTS_KEY: &str = "__squeezy_invalid_tool_arguments";
 pub const INVALID_TOOL_ARGUMENTS_ERROR_KEY: &str = "__squeezy_parse_error";
 pub const INVALID_TOOL_ARGUMENTS_RAW_KEY: &str = "__squeezy_raw_arguments";
 
+/// Tool name attached to a synthesized `FunctionCall` placeholder
+/// that stands in for a missing tool call discovered during
+/// cross-model replay (an orphan `FunctionCallOutput` whose `call_id`
+/// has no matching `FunctionCall` in the prior history). Picked so
+/// review tooling and exported transcripts can grep for the marker
+/// rather than the gap appearing as a legitimate model invocation.
+/// See [`normalize_tool_ids_for_replay`].
+pub const MODEL_SWITCHED_PLACEHOLDER_NAME: &str = "model_switched";
+
 mod anthropic;
 mod anthropic_betas;
 mod bedrock;
@@ -185,6 +194,106 @@ pub enum LlmInputItem {
         output: String,
     },
     Reasoning(ReasoningPayload),
+}
+
+/// Normalize tool-call IDs across a replay sequence so providers see
+/// a consistent canonical form (`call_1`, `call_2`, …) and every
+/// `FunctionCallOutput` has a matching `FunctionCall` preceding it.
+///
+/// Mid-session model switches (Anthropic ↔ OpenAI ↔ Google ↔
+/// Bedrock ↔ Ollama) leave a mixed pile of provider-specific
+/// tool-call ids in the persisted `LlmInputItem` stream:
+///
+/// - Anthropic emits `toolu_…` and requires `^[a-zA-Z0-9_-]+$` with
+///   ≤ 64 chars.
+/// - OpenAI Responses emits 450+-char base64-like ids containing `|`
+///   that Anthropic rejects outright.
+/// - Google emits `google_call_N`, Ollama emits `ollama_call_N`,
+///   Bedrock emits `tooluse_…`.
+/// - Chat-Completions aggregators echo whatever the upstream sent.
+///
+/// Replaying this stream to a different provider without
+/// normalization either fails the destination's id-shape check or
+/// fails to match a tool result to its tool call. This pass:
+///
+/// 1. Walks `items` in order and assigns each distinct original
+///    `call_id` a canonical `call_<N>` id (1-indexed by first
+///    occurrence), rewriting both `FunctionCall` and
+///    `FunctionCallOutput` items so the pair stays linked.
+/// 2. When a `FunctionCallOutput` appears whose `call_id` was not
+///    introduced by a prior `FunctionCall` in the same slice (orphan
+///    tool result — common after a model switch discarded the
+///    assistant turn that called the tool), synthesizes a placeholder
+///    `FunctionCall` with `name = MODEL_SWITCHED_PLACEHOLDER_NAME`
+///    and `arguments = {"reason": "model_switched"}` *before* the
+///    output so the wire format stays well-formed.
+///
+/// Non-tool items (`UserText`, `AssistantText`, `Reasoning`) pass
+/// through unchanged. Mirrors pi's `transformMessages` (see
+/// `others/pi/packages/ai/src/providers/transform-messages.ts`) —
+/// each provider's `request_body` calls this once at the front of
+/// its existing transform so the per-provider wire shapes are
+/// preserved.
+pub(crate) fn normalize_tool_ids_for_replay(items: &[LlmInputItem]) -> Vec<LlmInputItem> {
+    let mut id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut next_index: usize = 0;
+    let mut out: Vec<LlmInputItem> = Vec::with_capacity(items.len());
+
+    for item in items {
+        match item {
+            LlmInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                let canonical = canonicalize_call_id(call_id, &mut id_map, &mut next_index);
+                out.push(LlmInputItem::FunctionCall {
+                    call_id: canonical,
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                });
+            }
+            LlmInputItem::FunctionCallOutput { call_id, output } => {
+                let already_seen = id_map.contains_key(call_id);
+                let canonical = canonicalize_call_id(call_id, &mut id_map, &mut next_index);
+                if !already_seen {
+                    // Orphan tool result: synthesize a placeholder
+                    // FunctionCall in front of it so the destination
+                    // provider has a matching tool_use to pair with
+                    // this output. Without this Anthropic / Bedrock
+                    // reject the request with a "tool_result without
+                    // matching tool_use" error and the OpenAI
+                    // Responses path returns a similar shape error.
+                    out.push(LlmInputItem::FunctionCall {
+                        call_id: canonical.clone(),
+                        name: MODEL_SWITCHED_PLACEHOLDER_NAME.to_string(),
+                        arguments: serde_json::json!({ "reason": "model_switched" }),
+                    });
+                }
+                out.push(LlmInputItem::FunctionCallOutput {
+                    call_id: canonical,
+                    output: output.clone(),
+                });
+            }
+            other => out.push(other.clone()),
+        }
+    }
+
+    out
+}
+
+fn canonicalize_call_id(
+    original: &str,
+    id_map: &mut std::collections::HashMap<String, String>,
+    next_index: &mut usize,
+) -> String {
+    if let Some(canonical) = id_map.get(original) {
+        return canonical.clone();
+    }
+    *next_index += 1;
+    let canonical = format!("call_{}", *next_index);
+    id_map.insert(original.to_string(), canonical.clone());
+    canonical
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
