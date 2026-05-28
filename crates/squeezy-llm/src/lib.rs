@@ -54,6 +54,7 @@ pub mod models_dev;
 pub mod oauth;
 mod ollama;
 mod openai;
+mod openai_prompt_cache;
 pub mod overflow;
 mod registry;
 mod retry;

@@ -18,6 +18,7 @@ use crate::{
     LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
     ReasoningKind, ReasoningPayload,
     credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
+    openai_prompt_cache::clamp_prompt_cache_key,
     retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
     sse::SseDecoder,
     transport::shared_client,
@@ -146,7 +147,12 @@ impl OpenAiProvider {
         }
         let cache_spec = request.effective_cache_spec();
         if let Some(key) = cache_spec.key.as_deref() {
-            body["prompt_cache_key"] = json!(key);
+            // OpenAI's Responses API silently drops `prompt_cache_key`
+            // values longer than 64 codepoints — the request succeeds
+            // but the field is ignored server-side, so every turn pays
+            // full uncached input cost while telemetry shows zero
+            // cache hits. Clamp client-side. See [`clamp_prompt_cache_key`].
+            body["prompt_cache_key"] = json!(clamp_prompt_cache_key(key));
         }
         if cache_spec.retention == crate::CacheRetention::Long {
             body["prompt_cache_retention"] = json!("24h");
@@ -221,6 +227,24 @@ impl OpenAiProvider {
         }
         body
     }
+
+    /// Prompt-cache affinity headers attached to every Responses request
+    /// that carries a cache key. OpenAI's load balancer uses these to
+    /// route the session to the same backend that warmed the cached
+    /// prefix; without them, repeat turns can land on a cold node and
+    /// silently miss cache even when `prompt_cache_key` matches. Mirrors
+    /// the official Codex CLI's behavior and pi's
+    /// `openai-responses.ts` (`session_id` + `x-client-request-id`).
+    ///
+    /// The header values carry the full (unclamped) cache key — the
+    /// 64-codepoint limit is specific to the body field; routing headers
+    /// have OpenAI's general (much larger) header length cap.
+    pub(crate) fn affinity_headers(request: &LlmRequest) -> Vec<(&'static str, String)> {
+        let Some(key) = request.effective_cache_spec().key else {
+            return Vec::new();
+        };
+        vec![("session_id", key.clone()), ("x-client-request-id", key)]
+    }
 }
 
 fn openai_text_verbosity(verbosity: ResponseVerbosity) -> &'static str {
@@ -259,6 +283,7 @@ impl LlmProvider for OpenAiProvider {
             url.push_str(api_version);
         }
         let body = Self::request_body(&request, provider_name);
+        let affinity_headers = Self::affinity_headers(&request);
 
         Box::pin(try_stream! {
             let response = send_with_auth_retry(
@@ -272,6 +297,13 @@ impl LlmProvider for OpenAiProvider {
                     } else {
                         builder.bearer_auth(key)
                     };
+                    // Cache-affinity headers (only emitted when the
+                    // request carries a cache key) keep multi-turn
+                    // sessions pinned to the backend that warmed the
+                    // cached prefix.
+                    let builder = affinity_headers
+                        .iter()
+                        .fold(builder, |b, (name, value)| b.header(*name, value.as_str()));
                     builder.json(&body)
                 },
             ).await?;
