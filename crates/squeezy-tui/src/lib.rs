@@ -421,6 +421,12 @@ async fn run_inner(
     if let Some(banner) = update_banner.filter(|s| !s.trim().is_empty()) {
         app.push_log(banner);
     }
+    if terminal_eats_option_letter() {
+        app.toasts.push(
+            "Alt+letter shortcuts (e.g. Alt+E) need 'Use Option as Meta key' in Terminal → Settings → Profiles → Keyboard, or remap via [tui.keymap]",
+            toast::ToastVariant::Warning,
+        );
+    }
     for item in initial_transcript {
         app.push_transcript_item(item);
     }
@@ -975,17 +981,29 @@ fn normalise_control_byte(mut key: KeyEvent) -> KeyEvent {
 }
 
 /// Append a one-line summary of `key` to the path named by the
-/// `SQUEEZY_DEBUG_KEYS` env var. Silent no-op when unset or when the
-/// file can't be opened — diagnostics must never break the TUI.
+/// `SQUEEZY_DEBUG_KEYS` env var. Any non-empty / non-"0" value turns
+/// logging on. Values "1" / "true" / "yes" / "on" use the default
+/// path `/tmp/squeezy-keys.log` so the user doesn't have to pick one;
+/// any other value is taken as a literal file path. Silent no-op when
+/// the file can't be opened — diagnostics must never break the TUI.
 fn debug_log_key_event(key: &KeyEvent) {
     use std::io::Write;
-    let Some(path) = std::env::var_os("SQUEEZY_DEBUG_KEYS") else {
+    let Some(raw) = std::env::var_os("SQUEEZY_DEBUG_KEYS") else {
         return;
+    };
+    if raw.is_empty() || raw == "0" {
+        return;
+    }
+    let path: std::path::PathBuf = match raw.to_str() {
+        Some("1") | Some("true") | Some("yes") | Some("on") => {
+            std::path::PathBuf::from("/tmp/squeezy-keys.log")
+        }
+        _ => std::path::PathBuf::from(&raw),
     };
     let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&path)
     else {
         return;
     };
@@ -3226,7 +3244,15 @@ fn toggle_selected_transcript_entry(app: &mut TuiApp) {
         .or_else(|| latest_collapsed_transcript_entry(app))
         .or_else(|| latest_toggleable_transcript_entry(app))
     else {
+        // The status bar's at the bottom of the screen and easy to
+        // miss when the user is staring at the transcript — emit a
+        // toast so the feedback is impossible to ignore. The audit
+        // surfaced this as a recurring "Ctrl+E does nothing" report.
         app.status = "nothing expandable yet · /expand all also works".to_string();
+        app.toasts.push(
+            "nothing to expand yet — assistant replies become collapsible once they're long enough",
+            toast::ToastVariant::Info,
+        );
         return;
     };
     let Some(entry) = app.transcript.get_mut(index) else {
@@ -3269,6 +3295,10 @@ fn toggle_expand_all_transcript_entries(app: &mut TuiApp) {
     }
     if total_toggleable == 0 {
         app.status = "nothing expandable yet".to_string();
+        app.toasts.push(
+            "nothing to expand yet — try after the assistant replies with a longer message",
+            toast::ToastVariant::Info,
+        );
         return;
     }
     let target_collapsed = total_collapsed == 0;
@@ -5126,6 +5156,17 @@ fn mouse_capture_hint() -> String {
     } else {
         "native scroll & select · SQUEEZY_MOUSE_CAPTURE=1 for clickable buttons".to_string()
     }
+}
+
+/// True when the user is in Apple's Terminal.app. That terminal does
+/// NOT send `ESC+letter` for `Option+letter` by default — instead it
+/// emits the composed Unicode character (so `Alt+E` arrives as the
+/// acute-accent dead-key `´`, breaking every `Alt+letter` keymap
+/// entry). We surface a one-shot hint on first launch pointing the
+/// user at "Use Option as Meta key" in Terminal Settings → Profiles
+/// → Keyboard.
+fn terminal_eats_option_letter() -> bool {
+    std::env::var("TERM_PROGRAM").as_deref() == Ok("Apple_Terminal")
 }
 
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {

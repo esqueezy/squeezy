@@ -386,6 +386,45 @@ fn raw_control_byte_normalises_to_char_plus_control() {
 }
 
 #[tokio::test]
+async fn ctrl_e_expands_collapsed_reasoning_entry_end_to_end() {
+    // Reproduces the user-reported scenario: a reasoning chevron in
+    // collapsed state, no composer text, press Ctrl+E once → the
+    // reasoning entry should toggle to expanded.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    // Compact transcript_default keeps the reasoning entry collapsed
+    // on insert — matches the real-world default.
+    app.transcript_default = TranscriptDefault::Compact;
+    app.push_reasoning_segment(squeezy_core::ReasoningSnapshot {
+        display_text: "Clarifying user intent.\nThinking about file structure.\nDeciding plan."
+            .to_string(),
+        payload: squeezy_core::ReasoningPayload::OpenAi {
+            item_id: "item-1".to_string(),
+            summary: vec!["Clarifying user intent.".to_string()],
+            encrypted_content: None,
+        },
+    });
+    let reasoning_idx = app.transcript.len() - 1;
+    assert!(
+        app.transcript[reasoning_idx].collapsed,
+        "reasoning entry should start collapsed",
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl+e");
+
+    assert!(
+        !app.transcript[reasoning_idx].collapsed,
+        "ctrl+e with empty composer should expand the collapsed reasoning entry",
+    );
+}
+
+#[tokio::test]
 async fn raw_ctrl_e_dispatches_expand_action() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
