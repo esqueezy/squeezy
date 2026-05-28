@@ -2181,7 +2181,14 @@ fn vertex_preset_rejects_missing_project() {
 }
 
 #[test]
-fn cloudflare_workers_ai_preset_templates_base_url_from_account_id() {
+fn cloudflare_workers_ai_preset_carries_account_id_and_placeholder_template() {
+    // The Workers AI preset keeps the `{account_id}` placeholder in the
+    // resolved `base_url` and flows `cloudflare_account_id` through as a
+    // typed field on `OpenAiCompatibleConfig`. The substitution itself
+    // lives in the LLM client (`substitute_url_placeholders` in
+    // `squeezy-llm::compatible`) so a user override of `base_url` that
+    // keeps the placeholder syntax — say, fronting the API through a
+    // reverse proxy — gets the same treatment for free.
     let mut providers = std::collections::BTreeMap::new();
     providers.insert(
         "cloudflare_workers_ai".to_string(),
@@ -2211,7 +2218,20 @@ fn cloudflare_workers_ai_preset_templates_base_url_from_account_id() {
         OpenAiCompatiblePreset::CloudflareWorkersAi
     );
     assert_eq!(
-        compatible.base_url,
+        compatible.base_url, "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+        "config layer must keep the placeholder template; substitution lives in the LLM client",
+    );
+    assert_eq!(
+        compatible.account_id.as_deref(),
+        Some("acct-abc"),
+        "account_id must flow through to the provider config",
+    );
+    assert_eq!(compatible.gateway_id, None);
+    // The eager helper still resolves the same URL, so any caller that
+    // reads it directly (CLI inspect output, integration tests) stays
+    // consistent with the LLM client's runtime substitution.
+    assert_eq!(
+        cloudflare_workers_ai_base_url("acct-abc"),
         "https://api.cloudflare.com/client/v4/accounts/acct-abc/ai/v1"
     );
     assert_eq!(compatible.api_key_env, "CLOUDFLARE_API_KEY");
@@ -2233,7 +2253,7 @@ fn cloudflare_workers_ai_preset_rejects_missing_account_id() {
 }
 
 #[test]
-fn cloudflare_ai_gateway_preset_templates_base_url_and_injects_dual_auth_header() {
+fn cloudflare_ai_gateway_preset_carries_account_and_gateway_ids_and_injects_dual_auth_header() {
     let mut providers = std::collections::BTreeMap::new();
     providers.insert(
         "cloudflare_ai_gateway".to_string(),
@@ -2266,6 +2286,13 @@ fn cloudflare_ai_gateway_preset_templates_base_url_and_injects_dual_auth_header(
     );
     assert_eq!(
         compatible.base_url,
+        "https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat",
+        "config layer keeps the placeholder template; substitution lives in the LLM client",
+    );
+    assert_eq!(compatible.account_id.as_deref(), Some("acct-abc"));
+    assert_eq!(compatible.gateway_id.as_deref(), Some("my-gateway"));
+    assert_eq!(
+        cloudflare_ai_gateway_base_url("acct-abc", "my-gateway"),
         "https://gateway.ai.cloudflare.com/v1/acct-abc/my-gateway/compat"
     );
     // Dual auth: standard bearer goes through `api_key_env`; gateway token is
@@ -2309,7 +2336,14 @@ fn cloudflare_ai_gateway_defaults_gateway_id_when_omitted() {
     };
     assert_eq!(
         compatible.base_url,
-        "https://gateway.ai.cloudflare.com/v1/acct-abc/default/compat"
+        "https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat",
+        "template stays templated; the LLM client substitutes at provider build time",
+    );
+    assert_eq!(compatible.account_id.as_deref(), Some("acct-abc"));
+    assert_eq!(
+        compatible.gateway_id.as_deref(),
+        Some(DEFAULT_CLOUDFLARE_AI_GATEWAY_ID),
+        "missing cloudflare_gateway_id must fall back to the `default` gateway slug",
     );
     // No CF_AIG_TOKEN supplied → no `cf-aig-authorization` header injected;
     // the gateway runs in "open" / upstream-auth-only mode.

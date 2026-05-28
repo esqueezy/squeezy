@@ -110,10 +110,17 @@ pub const DEFAULT_BASETEN_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct"
 pub const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
 pub const DEFAULT_VLLM_BASE_URL: &str = "http://127.0.0.1:8000/v1";
 pub const DEFAULT_LLAMACPP_BASE_URL: &str = "http://127.0.0.1:8080/v1";
-// Cloudflare Workers AI + AI Gateway. Both base URLs are templated on
-// `cloudflare_account_id` (and AI Gateway additionally on `cloudflare_gateway_id`),
-// so the static defaults below are empty — the caller must template them via
-// `cloudflare_workers_ai_base_url` / `cloudflare_ai_gateway_base_url`.
+// Cloudflare Workers AI + AI Gateway. Both base URLs are per-account
+// (and the Gateway preset additionally per-gateway), so the default
+// templates carry `{account_id}` / `{gateway_id}` placeholders that get
+// substituted out of the matching `OpenAiCompatibleConfig` fields before
+// requests fire. The substitution lives in the LLM client
+// (`squeezy-llm::compatible`) so any user override of `base_url` that
+// keeps the placeholder syntax behaves the same as the bundled default.
+pub const DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL: &str =
+    "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1";
+pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL: &str =
+    "https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat";
 pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_ID: &str = "default";
 pub const DEFAULT_CLOUDFLARE_WORKERS_AI_MODEL: &str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_MODEL: &str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
@@ -158,9 +165,12 @@ pub fn resolve_model_alias(provider: &str, alias: &str) -> Option<&'static str> 
 
 /// Cloudflare Workers AI's OpenAI-compatible chat completions endpoint is
 /// per-account. Returns the resolved base URL for an `account_id`, ready for
-/// `/chat/completions` to be appended.
+/// `/chat/completions` to be appended. Built on top of the canonical
+/// [`DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL`] template so callers that read
+/// the template directly (e.g. config inspectors) and callers that resolve
+/// it eagerly stay in sync.
 pub fn cloudflare_workers_ai_base_url(account_id: &str) -> String {
-    format!("https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1")
+    DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL.replace("{account_id}", account_id)
 }
 
 /// Cloudflare AI Gateway proxies any OpenAI-compatible upstream behind a
@@ -168,7 +178,9 @@ pub fn cloudflare_workers_ai_base_url(account_id: &str) -> String {
 /// OpenAI-format compatibility surface; underneath it can route to Workers AI,
 /// OpenAI, Anthropic, etc. depending on the gateway's configured upstream.
 pub fn cloudflare_ai_gateway_base_url(account_id: &str, gateway_id: &str) -> String {
-    format!("https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat")
+    DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL
+        .replace("{account_id}", account_id)
+        .replace("{gateway_id}", gateway_id)
 }
 
 pub const MODEL_SELECTION_VERSION: u32 = 1;
@@ -1741,6 +1753,18 @@ pub struct OpenAiCompatibleConfig {
     pub base_url: String,
     pub extra_headers: BTreeMap<String, String>,
     pub transport: ProviderTransportConfig,
+    /// Cloudflare account id. Populated for the Workers AI / AI Gateway
+    /// presets so the LLM client can substitute the `{account_id}`
+    /// placeholder in `base_url` before requests fire. `None` for every
+    /// non-Cloudflare preset. `serde(default)` keeps older configs (and
+    /// hand-rolled provider configs that predate this field) deserializing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    /// Cloudflare AI Gateway id. Populated for the AI Gateway preset so
+    /// `{gateway_id}` in `base_url` resolves before requests fire. `None`
+    /// for the Workers AI preset and every non-Cloudflare preset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_id: Option<String>,
 }
 
 /// Named presets for the OpenAI-compatible (Chat Completions) provider. Each
@@ -1869,11 +1893,15 @@ impl OpenAiCompatiblePreset {
             Self::VLlm => DEFAULT_VLLM_BASE_URL,
             Self::LlamaCpp => DEFAULT_LLAMACPP_BASE_URL,
             // Cloudflare's base URLs are per-account (and per-gateway for the
-            // gateway preset). The caller must template them from
-            // `cloudflare_account_id` (and `cloudflare_gateway_id`); see
-            // `cloudflare_workers_ai_base_url` / `cloudflare_ai_gateway_base_url`.
-            Self::CloudflareWorkersAi => "",
-            Self::CloudflareAiGateway => "",
+            // gateway preset). The default templates carry `{account_id}`
+            // and `{gateway_id}` placeholders that the LLM client substitutes
+            // out of `OpenAiCompatibleConfig.account_id` / `.gateway_id`
+            // before requests fire (see `substitute_url_placeholders` in
+            // `squeezy-llm::compatible`). Users who override `base_url`
+            // can keep the same placeholder syntax to route through a
+            // custom reverse proxy without re-implementing the substitution.
+            Self::CloudflareWorkersAi => DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL,
+            Self::CloudflareAiGateway => DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL,
             Self::Custom => "",
         }
     }
@@ -7514,31 +7542,6 @@ fn build_openai_compatible_config(
                 .unwrap_or_else(|| DEFAULT_VERTEX_LOCATION.to_string());
             vertex_base_url(project.trim(), location.trim())
         }
-        (OpenAiCompatiblePreset::CloudflareWorkersAi, None) => {
-            let account_id = get_var("CLOUDFLARE_ACCOUNT_ID")
-                .or_else(|| provider_setting(providers, section, "cloudflare_account_id"))
-                .ok_or_else(|| {
-                    SqueezyError::Config(
-                        "providers.cloudflare_workers_ai.cloudflare_account_id (or CLOUDFLARE_ACCOUNT_ID) is required for the Cloudflare Workers AI preset"
-                            .to_string(),
-                    )
-                })?;
-            cloudflare_workers_ai_base_url(account_id.trim())
-        }
-        (OpenAiCompatiblePreset::CloudflareAiGateway, None) => {
-            let account_id = get_var("CLOUDFLARE_ACCOUNT_ID")
-                .or_else(|| provider_setting(providers, section, "cloudflare_account_id"))
-                .ok_or_else(|| {
-                    SqueezyError::Config(
-                        "providers.cloudflare_ai_gateway.cloudflare_account_id (or CLOUDFLARE_ACCOUNT_ID) is required for the Cloudflare AI Gateway preset"
-                            .to_string(),
-                    )
-                })?;
-            let gateway_id = get_var("CLOUDFLARE_AI_GATEWAY_ID")
-                .or_else(|| provider_setting(providers, section, "cloudflare_gateway_id"))
-                .unwrap_or_else(|| DEFAULT_CLOUDFLARE_AI_GATEWAY_ID.to_string());
-            cloudflare_ai_gateway_base_url(account_id.trim(), gateway_id.trim())
-        }
         (_, None) => preset.default_base_url().to_string(),
     };
     if base_url.trim().is_empty() {
@@ -7547,6 +7550,49 @@ fn build_openai_compatible_config(
             preset.display_name()
         )));
     }
+    // Cloudflare presets carry `{account_id}` (and `{gateway_id}` for the
+    // AI Gateway preset) placeholders in their default `base_url`
+    // template; the LLM client substitutes them out of these fields
+    // right before requests fire. Required values are validated up
+    // front so misconfigurations surface at config-build time rather
+    // than producing a confusing 404 against a literal `{account_id}`
+    // URL. Aliases (`CLOUDFLARE_ACCOUNT_ID` env, `cloudflare_account_id`
+    // TOML field) match the historical settings shape so existing
+    // configs keep working.
+    let (account_id, gateway_id) = match preset {
+        OpenAiCompatiblePreset::CloudflareWorkersAi => {
+            let account_id = get_var("CLOUDFLARE_ACCOUNT_ID")
+                .or_else(|| provider_setting(providers, section, "cloudflare_account_id"))
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    SqueezyError::Config(
+                        "providers.cloudflare_workers_ai.cloudflare_account_id (or CLOUDFLARE_ACCOUNT_ID) is required for the Cloudflare Workers AI preset"
+                            .to_string(),
+                    )
+                })?;
+            (Some(account_id), None)
+        }
+        OpenAiCompatiblePreset::CloudflareAiGateway => {
+            let account_id = get_var("CLOUDFLARE_ACCOUNT_ID")
+                .or_else(|| provider_setting(providers, section, "cloudflare_account_id"))
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    SqueezyError::Config(
+                        "providers.cloudflare_ai_gateway.cloudflare_account_id (or CLOUDFLARE_ACCOUNT_ID) is required for the Cloudflare AI Gateway preset"
+                            .to_string(),
+                    )
+                })?;
+            let gateway_id = get_var("CLOUDFLARE_AI_GATEWAY_ID")
+                .or_else(|| provider_setting(providers, section, "cloudflare_gateway_id"))
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| DEFAULT_CLOUDFLARE_AI_GATEWAY_ID.to_string());
+            (Some(account_id), Some(gateway_id))
+        }
+        _ => (None, None),
+    };
     let mut extra_headers = provider_setting_headers(providers, section).unwrap_or_default();
     // AI Gateway dual-auth: the upstream provider's API key flows in as the
     // standard `Authorization: Bearer …` (resolved by the provider), and an
@@ -7577,6 +7623,8 @@ fn build_openai_compatible_config(
         base_url,
         extra_headers,
         transport,
+        account_id,
+        gateway_id,
     }))
 }
 

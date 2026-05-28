@@ -1565,6 +1565,8 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
                 base_url: preset.default_base_url().to_string(),
                 extra_headers: BTreeMap::new(),
                 transport,
+                account_id: None,
+                gateway_id: None,
             })
         }
     };
