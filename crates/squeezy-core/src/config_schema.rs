@@ -683,6 +683,19 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
+                label: "persist_prompt_history",
+                toml_path: &["tui", "persist_prompt_history"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::Restart,
+                get: get_persist_prompt_history,
+                set: set_persist_prompt_history,
+                default_display: "false",
+                default: || FieldValue::Bool(false),
+                help: "Mirror the prompt-recall ring (Up/Down at the composer) to `~/.squeezy/prompt_history` so prior prompts survive across sessions.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
                 label: "alternate_screen",
                 toml_path: &["tui", "alternate_screen"],
                 kind: FieldKind::Enum {
@@ -1836,6 +1849,19 @@ fn set_coalesce_tool_runs(cfg: &mut AppConfig, value: FieldValue) -> Result<(), 
     match value {
         FieldValue::Bool(v) => {
             cfg.tui.coalesce_tool_runs = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_persist_prompt_history(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.tui.persist_prompt_history)
+}
+fn set_persist_prompt_history(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.tui.persist_prompt_history = v;
             Ok(())
         }
         _ => Err("expects bool"),

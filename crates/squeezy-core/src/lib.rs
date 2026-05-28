@@ -1526,8 +1526,12 @@ impl AppConfig {
             toml_string(self.tui.theme.as_str())
         ));
         output.push_str(&format!(
-            "show_reasoning_usage = {}\n\n",
+            "show_reasoning_usage = {}\n",
             self.tui.show_reasoning_usage
+        ));
+        output.push_str(&format!(
+            "persist_prompt_history = {}\n\n",
+            self.tui.persist_prompt_history
         ));
 
         for (name, server) in &self.mcp_servers {
@@ -6508,6 +6512,12 @@ pub struct TuiConfig {
     /// Off-screen attention surface (OSC 9 desktop notification / BEL).
     /// Fires on turn-complete and approval-pending; default `Off`.
     pub desktop_notifications: NotificationMethod,
+    /// Mirror the in-memory prompt-recall ring to a flat file on disk
+    /// (default `~/.squeezy/prompt_history`, XDG-compatible). Off by
+    /// default — history survives across sessions only when the user
+    /// opts in, matching shell-history conventions and avoiding any
+    /// surprise persisted plaintext for users who'd rather not have it.
+    pub persist_prompt_history: bool,
     /// User-supplied key rebindings for the TUI composer / chat surface.
     /// Keyed by an action slug (e.g. `transcript_overlay`, `page_up`);
     /// the value is a key spec like `"Ctrl+t"` or `"PageUp"`. Unknown
@@ -6546,6 +6556,7 @@ impl TuiConfig {
             desktop_notifications: settings
                 .desktop_notifications
                 .unwrap_or(NotificationMethod::Off),
+            persist_prompt_history: settings.persist_prompt_history.unwrap_or(false),
             keymap: settings.keymap.unwrap_or_default(),
         }
     }
@@ -6572,6 +6583,7 @@ pub struct TuiSettings {
     pub status_line_use_colors: Option<bool>,
     pub theme: Option<TuiTheme>,
     pub desktop_notifications: Option<NotificationMethod>,
+    pub persist_prompt_history: Option<bool>,
     pub keymap: Option<BTreeMap<String, String>>,
 }
 
@@ -6593,6 +6605,7 @@ impl TuiSettings {
                 "status_line_use_colors",
                 "theme",
                 "desktop_notifications",
+                "persist_prompt_history",
                 "keymap",
             ],
             source,
@@ -6667,6 +6680,12 @@ impl TuiSettings {
                 source,
                 &field(path, "desktop_notifications"),
             )?,
+            persist_prompt_history: bool_value(
+                table,
+                "persist_prompt_history",
+                source,
+                &field(path, "persist_prompt_history"),
+            )?,
             keymap: string_map_value(table, "keymap", source, &field(path, "keymap"))?,
         })
     }
@@ -6687,6 +6706,10 @@ impl TuiSettings {
         );
         replace_if_some(&mut self.theme, next.theme);
         replace_if_some(&mut self.desktop_notifications, next.desktop_notifications);
+        replace_if_some(
+            &mut self.persist_prompt_history,
+            next.persist_prompt_history,
+        );
         replace_if_some(&mut self.keymap, next.keymap);
     }
 }
@@ -6702,6 +6725,27 @@ pub fn default_settings_path() -> PathBuf {
         return config.join("squeezy").join("settings.toml");
     }
     PathBuf::from(".squeezy/settings.toml")
+}
+
+/// Path of the on-disk prompt-recall ring backing `[tui]
+/// .persist_prompt_history`. Prefers `$HOME/.squeezy/prompt_history`
+/// for parity with `default_settings_path`; falls back to
+/// `dirs::data_dir()/squeezy/prompt_history` (XDG-compatible:
+/// `$XDG_DATA_HOME/squeezy/prompt_history` on Linux,
+/// `%APPDATA%\squeezy\prompt_history` on Windows). Overridable with
+/// `SQUEEZY_PROMPT_HISTORY_PATH` for tests and power users who keep
+/// their dotfiles elsewhere.
+pub fn default_prompt_history_path() -> PathBuf {
+    if let Some(custom) = env::var_os("SQUEEZY_PROMPT_HISTORY_PATH") {
+        return PathBuf::from(custom);
+    }
+    if let Some(home) = home_squeezy_subpath("prompt_history") {
+        return home;
+    }
+    if let Some(data) = dirs::data_dir() {
+        return data.join("squeezy").join("prompt_history");
+    }
+    PathBuf::from(".squeezy/prompt_history")
 }
 
 pub fn default_projects_dir() -> PathBuf {
@@ -7010,6 +7054,7 @@ pub fn user_settings_template() -> &'static str {
 # alternate_screen = "auto"     # auto | always | never
 # synchronized_output = "auto"  # auto | always | never (DEC 2026 atomic redraw)
 # show_reasoning_usage = true
+# persist_prompt_history = false  # mirror Up/Down prompt history to ~/.squeezy/prompt_history (XDG-compatible)
 
 # [mcp.servers.docs]
 # enabled = true

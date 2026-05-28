@@ -67,6 +67,7 @@ mod keymap_config;
 mod mention;
 mod notification;
 mod overlay;
+mod prompt_history;
 mod prompt_queue;
 mod proposed_plan;
 mod render;
@@ -10133,7 +10134,7 @@ pub(crate) struct TuiApp {
     pub(crate) telemetry: TelemetryStatus,
     pub(crate) input: String,
     pub(crate) input_cursor: usize,
-    pub(crate) input_history: Vec<String>,
+    pub(crate) input_history: prompt_history::PromptHistory,
     pub(crate) input_history_index: Option<usize>,
     pub(crate) input_history_draft: String,
     pub(crate) slash_menu_index: usize,
@@ -10510,7 +10511,16 @@ impl TuiApp {
             telemetry: TelemetryStatus::from_config(&config.telemetry),
             input: String::new(),
             input_cursor: 0,
-            input_history: Vec::new(),
+            input_history: if config.tui.persist_prompt_history {
+                prompt_history::PromptHistory::with_persistence(
+                    prompt_history::DEFAULT_PROMPT_HISTORY_CAPACITY,
+                    squeezy_core::default_prompt_history_path(),
+                )
+            } else {
+                prompt_history::PromptHistory::in_memory(
+                    prompt_history::DEFAULT_PROMPT_HISTORY_CAPACITY,
+                )
+            },
             input_history_index: None,
             input_history_draft: String::new(),
             slash_menu_index: 0,
