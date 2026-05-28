@@ -3168,6 +3168,7 @@ fn test_advertised_tool(name: &str, capability: PermissionCapability) -> Adverti
         description: format!("{name} test tool"),
         capability,
         parameters: json!({"type": "object"}),
+        prepare_arguments: None,
     })
 }
 

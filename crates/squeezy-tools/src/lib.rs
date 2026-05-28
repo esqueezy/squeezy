@@ -224,7 +224,18 @@ pub struct ToolExecutionOptions {
     pub shell_ask_approver: Option<ShellAskApprover>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Per-tool soft-validation hook. Runs against the raw `arguments` JSON
+/// **before** typed-struct deserialization (and before the live
+/// `#[serde(deny_unknown_fields)]` schema rejects unknown keys), so a spec
+/// can repair common spelling drift such as `"filepath"` → `"path"`,
+/// normalize `null` placeholders into missing keys, lowercase a stray
+/// enum value, etc. Hooks are advisory: returning `Err` aborts the call
+/// with an `"invalid tool arguments"` `ToolResult` analogous to a serde
+/// error, so they should only fail when a normalization *cannot* leave
+/// the JSON in a typed-deserialize-friendly shape.
+pub type PrepareArgumentsHook = fn(&mut Value) -> std::result::Result<(), String>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
@@ -237,6 +248,14 @@ pub struct ToolSpec {
     /// shell → git via the shell classifier); session mode gating in the agent
     /// applies on top of both layers.
     pub capability: PermissionCapability,
+    /// Optional soft-validation hook that mutates the raw `arguments` JSON
+    /// before typed deserialization. `None` means dispatch deserializes the
+    /// arguments as-is. Never serialized — function pointers are a runtime
+    /// concern of the dispatcher, not part of the tool advertisement, and
+    /// they are deliberately excluded from [`PartialEq`] because rust does
+    /// not guarantee stable addresses across codegen units.
+    #[serde(skip)]
+    pub prepare_arguments: Option<PrepareArgumentsHook>,
 }
 
 impl ToolSpec {
@@ -246,7 +265,29 @@ impl ToolSpec {
         compact_tool_parameters(&mut self.parameters);
         self
     }
+
+    /// Attach a [`PrepareArgumentsHook`] to this spec. Overwrites any
+    /// previously-set hook.
+    pub(crate) fn with_prepare_arguments(mut self, hook: PrepareArgumentsHook) -> Self {
+        self.prepare_arguments = Some(hook);
+        self
+    }
 }
+
+impl PartialEq for ToolSpec {
+    fn eq(&self, other: &Self) -> bool {
+        // Hooks are runtime-only (see `prepare_arguments` doc): rust does
+        // not guarantee unique function-pointer addresses across codegen
+        // units, so structural equality skips that field. All
+        // model-visible fields are compared.
+        self.name == other.name
+            && self.description == other.description
+            && self.parameters == other.parameters
+            && self.capability == other.capability
+    }
+}
+
+impl Eq for ToolSpec {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -1309,6 +1350,20 @@ impl ToolRegistry {
         }
     }
 
+    /// Look up the optional [`PrepareArgumentsHook`] for a tool by name.
+    /// Reads from the cached spec list so this is O(N) over the current
+    /// tool catalog, which is bounded to dozens of entries; the lookup is
+    /// invoked once per tool call so the linear scan is dwarfed by the
+    /// actual tool work. Returns `None` for unknown tools (the dispatcher
+    /// will surface `unknown tool` later) and for tools that did not
+    /// declare a hook.
+    pub fn prepare_arguments_for(&self, name: &str) -> Option<PrepareArgumentsHook> {
+        self.specs()
+            .iter()
+            .find(|spec| spec.name == name)
+            .and_then(|spec| spec.prepare_arguments)
+    }
+
     pub async fn refresh_mcp_tools(&self, cancel: CancellationToken) -> McpRefreshOutcome {
         let outcome = self.mcp.refresh_tools(cancel).await;
         // Drop any cached `specs()` so the next call sees the refreshed MCP
@@ -2013,6 +2068,21 @@ impl ToolRegistry {
     ) -> ToolResult {
         if cancel.is_cancelled() {
             return ToolResult::cancelled(&call);
+        }
+
+        // F01: run the per-spec `prepare_arguments` hook before any
+        // downstream typed-struct deserialization. The hook can rename
+        // misspelled fields ("filepath" -> "path"), strip null
+        // placeholders, lowercase enum values, etc. — soft repairs that
+        // strengthen the silent-acceptance gap left by the typed arg
+        // structs' `deny_unknown_fields`. Hooks that return `Err` short
+        // circuit dispatch with the same shape as a serde error so the
+        // model sees a uniform "invalid tool arguments" failure.
+        let mut call = call;
+        if let Some(hook) = self.prepare_arguments_for(&call.name)
+            && let Err(err) = hook(&mut call.arguments)
+        {
+            return tool_prepare_error(&call, &err);
         }
 
         let result = if self.mcp_tool(&call.name).is_some() {
@@ -4989,6 +5059,20 @@ pub(crate) fn tool_arg_error(call: &ToolCall, err: serde_json::Error) -> ToolRes
         call,
         ToolStatus::Error,
         json!({ "error": format!("invalid tool arguments: {err}") }),
+        ToolCostHint::default(),
+        None,
+    )
+}
+
+/// Sibling of [`tool_arg_error`] for hook-returned errors from
+/// [`PrepareArgumentsHook`]. Keeps the user-visible shape identical
+/// (`"invalid tool arguments: …"`) so the model cannot tell a soft
+/// pre-validation failure apart from a typed-struct deserialize failure.
+pub(crate) fn tool_prepare_error(call: &ToolCall, message: &str) -> ToolResult {
+    make_result(
+        call,
+        ToolStatus::Error,
+        json!({ "error": format!("invalid tool arguments: {message}") }),
         ToolCostHint::default(),
         None,
     )

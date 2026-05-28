@@ -9605,3 +9605,163 @@ fn human_label_falls_back_to_tool_name_when_no_template() {
     let label = crate::human_label_for_call("brand_new_tool", &json!({"x": 1}));
     assert_eq!(label, "brand_new_tool");
 }
+
+#[test]
+fn prepare_arguments_lookup_advertises_only_hooked_tools() {
+    let root = temp_workspace("prepare_arguments_lookup");
+    let registry = ToolRegistry::new(&root).expect("registry");
+    // read_file and shell both ship hooks; tools without spelling drift
+    // (e.g. grep) intentionally leave the slot empty.
+    assert!(
+        registry.prepare_arguments_for("read_file").is_some(),
+        "read_file should advertise a prepare_arguments hook"
+    );
+    assert!(
+        registry.prepare_arguments_for("shell").is_some(),
+        "shell should advertise a prepare_arguments hook"
+    );
+    assert!(
+        registry.prepare_arguments_for("grep").is_none(),
+        "grep does not declare a hook"
+    );
+    assert!(
+        registry
+            .prepare_arguments_for("definitely_not_a_tool")
+            .is_none(),
+        "unknown tool names resolve to None"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn prepare_arguments_read_file_hook_normalizes_filepath_aliases() {
+    let root = temp_workspace("prepare_arguments_read_file_hook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let hook = registry
+        .prepare_arguments_for("read_file")
+        .expect("read_file hook");
+
+    // `filepath`, `file_path`, and `file` all promote to `path`.
+    for alias in ["filepath", "file_path", "file"] {
+        let mut args = json!({ alias: "sample.txt" });
+        hook(&mut args).expect("hook ok");
+        assert_eq!(
+            args,
+            json!({ "path": "sample.txt" }),
+            "alias `{alias}` should normalize to `path`"
+        );
+    }
+
+    // Canonical key wins when both are present — alias is dropped.
+    let mut args = json!({"path": "good.txt", "filepath": "bad.txt"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"path": "good.txt"}));
+
+    // Null placeholder for `path` is treated as missing so an alias can
+    // fill the slot without colliding with the canonical key.
+    let mut args = json!({"path": Value::Null, "filepath": "sample.txt"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"path": "sample.txt"}));
+
+    // Null alias is ignored — we never promote `path = null`.
+    let mut args = json!({"filepath": Value::Null});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({}));
+
+    // Non-object arguments pass through unchanged.
+    let mut args = json!(42);
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!(42));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn prepare_arguments_shell_hook_normalizes_command_aliases() {
+    let root = temp_workspace("prepare_arguments_shell_hook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let hook = registry.prepare_arguments_for("shell").expect("shell hook");
+
+    for alias in ["cmd", "shell_command", "bash", "bash_command"] {
+        let mut args = json!({ alias: "ls -la" });
+        hook(&mut args).expect("hook ok");
+        assert_eq!(
+            args,
+            json!({ "command": "ls -la" }),
+            "alias `{alias}` should normalize to `command`"
+        );
+    }
+
+    // Canonical `command` wins over `cmd`.
+    let mut args = json!({"command": "echo good", "cmd": "echo bad"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"command": "echo good"}));
+
+    // Null `command` placeholder is dropped so the alias can land.
+    let mut args = json!({"command": Value::Null, "cmd": "echo recovered"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"command": "echo recovered"}));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_dispatch_normalizes_filepath_alias_via_hook() {
+    let root = temp_workspace("read_file_filepath_alias");
+    fs::write(root.join("sample.txt"), "hello world").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Without the hook, `filepath` would trip `deny_unknown_fields` and
+    // surface an "invalid tool arguments" error. With it, dispatch
+    // succeeds and the typed `ReadFileArgs` deserialization sees the
+    // canonical `path` field.
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "alias_call".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"filepath": "sample.txt", "limit": 11}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["content"], "hello world");
+    assert_eq!(result.content["path"], "sample.txt");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_dispatch_misspelled_alias_still_fails() {
+    // Sanity: only the curated aliases are repaired. An arbitrary
+    // misspelling like `pth` is still rejected, which is the behavior we
+    // want so the model is forced to learn the canonical field name
+    // rather than rely on the hook for arbitrary drift.
+    let root = temp_workspace("read_file_bad_alias");
+    fs::write(root.join("sample.txt"), "hello").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "bad_alias".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"pth": "sample.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    let error = result.content["error"]
+        .as_str()
+        .expect("error message present");
+    assert!(
+        error.contains("invalid tool arguments"),
+        "unexpected error: {error}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
