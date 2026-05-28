@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_stream::try_stream;
@@ -8,6 +9,7 @@ use squeezy_core::{ProviderTransportConfig, Result, SqueezyError};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
+use crate::credentials::ApiKeySource;
 use crate::{LlmEvent, LlmStream};
 
 /// Fractional jitter applied to each backoff delay so concurrent clients hitting
@@ -45,6 +47,56 @@ impl RetryPolicy {
             retry_transport: true,
         }
     }
+}
+
+/// Run [`send_with_retry`] under an outer auth-refresh layer.
+///
+/// Resolves the API key from `source` once, dispatches the request
+/// through the existing transport/throttle retry path, and — only if
+/// the upstream comes back with `401`/`403` — calls
+/// [`ApiKeySource::invalidate`] and retries the request a single
+/// time with a freshly fetched key. A still-`401`/`403` on the
+/// second attempt is returned to the caller for the provider's
+/// existing error handler to surface.
+///
+/// The closure receives the resolved key as a `&str` so the provider
+/// client can stamp it onto the request the same way it does today
+/// (`x-api-key`, `bearer_auth`, `api-key` for Azure, etc.). Cloning
+/// the key inside the closure is fine — it's a short-lived string.
+///
+/// Layering note: this sits *outside* `send_with_retry` because
+/// 401/403 are not retryable on the same key. The existing policy
+/// (`retry_429`, `retry_5xx`, `retry_transport`) keeps owning
+/// transport-level recoveries; this helper just adds a one-shot
+/// "token rotated, try again" pass so OAuth-backed sources can
+/// refresh mid-session without bouncing the provider client.
+pub async fn send_with_auth_retry<F>(
+    source: &Arc<dyn ApiKeySource>,
+    policy: RetryPolicy,
+    cancel: &CancellationToken,
+    mut make_request: F,
+) -> Result<Response>
+where
+    F: FnMut(&str) -> RequestBuilder,
+{
+    let key = source.current_key().await?;
+    let response = send_with_retry(policy, cancel, || make_request(&key)).await?;
+    if !is_auth_failure(response.status()) {
+        return Ok(response);
+    }
+    tracing::warn!(
+        target: "squeezy_llm::auth_retry",
+        provider = source.provider_label(),
+        status = response.status().as_u16(),
+        "upstream rejected api key; invalidating source and retrying once",
+    );
+    source.invalidate().await?;
+    let refreshed = source.current_key().await?;
+    send_with_retry(policy, cancel, || make_request(&refreshed)).await
+}
+
+fn is_auth_failure(status: StatusCode) -> bool {
+    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
 }
 
 pub async fn send_with_retry(

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_stream::try_stream;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -13,8 +15,8 @@ use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
     ReasoningKind, ReasoningPayload,
-    credentials::resolve_api_key_with_inline,
-    retry::{RetryPolicy, idle_timeout, send_with_retry},
+    credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
+    retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
     sse::SseDecoder,
 };
 
@@ -22,7 +24,7 @@ use crate::{
 pub struct OpenAiProvider {
     name: &'static str,
     client: reqwest::Client,
-    api_key: String,
+    api_key: Arc<dyn ApiKeySource>,
     base_url: String,
     api_version: Option<String>,
     transport: ProviderTransportConfig,
@@ -33,7 +35,7 @@ impl std::fmt::Debug for OpenAiProvider {
         f.debug_struct("OpenAiProvider")
             .field("name", &self.name)
             .field("client", &self.client)
-            .field("api_key", &"<redacted>")
+            .field("api_key", &self.api_key)
             .field("base_url", &self.base_url)
             .field("api_version", &self.api_version)
             .field("transport", &self.transport)
@@ -45,14 +47,13 @@ impl OpenAiProvider {
     pub fn from_config(config: &OpenAiConfig) -> Result<Self> {
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
-        Ok(Self {
-            name: "openai",
-            client: reqwest::Client::new(),
-            api_key,
-            base_url: config.base_url.trim_end_matches('/').to_string(),
-            api_version: None,
-            transport: config.transport,
-        })
+        Ok(Self::with_api_key_source(
+            "openai",
+            static_api_key_source(api_key, "openai"),
+            config.base_url.trim_end_matches('/').to_string(),
+            None,
+            config.transport,
+        ))
     }
 
     pub fn from_azure_config(config: &AzureOpenAiConfig) -> Result<Self> {
@@ -63,14 +64,13 @@ impl OpenAiProvider {
         }
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
-        Ok(Self {
-            name: "azure_openai",
-            client: reqwest::Client::new(),
-            api_key,
-            base_url: config.base_url.trim_end_matches('/').to_string(),
-            api_version: Some(config.api_version.clone()),
-            transport: config.transport,
-        })
+        Ok(Self::with_api_key_source(
+            "azure_openai",
+            static_api_key_source(api_key, "azure_openai"),
+            config.base_url.trim_end_matches('/').to_string(),
+            Some(config.api_version.clone()),
+            config.transport,
+        ))
     }
 
     /// Build an OpenAI Responses-API client targeting xAI's `/responses`
@@ -90,14 +90,34 @@ impl OpenAiProvider {
         }
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
-        Ok(Self {
-            name: "xai",
+        Ok(Self::with_api_key_source(
+            "xai",
+            static_api_key_source(api_key, "xai"),
+            config.base_url.trim_end_matches('/').to_string(),
+            None,
+            config.transport,
+        ))
+    }
+
+    /// Construct the provider against an already-built credential
+    /// source. Used by the OpenAI Codex (ChatGPT Plus/Pro) OAuth
+    /// provider so a rotating access token can flow through the same
+    /// `/responses` HTTP path without rebuilding the client.
+    pub fn with_api_key_source(
+        name: &'static str,
+        api_key: Arc<dyn ApiKeySource>,
+        base_url: String,
+        api_version: Option<String>,
+        transport: ProviderTransportConfig,
+    ) -> Self {
+        Self {
+            name,
             client: reqwest::Client::new(),
             api_key,
-            base_url: config.base_url.trim_end_matches('/').to_string(),
-            api_version: None,
-            transport: config.transport,
-        })
+            base_url,
+            api_version,
+            transport,
+        }
     }
 
     fn request_body(request: &LlmRequest, provider_name: &str) -> Value {
@@ -221,15 +241,20 @@ impl LlmProvider for OpenAiProvider {
         let body = Self::request_body(&request, provider_name);
 
         Box::pin(try_stream! {
-            let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
+            let response = send_with_auth_retry(
+                &api_key,
+                RetryPolicy::provider_requests(transport),
+                &cancel,
+                |key| {
                     let builder = client.post(&url);
                     let builder = if provider_name == "azure_openai" {
-                        builder.header("api-key", api_key.clone())
+                        builder.header("api-key", key)
                     } else {
-                        builder.bearer_auth(api_key.clone())
+                        builder.bearer_auth(key)
                     };
                     builder.json(&body)
-                }).await?;
+                },
+            ).await?;
 
             let status = response.status();
             let response = if status == StatusCode::OK {

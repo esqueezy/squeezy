@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
@@ -11,15 +12,15 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
     ReasoningPayload,
-    credentials::resolve_api_key_with_inline,
-    retry::{RetryPolicy, idle_timeout, send_with_retry},
+    credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
+    retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
     sse::SseDecoder,
 };
 
 #[derive(Clone)]
 pub struct GoogleProvider {
     client: reqwest::Client,
-    api_key: String,
+    api_key: Arc<dyn ApiKeySource>,
     base_url: String,
     transport: ProviderTransportConfig,
 }
@@ -28,7 +29,7 @@ impl std::fmt::Debug for GoogleProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GoogleProvider")
             .field("client", &self.client)
-            .field("api_key", &"<redacted>")
+            .field("api_key", &self.api_key)
             .field("base_url", &self.base_url)
             .field("transport", &self.transport)
             .finish()
@@ -41,7 +42,7 @@ impl GoogleProvider {
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
         Ok(Self {
             client: reqwest::Client::new(),
-            api_key,
+            api_key: static_api_key_source(api_key, "google"),
             base_url: config.base_url.trim_end_matches('/').to_string(),
             transport: config.transport,
         })
@@ -107,12 +108,17 @@ impl LlmProvider for GoogleProvider {
         let transport = self.transport;
 
         Box::pin(try_stream! {
-            let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
-                client
-                    .post(&url)
-                    .header("x-goog-api-key", &api_key)
-                    .json(&body)
-            }).await?;
+            let response = send_with_auth_retry(
+                &api_key,
+                RetryPolicy::provider_requests(transport),
+                &cancel,
+                |key| {
+                    client
+                        .post(&url)
+                        .header("x-goog-api-key", key)
+                        .json(&body)
+                },
+            ).await?;
             let status = response.status();
             let response = if status == StatusCode::OK {
                 response

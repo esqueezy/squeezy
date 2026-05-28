@@ -1,16 +1,21 @@
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
 use squeezy_core::{CostSnapshot, ProviderTransportConfig, SqueezyError};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 use super::{
     JITTER_FRACTION, RetryPolicy, apply_jitter, backoff, idle_timeout, jitter_sample,
-    parse_retry_after, with_stream_retry,
+    parse_retry_after, send_with_auth_retry, with_stream_retry,
 };
+use crate::credentials::{ApiKeyFuture, ApiKeySource};
 use crate::{LlmEvent, LlmStream};
 
 #[test]
@@ -375,4 +380,241 @@ fn retry_after_falls_back_when_ms_header_is_unparseable() {
 fn retry_after_returns_none_when_no_headers_present() {
     let headers = reqwest::header::HeaderMap::new();
     assert_eq!(parse_retry_after(&headers), None);
+}
+
+// --- send_with_auth_retry --------------------------------------------------
+
+/// Test ApiKeySource that hands out a deterministic sequence of keys
+/// and counts how many times the retry layer touched it. Drives the
+/// `send_with_auth_retry` assertions below without spinning up the
+/// full OAuth flow.
+#[derive(Debug)]
+struct TestKeySource {
+    label: String,
+    keys: AsyncMutex<Vec<String>>,
+    current_key_calls: AtomicUsize,
+    invalidate_calls: AtomicUsize,
+}
+
+impl TestKeySource {
+    fn new(label: &str, keys: Vec<String>) -> Arc<Self> {
+        Arc::new(Self {
+            label: label.to_string(),
+            keys: AsyncMutex::new(keys.into_iter().rev().collect()),
+            current_key_calls: AtomicUsize::new(0),
+            invalidate_calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn current_key_calls(&self) -> usize {
+        self.current_key_calls.load(Ordering::SeqCst)
+    }
+
+    fn invalidate_calls(&self) -> usize {
+        self.invalidate_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ApiKeySource for TestKeySource {
+    fn current_key<'a>(&'a self) -> ApiKeyFuture<'a, String> {
+        Box::pin(async move {
+            self.current_key_calls.fetch_add(1, Ordering::SeqCst);
+            let mut keys = self.keys.lock().await;
+            Ok(keys.pop().unwrap_or_else(|| "exhausted".to_string()))
+        })
+    }
+
+    fn invalidate<'a>(&'a self) -> ApiKeyFuture<'a, ()> {
+        Box::pin(async move {
+            self.invalidate_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    fn provider_label(&self) -> &str {
+        &self.label
+    }
+}
+
+/// Spin a loopback TCP server that responds to each POST with a
+/// fixed status sequence. Used to drive the auth-retry happy and
+/// failure paths without depending on a live provider.
+async fn spawn_status_server(statuses: Vec<u16>) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_clone = attempts.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let attempt = attempts_clone.fetch_add(1, Ordering::SeqCst);
+            let status = statuses
+                .get(attempt)
+                .copied()
+                .unwrap_or_else(|| *statuses.last().expect("non-empty status list"));
+
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+            let reason = match status {
+                200 => "OK",
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                500 => "Internal Server Error",
+                _ => "Status",
+            };
+            let response = format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n");
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    (addr, attempts)
+}
+
+fn auth_retry_policy() -> RetryPolicy {
+    // Disable the inner 429/5xx/transport retry budget so the test
+    // observes the auth-retry layer in isolation: every 401 returned
+    // by the mock server is forwarded straight to the auth path.
+    RetryPolicy {
+        max_retries: 0,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+    }
+}
+
+#[tokio::test]
+async fn send_with_auth_retry_passes_through_on_2xx() {
+    let (addr, attempts) = spawn_status_server(vec![200]).await;
+    let source = TestKeySource::new("test", vec!["good-key".to_string()]);
+    let source_dyn: Arc<dyn ApiKeySource> = source.clone();
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_auth_retry(&source_dyn, auth_retry_policy(), &cancel, |key| {
+        client.post(&url).bearer_auth(key)
+    })
+    .await
+    .expect("send");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "exactly one HTTP attempt"
+    );
+    assert_eq!(source.current_key_calls(), 1, "no refresh on 2xx");
+    assert_eq!(
+        source.invalidate_calls(),
+        0,
+        "invalidate must not fire on a healthy response"
+    );
+}
+
+#[tokio::test]
+async fn send_with_auth_retry_refreshes_once_on_401() {
+    let (addr, attempts) = spawn_status_server(vec![401, 200]).await;
+    let source = TestKeySource::new(
+        "test",
+        vec!["stale-key".to_string(), "fresh-key".to_string()],
+    );
+    let source_dyn: Arc<dyn ApiKeySource> = source.clone();
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_auth_retry(&source_dyn, auth_retry_policy(), &cancel, |key| {
+        client.post(&url).bearer_auth(key)
+    })
+    .await
+    .expect("send");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "401 then 200 = exactly two HTTP attempts"
+    );
+    assert_eq!(
+        source.current_key_calls(),
+        2,
+        "the auth-retry layer must re-read the key after invalidate"
+    );
+    assert_eq!(source.invalidate_calls(), 1, "invalidate fires once on 401");
+}
+
+#[tokio::test]
+async fn send_with_auth_retry_refreshes_once_on_403() {
+    let (addr, attempts) = spawn_status_server(vec![403, 200]).await;
+    let source = TestKeySource::new(
+        "test",
+        vec!["stale-key".to_string(), "fresh-key".to_string()],
+    );
+    let source_dyn: Arc<dyn ApiKeySource> = source.clone();
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_auth_retry(&source_dyn, auth_retry_policy(), &cancel, |key| {
+        client.post(&url).bearer_auth(key)
+    })
+    .await
+    .expect("send");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(source.invalidate_calls(), 1);
+}
+
+#[tokio::test]
+async fn send_with_auth_retry_bubbles_up_persistent_401() {
+    // Second 401 means the refresh did not actually rotate the key
+    // (or the upstream still rejects). Surface the final response
+    // unchanged so the provider's existing error formatter reports
+    // an honest auth failure instead of looping forever.
+    let (addr, attempts) = spawn_status_server(vec![401, 401]).await;
+    let source = TestKeySource::new(
+        "test",
+        vec!["stale-key".to_string(), "still-stale".to_string()],
+    );
+    let source_dyn: Arc<dyn ApiKeySource> = source.clone();
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_auth_retry(&source_dyn, auth_retry_policy(), &cancel, |key| {
+        client.post(&url).bearer_auth(key)
+    })
+    .await
+    .expect("send");
+
+    assert_eq!(
+        response.status().as_u16(),
+        401,
+        "the second 401 must propagate so the caller sees the auth failure"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "exactly one retry; no infinite loop"
+    );
+    assert_eq!(
+        source.invalidate_calls(),
+        1,
+        "invalidate fires exactly once even when the refresh did not help"
+    );
 }
