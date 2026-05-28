@@ -42,6 +42,7 @@ use squeezy_vcs::{
 use squeezy_workspace::{CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexingPolicy};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
+use unicode_normalization::UnicodeNormalization;
 
 mod checkpoints;
 mod file_ops;
@@ -2781,6 +2782,45 @@ impl ToolRegistry {
                         }));
                         return Ok(());
                     }
+                    // F01 unicode-normalize fallback: NFKC the file + search,
+                    // then collapse smart quotes, em/en-dashes, and NBSP-class
+                    // whitespace to ASCII on both sides before re-searching.
+                    // Catches the cases the quote-only path misses — em-dash
+                    // drift from a Markdown auto-correct, NBSP injected by a
+                    // copy-paste, or NFKC-equivalent ligatures (e.g. `ﬁ` vs
+                    // `fi`). Single clean character-boundary match only; the
+                    // sha256 staleness gate still applies because the final
+                    // file is re-hashed in the commit phase.
+                    if let Some((ustart, uend, ucount)) =
+                        find_with_unicode_normalization(&state.current, search)
+                        && ucount == 1
+                    {
+                        let before_len = state.current.len();
+                        let mut new_contents = String::with_capacity(
+                            state.current.len() - (uend - ustart) + replace.len(),
+                        );
+                        new_contents.push_str(&state.current[..ustart]);
+                        new_contents.push_str(replace);
+                        new_contents.push_str(&state.current[uend..]);
+                        state.current = new_contents;
+                        let after_len = state.current.len();
+                        staged.mark_last_op_inexact(Some("unicode_normalize"));
+                        preview_ops.push(json!({
+                            "patch_index": index,
+                            "kind": "search_replace",
+                            "path": rel,
+                            "matches": ucount,
+                            "allow_multiple": allow_multiple.unwrap_or(false),
+                            "bytes_delta": after_len as i64 - before_len as i64,
+                            "fallback": "unicode_normalize",
+                            "exact": false,
+                            "preview": {
+                                "search": truncate_text(search, PATCH_SNIPPET_MAX_CHARS),
+                                "replace": truncate_text(replace, PATCH_SNIPPET_MAX_CHARS),
+                            }
+                        }));
+                        return Ok(());
+                    }
                     // Optional unified-diff fallback (F89): the search body is
                     // a unified diff; preflight against the live worktree, and
                     // if it would apply, materialise the result by reading the
@@ -5172,6 +5212,105 @@ fn is_opening_quote_context(chars: &[char], index: usize) -> bool {
         ' ' | '\t' | '\n' | '\r' | '(' | '[' | '{' | '\u{2014}' | '\u{2013}'
     )
 }
+
+/// Per-character ASCII substitutions for the broader unicode-normalize
+/// patch fallback. Covers the typographic substitutions that auto-correct
+/// editors and Markdown tools regularly slip into source files but that the
+/// model emits as plain ASCII: smart quotes, em/en-dashes and friends, and
+/// NBSP-class whitespace. Returns `None` when the character should be
+/// emitted unchanged.
+fn map_unicode_to_ascii(ch: char) -> Option<&'static str> {
+    match ch {
+        '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => Some("'"),
+        '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => Some("\""),
+        '\u{2014}' => Some("--"),
+        '\u{2013}' | '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2015}' | '\u{2212}' => Some("-"),
+        '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+        | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+        | '\u{3000}' => Some(" "),
+        _ => None,
+    }
+}
+
+/// Build the fuzzy buffer used by `find_with_unicode_normalization`: NFKC
+/// the input first, then substitute typographic ASCII equivalents per
+/// `map_unicode_to_ascii`. Returns the normalized bytes and a per-byte map
+/// back to original byte indices; the sentinel value at
+/// `byte_map[normalized.len()]` is the byte just past the end of the
+/// original buffer so callers can resolve match-end positions cleanly.
+///
+/// One source character may emit 0+ normalized characters because NFKC can
+/// expand (e.g. `½` → `1⁄2`) or contract (e.g. `ﬁ` → `fi`). For every byte
+/// pushed into the normalized buffer we record the *start* byte of the
+/// source character that produced it, which keeps the map monotonic and
+/// makes the resolved range a strict character-aligned slice of the
+/// original — partial-character matches are detected later via a
+/// round-trip check.
+fn unicode_normalize_with_byte_map(input: &str) -> (String, Vec<usize>) {
+    let mut normalized = String::with_capacity(input.len());
+    let mut byte_map: Vec<usize> = Vec::with_capacity(input.len());
+    for (orig_idx, ch) in input.char_indices() {
+        for nch in ch.nfkc() {
+            let pre_len = normalized.len();
+            match map_unicode_to_ascii(nch) {
+                Some(text) => normalized.push_str(text),
+                None => normalized.push(nch),
+            }
+            for _ in 0..(normalized.len() - pre_len) {
+                byte_map.push(orig_idx);
+            }
+        }
+    }
+    byte_map.push(input.len());
+    (normalized, byte_map)
+}
+
+/// Locate `search` inside `content` after the broader unicode-normalize
+/// chain (NFKC + smart quotes + em/en dashes + NBSP) on both sides. Returns
+/// `(byte_start, byte_end)` pointing at the matched slice in the *original*
+/// `content`, plus the number of clean character-boundary matches — the
+/// caller refuses to apply when more than one clean match exists. Returns
+/// `None` when no clean normalized match exists, the input does not benefit
+/// from normalization, or every candidate match would slice a character.
+///
+/// "Clean" means the match boundaries in the normalized buffer correspond
+/// to character boundaries in the original. We verify by re-normalizing
+/// `content[orig_start..orig_end]` and checking it round-trips to the
+/// normalized search; partial-character matches (which can happen with
+/// NFKC expansion such as `½` → `1⁄2`) are rejected so we never replace
+/// half of a source character.
+fn find_with_unicode_normalization(content: &str, search: &str) -> Option<(usize, usize, usize)> {
+    let (normalized_search, _) = unicode_normalize_with_byte_map(search);
+    if normalized_search.is_empty() {
+        return None;
+    }
+    let (normalized, byte_map) = unicode_normalize_with_byte_map(content);
+    // Skip when normalization is a no-op on both sides — there is no
+    // typographic drift to bridge here, just an honest miss. Keeps this
+    // fallback from shadowing exact failures with redundant work.
+    if normalized.as_str() == content && normalized_search.as_str() == search {
+        return None;
+    }
+    let mut clean: Vec<(usize, usize)> = Vec::new();
+    let mut scan_from = 0;
+    while let Some(rel) = normalized[scan_from..].find(normalized_search.as_str()) {
+        let n_start = scan_from + rel;
+        let n_end = n_start + normalized_search.len();
+        scan_from = n_start + 1;
+        let orig_start = *byte_map.get(n_start)?;
+        let orig_end = *byte_map.get(n_end)?;
+        let (verify, _) = unicode_normalize_with_byte_map(&content[orig_start..orig_end]);
+        if verify == normalized_search {
+            clean.push((orig_start, orig_end));
+        }
+    }
+    if clean.is_empty() {
+        return None;
+    }
+    let (orig_start, orig_end) = clean[0];
+    Some((orig_start, orig_end, clean.len()))
+}
+
 fn patch_match_contexts(content: &str, search: &str, max_matches: usize) -> Vec<Value> {
     content
         .match_indices(search)
