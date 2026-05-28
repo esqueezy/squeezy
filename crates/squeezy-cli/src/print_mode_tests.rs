@@ -223,3 +223,73 @@ fn is_image_extension_covers_pi_supported_image_types() {
         assert!(!is_image_extension(ext), "expected {ext} to be text");
     }
 }
+
+#[test]
+fn classify_prompt_strips_double_bang_prefix_and_sets_exclude_flag() {
+    let classified = classify_prompt("!!ls ~/.ssh".to_string());
+    assert_eq!(
+        classified,
+        PromptInput {
+            content: "ls ~/.ssh".to_string(),
+            exclude_from_context: true,
+        }
+    );
+}
+
+#[test]
+fn classify_prompt_leaves_plain_text_untouched() {
+    let classified = classify_prompt("explain README.md".to_string());
+    assert_eq!(
+        classified,
+        PromptInput {
+            content: "explain README.md".to_string(),
+            exclude_from_context: false,
+        }
+    );
+}
+
+#[test]
+fn classify_prompt_treats_single_bang_as_normal_content() {
+    // Pi's single-bang `!cmd` escape (LLM sees output) is not yet a
+    // print-mode shortcut. Leaving a single leading `!` in place keeps
+    // legitimate prompt bodies like `"!important: rerun the migration"`
+    // intact while reserving `!!` for the exclude semantic.
+    let classified = classify_prompt("!important note".to_string());
+    assert_eq!(
+        classified,
+        PromptInput {
+            content: "!important note".to_string(),
+            exclude_from_context: false,
+        }
+    );
+}
+
+#[test]
+fn classify_prompt_keeps_whitespace_before_bang_bang_as_content() {
+    // Detection is strict prefix-only so callers can't accidentally hide
+    // the exclude semantic behind a leading newline or space — the
+    // double-bang has to be the literal first two bytes.
+    let classified = classify_prompt(" !!ls".to_string());
+    assert_eq!(
+        classified,
+        PromptInput {
+            content: " !!ls".to_string(),
+            exclude_from_context: false,
+        }
+    );
+}
+
+#[test]
+fn classify_prompt_handles_empty_command_body_after_prefix() {
+    // `!!` alone is meaningless but should not panic; the empty body is
+    // passed through with the flag so the pump can surface a clear
+    // diagnostic instead of dispatching an empty turn.
+    let classified = classify_prompt("!!".to_string());
+    assert_eq!(
+        classified,
+        PromptInput {
+            content: String::new(),
+            exclude_from_context: true,
+        }
+    );
+}
