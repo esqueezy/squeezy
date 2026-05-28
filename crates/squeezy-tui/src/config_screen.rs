@@ -978,6 +978,7 @@ pub(crate) fn provider_variant_label(provider: &squeezy_core::ProviderConfig) ->
         P::AzureOpenAi(_) => "azure_openai",
         P::Bedrock(_) => "bedrock",
         P::Ollama(_) => "ollama",
+        P::OpenAiCodex(_) => "openai_codex",
         P::OpenAiCompatible(config) => config.preset.as_str(),
     }
 }
@@ -1046,9 +1047,11 @@ pub(crate) fn provider_api_key_env(
         P::Anthropic(c) => Some(("Anthropic", c.api_key_env.clone())),
         P::Google(c) => Some(("Google", c.api_key_env.clone())),
         P::AzureOpenAi(c) => Some(("Azure OpenAI", c.api_key_env.clone())),
-        // Bedrock uses AWS SDK creds; Ollama is local — neither has a single
-        // env-var keychain entry the screen can write.
-        P::Bedrock(_) | P::Ollama(_) => None,
+        // Bedrock uses AWS SDK creds; Ollama is local; the ChatGPT
+        // Codex provider stores OAuth tokens at `~/.squeezy/auth/`
+        // — none of these have an env-var keychain entry the screen
+        // can write.
+        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) => None,
         P::OpenAiCompatible(c) => {
             if c.api_key_env.is_empty() {
                 None
@@ -1071,7 +1074,10 @@ pub(crate) fn provider_section_name(
         P::Anthropic(_) => Some("anthropic"),
         P::Google(_) => Some("google"),
         P::AzureOpenAi(_) => Some("azure_openai"),
-        P::Bedrock(_) | P::Ollama(_) => None,
+        // The Codex provider's credentials live in the OAuth token
+        // file, not the providers TOML table, so there's no section
+        // to write.
+        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) => None,
         P::OpenAiCompatible(c) => Some(c.preset.as_str()),
     }
 }
@@ -1087,7 +1093,7 @@ pub(crate) fn provider_inline_api_key(provider: &squeezy_core::ProviderConfig) -
         P::Anthropic(c) => c.api_key.clone(),
         P::Google(c) => c.api_key.clone(),
         P::AzureOpenAi(c) => c.api_key.clone(),
-        P::Bedrock(_) | P::Ollama(_) => None,
+        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) => None,
         P::OpenAiCompatible(c) => c.api_key.clone(),
     }
 }

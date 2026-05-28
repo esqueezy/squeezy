@@ -125,7 +125,11 @@ fn set_effective_provider_api_key(cfg: &mut AppConfig, value: &str) {
         P::Google(c) => c.api_key = v,
         P::AzureOpenAi(c) => c.api_key = v,
         P::OpenAiCompatible(c) => c.api_key = v,
-        P::Bedrock(_) | P::Ollama(_) => {}
+        // The Codex provider holds its credential in the OAuth file
+        // (`~/.squeezy/auth/openai-codex.json`), not in a TOML
+        // `api_key` field. Ignoring the inline write here keeps the
+        // config screen surface a no-op for that variant.
+        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) => {}
     }
 }
 

@@ -24,6 +24,7 @@ mod google;
 mod lmstudio;
 pub mod model_discovery;
 pub mod models_dev;
+pub mod oauth;
 mod ollama;
 mod openai;
 mod registry;
@@ -50,6 +51,11 @@ pub use lmstudio::{
 pub use model_discovery::{
     CONSERVATIVE_FALLBACK_CAPABILITIES, CapabilitySource, ResolvedCapabilities,
     resolve_capabilities, resolve_capabilities_with,
+};
+pub use oauth::{
+    OPENAI_CODEX_AUTH_FILE_NAME, OpenAiCodexLoginOutcome, OpenAiCodexOAuthSource,
+    OpenAiCodexProvider, codex_auth_file_path, default_codex_auth_path, load_codex_token,
+    login_openai_codex_interactive, save_codex_token,
 };
 pub use ollama::{
     OllamaProvider, PullEvent, PullStream, fetch_ollama_context_window, fetch_ollama_model_names,

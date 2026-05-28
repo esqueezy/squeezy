@@ -120,7 +120,7 @@ impl OpenAiProvider {
         }
     }
 
-    fn request_body(request: &LlmRequest, provider_name: &str) -> Value {
+    pub(crate) fn request_body(request: &LlmRequest, provider_name: &str) -> Value {
         let mut body = json!({
             "model": request.model,
             "instructions": request.instructions,
@@ -323,7 +323,7 @@ impl LlmProvider for OpenAiProvider {
 /// without the buffer the persisted `ReasoningPayload::OpenAi.summary`
 /// would be empty and the next turn's replay would drop the segment.
 #[derive(Debug, Default)]
-struct ReasoningAccumulator {
+pub(crate) struct ReasoningAccumulator {
     summary: String,
     text: String,
 }
@@ -343,7 +343,7 @@ impl ReasoningAccumulator {
     }
 }
 
-fn parse_openai_event(
+pub(crate) fn parse_openai_event(
     data: &str,
     reasoning_acc: &mut ReasoningAccumulator,
 ) -> Result<Option<LlmEvent>> {
