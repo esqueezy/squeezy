@@ -96,8 +96,8 @@ use input::{
 
 use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
 use render::palette::{
-    self, AMBER, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN,
-    blend_color,
+    self, AMBER, BANG_RED, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET,
+    SUCCESS_GREEN, blend_color,
 };
 #[cfg(test)]
 use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG, WORKING_SHIMMER_HIGHLIGHT};
@@ -1060,15 +1060,6 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         // fall through — the keystroke still performs its normal action
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
-        if app.input.is_empty() {
-            toggle_selected_transcript_entry(app);
-        } else {
-            move_input_cursor_line_end(app);
-        }
-        return Ok(false);
-    }
-
     // The transcript-overlay open/close action is dispatched up top
     // by `dispatch_keymap_action`. While the overlay is open we still
     // need to forward navigation keys to its own handler before the
@@ -1105,6 +1096,15 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
         move_input_cursor_line_start(app);
+        return Ok(false);
+    }
+
+    // Readline-style line-end. The `ExpandSelectedTranscriptEntry`
+    // keymap action handles Ctrl+E when the composer is empty; when
+    // text is present it returns `false` after setting a hint status,
+    // and we end up here so the cursor-move semantics still work.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+        move_input_cursor_line_end(app);
         return Ok(false);
     }
 
@@ -1495,6 +1495,58 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             } else {
                 false
             }
+        }
+        keymap::Action::ExpandSelectedTranscriptEntry => {
+            // Trace every press so a user running with
+            // `RUST_LOG=squeezy_tui=debug` can see exactly which branch
+            // fires (composer state, overlay state, etc.). Cheap to
+            // emit; only active when a subscriber is attached.
+            tracing::debug!(
+                target: "squeezy_tui::keymap",
+                action = "expand_selected_transcript_entry",
+                composer_empty = app.input.is_empty(),
+                config_screen_open = app.config_screen.is_some(),
+                status_line_setup_open = app.status_line_setup.is_some(),
+                key_modifiers = ?key.modifiers,
+                key_code = ?key.code,
+                "Ctrl+E dispatched"
+            );
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            // Match the existing TranscriptHome/TranscriptEnd dual-mode
+            // semantics: when the composer has text, fall through so
+            // readline `move_input_cursor_line_end` keeps working.
+            // Otherwise expand the selected (or latest collapsed)
+            // transcript entry.
+            if !app.input.is_empty() {
+                // Helpful one-shot status hint so the user knows why
+                // Ctrl+E didn't expand — composer state is the most
+                // common reason this surface appears "broken".
+                app.status =
+                    "Ctrl+E moves to end-of-line in the composer · clear input, press Alt+E, or run /expand all to expand transcript"
+                        .to_string();
+                return false;
+            }
+            toggle_selected_transcript_entry(app);
+            true
+        }
+        keymap::Action::ExpandAllTranscriptEntries => {
+            tracing::debug!(
+                target: "squeezy_tui::keymap",
+                action = "expand_all_transcript_entries",
+                composer_empty = app.input.is_empty(),
+                config_screen_open = app.config_screen.is_some(),
+                status_line_setup_open = app.status_line_setup.is_some(),
+                key_modifiers = ?key.modifiers,
+                key_code = ?key.code,
+                "Alt+E dispatched"
+            );
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_expand_all_transcript_entries(app);
+            true
         }
     }
 }
@@ -2009,8 +2061,9 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 Some(value) => match parse_transcript_category(value) {
                     Some(category) => category,
                     None => {
-                        app.status = "usage: /collapse [all|tools|logs|diffs|receipts|assistant]"
-                            .to_string();
+                        app.status = format!(
+                            "usage: {command} [all|tools|logs|diffs|receipts|assistant|reasoning]"
+                        );
                         return true;
                     }
                 },
@@ -2905,6 +2958,7 @@ fn parse_transcript_category(value: &str) -> Option<TranscriptCategory> {
         "diffs" => Some(TranscriptCategory::Diffs),
         "receipts" => Some(TranscriptCategory::Receipts),
         "assistant" => Some(TranscriptCategory::Assistant),
+        "reasoning" | "thinking" => Some(TranscriptCategory::Reasoning),
         _ => None,
     }
 }
@@ -3096,7 +3150,7 @@ fn toggle_selected_transcript_entry(app: &mut TuiApp) {
         .or_else(|| latest_collapsed_transcript_entry(app))
         .or_else(|| latest_toggleable_transcript_entry(app))
     else {
-        app.status = "nothing expandable yet".to_string();
+        app.status = "nothing expandable yet · /expand all also works".to_string();
         return;
     };
     let Some(entry) = app.transcript.get_mut(index) else {
@@ -3106,7 +3160,7 @@ fn toggle_selected_transcript_entry(app: &mut TuiApp) {
     };
     entry.collapsed = !entry.collapsed;
     app.status = format!(
-        "{} transcript entry {}",
+        "{} transcript entry {} · Alt+E expand all",
         if entry.collapsed {
             "collapsed"
         } else {
@@ -3114,6 +3168,49 @@ fn toggle_selected_transcript_entry(app: &mut TuiApp) {
         },
         entry.id + 1
     );
+}
+
+/// Bulk expand / collapse across every toggleable transcript entry.
+///
+/// Semantics: if any toggleable entry is currently collapsed, expand
+/// all of them; otherwise (everything already expanded), collapse all
+/// back to default. One-shot toggle so the user can rapidly switch
+/// between "show me everything" and "back to compact" states.
+///
+/// Reports the count operated on via `app.status` so the user always
+/// gets feedback — silent UI is the whole reason the original
+/// transcript expand surface felt broken on small screens.
+fn toggle_expand_all_transcript_entries(app: &mut TuiApp) {
+    let mut total_toggleable = 0usize;
+    let mut total_collapsed = 0usize;
+    for entry in &app.transcript {
+        if entry.is_toggleable() {
+            total_toggleable += 1;
+            if entry.collapsed {
+                total_collapsed += 1;
+            }
+        }
+    }
+    if total_toggleable == 0 {
+        app.status = "nothing expandable yet".to_string();
+        return;
+    }
+    let target_collapsed = total_collapsed == 0;
+    let mut changed = 0usize;
+    for entry in app.transcript.iter_mut() {
+        if !entry.is_toggleable() {
+            continue;
+        }
+        if entry.collapsed != target_collapsed {
+            entry.collapsed = target_collapsed;
+            changed += 1;
+        }
+    }
+    app.status = if target_collapsed {
+        format!("collapsed {changed} of {total_toggleable} transcript entries · Ctrl+E expand one")
+    } else {
+        format!("expanded {changed} of {total_toggleable} transcript entries · Ctrl+E collapse one")
+    };
 }
 
 fn latest_toggleable_transcript_entry(app: &TuiApp) -> Option<usize> {
@@ -4944,6 +5041,17 @@ fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
     lines
 }
 
+fn mouse_capture_hint() -> String {
+    let enabled = std::env::var_os("SQUEEZY_MOUSE_CAPTURE")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    if enabled {
+        "capture on · click buttons · Shift+drag selects · Shift+wheel scrollback".to_string()
+    } else {
+        "native scroll & select · SQUEEZY_MOUSE_CAPTURE=1 for clickable buttons".to_string()
+    }
+}
+
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     let card_width = width.clamp(36, 64) as usize;
     let inner = card_width.saturating_sub(2);
@@ -4982,7 +5090,7 @@ fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
         startup_card_row(
             inner,
             "mouse",
-            "Shift+drag to select · Shift+wheel for scrollback".to_string(),
+            mouse_capture_hint(),
             Style::default().fg(QUIET),
         ),
         Line::from(Span::styled(
@@ -5424,6 +5532,9 @@ fn assistant_content_without_repeated_tool_output(app: &TuiApp, content: &str) -
     let mut content = normalize_fence_boundaries(content);
     let outputs = recent_shell_tool_outputs(app);
     for output in &outputs {
+        if let Some(stripped) = strip_repeated_raw_tool_output(&content, output) {
+            content = stripped;
+        }
         if let Some(stripped) = strip_repeated_fenced_tool_output(&content, output) {
             content = stripped;
         }
@@ -5435,6 +5546,12 @@ fn assistant_content_without_repeated_tool_output(app: &TuiApp, content: &str) -
         return String::new();
     }
     content
+}
+
+fn strip_repeated_raw_tool_output(content: &str, output: &str) -> Option<String> {
+    let content = normalize_duplicate_tool_output(content);
+    let output = normalize_duplicate_tool_output(output);
+    (!output.is_empty() && content == output).then(String::new)
 }
 
 /// Insert a newline before any ```` ``` ```` that's glued to non-whitespace
@@ -5876,15 +5993,19 @@ fn format_user_prompt_entry(
     _selected: bool,
     width: Option<u16>,
 ) -> Vec<Line<'static>> {
+    let bang_offset = bang_command_marker_offset(&item.content);
     let mut content = item.content.split('\n').collect::<Vec<_>>();
     if content.is_empty() {
         content.push("");
     }
     let mut lines = Vec::with_capacity(content.len() + 3);
     lines.push(user_prompt_blank_line(width));
+    let mut line_start = 0usize;
     lines.extend(content.into_iter().enumerate().map(|(index, line)| {
         let marker = if index == 0 { "> " } else { "  " };
-        user_prompt_content_line(marker, line, width)
+        let rendered = user_prompt_content_line(marker, line, line_start, bang_offset, width);
+        line_start = line_start.saturating_add(line.len()).saturating_add(1);
+        rendered
     }));
     lines.push(user_prompt_blank_line(width));
     lines.push(Line::from(""));
@@ -5900,7 +6021,13 @@ fn user_prompt_blank_line(width: Option<u16>) -> Line<'static> {
     ])
 }
 
-fn user_prompt_content_line(marker: &'static str, line: &str, width: Option<u16>) -> Line<'static> {
+fn user_prompt_content_line(
+    marker: &'static str,
+    line: &str,
+    line_start: usize,
+    bang_offset: Option<usize>,
+    width: Option<u16>,
+) -> Line<'static> {
     let text_width = line.chars().count();
     let padding = user_prompt_surface_width(marker, width)
         .map(|surface_width| " ".repeat(surface_width.saturating_sub(text_width)))
@@ -5913,26 +6040,29 @@ fn user_prompt_content_line(marker: &'static str, line: &str, width: Option<u16>
     let slash_len = (marker == "> ")
         .then(|| input::match_slash_command_prefix(line))
         .flatten();
-    if let Some(len) = slash_len {
-        let (prefix, rest) = line.split_at(len);
-        spans.push(Span::styled(
-            prefix.to_string(),
-            Style::default().fg(AMBER).bg(PROMPT_BG),
-        ));
-        if !rest.is_empty() {
-            spans.push(Span::styled(
-                rest.to_string(),
-                Style::default().fg(Color::White).bg(PROMPT_BG),
-            ));
+    let style_text_at = |abs_offset: usize| -> Style {
+        let base = Style::default().bg(PROMPT_BG);
+        if Some(abs_offset) == bang_offset {
+            base.fg(BANG_RED)
+        } else if let Some(len) = slash_len {
+            if marker == "> " && abs_offset < len {
+                base.fg(AMBER)
+            } else {
+                base.fg(Color::White)
+            }
+        } else {
+            base.fg(Color::White)
         }
-    } else {
-        spans.push(Span::styled(
-            line.to_string(),
-            Style::default().fg(Color::White).bg(PROMPT_BG),
-        ));
-    }
+    };
+    push_styled_segments(&mut spans, line, line_start, style_text_at);
     spans.push(Span::styled(padding, Style::default().bg(PROMPT_BG)));
     Line::from(spans)
+}
+
+fn bang_command_marker_offset(text: &str) -> Option<usize> {
+    text.char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .and_then(|(offset, ch)| (ch == '!').then_some(offset))
 }
 
 fn user_prompt_surface_width(marker: &str, width: Option<u16>) -> Option<usize> {
@@ -8475,6 +8605,7 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     let slash_len = parts
         .first()
         .and_then(|first| input::match_slash_command_prefix(first));
+    let bang_offset = bang_command_marker_offset(&app.input);
     let mut line_start = 0usize;
     parts
         .iter()
@@ -8497,36 +8628,28 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
             let slash_split = if index == 0 { slash_len } else { None };
             let style_text_at = |abs_offset: usize| -> Style {
                 let base = Style::default().bg(PROMPT_BG);
-                match slash_split {
-                    Some(len) if abs_offset < len => base.fg(AMBER),
-                    _ => base.fg(Color::White),
+                if Some(abs_offset) == bang_offset {
+                    base.fg(BANG_RED)
+                } else {
+                    match slash_split {
+                        Some(len) if abs_offset < len => base.fg(AMBER),
+                        _ => base.fg(Color::White),
+                    }
                 }
             };
             if cursor >= line_start && cursor <= line_end {
                 let split_at = cursor.saturating_sub(line_start).min(line.len());
                 let (before, after) = line.split_at(split_at);
                 if !before.is_empty() {
-                    push_styled_segments(
-                        &mut spans,
-                        before,
-                        line_start,
-                        slash_split,
-                        style_text_at,
-                    );
+                    push_styled_segments(&mut spans, before, line_start, style_text_at);
                 }
                 spans.push(prompt_cursor_span());
                 if !after.is_empty() {
                     let after_start = line_start + split_at;
-                    push_styled_segments(
-                        &mut spans,
-                        after,
-                        after_start,
-                        slash_split,
-                        style_text_at,
-                    );
+                    push_styled_segments(&mut spans, after, after_start, style_text_at);
                 }
             } else {
-                push_styled_segments(&mut spans, line, line_start, slash_split, style_text_at);
+                push_styled_segments(&mut spans, line, line_start, style_text_at);
             }
             line_start = line_end.saturating_add(1);
             Line::from(spans)
@@ -8534,32 +8657,32 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Push one or two styled spans for `chunk`, splitting on the slash
-/// boundary when the chunk straddles it so the amber prefix and the white
-/// rest remain visually distinct on the live input row.
+/// Push styled spans for `chunk`, splitting anywhere the computed style
+/// changes so special command prefixes stay visually distinct from the rest
+/// of the prompt.
 fn push_styled_segments(
     spans: &mut Vec<Span<'static>>,
     chunk: &str,
     chunk_start: usize,
-    slash_split: Option<usize>,
     style_text_at: impl Fn(usize) -> Style,
 ) {
-    let chunk_end = chunk_start + chunk.len();
-    if let Some(split) = slash_split
-        && chunk_start < split
-        && split < chunk_end
-    {
-        let local = split - chunk_start;
-        let (head, tail) = chunk.split_at(local);
-        if !head.is_empty() {
-            spans.push(Span::styled(head.to_string(), style_text_at(chunk_start)));
+    let mut current = String::new();
+    let mut current_style: Option<Style> = None;
+    for (relative, ch) in chunk.char_indices() {
+        let offset = chunk_start + relative;
+        let style = style_text_at(offset);
+        if current_style.is_some_and(|existing| existing != style) {
+            spans.push(Span::styled(
+                std::mem::take(&mut current),
+                current_style.unwrap(),
+            ));
         }
-        if !tail.is_empty() {
-            spans.push(Span::styled(tail.to_string(), style_text_at(split)));
-        }
-        return;
+        current_style = Some(style);
+        current.push(ch);
     }
-    spans.push(Span::styled(chunk.to_string(), style_text_at(chunk_start)));
+    if let Some(style) = current_style {
+        spans.push(Span::styled(current, style));
+    }
 }
 
 fn prompt_blank_line() -> Line<'static> {
@@ -9079,7 +9202,7 @@ fn format_status_hints(app: &TuiApp) -> String {
             .to_string();
     } else if app.cancel.is_some() {
         let mut hint = String::from(
-            "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-E expand · Ctrl-T transcript · Ctrl-Y copy · /help",
+            "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-E expand · Alt-E expand all · Ctrl-T transcript · Ctrl-Y copy · /help",
         );
         if !app.prompt_queue.is_empty() {
             hint.push_str(&format!(" · Ctrl+X Q reorder ({})", app.prompt_queue.len()));
@@ -9094,10 +9217,10 @@ fn format_status_hints(app: &TuiApp) -> String {
         return "Ctrl-R restore last prompt · Enter send · Ctrl+J newline · /help".to_string();
     }
     let mut base = if app.alternate_scroll_enabled {
-        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand · Ctrl-T transcript · /help"
+        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand · Alt-E expand all · Ctrl-T transcript · /help"
             .to_string()
     } else {
-        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand · Ctrl-T transcript · /help"
+        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand · Alt-E expand all · Ctrl-T transcript · /help"
             .to_string()
     };
     if app.context_compaction_threshold > 0
@@ -10213,11 +10336,20 @@ impl TranscriptEntry {
         call: Option<ToolCall>,
         _transcript_default: TranscriptDefault,
     ) -> Self {
-        // Tool results are now uniformly collapsed-by-default: the new
-        // codex-style head-tail preview caps each card at ~5 lines (50
-        // for direct `!`-shell). `TranscriptDefault::Normal|Compact`
-        // still gates messages and logs but no longer the tool card,
-        // because the cap itself is the whole point of the preview.
+        // Tool results are uniformly collapsed-by-default for the happy
+        // path: the codex-style head-tail preview caps each card at ~5
+        // lines (50 for direct `!`-shell).
+        //
+        // Failed tool calls are the exception. The preview hides the
+        // actual error message under "Ctrl-E to expand", which is
+        // exactly the failure mode the user complained about — a row
+        // of red ✖ "Failed X" with no visible reason. Auto-expand on
+        // failure so the diagnostic is inline, without forcing a
+        // keypress per error to read it.
+        let collapsed_default = !matches!(
+            result.status,
+            ToolStatus::Error | ToolStatus::Denied | ToolStatus::Cancelled
+        );
         Self {
             id,
             kind: TranscriptEntryKind::ToolResult(Box::new(ToolTranscript {
@@ -10225,7 +10357,7 @@ impl TranscriptEntry {
                 result,
                 repeat_count: 1,
             })),
-            collapsed: true,
+            collapsed: collapsed_default,
         }
     }
 
@@ -10324,6 +10456,9 @@ impl TranscriptEntry {
                 TranscriptEntryKind::Message(item) => item.role == Role::Assistant,
                 _ => false,
             },
+            TranscriptCategory::Reasoning => {
+                matches!(self.kind, TranscriptEntryKind::Reasoning(_))
+            }
         }
     }
 
@@ -10570,6 +10705,12 @@ enum TranscriptCategory {
     Diffs,
     Receipts,
     Assistant,
+    /// Streamed model reasoning blocks (greyed-out chevrons in the
+    /// transcript). The most common Ctrl+E target — exposing it as a
+    /// dedicated `/expand reasoning` lets users on terminals where
+    /// Ctrl+E / Alt+E never reach the application still drive the
+    /// expansion surface from a keystroke they control.
+    Reasoning,
 }
 
 /// Mid-turn cost/token snapshot surfaced in the status bar so the user
@@ -10712,30 +10853,46 @@ impl TerminalGuard {
             DisableModifyOtherKeys,
             PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
+        // Mouse capture is opt-in: it hijacks native text selection
+        // and terminal scrollback (Shift+drag / Shift+wheel become the
+        // escape hatch, which is friction users shouldn't pay by
+        // default). When off, the click registry sleeps and `>`/`v`
+        // disclosure buttons are still reachable via the keyboard
+        // chord (`Ctrl+X Q` for the queue overlay).
+        // Opt in with `SQUEEZY_MOUSE_CAPTURE=1`.
+        let mouse_capture = std::env::var_os("SQUEEZY_MOUSE_CAPTURE")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
         match mode {
             TerminalMode::Inline => {
                 execute!(
                     stdout,
                     Print(CLEAR_SCROLLBACK_AND_VISIBLE),
                     Print(DISABLE_MOUSE_MODES),
-                    Print(ENABLE_MOUSE_CLICK_CAPTURE),
                     DisableAlternateScroll,
                     EnableBracketedPaste
                 )
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+                if mouse_capture {
+                    execute!(stdout, Print(ENABLE_MOUSE_CLICK_CAPTURE))
+                        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+                }
             }
             TerminalMode::AlternateScreen => {
                 execute!(
                     stdout,
                     EnterAlternateScreen,
                     Print(DISABLE_MOUSE_MODES),
-                    Print(ENABLE_MOUSE_CLICK_CAPTURE),
                     EnableAlternateScroll,
                     Clear(ClearType::All),
                     MoveTo(0, 0),
                     EnableBracketedPaste
                 )
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+                if mouse_capture {
+                    execute!(stdout, Print(ENABLE_MOUSE_CLICK_CAPTURE))
+                        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+                }
             }
         }
         let backend = CrosstermBackend::new(stdout);
