@@ -67,7 +67,42 @@ read = "deny"
 fn cli_prompt_format_defaults_to_text() {
     let cli = Cli::try_parse_from(["squeezy", "--prompt", "hi"]).expect("parse");
     assert_eq!(cli.format, PromptFormat::Default);
-    assert_eq!(cli.prompt.as_deref(), Some("hi"));
+    assert_eq!(cli.prompt, vec!["hi".to_string()]);
+}
+
+#[test]
+fn cli_prompt_accepts_repeated_values_in_order() {
+    let cli =
+        Cli::try_parse_from(["squeezy", "--prompt", "first", "--prompt", "second"]).expect("parse");
+    assert_eq!(cli.prompt, vec!["first".to_string(), "second".to_string()]);
+}
+
+#[test]
+fn cli_prompt_accepts_at_mentions_and_dash() {
+    let cli = Cli::try_parse_from([
+        "squeezy",
+        "--prompt",
+        "@notes.md",
+        "--prompt",
+        "-",
+        "--prompt",
+        "follow up",
+    ])
+    .expect("parse");
+    assert_eq!(
+        cli.prompt,
+        vec![
+            "@notes.md".to_string(),
+            "-".to_string(),
+            "follow up".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn cli_prompt_defaults_to_empty_when_omitted() {
+    let cli = Cli::try_parse_from(["squeezy"]).expect("parse");
+    assert!(cli.prompt.is_empty());
 }
 
 #[test]

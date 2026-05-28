@@ -24,6 +24,7 @@ use squeezy_llm::{
 
 mod auth;
 mod doctor;
+mod print_mode;
 mod providers;
 mod update;
 use auth::handle_auth_command;
@@ -80,8 +81,11 @@ struct Cli {
     list_providers: bool,
     #[arg(long, help = "List built-in model metadata")]
     list_models: bool,
-    #[arg(long, help = "Run one non-interactive prompt and print streamed text")]
-    prompt: Option<String>,
+    #[arg(
+        long,
+        help = "Run a non-interactive prompt and print streamed text. Repeat --prompt to queue prompts sequentially; use --prompt @path to expand a utf-8 file's contents, and --prompt - to consume piped stdin. Piped stdin is also read automatically and prepended to the first prompt when --prompt - is absent."
+    )]
+    prompt: Vec<String>,
     #[arg(
         long,
         value_name = "FORMAT",
@@ -413,9 +417,11 @@ async fn main() -> squeezy_core::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    if cli.format == PromptFormat::Json && cli.prompt.is_none() {
+    let stdin_is_tty = print_mode::stdin_is_tty();
+    let prompt_mode_active = !cli.prompt.is_empty() || !stdin_is_tty;
+    if cli.format == PromptFormat::Json && !prompt_mode_active {
         return Err(SqueezyError::Config(
-            "--format json requires --prompt; interactive sessions and subcommands only emit human-formatted output"
+            "--format json requires --prompt or piped stdin; interactive sessions and subcommands only emit human-formatted output"
                 .to_string(),
         ));
     }
@@ -526,7 +532,19 @@ async fn main() -> squeezy_core::Result<()> {
     if let Some(note) = &resume_resolution.note {
         eprintln!("{note}");
     }
-    if let Some(prompt) = cli.prompt {
+    if prompt_mode_active {
+        let prompts = print_mode::resolve_prompt_inputs(
+            &cli.prompt,
+            stdin_is_tty,
+            print_mode::read_stdin_to_string,
+            print_mode::read_prompt_file,
+        )?;
+        if prompts.is_empty() {
+            return Err(SqueezyError::Config(
+                "no prompts to send: piped stdin was empty and no --prompt was supplied"
+                    .to_string(),
+            ));
+        }
         // Non-interactive prompt mode has no TUI to seed the summary into,
         // so surface it on stderr before the streamed completion lands on
         // stdout. The TUI path skips this print because it shows the same
@@ -534,10 +552,10 @@ async fn main() -> squeezy_core::Result<()> {
         if let Some(summary) = &onboarding.visible_summary {
             eprintln!("{summary}");
         }
-        let result = run_prompt(
+        let result = run_prompts(
             config,
             provider,
-            prompt,
+            prompts,
             cli.format,
             resume_resolution.session_id,
         )
@@ -1449,7 +1467,7 @@ struct StartupModelSelection {
 }
 
 fn should_run_startup_model_selector(cli: &Cli, config: &AppConfig) -> squeezy_core::Result<bool> {
-    if cli.prompt.is_some() || cli.list_models || cli.list_providers {
+    if !cli.prompt.is_empty() || cli.list_models || cli.list_providers {
         return Ok(false);
     }
     if !io::stdin().is_terminal() {
@@ -2006,10 +2024,10 @@ fn format_optional_u64(value: Option<u64>) -> String {
     value.map_or_else(|| "-".to_string(), |value| value.to_string())
 }
 
-async fn run_prompt(
+async fn run_prompts(
     config: AppConfig,
     provider: Arc<dyn LlmProvider>,
-    prompt: String,
+    prompts: Vec<String>,
     format: PromptFormat,
     resume_session_id: Option<String>,
 ) -> squeezy_core::Result<()> {
@@ -2019,7 +2037,7 @@ async fn run_prompt(
     // append onto it instead of spawning a fresh row. The previous
     // response id (if any) is fed back so a server-side conversation
     // thread carries over even though prompt mode runs single-shot.
-    let (session, previous_response_id) = if let Some(id) = resume_session_id {
+    let (session, mut previous_response_id) = if let Some(id) = resume_session_id {
         let handle = store.open_session(id);
         let previous = store
             .show(handle.session_id())
@@ -2035,142 +2053,200 @@ async fn run_prompt(
             None,
         )
     };
-    let mut redactions: u64 = 0;
-    let redacted_prompt = redactor.redact(&prompt);
-    redactions = redactions.saturating_add(redacted_prompt.redactions);
-    let redacted_prompt = redacted_prompt.text;
-    let redacted_instructions = redactor.redact(&config.instructions);
-    redactions = redactions.saturating_add(redacted_instructions.redactions);
-    let redacted_instructions = redacted_instructions.text;
-    if let Some(session) = &session {
-        let _ = session.append_event(SessionEvent::new(
-            "user_message",
-            None,
-            Some(redacted_prompt.clone()),
-            serde_json::json!({}),
-        ));
-    }
-    let request = LlmRequest {
-        model: Arc::from(config.model.as_str()),
-        instructions: Arc::from(redacted_instructions),
-        input: Arc::from(vec![LlmInputItem::UserText(redacted_prompt.clone())]),
-        max_output_tokens: config.max_output_tokens,
-        response_verbosity: request_response_verbosity(&config, provider.name()),
-        reasoning_effort: request_reasoning_effort(&config, provider.name()),
-        previous_response_id,
-        cache_key: session
-            .as_ref()
-            .map(|session| format!("squeezy::{}", session.session_id())),
-        tools: Arc::from(Vec::new()),
-        store: config.store_responses,
-        tool_choice: None,
-        output_schema: None,
-        parallel_tool_calls: None,
-        beta_headers: std::sync::Arc::from(Vec::new()),
-    };
-    let mut stream = provider.stream_response(request, CancellationToken::new());
-    let mut stdout = io::stdout().lock();
-    let mut assistant = String::new();
 
-    while let Some(event) = stream.next().await {
-        let event = event?;
-        if format == PromptFormat::Json {
-            // Emit one JSON object per line for every event. The schema is
-            // `LlmEvent`'s serde tag/data form: `{"type":"text_delta",
-            // "data":"..."}`, `{"type":"completed","data":{...}}`, etc.
-            // Newline-delimited so callers can `jq -c` or `read -r` line
-            // by line; flushing on every line keeps the pipe responsive
-            // when the consumer is a long-running script.
-            let line = serde_json::to_string(&event).map_err(|err| {
-                SqueezyError::Parse(format!("failed to serialize prompt event: {err}"))
-            })?;
-            writeln!(stdout, "{line}")?;
-            stdout.flush()?;
+    let redacted_instructions_full = redactor.redact(&config.instructions);
+    let mut total_redactions: u64 = redacted_instructions_full.redactions;
+    let redacted_instructions = redacted_instructions_full.text;
+
+    let mut conversation: Vec<ResumeItem> = Vec::with_capacity(prompts.len() * 2);
+    let mut transcript: Vec<squeezy_core::TranscriptItem> = Vec::with_capacity(prompts.len() * 2);
+    let mut total_cost = squeezy_core::CostSnapshot::default();
+    let mut total_output_bytes: u64 = 0;
+    let mut turns_completed: u64 = 0;
+    let mut stop_status = SessionStatus::Completed;
+
+    for prompt in prompts {
+        let redacted_prompt_full = redactor.redact(&prompt);
+        total_redactions = total_redactions.saturating_add(redacted_prompt_full.redactions);
+        let redacted_prompt = redacted_prompt_full.text;
+        if let Some(session) = &session {
+            let _ = session.append_event(SessionEvent::new(
+                "user_message",
+                None,
+                Some(redacted_prompt.clone()),
+                serde_json::json!({}),
+            ));
         }
-        match event {
-            LlmEvent::Started => {}
-            LlmEvent::TextDelta(delta) => {
-                assistant.push_str(&delta);
-                if format == PromptFormat::Default {
-                    write!(stdout, "{delta}")?;
-                    stdout.flush()?;
-                }
+        let request = LlmRequest {
+            model: Arc::from(config.model.as_str()),
+            instructions: Arc::from(redacted_instructions.clone()),
+            input: Arc::from(vec![LlmInputItem::UserText(redacted_prompt.clone())]),
+            max_output_tokens: config.max_output_tokens,
+            response_verbosity: request_response_verbosity(&config, provider.name()),
+            reasoning_effort: request_reasoning_effort(&config, provider.name()),
+            previous_response_id: previous_response_id.clone(),
+            cache_key: session
+                .as_ref()
+                .map(|session| format!("squeezy::{}", session.session_id())),
+            tools: Arc::from(Vec::new()),
+            store: config.store_responses,
+            tool_choice: None,
+            output_schema: None,
+            parallel_tool_calls: None,
+            beta_headers: std::sync::Arc::from(Vec::new()),
+        };
+        let mut stream = provider.stream_response(request, CancellationToken::new());
+        let mut stdout = io::stdout().lock();
+        let mut assistant = String::new();
+        let mut turn_response_id: Option<String> = None;
+        let mut turn_cost = squeezy_core::CostSnapshot::default();
+        let mut cancelled = false;
+
+        while let Some(event) = stream.next().await {
+            let event = event?;
+            if format == PromptFormat::Json {
+                // Emit one JSON object per line for every event. The schema is
+                // `LlmEvent`'s serde tag/data form: `{"type":"text_delta",
+                // "data":"..."}`, `{"type":"completed","data":{...}}`, etc.
+                // Newline-delimited so callers can `jq -c` or `read -r` line
+                // by line; flushing on every line keeps the pipe responsive
+                // when the consumer is a long-running script.
+                let line = serde_json::to_string(&event).map_err(|err| {
+                    SqueezyError::Parse(format!("failed to serialize prompt event: {err}"))
+                })?;
+                writeln!(stdout, "{line}")?;
+                stdout.flush()?;
             }
-            LlmEvent::ToolCall(tool_call) => {
-                if format == PromptFormat::Default {
-                    eprintln!(
-                        "tool call requested but prompt mode has no tools: {}",
-                        tool_call.name
-                    );
+            match event {
+                LlmEvent::Started => {}
+                LlmEvent::TextDelta(delta) => {
+                    assistant.push_str(&delta);
+                    if format == PromptFormat::Default {
+                        write!(stdout, "{delta}")?;
+                        stdout.flush()?;
+                    }
                 }
+                LlmEvent::ToolCall(tool_call) => {
+                    if format == PromptFormat::Default {
+                        eprintln!(
+                            "tool call requested but prompt mode has no tools: {}",
+                            tool_call.name
+                        );
+                    }
+                }
+                LlmEvent::Completed {
+                    response_id, cost, ..
+                } => {
+                    if format == PromptFormat::Default {
+                        writeln!(stdout)?;
+                        stdout.flush()?;
+                    }
+                    turn_response_id = response_id;
+                    turn_cost = cost;
+                }
+                LlmEvent::Cancelled => {
+                    if format == PromptFormat::Default {
+                        eprintln!("cancelled");
+                    }
+                    cancelled = true;
+                    break;
+                }
+                LlmEvent::ReasoningDelta { .. } | LlmEvent::ReasoningDone(_) => {}
             }
-            LlmEvent::Completed {
-                response_id, cost, ..
-            } => {
-                if format == PromptFormat::Default {
-                    writeln!(stdout)?;
-                    stdout.flush()?;
-                }
-                let redacted_assistant = redactor.redact(&assistant);
-                redactions = redactions.saturating_add(redacted_assistant.redactions);
-                let redacted_assistant = redacted_assistant.text;
-                if let Some(session) = &session {
-                    let _ = session.append_event(SessionEvent::new(
-                        "assistant_completed",
-                        None,
-                        Some(redacted_assistant.clone()),
-                        serde_json::json!({ "response_id": response_id, "cost": cost }),
-                    ));
-                    let _ = session.write_resume_state(&SessionResumeState {
-                        resume_available: true,
-                        previous_response_id: response_id,
-                        conversation: vec![
-                            ResumeItem::UserText {
-                                text: redacted_prompt.clone(),
-                            },
-                            ResumeItem::AssistantText {
-                                text: redacted_assistant.clone(),
-                            },
-                        ],
-                        transcript: vec![
-                            squeezy_core::TranscriptItem::user(redacted_prompt.clone()),
-                            squeezy_core::TranscriptItem::assistant(redacted_assistant.clone()),
-                        ],
-                        context_attachments: Vec::new(),
-                        context_compaction: Default::default(),
-                    });
-                    let metrics = squeezy_core::SessionMetrics {
-                        turns: 1,
-                        model_output_bytes: redacted_assistant.len() as u64,
-                        redactions,
-                        provider: cost.clone(),
-                        ..squeezy_core::SessionMetrics::default()
-                    };
-                    let _ =
-                        session.finish(SessionStatus::Completed, cost.clone(), metrics, redactions);
-                }
-                if format == PromptFormat::Default {
-                    eprintln!(
-                        "tokens: input={} output={} cached={} cache_write={} cost_usd={}",
-                        format_token(cost.input_tokens),
-                        format_token(cost.output_tokens),
-                        format_token(cost.cached_input_tokens),
-                        format_token(cost.cache_write_input_tokens),
-                        format_usd_micros(cost.estimated_usd_micros)
-                    );
-                }
-            }
-            LlmEvent::Cancelled => {
-                if format == PromptFormat::Default {
-                    eprintln!("cancelled");
-                }
-                break;
-            }
-            LlmEvent::ReasoningDelta { .. } | LlmEvent::ReasoningDone(_) => {}
         }
+        drop(stdout);
+
+        let redacted_assistant_full = redactor.redact(&assistant);
+        total_redactions = total_redactions.saturating_add(redacted_assistant_full.redactions);
+        let redacted_assistant = redacted_assistant_full.text;
+
+        if let Some(session) = &session {
+            let _ = session.append_event(SessionEvent::new(
+                "assistant_completed",
+                None,
+                Some(redacted_assistant.clone()),
+                serde_json::json!({ "response_id": turn_response_id, "cost": turn_cost }),
+            ));
+        }
+
+        conversation.push(ResumeItem::UserText {
+            text: redacted_prompt.clone(),
+        });
+        conversation.push(ResumeItem::AssistantText {
+            text: redacted_assistant.clone(),
+        });
+        transcript.push(squeezy_core::TranscriptItem::user(redacted_prompt));
+        transcript.push(squeezy_core::TranscriptItem::assistant(
+            redacted_assistant.clone(),
+        ));
+        total_output_bytes = total_output_bytes.saturating_add(redacted_assistant.len() as u64);
+        turns_completed = turns_completed.saturating_add(1);
+        previous_response_id = turn_response_id;
+        add_cost(&mut total_cost, &turn_cost);
+
+        if format == PromptFormat::Default {
+            eprintln!(
+                "tokens: input={} output={} cached={} cache_write={} cost_usd={}",
+                format_token(turn_cost.input_tokens),
+                format_token(turn_cost.output_tokens),
+                format_token(turn_cost.cached_input_tokens),
+                format_token(turn_cost.cache_write_input_tokens),
+                format_usd_micros(turn_cost.estimated_usd_micros)
+            );
+        }
+
+        if cancelled {
+            stop_status = SessionStatus::Cancelled;
+            break;
+        }
+    }
+
+    if let Some(session) = &session {
+        let _ = session.write_resume_state(&SessionResumeState {
+            resume_available: matches!(stop_status, SessionStatus::Completed),
+            previous_response_id: previous_response_id.clone(),
+            conversation,
+            transcript,
+            context_attachments: Vec::new(),
+            context_compaction: Default::default(),
+        });
+        let metrics = squeezy_core::SessionMetrics {
+            turns: turns_completed,
+            model_output_bytes: total_output_bytes,
+            redactions: total_redactions,
+            provider: total_cost.clone(),
+            ..squeezy_core::SessionMetrics::default()
+        };
+        let _ = session.finish(stop_status, total_cost.clone(), metrics, total_redactions);
     }
 
     Ok(())
+}
+
+/// Sum two [`squeezy_core::CostSnapshot`] values component-wise so the
+/// session metrics still reflect the aggregate token / dollar spend when
+/// a single `squeezy --prompt` invocation queues several prompts.
+fn add_cost(total: &mut squeezy_core::CostSnapshot, next: &squeezy_core::CostSnapshot) {
+    total.input_tokens = add_optional(total.input_tokens, next.input_tokens);
+    total.output_tokens = add_optional(total.output_tokens, next.output_tokens);
+    total.reasoning_output_tokens =
+        add_optional(total.reasoning_output_tokens, next.reasoning_output_tokens);
+    total.cached_input_tokens = add_optional(total.cached_input_tokens, next.cached_input_tokens);
+    total.cache_write_input_tokens = add_optional(
+        total.cache_write_input_tokens,
+        next.cache_write_input_tokens,
+    );
+    total.estimated_usd_micros =
+        add_optional(total.estimated_usd_micros, next.estimated_usd_micros);
+}
+
+fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 fn format_token(value: Option<u64>) -> String {
