@@ -47,6 +47,7 @@ mod cache_policy;
 mod compatible;
 mod contribution;
 mod credentials;
+mod faux;
 mod google;
 mod lmstudio;
 pub mod model_discovery;
@@ -80,6 +81,7 @@ pub use credentials::{
     ApiKeyFuture, ApiKeySource, KeySource, RefreshableToken, ResolvedKey, StaticApiKey, TokenState,
     delete_api_key, resolve_api_key, resolve_api_key_with_inline, static_api_key_source,
 };
+pub use faux::{DEFAULT_FAUX_NAME, FauxProvider, FauxScript, FauxStep, FauxToolCall, FauxTurn};
 pub use google::GoogleProvider;
 pub use lmstudio::{
     DEFAULT_LMSTUDIO_BASE_URL, LMStudioConfig, LMStudioProvider, fetch_lmstudio_model_names,
