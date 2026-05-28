@@ -568,6 +568,105 @@ fn request_body_attaches_anthropic_cache_control_when_cache_key_is_set() {
 }
 
 #[test]
+fn request_body_marks_last_tool_with_cache_control_for_anthropic_routes() {
+    // Regression guard for the per-provider drift the centralized
+    // cache_policy module exists to prevent: the native Anthropic
+    // adapter marks the trailing tool entry with `cache_control`, and
+    // Anthropic-via-aggregator routes must do the same so the cached
+    // tool prefix actually hits on the next turn. Without this the
+    // aggregator route bills the tool list as fresh-input tokens on
+    // every multi-turn coding session.
+    let mut request = sample_request();
+    request.cache_key = Some("repo-context".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    let tools = body["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["function"]["name"], "grep");
+    assert_eq!(
+        tools[0]["cache_control"]["type"], "ephemeral",
+        "Anthropic-via-aggregator route must mark the last tool entry, mirroring native Anthropic"
+    );
+}
+
+#[test]
+fn request_body_marks_last_stable_tool_skipping_trailing_dynamic_mcp_tools() {
+    // The tool registry pushes MCP-sourced tools (whose names carry the
+    // `mcp__` prefix) to the end of the advertised list. The cache
+    // breakpoint must sit on the last first-party tool so an MCP
+    // `tools/list` refresh that reorders or replaces dynamic entries
+    // does not invalidate the cached tool prefix.
+    let mut request = sample_request();
+    request.cache_key = Some("repo-context".to_string());
+    request.tools = Arc::from(vec![
+        LlmToolSpec {
+            name: "grep".to_string(),
+            description: "search files".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: true,
+        }
+        .into(),
+        LlmToolSpec {
+            name: "read".to_string(),
+            description: "read file".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: true,
+        }
+        .into(),
+        LlmToolSpec {
+            name: "mcp__github__list_issues".to_string(),
+            description: "list github issues".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: true,
+        }
+        .into(),
+    ]);
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    let tools = body["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 3);
+    assert!(tools[0].get("cache_control").is_none());
+    assert_eq!(
+        tools[1]["cache_control"]["type"], "ephemeral",
+        "breakpoint must land on the last first-party tool, not on the MCP tail"
+    );
+    assert!(tools[2].get("cache_control").is_none());
+}
+
+#[test]
+fn request_body_omits_tool_cache_control_for_non_anthropic_routes() {
+    // The Anthropic-flavoured cache_control markers must not bleed onto
+    // OpenAI-via-aggregator (or any non-anthropic/* route). Those routes
+    // rely on the top-level `prompt_cache_key` instead — verified by the
+    // separate `request_body_forwards_prompt_cache_key_to_openai_via_openrouter`
+    // test — and OpenAI rejects unknown `cache_control` fields on tool
+    // entries with a 400.
+    let mut request = sample_request();
+    request.model = "openai/gpt-5.5".to_string().into();
+    request.cache_key = Some("repo-context".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    let tools = body["tools"].as_array().expect("tools array");
+    assert!(
+        tools[0].get("cache_control").is_none(),
+        "openai/* aggregator routes must not carry Anthropic-style cache_control"
+    );
+}
+
+#[test]
+fn request_body_omits_tool_cache_control_when_no_cache_key() {
+    // No cache_key on the request → no markers anywhere, including on
+    // the tool list. Avoids billing for cache writes on short, one-shot
+    // calls where reads will not amortize the write cost.
+    let mut request = sample_request();
+    request.model = "anthropic/claude-opus-4-7".to_string().into();
+    request.cache_key = None;
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    let tools = body["tools"].as_array().expect("tools array");
+    assert!(
+        tools[0].get("cache_control").is_none(),
+        "no cache_key → no cache_control on tools"
+    );
+}
+
+#[test]
 fn request_body_skips_cache_control_for_non_anthropic_routes() {
     let mut request = sample_request();
     request.model = "openai/gpt-5.5".to_string().into();
