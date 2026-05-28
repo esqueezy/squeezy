@@ -2992,6 +2992,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "similar",
  "squeezy-core",
  "squeezy-graph",
  "squeezy-mcp",
