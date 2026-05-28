@@ -922,10 +922,67 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
     }
 }
 
+/// Rewrite a `KeyEvent` carrying a raw ASCII control byte
+/// (`\x01`..=`\x1A`) as the canonical `Char(<lowercase letter>) +
+/// CONTROL` form so downstream dispatchers see a single shape.
+/// Skips `\x08`/`\x09`/`\x0A`/`\x0D` (Backspace/Tab/Enter/CR are
+/// already distinct `KeyCode` variants) and `\x1B` (Esc). Pass-through
+/// when the event already carries CONTROL.
+fn normalise_control_byte(mut key: KeyEvent) -> KeyEvent {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return key;
+    }
+    let KeyCode::Char(ch) = key.code else {
+        return key;
+    };
+    let byte = ch as u32;
+    let is_remappable = matches!(
+        byte,
+        0x01 | 0x02
+            | 0x03
+            | 0x04
+            | 0x05
+            | 0x06
+            | 0x07
+            | 0x0B
+            | 0x0C
+            | 0x0E
+            | 0x0F
+            | 0x10
+            | 0x11
+            | 0x12
+            | 0x13
+            | 0x14
+            | 0x15
+            | 0x16
+            | 0x17
+            | 0x18
+            | 0x19
+            | 0x1A
+    );
+    if !is_remappable {
+        return key;
+    }
+    let letter = char::from_u32(byte + 0x60).expect("0x01..0x1A maps into 'a'..'z'");
+    key.code = KeyCode::Char(letter);
+    key.modifiers |= KeyModifiers::CONTROL;
+    key
+}
+
 async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Result<bool> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Ok(false);
     }
+
+    // Normalise raw ASCII control bytes into their canonical
+    // `Char(<lowercase letter>) + CONTROL` form before any dispatcher
+    // sees them. Terminals that do not fully honour kitty's
+    // DISAMBIGUATE_ESCAPE_CODES (Apple Terminal, older tmux versions,
+    // many SSH targets) emit e.g. `Ctrl+E` as `KeyCode::Char('\x05')`
+    // with empty modifiers, which silently misses every keymap arm
+    // that looks for `Char('e') + CONTROL`. This is the source of the
+    // "Ctrl+E does nothing", "Ctrl+X Q types Q" class of bugs.
+    let key = normalise_control_byte(key);
 
     // Any keypress while a turn-done notification is up counts as the
     // user acknowledging it — drop the title back to cleared so the
@@ -958,21 +1015,13 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         app.status.clear();
     }
 
-    // `Ctrl+X` starts the queue-overlay chord. Accept *three* shapes
-    // because terminals disagree on how they encode `Ctrl+letter`:
-    //   - Modern (kitty `DISAMBIGUATE_ESCAPE_CODES` honoured):
-    //     `KeyCode::Char('x')` + `KeyModifiers::CONTROL`.
-    //   - Legacy fallback (terminal ignores or partially honours kitty
-    //     flags): the raw ASCII control byte `\x18` arrives as
-    //     `KeyCode::Char('\x18')` with `KeyModifiers::NONE`. This is
-    //     what bit me earlier — `Ctrl+X` set nothing and the next `Q`
-    //     leaked into the composer.
-    //   - SHIFT held: `KeyCode::Char('X')` + `CONTROL` (+ optional SHIFT).
-    // `ALT` disqualifies (we don't want to grab `Ctrl+Alt+X`).
-    let is_ctrl_x_modern = matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X'))
-        && key.modifiers.contains(KeyModifiers::CONTROL);
-    let is_ctrl_x_raw = matches!(key.code, KeyCode::Char('\u{18}'));
-    if (is_ctrl_x_modern || is_ctrl_x_raw) && !key.modifiers.contains(KeyModifiers::ALT) {
+    // `Ctrl+X` starts the queue-overlay chord. `normalise_control_byte`
+    // above already canonicalised any raw `\x18` byte to
+    // `Char('x') + CONTROL`, so a single check is enough here.
+    if matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+    {
         app.pending_chord = Some(ChordPrefix::CtrlX);
         app.status = "Ctrl+X… (Q opens queue · Esc cancels)".to_string();
         return Ok(false);

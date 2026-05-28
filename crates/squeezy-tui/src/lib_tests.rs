@@ -317,6 +317,49 @@ async fn ctrl_x_q_chord_toggles_queue_overlay() {
     assert!(app.prompt_queue_overlay.is_none(), "overlay should close");
 }
 
+#[test]
+fn raw_control_byte_normalises_to_char_plus_control() {
+    use super::normalise_control_byte;
+    let raw = KeyEvent::new(KeyCode::Char('\u{05}'), KeyModifiers::NONE);
+    let out = normalise_control_byte(raw);
+    assert_eq!(out.code, KeyCode::Char('e'));
+    assert!(out.modifiers.contains(KeyModifiers::CONTROL));
+
+    let modern = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+    let out = normalise_control_byte(modern);
+    assert_eq!(out.code, KeyCode::Char('e'));
+    assert!(out.modifiers.contains(KeyModifiers::CONTROL));
+
+    // Tab/Enter/CR/Esc/Backspace bytes stay as Char form (they have
+    // dedicated KeyCode variants in the well-behaved path).
+    for byte in ['\u{09}', '\u{0A}', '\u{0D}', '\u{1B}', '\u{08}'] {
+        let raw = KeyEvent::new(KeyCode::Char(byte), KeyModifiers::NONE);
+        let out = normalise_control_byte(raw);
+        assert_eq!(out.code, KeyCode::Char(byte));
+        assert!(!out.modifiers.contains(KeyModifiers::CONTROL));
+    }
+}
+
+#[tokio::test]
+async fn raw_ctrl_e_dispatches_expand_action() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    assert!(app.transcript[0].collapsed);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('\u{05}'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("raw ctrl+e");
+    assert!(
+        !app.transcript[0].collapsed,
+        "raw \\x05 must reach the ExpandSelectedTranscriptEntry keymap arm",
+    );
+}
+
 #[tokio::test]
 async fn chord_leader_accepts_raw_ctrl_x_byte() {
     // Some terminals emit Ctrl+X as the literal ASCII control byte
