@@ -7,7 +7,7 @@ use squeezy_core::{
     AzureOpenAiConfig, DEFAULT_AZURE_OPENAI_API_VERSION, ProviderTransportConfig, Result,
     SqueezyError,
 };
-use squeezy_llm::{LlmInputItem, LlmProvider, LlmRequest, OpenAiProvider};
+use squeezy_llm::{CacheSpec, LlmInputItem, LlmProvider, LlmRequest, OpenAiProvider};
 use tokio_util::sync::CancellationToken;
 
 const API_KEY_ENV: &str = "AZURE_OPENAI_API_KEY";
@@ -54,6 +54,7 @@ async fn azure_openai_responses_streaming_costly() -> Result<()> {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

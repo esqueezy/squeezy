@@ -1,5 +1,5 @@
 use super::*;
-use crate::{LlmInputItem, LlmOutputSchema, LlmToolCall, LlmToolSpec};
+use crate::{CacheSpec, LlmInputItem, LlmOutputSchema, LlmToolCall, LlmToolSpec};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -14,6 +14,7 @@ fn request_body_uses_responses_streaming_shape() {
         reasoning_effort: None,
         previous_response_id: Some("resp_123".to_string()),
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "grep".to_string(),
@@ -81,6 +82,7 @@ fn request_body_serializes_tool_outputs_as_input_items() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -107,6 +109,7 @@ fn request_body_preserves_function_tool_order() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
@@ -148,6 +151,7 @@ fn request_body_includes_reasoning_and_text_verbosity_when_set() {
         reasoning_effort: Some(squeezy_core::ReasoningEffort::High),
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -181,6 +185,7 @@ fn request_body_maps_squeezy_verbosity_to_openai_values() {
             reasoning_effort: None,
             previous_response_id: None,
             cache_key: None,
+            cache: CacheSpec::default(),
             tools: Arc::from(Vec::new()),
             store: false,
             tool_choice: None,
@@ -206,6 +211,7 @@ fn request_body_emits_prompt_cache_key_when_set() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -229,6 +235,7 @@ fn request_body_omits_prompt_cache_key_when_unset() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -533,6 +540,7 @@ fn request_body_emits_text_format_when_output_schema_set() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         parallel_tool_calls: None,
@@ -566,6 +574,7 @@ fn request_body_omits_text_format_when_output_schema_unset() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: None,
@@ -595,6 +604,7 @@ fn request_body_emits_text_format_without_verbosity_when_only_schema_set() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: Some(LlmOutputSchema {
@@ -624,6 +634,7 @@ fn request_body_emits_parallel_tool_calls_false_when_disabled() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: None,
@@ -648,6 +659,7 @@ fn request_body_omits_parallel_tool_calls_when_unset_or_default_true() {
             reasoning_effort: None,
             previous_response_id: None,
             cache_key: None,
+            cache: CacheSpec::default(),
             tools: Arc::from(Vec::new()),
             store: false,
             output_schema: None,

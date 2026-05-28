@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use squeezy_core::{DEFAULT_MAX_OUTPUT_TOKENS, Result, SqueezyError};
-use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream};
+use squeezy_llm::{CacheSpec, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream};
 use tokio_util::sync::CancellationToken;
 
 pub const COSTLY_FLAG: &str = "SQUEEZY_RUN_COSTLY_TESTS";
@@ -72,6 +72,7 @@ pub fn echo_request(model: &str, prompt: &str) -> LlmRequest {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

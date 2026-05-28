@@ -11,7 +11,7 @@ use squeezy_core::{
     AppConfig, PermissionAction, PermissionCapability, PermissionRequest, PermissionVerdict, Role,
     TranscriptItem, TurnId,
 };
-use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
+use squeezy_llm::{CacheSpec, LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
 use squeezy_skills::{APPROVAL_POLICY_DOC_PATH, bundled_doc};
 use squeezy_telemetry::{TelemetryClient, TelemetryEvent};
 use tokio_util::sync::CancellationToken;
@@ -170,6 +170,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

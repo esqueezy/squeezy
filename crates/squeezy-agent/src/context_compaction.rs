@@ -11,7 +11,7 @@ use squeezy_core::{
     ContextCompactionTrigger, ContextEstimate, ContextPin, Redactor, SqueezyError,
     context_attachment_preview,
 };
-use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
+use squeezy_llm::{CacheSpec, LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
 use squeezy_store::{
     ResumeItem, SessionHandle, SqueezyStore, StoredReadSnapshot, StoredToolReceipt,
 };
@@ -666,6 +666,7 @@ pub(crate) async fn compact_conversation_with_strategy(
         tools: Arc::from(Vec::new()),
         store: false,
         cache_key: None,
+        cache: CacheSpec::default(),
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,

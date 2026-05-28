@@ -10,6 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
 use super::*;
+use crate::CacheSpec;
 use crate::credentials::ApiKeySource;
 
 static NONCE: AtomicU64 = AtomicU64::new(0);
@@ -374,6 +375,7 @@ fn codex_request_body_forces_store_false_and_encrypted_content() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: std::sync::Arc::from(Vec::new()),
         // Caller may have set `store=true`; the codex provider must
         // override it because the backend rejects `store=true`.

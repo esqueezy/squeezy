@@ -142,8 +142,17 @@ impl OpenAiProvider {
         if let Some(previous_response_id) = &request.previous_response_id {
             body["previous_response_id"] = json!(previous_response_id);
         }
-        if let Some(cache_key) = &request.cache_key {
-            body["prompt_cache_key"] = json!(cache_key);
+        let cache_spec = request.effective_cache_spec();
+        if let Some(key) = cache_spec.key.as_deref() {
+            body["prompt_cache_key"] = json!(key);
+        }
+        if cache_spec.retention == crate::CacheRetention::Long {
+            // OpenAI Responses API exposes a top-level
+            // `prompt_cache_retention` opt-in for extended (24h) prompt
+            // caching. We surface the legacy `Short` retention as the
+            // implicit default (field omitted) so existing callers stay
+            // on the provider's short-lived in-memory cache pool.
+            body["prompt_cache_retention"] = json!("24h");
         }
         if let Some(max_output_tokens) = request.max_output_tokens {
             body["max_output_tokens"] = json!(max_output_tokens);

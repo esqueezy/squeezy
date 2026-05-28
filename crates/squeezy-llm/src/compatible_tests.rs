@@ -1,5 +1,5 @@
 use super::*;
-use crate::{LlmEvent, LlmInputItem, LlmToolSpec};
+use crate::{CacheSpec, LlmEvent, LlmInputItem, LlmToolSpec};
 use serde_json::{Value, json};
 use squeezy_core::OpenAiCompatiblePreset;
 use std::sync::Arc;
@@ -30,6 +30,7 @@ fn sample_request() -> LlmRequest {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "grep".to_string(),
@@ -167,6 +168,7 @@ fn request_body_serialises_assistant_function_call_history() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

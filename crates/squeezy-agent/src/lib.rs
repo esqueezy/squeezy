@@ -28,10 +28,11 @@ use squeezy_core::{
 };
 use squeezy_hooks::{HookEvent, HookRegistry};
 use squeezy_llm::{
-    INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
-    ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate, StopReason, capabilities_for,
-    estimate_cost, estimate_request_context_calibrated, fetch_ollama_context_window,
+    CacheSpec, INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY,
+    INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream,
+    LlmToolCall, LlmToolSpec, ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate,
+    StopReason, capabilities_for, estimate_cost, estimate_request_context_calibrated,
+    fetch_ollama_context_window,
 };
 use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
@@ -1848,6 +1849,7 @@ impl Agent {
                 None
             },
             cache_key: self.session_prompt_cache_key(),
+            cache: CacheSpec::default(),
             tools: Arc::from(request_tool_specs(
                 &all_tool_specs,
                 mode,
@@ -4326,6 +4328,7 @@ impl TurnRuntime {
                 reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
                 previous_response_id: previous_response_id.clone(),
                 cache_key: self.session_prompt_cache_key(),
+                cache: CacheSpec::default(),
                 tools: Arc::from(request_tool_specs(
                     &self.all_tool_specs,
                     active_mode,
@@ -6620,6 +6623,7 @@ async fn run_subagent_rounds(
             reasoning_effort: request_reasoning_effort(config, parent.provider.name()),
             previous_response_id: None,
             cache_key: None,
+            cache: CacheSpec::default(),
             tools: Arc::from(tool_specs),
             store: false,
             tool_choice: effective_tool_choice(config.tool_choice.as_deref(), round),
@@ -9090,6 +9094,7 @@ Working target: {:?}",
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -10340,12 +10345,13 @@ fn replay_hash(value: &impl Serialize) -> String {
 
 /// Returns a stable LlmRequest snapshot for replay-hash purposes.
 ///
-/// `cache_key` is derived from the live session id, which changes
-/// across record/replay runs, so it must be excluded from the
-/// divergence hash.
+/// The cache hint (legacy `cache_key` and the new `cache` field) is
+/// derived from the live session id, which changes across record/replay
+/// runs, so it must be excluded from the divergence hash.
 fn replay_request_view(request: &LlmRequest) -> LlmRequest {
     let mut view = request.clone();
     view.cache_key = None;
+    view.cache = CacheSpec::default();
     view
 }
 

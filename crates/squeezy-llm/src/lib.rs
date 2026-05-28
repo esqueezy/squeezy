@@ -51,6 +51,7 @@ pub use tokens::{
 
 pub use anthropic::AnthropicProvider;
 pub use bedrock::BedrockProvider;
+pub use cache_policy::{CacheRetention, CacheSpec};
 pub use compatible::OpenAiCompatibleProvider;
 pub use contribution::{
     AnthropicContribution, AnthropicContributionConfig, GoogleContribution,
@@ -113,7 +114,22 @@ pub struct LlmRequest {
     pub response_verbosity: Option<ResponseVerbosity>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub previous_response_id: Option<String>,
+    /// **Deprecated.** Use [`LlmRequest::cache`] instead. Retained as a
+    /// backwards-compatibility shim for callers that have not yet migrated:
+    /// providers lift a `Some(key)` value into
+    /// `CacheSpec { key: Some(key), retention: CacheRetention::Short }`
+    /// via [`LlmRequest::effective_cache_spec`], preserving the historical
+    /// 5m / in-memory provider-default behavior.
     pub cache_key: Option<String>,
+    /// Universal prompt-cache hint — affinity key plus retention window.
+    /// Supersedes the legacy [`LlmRequest::cache_key`] field. Set
+    /// `retention: CacheRetention::Long` to opt into Anthropic's 1h `ttl`
+    /// and OpenAI's `prompt_cache_retention: "24h"`. `Short` keeps the
+    /// per-provider default cache window; `None` disables caching
+    /// entirely. `CacheSpec::default()` (the value used when this field
+    /// is omitted from a deserialized request) is the disabled state.
+    #[serde(default)]
+    pub cache: CacheSpec,
     pub tools: Arc<[Arc<LlmToolSpec>]>,
     pub store: bool,
     /// Optional `tool_choice` hint to forward to the provider when tools are
@@ -164,6 +180,7 @@ impl LlmRequest {
             reasoning_effort: None,
             previous_response_id: None,
             cache_key: None,
+            cache: CacheSpec::default(),
             tools: Arc::from(Vec::new()),
             store: false,
             tool_choice: None,
@@ -171,6 +188,32 @@ impl LlmRequest {
             parallel_tool_calls: None,
             beta_headers: empty_beta_headers(),
         }
+    }
+
+    /// Effective cache hint after lifting the deprecated
+    /// [`LlmRequest::cache_key`] field into the new [`CacheSpec`] shape.
+    ///
+    /// The merge rule preserves backwards compatibility while letting new
+    /// callers exclusively populate `cache`:
+    /// - The explicit `cache.retention` always wins. Callers asking for
+    ///   `CacheRetention::Long` get extended retention regardless of
+    ///   whether they used the legacy `cache_key` slot for the affinity
+    ///   key.
+    /// - When `cache.key` is `None`, it inherits from `cache_key` so
+    ///   legacy callers still surface a `prompt_cache_key` on OpenAI
+    ///   routes.
+    /// - When `cache.retention` is `None` *and* the legacy `cache_key` is
+    ///   set, retention is lifted to `Short` so old callers preserve
+    ///   their pre-retention-enum provider-default behavior.
+    pub fn effective_cache_spec(&self) -> CacheSpec {
+        let mut spec = self.cache.clone();
+        if spec.key.is_none() {
+            spec.key = self.cache_key.clone();
+        }
+        if spec.retention == CacheRetention::None && self.cache_key.is_some() {
+            spec.retention = CacheRetention::Short;
+        }
+        spec
     }
 }
 

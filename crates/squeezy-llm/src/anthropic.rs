@@ -13,7 +13,7 @@ use crate::{
     AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
     LlmStream, LlmToolCall, ReasoningKind, ReasoningPayload,
     anthropic_betas::anthropic_header_value,
-    cache_policy::{CachePolicy, json_markers, should_apply_caching},
+    cache_policy::{CachePolicy, CacheRetention, json_markers, should_apply_caching},
     credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
     oauth::{anthropic_oauth_beta_header, is_anthropic_oauth_token},
     overflow::{OverflowSignal, Usage as OverflowUsage, classify_terminal},
@@ -95,6 +95,16 @@ impl AnthropicProvider {
     pub(crate) fn request_body(request: &LlmRequest, auth: AnthropicAuthScheme) -> Value {
         let policy = CachePolicy::AUTO;
         let prompt_caching = should_apply_caching("anthropic", request);
+        // Retention drives the `ttl` field on every `cache_control`
+        // marker we emit. `effective_cache_spec` lifts the legacy
+        // `cache_key` slot into `{ retention: Short }` so pre-retention
+        // callers stay on the 5m default; new callers asking for
+        // `Long` get `ttl: "1h"` on each marker.
+        let retention = if prompt_caching {
+            request.effective_cache_spec().retention
+        } else {
+            CacheRetention::None
+        };
         let max_tokens = request
             .max_output_tokens
             .map(u64::from)
@@ -119,8 +129,9 @@ impl AnthropicProvider {
                 &request.instructions,
                 prompt_caching && policy.system,
                 auth,
+                retention,
             ),
-            "messages": anthropic_messages(&normalized_input, prompt_caching, policy),
+            "messages": anthropic_messages(&normalized_input, prompt_caching, policy, retention),
             "max_tokens": max_tokens,
             "stream": true,
         });
@@ -148,7 +159,7 @@ impl AnthropicProvider {
                 })
                 .collect();
             if prompt_caching && policy.tools {
-                json_markers::mark_last_stable_tool(&mut tool_values);
+                json_markers::mark_last_stable_tool(&mut tool_values, retention);
             }
             body["tools"] = Value::Array(tool_values);
         }
@@ -207,7 +218,12 @@ fn merge_oauth_beta_header(caller: Option<&str>, auth: AnthropicAuthScheme) -> O
     }
 }
 
-fn anthropic_system(instructions: &str, prompt_caching: bool, auth: AnthropicAuthScheme) -> Value {
+fn anthropic_system(
+    instructions: &str,
+    prompt_caching: bool,
+    auth: AnthropicAuthScheme,
+    retention: CacheRetention,
+) -> Value {
     let identity_first = matches!(auth, AnthropicAuthScheme::Oauth);
     if !prompt_caching {
         if identity_first {
@@ -229,7 +245,7 @@ fn anthropic_system(instructions: &str, prompt_caching: bool, auth: AnthropicAut
             "type": "text",
             "text": OAUTH_SYSTEM_IDENTITY,
         })];
-        let with_user = json_markers::system_array_with_marker(instructions);
+        let with_user = json_markers::system_array_with_marker(instructions, retention);
         if let Value::Array(items) = with_user {
             blocks.extend(items);
         } else {
@@ -237,10 +253,15 @@ fn anthropic_system(instructions: &str, prompt_caching: bool, auth: AnthropicAut
         }
         return Value::Array(blocks);
     }
-    json_markers::system_array_with_marker(instructions)
+    json_markers::system_array_with_marker(instructions, retention)
 }
 
-fn anthropic_messages(input: &[LlmInputItem], prompt_caching: bool, policy: CachePolicy) -> Value {
+fn anthropic_messages(
+    input: &[LlmInputItem],
+    prompt_caching: bool,
+    policy: CachePolicy,
+    retention: CacheRetention,
+) -> Value {
     let mut messages = Vec::new();
     for item in input {
         match item {
@@ -316,7 +337,7 @@ fn anthropic_messages(input: &[LlmInputItem], prompt_caching: bool, policy: Cach
     if prompt_caching {
         match policy.messages {
             crate::cache_policy::MessageStrategy::LatestUserMessage => {
-                json_markers::mark_last_user_block(&mut messages);
+                json_markers::mark_last_user_block(&mut messages, retention);
             }
         }
     }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::anthropic_betas::{anthropic_header_value, bedrock_extra_body_betas};
-use crate::{LlmInputItem, LlmToolCall, LlmToolSpec};
+use crate::{CacheRetention, CacheSpec, LlmInputItem, LlmToolCall, LlmToolSpec};
 use std::sync::Arc;
 
 #[test]
@@ -14,6 +14,7 @@ fn request_body_uses_messages_streaming_shape() {
         reasoning_effort: None,
         previous_response_id: Some("ignored".to_string()),
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "read_file".to_string(),
@@ -63,6 +64,7 @@ fn request_body_preserves_function_tool_order() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
@@ -103,6 +105,7 @@ fn request_body_uses_model_limit_when_output_cap_unset() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -138,6 +141,7 @@ fn request_body_maps_tool_roundtrip_messages() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -185,6 +189,7 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -233,6 +238,7 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "tool_a".to_string(),
@@ -281,6 +287,7 @@ fn request_body_places_tool_cache_control_on_last_first_party_tool_when_mcp_tool
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "apply_patch".to_string(),
@@ -346,6 +353,7 @@ fn request_body_falls_back_to_last_tool_when_all_advertised_tools_are_mcp() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "mcp__linear__create_issue".to_string(),
@@ -387,6 +395,7 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "tool_a".to_string(),
@@ -422,6 +431,7 @@ fn request_body_skips_cache_control_when_cache_key_is_absent() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -733,7 +743,7 @@ fn anthropic_messages_attach_thinking_blocks_to_assistant_turn() {
         LlmInputItem::Reasoning(payload),
         LlmInputItem::AssistantText("answer".to_string()),
     ];
-    let messages = anthropic_messages(&input, false, CachePolicy::AUTO);
+    let messages = anthropic_messages(&input, false, CachePolicy::AUTO, CacheRetention::None);
     let arr = messages.as_array().expect("array");
     assert_eq!(arr.len(), 1, "thinking + text fold into one assistant turn");
     let content = arr[0]["content"].as_array().expect("content array");
@@ -770,6 +780,7 @@ fn beta_headers_route_into_http_header() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -832,6 +843,7 @@ fn oauth_auth_scheme_prepends_claude_code_identity_to_system() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -875,6 +887,7 @@ fn api_key_auth_scheme_keeps_system_string_unchanged() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

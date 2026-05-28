@@ -18,7 +18,7 @@ use squeezy_core::{
     DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_MODEL, OllamaConfig, ProviderTransportConfig, Result,
     SqueezyError,
 };
-use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, OllamaProvider};
+use squeezy_llm::{CacheSpec, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, OllamaProvider};
 use tokio_util::sync::CancellationToken;
 
 const OPT_IN_ENV: &str = "SQUEEZY_OLLAMA_SMOKE";
@@ -59,6 +59,7 @@ async fn ollama_local_streaming_smoke() -> Result<()> {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

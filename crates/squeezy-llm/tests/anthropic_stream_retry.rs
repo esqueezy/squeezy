@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use squeezy_core::{AnthropicConfig, ProviderTransportConfig};
-use squeezy_llm::{AnthropicProvider, LlmEvent, LlmProvider, LlmRequest};
+use squeezy_llm::{AnthropicProvider, CacheSpec, LlmEvent, LlmProvider, LlmRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -132,6 +132,7 @@ fn build_request(model: &str) -> LlmRequest {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

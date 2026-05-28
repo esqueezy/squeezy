@@ -5,7 +5,7 @@ use squeezy_core::{
     DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_OPENAI_BASE_URL, DEFAULT_OPENAI_MODEL, OpenAiConfig,
     ProviderTransportConfig, Result, SqueezyError,
 };
-use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, OpenAiProvider};
+use squeezy_llm::{CacheSpec, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, OpenAiProvider};
 use tokio_util::sync::CancellationToken;
 
 const COSTLY_FLAG: &str = "SQUEEZY_RUN_COSTLY_TESTS";
@@ -42,6 +42,7 @@ async fn openai_responses_streaming_costly() -> Result<()> {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: std::sync::Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

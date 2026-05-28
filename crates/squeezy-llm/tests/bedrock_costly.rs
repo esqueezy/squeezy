@@ -6,7 +6,7 @@ use std::sync::Arc;
 use squeezy_core::{
     BedrockConfig, DEFAULT_BEDROCK_MODEL, DEFAULT_BEDROCK_REGION, ProviderTransportConfig, Result,
 };
-use squeezy_llm::{BedrockProvider, LlmInputItem, LlmProvider, LlmRequest};
+use squeezy_llm::{BedrockProvider, CacheSpec, LlmInputItem, LlmProvider, LlmRequest};
 use tokio_util::sync::CancellationToken;
 
 const MODEL_ENV: &str = "SQUEEZY_COSTLY_BEDROCK_MODEL";
@@ -42,6 +42,7 @@ async fn bedrock_converse_streaming_costly() -> Result<()> {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

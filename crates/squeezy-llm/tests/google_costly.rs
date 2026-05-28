@@ -6,7 +6,7 @@ use std::sync::Arc;
 use squeezy_core::{
     DEFAULT_GOOGLE_BASE_URL, DEFAULT_GOOGLE_MODEL, GoogleConfig, ProviderTransportConfig, Result,
 };
-use squeezy_llm::{GoogleProvider, LlmInputItem, LlmProvider, LlmRequest};
+use squeezy_llm::{CacheSpec, GoogleProvider, LlmInputItem, LlmProvider, LlmRequest};
 use tokio_util::sync::CancellationToken;
 
 const API_KEY_ENV: &str = "GEMINI_API_KEY";
@@ -49,6 +49,7 @@ async fn google_gemini_streaming_costly() -> Result<()> {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
