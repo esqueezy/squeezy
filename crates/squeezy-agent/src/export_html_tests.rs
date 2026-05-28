@@ -27,6 +27,7 @@ fn meta(id: &str) -> SessionMetadata {
         event_count: 0,
         token_calibration: Default::default(),
         parent_id: None,
+        schema_version: squeezy_store::SESSION_METADATA_SCHEMA_VERSION,
     }
 }
 
