@@ -42,7 +42,7 @@ use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
     PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
     SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity,
-    TranscriptDefault, TranscriptItem, TuiAlternateScreen, TuiTheme,
+    TranscriptDefault, TranscriptItem, TuiAlternateScreen, TuiSynchronizedOutput, TuiTheme,
 };
 use squeezy_llm::LlmProvider;
 use squeezy_store::{BugReportBundle, BugReportOptions, CleanupMode, SessionQuery};
@@ -136,6 +136,16 @@ const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1006h";
 // without needing a dedicated constant.
 const CLEAR_SCROLLBACK_AND_VISIBLE: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H";
 const RESET_KEYBOARD_ENHANCEMENT_FLAGS: &str = "\x1b[<u";
+/// DEC private mode 2026 — Begin Synchronized Update. Capable terminals
+/// buffer subsequent output and flip the cell grid atomically when they
+/// see the matching End Synchronized Update sequence. Terminals that do
+/// not implement the mode silently ignore both sequences, so emitting
+/// them is safe across the ecosystem.
+const BEGIN_SYNCHRONIZED_UPDATE: &str = "\x1b[?2026h";
+/// DEC private mode 2026 — End Synchronized Update. Pairs with
+/// [`BEGIN_SYNCHRONIZED_UPDATE`]; capable terminals commit the buffered
+/// frame atomically on receipt.
+const END_SYNCHRONIZED_UPDATE: &str = "\x1b[?2026l";
 const TITLE_SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TITLE_SPINNER_INTERVAL_MS: u64 = 100;
 const TITLE_NOTIFICATION_GLYPH: &str = "●";
@@ -172,6 +182,67 @@ fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+}
+
+/// Resolve the user's synchronized-output policy into a runtime flag.
+/// `Auto` consults the environment for known capable terminals; the
+/// sequences themselves are spec'd as silent no-ops on terminals that
+/// do not understand them, so a false negative here only forfeits the
+/// optimisation — it never corrupts output.
+fn resolve_synchronized_output(policy: TuiSynchronizedOutput) -> bool {
+    match policy {
+        TuiSynchronizedOutput::Always => true,
+        TuiSynchronizedOutput::Never => false,
+        // Wrap `env::var_os` in a closure so the HRTB on the resolver
+        // (`for<'a> Fn(&'a str) -> _`) is satisfied — passing the bare
+        // monomorphised function pointer here trips lifetime inference.
+        TuiSynchronizedOutput::Auto => {
+            detect_synchronized_output_support_from_env(|key: &str| env::var_os(key))
+        }
+    }
+}
+
+/// Pure capability heuristic for DEC mode 2026 support based on
+/// environment-variable signals exposed by the host terminal.
+/// Factored out for testability — production calls thread
+/// [`std::env::var_os`] in; tests pass a closure backed by a fixture
+/// map so the resolver is exercised without mutating real process env.
+fn detect_synchronized_output_support_from_env<F>(env_get: F) -> bool
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    if env_get("KITTY_WINDOW_ID").is_some()
+        || env_get("WEZTERM_PANE").is_some()
+        || env_get("WEZTERM_EXECUTABLE").is_some()
+        || env_get("GHOSTTY_RESOURCES_DIR").is_some()
+        || env_get("ALACRITTY_LOG").is_some()
+        || env_get("ALACRITTY_WINDOW_ID").is_some()
+        || env_get("ITERM_SESSION_ID").is_some()
+    {
+        return true;
+    }
+    if let Some(prog) = env_get("TERM_PROGRAM") {
+        let prog = prog.to_string_lossy().to_ascii_lowercase();
+        if matches!(
+            prog.as_str(),
+            "iterm.app" | "iterm2" | "wezterm" | "ghostty" | "kitty" | "vscode"
+        ) {
+            return true;
+        }
+    }
+    if let Some(term) = env_get("TERM") {
+        let term = term.to_string_lossy().to_ascii_lowercase();
+        if term.contains("kitty")
+            || term.contains("wezterm")
+            || term.contains("ghostty")
+            || term.contains("alacritty")
+            || term.contains("foot")
+            || term.contains("contour")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,7 +432,8 @@ async fn run_inner(
     // first frame uses the auto-detected tone and pops to the override on
     // the next redraw.
     apply_theme_overrides(config.tui.theme);
-    let mut terminal = TerminalGuard::enter(config.tui.alternate_screen)?;
+    let mut terminal =
+        TerminalGuard::enter(config.tui.alternate_screen, config.tui.synchronized_output)?;
     let resume_session_id =
         match maybe_pick_resume_session(&mut terminal, &config, resume_session_id, &startup)? {
             ResumeStartup::Use(id) => Some(id),
@@ -11377,11 +11449,20 @@ struct TerminalGuard {
     exit_hint: Option<String>,
     startup_flushed: bool,
     transcript_flushed_len: usize,
+    /// Resolved DEC 2026 synchronized-output flag. Computed once at
+    /// startup from the user's [`TuiSynchronizedOutput`] policy plus
+    /// terminal-capability detection; consulted around every frame
+    /// draw to wrap output in Begin/End Synchronized Update sequences.
+    synchronized_output: bool,
 }
 
 impl TerminalGuard {
-    fn enter(alternate_screen: TuiAlternateScreen) -> Result<Self> {
+    fn enter(
+        alternate_screen: TuiAlternateScreen,
+        synchronized_output: TuiSynchronizedOutput,
+    ) -> Result<Self> {
         let mode = TerminalMode::from(alternate_screen);
+        let synchronized_output = resolve_synchronized_output(synchronized_output);
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         let mut stdout = io::stdout();
         let _ = execute!(
@@ -11448,6 +11529,7 @@ impl TerminalGuard {
             exit_hint: None,
             startup_flushed: false,
             transcript_flushed_len: 0,
+            synchronized_output,
         })
     }
 
@@ -11461,15 +11543,43 @@ impl TerminalGuard {
             self.wipe_inline_viewport_for_resize()?;
         }
         self.apply_terminal_title(app)?;
-        match self.mode {
+        // DEC 2026 Begin Synchronized Update bracket. Writing it through
+        // the backend buffer puts it ahead of the cell-diff bytes that
+        // `terminal.draw` is about to emit; capable terminals start
+        // buffering at parse time and commit the whole frame when they
+        // see the matching End Synchronized Update written below.
+        // Unsupported terminals silently ignore both sequences.
+        if self.synchronized_output {
+            let _ = self
+                .terminal
+                .backend_mut()
+                .write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes());
+        }
+        // `terminal.draw` returns a value that borrows the terminal,
+        // which would block the post-draw `backend_mut` reborrow below.
+        // Collapse to `Result<(), io::Error>` immediately so the borrow
+        // ends before we reach for the backend again.
+        let draw_outcome: io::Result<()> = match self.mode {
             TerminalMode::Inline => {
                 self.flush_history(app)?;
-                self.terminal.draw(|frame| render_inline(frame, app))
+                self.terminal
+                    .draw(|frame| render_inline(frame, app))
+                    .map(|_| ())
             }
-            TerminalMode::AlternateScreen => self.terminal.draw(|frame| render(frame, app)),
+            TerminalMode::AlternateScreen => {
+                self.terminal.draw(|frame| render(frame, app)).map(|_| ())
+            }
+        };
+        // Always emit ESU (even when draw fails) so the terminal does
+        // not stay parked in a buffered-update state — the spec lets a
+        // capable terminal time the bracket out on its own, but closing
+        // it promptly keeps the visible frame in sync with our state.
+        if self.synchronized_output {
+            let backend = self.terminal.backend_mut();
+            let _ = backend.write_all(END_SYNCHRONIZED_UPDATE.as_bytes());
+            let _ = backend.flush();
         }
-        .map(|_| ())
-        .map_err(|err| SqueezyError::Terminal(err.to_string()))
+        draw_outcome.map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
 
     fn apply_terminal_title(&mut self, app: &mut TuiApp) -> Result<()> {

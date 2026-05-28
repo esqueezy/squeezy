@@ -1486,6 +1486,10 @@ impl AppConfig {
             toml_string(self.tui.alternate_screen.as_str())
         ));
         output.push_str(&format!(
+            "synchronized_output = {}\n",
+            toml_string(self.tui.synchronized_output.as_str())
+        ));
+        output.push_str(&format!(
             "theme = {}\n",
             toml_string(self.tui.theme.as_str())
         ));
@@ -6259,6 +6263,47 @@ impl TuiAlternateScreen {
     }
 }
 
+/// Controls whether the TUI wraps each frame draw in DEC mode 2026
+/// (Begin/End Synchronized Update). Capable terminals (kitty, WezTerm,
+/// Ghostty, iTerm2, Alacritty) flip the entire frame atomically, which
+/// eliminates the cell-by-cell tearing visible during fast streaming.
+/// The sequences are spec'd to be silently ignored by terminals that
+/// do not implement them, so emitting them is safe by default.
+///
+/// `Auto` enables wrapping when capability is signalled via environment
+/// (`KITTY_WINDOW_ID`, `WEZTERM_PANE`, `GHOSTTY_RESOURCES_DIR`,
+/// `ALACRITTY_LOG`, `TERM_PROGRAM` matching iTerm/WezTerm/Ghostty, or
+/// `TERM` containing `kitty`/`alacritty`/`wezterm`/`ghostty`). `Always`
+/// forces wrapping on regardless of detection (useful for terminals
+/// that do not advertise themselves but honour the sequence). `Never`
+/// disables wrapping entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiSynchronizedOutput {
+    Auto,
+    Always,
+    Never,
+}
+
+impl TuiSynchronizedOutput {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "always" | "on" | "true" => Some(Self::Always),
+            "never" | "off" | "false" => Some(Self::Never),
+            _ => None,
+        }
+    }
+}
+
 /// User-controlled palette for the TUI. `System` defers to terminal-tone
 /// detection (`COLORFGBG`); `Dark` and `Light` pin the tone but keep the
 /// default amber/gold accent identity; `Catppuccin` swaps to mauve accents
@@ -6341,6 +6386,10 @@ pub struct TuiConfig {
     pub tool_output_verbosity: ToolOutputVerbosity,
     pub transcript_default: TranscriptDefault,
     pub alternate_screen: TuiAlternateScreen,
+    /// DEC 2026 synchronized-output policy. `Auto` flips on for known
+    /// capable terminals; `Always` forces it on; `Never` disables it.
+    /// See [`TuiSynchronizedOutput`] for the capability heuristic.
+    pub synchronized_output: TuiSynchronizedOutput,
     pub show_reasoning_usage: bool,
     /// Render-time grouping of adjacent same-tool same-status calls into
     /// one card (e.g. three back-to-back `read_file` calls become "Read 3
@@ -6386,6 +6435,9 @@ impl TuiConfig {
             alternate_screen: settings
                 .alternate_screen
                 .unwrap_or(TuiAlternateScreen::Auto),
+            synchronized_output: settings
+                .synchronized_output
+                .unwrap_or(TuiSynchronizedOutput::Auto),
             show_reasoning_usage: settings.show_reasoning_usage.unwrap_or(true),
             coalesce_tool_runs: settings.coalesce_tool_runs.unwrap_or(true),
             status_line: settings.status_line,
@@ -6413,6 +6465,7 @@ pub struct TuiSettings {
     pub tool_output_verbosity: Option<ToolOutputVerbosity>,
     pub transcript_default: Option<TranscriptDefault>,
     pub alternate_screen: Option<TuiAlternateScreen>,
+    pub synchronized_output: Option<TuiSynchronizedOutput>,
     pub show_reasoning_usage: Option<bool>,
     pub coalesce_tool_runs: Option<bool>,
     pub status_line: Option<Vec<String>>,
@@ -6433,6 +6486,7 @@ impl TuiSettings {
                 "tool_output_verbosity",
                 "transcript_default",
                 "alternate_screen",
+                "synchronized_output",
                 "show_reasoning_usage",
                 "coalesce_tool_runs",
                 "status_line",
@@ -6476,6 +6530,12 @@ impl TuiSettings {
                 source,
                 &field(path, "alternate_screen"),
             )?,
+            synchronized_output: tui_synchronized_output_value(
+                table,
+                "synchronized_output",
+                source,
+                &field(path, "synchronized_output"),
+            )?,
             show_reasoning_usage: bool_value(
                 table,
                 "show_reasoning_usage",
@@ -6518,6 +6578,7 @@ impl TuiSettings {
         replace_if_some(&mut self.tool_output_verbosity, next.tool_output_verbosity);
         replace_if_some(&mut self.transcript_default, next.transcript_default);
         replace_if_some(&mut self.alternate_screen, next.alternate_screen);
+        replace_if_some(&mut self.synchronized_output, next.synchronized_output);
         replace_if_some(&mut self.show_reasoning_usage, next.show_reasoning_usage);
         replace_if_some(&mut self.status_line, next.status_line);
         replace_if_some(
@@ -6846,6 +6907,7 @@ pub fn user_settings_template() -> &'static str {
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
 # alternate_screen = "auto"     # auto | always | never
+# synchronized_output = "auto"  # auto | always | never (DEC 2026 atomic redraw)
 # show_reasoning_usage = true
 
 # [mcp.servers.docs]
@@ -6978,6 +7040,7 @@ pub fn project_settings_template() -> &'static str {
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
 # alternate_screen = "auto"     # auto | always | never
+# synchronized_output = "auto"  # auto | always | never (DEC 2026 atomic redraw)
 # show_reasoning_usage = true
 
 # [mcp.servers.docs]
@@ -8451,6 +8514,22 @@ fn tui_alternate_screen_value(
             "{source}: {path}: invalid TUI alternate screen {value:?}; expected auto, never, or always"
         ))),
     }
+}
+
+fn tui_synchronized_output_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<TuiSynchronizedOutput>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    TuiSynchronizedOutput::parse(&value).map(Some).ok_or_else(|| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: invalid TUI synchronized output {value:?}; expected auto, always, or never"
+        ))
+    })
 }
 
 fn tui_theme_value(
