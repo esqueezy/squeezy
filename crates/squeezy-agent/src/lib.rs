@@ -26,7 +26,7 @@ use squeezy_core::{
     TurnMetrics, context_attachment_preview, context_attachment_storage_text,
     default_settings_path, detect_context_attachment_kind,
 };
-use squeezy_hooks::{HookEvent, HookRegistry};
+use squeezy_hooks::{HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
@@ -3807,30 +3807,54 @@ impl TurnRuntime {
             .map(|handle| format!("squeezy::{}", handle.session_id()))
     }
 
-    /// Fan out a `HookEvent::PreTurn` to every registered handler when
-    /// a hook registry is installed. Mutation replies are logged but
-    /// not yet applied — that wiring is deferred to a follow-up
-    /// commit so this first hooks foundation stays minimal and
-    /// strictly observational. Returns immediately when no registry
-    /// is configured so the no-hooks path costs zero allocations.
-    fn dispatch_pre_turn(&self) {
-        let Some(registry) = self.hooks.as_ref() else {
-            return;
-        };
+    /// Fan out a `HookPayload::PreTurn` to every registered handler.
+    ///
+    /// Returns the concatenation of every handler's
+    /// `{"extra_instructions": "..."}` mutate field (in registration
+    /// order, separated by blank lines). Callers append the returned
+    /// text to the per-turn instructions so PreTurn handlers can
+    /// inject preamble (timestamps, on-call context, policy reminders)
+    /// without rewriting the whole instructions string. Mutate values
+    /// without a string `extra_instructions` field are logged for audit
+    /// and otherwise ignored. Returns `None` when no registry is
+    /// configured, when the registry is empty, or when no handler
+    /// proposed an extras mutation, so the no-hooks path costs zero
+    /// allocations.
+    fn dispatch_pre_turn(&self) -> Option<String> {
+        let registry = self.hooks.as_ref()?;
         if registry.is_empty() {
-            return;
+            return None;
         }
-        let payload = json!({ "turn_index": self.turn_id.to_string() });
-        let results = registry.dispatch(HookEvent::PreTurn, payload);
+        let results = registry.dispatch(HookPayload::PreTurn {
+            turn_id: self.turn_id.to_string(),
+        });
+        let mut extra_blocks: Vec<String> = Vec::new();
         for (idx, result) in results.iter().enumerate() {
             if let Some(mutate) = result.mutate.as_ref() {
-                tracing::debug!(
-                    target: "squeezy::hooks",
-                    turn_id = %self.turn_id,
-                    handler_index = idx,
-                    %mutate,
-                    "PreTurn handler proposed a mutation (not yet applied)"
-                );
+                let extracted = mutate
+                    .get("extra_instructions")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                if let Some(text) = extracted {
+                    tracing::debug!(
+                        target: "squeezy::hooks",
+                        turn_id = %self.turn_id,
+                        handler_index = idx,
+                        chars = text.chars().count(),
+                        "PreTurn handler appended extra_instructions"
+                    );
+                    extra_blocks.push(text);
+                } else {
+                    tracing::debug!(
+                        target: "squeezy::hooks",
+                        turn_id = %self.turn_id,
+                        handler_index = idx,
+                        %mutate,
+                        "PreTurn handler proposed an unsupported mutation shape (ignored)"
+                    );
+                }
             }
             if !result.allow {
                 tracing::debug!(
@@ -3842,14 +3866,127 @@ impl TurnRuntime {
                 );
             }
         }
+        if extra_blocks.is_empty() {
+            None
+        } else {
+            Some(extra_blocks.join("\n\n"))
+        }
     }
 
-    /// Fan out a `HookEvent::PreCompact` to every registered handler
-    /// when a hook registry is installed. `before_tokens` is the
-    /// pre-compaction estimate so handlers can decide whether to log,
-    /// veto (advisory today; not yet enforced), or react. The hook is
-    /// skipped entirely when no registry is configured so the no-hooks
-    /// path stays allocation-free.
+    /// Fan out a `HookPayload::UserPromptSubmit` carrying the user
+    /// input. Handlers can rewrite the prompt by returning
+    /// `mutate = {"prompt": "..."}`; later handlers see the
+    /// rewrites by earlier ones, so the final string the loop sees
+    /// is the result of the whole chain.
+    fn dispatch_user_prompt_submit(&self, input: String) -> String {
+        let Some(registry) = self.hooks.as_ref() else {
+            return input;
+        };
+        if registry.is_empty() {
+            return input;
+        }
+        let mut current = input;
+        let results = registry.dispatch(HookPayload::UserPromptSubmit {
+            prompt: current.clone(),
+            turn_id: self.turn_id.to_string(),
+        });
+        for (idx, result) in results.iter().enumerate() {
+            if let Some(mutate) = result.mutate.as_ref() {
+                let replacement = mutate
+                    .get("prompt")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                if let Some(replacement) = replacement {
+                    tracing::debug!(
+                        target: "squeezy::hooks",
+                        turn_id = %self.turn_id,
+                        handler_index = idx,
+                        old_chars = current.chars().count(),
+                        new_chars = replacement.chars().count(),
+                        "UserPromptSubmit handler rewrote prompt"
+                    );
+                    current = replacement;
+                } else {
+                    tracing::debug!(
+                        target: "squeezy::hooks",
+                        turn_id = %self.turn_id,
+                        handler_index = idx,
+                        %mutate,
+                        "UserPromptSubmit handler proposed an unsupported mutation shape (ignored)"
+                    );
+                }
+            }
+            if !result.allow {
+                tracing::debug!(
+                    target: "squeezy::hooks",
+                    turn_id = %self.turn_id,
+                    handler_index = idx,
+                    message = result.message.as_deref().unwrap_or(""),
+                    "UserPromptSubmit handler returned allow=false (not yet enforced)"
+                );
+            }
+        }
+        current
+    }
+
+    /// Fan out a `HookPayload::SessionStart` once per session. Fires
+    /// on the first turn of the session because hooks are installed
+    /// via [`Agent::set_hooks`] after construction — dispatching from
+    /// `Agent::new` would skip handlers the caller wires up later.
+    fn dispatch_session_start(&self) {
+        let Some(registry) = self.hooks.as_ref() else {
+            return;
+        };
+        if registry.is_empty() {
+            return;
+        }
+        let session_id = self.session_id().unwrap_or_else(|| "unknown".to_string());
+        let results = registry.dispatch(HookPayload::SessionStart {
+            session_id,
+            reason: "turn_started".to_string(),
+        });
+        log_observational_results("SessionStart", self.turn_id, &results);
+    }
+
+    /// Fan out a `HookPayload::Setup` once per agent boot in this
+    /// workspace. Companion to [`TurnRuntime::dispatch_session_start`]
+    /// — handlers may install caches or run maintenance tasks
+    /// without retripping on resumes.
+    fn dispatch_setup(&self) {
+        let Some(registry) = self.hooks.as_ref() else {
+            return;
+        };
+        if registry.is_empty() {
+            return;
+        }
+        let workspace = self.config.workspace_root.display().to_string();
+        let results = registry.dispatch(HookPayload::Setup {
+            workspace,
+            reason: "agent_boot".to_string(),
+        });
+        log_observational_results("Setup", self.turn_id, &results);
+    }
+
+    /// Fan out a `HookPayload::Stop` at the very end of a turn.
+    /// Audit handlers can capture turn boundaries without listening
+    /// to the `AgentEvent::Completed` channel directly.
+    fn dispatch_stop(&self) {
+        let Some(registry) = self.hooks.as_ref() else {
+            return;
+        };
+        if registry.is_empty() {
+            return;
+        }
+        let results = registry.dispatch(HookPayload::Stop {
+            turn_id: self.turn_id.to_string(),
+        });
+        log_observational_results("Stop", self.turn_id, &results);
+    }
+
+    /// Fan out a `HookPayload::PreCompact` when a hook registry is
+    /// installed. `before_tokens` is the pre-compaction estimate so
+    /// handlers can decide whether to log, veto (advisory today; not
+    /// yet enforced), or react.
     fn dispatch_pre_compact(&self, before_tokens: u64) {
         let Some(registry) = self.hooks.as_ref() else {
             return;
@@ -3857,37 +3994,16 @@ impl TurnRuntime {
         if registry.is_empty() {
             return;
         }
-        let payload = json!({
-            "turn_index": self.turn_id.to_string(),
-            "before_tokens": before_tokens,
+        let results = registry.dispatch(HookPayload::PreCompact {
+            turn_id: self.turn_id.to_string(),
+            before_tokens,
         });
-        let results = registry.dispatch(HookEvent::PreCompact, payload);
-        for (idx, result) in results.iter().enumerate() {
-            if let Some(mutate) = result.mutate.as_ref() {
-                tracing::debug!(
-                    target: "squeezy::hooks",
-                    turn_id = %self.turn_id,
-                    handler_index = idx,
-                    %mutate,
-                    "PreCompact handler proposed a mutation (not yet applied)"
-                );
-            }
-            if !result.allow {
-                tracing::debug!(
-                    target: "squeezy::hooks",
-                    turn_id = %self.turn_id,
-                    handler_index = idx,
-                    message = result.message.as_deref().unwrap_or(""),
-                    "PreCompact handler returned allow=false (not yet enforced)"
-                );
-            }
-        }
+        log_observational_results("PreCompact", self.turn_id, &results);
     }
 
-    /// Fan out a `HookEvent::PostCompact` carrying the before/after
+    /// Fan out a `HookPayload::PostCompact` carrying the before/after
     /// token counts so handlers can observe how much the rewrite
-    /// shrank the conversation. Mirrors `dispatch_pre_compact` in
-    /// every other respect.
+    /// shrank the conversation.
     fn dispatch_post_compact(&self, before_tokens: u64, after_tokens: u64) {
         let Some(registry) = self.hooks.as_ref() else {
             return;
@@ -3895,35 +4011,30 @@ impl TurnRuntime {
         if registry.is_empty() {
             return;
         }
-        let payload = json!({
-            "turn_index": self.turn_id.to_string(),
-            "before_tokens": before_tokens,
-            "after_tokens": after_tokens,
+        let results = registry.dispatch(HookPayload::PostCompact {
+            turn_id: self.turn_id.to_string(),
+            before_tokens,
+            after_tokens,
         });
-        let results = registry.dispatch(HookEvent::PostCompact, payload);
-        for (idx, result) in results.iter().enumerate() {
-            if let Some(mutate) = result.mutate.as_ref() {
-                tracing::debug!(
-                    target: "squeezy::hooks",
-                    turn_id = %self.turn_id,
-                    handler_index = idx,
-                    %mutate,
-                    "PostCompact handler proposed a mutation (not yet applied)"
-                );
-            }
-            if !result.allow {
-                tracing::debug!(
-                    target: "squeezy::hooks",
-                    turn_id = %self.turn_id,
-                    handler_index = idx,
-                    message = result.message.as_deref().unwrap_or(""),
-                    "PostCompact handler returned allow=false (not yet enforced)"
-                );
-            }
-        }
+        log_observational_results("PostCompact", self.turn_id, &results);
     }
 
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
+        // Session-scoped hooks fire on the first turn so handlers
+        // installed via `Agent::set_hooks` *after* `Agent::new`
+        // still observe the boundary. Cheap when no hooks are
+        // registered (each helper short-circuits before building a
+        // payload).
+        if self.turn_id.get() == 1 {
+            self.dispatch_setup();
+            self.dispatch_session_start();
+        }
+        // UserPromptSubmit gives handlers a chance to rewrite the
+        // user's input before any skill activation or routing. The
+        // `mutate.prompt` field of any handler's reply replaces the
+        // in-flight prompt; the chain runs in registration order so
+        // later handlers see earlier rewrites.
+        let input = self.dispatch_user_prompt_submit(input);
         let task_title = input.clone();
         let activation = self.tools.activate_skills_for_input(&input)?;
         let base_instructions = match self.tools.format_active_skills(&activation.skills) {
@@ -4247,10 +4358,16 @@ impl TurnRuntime {
         // skill append below invalidates this on a revision boundary.
         let mut instructions_cache: [Option<String>; 2] = [None, None];
         // Fire the PreTurn hook once per user turn, immediately before
-        // the first round's LLM request is built. Mutation replies are
-        // currently observational only — see `dispatch_pre_turn` for
-        // the rationale.
-        self.dispatch_pre_turn();
+        // the first round's LLM request is built. Handlers can append
+        // turn-scoped instructions via the typed mutate contract —
+        // see `dispatch_pre_turn`. The returned text is appended to
+        // `request_instructions` so the next-round builder picks it
+        // up the same way it picks up implicit skill instructions.
+        if let Some(extra) = self.dispatch_pre_turn() {
+            request_instructions.push_str("\n\n");
+            request_instructions.push_str(&extra);
+            instructions_cache = [None, None];
+        }
         // One-shot "the model promised follow-up tool use but stopped"
         // recovery latch. Set when a round ends with `finish_reason=stop`,
         // zero tool calls, AND the assistant text contains an intent
@@ -4916,16 +5033,27 @@ impl TurnRuntime {
             }
             seen_tool_outputs.remember_results(&results);
 
-            let outputs = results
+            // Capture each tool result's terminal status alongside its
+            // model-visible output so the post-commit `PostTool` hook
+            // below fires with the same status the agent reported for
+            // the corresponding tool round.
+            let outputs_with_status: Vec<(LlmInputItem, String, ToolStatus)> = results
                 .into_iter()
                 .map(|pending| {
                     let output = self.redactor.redact(&pending.result.model_output()).text;
-                    LlmInputItem::FunctionCallOutput {
+                    let tool_name = pending.result.tool_name.clone();
+                    let status = pending.result.status;
+                    let item = LlmInputItem::FunctionCallOutput {
                         call_id: pending.result.call_id,
                         output,
-                    }
+                    };
+                    (item, tool_name, status)
                 })
-                .collect::<Vec<_>>();
+                .collect();
+            let outputs: Vec<LlmInputItem> = outputs_with_status
+                .iter()
+                .map(|(item, _, _)| item.clone())
+                .collect();
             conversation.extend(
                 tool_calls
                     .iter()
@@ -4940,6 +5068,17 @@ impl TurnRuntime {
                     tool_output_summary(output),
                     json!({ "output": resume_item_for_json(output.clone()) }),
                 );
+            }
+            // PostTool fires after every output has landed in the
+            // conversation buffer; handlers that rebuild transcript-
+            // derived state (export, audit) see the post-commit view
+            // of the turn with the same status the agent reported.
+            if let Some(registry) = self.hooks.as_ref() {
+                for (item, tool_name, status) in &outputs_with_status {
+                    if let LlmInputItem::FunctionCallOutput { call_id, .. } = item {
+                        dispatch_post_tool(registry, self.turn_id, tool_name, call_id, *status);
+                    }
+                }
             }
 
             // Mid-turn compaction (F75): if the provider reported usage
@@ -5135,6 +5274,9 @@ impl TurnRuntime {
             metrics.clone(),
         ));
         self.session_metrics.lock().await.merge_turn(metrics);
+        // Stop fires after telemetry persistence so audit handlers
+        // see the final TurnMetrics already on disk.
+        self.dispatch_stop();
     }
 
     async fn persist_turn_state(&self, input: TurnPersistInput<'_>) {
@@ -5657,6 +5799,7 @@ struct PermissionDecisionContext {
     session_log: Option<SessionHandle>,
     conversation_state: Option<Arc<Mutex<ConversationState>>>,
     telemetry: TelemetryClient,
+    hooks: Option<Arc<HookRegistry>>,
 }
 
 impl PermissionDecisionContext {
@@ -5676,6 +5819,7 @@ impl PermissionDecisionContext {
             session_log: context.session_log.clone(),
             conversation_state: context.conversation_state.clone(),
             telemetry: context.telemetry.clone(),
+            hooks: context.hooks.clone(),
         }
     }
 
@@ -6112,6 +6256,7 @@ async fn handle_subagent_call(
         .redactor
         .redact(&compact_text(&request.prompt, 240))
         .text;
+    let subagent_id = lease.id;
     log_session_event(
         context.session_log.as_ref(),
         &context.redactor,
@@ -6124,6 +6269,9 @@ async fn handle_subagent_call(
             "thoroughness": request.thoroughness,
         }),
     );
+    if let Some(registry) = context.hooks.as_ref() {
+        dispatch_subagent_start(registry, context.turn_id, subagent_id, kind.as_str());
+    }
     let _ = context
         .tx
         .send(AgentEvent::SubagentStarted {
@@ -6142,6 +6290,15 @@ async fn handle_subagent_call(
     let child_context = context.with_cancel(child_cancel.clone());
     let execution = run_subagent(&child_context, kind, request).await;
     drop(lease);
+    if let Some(registry) = context.hooks.as_ref() {
+        dispatch_subagent_stop(
+            registry,
+            context.turn_id,
+            subagent_id,
+            kind.as_str(),
+            execution.status_label,
+        );
+    }
     broker
         .metrics
         .merge_subagent_tool_metrics(&execution.metrics);
@@ -7938,12 +8095,13 @@ async fn flush_parallel_batch(
     }
 }
 
-/// Fan out a `HookEvent::PreToolUse` to every registered handler when
-/// a hook registry is installed. Returns the first handler-supplied
-/// deny message (in registration order) so the caller can short-circuit
-/// the tool execution with `ToolStatus::Denied`. Mutation replies are
-/// still observational — applying them is left to a follow-up commit
-/// that wires the per-tool input pipeline. Returns `None` when no
+/// Fan out a `HookPayload::PreToolUse` to every registered handler.
+///
+/// Returns the first handler-supplied deny message (in registration
+/// order) so the caller can short-circuit the tool execution with
+/// `ToolStatus::Denied`. Mutation replies are observational at this
+/// site — applying argument rewrites is deferred to the typed
+/// [`squeezy_hooks::AgentHookBus`] path. Returns `None` when no
 /// registry is configured, when the registry is empty, or when every
 /// handler returned `allow=true`, so the no-hooks path costs zero
 /// allocations.
@@ -7952,12 +8110,11 @@ fn dispatch_pre_tool_use(context: &ToolExecutionContext<'_>, call: &ToolCall) ->
     if registry.is_empty() {
         return None;
     }
-    let payload = json!({
-        "turn_id": context.turn_id.to_string(),
-        "tool_name": call.name,
-        "call_id": call.call_id,
+    let results = registry.dispatch(HookPayload::PreToolUse {
+        turn_id: context.turn_id.to_string(),
+        tool_name: call.name.clone(),
+        call_id: call.call_id.clone(),
     });
-    let results = registry.dispatch(HookEvent::PreToolUse, payload);
     let mut deny_message: Option<String> = None;
     for (idx, result) in results.iter().enumerate() {
         if let Some(mutate) = result.mutate.as_ref() {
@@ -7991,10 +8148,11 @@ fn dispatch_pre_tool_use(context: &ToolExecutionContext<'_>, call: &ToolCall) ->
     deny_message
 }
 
-/// Fan out a `HookEvent::PostToolUse` to every registered handler after
-/// a tool result is available. Same observational contract as
-/// [`dispatch_pre_tool_use`]; the payload adds `status` so audit
-/// handlers can record per-tool outcomes.
+/// Fan out a `HookPayload::PostToolUse` after a tool result is
+/// available. When the tool reported a non-success status, also
+/// fans out a [`HookPayload::PostToolUseFailure`] so failure-only
+/// handlers can filter on the discriminant without re-parsing
+/// `status`.
 fn dispatch_post_tool_use(context: &ToolExecutionContext<'_>, result: &ToolResult) {
     let Some(registry) = context.hooks.as_ref() else {
         return;
@@ -8002,34 +8160,272 @@ fn dispatch_post_tool_use(context: &ToolExecutionContext<'_>, result: &ToolResul
     if registry.is_empty() {
         return;
     }
-    let payload = json!({
-        "turn_id": context.turn_id.to_string(),
-        "tool_name": result.tool_name,
-        "call_id": result.call_id,
-        "status": tool_status_str(result.status),
+    let status_label = tool_status_str(result.status).to_string();
+    let results = registry.dispatch(HookPayload::PostToolUse {
+        turn_id: context.turn_id.to_string(),
+        tool_name: result.tool_name.clone(),
+        call_id: result.call_id.clone(),
+        status: status_label.clone(),
     });
-    let results = registry.dispatch(HookEvent::PostToolUse, payload);
-    for (idx, hook_result) in results.iter().enumerate() {
-        if let Some(mutate) = hook_result.mutate.as_ref() {
+    log_tool_observational_results(
+        "PostToolUse",
+        context.turn_id,
+        &result.tool_name,
+        &result.call_id,
+        &results,
+    );
+    if !matches!(result.status, ToolStatus::Success) {
+        let error_message = result
+            .content
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                result
+                    .content
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            });
+        let failure_results = registry.dispatch(HookPayload::PostToolUseFailure {
+            turn_id: context.turn_id.to_string(),
+            tool_name: result.tool_name.clone(),
+            call_id: result.call_id.clone(),
+            status: status_label,
+            error: error_message,
+        });
+        log_tool_observational_results(
+            "PostToolUseFailure",
+            context.turn_id,
+            &result.tool_name,
+            &result.call_id,
+            &failure_results,
+        );
+    }
+}
+
+/// Fan out a `HookPayload::PostTool` once each tool output is appended
+/// to the conversation. Companion to `PostToolUse` — that one fires
+/// when the tool result is computed, this one fires after the result
+/// has been committed to the conversation the model will see next
+/// round.
+fn dispatch_post_tool(
+    registry: &HookRegistry,
+    turn_id: TurnId,
+    tool_name: &str,
+    call_id: &str,
+    status: ToolStatus,
+) {
+    if registry.is_empty() {
+        return;
+    }
+    let results = registry.dispatch(HookPayload::PostTool {
+        turn_id: turn_id.to_string(),
+        tool_name: tool_name.to_string(),
+        call_id: call_id.to_string(),
+        status: tool_status_str(status).to_string(),
+    });
+    log_tool_observational_results("PostTool", turn_id, tool_name, call_id, &results);
+}
+
+/// Fan out a `HookPayload::PermissionRequest` before the permission
+/// engine renders a verdict. Audit handlers see every gated request
+/// — including those the engine auto-allows or auto-denies without
+/// surfacing an approval prompt.
+fn dispatch_permission_request(
+    registry: &HookRegistry,
+    turn_id: TurnId,
+    call: &ToolCall,
+    request: &PermissionRequest,
+) {
+    if registry.is_empty() {
+        return;
+    }
+    let results = registry.dispatch(HookPayload::PermissionRequest {
+        capability: request.capability.as_str().to_string(),
+        tool_name: call.name.clone(),
+        turn_id: turn_id.to_string(),
+        call_id: call.call_id.clone(),
+        target: Some(request.target.clone()).filter(|value| !value.is_empty()),
+    });
+    log_tool_observational_results(
+        "PermissionRequest",
+        turn_id,
+        &call.name,
+        &call.call_id,
+        &results,
+    );
+}
+
+/// Fan out a `HookPayload::PermissionDenied` whenever the verdict
+/// resolved as deny. Fires regardless of whether the deny came from
+/// the policy evaluator, the AI reviewer, a user-clicked deny, or
+/// a persistent-deny rule install.
+fn dispatch_permission_denied(
+    registry: &HookRegistry,
+    turn_id: TurnId,
+    call: &ToolCall,
+    request: &PermissionRequest,
+    reason: &str,
+) {
+    if registry.is_empty() {
+        return;
+    }
+    let results = registry.dispatch(HookPayload::PermissionDenied {
+        capability: request.capability.as_str().to_string(),
+        tool_name: call.name.clone(),
+        turn_id: turn_id.to_string(),
+        call_id: call.call_id.clone(),
+        target: Some(request.target.clone()).filter(|value| !value.is_empty()),
+        reason: reason.to_string(),
+    });
+    log_tool_observational_results(
+        "PermissionDenied",
+        turn_id,
+        &call.name,
+        &call.call_id,
+        &results,
+    );
+}
+
+/// Fan out a `HookPayload::SubagentStart` when the subagent registry
+/// hands out a fresh lease.
+fn dispatch_subagent_start(
+    registry: &HookRegistry,
+    parent_turn_id: TurnId,
+    subagent_id: u64,
+    kind: &str,
+) {
+    if registry.is_empty() {
+        return;
+    }
+    let results = registry.dispatch(HookPayload::SubagentStart {
+        subagent_id: subagent_id.to_string(),
+        kind: kind.to_string(),
+        parent_turn_id: parent_turn_id.to_string(),
+    });
+    log_subagent_observational_results(
+        "SubagentStart",
+        parent_turn_id,
+        subagent_id,
+        kind,
+        &results,
+    );
+}
+
+/// Fan out a `HookPayload::SubagentStop` after the subagent finishes
+/// (success or failure). `status_label` reuses the same vocabulary
+/// the parent agent surfaces on `AgentEvent::SubagentCompleted` /
+/// `AgentEvent::SubagentFailed`.
+fn dispatch_subagent_stop(
+    registry: &HookRegistry,
+    parent_turn_id: TurnId,
+    subagent_id: u64,
+    kind: &str,
+    status_label: &str,
+) {
+    if registry.is_empty() {
+        return;
+    }
+    let results = registry.dispatch(HookPayload::SubagentStop {
+        subagent_id: subagent_id.to_string(),
+        kind: kind.to_string(),
+        parent_turn_id: parent_turn_id.to_string(),
+        status: status_label.to_string(),
+    });
+    log_subagent_observational_results("SubagentStop", parent_turn_id, subagent_id, kind, &results);
+}
+
+fn log_observational_results(event: &'static str, turn_id: TurnId, results: &[HookResult]) {
+    for (idx, result) in results.iter().enumerate() {
+        if let Some(mutate) = result.mutate.as_ref() {
             tracing::debug!(
                 target: "squeezy::hooks",
-                turn_id = %context.turn_id,
-                tool_name = %result.tool_name,
-                call_id = %result.call_id,
+                turn_id = %turn_id,
                 handler_index = idx,
+                event,
                 %mutate,
-                "PostToolUse handler proposed a mutation (not yet applied)"
+                "handler proposed a mutation (not yet applied)"
             );
         }
-        if !hook_result.allow {
+        if !result.allow {
             tracing::debug!(
                 target: "squeezy::hooks",
-                turn_id = %context.turn_id,
-                tool_name = %result.tool_name,
-                call_id = %result.call_id,
+                turn_id = %turn_id,
                 handler_index = idx,
-                message = hook_result.message.as_deref().unwrap_or(""),
-                "PostToolUse handler returned allow=false (not yet enforced)"
+                event,
+                message = result.message.as_deref().unwrap_or(""),
+                "handler returned allow=false (not yet enforced)"
+            );
+        }
+    }
+}
+
+fn log_tool_observational_results(
+    event: &'static str,
+    turn_id: TurnId,
+    tool_name: &str,
+    call_id: &str,
+    results: &[HookResult],
+) {
+    for (idx, result) in results.iter().enumerate() {
+        if let Some(mutate) = result.mutate.as_ref() {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                turn_id = %turn_id,
+                tool_name = %tool_name,
+                call_id = %call_id,
+                handler_index = idx,
+                event,
+                %mutate,
+                "handler proposed a mutation (not yet applied)"
+            );
+        }
+        if !result.allow {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                turn_id = %turn_id,
+                tool_name = %tool_name,
+                call_id = %call_id,
+                handler_index = idx,
+                event,
+                message = result.message.as_deref().unwrap_or(""),
+                "handler returned allow=false (not yet enforced)"
+            );
+        }
+    }
+}
+
+fn log_subagent_observational_results(
+    event: &'static str,
+    parent_turn_id: TurnId,
+    subagent_id: u64,
+    kind: &str,
+    results: &[HookResult],
+) {
+    for (idx, result) in results.iter().enumerate() {
+        if let Some(mutate) = result.mutate.as_ref() {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                parent_turn_id = %parent_turn_id,
+                subagent_id,
+                kind,
+                handler_index = idx,
+                event,
+                %mutate,
+                "handler proposed a mutation (not yet applied)"
+            );
+        }
+        if !result.allow {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                parent_turn_id = %parent_turn_id,
+                subagent_id,
+                kind,
+                handler_index = idx,
+                event,
+                message = result.message.as_deref().unwrap_or(""),
+                "handler returned allow=false (not yet enforced)"
             );
         }
     }
@@ -8468,6 +8864,13 @@ async fn permission_decision_for_request(
     call: &ToolCall,
     request: PermissionRequest,
 ) -> ApprovalDecision {
+    // PermissionRequest fires once per decision attempt, before any
+    // verdict is computed. Lets audit handlers record every gated
+    // request — including those resolved by an auto-allow rule or
+    // mode policy before the user is asked.
+    if let Some(registry) = context.hooks.as_ref() {
+        dispatch_permission_request(registry, context.turn_id, call, &request);
+    }
     let active_mode = load_session_mode(&context.session_mode);
     let session_id_for_plan_mode = context.session_id_for_plan_mode();
     let active_plan = plan_mode::latest_plan_path(
@@ -8476,6 +8879,9 @@ async fn permission_decision_for_request(
     );
     if let Some(verdict) = mode_permission_verdict(active_mode, &request, active_plan.as_deref()) {
         log_permission_verdict(&request, &verdict);
+        if let Some(registry) = context.hooks.as_ref() {
+            dispatch_permission_denied(registry, context.turn_id, call, &request, &verdict.reason);
+        }
         return ApprovalDecision::Denied(verdict_deny_reason_for_model(context, &verdict));
     }
     let session_rules = snapshot_session_rules(&context.session_rules);
@@ -8628,6 +9034,15 @@ async fn permission_decision_for_request(
             if verdict.silent {
                 log_silent_deny(context, &request, &verdict);
             }
+            if let Some(registry) = context.hooks.as_ref() {
+                dispatch_permission_denied(
+                    registry,
+                    context.turn_id,
+                    call,
+                    &request,
+                    &verdict.reason,
+                );
+            }
             ApprovalDecision::Denied(verdict_deny_reason_for_model(context, &verdict))
         }
         PermissionAction::Ask => {
@@ -8670,7 +9085,11 @@ async fn permission_decision_for_request(
                 Err(CancelErr::Cancelled) => return ApprovalDecision::Cancelled,
             };
             if send_result.is_err() {
-                return ApprovalDecision::Denied("approval channel closed".to_string());
+                let reason = "approval channel closed".to_string();
+                if let Some(registry) = context.hooks.as_ref() {
+                    dispatch_permission_denied(registry, context.turn_id, call, &request, &reason);
+                }
+                return ApprovalDecision::Denied(reason);
             }
             let decision = match decision_rx.or_cancel(&context.cancel).await {
                 Ok(decision) => decision,
@@ -8684,7 +9103,7 @@ async fn permission_decision_for_request(
                 Some(format!("{decision:?}")),
                 json!({ "decision": format!("{decision:?}") }),
             );
-            match decision {
+            let outcome = match decision {
                 Ok(ToolApprovalDecision::Approved | ToolApprovalDecision::AllowOnce) => {
                     ApprovalDecision::Approved
                 }
@@ -8813,7 +9232,19 @@ async fn permission_decision_for_request(
                 }
                 Ok(ToolApprovalDecision::Cancelled) => ApprovalDecision::Cancelled,
                 Err(_) => ApprovalDecision::Denied("approval was not answered".to_string()),
+            };
+            // Single PermissionDenied dispatch covers every deny exit
+            // from the ask flow — user-clicked-deny, ask-rule installs
+            // that resolve as deny, persistent-deny rule installs, and
+            // the timed-out "approval was not answered" fallback.
+            // Skipped on Approved / Cancelled so handlers only see the
+            // deny half.
+            if let (Some(registry), ApprovalDecision::Denied(reason)) =
+                (context.hooks.as_ref(), &outcome)
+            {
+                dispatch_permission_denied(registry, context.turn_id, call, &request, reason);
             }
+            outcome
         }
     }
 }

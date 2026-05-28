@@ -6,11 +6,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-// `json!` is only referenced by `#[cfg(unix)]` tests below; gate the
-// import the same way so Windows builds (which exclude those tests)
-// don't fail under `-D warnings`.
-#[cfg(unix)]
-use serde_json::json;
 use squeezy_core::{SkillConfigEntry, SkillsBudgetMode, SkillsConfig};
 use squeezy_hooks::{HookEvent, HookRegistry};
 use tracing_subscriber::fmt::MakeWriter;
@@ -1838,13 +1833,26 @@ fn skill_hook_fires_on_matching_event_and_skips_others() {
     registry.register(Box::new(handler));
 
     // Non-matching event does not run the script.
-    let _ = registry.dispatch(HookEvent::PostToolUse, json!({ "tool_name": "Bash" }));
+    let _ = registry.dispatch(squeezy_hooks::HookPayload::PostToolUse {
+        turn_id: "1".into(),
+        tool_name: "Bash".into(),
+        call_id: "c1".into(),
+        status: "success".into(),
+    });
     assert!(!marker.exists());
     // Matching event with the wrong tool also skips.
-    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Edit" }));
+    let _ = registry.dispatch(squeezy_hooks::HookPayload::PreToolUse {
+        turn_id: "1".into(),
+        tool_name: "Edit".into(),
+        call_id: "c2".into(),
+    });
     assert!(!marker.exists());
     // Matching event with the matching tool fires.
-    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Bash" }));
+    let _ = registry.dispatch(squeezy_hooks::HookPayload::PreToolUse {
+        turn_id: "1".into(),
+        tool_name: "Bash".into(),
+        call_id: "c3".into(),
+    });
     assert!(marker.exists(), "expected hook to create marker file");
 
     let _ = fs::remove_dir_all(root);
@@ -1884,9 +1892,13 @@ fn skill_hook_once_self_removes_after_first_run() {
     let mut registry = HookRegistry::new();
     registry.register(Box::new(handler));
 
-    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Bash" }));
-    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Bash" }));
-    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Bash" }));
+    for call_id in ["c1", "c2", "c3"] {
+        let _ = registry.dispatch(squeezy_hooks::HookPayload::PreToolUse {
+            turn_id: "1".into(),
+            tool_name: "Bash".into(),
+            call_id: call_id.into(),
+        });
+    }
     let count = fs::read_to_string(&counter).expect("read counter");
     assert_eq!(count.trim(), "1", "once: true must fire exactly once");
 
