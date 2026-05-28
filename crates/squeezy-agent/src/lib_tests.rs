@@ -1106,6 +1106,167 @@ async fn shell_tool_emits_job_events_and_session_events() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// F04 coverage lock: a shell tool whose stdout contains a token-shaped
+/// secret must NOT leak the raw bytes through any of the three downstream
+/// surfaces — the transcript event (`AgentEvent::ToolCallCompleted.result`),
+/// the persisted session log (`SessionStore::show.events` + replay tape),
+/// or the next provider request (`LlmInputItem::FunctionCallOutput.output`
+/// in `provider.requests()[1].input`). Each surface has its own call-site
+/// pass through the `Redactor`, so this test pins all three at once.
+#[tokio::test]
+async fn shell_tool_output_secrets_are_redacted_across_transcript_session_log_and_provider_resend()
+{
+    const SECRET: &str = "ghp_abcdefghijklmnopqrstuvwxyz";
+
+    let root = temp_workspace("agent_shell_output_secret_redaction");
+    // Round 1 emits the shell tool call; round 2 lets the turn terminate
+    // once the tool output has been re-sent to the provider. The second
+    // request is what we inspect for the resend path.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command":
+                        "echo 'leak ghp_abcdefghijklmnopqrstuvwxyz here'",
+                    "description": "print a fake github token",
+                    "timeout_ms": 10_000,
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![Ok(LlmEvent::Completed {
+            response_id: Some("resp_2".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        })],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            shell: PermissionMode::Allow,
+            shell_sandbox: squeezy_core::ShellSandboxConfig {
+                mode: ShellSandboxMode::Off,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+    let session_id = agent.session_id().expect("session id");
+
+    let mut rx = agent.start_turn("run shell".to_string(), CancellationToken::new());
+    let mut shell_result = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ToolCallCompleted { result, .. } = event
+            && result.tool_name == "shell"
+        {
+            shell_result = Some(result);
+        }
+    }
+
+    let shell_result = shell_result.expect("shell ToolCallCompleted event must fire");
+    assert_eq!(shell_result.status, ToolStatus::Success);
+
+    // Path 1: transcript render. The TUI consumes `result.content` from
+    // `AgentEvent::ToolCallCompleted`; that JSON must already be redacted.
+    let transcript_payload =
+        serde_json::to_string(&shell_result.content).expect("serialize tool result content");
+    assert!(
+        !transcript_payload.contains(SECRET),
+        "transcript ToolCallCompleted result leaked the raw secret",
+    );
+    assert!(
+        transcript_payload.contains("<redacted:github_token"),
+        "transcript tool result must carry the github_token redaction marker",
+    );
+    assert!(
+        shell_result.cost_hint.redactions > 0,
+        "tool result cost hint must report at least one redaction",
+    );
+
+    // Path 2: provider resend. After the tool runs the agent loops back
+    // and re-sends the result as a `FunctionCallOutput`. Pull that item
+    // out of the recorded second-round request input.
+    let requests = provider.requests();
+    assert!(
+        requests.len() >= 2,
+        "provider must receive a second-round request that re-sends the tool output",
+    );
+    let resent_output = requests
+        .iter()
+        .flat_map(|request| request.input.iter().cloned())
+        .find_map(|item| match item {
+            LlmInputItem::FunctionCallOutput { output, .. } => Some(output),
+            _ => None,
+        })
+        .expect("expected a FunctionCallOutput in provider request input");
+    assert!(
+        !resent_output.contains(SECRET),
+        "FunctionCallOutput.output leaked the raw secret to the provider",
+    );
+    assert!(
+        resent_output.contains("<redacted:github_token"),
+        "FunctionCallOutput.output must carry the github_token redaction marker",
+    );
+
+    // Path 3: persisted session log + replay tape on disk. Both surfaces
+    // are flushed by `show_session`; nothing in either may contain the
+    // raw secret. Spot-check that the tool_result lifecycle event also
+    // carries the redaction marker so a regression that drops the
+    // log_session_event redactor pass would be caught here.
+    let record = agent.show_session(&session_id).expect("session record");
+    for event in &record.events {
+        let payload_json =
+            serde_json::to_string(&event.payload).expect("serialize session event payload");
+        assert!(
+            !payload_json.contains(SECRET),
+            "session log event {} leaked the raw secret",
+            event.kind,
+        );
+        if let Some(summary) = &event.summary {
+            assert!(
+                !summary.contains(SECRET),
+                "session log event {} summary leaked the raw secret",
+                event.kind,
+            );
+        }
+    }
+    let tool_result_event = record
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_result")
+        .expect("session log must contain a tool_result event");
+    assert!(
+        serde_json::to_string(&tool_result_event.payload)
+            .expect("serialize tool_result payload")
+            .contains("<redacted:github_token"),
+        "tool_result session event must carry the redaction marker",
+    );
+    if let Some(replay) = &record.replay {
+        for event in &replay.events {
+            let payload_json =
+                serde_json::to_string(&event.payload).expect("serialize replay event payload");
+            assert!(
+                !payload_json.contains(SECRET),
+                "session replay event {:?} leaked the raw secret",
+                event.kind,
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn asks_for_edit_permission_before_write_tool() {
     let root = temp_workspace("agent_approval");
