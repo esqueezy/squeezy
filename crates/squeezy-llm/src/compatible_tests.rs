@@ -813,6 +813,23 @@ fn request_body_omits_prompt_cache_retention_for_short_retention_legacy_cache_ke
 }
 
 #[test]
+fn request_body_clamps_prompt_cache_key_for_openai_aggregator_route() {
+    // F11: aggregator routes that forward `prompt_cache_key` verbatim to
+    // OpenAI must also clamp to the 64-codepoint limit so the
+    // OpenRouter → OpenAI hop does not silently drop the field.
+    let mut request = sample_request();
+    request.model = "openai/gpt-5.5".to_string().into();
+    let long_key: String = "a".repeat(100);
+    request.cache_key = Some(long_key);
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    let emitted = body["prompt_cache_key"]
+        .as_str()
+        .expect("prompt_cache_key must be emitted");
+    assert_eq!(emitted.chars().count(), 64);
+    assert_eq!(emitted, "a".repeat(64));
+}
+
+#[test]
 fn classify_recognizes_known_namespaces() {
     // The typed compat table is the single source of truth for namespace
     // → wire-shape decisions. Every known vendor prefix must classify to

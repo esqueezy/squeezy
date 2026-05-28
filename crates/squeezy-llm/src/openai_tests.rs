@@ -285,6 +285,193 @@ fn request_body_emits_prompt_cache_retention_24h_for_long_retention() {
 }
 
 #[test]
+fn request_body_clamps_prompt_cache_key_to_sixty_four_codepoints() {
+    // F11 reproducer: a 100-codepoint session id (e.g. a namespaced UUID
+    // chain) must clamp to 64 codepoints in the request body. OpenAI
+    // silently drops the field server-side when it exceeds the limit,
+    // turning every cached turn into a cache miss with zero visible
+    // error.
+    let long_key: String = "a".repeat(100);
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some(long_key.clone()),
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    let emitted = body["prompt_cache_key"]
+        .as_str()
+        .expect("prompt_cache_key must be emitted");
+    assert_eq!(emitted.chars().count(), 64);
+    assert_eq!(emitted, "a".repeat(64));
+}
+
+#[test]
+fn request_body_preserves_multibyte_prompt_cache_key_under_codepoint_limit() {
+    // Multibyte regression guard: 64 two-byte codepoints is 128 bytes —
+    // well over a naive byte clamp — but only 64 codepoints, so the key
+    // must round-trip unchanged.
+    let key: String = "α".repeat(64);
+    assert_eq!(key.len(), 128, "two-byte UTF-8 sanity check");
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some(key.clone()),
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    assert_eq!(body["prompt_cache_key"], key);
+}
+
+#[test]
+fn request_body_clamps_multibyte_prompt_cache_key_at_codepoint_boundary() {
+    // 65 two-byte codepoints must clamp to 64 codepoints (128 bytes),
+    // never mid-character.
+    let key: String = "α".repeat(65);
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some(key),
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    let emitted = body["prompt_cache_key"]
+        .as_str()
+        .expect("prompt_cache_key must be emitted");
+    assert_eq!(emitted.chars().count(), 64);
+    assert_eq!(emitted, "α".repeat(64));
+}
+
+#[test]
+fn affinity_headers_emitted_with_cache_key_carry_full_unclamped_value() {
+    // The body field is clamped to 64 codepoints (above), but the
+    // routing headers do not share that limit — they carry the full
+    // session id so OpenAI's load balancer can pin repeat turns to the
+    // backend that warmed the cached prefix.
+    let long_key: String = "a".repeat(100);
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some(long_key.clone()),
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let headers = OpenAiProvider::affinity_headers(&request);
+    assert_eq!(headers.len(), 2);
+    let by_name: std::collections::BTreeMap<&str, &str> = headers
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+    assert_eq!(by_name.get("session_id"), Some(&long_key.as_str()));
+    assert_eq!(by_name.get("x-client-request-id"), Some(&long_key.as_str()));
+}
+
+#[test]
+fn affinity_headers_present_when_cache_spec_carries_key() {
+    // Headers must surface regardless of which slot (legacy `cache_key`
+    // vs the universal `cache.key`) carried the affinity hint.
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: crate::CacheSpec {
+            key: Some("squeezy::session-affinity".to_string()),
+            retention: crate::CacheRetention::Long,
+        },
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let headers = OpenAiProvider::affinity_headers(&request);
+    assert_eq!(headers.len(), 2);
+    for (_, value) in &headers {
+        assert_eq!(value, "squeezy::session-affinity");
+    }
+}
+
+#[test]
+fn affinity_headers_absent_when_no_cache_key() {
+    // No cache key → no affinity headers. Without this gate the OpenAI
+    // load balancer would see empty header values on every uncached
+    // request, which is meaningless overhead.
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    assert!(OpenAiProvider::affinity_headers(&request).is_empty());
+}
+
+#[test]
 fn request_body_omits_prompt_cache_retention_for_short_retention() {
     // Regression guard for the legacy-field migration path: callers that
     // still set the deprecated `cache_key` slot get `Short` retention via

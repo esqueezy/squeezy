@@ -29,6 +29,7 @@ use crate::{
     ReasoningPayload,
     cache_policy::{CacheRetention, ephemeral_marker, json_markers, last_stable_tool_index},
     credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
+    openai_prompt_cache::clamp_prompt_cache_key,
     retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
     sse::SseDecoder,
     transport::shared_client,
@@ -211,8 +212,10 @@ impl OpenAiCompatibleProvider {
             // unknown body fields, so emitting it unconditionally costs
             // nothing and recovers cached-input billing for OpenAI-via-
             // OpenRouter traffic that the Anthropic-only `cache_control`
-            // path above does not cover.
-            body["prompt_cache_key"] = json!(key);
+            // path above does not cover. Clamp to the 64-codepoint limit
+            // OpenAI silently enforces (long keys are dropped server-side
+            // with no error, eating every cache hit).
+            body["prompt_cache_key"] = json!(clamp_prompt_cache_key(key));
         }
         if cache_retention == CacheRetention::Long {
             // Mirror the OpenAI native provider's extended-retention opt-in
