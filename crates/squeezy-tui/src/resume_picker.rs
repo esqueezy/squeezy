@@ -23,7 +23,10 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 use squeezy_core::{AppConfig, SqueezyError};
-use squeezy_store::{GlobalSessionIndexEntry, SessionMetadata, SessionQuery, SessionStore};
+use squeezy_store::{
+    EventBranchTip, GlobalSessionIndexEntry, SessionMetadata, SessionQuery, SessionStore,
+    detect_branches,
+};
 
 use crate::render::palette::{AMBER, GOLD, MODE_PURPLE, QUIET};
 
@@ -54,6 +57,12 @@ pub(crate) struct SessionSummary {
     /// Optional repo-root label shown alongside cross-project entries so
     /// the user can disambiguate sibling clones with similar prompts.
     pub(crate) repo_root: Option<String>,
+    /// Branch tips discovered in the session's `events.jsonl`. Empty for
+    /// linear sessions (the common case); populated when the session log
+    /// contains at least two branches because the user re-prompted from
+    /// an earlier turn. Each tip becomes its own row in the picker so the
+    /// user can navigate to either path.
+    pub(crate) branches: Vec<EventBranchTip>,
 }
 
 impl SessionSummary {
@@ -66,6 +75,7 @@ impl SessionSummary {
             turn_count: metadata.metrics.turns,
             cwd: metadata.cwd.clone(),
             repo_root: metadata.repo_root.clone(),
+            branches: Vec::new(),
         }
     }
 
@@ -82,6 +92,7 @@ impl SessionSummary {
             turn_count: entry.turn_count,
             cwd: entry.cwd.clone(),
             repo_root: entry.repo_root.clone(),
+            branches: Vec::new(),
         }
     }
 
@@ -132,7 +143,14 @@ fn truncate(input: &str, limit: usize) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResumeChoice {
     StartFresh,
-    Resume(String),
+    Resume {
+        session_id: String,
+        /// When `Some(sequence)`, the user picked a branch tip in a
+        /// branched session and the caller should resume at that specific
+        /// tip rather than the latest event. `None` for linear sessions
+        /// (the common case), where the resume flow is unchanged.
+        branch_tip: Option<u64>,
+    },
     /// Selected session lives outside the current cwd. The TUI exits without
     /// chdir-ing and surfaces the `squeezy sessions resume <id>` invocation
     /// the user should run from `target_cwd` — silently relocating the
@@ -142,6 +160,40 @@ pub(crate) enum ResumeChoice {
         target_cwd: String,
     },
     Quit,
+}
+
+/// One selectable row in the picker. Linear sessions produce a single
+/// entry; branched sessions expand into one entry per branch tip so the
+/// user can navigate to either path. `summary` is shared across rows
+/// belonging to the same session so the row renderer still has access
+/// to `cwd`, `repo_root`, etc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PickerEntry {
+    pub(crate) summary: SessionSummary,
+    /// `Some(tip)` when this row represents one branch of a branched
+    /// session; `None` when the session is linear (or contains exactly
+    /// one branch tip, which the detector treats as linear).
+    pub(crate) branch_tip: Option<EventBranchTip>,
+}
+
+impl PickerEntry {
+    fn linear(summary: SessionSummary) -> Self {
+        Self {
+            summary,
+            branch_tip: None,
+        }
+    }
+
+    fn branched(summary: SessionSummary, branch_tip: EventBranchTip) -> Self {
+        Self {
+            summary,
+            branch_tip: Some(branch_tip),
+        }
+    }
+
+    fn session_id(&self) -> &str {
+        &self.summary.session_id
+    }
 }
 
 /// Pure filter applied to the raw session list. Returns the most-recent
@@ -236,7 +288,9 @@ pub(crate) fn merge_candidates_for_picker(
 pub(crate) struct ResumePickerState {
     /// Currently-visible rows, derived from `all_sessions` and the
     /// `show_all_projects` toggle. Recomputed every time the toggle flips.
-    pub(crate) candidates: Vec<SessionSummary>,
+    /// One entry per row — branched sessions expand into multiple rows so
+    /// each branch tip is independently selectable.
+    pub(crate) candidates: Vec<PickerEntry>,
     /// Full recent list across every cwd; the cwd-scoped view is a filter
     /// over this. Kept on the state so Tab can re-derive `candidates`
     /// without re-reading the session store.
@@ -253,7 +307,7 @@ impl ResumePickerState {
     /// re-applying the recency filter.
     pub(crate) fn new(all_sessions: Vec<SessionSummary>, cwd: PathBuf) -> Self {
         let cwd_str = cwd.display().to_string();
-        let candidates = scoped_view(&all_sessions, &cwd_str);
+        let candidates = expand_entries(scoped_view(&all_sessions, &cwd_str));
         Self {
             candidates,
             all_sessions,
@@ -280,11 +334,12 @@ impl ResumePickerState {
     /// silently moved under them.
     pub(crate) fn toggle_all_projects(&mut self) {
         self.show_all_projects = !self.show_all_projects;
-        self.candidates = if self.show_all_projects {
+        let visible = if self.show_all_projects {
             self.all_sessions.clone()
         } else {
             scoped_view(&self.all_sessions, &self.cwd.display().to_string())
         };
+        self.candidates = expand_entries(visible);
         self.cursor = 0;
     }
 
@@ -293,14 +348,17 @@ impl ResumePickerState {
             return Some(ResumeChoice::StartFresh);
         }
         // candidate rows live at indices 1..=N.
-        let summary = self.candidates.get(self.cursor - 1)?;
+        let entry = self.candidates.get(self.cursor - 1)?;
         let cwd_str = self.cwd.display().to_string();
-        if summary.cwd == cwd_str {
-            Some(ResumeChoice::Resume(summary.session_id.clone()))
+        if entry.summary.cwd == cwd_str {
+            Some(ResumeChoice::Resume {
+                session_id: entry.session_id().to_string(),
+                branch_tip: entry.branch_tip.as_ref().map(|tip| tip.tip_sequence),
+            })
         } else {
             Some(ResumeChoice::CrossProject {
-                session_id: summary.session_id.clone(),
-                target_cwd: summary.cwd.clone(),
+                session_id: entry.session_id().to_string(),
+                target_cwd: entry.summary.cwd.clone(),
             })
         }
     }
@@ -341,6 +399,27 @@ fn scoped_view(all: &[SessionSummary], cwd_str: &str) -> Vec<SessionSummary> {
     all.iter().filter(|s| s.cwd == cwd_str).cloned().collect()
 }
 
+/// Flatten each summary into selectable rows: linear sessions emit a
+/// single `PickerEntry`, branched sessions emit one entry per branch tip
+/// so the user can pick either path. Sessions reach this function in
+/// newest-first order (set by `filter_inner`), and we preserve that
+/// order across branch expansion: tips inside one session stay grouped,
+/// with the newest tip first (already enforced by `detect_branches`).
+fn expand_entries(summaries: Vec<SessionSummary>) -> Vec<PickerEntry> {
+    let mut entries = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        if summary.branches.len() < 2 {
+            entries.push(PickerEntry::linear(summary));
+            continue;
+        }
+        let tips = summary.branches.clone();
+        for tip in tips {
+            entries.push(PickerEntry::branched(summary.clone(), tip));
+        }
+    }
+    entries
+}
+
 /// Pull recent resumable sessions across every cwd. The picker filters
 /// down to the current cwd by default but keeps the broader list around
 /// so Tab can flip into a cross-project view without a second store read.
@@ -360,7 +439,18 @@ pub(crate) fn load_candidates(config: &AppConfig) -> Vec<SessionSummary> {
     };
     let global = SessionStore::list_global_index();
     let now_ms = current_unix_ms();
-    merge_candidates_for_picker(&local, &global, now_ms)
+    let mut summaries = merge_candidates_for_picker(&local, &global, now_ms);
+    // Branch detection requires reading each candidate's event log. The
+    // list is already capped so this stays cheap on cold start; we
+    // silently ignore read errors because the picker is a convenience
+    // surface — a session that fails to load simply renders as linear,
+    // the same as legacy logs.
+    for summary in &mut summaries {
+        if let Ok(record) = store.show(&summary.session_id) {
+            summary.branches = detect_branches(&record.events);
+        }
+    }
+    summaries
 }
 
 fn current_unix_ms() -> u64 {
@@ -460,11 +550,11 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     rows.push(render_start_fresh_row(
         state.cursor == state.start_fresh_index(),
     ));
-    rows.extend(state.candidates.iter().enumerate().map(|(idx, summary)| {
+    rows.extend(state.candidates.iter().enumerate().map(|(idx, entry)| {
         // candidates start at row 1; active row uses the cursor offset.
         let row_idx = idx + 1;
-        let cross_project = summary.cwd != cwd_str;
-        render_candidate_row(idx, summary, row_idx == state.cursor, cross_project)
+        let cross_project = entry.summary.cwd != cwd_str;
+        render_candidate_row(idx, entry, row_idx == state.cursor, cross_project)
     }));
 
     let body = Paragraph::new(rows);
@@ -493,10 +583,11 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
 
 fn render_candidate_row(
     _idx: usize,
-    summary: &SessionSummary,
+    entry: &PickerEntry,
     active: bool,
     cross_project: bool,
 ) -> Line<'static> {
+    let summary = &entry.summary;
     let (prefix_color, label_style) = if active {
         (
             AMBER,
@@ -511,14 +602,32 @@ fn render_candidate_row(
     } else {
         Style::default().fg(QUIET)
     };
+    // Branched rows replace the default session label with the branch's
+    // first user message (if any) so the user can disambiguate two paths
+    // that came out of the same fork point.
+    let (label, branch_marker) = match entry.branch_tip.as_ref() {
+        Some(tip) => {
+            let branch_label = tip
+                .first_message_after_branch
+                .as_deref()
+                .map(|text| truncate(text.lines().next().unwrap_or(text), 80))
+                .unwrap_or_else(|| summary.label());
+            let marker = format!("  ⎇ branch @{}", tip.tip_sequence);
+            (branch_label, Some(marker))
+        }
+        None => (summary.label(), None),
+    };
     let mut spans = vec![
         Span::styled(prefix, Style::default().fg(prefix_color)),
         Span::styled(format_started_at(summary.started_at_ms), timestamp_style),
         Span::styled("  ", Style::default()),
         Span::styled(format!("{:>10}", summary.turn_indicator()), timestamp_style),
         Span::styled("  ", Style::default()),
-        Span::styled(summary.label(), label_style),
+        Span::styled(label, label_style),
     ];
+    if let Some(marker) = branch_marker {
+        spans.push(Span::styled(marker, Style::default().fg(MODE_PURPLE)));
+    }
     if cross_project {
         spans.push(Span::styled("  · ", Style::default().fg(QUIET)));
         spans.push(Span::styled(

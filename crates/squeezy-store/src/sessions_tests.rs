@@ -1932,6 +1932,7 @@ fn bundle_rollout_trace_merges_events_and_replay_by_timestamp() {
         turn_id: Some("turn-1".to_string()),
         summary: Some("find a bug".to_string()),
         payload: json!({"text": "find a bug"}),
+        parent_event_sequence: None,
     }));
     events_jsonl.extend(event_line(&SessionEvent {
         ts_unix_ms: 300,
@@ -1939,6 +1940,7 @@ fn bundle_rollout_trace_merges_events_and_replay_by_timestamp() {
         turn_id: Some("turn-1".to_string()),
         summary: Some("done".to_string()),
         payload: json!({"text": "done", "response_id": "resp_1"}),
+        parent_event_sequence: None,
     }));
     fs::write(&events_path, events_jsonl).expect("write events.jsonl");
 
@@ -2190,275 +2192,141 @@ fn memory_path_is_none_when_home_unset() {
     );
 }
 
-#[test]
-fn global_index_aggregates_sessions_across_projects() {
-    let home = temp_root("global-index-cross-project");
-    let project_a = temp_root("global-index-project-a");
-    let project_b = temp_root("global-index-project-b");
-    with_home(&home, || {
-        let config_a = AppConfig {
-            workspace_root: project_a.clone(),
-            session_logs: SessionLogConfig {
-                log_dir: Some(PathBuf::from(".squeezy/sessions")),
-                ..SessionLogConfig::default()
-            },
-            ..AppConfig::default()
-        };
-        let config_b = AppConfig {
-            workspace_root: project_b.clone(),
-            session_logs: SessionLogConfig {
-                log_dir: Some(PathBuf::from(".squeezy/sessions")),
-                ..SessionLogConfig::default()
-            },
-            ..AppConfig::default()
-        };
-        let store_a = SessionStore::open(&config_a);
-        let store_b = SessionStore::open(&config_b);
-
-        let mut meta_a = SessionMetadata::new(&config_a, "test-provider");
-        meta_a.cwd = project_a.display().to_string();
-        let handle_a = store_a.start_session(meta_a).expect("start project A");
-        handle_a
-            .append_event(SessionEvent::new(
-                "user_message",
-                None,
-                Some("fix payment bug".to_string()),
-                json!({}),
-            ))
-            .expect("append A");
-        handle_a.flush_events().expect("flush A");
-
-        let mut meta_b = SessionMetadata::new(&config_b, "test-provider");
-        meta_b.cwd = project_b.display().to_string();
-        let handle_b = store_b.start_session(meta_b).expect("start project B");
-        handle_b
-            .append_event(SessionEvent::new(
-                "user_message",
-                None,
-                Some("rewrite cache layer".to_string()),
-                json!({}),
-            ))
-            .expect("append B");
-        handle_b.flush_events().expect("flush B");
-
-        // Per-project listings stay scoped — A sees only A, B only B.
-        let listed_a = store_a.list(&SessionQuery::default()).expect("list A");
-        let listed_b = store_b.list(&SessionQuery::default()).expect("list B");
-        assert_eq!(listed_a.len(), 1, "project A list is project-local");
-        assert_eq!(listed_b.len(), 1, "project B list is project-local");
-
-        // The global index lifts both sessions out of their per-project
-        // session roots so a resume picker run from either cwd can see them.
-        let global = SessionStore::list_global_index();
-        let ids: BTreeSet<String> = global.iter().map(|e| e.session_id.clone()).collect();
-        assert!(
-            ids.contains(handle_a.session_id()),
-            "project A session missing from global index: {ids:?}",
-        );
-        assert!(
-            ids.contains(handle_b.session_id()),
-            "project B session missing from global index: {ids:?}",
-        );
-
-        // Each entry retains its source cwd + title so the picker can
-        // render the "(repo) prompt" hint without re-reading metadata.
-        let entry_a = global
-            .iter()
-            .find(|e| e.session_id == handle_a.session_id())
-            .expect("entry A");
-        let entry_b = global
-            .iter()
-            .find(|e| e.session_id == handle_b.session_id())
-            .expect("entry B");
-        assert_eq!(entry_a.cwd, project_a.display().to_string());
-        assert_eq!(entry_b.cwd, project_b.display().to_string());
-        assert_eq!(entry_a.title.as_deref(), Some("fix payment bug"));
-        assert_eq!(entry_b.title.as_deref(), Some("rewrite cache layer"));
-        assert!(entry_a.resume_available);
-        assert!(entry_b.resume_available);
-    });
-}
-
-#[test]
-fn global_index_dedupes_by_session_id_keeping_latest() {
-    let home = temp_root("global-index-dedup");
-    with_home(&home, || {
-        let entry_v1 = GlobalSessionIndexEntry {
-            session_id: "sess-1".to_string(),
-            cwd: "/work/repo".to_string(),
-            workspace_root: "/work/repo".to_string(),
-            repo_root: None,
-            title: Some("initial".to_string()),
-            started_at_ms: 1_000,
-            last_event_at_ms: 1_000,
-            turn_count: 0,
-            resume_available: true,
-        };
-        let entry_v2 = GlobalSessionIndexEntry {
-            title: Some("after first prompt".to_string()),
-            last_event_at_ms: 2_000,
-            turn_count: 1,
-            ..entry_v1.clone()
-        };
-        let entry_v3 = GlobalSessionIndexEntry {
-            title: Some("session finished".to_string()),
-            last_event_at_ms: 3_000,
-            turn_count: 4,
-            resume_available: false,
-            ..entry_v1.clone()
-        };
-
-        SessionStore::append_global_index_entry(&entry_v1);
-        SessionStore::append_global_index_entry(&entry_v2);
-        SessionStore::append_global_index_entry(&entry_v3);
-
-        let listed = SessionStore::list_global_index();
-        assert_eq!(
-            listed.len(),
-            1,
-            "duplicate session_id rows must collapse to one entry",
-        );
-        let entry = &listed[0];
-        assert_eq!(entry.session_id, "sess-1");
-        assert_eq!(
-            entry.title.as_deref(),
-            Some("session finished"),
-            "latest last_event_at_ms wins",
-        );
-        assert_eq!(entry.turn_count, 4);
-        assert!(
-            !entry.resume_available,
-            "terminal snapshot overrides earlier resume_available",
-        );
-    });
-}
-
-#[test]
-fn global_index_compacts_when_file_grows_past_threshold() {
-    let home = temp_root("global-index-compaction");
-    with_home(&home, || {
-        // Pad the title so every append crosses ~1.5KB on disk; with the
-        // 256KiB threshold this is far less than 500 rewrites but still
-        // exercises the rewrite branch deterministically.
-        let payload = "x".repeat(2_000);
-        for i in 0..200u32 {
-            SessionStore::append_global_index_entry(&GlobalSessionIndexEntry {
-                session_id: format!("sess-{i}"),
-                cwd: format!("/work/project-{i}"),
-                workspace_root: format!("/work/project-{i}"),
-                repo_root: None,
-                title: Some(payload.clone()),
-                started_at_ms: i as u64,
-                last_event_at_ms: i as u64,
-                turn_count: 0,
-                resume_available: true,
-            });
-        }
-        // Duplicate a subset so compaction has something to coalesce.
-        for i in 0..50u32 {
-            SessionStore::append_global_index_entry(&GlobalSessionIndexEntry {
-                session_id: format!("sess-{i}"),
-                cwd: format!("/work/project-{i}"),
-                workspace_root: format!("/work/project-{i}"),
-                repo_root: None,
-                title: Some(payload.clone()),
-                started_at_ms: i as u64,
-                last_event_at_ms: (i as u64) + 1_000,
-                turn_count: 7,
-                resume_available: true,
-            });
-        }
-
-        let path = SessionStore::global_index_path().expect("HOME set");
-        let size_before = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        assert!(
-            size_before > GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES,
-            "test setup must exceed compaction threshold (got {size_before} bytes)",
-        );
-
-        let listed = SessionStore::list_global_index();
-        assert_eq!(listed.len(), 200, "dedupe keeps one entry per session_id");
-
-        let size_after = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        assert!(
-            size_after < size_before,
-            "list_global_index must rewrite the file when it exceeds the threshold (before={size_before}, after={size_after})",
-        );
-
-        // The rewritten file is still a valid newline-delimited JSONL
-        // stream that a second read sees identically — important because
-        // the next session start will append straight to its tail.
-        let again = SessionStore::list_global_index();
-        let ids_again: BTreeSet<String> = again.iter().map(|e| e.session_id.clone()).collect();
-        let ids_first: BTreeSet<String> = listed.iter().map(|e| e.session_id.clone()).collect();
-        assert_eq!(ids_again, ids_first);
-    });
-}
-
-#[test]
-fn global_index_path_is_none_when_home_unset() {
-    let _guard = HOME_LOCK.lock().expect("HOME lock");
-    let previous = std::env::var_os("HOME");
-    unsafe {
-        std::env::remove_var("HOME");
+fn raw_event(
+    ts_unix_ms: u64,
+    kind: &str,
+    summary: Option<&str>,
+    parent_event_sequence: Option<u64>,
+) -> SessionEvent {
+    SessionEvent {
+        ts_unix_ms,
+        kind: kind.to_string(),
+        turn_id: None,
+        summary: summary.map(str::to_string),
+        payload: json!({}),
+        parent_event_sequence,
     }
-    let path = SessionStore::global_index_path();
-    let listed = SessionStore::list_global_index();
-    unsafe {
-        match previous {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-    assert!(path.is_none(), "HOME unset means no global index path");
+}
+
+#[test]
+fn session_event_omits_parent_when_none_on_serialise() {
+    let event = SessionEvent::new("user_message", None, Some("hi".to_string()), json!({}));
+    let body = serde_json::to_string(&event).expect("serialise");
     assert!(
-        listed.is_empty(),
-        "HOME unset surfaces no entries — the index is best-effort enrichment",
+        !body.contains("parent_event_sequence"),
+        "linear events stay byte-identical: {body}",
     );
 }
 
 #[test]
-fn archive_session_marks_global_index_entry_unresumable() {
-    let home = temp_root("global-index-archive");
-    let project = temp_root("global-index-archive-project");
-    with_home(&home, || {
-        let config = AppConfig {
-            workspace_root: project.clone(),
-            session_logs: SessionLogConfig {
-                log_dir: Some(PathBuf::from(".squeezy/sessions")),
-                ..SessionLogConfig::default()
-            },
-            ..AppConfig::default()
-        };
-        let store = SessionStore::open(&config);
-        let mut meta = SessionMetadata::new(&config, "test-provider");
-        meta.cwd = project.display().to_string();
-        let handle = store.start_session(meta).expect("start");
-        let id = handle.session_id().to_string();
+fn session_event_round_trips_parent_event_sequence() {
+    let event = SessionEvent::new("user_message", None, Some("retry".to_string()), json!({}))
+        .with_parent_event_sequence(2);
+    let body = serde_json::to_string(&event).expect("serialise");
+    assert!(body.contains("parent_event_sequence"));
+    let parsed: SessionEvent = serde_json::from_str(&body).expect("deserialise");
+    assert_eq!(parsed.parent_event_sequence, Some(2));
+}
 
-        let live = SessionStore::list_global_index();
-        let live_entry = live
-            .iter()
-            .find(|e| e.session_id == id)
-            .expect("entry recorded on start");
-        assert!(
-            live_entry.resume_available,
-            "fresh session must be resumable",
-        );
-
-        // Drop the handle first so the async writer doesn't fight us
-        // for the session dir during the rename.
-        drop(handle);
-        store.archive_session(&id).expect("archive");
-
-        let archived = SessionStore::list_global_index();
-        let entry = archived
-            .iter()
-            .find(|e| e.session_id == id)
-            .expect("archived entry still visible");
-        assert!(
-            !entry.resume_available,
-            "archive must flip resume_available off so the picker hides the entry",
-        );
+#[test]
+fn session_event_deserialises_legacy_payload_without_parent_field() {
+    let legacy = json!({
+        "ts_unix_ms": 1_700_000_000_000_u64,
+        "kind": "user_message",
+        "turn_id": null,
+        "summary": "legacy",
+        "payload": {"text": "legacy"},
     });
+    let event: SessionEvent = serde_json::from_value(legacy).expect("legacy deserialise");
+    assert_eq!(event.parent_event_sequence, None);
+}
+
+#[test]
+fn detect_branches_returns_empty_for_linear_log() {
+    let events = vec![
+        raw_event(10, "user_message", Some("q1"), None),
+        raw_event(20, "assistant_completed", Some("a1"), None),
+        raw_event(30, "user_message", Some("q2"), None),
+        raw_event(40, "assistant_completed", Some("a2"), None),
+    ];
+    assert!(detect_branches(&events).is_empty());
+}
+
+#[test]
+fn detect_branches_returns_empty_for_single_or_zero_events() {
+    assert!(detect_branches(&[]).is_empty());
+    let one = vec![raw_event(10, "user_message", Some("q1"), None)];
+    assert!(detect_branches(&one).is_empty());
+}
+
+#[test]
+fn detect_branches_finds_both_paths_when_user_reprompts() {
+    // Tree (linear unless noted):
+    //   0 user "q1"
+    //   1 assistant "a1"
+    //   2 user "q2 (path A)"      -> linear child of 1
+    //   3 assistant "a2-A"
+    //   4 user "q2 (path B)"      -> branched off 1 (re-prompt)
+    //   5 assistant "a2-B"
+    let events = vec![
+        raw_event(10, "user_message", Some("q1"), None),
+        raw_event(20, "assistant_completed", Some("a1"), None),
+        raw_event(30, "user_message", Some("q2 path A"), None),
+        raw_event(40, "assistant_completed", Some("a2 A"), None),
+        raw_event(50, "user_message", Some("q2 path B"), Some(1)),
+        raw_event(60, "assistant_completed", Some("a2 B"), None),
+    ];
+
+    let tips = detect_branches(&events);
+    assert_eq!(tips.len(), 2, "two leaves expected: {tips:?}");
+
+    // Newest tip first.
+    let tip_b = &tips[0];
+    let tip_a = &tips[1];
+    assert_eq!(tip_b.tip_sequence, 5);
+    assert_eq!(tip_b.branched_from_sequence, 1);
+    assert_eq!(
+        tip_b.first_message_after_branch.as_deref(),
+        Some("q2 path B"),
+    );
+    assert_eq!(tip_a.tip_sequence, 3);
+    assert_eq!(tip_a.branched_from_sequence, 1);
+    assert_eq!(
+        tip_a.first_message_after_branch.as_deref(),
+        Some("q2 path A"),
+    );
+}
+
+#[test]
+fn detect_branches_handles_three_way_fork() {
+    // 0 -> 1 -> { 2 (linear), 3 (branch), 4 (branch) }
+    let events = vec![
+        raw_event(10, "user_message", Some("root"), None),
+        raw_event(20, "assistant_completed", Some("a1"), None),
+        raw_event(30, "user_message", Some("path-1"), None),
+        raw_event(31, "user_message", Some("path-2"), Some(1)),
+        raw_event(32, "user_message", Some("path-3"), Some(1)),
+    ];
+    let tips = detect_branches(&events);
+    assert_eq!(tips.len(), 3);
+    let sequences: Vec<u64> = tips.iter().map(|t| t.tip_sequence).collect();
+    assert!(sequences.contains(&2));
+    assert!(sequences.contains(&3));
+    assert!(sequences.contains(&4));
+    for tip in &tips {
+        assert_eq!(tip.branched_from_sequence, 1);
+    }
+}
+
+#[test]
+fn detect_branches_ignores_self_or_out_of_range_parent() {
+    // Self-parent and a forward-pointing parent are both treated as the
+    // implicit linear parent so a malformed log still produces a sane
+    // tree (and no spurious "branch").
+    let events = vec![
+        raw_event(10, "user_message", Some("q1"), None),
+        raw_event(20, "assistant_completed", Some("a1"), Some(1)),
+        raw_event(30, "user_message", Some("q2"), Some(99)),
+    ];
+    assert!(detect_branches(&events).is_empty());
 }

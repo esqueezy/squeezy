@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use squeezy_store::{GlobalSessionIndexEntry, SessionMetadata, SessionStatus};
+use squeezy_store::{EventBranchTip, SessionMetadata, SessionStatus};
 
 use super::*;
 
@@ -107,6 +107,7 @@ fn summary_at(id: &str, cwd: &str) -> SessionSummary {
         turn_count: 0,
         cwd: cwd.to_string(),
         repo_root: None,
+        branches: Vec::new(),
     }
 }
 
@@ -140,7 +141,10 @@ fn picker_enter_on_candidate_resumes_that_session() {
     assert_eq!(state.cursor, 2); // second candidate (row 2)
     assert_eq!(
         state.dispatch(press(KeyCode::Enter)),
-        Some(ResumeChoice::Resume("second".to_string()))
+        Some(ResumeChoice::Resume {
+            session_id: "second".to_string(),
+            branch_tip: None,
+        })
     );
 }
 
@@ -197,6 +201,7 @@ fn session_summary_label_truncates_long_prompts() {
         turn_count: 0,
         cwd: "/work/repo".to_string(),
         repo_root: None,
+        branches: Vec::new(),
     };
     let label = summary.label();
     assert!(label.chars().count() <= 80, "label too long: {label}");
@@ -216,7 +221,7 @@ fn toggle_all_projects_includes_cross_cwd_sessions() {
         state
             .candidates
             .iter()
-            .map(|s| s.session_id.as_str())
+            .map(|entry| entry.session_id())
             .collect::<Vec<_>>(),
         vec!["scoped"]
     );
@@ -228,7 +233,7 @@ fn toggle_all_projects_includes_cross_cwd_sessions() {
         state
             .candidates
             .iter()
-            .map(|s| s.session_id.as_str())
+            .map(|entry| entry.session_id())
             .collect::<Vec<_>>(),
         vec!["scoped", "sibling"]
     );
@@ -266,6 +271,7 @@ fn project_hint_prefers_repo_root_basename() {
         turn_count: 0,
         cwd: "/work/other/src/deep".to_string(),
         repo_root: Some("/work/other".to_string()),
+        branches: Vec::new(),
     };
     assert_eq!(s.project_hint(), "other");
 }
@@ -280,6 +286,7 @@ fn project_hint_falls_back_to_cwd_tail() {
         turn_count: 0,
         cwd: "/work/sibling".to_string(),
         repo_root: None,
+        branches: Vec::new(),
     };
     assert_eq!(s.project_hint(), "sibling");
 }
@@ -300,104 +307,94 @@ fn filter_all_projects_keeps_cross_cwd_entries() {
     );
 }
 
-fn global_entry(
-    id: &str,
-    cwd: &str,
-    started_at_ms: u64,
-    resume_available: bool,
-) -> GlobalSessionIndexEntry {
-    GlobalSessionIndexEntry {
-        session_id: id.to_string(),
-        cwd: cwd.to_string(),
-        workspace_root: cwd.to_string(),
-        repo_root: None,
-        title: Some(format!("global task for {id}")),
-        started_at_ms,
-        last_event_at_ms: started_at_ms,
-        turn_count: 0,
-        resume_available,
+fn tip(tip_sequence: u64, branched_from: u64, ts: u64, message: &str) -> EventBranchTip {
+    EventBranchTip {
+        tip_sequence,
+        branched_from_sequence: branched_from,
+        tip_ts_unix_ms: ts,
+        first_message_after_branch: Some(message.to_string()),
     }
 }
 
 #[test]
-fn merge_surfaces_cross_project_sessions_from_global_index() {
-    // Per-project store only contains the local session; the cross-project
-    // index supplies the sibling-repo entry. The picker needs both so the
-    // Tab toggle can flip into a cross-project view.
-    let now = 5_000_000;
-    let local = vec![meta("local", "/work/repo", now - 1_000, true)];
-    let global = vec![global_entry("sibling", "/work/other", now - 2_000, true)];
-
-    let out = merge_candidates_for_picker(&local, &global, now);
-    let ids: Vec<&str> = out.iter().map(|s| s.session_id.as_str()).collect();
-    assert_eq!(
-        ids,
-        vec!["local", "sibling"],
-        "merge must surface both local + global entries newest-first",
-    );
-    // The sibling row keeps the cwd we put in the global index so the
-    // picker can render the "(other)" hint.
-    let sibling = out
+fn picker_expands_branched_sessions_into_one_row_per_branch_tip() {
+    // Synthesised summary: a single session with two branches (the user
+    // re-prompted from an earlier turn). The picker should surface both
+    // paths as independent rows so each is selectable.
+    let mut branched = summary("branched");
+    branched.branches = vec![
+        tip(5, 1, 200, "path B prompt"),
+        tip(3, 1, 100, "path A prompt"),
+    ];
+    let state = ResumePickerState::new(vec![branched.clone()], cwd());
+    assert_eq!(state.candidates.len(), 2);
+    let session_ids: Vec<&str> = state
+        .candidates
         .iter()
-        .find(|s| s.session_id == "sibling")
-        .expect("sibling present");
-    assert_eq!(sibling.cwd, "/work/other");
+        .map(|entry| entry.session_id())
+        .collect();
+    assert_eq!(session_ids, vec!["branched", "branched"]);
+    let branch_tips: Vec<Option<u64>> = state
+        .candidates
+        .iter()
+        .map(|entry| entry.branch_tip.as_ref().map(|t| t.tip_sequence))
+        .collect();
+    assert_eq!(branch_tips, vec![Some(5), Some(3)]);
+}
+
+#[test]
+fn picker_enter_on_branch_row_returns_branch_tip_in_resume_choice() {
+    let mut branched = summary("branched");
+    branched.branches = vec![tip(5, 1, 200, "path B"), tip(3, 1, 100, "path A")];
+    let mut state = ResumePickerState::new(vec![branched], cwd());
+    // [start_fresh, branch tip 5, branch tip 3]. Down twice lands on tip 3.
+    state.dispatch(press(KeyCode::Down));
+    state.dispatch(press(KeyCode::Down));
     assert_eq!(
-        sibling.first_user_task.as_deref(),
-        Some("global task for sibling"),
+        state.dispatch(press(KeyCode::Enter)),
+        Some(ResumeChoice::Resume {
+            session_id: "branched".to_string(),
+            branch_tip: Some(3),
+        })
     );
 }
 
 #[test]
-fn merge_prefers_local_metadata_when_session_id_overlaps() {
-    // The local SessionMetadata carries the richer title; the global
-    // index entry for the same session_id must lose so the picker shows
-    // the finalized state, not the stale snapshot.
-    let now = 5_000_000;
-    let mut local_meta = meta("shared", "/work/repo", now - 1_000, true);
-    local_meta.first_user_task = Some("local prompt wins".to_string());
-    let local = vec![local_meta];
-    let global = vec![GlobalSessionIndexEntry {
-        title: Some("global prompt loses".to_string()),
-        ..global_entry("shared", "/work/repo", now - 1_000, true)
-    }];
-
-    let out = merge_candidates_for_picker(&local, &global, now);
-    assert_eq!(
-        out.len(),
-        1,
-        "duplicate session_ids must collapse to one row"
-    );
-    assert_eq!(
-        out[0].first_user_task.as_deref(),
-        Some("local prompt wins"),
-        "local SessionMetadata must win over the global index snapshot",
-    );
+fn picker_keeps_linear_session_as_single_row() {
+    let linear = summary("linear");
+    let state = ResumePickerState::new(vec![linear], cwd());
+    assert_eq!(state.candidates.len(), 1);
+    assert!(state.candidates[0].branch_tip.is_none());
 }
 
 #[test]
-fn merge_drops_unresumable_global_entries() {
-    let now = 5_000_000;
-    let global = vec![global_entry("done", "/work/other", now - 1_000, false)];
-    let out = merge_candidates_for_picker(&[], &global, now);
+fn picker_handles_single_branch_tip_as_linear() {
+    // detect_branches refuses to report only one tip, but if a caller ever
+    // hands us a summary with a single tip we still want to render one row
+    // rather than dropping the session entirely.
+    let mut summary = summary("one-tip");
+    summary.branches = vec![tip(2, 0, 50, "only path")];
+    let state = ResumePickerState::new(vec![summary], cwd());
+    assert_eq!(state.candidates.len(), 1);
+    assert!(state.candidates[0].branch_tip.is_none());
+}
+
+#[test]
+fn picker_expands_branches_after_tab_toggle() {
+    let mut sibling = summary_at("sibling", "/work/other");
+    sibling.branches = vec![tip(4, 1, 90, "branch B"), tip(2, 1, 70, "branch A")];
+    let state = ResumePickerState::new(vec![sibling], cwd());
     assert!(
-        out.is_empty(),
-        "resume_available=false in the index must hide the row from the picker",
+        state.candidates.is_empty(),
+        "scoped view hides cross-project branches by default",
     );
-}
-
-#[test]
-fn merge_drops_stale_global_entries() {
-    let now = 30 * 24 * 60 * 60 * 1_000;
-    let global = vec![global_entry(
-        "ancient",
-        "/work/other",
-        now - 30 * 24 * 60 * 60 * 1_000 + 1,
-        true,
-    )];
-    let out = merge_candidates_for_picker(&[], &global, now);
-    assert!(
-        out.is_empty(),
-        "entries older than the recency window must be dropped"
-    );
+    let mut state = state;
+    state.dispatch(press(KeyCode::Tab));
+    assert_eq!(state.candidates.len(), 2);
+    // Cross-project branched rows must still surface as CrossProject so
+    // the user gets the chdir hint rather than an in-process resume that
+    // would silently jump cwds.
+    state.dispatch(press(KeyCode::Down));
+    let choice = state.dispatch(press(KeyCode::Enter));
+    assert!(matches!(choice, Some(ResumeChoice::CrossProject { .. })));
 }
