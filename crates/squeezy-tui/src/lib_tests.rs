@@ -11,7 +11,8 @@ use squeezy_core::{
     ContextAttachmentStatus, ContextEstimate, CostSnapshot, PermissionCapability, PermissionMode,
     PermissionPolicy, PermissionRequest, PermissionRisk, PermissionScope, SessionMode,
     StatusVerbosity, TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus,
-    TaskVerificationState, ToolOutputVerbosity, TuiAlternateScreen, TuiConfig, TurnId, TurnMetrics,
+    TaskVerificationState, ToolOutputVerbosity, TuiAlternateScreen, TuiConfig,
+    TuiSynchronizedOutput, TurnId, TurnMetrics,
 };
 use squeezy_llm::UnavailableProvider;
 use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus};
@@ -9055,6 +9056,94 @@ async fn alt_nine_reports_no_session_when_slot_is_empty() {
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn synchronized_output_resolver_honours_always_and_never_without_env() {
+    // `Always` must short-circuit env probing so capability detection
+    // never demotes an explicit opt-in to off.
+    assert!(super::resolve_synchronized_output(
+        TuiSynchronizedOutput::Always
+    ));
+    assert!(!super::resolve_synchronized_output(
+        TuiSynchronizedOutput::Never
+    ));
+}
+
+#[test]
+fn synchronized_output_auto_detects_known_capable_terminals() {
+    // Each row covers one of the capability signals advertised by the
+    // terminals listed in the F09 finding — when only that variable is
+    // set, `auto` must resolve to enabled.
+    let signals: &[&[(&str, &str)]] = &[
+        &[("KITTY_WINDOW_ID", "42")],
+        &[("WEZTERM_PANE", "0")],
+        &[("WEZTERM_EXECUTABLE", "/usr/local/bin/wezterm")],
+        &[(
+            "GHOSTTY_RESOURCES_DIR",
+            "/Applications/Ghostty.app/Contents/Resources",
+        )],
+        &[("ALACRITTY_LOG", "/tmp/alacritty.log")],
+        &[("ALACRITTY_WINDOW_ID", "1")],
+        &[("ITERM_SESSION_ID", "w0t0p0")],
+        &[("TERM_PROGRAM", "iTerm.app")],
+        &[("TERM_PROGRAM", "WezTerm")],
+        &[("TERM_PROGRAM", "ghostty")],
+        &[("TERM_PROGRAM", "kitty")],
+        &[("TERM_PROGRAM", "vscode")],
+        &[("TERM", "xterm-kitty")],
+        &[("TERM", "wezterm")],
+        &[("TERM", "alacritty")],
+        &[("TERM", "xterm-ghostty")],
+        &[("TERM", "foot")],
+        &[("TERM", "contour")],
+    ];
+    for fixture in signals {
+        let lookup = |key: &str| -> Option<std::ffi::OsString> {
+            fixture
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| std::ffi::OsString::from(*v))
+        };
+        assert!(
+            super::detect_synchronized_output_support_from_env(lookup),
+            "capability detection should flag {fixture:?}"
+        );
+    }
+}
+
+#[test]
+fn synchronized_output_auto_stays_off_for_unknown_terminals() {
+    // No env signals: capability detection must NOT speculatively
+    // enable sync mode. Users on terminals we have no evidence about
+    // still get the no-op-safe codes via `Always`, but `Auto` errs on
+    // the side of leaving them alone.
+    let empty = |_: &str| -> Option<std::ffi::OsString> { None };
+    assert!(!super::detect_synchronized_output_support_from_env(empty));
+
+    let only_screen = |key: &str| -> Option<std::ffi::OsString> {
+        if key == "TERM" {
+            Some(std::ffi::OsString::from("screen-256color"))
+        } else {
+            None
+        }
+    };
+    assert!(
+        !super::detect_synchronized_output_support_from_env(only_screen),
+        "screen/tmux passthrough must not auto-enable BSU"
+    );
+
+    let only_dumb = |key: &str| -> Option<std::ffi::OsString> {
+        if key == "TERM" {
+            Some(std::ffi::OsString::from("dumb"))
+        } else {
+            None
+        }
+    };
+    assert!(
+        !super::detect_synchronized_output_support_from_env(only_dumb),
+        "dumb terminal must not auto-enable BSU"
+    );
 }
 
 #[tokio::test]

@@ -24,6 +24,7 @@ use crate::{
     DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_WEBSEARCH_PROVIDER,
     OpenAiCompatiblePreset, PermissionMode, ProviderConfig, ReasoningEffort, ResponseVerbosity,
     SessionMode, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
+    TuiSynchronizedOutput,
 };
 
 /// When a save takes effect.
@@ -378,6 +379,7 @@ pub const RESPONSE_VERBOSITY_OPTIONS: &[&str] = &["concise", "normal", "verbose"
 pub const TOOL_OUTPUT_VERBOSITY_OPTIONS: &[&str] = &["compact", "normal", "verbose"];
 pub const TRANSCRIPT_DEFAULT_OPTIONS: &[&str] = &["compact", "expanded"];
 pub const ALTERNATE_SCREEN_OPTIONS: &[&str] = &["auto", "never", "always"];
+pub const SYNCHRONIZED_OUTPUT_OPTIONS: &[&str] = &["auto", "always", "never"];
 pub const PERMISSION_MODE_OPTIONS: &[&str] = &["allow", "ask", "deny"];
 pub const THEME_OPTIONS: &[&str] = &["system", "dark", "light", "catppuccin", "high-contrast"];
 
@@ -692,6 +694,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default_display: "auto",
                 default: || FieldValue::Enum("auto"),
                 help: "Whether to take over the terminal screen on launch.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "synchronized_output",
+                toml_path: &["tui", "synchronized_output"],
+                kind: FieldKind::Enum {
+                    options: SYNCHRONIZED_OUTPUT_OPTIONS,
+                },
+                tier: ApplyTier::Restart,
+                get: get_synchronized_output,
+                set: set_synchronized_output,
+                default_display: "auto",
+                default: || FieldValue::Enum("auto"),
+                help: "Wrap each frame in DEC 2026 Begin/End Synchronized Update so capable terminals (kitty, WezTerm, Ghostty, iTerm2, Alacritty) flip the cell grid atomically and eliminate streaming tearing. `auto` enables when the terminal advertises support; the sequences are silently ignored elsewhere.",
                 env_override: None,
                 secret: false,
             },
@@ -1839,6 +1856,19 @@ fn set_alternate_screen(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'
         "always" => TuiAlternateScreen::Always,
         _ => return Err("invalid alternate_screen"),
     };
+    Ok(())
+}
+
+fn get_synchronized_output(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.tui.synchronized_output.as_str())
+}
+fn set_synchronized_output(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::Enum(s) => s,
+        _ => return Err("expects enum"),
+    };
+    cfg.tui.synchronized_output =
+        TuiSynchronizedOutput::parse(s).ok_or("invalid synchronized_output")?;
     Ok(())
 }
 
