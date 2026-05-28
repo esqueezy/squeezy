@@ -3466,6 +3466,29 @@ impl ToolRegistry {
             }
         }
 
+        // F14: short-circuit identical-content writes by sha256 comparison
+        // before touching the disk. The existing read above already gave us
+        // `before_sha256`; computing the proposed-content sha first lets us
+        // skip `fs::write`, `invalidate_diff_cache`, and the checkpoint
+        // append when nothing would change. Skipping the write avoids the
+        // mtime bump and the journal entry that would otherwise be recorded
+        // for a no-op edit.
+        let after_sha256 = sha256_hex(args.content.as_bytes());
+        if before_sha256.as_deref() == Some(after_sha256.as_str()) {
+            let cost = ToolCostHint {
+                bytes_read: before.as_ref().map_or(0, |bytes| bytes.len() as u64),
+                ..ToolCostHint::default()
+            };
+            let content = json!({
+                "path": rel.to_string_lossy(),
+                "before_sha256": before_sha256,
+                "after_sha256": after_sha256,
+                "bytes_written": 0,
+                "noop": true,
+            });
+            return make_result(call, ToolStatus::Success, content, cost, Some(after_sha256));
+        }
+
         if let Some(parent) = path.parent()
             && let Err(err) = fs::create_dir_all(parent)
         {
@@ -3476,7 +3499,6 @@ impl ToolRegistry {
         }
         self.invalidate_diff_cache();
 
-        let after_sha256 = sha256_hex(args.content.as_bytes());
         let cost = ToolCostHint {
             bytes_read: before.as_ref().map_or(0, |bytes| bytes.len() as u64),
             output_bytes: args.content.len() as u64,
@@ -3488,6 +3510,7 @@ impl ToolRegistry {
             "before_sha256": before_sha256,
             "after_sha256": after_sha256,
             "bytes_written": args.content.len(),
+            "noop": false,
         });
         self.append_checkpoint_to_content(
             &mut content,
