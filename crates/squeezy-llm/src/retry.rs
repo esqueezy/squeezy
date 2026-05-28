@@ -261,7 +261,8 @@ impl StreamSkipState {
             }
             LlmEvent::ReasoningDone(_) => self.emitted_reasoning_done += 1,
             LlmEvent::ToolCall(_) => self.emitted_tool_calls += 1,
-            LlmEvent::Completed { .. } | LlmEvent::Cancelled => {}
+            LlmEvent::Completed { .. } | LlmEvent::Cancelled | LlmEvent::ContextOverflow { .. } => {
+            }
         }
     }
 }
@@ -340,6 +341,9 @@ impl SkipCursor {
                 reasoning_only_stop,
             }),
             LlmEvent::Cancelled => Some(LlmEvent::Cancelled),
+            LlmEvent::ContextOverflow { provider, signal } => {
+                Some(LlmEvent::ContextOverflow { provider, signal })
+            }
         }
     }
 }
