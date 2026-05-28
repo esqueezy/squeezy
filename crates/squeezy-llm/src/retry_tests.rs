@@ -105,6 +105,7 @@ async fn mock_transport_drops_mid_stream_for_two_attempts_then_succeeds_on_third
         retry_429: false,
         retry_5xx: false,
         retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
     };
     let cancel = CancellationToken::new();
     let attempts = Arc::new(Mutex::new(0u32));
@@ -159,6 +160,7 @@ async fn mock_transport_stops_retrying_once_stream_max_retries_is_exhausted() {
         retry_429: false,
         retry_5xx: false,
         retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
     };
     let cancel = CancellationToken::new();
     let attempts = Arc::new(Mutex::new(0u32));
@@ -194,6 +196,7 @@ async fn mock_transport_does_not_double_emit_when_reconnect_replays_prefix() {
         retry_429: false,
         retry_5xx: false,
         retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
     };
     let cancel = CancellationToken::new();
     let attempts = Arc::new(Mutex::new(0u32));
@@ -385,6 +388,51 @@ fn retry_after_returns_none_when_no_headers_present() {
     assert_eq!(parse_retry_after(&headers), None);
 }
 
+#[test]
+fn malicious_retry_after_header_is_clamped_to_policy_cap() {
+    // A hostile upstream asking for ~11.5 days of cooldown must not
+    // be able to park the agent: the default cap (60s) bounds the
+    // chosen delay regardless of what the header claims.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        "999999".parse().expect("header value"),
+    );
+    let parsed = parse_retry_after(&headers).expect("retry-after present");
+    assert_eq!(
+        parsed,
+        Duration::from_secs(999_999),
+        "parser must report the raw header value untouched",
+    );
+
+    let policy = RetryPolicy::provider_requests(ProviderTransportConfig::default());
+    assert_eq!(
+        policy.max_retry_delay,
+        Duration::from_secs(60),
+        "default policy must carry the 60s ceiling from ProviderTransportConfig",
+    );
+    assert_eq!(
+        parsed.min(policy.max_retry_delay),
+        Duration::from_secs(60),
+        "malicious Retry-After: 999999 must clamp to 60s",
+    );
+}
+
+#[test]
+fn retry_policy_inherits_max_retry_delay_from_transport_config() {
+    // Both the request and stream policies must carry the
+    // operator-configured ceiling so callers cannot accidentally
+    // bypass it by routing through a different policy constructor.
+    let transport = ProviderTransportConfig {
+        max_retry_delay_ms: 5_000,
+        ..ProviderTransportConfig::default()
+    };
+    let request_policy = RetryPolicy::provider_requests(transport);
+    let stream_policy = RetryPolicy::provider_stream(transport);
+    assert_eq!(request_policy.max_retry_delay, Duration::from_millis(5_000));
+    assert_eq!(stream_policy.max_retry_delay, Duration::from_millis(5_000));
+}
+
 // --- send_with_auth_retry --------------------------------------------------
 
 /// Test ApiKeySource that hands out a deterministic sequence of keys
@@ -496,6 +544,7 @@ fn auth_retry_policy() -> RetryPolicy {
         retry_429: false,
         retry_5xx: false,
         retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
     }
 }
 

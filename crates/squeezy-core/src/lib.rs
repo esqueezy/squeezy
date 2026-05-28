@@ -207,6 +207,12 @@ pub const DEFAULT_PROVIDER_POOL_IDLE_TIMEOUT_MS: u64 = 90_000;
 /// reusing as many warmed sockets as they did before the dispatcher
 /// was centralized.
 pub const DEFAULT_PROVIDER_POOL_MAX_IDLE_PER_HOST: u32 = u32::MAX;
+/// Hard ceiling (ms) on any inter-retry sleep — including a
+/// server-supplied `Retry-After` / `Retry-After-Ms` hint. Sized at one
+/// minute so honest throttle hints (typically seconds) pass through
+/// untouched while a malicious or buggy upstream can't park the agent
+/// for hours by claiming a multi-day cooldown.
+pub const DEFAULT_PROVIDER_MAX_RETRY_DELAY_MS: u64 = 60_000;
 pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
 // Per-subagent-invocation budgets. No peer agent has any equivalent —
 // codex, CC, and opencode bound work per single tool call,
@@ -2080,6 +2086,12 @@ pub struct ProviderTransportConfig {
     /// Maximum idle TCP connections kept per origin in the shared
     /// HTTP pool. `u32::MAX` is effectively unbounded.
     pub pool_max_idle_per_host: u32,
+    /// Upper bound (ms) on any inter-retry sleep. The retry path
+    /// honors `Retry-After` / `Retry-After-Ms` hints from the
+    /// upstream, but clamps the resulting delay to this value so a
+    /// malicious or buggy header (e.g. `Retry-After: 999999`) can't
+    /// hang the agent indefinitely.
+    pub max_retry_delay_ms: u64,
 }
 
 impl Default for ProviderTransportConfig {
@@ -2090,6 +2102,7 @@ impl Default for ProviderTransportConfig {
             stream_idle_timeout_ms: DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_MS,
             pool_idle_timeout_ms: DEFAULT_PROVIDER_POOL_IDLE_TIMEOUT_MS,
             pool_max_idle_per_host: DEFAULT_PROVIDER_POOL_MAX_IDLE_PER_HOST,
+            max_retry_delay_ms: DEFAULT_PROVIDER_MAX_RETRY_DELAY_MS,
         }
     }
 }
