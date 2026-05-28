@@ -26,7 +26,7 @@ use squeezy_core::{
     TurnMetrics, context_attachment_preview, context_attachment_storage_text,
     default_settings_path, detect_context_attachment_kind,
 };
-use squeezy_hooks::{HookPayload, HookRegistry, HookResult};
+use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
     CacheSpec, INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY,
     INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream,
@@ -1162,6 +1162,11 @@ pub struct Agent {
     /// `Some`. Defaults to `None` for backwards compatibility — callers
     /// that need hooks install a registry via `set_hooks`.
     hooks: Option<Arc<HookRegistry>>,
+    /// Optional typed [`AgentHookBus`]. Currently consulted by
+    /// [`Agent::switch_session`] so handlers can veto a session swap
+    /// (e.g. an unsaved-work guard). Defaults to `None`; callers wire a
+    /// bus via [`Agent::set_agent_hook_bus`].
+    agent_hook_bus: Option<Arc<AgentHookBus>>,
     /// Config save queued from the config screen. Drained before each
     /// `start_turn` so the running turn (if any) finishes on the old config
     /// and the next turn picks up the new one.
@@ -1523,6 +1528,7 @@ impl Agent {
             store,
             replay,
             hooks: None,
+            agent_hook_bus: None,
             pending_swap: None,
         }
     }
@@ -1602,6 +1608,21 @@ impl Agent {
     /// dispatch entirely.
     pub fn hooks(&self) -> Option<&Arc<HookRegistry>> {
         self.hooks.as_ref()
+    }
+
+    /// Install (or clear) the typed [`AgentHookBus`] consulted on
+    /// lifecycle transitions such as [`Agent::switch_session`]. The bus
+    /// is wrapped in `Arc` so cloned agents share the same handler set.
+    /// Passing `None` removes any previously-installed bus.
+    pub fn set_agent_hook_bus(&mut self, bus: Option<Arc<AgentHookBus>>) {
+        self.agent_hook_bus = bus;
+    }
+
+    /// Borrow the currently-installed typed hook bus, if any. Returns
+    /// `None` when no bus has been installed so callers can skip
+    /// dispatch entirely.
+    pub fn agent_hook_bus(&self) -> Option<&Arc<AgentHookBus>> {
+        self.agent_hook_bus.as_ref()
     }
 
     /// Snapshot of session-scoped permission rules. Primarily intended for
@@ -2037,6 +2058,30 @@ impl Agent {
             Self::resume(self.config.clone(), self.provider.clone(), session_id)?;
         *self = agent;
         Ok(transcript)
+    }
+
+    /// Swap the active session to `session_id`, consulting the typed
+    /// [`AgentHookBus`] first so handlers can veto the switch.
+    ///
+    /// Each registered [`squeezy_hooks::AgentHook::before_session_switch`]
+    /// fires in registration order; the bus short-circuits on the first
+    /// [`Decision::Deny`] and this method returns
+    /// [`SqueezyError::Agent`] without touching the in-process session
+    /// state. When no bus is installed (or every hook allows) the call
+    /// delegates to [`Agent::resume_current`], so the existing
+    /// transcript-rebuild contract is preserved.
+    pub async fn switch_session(
+        &mut self,
+        session_id: &str,
+    ) -> squeezy_core::Result<Vec<TranscriptItem>> {
+        if let Some(bus) = self.agent_hook_bus.clone()
+            && let Decision::Deny { message } = bus.before_session_switch(session_id).await
+        {
+            return Err(SqueezyError::Agent(format!(
+                "session switch to {session_id} denied by hook: {message}"
+            )));
+        }
+        self.resume_current(session_id)
     }
 
     /// Branch the active session into a sibling session that inherits the
