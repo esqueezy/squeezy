@@ -2758,6 +2758,7 @@ dependencies = [
  "squeezy-agent",
  "squeezy-core",
  "squeezy-llm",
+ "squeezy-skills",
  "squeezy-store",
  "squeezy-telemetry",
  "squeezy-tools",

@@ -136,7 +136,11 @@ impl SkillSource {
         }
     }
 
-    pub(crate) const fn as_str(self) -> &'static str {
+    /// Stable kebab/snake-case label for this source. Used by JSON and
+    /// human renderers across the workspace (e.g.
+    /// `squeezy config browse`) so callers don't have to re-derive a
+    /// display string from the enum variant.
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::CompatUser => "compat_user",
             Self::User => "user",
