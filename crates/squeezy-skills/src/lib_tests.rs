@@ -329,6 +329,268 @@ fn missing_extra_root_warns_without_failing_discovery() {
 }
 
 #[test]
+fn monorepo_root_and_package_skills_both_load_from_subdir_cwd() {
+    // Monorepo layout: skills live at the repo root *and* inside an
+    // individual package. When the agent is launched from the package
+    // (cwd = packages/foo), the catalog should surface both the
+    // package-local skill and the root-level sibling so the package can
+    // rely on shared monorepo-wide skills without copying them.
+    let monorepo = temp_workspace("skills_monorepo_root_and_package");
+    fs::create_dir_all(monorepo.join(".git")).expect("mkdir .git");
+    write_skill(
+        &monorepo.join(".squeezy/skills/root-skill"),
+        "root-skill",
+        "Shared monorepo skill",
+        &[],
+    );
+    let package_root = monorepo.join("packages/foo");
+    write_skill(
+        &package_root.join(".squeezy/skills/package-skill"),
+        "package-skill",
+        "Package-local skill",
+        &[],
+    );
+    let config = SkillsConfig {
+        user_dir: monorepo.join("user-noop"),
+        compat_user_dir: monorepo.join("compat-noop"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&package_root, &config);
+    let names: BTreeSet<String> = catalog
+        .summaries()
+        .into_iter()
+        .map(|summary| summary.name)
+        .collect();
+    assert!(
+        names.contains("root-skill"),
+        "ancestor walk must surface the monorepo-root skill from cwd={}, got {names:?}",
+        package_root.display()
+    );
+    assert!(
+        names.contains("package-skill"),
+        "cwd-local skill must still load alongside ancestor skills, got {names:?}"
+    );
+
+    let _ = fs::remove_dir_all(monorepo);
+}
+
+#[test]
+fn cwd_local_skill_wins_over_same_name_skill_in_monorepo_root() {
+    // When the same skill name exists at both the package cwd and the
+    // monorepo root, the cwd-local copy must win. This is the rule that
+    // lets a package override a shared monorepo skill without renaming
+    // it: drop a same-name skill in the package's `.squeezy/skills/`
+    // and it shadows the root version for that package's cwd.
+    let monorepo = temp_workspace("skills_monorepo_cwd_wins");
+    fs::create_dir_all(monorepo.join(".git")).expect("mkdir .git");
+    write_skill(
+        &monorepo.join(".squeezy/skills/shared"),
+        "shared",
+        "Monorepo-root version",
+        &[],
+    );
+    let package_root = monorepo.join("packages/foo");
+    write_skill(
+        &package_root.join(".squeezy/skills/shared"),
+        "shared",
+        "Package-local version",
+        &[],
+    );
+    let config = SkillsConfig {
+        user_dir: monorepo.join("user-noop"),
+        compat_user_dir: monorepo.join("compat-noop"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&package_root, &config);
+    let summaries: Vec<SkillSummary> = catalog
+        .summaries()
+        .into_iter()
+        .filter(|summary| summary.name == "shared")
+        .collect();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "same-name skill must collapse to a single entry, got {summaries:?}"
+    );
+    let summary = &summaries[0];
+    assert_eq!(summary.description, "Package-local version");
+    assert!(
+        summary
+            .location
+            .starts_with(package_root.join(".squeezy/skills/shared")),
+        "package-local skill location should win, got {}",
+        summary.location.display()
+    );
+
+    let _ = fs::remove_dir_all(monorepo);
+}
+
+#[test]
+fn ancestor_walk_picks_up_compat_agents_skills_dir() {
+    // The compat `.agents/skills/` form must also be discovered along
+    // the ancestor walk so monorepos that haven't migrated off the
+    // legacy directory still get sibling skill visibility from a
+    // package cwd.
+    let monorepo = temp_workspace("skills_monorepo_compat_ancestor");
+    fs::create_dir_all(monorepo.join(".git")).expect("mkdir .git");
+    write_skill(
+        &monorepo.join(".agents/skills/legacy"),
+        "legacy",
+        "Legacy compat ancestor skill",
+        &[],
+    );
+    let package_root = monorepo.join("packages/foo");
+    fs::create_dir_all(&package_root).expect("mkdir package");
+    let config = SkillsConfig {
+        user_dir: monorepo.join("user-noop"),
+        compat_user_dir: monorepo.join("compat-noop"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&package_root, &config);
+    let summary = catalog
+        .summaries()
+        .into_iter()
+        .find(|summary| summary.name == "legacy")
+        .expect("legacy ancestor skill must surface");
+    assert_eq!(summary.source, SkillSource::CompatProject);
+
+    let _ = fs::remove_dir_all(monorepo);
+}
+
+#[test]
+fn ancestor_walk_stops_at_first_git_root() {
+    // A nested git repository (e.g. a submodule) must terminate the
+    // ancestor walk so a package never reaches into a parent
+    // repository's skill set. The closer `.git` marker is the
+    // authoritative boundary even when an outer ancestor would also
+    // qualify as a repository root.
+    let outer = temp_workspace("skills_monorepo_nested_git");
+    fs::create_dir_all(outer.join(".git")).expect("mkdir outer .git");
+    write_skill(
+        &outer.join(".squeezy/skills/outer-skill"),
+        "outer-skill",
+        "Outer repo skill that must be invisible",
+        &[],
+    );
+    let inner = outer.join("inner-repo");
+    fs::create_dir_all(inner.join(".git")).expect("mkdir inner .git");
+    write_skill(
+        &inner.join(".squeezy/skills/inner-skill"),
+        "inner-skill",
+        "Inner repo skill",
+        &[],
+    );
+    let package_root = inner.join("packages/foo");
+    fs::create_dir_all(&package_root).expect("mkdir package");
+    let config = SkillsConfig {
+        user_dir: outer.join("user-noop"),
+        compat_user_dir: outer.join("compat-noop"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&package_root, &config);
+    let names: BTreeSet<String> = catalog
+        .summaries()
+        .into_iter()
+        .map(|summary| summary.name)
+        .collect();
+    assert!(
+        names.contains("inner-skill"),
+        "inner repo skill should still load from its own root, got {names:?}"
+    );
+    assert!(
+        !names.contains("outer-skill"),
+        "ancestor walk must stop at the inner repo's .git boundary, got {names:?}"
+    );
+
+    let _ = fs::remove_dir_all(outer);
+}
+
+#[test]
+fn ancestor_walk_respects_native_over_compat_inside_same_ancestor() {
+    // Inside a single ancestor, `.squeezy/skills/` must still win over
+    // `.agents/skills/` on same-name collision, mirroring the cwd-level
+    // precedence rule. The ancestor walk's "inner shadows outer" policy
+    // applies across ancestors only — within one ancestor the existing
+    // source precedence stays authoritative.
+    let monorepo = temp_workspace("skills_monorepo_native_over_compat");
+    fs::create_dir_all(monorepo.join(".git")).expect("mkdir .git");
+    write_skill(
+        &monorepo.join(".agents/skills/dual"),
+        "dual",
+        "Compat version",
+        &[],
+    );
+    write_skill(
+        &monorepo.join(".squeezy/skills/dual"),
+        "dual",
+        "Native version",
+        &[],
+    );
+    let package_root = monorepo.join("packages/foo");
+    fs::create_dir_all(&package_root).expect("mkdir package");
+    let config = SkillsConfig {
+        user_dir: monorepo.join("user-noop"),
+        compat_user_dir: monorepo.join("compat-noop"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&package_root, &config);
+    let summary = catalog
+        .summaries()
+        .into_iter()
+        .find(|summary| summary.name == "dual")
+        .expect("ancestor skill must surface");
+    assert_eq!(summary.source, SkillSource::Project);
+    assert_eq!(summary.description, "Native version");
+
+    let _ = fs::remove_dir_all(monorepo);
+}
+
+#[test]
+fn ancestor_walk_stops_at_workspace_root_when_it_is_itself_git_root() {
+    // When the cwd is already a git root, the strict-ancestor walk
+    // must be a no-op — a checkout at `~/code/myrepo` should never
+    // reach into `~` or `/` looking for unrelated skill caches. The
+    // `ancestor_project_roots` helper enforces this by short-circuiting
+    // on `is_git_root(workspace_root)`.
+    let root = temp_workspace("skills_monorepo_no_parent_walk");
+    fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+    write_skill(
+        &root.join(".squeezy/skills/local"),
+        "local",
+        "Local skill",
+        &[],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user-noop"),
+        compat_user_dir: root.join("compat-noop"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let names: Vec<String> = catalog
+        .summaries()
+        .into_iter()
+        .map(|summary| summary.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["local"],
+        "no ancestor walk should run when cwd is itself a git root, got {names:?}"
+    );
+    assert!(
+        ancestor_project_roots(&root).is_empty(),
+        "ancestor list must be empty when cwd is a git root"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn explicit_and_trigger_activation_loads_lazily() {
     let root = temp_workspace("skills_activation");
     let config = SkillsConfig {
