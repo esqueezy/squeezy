@@ -18,6 +18,16 @@ pub use hardening::pre_main_hardening;
 
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
+/// ChatGPT Plus/Pro Codex backend. Mirrors pi's `openai-codex-responses`
+/// route — the protocol is OpenAI's Responses API, but the requests go
+/// through the ChatGPT backend with the subscription's account id stamped
+/// in `chatgpt-account-id`.
+pub const DEFAULT_OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+pub const DEFAULT_OPENAI_CODEX_MODEL: &str = DEFAULT_OPENAI_MODEL;
+/// Originator tag stamped on every Codex request so OpenAI can attribute
+/// traffic to squeezy in their dashboards. Matches the `originator`
+/// header pi uses (`"pi"`) but identifies squeezy specifically.
+pub const DEFAULT_OPENAI_CODEX_ORIGINATOR: &str = "squeezy";
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-4-7";
 pub const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -564,6 +574,17 @@ impl AppConfig {
                     .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
                 transport: provider_transport_settings(&providers, &["openai"]),
             }),
+            "openai-codex" | "openai_codex" | "chatgpt" => {
+                ProviderConfig::OpenAiCodex(OpenAiCodexConfig {
+                    base_url: get_var("OPENAI_CODEX_BASE_URL")
+                        .or_else(|| provider_setting(&providers, "openai_codex", "base_url"))
+                        .unwrap_or_else(|| DEFAULT_OPENAI_CODEX_BASE_URL.to_string()),
+                    originator: get_var("OPENAI_CODEX_ORIGINATOR")
+                        .or_else(|| provider_setting(&providers, "openai_codex", "originator"))
+                        .unwrap_or_else(|| DEFAULT_OPENAI_CODEX_ORIGINATOR.to_string()),
+                    transport: provider_transport_settings(&providers, &["openai_codex"]),
+                })
+            }
             other if OpenAiCompatiblePreset::parse(other).is_some() => {
                 let preset =
                     OpenAiCompatiblePreset::parse(other).expect("guarded by match condition");
@@ -594,6 +615,10 @@ impl AppConfig {
                 .unwrap_or_else(|| DEFAULT_BEDROCK_MODEL.to_string()),
             ProviderConfig::Ollama(_) => provider_setting(&providers, "ollama", "default_model")
                 .unwrap_or_else(|| DEFAULT_OLLAMA_MODEL.to_string()),
+            ProviderConfig::OpenAiCodex(_) => {
+                provider_setting(&providers, "openai_codex", "default_model")
+                    .unwrap_or_else(|| DEFAULT_OPENAI_CODEX_MODEL.to_string())
+            }
             ProviderConfig::OpenAiCompatible(config) => {
                 provider_setting(&providers, config.preset.as_str(), "default_model")
                     .unwrap_or_else(|| config.preset.default_model().to_string())
@@ -621,6 +646,7 @@ impl AppConfig {
             ProviderConfig::AzureOpenAi(_) => "azure_openai",
             ProviderConfig::Bedrock(_) => "bedrock",
             ProviderConfig::Ollama(_) => "ollama",
+            ProviderConfig::OpenAiCodex(_) => "openai_codex",
             ProviderConfig::OpenAiCompatible(_) => "",
         };
         let model = resolve_model_alias(provider_slug, &raw_model)
@@ -1560,6 +1586,7 @@ fn provider_kind(provider: &ProviderConfig) -> &'static str {
         ProviderConfig::AzureOpenAi(_) => "azure_openai",
         ProviderConfig::Bedrock(_) => "bedrock",
         ProviderConfig::Ollama(_) => "ollama",
+        ProviderConfig::OpenAiCodex(_) => "openai_codex",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
     }
 }
@@ -1653,6 +1680,12 @@ pub enum ProviderConfig {
     Bedrock(BedrockConfig),
     Ollama(OllamaConfig),
     OpenAiCompatible(OpenAiCompatibleConfig),
+    /// ChatGPT Plus/Pro subscription. The wire protocol is the OpenAI
+    /// Responses API; auth is an OAuth access token persisted under
+    /// `~/.squeezy/auth/openai-codex.json` rather than an env-var API
+    /// key. The credential is never carried inline in the TOML — the
+    /// settings only describe the endpoint and originator.
+    OpenAiCodex(OpenAiCodexConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1930,6 +1963,19 @@ pub struct OpenAiConfig {
     #[serde(serialize_with = "redact_secret_opt")]
     pub api_key: Option<String>,
     pub base_url: String,
+    pub transport: ProviderTransportConfig,
+}
+
+/// ChatGPT Plus/Pro subscription provider settings. The OAuth token
+/// itself lives outside the TOML (under `~/.squeezy/auth/openai-codex.json`
+/// with `chmod 600`); only the endpoint and the originator label are
+/// configurable here. `base_url` accepts user overrides for testing
+/// against a captive backend but defaults to the live ChatGPT Codex
+/// endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiCodexConfig {
+    pub base_url: String,
+    pub originator: String,
     pub transport: ProviderTransportConfig,
 }
 
@@ -7164,6 +7210,7 @@ fn validate_provider_base_urls(provider: &ProviderConfig) -> Result<()> {
         ProviderConfig::Google(cfg) => check_base_url_scheme(&cfg.base_url, "google"),
         ProviderConfig::AzureOpenAi(cfg) => check_base_url_scheme(&cfg.base_url, "azure_openai"),
         ProviderConfig::Ollama(cfg) => check_base_url_scheme(&cfg.base_url, "ollama"),
+        ProviderConfig::OpenAiCodex(cfg) => check_base_url_scheme(&cfg.base_url, "openai_codex"),
         ProviderConfig::OpenAiCompatible(cfg) => {
             check_base_url_scheme(&cfg.base_url, cfg.preset.as_str())
         }
@@ -7330,6 +7377,7 @@ fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] 
         ProviderConfig::AzureOpenAi(_) => &["azure_openai", "azure"],
         ProviderConfig::Bedrock(_) => &["bedrock"],
         ProviderConfig::Ollama(_) => &["ollama"],
+        ProviderConfig::OpenAiCodex(_) => &["openai_codex"],
         ProviderConfig::OpenAiCompatible(config) => match config.preset {
             OpenAiCompatiblePreset::OpenRouter => &["openrouter"],
             OpenAiCompatiblePreset::Vercel => &["vercel"],

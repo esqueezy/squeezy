@@ -6,7 +6,7 @@ use squeezy_core::{CostSnapshot, ModelProfile, OpenAiCompatiblePreset, ProviderC
 
 use crate::{
     AnthropicProvider, BedrockProvider, GoogleProvider, LlmInputItem, LlmProvider, LlmRequest,
-    OllamaProvider, OpenAiCompatibleProvider, OpenAiProvider, XaiProvider,
+    OllamaProvider, OpenAiCodexProvider, OpenAiCompatibleProvider, OpenAiProvider, XaiProvider,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -210,6 +210,7 @@ fn leak_string(value: String) -> &'static str {
 
 pub const PROVIDERS: &[&str] = &[
     "openai",
+    "openai_codex",
     "anthropic",
     "google",
     "azure_openai",
@@ -340,6 +341,7 @@ pub fn provider_name(config: &ProviderConfig) -> &'static str {
         ProviderConfig::AzureOpenAi(_) => "azure_openai",
         ProviderConfig::Bedrock(_) => "bedrock",
         ProviderConfig::Ollama(_) => "ollama",
+        ProviderConfig::OpenAiCodex(_) => "openai_codex",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
     }
 }
@@ -356,6 +358,13 @@ pub fn provider_from_config(config: &ProviderConfig) -> Result<Arc<dyn LlmProvid
         }
         ProviderConfig::Bedrock(bedrock) => Ok(Arc::new(BedrockProvider::from_config(bedrock)?)),
         ProviderConfig::Ollama(ollama) => Ok(Arc::new(OllamaProvider::from_config(ollama))),
+        // `from_config` consults the on-disk token under
+        // `~/.squeezy/auth/openai-codex.json`. Local file I/O only —
+        // refresh happens lazily on the first streaming request
+        // through the OAuth source.
+        ProviderConfig::OpenAiCodex(codex) => {
+            Ok(Arc::new(OpenAiCodexProvider::from_config(codex)?))
+        }
         ProviderConfig::OpenAiCompatible(config) => match config.preset {
             // xAI ships both Chat Completions and Responses APIs on the
             // same host; route Grok 3+ through Responses for reasoning

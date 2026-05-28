@@ -976,6 +976,7 @@ pub enum ProviderKind {
     CloudflareWorkersAi,
     CloudflareAiGateway,
     OpenAiCompatible,
+    OpenAiCodex,
 }
 
 impl ProviderKind {
@@ -988,6 +989,7 @@ impl ProviderKind {
             ProviderConfig::AzureOpenAi(_) => Self::AzureOpenAi,
             ProviderConfig::Bedrock(_) => Self::Bedrock,
             ProviderConfig::Ollama(_) => Self::Ollama,
+            ProviderConfig::OpenAiCodex(_) => Self::OpenAiCodex,
             ProviderConfig::OpenAiCompatible(config) => match config.preset {
                 OpenAiCompatiblePreset::OpenRouter => Self::OpenRouter,
                 OpenAiCompatiblePreset::Vercel => Self::Vercel,

@@ -24,7 +24,7 @@ mod google;
 mod lmstudio;
 pub mod model_discovery;
 pub mod models_dev;
-mod oauth;
+pub mod oauth;
 mod ollama;
 mod openai;
 mod registry;
@@ -53,12 +53,15 @@ pub use model_discovery::{
     resolve_capabilities, resolve_capabilities_with,
 };
 pub use oauth::{
-    ANTHROPIC_OAUTH_TOKEN_PREFIX, AnthropicLoginConfig, AnthropicOAuthSource, PersistedTokens,
-    PkceCodes, TokenResponse,
+    ANTHROPIC_OAUTH_TOKEN_PREFIX, AnthropicLoginConfig, AnthropicOAuthSource,
+    OPENAI_CODEX_AUTH_FILE_NAME, OpenAiCodexLoginOutcome, OpenAiCodexOAuthSource,
+    OpenAiCodexProvider, PersistedTokens, PkceCodes, TokenResponse,
     anthropic_default_storage_path as oauth_anthropic_default_storage_path,
     anthropic_oauth_beta_header, anthropic_read_tokens as oauth_anthropic_read_tokens,
-    anthropic_write_tokens as oauth_anthropic_write_tokens, exchange_authorization_code,
-    generate_pkce, is_anthropic_oauth_token, parse_authorization_input, refresh_anthropic_token,
+    anthropic_write_tokens as oauth_anthropic_write_tokens, codex_auth_file_path,
+    default_codex_auth_path, exchange_authorization_code, generate_pkce, is_anthropic_oauth_token,
+    load_codex_token, login_openai_codex_interactive, parse_authorization_input,
+    refresh_anthropic_token, save_codex_token,
 };
 pub use ollama::{
     OllamaProvider, PullEvent, PullStream, fetch_ollama_context_window, fetch_ollama_model_names,

@@ -3,7 +3,7 @@ use std::env;
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
 use squeezy_core::{
@@ -11,8 +11,9 @@ use squeezy_core::{
     settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits},
 };
 use squeezy_llm::{
-    AnthropicLoginConfig, AnthropicOAuthSource, PersistedTokens, exchange_authorization_code,
-    generate_pkce, parse_authorization_input,
+    AnthropicLoginConfig, AnthropicOAuthSource, OpenAiCodexLoginOutcome, PersistedTokens,
+    codex_auth_file_path, exchange_authorization_code, generate_pkce,
+    login_openai_codex_interactive, parse_authorization_input,
 };
 
 /// Every `[providers.<section>]` name that can carry an inline `api_key`,
@@ -177,6 +178,14 @@ pub enum AuthCommand {
         #[command(subcommand)]
         command: AnthropicOauthCommand,
     },
+    #[command(
+        name = "openai-codex",
+        about = "Manage the ChatGPT Plus/Pro subscription (OpenAI Codex OAuth) token"
+    )]
+    OpenAiCodex {
+        #[command(subcommand)]
+        command: OpenAiCodexCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -193,11 +202,34 @@ pub enum AnthropicOauthCommand {
     Status,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum OpenAiCodexCommand {
+    #[command(about = "Run the OAuth login flow and persist the access/refresh tokens")]
+    Login(OpenAiCodexLoginArgs),
+    #[command(about = "Remove the persisted Codex token (sign out)")]
+    Logout,
+    #[command(about = "Show whether a Codex token is currently persisted")]
+    Status,
+}
+
 #[derive(Debug, Args, Default)]
 pub struct AnthropicLoginArgs {
     /// Skip the best-effort `open`/`xdg-open` browser launch and only
     /// print the authorize URL. Useful in headless or SSH sessions.
     #[arg(long, help = "Do not try to launch a browser; just print the URL")]
+    pub no_browser: bool,
+}
+
+#[derive(Debug, Args, Default)]
+pub struct OpenAiCodexLoginArgs {
+    /// Originator tag stamped in the OAuth authorize URL and on every
+    /// Codex request. Defaults to `squeezy` so OpenAI can attribute
+    /// traffic; override only if you know what you're doing.
+    #[arg(long, help = "OAuth originator tag (default: squeezy)")]
+    pub originator: Option<String>,
+    /// Skip the automatic browser launch. The CLI prints the URL and
+    /// waits for the callback — useful on headless hosts.
+    #[arg(long, help = "Do not invoke a browser; print the URL only")]
     pub no_browser: bool,
 }
 
@@ -256,6 +288,183 @@ pub async fn handle_auth_command(command: &AuthCommand) -> squeezy_core::Result<
         AuthCommand::Remove(args) => handle_auth_remove(args),
         AuthCommand::Status(args) => handle_auth_status(args),
         AuthCommand::Anthropic { command } => handle_anthropic_oauth(command).await,
+        AuthCommand::OpenAiCodex { command } => handle_openai_codex_command(command),
+    }
+}
+
+fn handle_openai_codex_command(command: &OpenAiCodexCommand) -> squeezy_core::Result<()> {
+    match command {
+        OpenAiCodexCommand::Login(args) => handle_openai_codex_login(args),
+        OpenAiCodexCommand::Logout => handle_openai_codex_logout(),
+        OpenAiCodexCommand::Status => handle_openai_codex_status(),
+    }
+}
+
+fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Result<()> {
+    let auth_path = codex_auth_file_path().ok_or_else(|| {
+        SqueezyError::Config(
+            "could not determine ~/.squeezy auth directory; \
+             set SQUEEZY_OPENAI_CODEX_AUTH_FILE or HOME"
+                .to_string(),
+        )
+    })?;
+    let originator = args
+        .originator
+        .clone()
+        .unwrap_or_else(|| "squeezy".to_string());
+    let no_browser = args.no_browser;
+
+    // Construct a runtime explicitly so this stays runnable from the
+    // non-async `handle_auth_command` entry point without changing
+    // the trait signature.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| SqueezyError::Config(format!("tokio runtime build failed: {err}")))?;
+
+    let auth_path_for_login = auth_path.clone();
+    let outcome: OpenAiCodexLoginOutcome = runtime.block_on(async move {
+        login_openai_codex_interactive(&originator, &auth_path_for_login, |url| {
+            eprintln!("Open this URL in your browser to sign in to ChatGPT Plus/Pro:");
+            eprintln!();
+            eprintln!("    {url}");
+            eprintln!();
+            if no_browser {
+                eprintln!("(--no-browser: not launching a browser; waiting for callback…)");
+                return Ok(());
+            }
+            match open_browser(url) {
+                Ok(()) => {
+                    eprintln!("Browser launched. Waiting for callback…");
+                }
+                Err(err) => {
+                    eprintln!("Could not launch browser ({err}). Open the URL manually.");
+                }
+            }
+            Ok(())
+        })
+        .await
+    })?;
+
+    let expires_in = expires_in_human(outcome.expires_at_unix_ms);
+    println!(
+        "signed in to ChatGPT (account {}); token saved to {}{}",
+        outcome.account_id,
+        outcome.auth_file.display(),
+        expires_in
+            .map(|s| format!("; access token valid for ~{s}"))
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
+fn handle_openai_codex_logout() -> squeezy_core::Result<()> {
+    let auth_path = codex_auth_file_path().ok_or_else(|| {
+        SqueezyError::Config(
+            "could not determine ~/.squeezy auth directory; \
+             set SQUEEZY_OPENAI_CODEX_AUTH_FILE or HOME"
+                .to_string(),
+        )
+    })?;
+    match std::fs::remove_file(&auth_path) {
+        Ok(()) => {
+            println!("removed codex token at {}", auth_path.display());
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            println!("no codex token at {}", auth_path.display());
+            Ok(())
+        }
+        Err(err) => Err(SqueezyError::Config(format!(
+            "could not remove {}: {err}",
+            auth_path.display()
+        ))),
+    }
+}
+
+fn handle_openai_codex_status() -> squeezy_core::Result<()> {
+    let auth_path = codex_auth_file_path().ok_or_else(|| {
+        SqueezyError::Config(
+            "could not determine ~/.squeezy auth directory; \
+             set SQUEEZY_OPENAI_CODEX_AUTH_FILE or HOME"
+                .to_string(),
+        )
+    })?;
+    if !auth_path.exists() {
+        println!(
+            "no codex token at {} — run `squeezy auth openai-codex login`",
+            auth_path.display()
+        );
+        return Ok(());
+    }
+    match squeezy_llm::load_codex_token(&auth_path)? {
+        Some(token) => {
+            let expires_in = expires_in_human(token.expires_at_unix_ms);
+            println!(
+                "codex token present at {} for account {}{}",
+                auth_path.display(),
+                token.account_id,
+                expires_in
+                    .map(|s| format!(" (access token valid for ~{s})"))
+                    .unwrap_or_else(
+                        || " (access token already expired; will refresh on next use)".to_string()
+                    )
+            );
+            Ok(())
+        }
+        None => {
+            println!(
+                "no codex token at {} — run `squeezy auth openai-codex login`",
+                auth_path.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+fn expires_in_human(expires_at_unix_ms: u64) -> Option<String> {
+    let expiry = UNIX_EPOCH.checked_add(Duration::from_millis(expires_at_unix_ms))?;
+    let now = SystemTime::now();
+    let remaining = expiry.duration_since(now).ok()?;
+    let secs = remaining.as_secs();
+    if secs < 60 {
+        Some(format!("{secs}s"))
+    } else if secs < 3600 {
+        Some(format!("{}m", secs / 60))
+    } else {
+        Some(format!("{}h {}m", secs / 3600, (secs % 3600) / 60))
+    }
+}
+
+/// Best-effort browser launcher. Each platform has its own CLI:
+/// `open` on macOS, `xdg-open` on Linux, `cmd /C start` on Windows.
+/// Falls back to an explicit error so the caller can print the URL
+/// for the user to open manually.
+fn open_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).status()?;
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open").arg(url).status()?;
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .status()?;
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = url;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no browser launcher for this platform",
+        ))
     }
 }
 

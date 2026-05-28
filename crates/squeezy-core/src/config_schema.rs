@@ -14,16 +14,16 @@ use crate::{
     DEFAULT_FEEDBACK_ENDPOINT, DEFAULT_FEEDBACK_MAX_BYTES, DEFAULT_GOOGLE_MODEL,
     DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_SEARCH_FILES_PER_TURN,
     DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN, DEFAULT_MAX_TOOL_CALLS_PER_TURN, DEFAULT_OLLAMA_MODEL,
-    DEFAULT_OPENAI_MODEL, DEFAULT_PARALLEL_API_KEY_ENV, DEFAULT_PARALLEL_MCP_URL,
-    DEFAULT_REPORT_ENDPOINT, DEFAULT_REPORT_MAX_BYTES, DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS,
-    DEFAULT_SESSION_LOG_RETENTION_DAYS, DEFAULT_SESSION_MAX_EVENT_BYTES,
-    DEFAULT_SESSION_MAX_SESSION_BYTES, DEFAULT_STREAM_IDLE_TIMEOUT_MS,
-    DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS, DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
-    DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS, DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL,
-    DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL, DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS,
-    DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode, ProviderConfig,
-    ReasoningEffort, ResponseVerbosity, SessionMode, StatusVerbosity, ToolOutputVerbosity,
-    TranscriptDefault, TuiAlternateScreen,
+    DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_PARALLEL_API_KEY_ENV,
+    DEFAULT_PARALLEL_MCP_URL, DEFAULT_REPORT_ENDPOINT, DEFAULT_REPORT_MAX_BYTES,
+    DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS, DEFAULT_SESSION_LOG_RETENTION_DAYS,
+    DEFAULT_SESSION_MAX_EVENT_BYTES, DEFAULT_SESSION_MAX_SESSION_BYTES,
+    DEFAULT_STREAM_IDLE_TIMEOUT_MS, DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
+    DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL, DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
+    DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
+    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_WEBSEARCH_PROVIDER,
+    OpenAiCompatiblePreset, PermissionMode, ProviderConfig, ReasoningEffort, ResponseVerbosity,
+    SessionMode, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
 };
 
 /// When a save takes effect.
@@ -1477,8 +1477,9 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
     use crate::{
         AnthropicConfig, AzureOpenAiConfig, BedrockConfig, DEFAULT_ANTHROPIC_BASE_URL,
         DEFAULT_AZURE_OPENAI_API_VERSION, DEFAULT_AZURE_OPENAI_BASE_URL, DEFAULT_BEDROCK_REGION,
-        DEFAULT_GOOGLE_BASE_URL, DEFAULT_OLLAMA_BASE_URL, DEFAULT_OPENAI_BASE_URL, GoogleConfig,
-        OllamaConfig, OpenAiCompatibleConfig, OpenAiCompatiblePreset, OpenAiConfig,
+        DEFAULT_GOOGLE_BASE_URL, DEFAULT_OLLAMA_BASE_URL, DEFAULT_OPENAI_BASE_URL,
+        DEFAULT_OPENAI_CODEX_BASE_URL, DEFAULT_OPENAI_CODEX_ORIGINATOR, GoogleConfig, OllamaConfig,
+        OpenAiCodexConfig, OpenAiCompatibleConfig, OpenAiCompatiblePreset, OpenAiConfig,
         ProviderTransportConfig,
     };
     let transport = ProviderTransportConfig::default();
@@ -1489,6 +1490,13 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
             base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
             transport,
         }),
+        "openai-codex" | "openai_codex" | "chatgpt" => {
+            ProviderConfig::OpenAiCodex(OpenAiCodexConfig {
+                base_url: DEFAULT_OPENAI_CODEX_BASE_URL.to_string(),
+                originator: DEFAULT_OPENAI_CODEX_ORIGINATOR.to_string(),
+                transport,
+            })
+        }
         "anthropic" => ProviderConfig::Anthropic(AnthropicConfig {
             api_key_env: "SQUEEZY_ANTHROPIC_KEY".to_string(),
             api_key: None,
@@ -1542,6 +1550,7 @@ fn provider_to_str(p: &ProviderConfig) -> &'static str {
         ProviderConfig::AzureOpenAi(_) => "azure_openai",
         ProviderConfig::Bedrock(_) => "bedrock",
         ProviderConfig::Ollama(_) => "ollama",
+        ProviderConfig::OpenAiCodex(_) => "openai_codex",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
     }
 }
@@ -1554,6 +1563,7 @@ pub fn default_model_for(provider: &str) -> &'static str {
         "azure_openai" => DEFAULT_AZURE_OPENAI_MODEL,
         "bedrock" => DEFAULT_BEDROCK_MODEL,
         "ollama" => DEFAULT_OLLAMA_MODEL,
+        "openai_codex" | "openai-codex" | "chatgpt" => DEFAULT_OPENAI_CODEX_MODEL,
         other => match OpenAiCompatiblePreset::parse(other) {
             Some(preset) => preset.default_model(),
             None => DEFAULT_OPENAI_MODEL,
