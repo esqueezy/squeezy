@@ -66,6 +66,7 @@ mod cancel;
 mod context_compaction;
 mod cost_broker;
 mod exploration_compiler;
+pub mod export_html;
 mod micro_compaction;
 mod permission_persist;
 mod plan_mode;
@@ -88,6 +89,7 @@ use roles::{RoleModelPolicy, SubagentRole, role_config};
 pub use ai_reviewer::{ReviewerAuditEntry, ReviewerAuditVerdict};
 pub use context_compaction::ContextCompactionReport;
 pub use cost_broker::CostCapStatus;
+pub use export_html::{ExportError, ExportOpts, ExportTheme, export_session_to_html};
 pub use plan_mode::{PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG, strip_proposed_plan_blocks};
 
 // Emergency belt on tool rounds per turn — codex and opencode loop

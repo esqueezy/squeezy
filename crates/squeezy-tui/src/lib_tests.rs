@@ -8281,6 +8281,7 @@ fn slash_commands_have_documented_capability_for_every_entry() {
         "/resume",
         "/fork",
         "/session-export",
+        "/session-export-html",
         "/session-cleanup",
         "/undo",
         "/revert-turn",
