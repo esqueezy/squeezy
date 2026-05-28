@@ -222,9 +222,9 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     ),
     slash_args_caps(
         "/session",
-        "show a saved session",
+        "show a saved session, or rename/label the active one",
         true,
-        "<id>",
+        "<id> | rename <name> | label <name>",
         &[PermissionCapability::Read],
     ),
     slash_args_caps(

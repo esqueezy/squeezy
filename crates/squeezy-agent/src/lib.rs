@@ -1890,6 +1890,73 @@ impl Agent {
         SessionStore::open(&self.config).export(session_id)
     }
 
+    /// Set (or clear, when `name` is `None`) the active session's
+    /// `display_name`. The new value is persisted to the session's
+    /// `metadata.json` *and* refreshed in the cross-project global
+    /// index so the resume picker — both same-cwd and Tab-toggled
+    /// cross-project — surfaces the user-facing name on the next
+    /// open. Returns the post-update metadata snapshot.
+    ///
+    /// Errors when no session log is attached (session logging
+    /// disabled at startup).
+    pub fn set_session_display_name(
+        &self,
+        name: Option<String>,
+    ) -> squeezy_core::Result<SessionMetadata> {
+        let Some(handle) = self.session_log.as_ref() else {
+            return Err(SqueezyError::Agent(
+                "no active session to rename".to_string(),
+            ));
+        };
+        let normalized = name.and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        handle.update_metadata_and_index(|metadata| {
+            metadata.display_name = normalized;
+        })
+    }
+
+    /// Append `label` to the active session's `labels` list, deduping
+    /// case-sensitively so muscle-memory re-runs stay no-ops. Returns
+    /// `(metadata, added)`; `added` is `false` when the label was
+    /// already present, in which case the metadata snapshot is still
+    /// returned so callers can echo the current label set.
+    ///
+    /// Empty labels are rejected so the user never accidentally
+    /// inserts a blank tag.
+    pub fn add_session_label(
+        &self,
+        label: String,
+    ) -> squeezy_core::Result<(SessionMetadata, bool)> {
+        let Some(handle) = self.session_log.as_ref() else {
+            return Err(SqueezyError::Agent(
+                "no active session to label".to_string(),
+            ));
+        };
+        let normalized = label.trim().to_string();
+        if normalized.is_empty() {
+            return Err(SqueezyError::Agent("label must not be empty".to_string()));
+        }
+        let mut added = false;
+        let snapshot = handle.update_metadata_and_index(|metadata| {
+            if metadata
+                .labels
+                .iter()
+                .any(|existing| existing == &normalized)
+            {
+                return;
+            }
+            metadata.labels.push(normalized.clone());
+            added = true;
+        })?;
+        Ok((snapshot, added))
+    }
+
     pub fn prepare_feedback(&self, message: &str) -> squeezy_core::Result<PreparedFeedback> {
         prepare_feedback(&self.config, message, "tui")
     }
@@ -2388,6 +2455,35 @@ impl Agent {
                     exists,
                 }
             }
+            DispatchCommand::SessionRename { name } => {
+                let normalized = if name.trim().is_empty() {
+                    None
+                } else {
+                    Some(name)
+                };
+                match self.set_session_display_name(normalized) {
+                    Ok(metadata) => DispatchOutcome::SessionRenamed {
+                        session_id: metadata.session_id,
+                        display_name: metadata.display_name,
+                    },
+                    Err(err) => DispatchOutcome::Error {
+                        command: "/session".into(),
+                        message: format!("{err}"),
+                    },
+                }
+            }
+            DispatchCommand::SessionLabel { name } => match self.add_session_label(name.clone()) {
+                Ok((metadata, added)) => DispatchOutcome::SessionLabelled {
+                    session_id: metadata.session_id,
+                    label: name,
+                    added,
+                    labels: metadata.labels,
+                },
+                Err(err) => DispatchOutcome::Error {
+                    command: "/session".into(),
+                    message: format!("{err}"),
+                },
+            },
             DispatchCommand::SessionExport { id } => match self.export_session(&id) {
                 Ok(value) => DispatchOutcome::SessionExported {
                     session_id: id,

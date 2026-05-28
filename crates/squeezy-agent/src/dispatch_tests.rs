@@ -260,6 +260,41 @@ fn parse_session_family() {
             id: "sess-1".to_string()
         }
     );
+    // `/session rename <name>` captures the remainder verbatim so a
+    // user can pass multi-word names without quoting.
+    assert_eq!(
+        parse("/session rename payments refactor").unwrap(),
+        DispatchCommand::SessionRename {
+            name: "payments refactor".to_string()
+        }
+    );
+    // `/session rename` with no argument clears the display_name.
+    assert_eq!(
+        parse("/session rename").unwrap(),
+        DispatchCommand::SessionRename {
+            name: String::new()
+        }
+    );
+    assert_eq!(
+        parse("/session label bugfix").unwrap(),
+        DispatchCommand::SessionLabel {
+            name: "bugfix".to_string()
+        }
+    );
+    // `/session label` without an argument is a usage error — labels
+    // are append-only so an empty argument has no useful meaning.
+    assert!(matches!(
+        parse("/session label").unwrap_err(),
+        DispatchCommandParseError::Usage { .. }
+    ));
+    // Reserved subcommands take precedence over treating the head as
+    // a session id; both `rename` and `label` are unrelated to real
+    // session ids (timestamped hex slugs) so this is unambiguous.
+    assert_eq!(parse("/session rename").unwrap().slash_name(), "/session");
+    assert_eq!(
+        parse("/session label tag").unwrap().slash_name(),
+        "/session"
+    );
     assert_eq!(
         parse("/resume sess-2").unwrap(),
         DispatchCommand::Resume {

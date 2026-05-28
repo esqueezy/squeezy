@@ -807,6 +807,12 @@ impl Driver {
                 format!("unsupported_slash_command:{command}")
             }
             squeezy_agent::DispatchOutcome::Error { message, .. } => format!("error:{message}"),
+            squeezy_agent::DispatchOutcome::SessionRenamed { display_name, .. } => {
+                format!("session_renamed:{}", display_name.as_deref().unwrap_or(""))
+            }
+            squeezy_agent::DispatchOutcome::SessionLabelled { labels, .. } => {
+                format!("session_labelled:{}", labels.join(","))
+            }
         };
         Ok(status)
     }

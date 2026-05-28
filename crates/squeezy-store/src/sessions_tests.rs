@@ -2801,3 +2801,120 @@ fn resolve_session_id_prefix_not_found_when_no_candidate_matches() {
         other => panic!("expected NotFound for empty prefix, got {other:?}"),
     }
 }
+
+#[test]
+fn session_metadata_deserialises_legacy_payload_without_display_name_or_labels() {
+    // Older `metadata.json` files predate `display_name` / `labels`.
+    // `serde(default)` keeps them loadable so a rollout can ship the
+    // new fields without rewriting on-disk session histories.
+    let legacy = json!({
+        "session_id": "sess-legacy",
+        "started_at_ms": 1_700_000_000_000_u64,
+        "ended_at_ms": null,
+        "cwd": "/work/repo",
+        "workspace_root": "/work/repo",
+        "repo_root": null,
+        "branch": null,
+        "provider": "test-provider",
+        "model": "test-model",
+        "mode": "build",
+        "status": "running",
+        "first_user_task": "carry me forward",
+        "latest_summary": null,
+        "cost": CostSnapshot::default(),
+        "metrics": SessionMetrics::default(),
+        "redactions": 0,
+        "resume_available": true,
+        "resume_unavailable_reason": null,
+        "event_count": 0,
+    });
+    let metadata: SessionMetadata =
+        serde_json::from_value(legacy).expect("legacy metadata deserialise");
+    assert!(
+        metadata.display_name.is_none(),
+        "legacy metadata must default to no display name"
+    );
+    assert!(
+        metadata.labels.is_empty(),
+        "legacy metadata must default to no labels"
+    );
+}
+
+#[test]
+fn session_metadata_round_trips_display_name_and_labels() {
+    let metadata = SessionMetadata {
+        session_id: "sess-roundtrip".to_string(),
+        cwd: "/work/repo".to_string(),
+        workspace_root: "/work/repo".to_string(),
+        display_name: Some("payments refactor".to_string()),
+        labels: vec!["bugfix".to_string(), "payments".to_string()],
+        ..SessionMetadata::default()
+    };
+    let text = serde_json::to_string(&metadata).expect("serialise");
+    let parsed: SessionMetadata = serde_json::from_str(&text).expect("deserialise");
+    assert_eq!(parsed.display_name.as_deref(), Some("payments refactor"));
+    assert_eq!(parsed.labels, vec!["bugfix", "payments"]);
+}
+
+#[test]
+fn update_metadata_and_index_persists_display_name_to_metadata_json() {
+    // End-to-end: rename a session, then re-open it and confirm the new
+    // display_name reaches the on-disk metadata.json. The global index
+    // refresh path is exercised in production but skipped here because
+    // `temp_root` lives under the OS temp dir and the index write
+    // guards against polluting `~/.squeezy/sessions/index.jsonl`.
+    let root = temp_root("update-metadata-display-name");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle
+        .append_event(SessionEvent::new(
+            "user_message",
+            None,
+            Some("seed".to_string()),
+            json!({"ok": true}),
+        ))
+        .expect("append event");
+    handle.flush_events().expect("flush");
+
+    let snapshot = handle
+        .update_metadata_and_index(|metadata| {
+            metadata.display_name = Some("payments refactor".to_string());
+            metadata.labels.push("bugfix".to_string());
+        })
+        .expect("update metadata");
+    assert_eq!(snapshot.display_name.as_deref(), Some("payments refactor"));
+    assert_eq!(snapshot.labels, vec!["bugfix".to_string()]);
+
+    let reread = store.show(handle.session_id()).expect("re-open session");
+    assert_eq!(
+        reread.metadata.display_name.as_deref(),
+        Some("payments refactor"),
+        "rename must survive a fresh metadata read"
+    );
+    assert_eq!(reread.metadata.labels, vec!["bugfix".to_string()]);
+}
+
+#[test]
+fn global_session_index_entry_propagates_display_name() {
+    let metadata = SessionMetadata {
+        session_id: "sess-index".to_string(),
+        cwd: "/work/repo".to_string(),
+        workspace_root: "/work/repo".to_string(),
+        first_user_task: Some("inferred task".to_string()),
+        display_name: Some("nice name".to_string()),
+        ..SessionMetadata::default()
+    };
+    let entry = GlobalSessionIndexEntry::from_metadata(&metadata, 42);
+    assert_eq!(entry.display_name.as_deref(), Some("nice name"));
+    assert_eq!(entry.title.as_deref(), Some("inferred task"));
+}
