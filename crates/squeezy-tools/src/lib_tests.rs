@@ -5276,10 +5276,12 @@ async fn shell_truncation_spills_full_output_to_tempfile_and_round_trips_via_rea
     assert!(spill_bytes > 0, "spillover must record non-zero bytes");
 
     let shaped_stdout = result.content["stdout"].as_str().expect("stdout");
-    let expected_footer = format!("[truncated; full output: {spill_path} ({spill_bytes} bytes)]");
+    let expected_footer = format!(
+        "[truncated; full output: {spill_path} ({spill_bytes} bytes); recover via read_tool_output {{\"path\": \"{spill_path}\"}}]"
+    );
     assert!(
         shaped_stdout.contains(&expected_footer),
-        "shaped stdout must surface the spillover path footer; got: {shaped_stdout:?}",
+        "shaped stdout must surface the spillover path footer naming read_tool_output; got: {shaped_stdout:?}",
     );
 
     // Path must live under $TMPDIR/squeezy-spillover/<session>/.

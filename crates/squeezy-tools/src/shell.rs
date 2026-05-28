@@ -839,7 +839,9 @@ pub(crate) fn shell_spillover_metadata(info: &ShellSpilloverInfo) -> serde_json:
 /// Append the model-facing spillover footer line to a shaped stdout
 /// block. The footer is a stable text marker so the model can spot the
 /// spillover even when the structured `spillover` field gets stripped
-/// during further compaction.
+/// during further compaction. It names `read_tool_output` and embeds
+/// the path as a copy-pasteable usage example so the model can pivot
+/// directly to the recovery call without inferring the contract.
 pub(crate) fn append_spillover_footer(
     shaped_stdout: &str,
     spillover: Option<&ShellSpilloverInfo>,
@@ -847,10 +849,10 @@ pub(crate) fn append_spillover_footer(
     let Some(spill) = spillover else {
         return shaped_stdout.to_string();
     };
+    let path = spill.path.display();
+    let bytes = spill.bytes;
     let footer = format!(
-        "[truncated; full output: {} ({} bytes)]",
-        spill.path.display(),
-        spill.bytes,
+        "[truncated; full output: {path} ({bytes} bytes); recover via read_tool_output {{\"path\": \"{path}\"}}]"
     );
     if shaped_stdout.is_empty() {
         return footer;
