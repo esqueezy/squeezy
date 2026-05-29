@@ -61,6 +61,7 @@ mod shell_program;
 mod shell_sandbox;
 mod shell_spillover;
 mod specs;
+mod tool_io;
 mod truncate;
 mod web;
 #[cfg(windows)]
@@ -113,6 +114,7 @@ use specs::{
     refresh_compiler_facts_spec, repo_map_spec, shell_spec, symbol_context_spec,
     upstream_flow_spec, verify_spec, webfetch_spec, websearch_spec, write_file_spec,
 };
+pub use tool_io::{DefaultToolIo, ToolIo};
 
 #[cfg(all(test, target_os = "macos"))]
 use shell_sandbox::macos_shell_sandbox_profile;
@@ -764,6 +766,12 @@ pub struct ToolRegistry {
     pub(crate) shell_spillover: Arc<shell_spillover::ShellSpilloverStore>,
     pub(crate) web_config: Arc<WebToolConfig>,
     pub(crate) http: Arc<dyn WebHttpClient>,
+    /// Pluggable filesystem / IO surface. Defaults to
+    /// [`DefaultToolIo`] (a passthrough over [`std::fs`]) so production
+    /// behaviour is unchanged. Tests and future sandbox layers can
+    /// swap this for an alternate implementation via
+    /// [`ToolRegistry::with_tool_io`].
+    pub(crate) io: Arc<dyn ToolIo>,
     pub(crate) graph: Arc<StdMutex<Option<GraphManager>>>,
     vcs: Arc<GitVcs>,
     /// Shared persistent state store. When `None`, `read_mode=diff` with
@@ -1077,6 +1085,7 @@ impl ToolRegistry {
             shell_spillover: Arc::new(shell_spillover::ShellSpilloverStore::new()),
             web_config: Arc::new(config.web.normalized()),
             http,
+            io: Arc::new(DefaultToolIo),
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
             state_store: state_store.clone(),
@@ -1125,6 +1134,7 @@ impl ToolRegistry {
             shell_spillover: Arc::new(shell_spillover::ShellSpilloverStore::new()),
             web_config: Arc::new(web_config.normalized()),
             http,
+            io: Arc::new(DefaultToolIo),
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
             state_store: None,
@@ -1144,6 +1154,16 @@ impl ToolRegistry {
             cached_specs: Arc::new(StdMutex::new(None)),
             patch_plans: Arc::new(StdMutex::new(HashMap::new())),
         })
+    }
+
+    /// Swap the registry's [`ToolIo`] backend (typically used by tests or
+    /// future sandbox shells). The substitution applies to every tool
+    /// that has been migrated through the abstraction; tools still using
+    /// raw `std::fs` will continue to bypass it until they are migrated.
+    /// See `docs/internal/TOOL_IO.md` for the migration tracker.
+    pub fn with_tool_io(mut self, io: Arc<dyn ToolIo>) -> Self {
+        self.io = io;
+        self
     }
 
     pub(crate) fn diff_snapshot(&self, mode: DiffMode, options: DiffOptions) -> DiffSnapshot {
