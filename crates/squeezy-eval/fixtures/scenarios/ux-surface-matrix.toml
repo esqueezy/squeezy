@@ -1,0 +1,127 @@
+id = "ux-surface-matrix"
+title = "Offline UX surface matrix"
+description = """
+Offline fixture for broad UX/UI inspection across non-happy-path surfaces:
+plan-mode user input, approval disposition overlays, compact markdown,
+status-like density, color labels, wrapped lists, and narrow terminal capture.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "plan"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = true
+width = 52
+height = 18
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "respond_user_input"
+decision = { action = "freeform", text = "Use a compact table, but keep path and confidence labels readable." }
+
+[[steps]]
+kind = "prompt"
+text = "Ask one UX clarifying question before rendering a compact report."
+
+[[steps]]
+kind = "action"
+action = "switch_mode"
+mode = "build"
+
+[[steps]]
+kind = "action"
+action = "deny"
+match = { tool = "shell" }
+reason = "fixture denies shell so approval UI can be inspected"
+
+[[steps]]
+kind = "prompt"
+text = "Try a shell command that would need approval, then summarize the denied UX."
+
+[[steps]]
+kind = "prompt"
+text = "Render a compact mixed markdown UX report with paths, URLs, labels, bullets, and code."
+
+[[steps]]
+kind = "prompt"
+text = "Render status-line density examples for long model names, branch names, tokens, session ids, and cost."
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 2
+no_tool_errors = false
+
+[mock]
+default_text = "(mock fallback)"
+
+[[mock.turns]]
+text = "I need one decision before rendering."
+tool_calls = [
+  { name = "request_user_input", arguments = { question = "Which report shape should the fixture prefer?", choices = [
+    { label = "Compact table", value = "compact" },
+    { label = "Narrative", value = "narrative" }
+  ], allow_freeform = true } }
+]
+input_tokens = 120
+output_tokens = 24
+
+[[mock.turns]]
+text = """
+Using the free-form answer: compact table with readable path and confidence labels.
+"""
+input_tokens = 140
+output_tokens = 18
+
+[[mock.turns]]
+text = "Checking approval behavior before running the command."
+tool_calls = [
+  { name = "shell", arguments = { command = "printf 'approval fixture with a very long command body that should not dominate the modal' && printf ' more output'", timeout_ms = 1000 } }
+]
+input_tokens = 160
+output_tokens = 20
+
+[[mock.turns]]
+text = """
+The shell request was denied. The UX should make the denied tool, reason, and next action visible without dumping the entire command twice.
+"""
+input_tokens = 180
+output_tokens = 28
+
+[[mock.turns]]
+text = """
+# UX Surface Matrix
+
+Path and URL density:
+
+| Surface | Example | Confidence | Risk |
+|---|---|---|---|
+| status | `feature/squeezy-eval-ux-surface-matrix-with-long-name` | exact_syntax | wraps hard |
+| link | https://example.com/squeezy/eval/rendering/fixtures/with/a/deep/path?mode=dark | candidate_set | floods table |
+| path | crates/squeezy-tui/src/render/markdown.rs:608 | label_missing | looks like citation |
+
+- Error color: denied shell should stand apart from warning and success.
+- Inline code: `exact_syntax` in prose should be colored.
+- LongWord: SupercalifragilisticexpialidociousIdentifierWithoutBreaksInANarrowPane.
+"""
+input_tokens = 200
+output_tokens = 120
+
+[[mock.turns]]
+text = """
+Status density samples:
+
+`openai:gpt-5.4-mini-with-long-reasoning-name` · `fix/eval-ux-render-overfetch-with-extra-context` · `ctx 87%` · `read 12.4MB` · `session 019e57d8-dbf1-79c2-ae5a-cc67e93f3a34`
+
+Plan progress sample: completed 7/20; in_progress validate-live-render-scenarios-with-narrow-captures; pending open-pr-and-monitor-ci.
+"""
+input_tokens = 160
+output_tokens = 80
+
+[triage]
+enabled = false

@@ -70,6 +70,14 @@ pub struct TuiFrame {
     pub plain_text: String,
     /// ANSI-escaped re-render suitable for `cat`ing into a terminal.
     pub ansi: String,
+    /// True when the serialized grid clipped rendered content below
+    /// `height`. Consumers can distinguish "blank lower rows" from
+    /// "more content existed but was off-screen".
+    #[serde(default)]
+    pub visual_truncated: bool,
+    /// Estimated wrapped visual rows omitted by `height` clipping.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub omitted_line_count: u64,
     /// Overlay-triggering events observed in this turn. Each entry is
     /// a small `{kind, summary}` pair so reviewers can spot
     /// "approval was requested but not answered" without reaching
@@ -93,6 +101,24 @@ pub struct TuiOverlayEvent {
     /// Final disposition observed during the turn: `"approved"`,
     /// `"denied:<reason>"`, `"auto_cancelled"`, `"accepted"`, etc.
     pub disposition: String,
+    /// Extra structured details worth displaying in the capture frame:
+    /// permission summaries, choices, full free-form answers, or denial
+    /// context.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<String>,
+    /// Tool-specific preview lines when an overlay was raised for a tool
+    /// approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct RenderedGrid {
+    pub cells: Vec<TuiCell>,
+    pub plain_text: String,
+    pub ansi: String,
+    pub visual_truncated: bool,
+    pub omitted_line_count: u64,
 }
 
 /// JSONL writer wrapping `frames_tui.jsonl`. Created lazily so
@@ -139,22 +165,18 @@ impl TuiCaptureWriter {
             .open(&replay_path)
             .map_err(|err| EvalError::Io(format!("open {replay_path:?}: {err}")))?;
         // Pin a deterministic palette tone via env. The TUI's palette
-        // detector reads `COLORFGBG` and `NO_COLOR`; setting them here
-        // before any render call gives reproducible cell colors across
-        // hosts. Skipping when the user has already exported one of
-        // these.
-        if std::env::var_os("COLORFGBG").is_none() {
-            let value = match config.palette_tone.as_deref() {
-                Some("light") => "0;15", // black on white = light terminal
-                _ => "15;0",             // white on black = dark terminal
-            };
-            // SAFETY: process-wide env mutation. The driver runs one
-            // scenario per process today; the parallel runner in
-            // Phase 7 needs a per-process scratch env or to set this
-            // before forking.
-            unsafe {
-                std::env::set_var("COLORFGBG", value);
-            }
+        // detector reads `COLORFGBG` and `NO_COLOR`; forcing the requested
+        // value here makes fixture captures reproducible even when the host
+        // shell already exported a conflicting terminal palette hint.
+        let value = match config.palette_tone.as_deref() {
+            Some("light") => "0;15", // black on white = light terminal
+            _ => "15;0",             // white on black = dark terminal
+        };
+        // SAFETY: process-wide env mutation. The driver runs one scenario per
+        // process today; the parallel runner in Phase 7 needs a per-process
+        // scratch env or to set this before forking.
+        unsafe {
+            std::env::set_var("COLORFGBG", value);
         }
         Ok(Some(Self {
             inner: Mutex::new(TuiCaptureInner {
@@ -229,8 +251,26 @@ pub fn render_markdown_to_grid(
     markdown: &str,
     width: u16,
     height: u16,
-) -> Result<(Vec<TuiCell>, String, String), EvalError> {
-    let lines: Vec<Line<'_>> = squeezy_tui::render_markdown(markdown);
+) -> Result<RenderedGrid, EvalError> {
+    render_lines_to_grid(squeezy_tui::render_markdown(markdown), width, height)
+}
+
+pub fn render_capture_to_grid(
+    markdown: &str,
+    overlays: &[TuiOverlayEvent],
+    width: u16,
+    height: u16,
+) -> Result<RenderedGrid, EvalError> {
+    let body = capture_markdown(markdown, overlays);
+    render_markdown_to_grid(&body, width, height)
+}
+
+fn render_lines_to_grid(
+    lines: Vec<Line<'static>>,
+    width: u16,
+    height: u16,
+) -> Result<RenderedGrid, EvalError> {
+    let estimated_rows = estimated_wrapped_rows(&lines, width);
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend)
@@ -295,7 +335,79 @@ pub fn render_markdown_to_grid(
         }
         ansi.push('\n');
     }
-    Ok((cells, plain, ansi))
+    let omitted_line_count = estimated_rows.saturating_sub(u64::from(height));
+    Ok(RenderedGrid {
+        cells,
+        plain_text: plain,
+        ansi,
+        visual_truncated: omitted_line_count > 0,
+        omitted_line_count,
+    })
+}
+
+fn capture_markdown(markdown: &str, overlays: &[TuiOverlayEvent]) -> String {
+    let body = repair_glued_sentences(markdown);
+    if overlays.is_empty() {
+        return body;
+    }
+    let mut out = String::new();
+    out.push_str("**Overlay state**\n");
+    for overlay in overlays {
+        out.push_str("- `");
+        out.push_str(&overlay.kind);
+        out.push_str("` ");
+        out.push_str(&overlay.summary);
+        out.push_str(" -> ");
+        out.push_str(&overlay.disposition);
+        out.push('\n');
+        for detail in &overlay.details {
+            out.push_str("  - ");
+            out.push_str(detail);
+            out.push('\n');
+        }
+        for preview in overlay.preview.iter().take(8) {
+            out.push_str("  - `preview` ");
+            out.push_str(preview);
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+    out.push_str(&body);
+    out
+}
+
+fn repair_glued_sentences(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        out.push(ch);
+        if matches!(ch, '.' | '!' | '?')
+            && let Some(next) = chars.peek()
+            && next.is_ascii_uppercase()
+        {
+            out.push(' ');
+        }
+    }
+    out
+}
+
+fn estimated_wrapped_rows(lines: &[Line<'_>], width: u16) -> u64 {
+    let width = usize::from(width.max(1));
+    lines
+        .iter()
+        .map(|line| {
+            let chars: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.chars().count())
+                .sum();
+            chars.div_ceil(width).max(1) as u64
+        })
+        .sum()
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn color_name(c: Color) -> Option<String> {

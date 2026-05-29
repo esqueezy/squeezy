@@ -59,36 +59,117 @@ struct CodeBlock {
     source: String,
 }
 
-/// Accumulator for GFM tables. Cells are collected as plain strings (style is
-/// dropped for the table render) so that columns can be width-padded and
-/// joined with ` | ` separators. A `---` divider is emitted between header
-/// and body rows.
+const MAX_TABLE_COLUMN_WIDTH: usize = 18;
+const MIN_TABLE_COLUMN_WIDTH: usize = 6;
+const MAX_TABLE_ROW_WIDTH: usize = 52;
+const MAX_LINK_URL_CHARS: usize = 48;
+const MAX_UNBROKEN_TEXT_TOKEN_CHARS: usize = 56;
+const MAX_INLINE_CODE_CHARS: usize = 48;
+
+#[derive(Clone, Debug, Default)]
+struct TableCell {
+    runs: Vec<TableRun>,
+}
+
+#[derive(Clone, Debug)]
+struct TableRun {
+    text: String,
+    style: Style,
+}
+
+impl TableCell {
+    fn push_text(&mut self, text: &str, style: Style) {
+        let mut collapsed = String::new();
+        for ch in text.chars() {
+            if ch == '\n' || ch == '\r' {
+                if !collapsed.ends_with(' ') {
+                    collapsed.push(' ');
+                }
+            } else {
+                collapsed.push(ch);
+            }
+        }
+        if collapsed.is_empty() {
+            return;
+        }
+        if let Some(last) = self.runs.last_mut()
+            && last.style == style
+        {
+            last.text.push_str(&collapsed);
+            return;
+        }
+        self.runs.push(TableRun {
+            text: collapsed,
+            style,
+        });
+    }
+
+    fn char_count(&self) -> usize {
+        self.runs.iter().map(|run| run.text.chars().count()).sum()
+    }
+
+    fn render_spans(&self, width: usize, fallback_style: Style) -> Vec<Span<'static>> {
+        let mut out = Vec::new();
+        let total = self.char_count();
+        let visible_limit = if total > width && width >= 3 {
+            width - 3
+        } else {
+            width
+        };
+        let mut remaining = visible_limit;
+        for run in &self.runs {
+            if remaining == 0 {
+                break;
+            }
+            let run_style = confidence_label_exact_match(run.text.trim())
+                .map(|label| {
+                    run.style
+                        .patch(Style::default().fg(confidence_label_color(label)))
+                })
+                .unwrap_or(run.style);
+            let run_chars = run.text.chars().count();
+            let take = remaining.min(run_chars);
+            let visible: String = run.text.chars().take(take).collect();
+            for span in confidence_label_spans(&visible, run_style) {
+                out.push(span);
+            }
+            remaining -= take;
+            if take < run_chars {
+                break;
+            }
+        }
+        if total > width && width >= 3 {
+            out.push(Span::styled("...", fallback_style));
+        }
+        let visible_width: usize = out.iter().map(|span| span.content.chars().count()).sum();
+        if visible_width < width {
+            out.push(Span::styled(
+                " ".repeat(width - visible_width),
+                fallback_style,
+            ));
+        }
+        out
+    }
+}
+
+/// Accumulator for GFM tables. Cells preserve inline styles so code spans,
+/// links, and confidence labels remain visible inside the compact table render.
 #[derive(Default, Debug)]
 struct TableBuilder {
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    headers: Vec<TableCell>,
+    rows: Vec<Vec<TableCell>>,
     /// Row currently being built (one entry per `TableRow`/`TableHead`).
-    current_row: Vec<String>,
+    current_row: Vec<TableCell>,
     /// Cell currently being built (one entry per `TableCell`).
-    current_cell: String,
+    current_cell: TableCell,
     /// True while inside `TableHead` so cells flush into `headers` rather
     /// than `rows`.
     in_header: bool,
 }
 
 impl TableBuilder {
-    fn push_text(&mut self, text: &str) {
-        // Markdown soft/hard breaks inside a table cell should not introduce
-        // newlines in the rendered grid; collapse them to single spaces.
-        for ch in text.chars() {
-            if ch == '\n' || ch == '\r' {
-                if !self.current_cell.ends_with(' ') {
-                    self.current_cell.push(' ');
-                }
-            } else {
-                self.current_cell.push(ch);
-            }
-        }
+    fn push_text(&mut self, text: &str, style: Style) {
+        self.current_cell.push_text(text, style);
     }
 
     fn finish_cell(&mut self) {
@@ -116,28 +197,30 @@ impl TableBuilder {
         let mut widths = vec![0usize; col_count];
         // Compute column widths via display char counts (treat each char as 1).
         for (i, width) in widths.iter_mut().enumerate() {
-            let header_cell = self.headers.get(i).map(String::as_str).unwrap_or("");
-            *width = (*width).max(header_cell.chars().count());
+            *width = (*width).max(self.headers.get(i).map(TableCell::char_count).unwrap_or(0));
             for row in &self.rows {
-                let body_cell = row.get(i).map(String::as_str).unwrap_or("");
-                *width = (*width).max(body_cell.chars().count());
+                *width = (*width).max(row.get(i).map(TableCell::char_count).unwrap_or(0));
             }
+            *width = (*width).min(MAX_TABLE_COLUMN_WIDTH);
         }
+        fit_table_width(&mut widths);
 
-        let render_row = |row: &[String]| -> Line<'static> {
-            let mut buf = String::new();
+        let render_row = |row: &[TableCell]| -> Line<'static> {
+            let mut spans = Vec::new();
             for (i, width) in widths.iter().enumerate() {
                 if i > 0 {
-                    buf.push_str(" | ");
+                    spans.push(Span::styled(
+                        " | ",
+                        style.patch(Style::default().fg(palette::QUIET)),
+                    ));
                 }
-                let cell = row.get(i).map(String::as_str).unwrap_or("");
-                buf.push_str(cell);
-                let cell_width = cell.chars().count();
-                if cell_width < *width {
-                    buf.extend(std::iter::repeat_n(' ', *width - cell_width));
-                }
+                let rendered = row
+                    .get(i)
+                    .map(|cell| cell.render_spans(*width, style))
+                    .unwrap_or_else(|| vec![Span::styled(" ".repeat(*width), style)]);
+                spans.extend(rendered);
             }
-            Line::from(Span::styled(buf, style))
+            Line::from(spans)
         };
 
         let mut out = Vec::new();
@@ -178,19 +261,27 @@ impl Writer {
                 Event::Start(tag) => self.start(tag),
                 Event::End(tag) => self.end(tag),
                 Event::Text(text)
-                | Event::Code(text)
                 | Event::Html(text)
                 | Event::InlineHtml(text)
                 | Event::InlineMath(text)
                 | Event::DisplayMath(text)
                 | Event::FootnoteReference(text) => {
                     if let Some(table) = self.table.as_mut() {
-                        table.push_text(&text);
+                        table.push_text(&text, self.current_style);
+                    }
+                }
+                Event::Code(text) => {
+                    if let Some(table) = self.table.as_mut() {
+                        let text = compact_inline_code(&text);
+                        table.push_text(
+                            &text,
+                            self.current_style.patch(inline_code_style_for(&text)),
+                        );
                     }
                 }
                 Event::SoftBreak | Event::HardBreak => {
                     if let Some(table) = self.table.as_mut() {
-                        table.push_text(" ");
+                        table.push_text(" ", self.current_style);
                     }
                 }
                 Event::Rule | Event::TaskListMarker(_) => {}
@@ -205,7 +296,11 @@ impl Writer {
                 self.push_text_with_confidence_labels(&text, self.current_style);
             }
             Event::Code(code) => {
-                self.push_text(&code, self.current_style.patch(inline_code_style()));
+                let code = compact_inline_code(&code);
+                self.push_text(
+                    &code,
+                    self.current_style.patch(inline_code_style_for(&code)),
+                );
             }
             Event::SoftBreak | Event::HardBreak => self.finish_line(),
             Event::Rule => {
@@ -290,7 +385,11 @@ impl Writer {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item => self.finish_line(),
+            TagEnd::Paragraph | TagEnd::Item => self.finish_line(),
+            TagEnd::Heading(_) => {
+                self.finish_line();
+                self.pop_style();
+            }
             TagEnd::BlockQuote(_) => {
                 self.finish_line();
                 self.quote_depth = self.quote_depth.saturating_sub(1);
@@ -310,9 +409,9 @@ impl Writer {
                 if let Some(url) = self.link_stack.pop()
                     && !url.is_empty()
                 {
-                    let text = format!(" ({url})");
+                    let text = format!(" ({})", display_link_url(&url));
                     if let Some(table) = self.table.as_mut() {
-                        table.push_text(&text);
+                        table.push_text(&text, self.current_style);
                     } else {
                         self.push_text(&text, self.current_style);
                     }
@@ -375,7 +474,7 @@ impl Writer {
         if depth > 0 {
             self.push_text(&"  ".repeat(depth), Style::default());
         }
-        let (marker, ordered) = if let Some(list) = self.list_stack.last_mut() {
+        let (marker, _ordered) = if let Some(list) = self.list_stack.last_mut() {
             if list.ordered {
                 let marker = format!("{}. ", list.next);
                 list.next += 1;
@@ -386,16 +485,9 @@ impl Writer {
         } else {
             ("- ".to_string(), false)
         };
-        // Mirror Codex's discipline: ordered markers carry a single
-        // semantic color (`LightBlue` for "this is a numbered step");
-        // unordered markers stay unstyled so a long bullet list reads as
-        // structure, not as a wall of color. The prior `GOLD` painted
-        // every marker bright yellow on every line.
-        let style = if ordered {
-            Style::default().fg(Color::LightBlue)
-        } else {
-            Style::default()
-        };
+        // Ordered and unordered markers share a quiet structural color so
+        // bullets do not disappear next to numbered lists in dense output.
+        let style = Style::default().fg(Color::LightBlue);
         self.push_text(&marker, style);
     }
 
@@ -440,6 +532,7 @@ impl Writer {
     }
 
     fn push_text(&mut self, text: &str, style: Style) {
+        let text = compact_unbroken_text_tokens(text);
         for segment in text.split_inclusive('\n') {
             self.ensure_quote_prefix();
             if let Some(line) = segment.strip_suffix('\n') {
@@ -503,18 +596,48 @@ fn heading_style(level: HeadingLevel) -> Style {
     style
 }
 
-fn inline_code_style() -> Style {
-    // Mirror Codex: inline code is the one place a single semantic color
-    // earns its keep — the eye learns "cyan = identifier" instantly.
-    // Standard `Cyan`, not bright/light, so it sits beside prose
-    // without screaming.
-    Style::default().fg(Color::Cyan)
+fn inline_code_style_for(text: &str) -> Style {
+    let lower = text.to_ascii_lowercase();
+    let color = if looks_like_session_id(text) || lower.starts_with("session") {
+        palette::QUIET
+    } else if lower.contains("model") || text.starts_with('@') {
+        Color::LightMagenta
+    } else if lower.contains("branch") || lower.contains("refs/") || lower.contains('/') {
+        Color::Magenta
+    } else if lower.contains("cost")
+        || lower.contains("token")
+        || lower.contains("ctx")
+        || lower.contains("read:")
+    {
+        palette::AMBER
+    } else {
+        Color::Cyan
+    };
+    Style::default().fg(color)
+}
+
+fn compact_inline_code(text: &str) -> String {
+    let collapsed = collapse_spaces(text);
+    if looks_like_session_id(&collapsed) {
+        middle_truncate_chars(&collapsed, 24)
+    } else {
+        middle_truncate_chars(&collapsed, MAX_INLINE_CODE_CHARS)
+    }
+}
+
+fn looks_like_session_id(text: &str) -> bool {
+    let hexish = text
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit() || *c == '-')
+        .count();
+    text.len() >= 32 && text.contains('-') && hexish * 5 >= text.chars().count() * 4
 }
 
 /// Graph confidence labels squeezy emits in assistant prose
 /// (`exact_syntax`, `import_resolved`, `candidate_set`, `external`,
 /// `unknown`, `label_missing`). The renderer highlights any of these
 /// when they appear:
+///   * as a standalone prose token (`label_missing`),
 ///   * preceded by an em dash and space (`X — exact_syntax`), or
 ///   * wrapped in square brackets (`[exact_syntax]`).
 ///
@@ -550,21 +673,69 @@ fn confidence_label_color(label: &str) -> Color {
     }
 }
 
+fn confidence_label_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    if let Some(label) = confidence_label_exact_match(text) {
+        return vec![Span::styled(
+            text.to_string(),
+            base_style.patch(Style::default().fg(confidence_label_color(label))),
+        )];
+    }
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while let Some((start, end, label)) = find_next_confidence_label(text, cursor) {
+        if start > cursor {
+            out.push(Span::styled(text[cursor..start].to_string(), base_style));
+        }
+        out.push(Span::styled(
+            text[start..end].to_string(),
+            base_style.patch(Style::default().fg(confidence_label_color(label))),
+        ));
+        cursor = end;
+    }
+    if cursor < text.len() {
+        out.push(Span::styled(text[cursor..].to_string(), base_style));
+    }
+    out
+}
+
+fn fit_table_width(widths: &mut [usize]) {
+    if widths.is_empty() {
+        return;
+    }
+    let separators = widths.len().saturating_sub(1) * 3;
+    while widths.iter().sum::<usize>() + separators > MAX_TABLE_ROW_WIDTH {
+        let Some((idx, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, width)| **width > MIN_TABLE_COLUMN_WIDTH)
+            .max_by_key(|(_, width)| **width)
+        else {
+            break;
+        };
+        widths[idx] -= 1;
+    }
+}
+
 /// Locate the next confidence label in `text` starting from `from`.
 /// Returns the byte range to style and the matched label string.
 fn find_next_confidence_label(text: &str, from: usize) -> Option<(usize, usize, &'static str)> {
     let haystack = &text[from..];
     let mut best: Option<(usize, usize, &'static str)> = None;
     for &label in CONFIDENCE_LABELS {
-        // `— label` form: match the literal " — label" or " — label" with
-        // an em dash; require a leading separator so we don't colour
-        // bare matches inside identifiers (`my_exact_syntax_test`).
+        if let Some(off) = haystack.find(label) {
+            let label_start = from + off;
+            let label_end = label_start + label.len();
+            if is_identifier_boundary(text, label_start, label_end) {
+                pick_earliest(&mut best, (label_start, label_end, label));
+            }
+        }
+        // `— label` form: match the literal " — label" with an em dash.
         let with_em_dash = format!(" — {label}");
         if let Some(off) = haystack.find(&with_em_dash) {
             // Highlight just the label, not the em-dash separator.
             let label_start = from + off + with_em_dash.len() - label.len();
             let label_end = label_start + label.len();
-            if !is_identifier_continuation(text, label_end) {
+            if is_identifier_boundary(text, label_start, label_end) {
                 pick_earliest(&mut best, (label_start, label_end, label));
             }
         }
@@ -591,14 +762,107 @@ fn pick_earliest<'a>(
     }
 }
 
-/// Returns true when the byte after `end` is alphanumeric or `_` — i.e.
-/// we're still inside an identifier, so the apparent label is actually
-/// the prefix of a longer word (`exact_syntax_foo`).
-fn is_identifier_continuation(text: &str, end: usize) -> bool {
-    text.as_bytes()
-        .get(end)
-        .map(|b| b.is_ascii_alphanumeric() || *b == b'_')
-        .unwrap_or(false)
+fn is_identifier_boundary(text: &str, start: usize, end: usize) -> bool {
+    !text
+        .as_bytes()
+        .get(start.saturating_sub(1))
+        .filter(|_| start > 0)
+        .is_some_and(is_identifier_byte)
+        && !text.as_bytes().get(end).is_some_and(is_identifier_byte)
+}
+
+fn is_identifier_byte(byte: &u8) -> bool {
+    byte.is_ascii_alphanumeric() || *byte == b'_'
+}
+
+fn display_link_url(url: &str) -> String {
+    middle_truncate_chars(url, MAX_LINK_URL_CHARS)
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut out = String::new();
+    for _ in 0..max_chars {
+        let Some(ch) = chars.next() else {
+            return text.to_string();
+        };
+        out.push(ch);
+    }
+    if chars.next().is_some() && max_chars >= 3 {
+        out.truncate(out.len().saturating_sub(3));
+        out.push_str("...");
+    }
+    out
+}
+
+fn middle_truncate_chars(text: &str, max_chars: usize) -> String {
+    let len = text.chars().count();
+    if len <= max_chars {
+        return text.to_string();
+    }
+    if max_chars < 5 {
+        return truncate_chars(text, max_chars);
+    }
+    let marker = "...";
+    let keep = max_chars - marker.len();
+    let head = keep / 2;
+    let tail = keep - head;
+    let prefix: String = text.chars().take(head).collect();
+    let suffix: String = text
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}{marker}{suffix}")
+}
+
+fn compact_unbroken_text_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            flush_compact_token(&mut out, &mut token);
+            out.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    flush_compact_token(&mut out, &mut token);
+    out
+}
+
+fn flush_compact_token(out: &mut String, token: &mut String) {
+    if token.is_empty() {
+        return;
+    }
+    let char_count = token.chars().count();
+    let has_break_points = token.contains('/') || token.contains('\\');
+    if char_count > MAX_UNBROKEN_TEXT_TOKEN_CHARS && !has_break_points {
+        out.push_str(&middle_truncate_chars(token, MAX_UNBROKEN_TEXT_TOKEN_CHARS));
+    } else {
+        out.push_str(token);
+    }
+    token.clear();
+}
+
+fn collapse_spaces(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            pending_space = true;
+        } else {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            out.push(ch);
+            pending_space = false;
+        }
+    }
+    out
 }
 
 fn code_block_language(kind: CodeBlockKind<'_>) -> Option<String> {

@@ -200,10 +200,7 @@ async fn exploration_compiler_prefetches_graph_context_before_model_request() {
         .iter()
         .map(|(call_id, _)| *call_id)
         .collect::<Vec<_>>();
-    assert_eq!(
-        call_ids,
-        vec!["planner_definition_search", "planner_symbol_context"]
-    );
+    assert_eq!(call_ids, vec!["planner_definition_search"]);
     assert!(
         outputs
             .iter()

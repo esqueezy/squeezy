@@ -1041,6 +1041,9 @@ impl Driver {
                 AgentEvent::ToolCallQueued { turn_id, call } => {
                     let turn_str = format!("{turn_id:?}");
                     let value = serde_json::to_value(&call).unwrap_or(Value::Null);
+                    frame
+                        .queued_tool_calls
+                        .push(ToolCallSummary::from_call(&call.name, &call.arguments));
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::ToolCallQueued {
@@ -1133,20 +1136,24 @@ impl Driver {
                 } => {
                     let turn_str = format!("{turn_id:?}");
                     let (decision, recorded) = self.decide_approval(&request.tool_name).await;
+                    let details = approval_overlay_details(&request);
+                    let preview = preview_overlay_lines(&request.preview);
                     self.pending_overlays
                         .lock()
                         .await
                         .push(crate::tui_capture::TuiOverlayEvent {
                             kind: "approval".into(),
-                            summary: request.tool_name.clone(),
+                            summary: request.permission.summary.clone(),
                             disposition: recorded.clone(),
+                            details,
+                            preview,
                         });
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::Approval {
                             request: json!({
-                                "tool": request.tool_name,
-                                "summary": request.permission.summary,
+                                "tool": request.tool_name.clone(),
+                                "summary": request.permission.summary.clone(),
                             }),
                             decision: recorded,
                         },
@@ -1172,6 +1179,8 @@ impl Driver {
                             kind: "mcp_elicitation".into(),
                             summary: format!("server={}", request.server),
                             disposition: status.clone(),
+                            details: vec![format!("server: {}", request.server)],
+                            preview: Vec::new(),
                         });
                     self.capture.record(
                         Some(turn_str),
@@ -1203,8 +1212,10 @@ impl Driver {
                         .await
                         .push(crate::tui_capture::TuiOverlayEvent {
                             kind: "request_user_input".into(),
-                            summary: request.question.chars().take(80).collect(),
+                            summary: request.question.clone(),
                             disposition: status.clone(),
+                            details: user_input_overlay_details(&request),
+                            preview: Vec::new(),
                         });
                     self.capture.record(
                         Some(turn_str),
@@ -1274,7 +1285,10 @@ impl Driver {
                         Some(turn_str),
                         EvalEventKind::McpStatusUpdated {
                             servers,
-                            generated_unix_millis: snapshot.generated_unix_millis,
+                            generated_unix_millis: snapshot
+                                .generated_unix_millis
+                                .min(u64::MAX as u128)
+                                as u64,
                         },
                     )?;
                 }
@@ -1318,7 +1332,7 @@ impl Driver {
                             status: notification.status.as_str().to_string(),
                             title: notification.title.clone(),
                             summary: notification.summary.clone(),
-                            ts_unix_ms: notification.ts_unix_ms,
+                            notification_ts_unix_ms: notification.ts_unix_ms,
                         },
                     )?;
                 }
@@ -1575,19 +1589,22 @@ impl Driver {
         // Skipped unless `[tui_capture] enabled = true` is set on the
         // scenario.
         if let Some(writer) = self.tui_capture.as_ref() {
-            let (cells, plain_text, ansi_grid) = crate::tui_capture::render_markdown_to_grid(
+            let overlays = self.pending_overlays.lock().await.clone();
+            let rendered = crate::tui_capture::render_capture_to_grid(
                 &frame.assistant_text,
+                &overlays,
                 writer.width(),
                 writer.height(),
             )?;
-            let overlays = self.pending_overlays.lock().await.clone();
             let tui_frame = crate::tui_capture::TuiFrame {
                 turn_id: frame.turn_id.clone(),
                 width: writer.width(),
                 height: writer.height(),
-                cells,
-                plain_text,
-                ansi: ansi_grid,
+                cells: rendered.cells,
+                plain_text: rendered.plain_text,
+                ansi: rendered.ansi,
+                visual_truncated: rendered.visual_truncated,
+                omitted_line_count: rendered.omitted_line_count,
                 overlays,
             };
             writer.write(&tui_frame)?;
@@ -1713,7 +1730,7 @@ impl Driver {
                     ),
                     crate::scenario::UserInputDecision::Freeform { text } => (
                         squeezy_agent::RequestUserInputResponse::freeform(text.clone()),
-                        format!("freeform:{}", text.chars().take(60).collect::<String>()),
+                        format!("freeform:{text}"),
                     ),
                     crate::scenario::UserInputDecision::Cancel => (
                         squeezy_agent::RequestUserInputResponse::cancelled(),
@@ -1835,6 +1852,74 @@ fn user_input_matches(action: &Action, request: &squeezy_agent::RequestUserInput
         return false;
     }
     true
+}
+
+fn approval_overlay_details(request: &squeezy_agent::ToolApprovalRequest) -> Vec<String> {
+    let mut details = vec![
+        format!("tool: {}", request.tool_name),
+        format!("target: {}", request.permission.target),
+        format!("risk: {:?}", request.permission.risk),
+        format!("reason: {}", request.reason),
+    ];
+    if let Some(context) = &request.context
+        && !context.trim().is_empty()
+    {
+        details.push(format!("context: {}", normalize_overlay_text(context)));
+    }
+    for (key, value) in request.permission.metadata.iter().take(4) {
+        details.push(format!("{key}: {}", normalize_overlay_text(value)));
+    }
+    details
+}
+
+fn user_input_overlay_details(request: &squeezy_agent::RequestUserInputRequest) -> Vec<String> {
+    let mut details = vec![format!("question: {}", request.question)];
+    if !request.choices.is_empty() {
+        details.push(format!(
+            "choices: {}",
+            request
+                .choices
+                .iter()
+                .map(|choice| format!("{}={}", choice.label, choice.value))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    details.push(format!("freeform: {}", request.allow_freeform));
+    details
+}
+
+fn preview_overlay_lines(lines: &[squeezy_tools::preview::PreviewLine]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|line| match line {
+            squeezy_tools::preview::PreviewLine::Plain { text } => text.clone(),
+            squeezy_tools::preview::PreviewLine::Diff { added, line } => {
+                format!("{}{}", if *added { "+" } else { "-" }, line)
+            }
+            squeezy_tools::preview::PreviewLine::Highlighted { lang, text } => {
+                format!("{lang}: {text}")
+            }
+            squeezy_tools::preview::PreviewLine::Warning { text } => format!("warning: {text}"),
+        })
+        .map(|text| normalize_overlay_text(&text))
+        .collect()
+}
+
+fn normalize_overlay_text(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::with_capacity(collapsed.len());
+    let mut chars = collapsed.chars().peekable();
+    while let Some(ch) = chars.next() {
+        out.push(ch);
+        if matches!(ch, '.' | '!' | '?')
+            && let Some(next) = chars.peek()
+            && next.is_ascii_uppercase()
+        {
+            out.push(' ');
+        }
+    }
+    out
 }
 
 fn action_to_value(action: &Action) -> Value {
