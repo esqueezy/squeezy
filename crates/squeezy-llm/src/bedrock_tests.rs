@@ -414,6 +414,15 @@ fn config_request_metadata_appears_on_converse_stream_input() {
 
 #[test]
 fn conversation_messages_reject_unknown_image_mime() {
+    // Bedrock's `ImageFormat` enum is `{Png, Jpeg, Gif, Webp}`. Any
+    // MIME outside that allowlist must fail loud as a ProviderRequest
+    // error with a stable, structured message so callers can surface
+    // it directly instead of silently dropping the image or letting
+    // the AWS service reject it after the wire call. We pin the
+    // documented format here (`"bedrock: unsupported image format
+    // '{mime}'; supported: png, jpeg, gif, webp"`) so accidental
+    // wording drift surfaces as a test failure rather than a UX
+    // regression for operators who script around the error text.
     let bytes: Arc<[u8]> = Arc::from(vec![1u8, 2, 3, 4]);
     let err = conversation_messages(
         &[LlmInputItem::Image {
@@ -423,10 +432,12 @@ fn conversation_messages_reject_unknown_image_mime() {
         false,
     )
     .expect_err("unsupported MIME must surface an explicit ProviderRequest error");
-    let message = err.to_string();
-    assert!(
-        message.contains("image/avif"),
-        "error must mention the unsupported MIME: {message}"
+    let SqueezyError::ProviderRequest(message) = &err else {
+        panic!("expected ProviderRequest, got {err:?}");
+    };
+    assert_eq!(
+        message, "bedrock: unsupported image format 'image/avif'; supported: png, jpeg, gif, webp",
+        "error text must match the documented format exactly",
     );
 }
 

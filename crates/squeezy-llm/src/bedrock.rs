@@ -659,8 +659,18 @@ pub(crate) fn tool_configuration(
 /// Maps the canonical `image/{png,jpeg,gif,webp}` MIME strings to the
 /// SDK's `ImageFormat` enum and wraps the raw bytes in a `Blob` so the
 /// Converse API receives the binary payload directly (no base64 wrap —
-/// the SDK does that on the wire). Returns a structured error for
-/// unknown MIME types instead of silently dropping the image.
+/// the SDK does that on the wire).
+///
+/// Per the AWS Bedrock Converse API, `ImageFormat` must be one of
+/// `{Png, Jpeg, Gif, Webp}`. We perform a strict enum match here with
+/// no fallback variant: any MIME outside the allowlist surfaces a
+/// `SqueezyError::ProviderRequest` before the wire call so callers see
+/// a single, well-named provider error instead of a silently dropped
+/// image or an opaque service rejection.
+///
+/// Sibling providers (Anthropic, OpenAI, Google) intentionally keep
+/// their tolerant MIME behavior and accept formats like `image/heic`
+/// and `image/avif`; this strictness is Bedrock-local.
 pub(crate) fn bedrock_image_block(media_type: &str, bytes: &Arc<[u8]>) -> Result<ImageBlock> {
     let format = match media_type.to_ascii_lowercase().as_str() {
         "image/png" => ImageFormat::Png,
@@ -669,7 +679,7 @@ pub(crate) fn bedrock_image_block(media_type: &str, bytes: &Arc<[u8]>) -> Result
         "image/webp" => ImageFormat::Webp,
         other => {
             return Err(SqueezyError::ProviderRequest(format!(
-                "Bedrock does not support image MIME `{other}`; expected one of image/png, image/jpeg, image/gif, image/webp",
+                "bedrock: unsupported image format '{other}'; supported: png, jpeg, gif, webp",
             )));
         }
     };
