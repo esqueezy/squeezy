@@ -2937,6 +2937,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "squeezy-platform"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+]
+
+[[package]]
 name = "squeezy-rank"
 version = "0.1.0"
 
@@ -3030,6 +3037,7 @@ dependencies = [
  "squeezy-agent",
  "squeezy-core",
  "squeezy-llm",
+ "squeezy-platform",
  "squeezy-rank",
  "squeezy-skills",
  "squeezy-store",

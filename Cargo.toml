@@ -10,6 +10,7 @@ members = [
     "crates/squeezy-llm",
     "crates/squeezy-mcp",
     "crates/squeezy-parse",
+    "crates/squeezy-platform",
     "crates/squeezy-rank",
     "crates/squeezy-skills",
     "crates/squeezy-store",
@@ -113,6 +114,7 @@ squeezy-hooks = { path = "crates/squeezy-hooks", version = "=0.1.0" }
 squeezy-llm = { path = "crates/squeezy-llm", version = "=0.1.0" }
 squeezy-mcp = { path = "crates/squeezy-mcp", version = "=0.1.0" }
 squeezy-parse = { path = "crates/squeezy-parse", version = "=0.1.0" }
+squeezy-platform = { path = "crates/squeezy-platform", version = "=0.1.0" }
 squeezy-rank = { path = "crates/squeezy-rank", version = "=0.1.0" }
 squeezy-skills = { path = "crates/squeezy-skills", version = "=0.1.0" }
 squeezy-store = { path = "crates/squeezy-store", version = "=0.1.0" }

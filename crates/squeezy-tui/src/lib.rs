@@ -1086,6 +1086,19 @@ fn normalise_control_byte(mut key: KeyEvent) -> KeyEvent {
     key
 }
 
+/// Recover modifier bits that the terminal emulator dropped before
+/// crossterm saw `key`. On macOS this consults `CGEventSourceKeyState`
+/// via [`squeezy_platform::detect_modifier_state`] so a bare `Enter`
+/// from Apple Terminal / iTerm2 / Ghostty defaults gets promoted to
+/// `Shift+Enter` when the user is actually holding Shift. On every
+/// other platform this is a zero-cost no-op.
+fn apply_platform_modifier_shim(mut key: KeyEvent) -> KeyEvent {
+    if let Some(shim) = squeezy_platform::detect_modifier_state(&key) {
+        key.modifiers = shim.apply(key.modifiers);
+    }
+    key
+}
+
 /// Append a one-line summary of `key` to the path named by the
 /// `SQUEEZY_DEBUG_KEYS` env var. Silent no-op when unset or when the
 /// file can't be opened — diagnostics must never break the TUI.
@@ -1122,6 +1135,15 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
     // that looks for `Char('e') + CONTROL`. This is the source of the
     // "Ctrl+E does nothing", "Ctrl+X Q types Q" class of bugs.
     let key = normalise_control_byte(key);
+
+    // On macOS, recover modifier bits the terminal dropped before
+    // crossterm saw the event. Apple Terminal / iTerm2 / Ghostty
+    // (default configs) deliver `Shift+Enter` as a bare `\r`, so
+    // crossterm reports `Enter` with empty modifiers. The shim asks
+    // CoreGraphics whether Shift is physically held and re-attaches
+    // the bit so the downstream Shift+Enter newline arm fires
+    // correctly. Non-macOS targets compile this to a no-op.
+    let key = apply_platform_modifier_shim(key);
 
     // Any keypress while a turn-done notification is up counts as the
     // user acknowledging it — drop the title back to cleared so the
@@ -1278,6 +1300,15 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && (key.code == KeyCode::Char('j') || key.code == KeyCode::Enter)
     {
+        insert_input_char(app, '\n');
+        return Ok(false);
+    }
+
+    // Shift+Enter inserts a newline rather than submitting. The
+    // modifier may arrive natively (Kitty / xterm modifyOtherKeys) or
+    // via `apply_platform_modifier_shim` on macOS terminals that
+    // dropped the bit. Either way we land here.
+    if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter {
         insert_input_char(app, '\n');
         return Ok(false);
     }
