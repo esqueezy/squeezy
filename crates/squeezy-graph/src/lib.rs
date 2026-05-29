@@ -6,6 +6,7 @@ use std::{
 };
 
 pub mod backend;
+pub mod cross_file;
 mod languages;
 mod references;
 mod resolution;
@@ -61,6 +62,21 @@ pub struct GraphSymbol {
     pub confidence: Confidence,
     pub freshness: Freshness,
     pub dirty: Option<DirtyAnnotation>,
+    /// Mirror of [`ParsedSymbol::arity`]; populated when the parser was
+    /// able to count fixed positional parameters for the symbol's kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arity: Option<u8>,
+    /// `true` when the symbol came from a parsed workspace file. `false`
+    /// reserves space for external stubs and parse-failed files which the
+    /// resolver should not treat as authoritative candidates by default.
+    /// Defaults to `true` for back-compat with persisted JSON snapshots
+    /// produced before this field existed.
+    #[serde(default = "default_scanned")]
+    pub scanned: bool,
+}
+
+fn default_scanned() -> bool {
+    true
 }
 
 impl From<ParsedSymbol> for GraphSymbol {
@@ -82,6 +98,8 @@ impl From<ParsedSymbol> for GraphSymbol {
             confidence: symbol.confidence,
             freshness: symbol.freshness,
             dirty: None,
+            arity: symbol.arity,
+            scanned: true,
         }
     }
 }
@@ -362,6 +380,21 @@ pub struct SemanticGraph {
     wildcard_aliased_imports: Vec<usize>,
     java_package_by_file: HashMap<FileId, Vec<String>>,
     js_ts_resolver: JsTsResolver,
+    /// Parallel index of `(file, name, arity) -> symbol` so the resolver
+    /// can disambiguate overloaded callees by exact positional-parameter
+    /// count when the AST already gave us that information. The phased
+    /// resolver consumes this; the legacy single-pass path does not yet
+    /// read from it (Item 5 PR-2).
+    arity_index: HashMap<(FileId, String, u8), SymbolId>,
+    /// Reverse import edge: which files import the key. Populated from
+    /// `imports_by_file` plus per-language path resolution; used by
+    /// affected-set incremental refresh (Item 3 PR-2).
+    importers_by_file: HashMap<FileId, Vec<FileId>>,
+    /// Per-file [`cross_file::ResolverSlot`] holding exports / imports /
+    /// supertypes for the phased pipeline. Populated even before any
+    /// resolver phase consumes it so the per-language flip does not need
+    /// a one-time backfill.
+    resolver_slots: cross_file::ResolverSlots,
 }
 
 #[derive(Debug, Clone)]
@@ -418,6 +451,9 @@ impl SemanticGraph {
             wildcard_aliased_imports: Vec::new(),
             java_package_by_file: HashMap::new(),
             js_ts_resolver: JsTsResolver::default(),
+            arity_index: HashMap::new(),
+            importers_by_file: HashMap::new(),
+            resolver_slots: cross_file::ResolverSlots::new(),
         }
     }
 
@@ -1289,6 +1325,7 @@ impl SemanticGraph {
     fn rebuild_resolution_indexes(&mut self) {
         self.symbols_by_name.clear();
         self.children_by_parent.clear();
+        self.arity_index.clear();
         self.rebuild_import_indexes();
 
         for symbol in self.symbols.values() {
@@ -1296,6 +1333,12 @@ impl SemanticGraph {
                 .entry(symbol.name.clone())
                 .or_default()
                 .push(symbol.id.clone());
+            if let Some(arity) = symbol.arity {
+                self.arity_index.insert(
+                    (symbol.file_id.clone(), symbol.name.clone(), arity),
+                    symbol.id.clone(),
+                );
+            }
         }
 
         for edge in &self.edges {
@@ -1307,6 +1350,87 @@ impl SemanticGraph {
                     .or_default()
                     .push(to.clone());
             }
+        }
+
+        self.rebuild_resolver_slots();
+        self.rebuild_importers_by_file();
+    }
+
+    /// Populate per-file [`cross_file::ResolverSlot`] entries. The phased
+    /// resolver does not yet consume these; the populate step exists so
+    /// the per-language flip can read a ready table on the first refresh
+    /// instead of paying a one-time backfill.
+    fn rebuild_resolver_slots(&mut self) {
+        self.resolver_slots.clear();
+        for file_id in self.files.keys() {
+            self.resolver_slots
+                .insert(file_id.clone(), cross_file::ResolverSlot::default());
+        }
+        for symbol in self.symbols.values() {
+            let Some(slot) = self.resolver_slots.get_mut(&symbol.file_id) else {
+                continue;
+            };
+            if symbol_is_exported(symbol) {
+                slot.exports.insert(cross_file::ExportEntry {
+                    name: symbol.name.clone(),
+                    kind: cross_file::ExportKind::Named,
+                    symbol: Some(symbol.id.clone()),
+                    source: None,
+                });
+            }
+        }
+        for import in &self.imports {
+            if import.alias.as_deref() == Some("__java_package__") {
+                continue;
+            }
+            let Some(slot) = self.resolver_slots.get_mut(&import.file_id) else {
+                continue;
+            };
+            slot.imports.push(cross_file::ImportEntry {
+                path: import.path.clone(),
+                imported_name: import.imported_name.clone(),
+                alias: import.alias.clone(),
+                source_file: None,
+            });
+        }
+    }
+
+    /// Populate the reverse-import index by walking every parsed import and
+    /// attaching the importing file to each candidate target file the
+    /// existing legacy machinery resolves the import to. Subsequent items
+    /// will replace the candidate scan with a phased lookup once that
+    /// pipeline is online.
+    fn rebuild_importers_by_file(&mut self) {
+        self.importers_by_file.clear();
+        // Compute first into a local map so we can borrow `self` immutably
+        // while walking imports without mutating `importers_by_file` in
+        // the same loop.
+        let mut updates: HashMap<FileId, Vec<FileId>> = HashMap::new();
+        for import in &self.imports {
+            if import.alias.as_deref() == Some("__java_package__") {
+                continue;
+            }
+            let target_name = import
+                .alias
+                .clone()
+                .unwrap_or_else(|| last_path_segment(&import.path));
+            for symbol_id in self.symbols_by_name.get(&target_name).into_iter().flatten() {
+                let Some(symbol) = self.symbols.get(symbol_id) else {
+                    continue;
+                };
+                if symbol.file_id == import.file_id {
+                    continue;
+                }
+                updates
+                    .entry(symbol.file_id.clone())
+                    .or_default()
+                    .push(import.file_id.clone());
+            }
+        }
+        for (target, mut importers) in updates {
+            importers.sort_by(|left, right| left.0.cmp(&right.0));
+            importers.dedup();
+            self.importers_by_file.insert(target, importers);
         }
     }
 
@@ -2412,11 +2536,44 @@ fn file_symbol(file: &FileRecord) -> GraphSymbol {
         confidence: Confidence::ExactSyntax,
         freshness: file.freshness,
         dirty: None,
+        arity: None,
+        scanned: true,
     }
 }
 
 fn file_symbol_id(file_id: &FileId) -> SymbolId {
     SymbolId::new(format!("file:{}", file_id.0))
+}
+
+/// Heuristic for whether a symbol should be considered exported for the
+/// purposes of cross-file [`cross_file::ExportTable`]. Squeezy's visibility
+/// labels vary by language ("pub", "public", `null` for Python module
+/// scope, etc.); we treat the symbol as exported when the visibility
+/// string is missing or anything other than `private`/`protected`. Anchor
+/// the rule here so language-specific tightenings (Item 1 PR-2..5) land
+/// in one place.
+fn symbol_is_exported(symbol: &GraphSymbol) -> bool {
+    if !matches!(
+        symbol.kind,
+        SymbolKind::Class
+            | SymbolKind::Function
+            | SymbolKind::Method
+            | SymbolKind::Interface
+            | SymbolKind::Struct
+            | SymbolKind::Enum
+            | SymbolKind::Trait
+            | SymbolKind::TypeAlias
+            | SymbolKind::Const
+            | SymbolKind::Macro
+            | SymbolKind::Test
+            | SymbolKind::Module
+    ) {
+        return false;
+    }
+    match symbol.visibility.as_deref() {
+        Some("private") | Some("protected") | Some("internal") => false,
+        _ => true,
+    }
 }
 
 fn last_path_segment(path: &str) -> String {
