@@ -1552,6 +1552,7 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
             base_url: None,
             bearer_token: None,
             request_metadata: BTreeMap::new(),
+            thinking_display: Default::default(),
             transport,
         }),
         "ollama" => ProviderConfig::Ollama(OllamaConfig {

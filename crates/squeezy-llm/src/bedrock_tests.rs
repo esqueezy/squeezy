@@ -4,16 +4,16 @@ use std::sync::Arc;
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_sdk_bedrockruntime::config::{Credentials, Region, SharedCredentialsProvider};
 use aws_sdk_bedrockruntime::types::{
-    CachePointType, ContentBlock, ConversationRole, ConverseStreamMetadataEvent,
-    ConverseStreamOutput, MessageStopEvent, StopReason, SystemContentBlock, TokenUsage,
-    ToolInputSchema,
+    CachePointType, ContentBlock, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStopEvent,
+    ConversationRole, ConverseStreamMetadataEvent, ConverseStreamOutput, MessageStopEvent,
+    ReasoningContentBlockDelta, StopReason, SystemContentBlock, TokenUsage, ToolInputSchema,
 };
 use aws_smithy_types::{Document, Number};
 use serde_json::json;
 use squeezy_core::SqueezyError;
 
 use aws_sdk_bedrockruntime::operation::converse_stream::builders::ConverseStreamInputBuilder;
-use squeezy_core::{BedrockConfig, ProviderTransportConfig};
+use squeezy_core::{BedrockConfig, BedrockThinkingDisplay, ProviderTransportConfig};
 
 use super::{
     BedrockProvider, BedrockStreamState, bedrock_request_metadata_map, build_bedrock_client,
@@ -21,7 +21,7 @@ use super::{
     tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
-use crate::{LlmInputItem, LlmToolSpec};
+use crate::{LlmEvent, LlmInputItem, LlmToolSpec, ReasoningKind, ReasoningPayload};
 
 #[test]
 fn system_blocks_skip_blank_instructions() {
@@ -387,6 +387,7 @@ fn config_request_metadata_appears_on_converse_stream_input() {
         base_url: None,
         bearer_token: None,
         request_metadata: tags.clone(),
+        thinking_display: Default::default(),
         transport: ProviderTransportConfig::default(),
     })
     .expect("provider builds from config with request_metadata");
@@ -457,6 +458,7 @@ fn aws_bearer_token_env_routes_through_bedrock_bearer_auth() {
         base_url: None,
         bearer_token: Some("bedrock-api-key-test".to_string()),
         request_metadata: BTreeMap::new(),
+        thinking_display: Default::default(),
         transport: squeezy_core::ProviderTransportConfig::default(),
     };
     let provider = crate::BedrockProvider::from_config(&bedrock)
@@ -531,5 +533,207 @@ fn missing_bearer_token_falls_back_to_default_credential_chain() {
     assert!(
         message.contains("aws configure") || message.contains("AWS_PROFILE"),
         "error must also point at the standard credential-chain recovery paths: {message}",
+    );
+}
+
+/// Construct a `reasoningContent` text-delta event for the given block
+/// index. The Bedrock stream handler routes these on
+/// `state.thinking_display` so tests can compare event traces across
+/// the Raw / Summarized / Hidden variants from the same input fixture.
+fn reasoning_text_delta_event(index: i32, text: &str) -> ConverseStreamOutput {
+    let delta = ContentBlockDeltaEvent::builder()
+        .content_block_index(index)
+        .delta(ContentBlockDelta::ReasoningContent(
+            ReasoningContentBlockDelta::Text(text.to_string()),
+        ))
+        .build()
+        .expect("ContentBlockDeltaEvent::build is infallible when content_block_index is set");
+    ConverseStreamOutput::ContentBlockDelta(delta)
+}
+
+fn reasoning_block_stop_event(index: i32) -> ConverseStreamOutput {
+    let stop = ContentBlockStopEvent::builder()
+        .content_block_index(index)
+        .build()
+        .expect("ContentBlockStopEvent::build is infallible when content_block_index is set");
+    ConverseStreamOutput::ContentBlockStop(stop)
+}
+
+/// Replay a deterministic reasoning sequence ("first", "second",
+/// "third" on the same block) through `handle_bedrock_event` and
+/// return the resulting `ReasoningDelta` text events plus the
+/// terminal `ReasoningDone` payload yielded by `flush_reasoning`.
+fn drive_reasoning_sequence(
+    display: BedrockThinkingDisplay,
+) -> (Vec<String>, Option<ReasoningPayload>) {
+    let mut state = BedrockStreamState::with_thinking_display(display);
+    let mut deltas = Vec::new();
+    let sequence = [
+        reasoning_text_delta_event(0, "first "),
+        reasoning_text_delta_event(0, "second "),
+        reasoning_text_delta_event(0, "third"),
+        reasoning_block_stop_event(0),
+    ];
+    for event in sequence {
+        let emitted = handle_bedrock_event(event, &mut state).expect("event handles cleanly");
+        for llm_event in emitted {
+            if let LlmEvent::ReasoningDelta { text, kind } = llm_event {
+                assert!(
+                    matches!(kind, ReasoningKind::Text),
+                    "reasoning text deltas must carry ReasoningKind::Text",
+                );
+                deltas.push(text);
+            } else {
+                panic!("unexpected non-reasoning event during reasoning sequence: {llm_event:?}");
+            }
+        }
+    }
+    let payload = state.flush_reasoning();
+    (deltas, payload)
+}
+
+#[test]
+fn bedrock_thinking_display_parses_canonical_names_and_aliases() {
+    assert_eq!(
+        BedrockThinkingDisplay::parse("summarized"),
+        Some(BedrockThinkingDisplay::Summarized)
+    );
+    assert_eq!(
+        BedrockThinkingDisplay::parse("Summarized"),
+        Some(BedrockThinkingDisplay::Summarized)
+    );
+    assert_eq!(
+        BedrockThinkingDisplay::parse(" default "),
+        Some(BedrockThinkingDisplay::Summarized)
+    );
+    assert_eq!(
+        BedrockThinkingDisplay::parse("hidden"),
+        Some(BedrockThinkingDisplay::Hidden)
+    );
+    assert_eq!(
+        BedrockThinkingDisplay::parse("off"),
+        Some(BedrockThinkingDisplay::Hidden)
+    );
+    assert_eq!(
+        BedrockThinkingDisplay::parse("raw"),
+        Some(BedrockThinkingDisplay::Raw)
+    );
+    assert_eq!(
+        BedrockThinkingDisplay::parse("verbatim"),
+        Some(BedrockThinkingDisplay::Raw)
+    );
+    assert_eq!(BedrockThinkingDisplay::parse("nope"), None);
+    assert_eq!(
+        BedrockThinkingDisplay::default(),
+        BedrockThinkingDisplay::Summarized
+    );
+}
+
+#[test]
+fn bedrock_thinking_display_raw_emits_every_chunk_verbatim() {
+    let (deltas, payload) = drive_reasoning_sequence(BedrockThinkingDisplay::Raw);
+    assert_eq!(
+        deltas,
+        vec![
+            "first ".to_string(),
+            "second ".to_string(),
+            "third".to_string()
+        ],
+        "Raw must forward each reasoningContent chunk verbatim, in order"
+    );
+    let Some(ReasoningPayload::Anthropic { blocks }) = payload else {
+        panic!("Raw must still surface ReasoningDone so signed thinking can replay");
+    };
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        blocks[0].text, "first second third",
+        "Raw payload must contain the full accumulated thinking text"
+    );
+}
+
+#[test]
+fn bedrock_thinking_display_summarized_emits_only_first_chunk() {
+    let (deltas, payload) = drive_reasoning_sequence(BedrockThinkingDisplay::Summarized);
+    assert_eq!(
+        deltas,
+        vec!["first ".to_string()],
+        "Summarized must emit exactly one ReasoningDelta per block (the first chunk)"
+    );
+    let Some(ReasoningPayload::Anthropic { blocks }) = payload else {
+        panic!("Summarized must still flush ReasoningDone so signed thinking can replay");
+    };
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        blocks[0].text, "first second third",
+        "Summarized must still accumulate the full thinking text for replay, even though the deltas were elided"
+    );
+}
+
+#[test]
+fn bedrock_thinking_display_hidden_drops_reasoning_entirely() {
+    let (deltas, payload) = drive_reasoning_sequence(BedrockThinkingDisplay::Hidden);
+    assert!(
+        deltas.is_empty(),
+        "Hidden must suppress every reasoning delta; saw {deltas:?}"
+    );
+    assert!(
+        payload.is_none(),
+        "Hidden must suppress ReasoningDone too; saw {payload:?}"
+    );
+}
+
+#[test]
+fn bedrock_thinking_display_summarized_resets_between_blocks() {
+    // A multi-block reasoning trace (e.g. interleaved thinking)
+    // should re-emit the first chunk for *each* block under
+    // Summarized — the "first" gate is per-block, not per-stream.
+    let mut state = BedrockStreamState::with_thinking_display(BedrockThinkingDisplay::Summarized);
+    let mut deltas = Vec::new();
+    let sequence = [
+        reasoning_text_delta_event(0, "alpha-1 "),
+        reasoning_text_delta_event(0, "alpha-2"),
+        reasoning_block_stop_event(0),
+        reasoning_text_delta_event(1, "beta-1 "),
+        reasoning_text_delta_event(1, "beta-2"),
+        reasoning_block_stop_event(1),
+    ];
+    for event in sequence {
+        for llm_event in handle_bedrock_event(event, &mut state).expect("handle event") {
+            if let LlmEvent::ReasoningDelta { text, .. } = llm_event {
+                deltas.push(text);
+            }
+        }
+    }
+    assert_eq!(
+        deltas,
+        vec!["alpha-1 ".to_string(), "beta-1 ".to_string()],
+        "Summarized must emit the first chunk of each independent reasoning block"
+    );
+    let Some(ReasoningPayload::Anthropic { blocks }) = state.flush_reasoning() else {
+        panic!("expected ReasoningDone payload for the two finalized blocks");
+    };
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].text, "alpha-1 alpha-2");
+    assert_eq!(blocks[1].text, "beta-1 beta-2");
+}
+
+#[test]
+fn bedrock_thinking_display_default_matches_summarized() {
+    // The default policy (used when TOML / env omit
+    // `thinking_display`) must equal `Summarized`. We verify by
+    // round-tripping through `BedrockStreamState::default` (no
+    // explicit display value) and confirming the second chunk drops.
+    let mut state = BedrockStreamState::default();
+    let emit_first = handle_bedrock_event(reasoning_text_delta_event(0, "alpha"), &mut state)
+        .expect("first chunk handles cleanly");
+    let emit_second = handle_bedrock_event(reasoning_text_delta_event(0, "beta"), &mut state)
+        .expect("second chunk handles cleanly");
+    assert!(
+        matches!(emit_first.as_slice(), [LlmEvent::ReasoningDelta { text, .. }] if text == "alpha"),
+        "default state must emit the first chunk (Summarized policy): {emit_first:?}"
+    );
+    assert!(
+        emit_second.is_empty(),
+        "default state must drop subsequent chunks under the Summarized policy: {emit_second:?}"
     );
 }
