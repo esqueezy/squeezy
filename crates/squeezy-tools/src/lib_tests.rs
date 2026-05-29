@@ -497,7 +497,7 @@ fn write_file_permission_request_target_matches_suggested_rule_target() {
 
 #[test]
 fn session_approval_extends_to_edit_family_on_optin() {
-    // F04-permission-scope-collapse-edit-family (squeezy-1ro.57): once the
+    // F04-permission-scope-collapse-edit-family: once the
     // user opts into a session rule from one edit-family tool on a given
     // path, the same rule must cover the rest of the family (write_file
     // <-> apply_patch) for that path without re-prompting. The mechanism

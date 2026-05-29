@@ -2180,7 +2180,7 @@ async fn blocked_web_domain_rule_returns_denied_tool_result() {
 
 #[tokio::test]
 async fn silent_deny_omits_reason_from_tool_result() {
-    // F04-cc-permission-decision-silent-vs-explained (squeezy-4b7.17):
+    // F04-cc-permission-decision-silent-vs-explained:
     // a deny rule with `silent = true` must replace the structured
     // `capability=...; target=...; risk=...` line in the tool-result with the
     // static `action denied by policy` placeholder. The model's tool-result

@@ -4907,7 +4907,7 @@ fn parent_tools_with_mutators() -> Vec<AdvertisedTool> {
 
 #[test]
 fn explore_subagent_cannot_call_write_file() {
-    // F10-typed-subagent-permission-derivation (squeezy-1ro.52): the explorer
+    // F10-typed-subagent-permission-derivation: the explorer
     // role is read-only by construction. `subagent_allowed_tools` filters the
     // parent tool advertisement down to Read|Search capability, so even when
     // the parent advertises `write_file`, `apply_patch`, and `shell`, the
@@ -4972,7 +4972,7 @@ fn typed_subagents_filter_to_read_search_capability() {
 
 #[test]
 fn reviewer_subagent_cannot_call_apply_patch_or_shell() {
-    // F10-typed-subagent-permission-derivation (squeezy-1ro.52): the reviewer
+    // F10-typed-subagent-permission-derivation: the reviewer
     // role reviews diffs and must not be able to mutate the working tree or
     // run shell commands, even if the parent advertisement contains those
     // tools.

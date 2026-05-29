@@ -33,7 +33,7 @@ pub(crate) enum Overlay {
 /// The TUI does not have a generic focus manager today: the resting
 /// input owner is always the composer, and modal overlays / popups
 /// borrow keys while they are open. This enum is the contract the
-/// audit note pinned to OpenCode squeezy-1ro.27 — callers tell
+/// audit note for the OpenCode parity follow-up — callers tell
 /// [`DialogHandle::open`] what was focused, and [`DialogHandle::restore_focus`]
 /// hands that hint back at close time so future focusables can be
 /// added without changing call sites.
