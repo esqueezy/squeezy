@@ -87,7 +87,9 @@ pub use streaming_patch::{
 
 #[cfg(test)]
 pub(crate) use events::apply_mcp_status_update;
-pub(crate) use events::{drain_agent_events, drain_job_events, drain_pending_diff};
+pub(crate) use events::{
+    drain_agent_events, drain_job_events, drain_pending_diff, drain_plan_housekeeping,
+};
 #[cfg(test)]
 pub(crate) use input::set_input;
 pub(crate) use input::{HistoryDirection, SLASH_COMMANDS, SelectionDirection, SlashCommand};
@@ -448,31 +450,67 @@ async fn run_inner(
             ResumeStartup::Fresh => None,
             ResumeStartup::Quit => return Ok(()),
         };
+    // Cover the gap between the picker exiting and the main loop's
+    // first `draw_app`: `Agent::resume`/`Agent::build` walk the
+    // workspace, initialise tree-sitter, open redb, and replay
+    // `events.jsonl`. The placeholder gives the user immediate feedback
+    // instead of a blank viewport for that window.
+    let startup_message = if resume_session_id.is_some() {
+        "Resuming session…"
+    } else {
+        "Starting session…"
+    };
+    let _ = terminal.draw_startup_placeholder(startup_message);
     let (mut agent, initial_transcript) = if let Some(session_id) = resume_session_id {
         Agent::resume(config.clone(), provider, &session_id)?
     } else {
         (Agent::new(config.clone(), provider), Vec::new())
     };
-    // One-shot migration of pre-v3 flat-layout plan files into a
-    // legacy subdir; safe to run unconditionally (no-op when nothing
-    // needs moving). Per-session pruning runs below once we know the
-    // session id.
-    let migrated = proposed_plan::migrate_legacy_plans(&config.workspace_root);
+    // Plan housekeeping (legacy migration + git-referenced protection +
+    // retention pruning) is best-effort maintenance: the 30-day `git
+    // log` shell-out and the plan-dir fs walks add tens-to-hundreds of
+    // milliseconds and nothing on the input path depends on the result.
+    // Run it on the blocking pool so the first frame paints immediately;
+    // the result lands as log lines once the main loop drains the
+    // channel.
     let session_id_for_plans = agent.session_id();
     let plans_session_owned = session_id_for_plans
         .clone()
         .unwrap_or_else(|| proposed_plan::FALLBACK_SESSION_ID.to_string());
-    // PR-H (issue 13): plan ids referenced in the last 30 days of git
-    // history survive retention pruning even when older than the cap,
-    // so design-doc references in commits don't get yanked under the
-    // user. Best-effort: no git repo → empty protected set → mtime
-    // behaviour.
-    let protected_plan_ids = proposed_plan::git_referenced_plan_ids(&config.workspace_root, 30);
-    let pruned = proposed_plan::prune_plan_dir(
-        &config.workspace_root,
-        &plans_session_owned,
-        &protected_plan_ids,
-    );
+    let (plan_housekeeping_tx, plan_housekeeping_rx) = oneshot::channel::<Vec<String>>();
+    let plan_workspace_root = config.workspace_root.clone();
+    let plan_session_for_task = plans_session_owned.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut logs: Vec<String> = Vec::new();
+        // One-shot migration of pre-v3 flat-layout plan files into a
+        // legacy subdir; safe to run unconditionally.
+        let migrated = proposed_plan::migrate_legacy_plans(&plan_workspace_root);
+        if migrated > 0 {
+            logs.push(format!(
+                "migrated {migrated} legacy plan file(s) to {}/{}",
+                proposed_plan::PLAN_DIR,
+                proposed_plan::LEGACY_PLAN_DIR
+            ));
+        }
+        // Plan ids referenced in the last 30 days of git history survive
+        // retention pruning even when older than the cap. Best-effort:
+        // no git repo → empty protected set → mtime behaviour.
+        let protected_plan_ids = proposed_plan::git_referenced_plan_ids(&plan_workspace_root, 30);
+        let pruned = proposed_plan::prune_plan_dir(
+            &plan_workspace_root,
+            &plan_session_for_task,
+            &protected_plan_ids,
+        );
+        if pruned > 0 {
+            logs.push(format!(
+                "pruned {pruned} stale plan file(s) from {}/{} (kept {} newest)",
+                proposed_plan::PLAN_DIR,
+                plan_session_for_task,
+                proposed_plan::PLAN_RETENTION_LIMIT
+            ));
+        }
+        let _ = plan_housekeeping_tx.send(logs);
+    });
     // `StartupProfile` is moved into `TuiApp::new`, so capture the banner
     // (the only field needed below) before that hand-off.
     let update_banner = startup.update_banner.clone();
@@ -483,21 +521,7 @@ async fn run_inner(
         startup,
     );
     app.session_id = session_id_for_plans;
-    if migrated > 0 {
-        app.push_log(format!(
-            "migrated {migrated} legacy plan file(s) to {}/{}",
-            proposed_plan::PLAN_DIR,
-            proposed_plan::LEGACY_PLAN_DIR
-        ));
-    }
-    if pruned > 0 {
-        app.push_log(format!(
-            "pruned {pruned} stale plan file(s) from {}/{} (kept {} newest)",
-            proposed_plan::PLAN_DIR,
-            plans_session_owned,
-            proposed_plan::PLAN_RETENTION_LIMIT
-        ));
-    }
+    app.plan_housekeeping_rx = Some(plan_housekeeping_rx);
     if let Some(banner) = update_banner.filter(|s| !s.trim().is_empty()) {
         app.push_log(banner);
     }
@@ -528,6 +552,7 @@ async fn run_inner(
         // Drain producers first so the next draw reflects everything that
         // has landed since the previous iteration. A flurry of events
         // therefore coalesces into a single frame.
+        drain_plan_housekeeping(&mut app);
         drain_job_events(&mut app);
         drain_agent_events(&mut app).await;
         if app.auto_drain_queue {
@@ -10385,6 +10410,11 @@ pub(crate) struct TuiApp {
     pub(crate) job_rx: Option<broadcast::Receiver<JobEvent>>,
     pub(crate) jobs: BTreeMap<JobId, JobSnapshot>,
     pub(crate) notifications: VecDeque<JobNotification>,
+    /// Receives formatted log lines from the deferred plan-housekeeping
+    /// task (`migrate_legacy_plans` + `git_referenced_plan_ids` +
+    /// `prune_plan_dir`). Moved off the boot path so a 30-day `git log`
+    /// shell-out and any plan-dir fs walks don't gate the first frame.
+    pub(crate) plan_housekeeping_rx: Option<oneshot::Receiver<Vec<String>>>,
     pub(crate) cancel: Option<CancellationToken>,
     pub(crate) pending_approval: Option<PendingApproval>,
     pub(crate) approval_selection_index: usize,
@@ -10711,6 +10741,7 @@ impl TuiApp {
             job_rx: None,
             jobs: BTreeMap::new(),
             notifications: VecDeque::new(),
+            plan_housekeeping_rx: None,
             cancel: None,
             pending_approval: None,
             approval_selection_index: 0,
@@ -11683,6 +11714,45 @@ impl TerminalGuard {
 
     fn set_exit_hint(&mut self, exit_hint: Option<String>) {
         self.exit_hint = exit_hint;
+    }
+
+    /// Paint a single centered status line, flushed before the first real
+    /// `draw_app` frame. The picker exits into a blank viewport while
+    /// `Agent::resume`/`Agent::build` walk the workspace; without this the
+    /// user just stares at empty space until the main loop starts.
+    fn draw_startup_placeholder(&mut self, message: &str) -> Result<()> {
+        let message = message.to_string();
+        self.terminal
+            .draw(|frame| {
+                let area = frame.area();
+                if area.width == 0 || area.height == 0 {
+                    return;
+                }
+                let line = Line::from(vec![
+                    Span::styled(
+                        "● ",
+                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        message,
+                        Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+                    ),
+                ]);
+                let paragraph =
+                    Paragraph::new(vec![line]).alignment(ratatui::layout::Alignment::Center);
+                let row = area.y + area.height / 2;
+                let target = Rect {
+                    x: area.x,
+                    y: row,
+                    width: area.width,
+                    height: 1,
+                };
+                frame.render_widget(paragraph, target);
+            })
+            .map(|_| ())
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        let _ = self.terminal.backend_mut().flush();
+        Ok(())
     }
 
     fn draw_app(&mut self, app: &mut TuiApp) -> Result<()> {
