@@ -11,6 +11,8 @@
 //! Inspired by `semsitter/udg-gen/src/cross_file/`; nothing is copied, only
 //! the shape is mirrored so the consumer side lines up.
 
+pub mod scheduler;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
