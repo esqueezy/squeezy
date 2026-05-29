@@ -610,6 +610,22 @@ text = "Do not inspect files. Produce a compact markdown sample for testing term
     .unwrap()
 }
 
+fn scenario_with_ux_render_prompt_without_file_ban() -> Scenario {
+    toml::from_str(
+        r#"
+id = "ux-render"
+title = "ux-render"
+description = "Offline fixture that renders a compact UX report"
+[workspace]
+local = "/tmp/r"
+[[steps]]
+kind = "prompt"
+text = "Render a compact UX report with paths and exact_syntax labels."
+"#,
+    )
+    .unwrap()
+}
+
 #[test]
 fn ungrounded_citation_quiet_for_synthetic_render_sample() {
     let events = vec![
@@ -886,6 +902,64 @@ fn exact_syntax_without_source_quiet_for_synthetic_render_sample() {
             .check(&ctx, &scenario_with_synthetic_render_prompt())
             .is_empty()
     );
+}
+
+#[test]
+fn exact_syntax_without_source_quiet_for_ux_render_fixture_prompt() {
+    let events = vec![
+        EvalEvent {
+            schema_version: 2,
+            ts_unix_ms: 0,
+            sequence: 4,
+            turn_id: Some("T(3)".into()),
+            kind: EvalEventKind::AssistantDelta {
+                delta: "Render `exact_syntax` and label_missing in a UX table.".into(),
+            },
+        },
+        EvalEvent {
+            schema_version: 2,
+            ts_unix_ms: 0,
+            sequence: 5,
+            turn_id: Some("T(3)".into()),
+            kind: EvalEventKind::TurnCompleted {
+                metrics: serde_json::json!({}),
+                cost: serde_json::json!({}),
+                stop_reason: None,
+                reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
+            },
+        },
+    ];
+    let ctx = ctx_from_events(events);
+    assert!(
+        ExactSyntaxWithoutSource
+            .check(&ctx, &scenario_with_ux_render_prompt_without_file_ban())
+            .is_empty()
+    );
+}
+
+#[test]
+fn denied_tool_call_ux_flags_denied_tool_completion() {
+    let events = vec![EvalEvent {
+        schema_version: 2,
+        ts_unix_ms: 0,
+        sequence: 8,
+        turn_id: Some("T(2)".into()),
+        kind: EvalEventKind::ToolCallCompleted {
+            result: serde_json::json!({
+                "tool_name": "shell",
+                "status": "Denied",
+                "error": "denied by scenario"
+            }),
+        },
+    }];
+    let ctx = ctx_from_events(events);
+    let out = DeniedToolCallUx.check(&ctx, &empty_scenario());
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].rule_id, "denied_tool_call_ux");
+    assert!(out[0].summary.contains("denial reason"));
 }
 
 fn assistant_delta(seq: u64, turn: &str, text: &str) -> EvalEvent {

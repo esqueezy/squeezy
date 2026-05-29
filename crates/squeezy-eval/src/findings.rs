@@ -1117,10 +1117,12 @@ fn scenario_requests_synthetic_render_sample(scenario: &Scenario) -> bool {
         }
     }
     let haystack = haystack.to_ascii_lowercase();
-    haystack.contains("do not inspect files")
+    (haystack.contains("do not inspect files")
         && (haystack.contains("terminal rendering")
             || haystack.contains("markdown sample")
-            || haystack.contains("render sample"))
+            || haystack.contains("render sample")))
+        || haystack.contains("render a compact mixed markdown")
+        || haystack.contains("render a compact ux report")
 }
 
 /// A live turn failed because the provider hit the output-token cap.
@@ -1524,6 +1526,7 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
         // Phase 5 additions (TUI-coverage rules)
         Box::new(TuiOverlayUnhandled),
         Box::new(TuiUserInputAutoCancelled),
+        Box::new(DeniedToolCallUx),
         // Phase 7 additions
         Box::new(PlatformMismatch),
     ]
@@ -1617,6 +1620,50 @@ impl Rule for TuiUserInputAutoCancelled {
                     }],
                 });
             }
+        }
+        out
+    }
+}
+
+/// A denied tool call is intentional in permission UX scenarios, but it still
+/// needs an explicit frame/audit signal so reviewers validate the denial copy,
+/// reason, and next action instead of treating it like an invisible non-error.
+pub struct DeniedToolCallUx;
+impl Rule for DeniedToolCallUx {
+    fn rule_id(&self) -> &'static str {
+        "denied_tool_call_ux"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for event in &ctx.events {
+            let EvalEventKind::ToolCallCompleted { result } = &event.kind else {
+                continue;
+            };
+            let denied = result
+                .get("status")
+                .and_then(|value| value.as_str())
+                .is_some_and(|status| status == "Denied");
+            if !denied {
+                continue;
+            }
+            let tool = result
+                .get("tool_name")
+                .or_else(|| result.get("name"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("tool");
+            out.push(Finding {
+                rule_id: "denied_tool_call_ux".into(),
+                severity: Severity::Minor,
+                category: "ux".into(),
+                summary: format!(
+                    "Denied `{tool}` tool call captured; validate that the TUI shows the denial \
+                     reason and next-action guidance."
+                ),
+                evidence: vec![EvidencePointer {
+                    trace_event: Some(event.sequence),
+                    frame: None,
+                }],
+            });
         }
         out
     }
