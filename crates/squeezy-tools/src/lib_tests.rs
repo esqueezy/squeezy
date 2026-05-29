@@ -10452,3 +10452,202 @@ async fn read_file_dispatch_misspelled_alias_still_fails() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+// ---------------------------------------------------------------------------
+// F01: ToolIo abstraction tests.
+//
+// These tests cover the proof-of-concept migration of `read_file` to route
+// its filesystem reads through the [`ToolIo`] trait. The first exercises
+// the real-filesystem path (the production default); the second swaps in
+// a fake `ToolIo` and proves that `read_file` actually consults the trait
+// rather than calling into `std::fs` directly.
+// ---------------------------------------------------------------------------
+
+/// Fake [`ToolIo`] that returns canned bytes from an in-memory map. Test
+/// fixtures construct it with the workspace-canonicalised path the
+/// `ToolRegistry` will use after `resolve_existing`, so the registry's
+/// upstream path validation still sees the file on disk while every IO
+/// call that read_file issues is satisfied by the fake.
+#[derive(Debug, Default)]
+struct CannedToolIo {
+    files: Mutex<std::collections::HashMap<PathBuf, Vec<u8>>>,
+    file_len_calls: std::sync::atomic::AtomicU64,
+    read_range_calls: std::sync::atomic::AtomicU64,
+    sha256_calls: std::sync::atomic::AtomicU64,
+}
+
+impl CannedToolIo {
+    fn new(path: impl Into<PathBuf>, contents: Vec<u8>) -> Self {
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.into(), contents);
+        Self {
+            files: Mutex::new(files),
+            ..Self::default()
+        }
+    }
+
+    fn file_len_calls(&self) -> u64 {
+        self.file_len_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn read_range_calls(&self) -> u64 {
+        self.read_range_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn sha256_calls(&self) -> u64 {
+        self.sha256_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ToolIo for CannedToolIo {
+    fn file_len(&self, path: &Path) -> std::io::Result<u64> {
+        self.file_len_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.files
+            .lock()
+            .expect("files")
+            .get(path)
+            .map(|bytes| bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no fake entry"))
+    }
+
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        self.files
+            .lock()
+            .expect("files")
+            .get(path)
+            .cloned()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no fake entry"))
+    }
+
+    fn read_range(&self, path: &Path, offset: u64, limit: usize) -> std::io::Result<Vec<u8>> {
+        self.read_range_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let files = self.files.lock().expect("files");
+        let bytes = files
+            .get(path)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no fake entry"))?;
+        let start = (offset as usize).min(bytes.len());
+        let end = start.saturating_add(limit).min(bytes.len());
+        Ok(bytes[start..end].to_vec())
+    }
+
+    fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        self.files
+            .lock()
+            .expect("files")
+            .insert(path.to_path_buf(), bytes.to_vec());
+        Ok(())
+    }
+
+    fn sha256(&self, path: &Path) -> std::io::Result<String> {
+        self.sha256_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Fall through to the trait default so we exercise the
+        // `read_range`-streaming path too.
+        let bytes = self.read(path)?;
+        Ok(crate::sha256_hex(&bytes))
+    }
+}
+
+#[tokio::test]
+async fn read_file_routes_through_default_tool_io() {
+    // Real filesystem path: explicitly wire `DefaultToolIo` and check
+    // that `read_file` still returns the bytes that are on disk.
+    let root = temp_workspace("read_file_default_io");
+    fs::write(root.join("greeting.txt"), b"hello, world").expect("write sample");
+
+    let registry = ToolRegistry::new(&root)
+        .expect("registry")
+        .with_tool_io(Arc::new(DefaultToolIo));
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "default_io".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "greeting.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["content"], "hello, world");
+    assert_eq!(result.content["total_bytes"], json!(b"hello, world".len()));
+    assert_eq!(
+        result.content["sha256"],
+        sha256_hex("hello, world").as_str()
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_routes_through_custom_tool_io() {
+    // Mock-IO path: write one set of bytes to disk so path resolution
+    // succeeds, then register a *different* payload in the fake `ToolIo`
+    // and confirm `read_file` returns the fake payload. This is the
+    // proof that the migrated tool actually consults `self.io` for its
+    // reads rather than reaching into `std::fs` directly.
+    let root = temp_workspace("read_file_custom_io");
+    let file_name = "sample.txt";
+    let on_disk = b"REAL-FILE-BYTES";
+    let in_memory = b"fake-bytes-from-tool-io";
+
+    fs::write(root.join(file_name), on_disk).expect("write sample");
+
+    // `execute_read_file` canonicalises the path before calling the
+    // trait, so register the fake under the same canonical form.
+    let canonical = std::fs::canonicalize(root.join(file_name)).expect("canonicalize");
+    let fake = Arc::new(CannedToolIo::new(canonical.clone(), in_memory.to_vec()));
+
+    let registry = ToolRegistry::new(&root)
+        .expect("registry")
+        .with_tool_io(fake.clone());
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "custom_io".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": file_name}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(
+        result.content["content"], "fake-bytes-from-tool-io",
+        "read_file must surface the bytes the fake ToolIo returned, not the on-disk bytes",
+    );
+    assert_eq!(
+        result.content["total_bytes"],
+        json!(in_memory.len()),
+        "total_bytes must reflect the fake ToolIo's `file_len`, not the real on-disk length",
+    );
+    assert_eq!(
+        result.content["sha256"],
+        sha256_hex(in_memory).as_str(),
+        "sha256 must hash the fake bytes, not the on-disk bytes",
+    );
+
+    // And the fake actually fielded each IO concern: at least one
+    // length probe, at least one ranged read, and one hash computation.
+    assert!(
+        fake.file_len_calls() >= 1,
+        "expected file_len to be routed through the fake"
+    );
+    assert!(
+        fake.read_range_calls() >= 1,
+        "expected read_range to be routed through the fake"
+    );
+    assert_eq!(
+        fake.sha256_calls(),
+        1,
+        "expected exactly one sha256 hash computed through the fake"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

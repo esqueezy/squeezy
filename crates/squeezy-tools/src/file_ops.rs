@@ -17,8 +17,7 @@ use crate::{
     DEFAULT_MAX_BYTES_PER_FILE, DEFAULT_MAX_FILES, DEFAULT_READ_LIMIT, MAX_READ_LIMIT,
     POLICY_PREFIX_BYTES, ToolCall, ToolCostHint, ToolRegistry, ToolResult, ToolStatus,
     build_include_set, build_required_glob, diff_path_set, file_len, is_secret_path, make_result,
-    read_prefix, read_range, sha256_file, tool_arg_error, tool_error, truncate_text,
-    workspace_path,
+    read_prefix, tool_arg_error, tool_error, truncate_text, workspace_path,
 };
 
 pub(crate) const DEFAULT_MAX_MATCHES: usize = 100;
@@ -546,11 +545,11 @@ impl ToolRegistry {
             );
         }
 
-        let total_bytes = match file_len(&path) {
+        let total_bytes = match self.io.file_len(&path) {
             Ok(len) => len,
             Err(err) => return tool_error(call, err),
         };
-        let prefix_bytes = read_prefix(&path, POLICY_PREFIX_BYTES).ok();
+        let prefix_bytes = self.io.read_range(&path, 0, POLICY_PREFIX_BYTES).ok();
         let ignored_reason = self
             .policy_exclusion_for_file(&path, &rel, prefix_bytes.as_deref())
             .map(ExclusionReason::as_str);
@@ -563,11 +562,11 @@ impl ToolRegistry {
         // agent can wrap the bytes in `LlmInputItem::Image` instead of
         // re-serialising binary content as lossy UTF-8 text.
         if let Some(mime) = prefix_bytes.as_deref().and_then(detect_image_mime) {
-            let bytes = match read_range(&path, 0, total_bytes as usize) {
+            let bytes = match self.io.read_range(&path, 0, total_bytes as usize) {
                 Ok(bytes) => bytes,
                 Err(err) => return tool_error(call, err),
             };
-            let content_sha256 = match sha256_file(&path) {
+            let content_sha256 = match self.io.sha256(&path) {
                 Ok(hash) => hash,
                 Err(err) => return tool_error(call, err),
             };
@@ -607,7 +606,7 @@ impl ToolRegistry {
         // if the full-file hash matches what we already returned for the same
         // window in a prior call, emit a stub instead of re-serializing
         // identical bytes.
-        let content_sha256 = match sha256_file(&path) {
+        let content_sha256 = match self.io.sha256(&path) {
             Ok(hash) => hash,
             Err(err) => return tool_error(call, err),
         };
@@ -651,7 +650,7 @@ impl ToolRegistry {
             }
         }
 
-        let bytes = match read_range(&path, offset as u64, limit) {
+        let bytes = match self.io.read_range(&path, offset as u64, limit) {
             Ok(bytes) => bytes,
             Err(err) => return tool_error(call, err),
         };
