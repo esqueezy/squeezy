@@ -28,6 +28,7 @@ async fn bedrock_converse_streaming_costly() -> Result<()> {
         region,
         base_url: env::var("BEDROCK_BASE_URL").ok(),
         bearer_token: env::var("AWS_BEARER_TOKEN_BEDROCK").ok(),
+        request_metadata: std::collections::BTreeMap::new(),
         transport: ProviderTransportConfig::default(),
     })?;
     let model = env::var(MODEL_ENV)

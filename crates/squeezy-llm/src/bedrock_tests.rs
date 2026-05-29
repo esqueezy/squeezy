@@ -12,9 +12,13 @@ use aws_smithy_types::{Document, Number};
 use serde_json::json;
 use squeezy_core::SqueezyError;
 
+use aws_sdk_bedrockruntime::operation::converse_stream::builders::ConverseStreamInputBuilder;
+use squeezy_core::{BedrockConfig, ProviderTransportConfig};
+
 use super::{
-    BedrockStreamState, build_bedrock_client, conversation_messages, handle_bedrock_event,
-    json_to_document, system_blocks, tool_configuration,
+    BedrockProvider, BedrockStreamState, bedrock_request_metadata_map, build_bedrock_client,
+    conversation_messages, handle_bedrock_event, json_to_document, system_blocks,
+    tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{LlmInputItem, LlmToolSpec};
@@ -381,6 +385,7 @@ fn config_request_metadata_appears_on_converse_stream_input() {
     let provider = BedrockProvider::from_config(&BedrockConfig {
         region: "us-east-1".to_string(),
         base_url: None,
+        bearer_token: None,
         request_metadata: tags.clone(),
         transport: ProviderTransportConfig::default(),
     })
@@ -440,6 +445,7 @@ fn aws_bearer_token_env_routes_through_bedrock_bearer_auth() {
         region: squeezy_core::DEFAULT_BEDROCK_REGION.to_string(),
         base_url: None,
         bearer_token: Some("bedrock-api-key-test".to_string()),
+        request_metadata: BTreeMap::new(),
         transport: squeezy_core::ProviderTransportConfig::default(),
     };
     let provider = crate::BedrockProvider::from_config(&bedrock)
