@@ -26,6 +26,7 @@ similar.workspace = true
 squeezy-agent.workspace = true
 squeezy-core.workspace = true
 squeezy-llm.workspace = true
+squeezy-platform.workspace = true
 squeezy-rank.workspace = true
 squeezy-skills.workspace = true
 squeezy-store.workspace = true

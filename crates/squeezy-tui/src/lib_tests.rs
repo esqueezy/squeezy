@@ -5918,6 +5918,31 @@ async fn ctrl_j_and_backslash_enter_insert_prompt_newlines() {
 }
 
 #[tokio::test]
+async fn shift_enter_inserts_newline_without_submitting() {
+    // Shift+Enter is the cross-terminal newline shortcut once the
+    // platform shim has recovered the SHIFT modifier from CoreGraphics
+    // (on macOS) or the terminal delivered it natively (Kitty / xterm
+    // modifyOtherKeys). Either way the composer should grow a `\n`
+    // rather than submitting an empty turn.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    set_input(&mut app, "hello".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift+enter newline");
+
+    assert_eq!(app.input, "hello\n");
+    // The turn channel should not have been opened — Shift+Enter must
+    // not submit even when the composer is non-empty.
+    assert!(app.turn_rx.is_none());
+}
+
+#[tokio::test]
 async fn ctrl_y_copies_last_assistant_message() {
     let mut agent = test_agent(SessionMode::Build);
     let writes = Arc::new(StdMutex::new(Vec::new()));
