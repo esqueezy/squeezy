@@ -613,6 +613,28 @@ pub(crate) fn drain_pending_diff(app: &mut TuiApp) {
     }
 }
 
+/// Drain the deferred plan-housekeeping result. The migration / pruning
+/// runs on a blocking task started before the first frame so a 30-day
+/// `git log` doesn't gate the TUI becoming interactive; the formatted
+/// log lines land here and get pushed once the task signals completion.
+pub(crate) fn drain_plan_housekeeping(app: &mut TuiApp) {
+    let Some(mut rx) = app.plan_housekeeping_rx.take() else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(logs) => {
+            for line in logs {
+                app.push_log(line);
+            }
+            app.needs_redraw = true;
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+            app.plan_housekeeping_rx = Some(rx);
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+    }
+}
+
 pub(crate) fn apply_job_update(app: &mut TuiApp, job: JobSnapshot) {
     app.jobs.insert(job.id, job);
     prune_tui_jobs(&mut app.jobs);
