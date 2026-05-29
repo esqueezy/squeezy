@@ -599,6 +599,11 @@ impl AppConfig {
                         .filter(|value| !value.is_empty()),
                     request_metadata: provider_setting_request_metadata(&providers, "bedrock")
                         .unwrap_or_default(),
+                    thinking_display: get_var("SQUEEZY_BEDROCK_THINKING_DISPLAY")
+                        .or_else(|| provider_setting(&providers, "bedrock", "thinking_display"))
+                        .as_deref()
+                        .and_then(BedrockThinkingDisplay::parse)
+                        .unwrap_or_default(),
                     transport: provider_transport_settings(&providers, &["bedrock"]),
                 })
             }
@@ -2142,7 +2147,67 @@ pub struct BedrockConfig {
     /// (F16pi-bedrock-request-metadata-tags.)
     #[serde(default)]
     pub request_metadata: BTreeMap<String, String>,
+    /// How the Bedrock stream handler should render the model's
+    /// `reasoningContent` blocks back to the agent's event stream.
+    /// `Summarized` (default) emits the first text chunk per block as
+    /// a compact preview; `Hidden` drops reasoning entirely; `Raw`
+    /// preserves the verbatim per-chunk `LlmEvent::ReasoningDelta`
+    /// stream so consumers that want full thinking traces (signed
+    /// thinking replay, eval transcripts) can opt in.
+    /// (F16pi-bedrock-thinking-display-omitted.)
+    #[serde(default)]
+    pub thinking_display: BedrockThinkingDisplay,
     pub transport: ProviderTransportConfig,
+}
+
+/// User-selectable rendering policy for Bedrock `reasoningContent`
+/// blocks emitted by Anthropic / Claude models hosted on AWS Bedrock.
+///
+/// * `Summarized` (default) — emit only the first per-block text chunk
+///   as `LlmEvent::ReasoningDelta` so the agent UI shows a compact
+///   preview without flooding the transcript with full thinking
+///   traces. The completed thinking block is still surfaced as
+///   `LlmEvent::ReasoningDone` so signed thinking can replay on the
+///   next turn.
+/// * `Hidden` — drop reasoning blocks entirely. No `ReasoningDelta`
+///   events fire and `ReasoningDone` is suppressed, so the agent never
+///   sees the model's thinking. Useful for cost-sensitive deployments
+///   that don't want thinking traces in transcripts or audit logs;
+///   incompatible with Anthropic interleaved-thinking replay.
+/// * `Raw` — emit every `reasoningContent` text chunk verbatim, exactly
+///   as the upstream stream delivered it. Matches the pre-feature
+///   behavior for callers that want unmodified thinking output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BedrockThinkingDisplay {
+    #[default]
+    Summarized,
+    Hidden,
+    Raw,
+}
+
+impl BedrockThinkingDisplay {
+    /// Parse a TOML / env-var string into a [`BedrockThinkingDisplay`].
+    /// Accepts the canonical snake-case names plus a small set of
+    /// natural-language aliases so operators can write either
+    /// `thinking_display = "raw"` or `thinking_display = "verbose"`
+    /// without surprising rejections.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "summarized" | "summary" | "summarised" | "default" => Some(Self::Summarized),
+            "hidden" | "off" | "drop" | "none" => Some(Self::Hidden),
+            "raw" | "verbatim" | "full" | "verbose" => Some(Self::Raw),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Summarized => "summarized",
+            Self::Hidden => "hidden",
+            Self::Raw => "raw",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2671,6 +2736,11 @@ pub struct ProviderSettings {
     /// Ollama-only: `"native"` (default) or `"openai_compatible"` to pin the
     /// provider to `/v1/chat/completions` SSE instead of `/api/chat` NDJSON.
     pub route_style: Option<String>,
+    /// Bedrock-only: how the provider should render the model's
+    /// `reasoningContent` blocks. Accepts `"summarized"` (default),
+    /// `"hidden"`, or `"raw"`. See [`BedrockThinkingDisplay`] for the
+    /// per-variant semantics. Other providers ignore this field.
+    pub thinking_display: Option<String>,
     /// Faux-only: path to a TOML script file consumed by the in-process
     /// faux provider. Other providers ignore this field.
     pub script: Option<String>,
@@ -2699,6 +2769,7 @@ impl ProviderSettings {
                 "request_metadata",
                 "deployment_name_map",
                 "route_style",
+                "thinking_display",
                 "script",
             ],
             source,
@@ -2808,6 +2879,12 @@ impl ProviderSettings {
             request_metadata: None,
             deployment_name_map,
             route_style: string_value(table, "route_style", source, &field(path, "route_style"))?,
+            thinking_display: string_value(
+                table,
+                "thinking_display",
+                source,
+                &field(path, "thinking_display"),
+            )?,
             script: string_value(table, "script", source, &field(path, "script"))?,
         })
     }
@@ -2832,6 +2909,7 @@ impl ProviderSettings {
         );
         replace_if_some(&mut self.headers, next.headers);
         replace_if_some(&mut self.route_style, next.route_style);
+        replace_if_some(&mut self.thinking_display, next.thinking_display);
         replace_if_some(&mut self.script, next.script);
     }
 }
@@ -7575,6 +7653,7 @@ fn provider_setting(
         "vertex_project" => settings.vertex_project.as_ref(),
         "vertex_location" => settings.vertex_location.as_ref(),
         "route_style" => settings.route_style.as_ref(),
+        "thinking_display" => settings.thinking_display.as_ref(),
         "cloudflare_account_id" => settings.cloudflare_account_id.as_ref(),
         "cloudflare_gateway_id" => settings.cloudflare_gateway_id.as_ref(),
         "script" => settings.script.as_ref(),

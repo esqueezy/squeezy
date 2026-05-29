@@ -21,7 +21,10 @@ use aws_sdk_bedrockruntime::{
 };
 use aws_smithy_types::{Blob, Document, Number};
 use serde_json::Value;
-use squeezy_core::{BedrockConfig, CostSnapshot, ProviderTransportConfig, Result, SqueezyError};
+use squeezy_core::{
+    BedrockConfig, BedrockThinkingDisplay, CostSnapshot, ProviderTransportConfig, Result,
+    SqueezyError,
+};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +43,9 @@ pub struct BedrockProvider {
     /// Operator-defined cost-allocation tags forwarded on every
     /// ConverseStream invocation (F16pi-bedrock-request-metadata-tags).
     request_metadata: std::collections::BTreeMap<String, String>,
+    /// How to render Bedrock `reasoningContent` blocks on the
+    /// outbound `LlmEvent` stream (F16pi-bedrock-thinking-display-omitted).
+    thinking_display: BedrockThinkingDisplay,
     transport: ProviderTransportConfig,
     shared: Arc<tokio::sync::OnceCell<SdkConfig>>,
 }
@@ -51,6 +57,7 @@ impl BedrockProvider {
             base_url: config.base_url.clone(),
             bearer_token: config.bearer_token.clone(),
             request_metadata: config.request_metadata.clone(),
+            thinking_display: config.thinking_display,
             transport: config.transport,
             shared: Arc::new(tokio::sync::OnceCell::new()),
         })
@@ -210,7 +217,7 @@ impl LlmProvider for BedrockProvider {
             yield LlmEvent::Started;
 
             let mut stream = response.stream;
-            let mut state = BedrockStreamState::default();
+            let mut state = BedrockStreamState::with_thinking_display(provider.thinking_display);
             loop {
                 let polled = tokio::select! {
                     _ = cancel.cancelled() => {
@@ -276,9 +283,22 @@ struct BedrockStreamState {
     saw_message_stop: bool,
     stop_reason: Option<crate::StopReason>,
     saw_metadata: bool,
+    /// Operator-selected policy for rendering reasoning blocks on the
+    /// outbound event stream. Default (`Summarized`) emits the first
+    /// per-block text chunk and drops the rest; `Hidden` suppresses
+    /// every reasoning event; `Raw` keeps the verbatim per-chunk
+    /// `ReasoningDelta` stream.
+    thinking_display: BedrockThinkingDisplay,
 }
 
 impl BedrockStreamState {
+    fn with_thinking_display(thinking_display: BedrockThinkingDisplay) -> Self {
+        Self {
+            thinking_display,
+            ..Default::default()
+        }
+    }
+
     fn cost(&self) -> CostSnapshot {
         CostSnapshot {
             input_tokens: self.input_tokens,
@@ -291,7 +311,15 @@ impl BedrockStreamState {
     }
 
     fn flush_reasoning(&mut self) -> Option<ReasoningPayload> {
-        if self.finished_reasoning.is_empty() {
+        // `Hidden` callers explicitly opt out of seeing reasoning at
+        // all, including the signed-thinking replay payload that
+        // normally rides on `LlmEvent::ReasoningDone`. We still drained
+        // the per-block accumulator above so the state is reset for
+        // the next turn; we just never surface it.
+        if matches!(self.thinking_display, BedrockThinkingDisplay::Hidden)
+            || self.finished_reasoning.is_empty()
+        {
+            self.finished_reasoning.clear();
             return None;
         }
         Some(ReasoningPayload::Anthropic {
@@ -338,6 +366,7 @@ fn handle_bedrock_event(
                 }
                 Some(ContentBlockDelta::ReasoningContent(reasoning)) => {
                     let index = delta.content_block_index;
+                    let thinking_display = state.thinking_display;
                     let block = state.reasoning_blocks.entry(index).or_insert_with(|| {
                         AnthropicThinkingBlock {
                             kind: AnthropicThinkingKind::Thinking,
@@ -348,14 +377,32 @@ fn handle_bedrock_event(
                     });
                     match reasoning {
                         ReasoningContentBlockDelta::Text(text) => {
+                            // We always accumulate the full text into
+                            // `AnthropicThinkingBlock` so the signed
+                            // `ReasoningDone` replay payload stays
+                            // intact; the display policy only gates
+                            // what we surface on the *delta* stream.
+                            let was_empty_before_push = block.text.is_empty();
                             block.text.push_str(&text);
                             if text.is_empty() {
-                                Ok(Vec::new())
-                            } else {
-                                Ok(vec![LlmEvent::ReasoningDelta {
+                                return Ok(Vec::new());
+                            }
+                            match thinking_display {
+                                BedrockThinkingDisplay::Raw => Ok(vec![LlmEvent::ReasoningDelta {
                                     text,
                                     kind: ReasoningKind::Text,
-                                }])
+                                }]),
+                                BedrockThinkingDisplay::Summarized => {
+                                    if was_empty_before_push {
+                                        Ok(vec![LlmEvent::ReasoningDelta {
+                                            text,
+                                            kind: ReasoningKind::Text,
+                                        }])
+                                    } else {
+                                        Ok(Vec::new())
+                                    }
+                                }
+                                BedrockThinkingDisplay::Hidden => Ok(Vec::new()),
                             }
                         }
                         ReasoningContentBlockDelta::Signature(sig) => {
