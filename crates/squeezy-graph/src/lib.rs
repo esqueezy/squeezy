@@ -10,6 +10,7 @@ pub mod cross_file;
 mod languages;
 mod references;
 mod resolution;
+pub mod resolver_cache;
 
 use serde::{Deserialize, Serialize};
 use squeezy_core::{
