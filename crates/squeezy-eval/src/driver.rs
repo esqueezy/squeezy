@@ -1795,9 +1795,34 @@ impl Driver {
                     completed = true;
                     break;
                 }
-                AgentEvent::Cancelled { turn_id } => {
+                AgentEvent::Cancelled {
+                    turn_id,
+                    cost,
+                    metrics: _,
+                } => {
                     let turn_str = format!("{turn_id:?}");
                     frame.elapsed_ms = turn_start.elapsed().as_millis() as u64;
+                    // Mirror the `Completed` arm's accounting on the
+                    // cancel path. A mid-stream cancel still bills for
+                    // whatever input the provider already saw and
+                    // whatever output it already streamed back; reporting
+                    // those as zero would silently under-count the run's
+                    // `totals` in `run.json`. The cost broker on the
+                    // agent side seeds `cost.estimated_usd_micros` from
+                    // the pricing registry when the provider does not
+                    // emit a usage payload, so we re-apply the same
+                    // fallback here in case the cancel surfaced through a
+                    // path that left the field unfilled.
+                    frame.input_tokens = cost.input_tokens.unwrap_or(0);
+                    frame.output_tokens = cost.output_tokens.unwrap_or(0);
+                    let cost_micro = cost.estimated_usd_micros.unwrap_or_else(|| {
+                        squeezy_llm::estimate_cost(self.provider_name, &self.model, &cost)
+                            .unwrap_or(0)
+                    });
+                    frame.cost_micro_usd = cost_micro;
+                    frame.cost_display = crate::frames::format_cost_micro_usd(cost_micro);
+                    *self.total_input_tokens.lock().await += frame.input_tokens;
+                    *self.total_cost_micro_usd.lock().await += cost_micro;
                     frame.finish = FrameFinish::Cancelled;
                     self.capture
                         .record(Some(turn_str), EvalEventKind::TurnCancelled)?;
