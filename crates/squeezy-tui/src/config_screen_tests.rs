@@ -1005,6 +1005,22 @@ fn sidebar_shows_more_below_marker_when_clipped() {
     );
 }
 
+#[test]
+fn field_pane_keeps_active_row_visible_when_clipped() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    state.field_index = state.row_count() - 2;
+    let active_label = state.current_field().label;
+    let rendered = render_screen_to_text(&state, 120, 14);
+    assert!(
+        rendered.contains(&format!("› {active_label}")),
+        "short field pane should scroll to the active row, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("▲"),
+        "scrolled field pane should show rows hidden above, got:\n{rendered}"
+    );
+}
+
 #[tokio::test]
 async fn tab_from_default_user_scope_advances_to_repo() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);

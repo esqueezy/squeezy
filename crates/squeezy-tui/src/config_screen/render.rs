@@ -815,12 +815,29 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
     // When an editor is open, focus the pane on just the active row + the
     // editor block, so the editor is always visible in small viewports.
     let editing = state.editor.is_some() || state.secret_entry.is_some();
-    let rows: Vec<usize> = if editing {
-        vec![state.field_index]
+    let (rows, hidden_above, hidden_below) = if editing {
+        (vec![state.field_index], 0, 0)
     } else {
-        (0..total_rows).collect()
+        let detail_rows = if state.on_synthetic_api_key_row() {
+            2usize
+        } else {
+            3usize
+        };
+        let row_area = (area.height as usize).saturating_sub(2 + detail_rows);
+        let (start, end) = field_row_window(total_rows, state.field_index, row_area);
+        (
+            (start..end).collect(),
+            start,
+            total_rows.saturating_sub(end),
+        )
     };
 
+    if hidden_above > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ▲ {hidden_above} more above"),
+            Style::default().fg(QUIET),
+        )));
+    }
     for row in rows {
         let active = row == state.field_index;
         let prefix = if active { "› " } else { "  " };
@@ -909,6 +926,12 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
             }
         }
     }
+    if hidden_below > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ▼ {hidden_below} more below"),
+            Style::default().fg(QUIET),
+        )));
+    }
 
     lines.push(Line::raw(""));
     if state.on_synthetic_api_key_row() {
@@ -953,6 +976,48 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
     }
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn field_row_window(total: usize, cursor: usize, available_rows: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    if total <= available_rows {
+        return (0, total);
+    }
+
+    let cursor = cursor.min(total - 1);
+    if available_rows <= 1 {
+        return (cursor, cursor + 1);
+    }
+    if available_rows == 2 {
+        let start = if cursor == 0 { 0 } else { cursor };
+        return (start, start + 1);
+    }
+
+    let mut row_slots = available_rows.saturating_sub(1).max(1);
+    let mut start = scroll_start_for_cursor(total, cursor, row_slots);
+    loop {
+        let marker_rows = usize::from(start > 0) + usize::from(start + row_slots < total);
+        let next_slots = available_rows.saturating_sub(marker_rows).max(1);
+        let next_start = scroll_start_for_cursor(total, cursor, next_slots);
+        if next_slots == row_slots && next_start == start {
+            break;
+        }
+        row_slots = next_slots;
+        start = next_start;
+    }
+    (start, (start + row_slots).min(total))
+}
+
+fn scroll_start_for_cursor(total: usize, cursor: usize, visible_rows: usize) -> usize {
+    if total <= visible_rows {
+        0
+    } else if cursor + 1 > visible_rows {
+        (cursor + 1 - visible_rows).min(total - visible_rows)
+    } else {
+        0
+    }
 }
 
 fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
