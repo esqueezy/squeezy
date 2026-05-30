@@ -132,6 +132,14 @@ pub struct SqueezyOverlay {
     /// reasoning entry can still be the Ctrl+O target.
     #[serde(default)]
     pub show_reasoning_usage: Option<bool>,
+    /// Override `AppConfig.checkpoints_enabled`. Mirrors the
+    /// `[tools].checkpoints_enabled` settings key and the
+    /// `SQUEEZY_CHECKPOINTS_ENABLED` env var. Without this overlay,
+    /// scenarios that need checkpoint tracking (e.g. the git-vcs
+    /// `/diff` and `/undo` probes) would have to rely on the env var
+    /// being set in the operator's shell.
+    #[serde(default)]
+    pub checkpoints_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

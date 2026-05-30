@@ -517,6 +517,9 @@ fn apply_overlay(
     if let Some(show) = overlay.show_reasoning_usage {
         config.tui.show_reasoning_usage = show;
     }
+    if let Some(enabled) = overlay.checkpoints_enabled {
+        config.checkpoints_enabled = enabled;
+    }
     Ok(())
 }
 
