@@ -4062,6 +4062,9 @@ async fn spill_envelope_includes_recovery_hint_and_on_disk_path() {
     assert_eq!(content["recovery_args"]["handle"], handle);
 
     // on_disk_path must point at the spilled file under the workspace.
+    // Both sides are canonicalized so Windows' `\\?\` verbatim-UNC
+    // prefix (returned by `Path::canonicalize`) doesn't trip the
+    // equality check against the tool's plain-form path.
     let on_disk_path = content["on_disk_path"]
         .as_str()
         .expect("on_disk_path string");
@@ -4071,9 +4074,11 @@ async fn spill_envelope_includes_recovery_hint_and_on_disk_path() {
         .join(".squeezy")
         .join("tool_outputs")
         .join(format!("{handle}.json"));
+    let actual_path = PathBuf::from(on_disk_path)
+        .canonicalize()
+        .expect("on_disk_path canonicalizes");
     assert_eq!(
-        PathBuf::from(on_disk_path),
-        expected_path,
+        actual_path, expected_path,
         "on_disk_path must match the file on disk"
     );
     assert!(
