@@ -5485,7 +5485,7 @@ fn transcript_lines_for_render(
 
 fn streaming_reasoning_lines(text: &str) -> Vec<Line<'static>> {
     let style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
-    let mut lines = vec![Line::from(Span::styled("▾ thinking…".to_string(), style))];
+    let mut lines = vec![Line::from(Span::styled("▾ reasoning…".to_string(), style))];
     for raw in text.lines() {
         lines.push(Line::from(Span::styled(format!("▏ {}", raw), style)));
     }
@@ -6615,8 +6615,9 @@ fn reasoning_block_lines_with_extras(
         if extras > 0 {
             suffix.push_str(&format!(" · +{extras} more"));
         }
+        let summary_sep = if summary.is_empty() { "" } else { " · " };
         lines.push(Line::from(Span::styled(
-            format!("{marker}▸ reasoning: {summary}{suffix}"),
+            format!("{marker}▸ reasoning{summary_sep}{summary}{suffix}"),
             style,
         )));
     } else {
