@@ -224,6 +224,14 @@ that preset. You still need the matching API-key env var exported
 (`OPENAI_API_KEY`, `PORTKEY_API_KEY`, etc.) — the scenario references
 the provider by name only.
 
+Scenarios that exercise the `/diff` and `/undo` git-and-vcs surfaces
+need Squeezy's checkpoint tracking enabled. Either set
+`[squeezy] checkpoints_enabled = true` in the scenario overlay (the
+recommended path — keeps the scenario self-contained) or export
+`SQUEEZY_CHECKPOINTS_ENABLED=1` in the shell before running. Without
+one of those, edits do not produce checkpoint metadata and `/undo`
+becomes a no-op.
+
 ### Steps: prompts and actions
 
 `steps` is an ordered array. Two kinds: `prompt` and `action`.
