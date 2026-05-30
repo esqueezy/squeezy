@@ -10058,8 +10058,25 @@ pub(crate) fn format_error_status(error: &SqueezyError) -> String {
         SqueezyError::ProviderNotConfigured(_) => {
             format!("{error}; configure provider credentials or pick another provider")
         }
-        SqueezyError::ProviderRequest(_) | SqueezyError::ProviderStream(_) => {
-            format!("{error}; retry or check provider/network status")
+        SqueezyError::ProviderRequest(message) | SqueezyError::ProviderStream(message) => {
+            // The provider layer humanises Anthropic 4xx envelopes and
+            // tags non-transient ones with [`NON_RETRYABLE_MARKER`] so
+            // the status line and turn-failed banner can suppress the
+            // "retry or check provider/network status" suffix on
+            // genuinely terminal errors (400 invalid_request, 401, 403,
+            // 404). 5xx, 429, and unknown shapes keep the retry hint.
+            // See `crates/squeezy-llm/src/anthropic_error.rs`.
+            let (non_retryable, stripped) =
+                squeezy_llm::anthropic_error::strip_non_retryable_marker(message);
+            let prefix = match error {
+                SqueezyError::ProviderRequest(_) => "provider request failed",
+                _ => "provider stream failed",
+            };
+            if non_retryable {
+                format!("{prefix}: {stripped}")
+            } else {
+                format!("{prefix}: {stripped}; retry or check provider/network status")
+            }
         }
         SqueezyError::Permission(_) => {
             format!("{error}; approve, adjust policy, or change request")

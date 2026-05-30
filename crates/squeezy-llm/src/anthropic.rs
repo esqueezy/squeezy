@@ -477,19 +477,22 @@ fn anthropic_stream_attempt(
         let response = if status == StatusCode::OK {
             response
         } else {
-            let message = response
+            let body = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "failed to read error response".to_string());
-            let formatted = format!("{status}: {message}");
             // Pre-stream HTTP error path. Anthropic surfaces overflow as a
             // 400 with `prompt is too long: …` in the body; emit the
             // classifier signal additively before propagating the error
             // so the agent can react instead of looping into the same call.
+            // The overflow classifier still inspects the raw body — its
+            // pattern set keys on the verbatim provider prose, not on the
+            // humanised TUI line.
+            let raw_for_classifier = format!("{status}: {body}");
             if let Some(signal) = classify_terminal(
                 ANTHROPIC_PROVIDER_NAME,
                 None,
-                Some(&formatted),
+                Some(&raw_for_classifier),
                 None,
                 true,
             ) {
@@ -498,6 +501,13 @@ fn anthropic_stream_attempt(
                     signal,
                 };
             }
+            // Humanise the JSON envelope before propagating: the status
+            // line and turn-failed banner used to print the raw payload
+            // and a bogus "retry" hint on 400s. The normaliser extracts
+            // `error.message` + `request_id`, encodes a retry verdict
+            // via [`NON_RETRYABLE_MARKER`], and falls back to the raw
+            // shape when the body is not a recognisable envelope.
+            let formatted = crate::anthropic_error::format_for_provider_error(status, &body);
             Err(SqueezyError::ProviderRequest(formatted))?;
             unreachable!("provider error returned above");
         };
