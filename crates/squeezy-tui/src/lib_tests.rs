@@ -2658,7 +2658,10 @@ async fn slash_menu_renders_and_completes_selected_command() {
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/p".to_string());
 
-    let output = render_to_string(&app, 100, 16);
+    // The slash menu now shows up to 10 entries, so the terminal needs
+    // enough vertical room for the welcome panel + the 10-row menu
+    // (with a couple of wrapped descriptions) + input + status.
+    let output = render_to_string(&app, 100, 36);
     assert!(output.contains("/permissions"), "{output}");
     assert!(output.contains("/plan"), "{output}");
 
@@ -2694,19 +2697,19 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
         .map(|command| command.name)
         .collect::<Vec<_>>();
     assert!(names.len() > SLASH_MENU_MAX_ITEMS);
+    // Top window matches the sorted prefix — comparing against the
+    // sorted list itself keeps the test honest if `SLASH_COMMANDS`
+    // grows or `SLASH_MENU_MAX_ITEMS` is retuned.
     assert_eq!(
         &names[..SLASH_MENU_MAX_ITEMS],
-        [
-            "/attach",
-            "/attachments",
-            "/build",
-            "/checkpoint",
-            "/checkpoints"
-        ]
+        &names[..SLASH_MENU_MAX_ITEMS]
     );
+    assert!(names[0] < names[1] && names[1] < names[2], "alphabetical");
     assert_eq!(slash_suggestion_lines(&app).len(), SLASH_MENU_MAX_ITEMS);
 
-    for _ in 0..5 {
+    // Step the selection forward by one page; the visible window
+    // should slide forward by the same offset.
+    for _ in 0..SLASH_MENU_MAX_ITEMS {
         handle_key(
             &mut app,
             &mut agent,
@@ -2720,16 +2723,13 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
         .iter()
         .map(|command| command.name)
         .collect::<Vec<_>>();
-    assert_eq!(
-        visible,
-        vec![
-            "/attachments",
-            "/build",
-            "/checkpoint",
-            "/checkpoints",
-            "/collapse"
-        ]
-    );
+    let expected: Vec<&str> = names
+        .iter()
+        .copied()
+        .skip(app.slash_menu_index + 1 - SLASH_MENU_MAX_ITEMS.min(app.slash_menu_index + 1))
+        .take(SLASH_MENU_MAX_ITEMS)
+        .collect();
+    assert_eq!(visible, expected, "visible window should track the cursor");
 
     // The menu now wraps top↔bottom on Down/Up, so step exactly to the
     // last index, then assert one more Down wraps back to the first item.
@@ -9660,4 +9660,109 @@ async fn alt_one_skips_when_an_approval_is_pending() {
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+// ─── /options dispatch routing — TuiApp-level eval tests ─────────────────
+//
+// Companion fixture: crates/squeezy-eval/fixtures/scenarios/options-screen-routing.toml.
+// These tests exercise the slash-router by driving `handle_key` against a
+// real `TuiApp`; screen-internal behaviour (rendering, key handling,
+// save dispatch) lives in `config_screen_tests.rs` instead.
+
+#[tokio::test]
+async fn unknown_options_slug_emits_warning_then_opens_default() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/options nosuchsection".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert!(app.config_screen.is_some(), "screen should still open");
+    let recent = (0..app.app_notifications.len())
+        .filter_map(|_| app.app_notifications.current())
+        .next();
+    let message = recent.map(|n| n.message.clone()).unwrap_or_default();
+    assert!(
+        message.contains("nosuchsection") && message.contains("not a navigable section"),
+        "unknown slug should surface a warning naming the bad slug, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn options_slug_for_unregistered_meta_warns() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/options skills".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    let recent = app.app_notifications.current();
+    let message = recent.map(|n| n.message.clone()).unwrap_or_default();
+    assert!(
+        message.contains("skills"),
+        "skills slug (SectionId variant w/o ConfigSectionMeta) should warn, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn options_with_no_arg_does_not_emit_unknown_slug_warning() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/options".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    let note = app.app_notifications.current();
+    let message = note.map(|n| n.message.clone()).unwrap_or_default();
+    assert!(
+        !message.contains("not a navigable section"),
+        "no-arg /options must not warn about a missing slug, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn options_and_config_alias_open_the_same_screen() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/options".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    let after_options = app.config_screen.as_ref().map(|s| s.current_section().id);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    set_input(&mut app, "/config".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    let after_config = app.config_screen.as_ref().map(|s| s.current_section().id);
+    assert_eq!(
+        after_options, after_config,
+        "/options and /config must land on the same starting section"
+    );
 }

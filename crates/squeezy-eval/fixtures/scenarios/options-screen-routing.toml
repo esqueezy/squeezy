@@ -1,0 +1,78 @@
+id = "options-screen-routing"
+title = "Offline /options slash routing"
+description = """
+Offline fixture that exercises the slash router for `/options` and its
+aliases. The screen itself is a TUI overlay (`DispatchOutcome::TuiOnly`),
+so this scenario asserts that every `/options …` form dispatches without
+falling through to the model, and that the legacy `/config` alias still
+routes the same way.
+
+Companion rendering-level coverage lives in
+`crates/squeezy-tui/src/config_screen_eval_tests.rs` — that file drives
+the screen state machine directly and asserts the UI invariants
+catalogued by the /options UX audit.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = false
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/options"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/options permissions"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/options models"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/options reset"
+
+# Legacy alias must keep routing into the same TUI overlay.
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/config"
+
+# Unknown / non-registered section slugs (Skills, Tools, McpServers,
+# ShellSandbox, PermissionRules, Providers, Context) used to fall
+# through silently to the default Models section. The screen now emits
+# a warning on the unknown slug. The dispatch path still routes to
+# `Config`, so the slash command remains a successful TUI-only outcome
+# here — the warning fires inside the TUI overlay.
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/options skills"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/options nosuchsection"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — no model turn expected in this scenario)"
+
+[triage]
+enabled = false

@@ -39,8 +39,10 @@ fn tab_cycles_through_three_scopes() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
-    assert_eq!(state.scope, ConfigScope::Local);
-    for expected in [ConfigScope::User, ConfigScope::Repo, ConfigScope::Local] {
+    // Default scope is User (leftmost tab) — Tab walks
+    // User → Repo → Local → User and BackTab reverses.
+    assert_eq!(state.scope, ConfigScope::User);
+    for expected in [ConfigScope::Repo, ConfigScope::Local, ConfigScope::User] {
         handle_key(
             &mut state,
             &mut agent,
@@ -49,14 +51,14 @@ fn tab_cycles_through_three_scopes() {
         );
         assert_eq!(state.scope, expected);
     }
-    // BackTab reverses.
+    // BackTab reverses: User → Local.
     handle_key(
         &mut state,
         &mut agent,
         &mut q,
         KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
     );
-    assert_eq!(state.scope, ConfigScope::Repo);
+    assert_eq!(state.scope, ConfigScope::Local);
 }
 
 #[test]
@@ -562,4 +564,618 @@ fn path_editor_commits_pathbuf() {
         other => panic!("expected Path commit, got {:?}", other),
     };
     assert_eq!(p, std::path::PathBuf::from("/tmp/c"));
+}
+
+// ─── /options UX/UI eval fixture ──────────────────────────────────────────
+//
+// Companion to `crates/squeezy-eval/fixtures/scenarios/options-screen-routing.toml`
+// (slash-router level) and to the `unknown_options_slug_…` tests in
+// `lib_tests.rs` (TuiApp dispatch). The tests in this block drive
+// `ConfigScreenState` directly to cover the rendering, key handling,
+// and runtime-efficacy invariants identified by the /options UX audit.
+
+fn render_screen_to_text(state: &ConfigScreenState, width: u16, height: u16) -> String {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let area = Rect::new(0, 0, width, height);
+            render(frame, area, state);
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let mut output = String::new();
+    for y in 0..height {
+        for x in 0..width {
+            output.push_str(buffer[(x, y)].symbol());
+        }
+        output.push('\n');
+    }
+    output
+}
+
+#[test]
+fn default_scope_is_user() {
+    let state = ConfigScreenState::new(AppConfig::default(), None);
+    assert_eq!(
+        state.scope,
+        ConfigScope::User,
+        "first-open scope should be User (leftmost tab)"
+    );
+}
+
+#[tokio::test]
+async fn shift_x_arms_discard_confirmation_then_n_cancels() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.scope = ConfigScope::User;
+    state.field_index = 4; // show_reasoning_usage (Bool, no env_override)
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    assert!(
+        !state.undo_stack.is_empty(),
+        "Space should have queued a write"
+    );
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+    );
+    assert!(
+        state.discard_confirm,
+        "Shift+X should arm the discard-confirm overlay"
+    );
+    assert!(
+        !state.undo_stack.is_empty(),
+        "discard must NOT fire until y is pressed"
+    );
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+    );
+    assert!(!state.discard_confirm, "'n' should clear the confirmation");
+    assert!(
+        !state.undo_stack.is_empty(),
+        "cancelled discard must keep the undo stack intact"
+    );
+}
+
+#[tokio::test]
+async fn shift_x_on_empty_undo_stack_short_circuits_without_confirm() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    assert!(state.undo_stack.is_empty());
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+    );
+    assert!(
+        !state.discard_confirm,
+        "no undo entries → no confirmation overlay"
+    );
+    let note = q.current().expect("info note");
+    assert!(
+        note.message.contains("Nothing to discard"),
+        "empty-stack path should explain why, got: {}",
+        note.message
+    );
+}
+
+#[tokio::test]
+async fn discard_confirm_y_wipes_session_writes() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.scope = ConfigScope::User;
+    state.field_index = 4;
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    assert!(!state.undo_stack.is_empty());
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+    );
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+    );
+    assert!(!state.discard_confirm);
+    assert!(
+        state.undo_stack.is_empty(),
+        "confirmed discard should clear the undo stack"
+    );
+}
+
+#[test]
+fn footer_documents_ctrl_r_ctrl_d_and_shift_x() {
+    let state = ConfigScreenState::new(AppConfig::default(), None);
+    let rendered = render_screen_to_text(&state, 120, 30);
+    assert!(
+        rendered.contains("Ctrl+R") && rendered.contains("reset"),
+        "footer should advertise Ctrl+R reset-to-default"
+    );
+    assert!(
+        rendered.contains("Ctrl+D") && rendered.contains("clear"),
+        "footer should advertise Ctrl+D clear-override"
+    );
+    assert!(
+        rendered.contains("Shift+X"),
+        "discard binding should be labelled Shift+X, not bare X"
+    );
+}
+
+#[test]
+fn footer_documents_shift_tab_for_reverse_scope_cycle() {
+    let state = ConfigScreenState::new(AppConfig::default(), None);
+    let rendered = render_screen_to_text(&state, 120, 30);
+    assert!(
+        rendered.contains("Shift+Tab"),
+        "footer should mention Shift+Tab as the reverse-scope chord"
+    );
+}
+
+#[test]
+fn env_source_badge_no_longer_uses_error_red() {
+    use crate::render::palette::ERROR_RED;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    // Use SQUEEZY_SESSION_MODE (Modes section) so this test doesn't race
+    // with `enter_on_env_shadowed_field_emits_warning_instead_of_opening_editor`,
+    // which also flips SQUEEZY_TELEMETRY around the same time when the
+    // test runner parallelises.
+    // SAFETY: tests in this module run single-threaded.
+    unsafe { std::env::set_var("SQUEEZY_SESSION_MODE", "plan") };
+    let state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Modes));
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let area = Rect::new(0, 0, 120, 30);
+            render(frame, area, &state);
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let mut found_env_badge = false;
+    let mut env_badge_colour = None;
+    for y in 0..30u16 {
+        let mut row = String::new();
+        for x in 0..120u16 {
+            row.push_str(buffer[(x, y)].symbol());
+        }
+        if let Some(start) = row.find("[env]") {
+            found_env_badge = true;
+            env_badge_colour = Some(buffer[(start as u16 + 1, y)].fg);
+            break;
+        }
+    }
+    unsafe { std::env::remove_var("SQUEEZY_SESSION_MODE") };
+    assert!(
+        found_env_badge,
+        "env-shadowed field should render an [env] badge"
+    );
+    assert_ne!(
+        env_badge_colour,
+        Some(ERROR_RED),
+        "[env] badge must not be coloured as an error"
+    );
+}
+
+#[test]
+fn api_key_row_reports_env_var_presence() {
+    // Construct an OpenAI provider explicitly so the api_key_env name
+    // is deterministic — `AppConfig::default()` reads the user's real
+    // `~/.squeezy/settings.toml` overlay and can yield a different
+    // provider depending on whose machine runs the test.
+    let custom_env = "SQUEEZY_OPTIONS_EVAL_OPENAI_KEY";
+    // SAFETY: tests in this module run single-threaded.
+    unsafe { std::env::set_var(custom_env, "sk-test-from-env-XYZ") };
+    let mut cfg = AppConfig::default();
+    cfg.provider = squeezy_core::ProviderConfig::OpenAi(squeezy_core::OpenAiConfig {
+        api_key_env: custom_env.to_string(),
+        api_key: None,
+        base_url: squeezy_core::DEFAULT_OPENAI_BASE_URL.to_string(),
+        transport: Default::default(),
+    });
+    let mut state = ConfigScreenState::new(cfg, Some(SectionId::Models));
+    state.field_index = 2; // synthetic API-key row
+    let rendered = render_screen_to_text(&state, 120, 30);
+    unsafe { std::env::remove_var(custom_env) };
+    assert!(
+        rendered.contains("[env · openai]") && rendered.contains("from environment"),
+        "API-key row should advertise env-provided credentials, got:\n{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn model_picker_provider_swap_writes_once_not_twice() {
+    // SAFETY: tests in this module run single-threaded.
+    unsafe {
+        std::env::remove_var("SQUEEZY_MODEL");
+        std::env::remove_var("SQUEEZY_PROVIDER");
+    }
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.field_index = 1;
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    let picker = state.picker.as_mut().expect("picker open");
+    picker.all_providers = true;
+    for ch in ['c', 'l', 'a', 'u', 'd'] {
+        handle_key(
+            &mut state,
+            &mut agent,
+            &mut q,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+        );
+    }
+    let before_writes = state.undo_stack.len();
+    let provider_field = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SectionId::Models)
+        .and_then(|s| {
+            s.fields
+                .iter()
+                .find(|f| f.toml_path == ["model", "provider"])
+        })
+        .unwrap();
+    let provider_before = match (provider_field.get)(&state.effective) {
+        FieldValue::Enum(s) => s,
+        _ => panic!("provider not Enum"),
+    };
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    let provider_after = match (provider_field.get)(&state.effective) {
+        FieldValue::Enum(s) => s,
+        _ => panic!("provider not Enum"),
+    };
+    if provider_before != provider_after {
+        let writes_added = state.undo_stack.len() - before_writes;
+        assert!(
+            writes_added <= 1,
+            "provider+model swap should issue at most one save_field write, got {writes_added}"
+        );
+    }
+}
+
+#[test]
+fn search_overlay_clips_with_scroll_indicators() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    let mut matches = Vec::new();
+    for (sidx, section) in CONFIG_SECTIONS.iter().enumerate() {
+        for (fidx, _field) in section.fields.iter().enumerate() {
+            matches.push((sidx, fidx, 0));
+        }
+    }
+    let total = matches.len();
+    assert!(
+        total > 20,
+        "this fixture needs CONFIG_SECTIONS to have enough fields to overflow"
+    );
+    state.search = Some(SearchOverlayState {
+        query: String::new(),
+        cursor: total - 1,
+        matches,
+    });
+    let rendered = render_screen_to_text(&state, 120, 18);
+    assert!(
+        rendered.contains("▲"),
+        "scrolled-down overlay must show ▲ marker for hidden rows above"
+    );
+}
+
+#[test]
+fn model_picker_clips_with_scroll_indicators() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
+    state.picker = Some(ModelPickerState {
+        filter: String::new(),
+        cursor: 0,
+        all_providers: true,
+        current_provider: "openai",
+    });
+    let rendered = render_screen_to_text(&state, 120, 14);
+    assert!(
+        rendered.contains("▼"),
+        "tight pane should show ▼ marker for entries below the window"
+    );
+}
+
+#[tokio::test]
+async fn ctrl_s_message_includes_undo_hint() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+    );
+    let note = q.current().expect("ctrl+s should push a note");
+    assert!(
+        note.message.contains("Ctrl+Z"),
+        "ctrl+s message should hint at the undo path, got: {}",
+        note.message
+    );
+}
+
+#[tokio::test]
+async fn picker_open_path_locates_provider_field_by_toml_path() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.field_index = 1;
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    let picker = state.picker.as_ref().expect("picker should be open");
+    let provider_field = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SectionId::Models)
+        .and_then(|s| {
+            s.fields
+                .iter()
+                .find(|f| f.toml_path == ["model", "provider"])
+        })
+        .expect("Models section must expose [model].provider");
+    let resolved = match (provider_field.get)(&state.effective) {
+        FieldValue::Enum(s) => s,
+        other => panic!("provider field not Enum: {other:?}"),
+    };
+    assert_eq!(
+        picker.current_provider, resolved,
+        "picker should derive current_provider from the toml_path lookup, not hard-coded index"
+    );
+}
+
+#[tokio::test]
+async fn discard_confirm_overlay_renders_with_file_list() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.scope = ConfigScope::User;
+    state.field_index = 4;
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+    );
+    assert!(state.discard_confirm);
+    let rendered = render_screen_to_text(&state, 120, 30);
+    assert!(
+        rendered.contains("Discard all session writes"),
+        "overlay should announce itself, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("y") && rendered.contains("n"),
+        "overlay should list y/n bindings, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn sidebar_shows_more_below_marker_when_clipped() {
+    let state = ConfigScreenState::new(AppConfig::default(), None);
+    let rendered = render_screen_to_text(&state, 80, 10);
+    assert!(
+        rendered.contains("▼"),
+        "short pane should show ▼ marker on the sidebar to flag clipping, got:\n{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn tab_from_default_user_scope_advances_to_repo() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    assert_eq!(state.scope, ConfigScope::User);
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+    );
+    assert_eq!(
+        state.scope,
+        ConfigScope::Repo,
+        "Tab from the default User scope should advance to Repo"
+    );
+}
+
+// ─── Runtime efficacy probes ───────────────────────────────────────────────
+//
+// "Does the option actually take effect after I change it." Each test
+// exercises a field, then reads the agent's effective config (Immediate
+// tier) or queued swap (NextPrompt) and asserts the new value
+// propagated. Restart-tier fields only fire after a fresh process boot
+// and are out of scope for unit tests.
+
+#[tokio::test]
+async fn immediate_tier_bool_save_propagates_to_agent() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.scope = ConfigScope::User;
+    state.field_index = 4;
+    let before = agent.config_snapshot().tui.show_reasoning_usage;
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    let after = agent.config_snapshot().tui.show_reasoning_usage;
+    assert_ne!(
+        before, after,
+        "Immediate-tier Bool save must hot-swap into the agent's effective config"
+    );
+}
+
+#[tokio::test]
+async fn immediate_tier_enum_save_propagates_to_agent() {
+    use squeezy_core::ResponseVerbosity;
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.scope = ConfigScope::User;
+    state.field_index = 0;
+    state.effective.tui.response_verbosity = ResponseVerbosity::Normal;
+    agent.replace_config(state.effective.clone());
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    let observed = agent.config_snapshot().tui.response_verbosity;
+    assert_ne!(
+        observed,
+        ResponseVerbosity::Normal,
+        "Space-cycle on response_verbosity must change the agent's live config"
+    );
+}
+
+#[tokio::test]
+async fn immediate_tier_permission_save_propagates_to_agent() {
+    use squeezy_core::PermissionMode;
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Permissions));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.scope = ConfigScope::User;
+    state.field_index = 0;
+    state.effective.permissions.read = PermissionMode::Allow;
+    agent.replace_config(state.effective.clone());
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    assert_ne!(
+        agent.config_snapshot().permissions.read,
+        PermissionMode::Allow,
+        "permission saves must hot-swap so the next tool call sees the new mode"
+    );
+}
+
+#[tokio::test]
+async fn next_prompt_tier_save_arms_pending_swap() {
+    use squeezy_core::config_schema::ApplyTier;
+    // SAFETY: tests in this module run single-threaded.
+    unsafe { std::env::remove_var("SQUEEZY_SUBAGENT_MAX_TOOL_CALLS_PER_CALL") };
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Subagents));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.scope = ConfigScope::User;
+    let section = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SectionId::Subagents)
+        .unwrap();
+    let (idx, max_calls_field) = section
+        .fields
+        .iter()
+        .enumerate()
+        .find(|(_, f)| f.toml_path == ["subagents", "max_tool_calls_per_call"])
+        .expect("field exists");
+    state.field_index = idx;
+    assert!(
+        matches!(max_calls_field.tier, ApplyTier::NextPrompt),
+        "test fixture relies on this being NextPrompt"
+    );
+    let before = agent.config_snapshot().subagents.max_tool_calls_per_call;
+    let new_value = FieldValue::Integer((before as i64) + 1);
+    (max_calls_field.set)(&mut state.effective, new_value.clone()).expect("set ok");
+    save_field(&mut state, &mut agent, &mut q, max_calls_field, new_value);
+    let swap = agent
+        .pending_config_swap()
+        .expect("NextPrompt save must arm a pending swap");
+    assert_eq!(
+        swap.config.subagents.max_tool_calls_per_call,
+        before + 1,
+        "queued swap must carry the new value"
+    );
+    assert_eq!(
+        agent.config_snapshot().subagents.max_tool_calls_per_call,
+        before,
+        "NextPrompt saves must NOT mutate the live agent.config until drain_pending_swap fires"
+    );
+}
+
+#[tokio::test]
+async fn next_prompt_swap_applies_on_drain() {
+    // SAFETY: tests in this module run single-threaded.
+    unsafe { std::env::remove_var("SQUEEZY_SUBAGENT_MAX_TOOL_CALLS_PER_CALL") };
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Subagents));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.scope = ConfigScope::User;
+    let section = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SectionId::Subagents)
+        .unwrap();
+    let (idx, field) = section
+        .fields
+        .iter()
+        .enumerate()
+        .find(|(_, f)| f.toml_path == ["subagents", "max_tool_calls_per_call"])
+        .unwrap();
+    state.field_index = idx;
+    let before = agent.config_snapshot().subagents.max_tool_calls_per_call;
+    let new_value = FieldValue::Integer((before as i64) + 5);
+    (field.set)(&mut state.effective, new_value.clone()).expect("set ok");
+    save_field(&mut state, &mut agent, &mut q, field, new_value);
+    let drained = agent.drain_pending_swap();
+    assert!(
+        drained.is_some(),
+        "drain_pending_swap should yield the armed swap"
+    );
+    assert_eq!(
+        agent.config_snapshot().subagents.max_tool_calls_per_call,
+        before + 5,
+        "drained swap must apply the new value to the live config"
+    );
+    assert!(
+        agent.pending_config_swap().is_none(),
+        "drain should consume the queued swap"
+    );
 }

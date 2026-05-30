@@ -12,9 +12,7 @@ use super::{
     ConfigScope, ConfigScreenState, FieldEditor, ModelPickerState, SearchOverlayState,
     SecretEntryState, inheritance_label, picker_matches, provider_api_key_env, tier_path,
 };
-use crate::render::palette::{
-    AMBER, ERROR_RED, GOLD, MODE_PURPLE, QUIET, SEPARATOR_BLUE, SUCCESS_GREEN,
-};
+use crate::render::palette::{AMBER, GOLD, MODE_PURPLE, QUIET, SEPARATOR_BLUE, SUCCESS_GREEN};
 
 /// Pretty-print an absolute config path: replace `$HOME` with `~` so the
 /// tab subtitle stays compact, while still surfacing the per-machine
@@ -37,7 +35,10 @@ pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
         .constraints([
             Constraint::Length(3), // tab strip
             Constraint::Min(0),    // body
-            Constraint::Length(2), // footer
+            // Two help rows (primary + secondary chords) + the top
+            // border = 3 lines. The single-row footer used to drop
+            // Ctrl+R/Ctrl+D/Shift+X off the screen entirely.
+            Constraint::Length(3), // footer
         ])
         .split(area);
 
@@ -145,6 +146,8 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
     );
     if state.reset_confirm.is_some() {
         render_reset_confirm(frame, chunks[2], state);
+    } else if state.discard_confirm {
+        render_discard_confirm(frame, chunks[2], state);
     } else if let Some(entry) = &state.secret_entry {
         render_secret_entry(frame, chunks[2], entry);
     } else if let Some(picker) = &state.picker {
@@ -321,6 +324,54 @@ fn render_reset_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
+fn render_discard_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![Span::styled(
+        "Discard all session writes",
+        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::raw(""));
+    let count = state.undo_stack.len();
+    let plural = if count == 1 { "" } else { "s" };
+    lines.push(Line::from(vec![
+        Span::raw("  Revert "),
+        Span::styled(
+            format!("{count} write{plural}"),
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" made since the screen opened?"),
+    ]));
+    lines.push(Line::raw(""));
+    // Affected tier files — same baseline list that `discard_all` walks.
+    for (path, _) in &state.baseline {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        lines.push(Line::from(vec![
+            Span::styled("    file  ", Style::default().fg(QUIET)),
+            Span::raw(path.display().to_string()),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  Each tier file is restored to the bytes captured when /options opened.",
+        Style::default().fg(QUIET),
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("y", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
+        Span::styled(" discard   ", Style::default().fg(QUIET)),
+        Span::styled("n", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
+        Span::styled(" cancel   ", Style::default().fg(QUIET)),
+        Span::styled(
+            "Esc",
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" cancel", Style::default().fg(QUIET)),
+    ]));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
 fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntryState) {
     let display: String = if entry.reveal {
         // Explicit Ctrl+T toggle — show the full plaintext for verification.
@@ -399,10 +450,33 @@ fn render_search_overlay(frame: &mut Frame<'_>, area: Rect, search: &SearchOverl
             Style::default().fg(QUIET),
         )));
     } else {
-        for (idx, (sidx, fidx, _score)) in search.matches.iter().enumerate() {
+        // Reserve rows for: 3 above (header + query + blank) and 2 below
+        // (blank + help). Below that ceiling, scroll the match window
+        // around the active cursor so navigating past the visible region
+        // doesn't park the highlight off-screen.
+        let chrome = 5u16;
+        let visible = area.height.saturating_sub(chrome).max(1) as usize;
+        let total = search.matches.len();
+        let cursor = search.cursor.min(total - 1);
+        let start = if total <= visible {
+            0
+        } else if cursor + 1 > visible {
+            (cursor + 1 - visible).min(total - visible)
+        } else {
+            0
+        };
+        let end = (start + visible).min(total);
+        if start > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  ▲ {} more above", start),
+                Style::default().fg(QUIET),
+            )));
+        }
+        for (idx, (sidx, fidx, _score)) in search.matches[start..end].iter().enumerate() {
+            let row_idx = start + idx;
             let section = &CONFIG_SECTIONS[*sidx];
             let field = &section.fields[*fidx];
-            let active = idx == search.cursor.min(search.matches.len() - 1);
+            let active = row_idx == cursor;
             let prefix = if active { "› " } else { "  " };
             let style = if active {
                 Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
@@ -417,6 +491,12 @@ fn render_search_overlay(frame: &mut Frame<'_>, area: Rect, search: &SearchOverl
                 Span::styled(format!("{:<22}", section.label), Style::default().fg(QUIET)),
                 Span::styled(format!("{:<28}", field.label), style),
             ]));
+        }
+        if end < total {
+            lines.push(Line::from(Span::styled(
+                format!("  ▼ {} more below", total - end),
+                Style::default().fg(QUIET),
+            )));
         }
     }
     lines.push(Line::raw(""));
@@ -456,8 +536,30 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerSt
             Style::default().fg(QUIET),
         )));
     } else {
-        for (idx, info) in matches.iter().enumerate() {
-            let active = idx == picker.cursor.min(matches.len() - 1);
+        // Same scrolling treatment as the search overlay — large
+        // registries (the all-providers tab can be 60+ entries) used to
+        // run the cursor straight off the bottom of the pane.
+        let chrome = 5u16;
+        let visible = area.height.saturating_sub(chrome).max(1) as usize;
+        let total = matches.len();
+        let cursor = picker.cursor.min(total - 1);
+        let start = if total <= visible {
+            0
+        } else if cursor + 1 > visible {
+            (cursor + 1 - visible).min(total - visible)
+        } else {
+            0
+        };
+        let end = (start + visible).min(total);
+        if start > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  ▲ {} more above", start),
+                Style::default().fg(QUIET),
+            )));
+        }
+        for (idx, info) in matches[start..end].iter().enumerate() {
+            let row_idx = start + idx;
+            let active = row_idx == cursor;
             let prefix = if active { "› " } else { "  " };
             let style = if active {
                 Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
@@ -493,6 +595,12 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerSt
             }
             lines.push(Line::from(row));
         }
+        if end < total {
+            lines.push(Line::from(Span::styled(
+                format!("  ▼ {} more below", total - end),
+                Style::default().fg(QUIET),
+            )));
+        }
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
@@ -503,7 +611,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerSt
 }
 
 fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
-    let mut lines = Vec::with_capacity(CONFIG_SECTIONS.len());
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(CONFIG_SECTIONS.len());
     for (idx, section) in CONFIG_SECTIONS.iter().enumerate() {
         let active = idx == state.section_index;
         let prefix = if active { "› " } else { "  " };
@@ -523,7 +631,8 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) 
     // The sidebar lists CONFIG_SECTIONS verbatim; on shorter terminals it
     // overflows and items at the bottom (notably Reset) get clipped. Pin
     // the active row inside the visible window by scrolling just enough
-    // to keep it on-screen.
+    // to keep it on-screen, then stamp ▲/▼ markers at the edges so the
+    // user knows there's more above or below.
     let height = area.height as usize;
     let total = lines.len();
     let scroll = if height == 0 || total <= height {
@@ -534,6 +643,22 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) 
             .saturating_sub(height - 1)
             .min(total - height) as u16
     };
+    if scroll > 0
+        && let Some(first) = lines.first_mut()
+    {
+        *first = Line::from(Span::styled(
+            "  ▲ more",
+            Style::default().fg(QUIET).add_modifier(Modifier::DIM),
+        ));
+    }
+    if total > height + scroll as usize
+        && let Some(last) = lines.get_mut(scroll as usize + height.saturating_sub(1))
+    {
+        *last = Line::from(Span::styled(
+            "  ▼ more",
+            Style::default().fg(QUIET).add_modifier(Modifier::DIM),
+        ));
+    }
     frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
 }
 
@@ -613,6 +738,13 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                     };
                 let inline_present =
                     super::provider_inline_api_key(&state.effective.provider).is_some();
+                // The label said "unset" even when the user had exported
+                // the env var in their shell. A key present in $OPENAI_API_KEY
+                // is exactly what the provider client picks up at startup,
+                // so report it as such — the inline TOML write is only one
+                // way to populate the credential.
+                let env_present =
+                    !env_var.is_empty() && std::env::var(&env_var).is_ok_and(|v| !v.is_empty());
                 let label_style = if active {
                     Style::default()
                         .fg(MODE_PURPLE)
@@ -624,6 +756,8 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                     "n/a for this provider".to_string()
                 } else if inline_present {
                     format!("•••• ({env_var})")
+                } else if env_present {
+                    format!("•••• ({env_var} — from environment)")
                 } else {
                     format!("unset ({env_var})")
                 };
@@ -631,6 +765,8 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                     String::new()
                 } else if inline_present {
                     format!("[toml · {}]", provider_label.to_lowercase())
+                } else if env_present {
+                    format!("[env · {}]", provider_label.to_lowercase())
                 } else {
                     format!("[unset · {}]", provider_label.to_lowercase())
                 };
@@ -857,29 +993,42 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, _state: &ConfigScreenState) {
-    let hint = Line::from(vec![
-        Span::styled(" Tab", Style::default().fg(GOLD)),
+    // Two rows of bindings — the original single line dropped Ctrl+R,
+    // Ctrl+D, BackTab, and labelled the discard binding as a bare "X"
+    // even though it requires Shift. Splitting across two lines keeps
+    // the most-used navigation visible on narrow terminals while the
+    // less-discovered chords stay one glance away.
+    let primary = Line::from(vec![
+        Span::styled(" Tab/Shift+Tab", Style::default().fg(GOLD)),
         Span::raw(" scope · "),
         Span::styled("↑/↓", Style::default().fg(GOLD)),
         Span::raw(" field · "),
+        Span::styled("←/→", Style::default().fg(GOLD)),
+        Span::raw(" section · "),
         Span::styled("Enter", Style::default().fg(GOLD)),
         Span::raw(" edit · "),
         Span::styled("Space", Style::default().fg(GOLD)),
         Span::raw(" cycle · "),
         Span::styled("/", Style::default().fg(GOLD)),
         Span::raw(" search · "),
-        Span::styled("Ctrl+Z", Style::default().fg(GOLD)),
-        Span::raw(" undo · "),
-        Span::styled("X", Style::default().fg(GOLD)),
-        Span::raw(" discard · "),
         Span::styled("Esc", Style::default().fg(GOLD)),
         Span::raw(" close "),
+    ]);
+    let secondary = Line::from(vec![
+        Span::styled(" Ctrl+R", Style::default().fg(GOLD)),
+        Span::raw(" reset to default · "),
+        Span::styled("Ctrl+D", Style::default().fg(GOLD)),
+        Span::raw(" clear override · "),
+        Span::styled("Ctrl+Z", Style::default().fg(GOLD)),
+        Span::raw(" undo · "),
+        Span::styled("Shift+X", Style::default().fg(GOLD)),
+        Span::raw(" discard all (with y/n) "),
     ]);
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(QUIET));
     frame.render_widget(
-        Paragraph::new(hint)
+        Paragraph::new(vec![primary, secondary])
             .style(Style::default().fg(Color::White))
             .block(block),
         area,
@@ -892,7 +1041,11 @@ fn source_style(source: FieldSource) -> Style {
         FieldSource::User => Style::default().fg(AMBER),
         FieldSource::Project => Style::default().fg(GOLD),
         FieldSource::Repo => Style::default().fg(SUCCESS_GREEN),
-        FieldSource::Env => Style::default().fg(ERROR_RED),
+        // Env overrides are informational ("this value comes from $SQUEEZY_*"),
+        // not an error. Painting them ERROR_RED used to look like a warning
+        // banner on otherwise-fine rows. MODE_PURPLE matches how the API-key
+        // synthetic row already flags an env-derived secret.
+        FieldSource::Env => Style::default().fg(MODE_PURPLE),
     }
 }
 

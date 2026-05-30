@@ -129,7 +129,12 @@ const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
 const PROMPT_MIN_HEIGHT: u16 = 3;
 const PROMPT_MAX_HEIGHT: u16 = 8;
 const INLINE_VIEWPORT_HEIGHT: u16 = 18;
-const SLASH_MENU_MAX_ITEMS: usize = 5;
+// The slash-command roster grew well past 30 entries, so a 5-row
+// window forced users to scroll for almost any non-top-5 command.
+// 10 fits comfortably in a standard 24-row terminal alongside the
+// prompt + status row and matches the picker height used by /options
+// search and the model picker.
+const SLASH_MENU_MAX_ITEMS: usize = 10;
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 /// Enable basic button-press/release reporting (1000) with SGR
 /// coordinate encoding (1006). Required for the clickable queue
@@ -2044,9 +2049,26 @@ fn expand_prompt_template_or_fallthrough(app: &mut TuiApp, agent: &mut Agent, in
 async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: DispatchCommand) {
     match cmd {
         DispatchCommand::Config { section } => {
-            let id = section
-                .as_deref()
-                .and_then(squeezy_core::config_schema::section_from_slug);
+            let slug = section.as_deref();
+            let id = slug.and_then(squeezy_core::config_schema::section_from_slug);
+            // `/options <slug>` used to silently fall back to the Models
+            // section when the slug was a valid `SectionId` variant that
+            // had no `ConfigSectionMeta` entry (Skills, Tools, Providers,
+            // Context, McpServers, ShellSandbox, PermissionRules) or was
+            // simply unrecognised. Make the fallback explicit so the user
+            // knows their argument was ignored.
+            if let Some(raw) = slug
+                && !raw.is_empty()
+                && id.is_none()
+            {
+                app.app_notifications.push(
+                    format!(
+                        "/options: '{raw}' is not a navigable section — opening the default view. \
+                         Press / to search field labels."
+                    ),
+                    NotifySeverity::Warn,
+                );
+            }
             toggle_config_screen(app, agent, id);
         }
         DispatchCommand::Statusline => toggle_status_line_setup(app),
@@ -9149,7 +9171,16 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
         0
     };
     let suggestion_lines = if queue_overlay_lines == 0 && overlay_lines == 0 && mention_lines == 0 {
-        slash_suggestions(&app.input).len()
+        // Cap at SLASH_MENU_MAX_ITEMS so the popup_height computation
+        // matches what `slash_suggestion_lines` will actually render.
+        // Using the unbounded `slash_suggestions().len()` caused the
+        // popup_height to factor in items that get clipped, which left
+        // no slack for the actual window — and the menu rendered the
+        // bottom slice of the SLASH_MENU_MAX_ITEMS window instead of
+        // the top.
+        slash_suggestions(&app.input)
+            .len()
+            .min(SLASH_MENU_MAX_ITEMS)
     } else {
         0
     };
@@ -9157,7 +9188,12 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
     // non-empty so the click target stays put whether the reorder
     // overlay is open or closed.
     let indicator_lines = if app.prompt_queue.is_empty() { 0 } else { 1 };
-    let popup_height = queue_overlay_lines + overlay_lines + mention_lines + indicator_lines;
+    // Include the slash-suggestion height in the popup_height budget so
+    // `max_height` grows past `PROMPT_MAX_HEIGHT` when the menu needs
+    // more vertical room. Without this, a long match list collapses to
+    // the 8-row prompt cap and clips the top of the menu.
+    let popup_height =
+        queue_overlay_lines + overlay_lines + mention_lines + suggestion_lines + indicator_lines;
     let max_height = (PROMPT_MAX_HEIGHT as usize).max(popup_height + PROMPT_MIN_HEIGHT as usize);
     prompt_visual_line_count(&app.input, width)
         .saturating_add(2)
