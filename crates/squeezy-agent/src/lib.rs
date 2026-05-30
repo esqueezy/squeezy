@@ -3356,7 +3356,20 @@ fn spawn_turn_cancel_monitor(
                     });
                 }
                 if let Some(tx) = tx.upgrade() {
-                    let _ = tx.send(AgentEvent::Cancelled { turn_id }).await;
+                    // Watchdog fallback: the round loop's primary cancel
+                    // path normally fires `AgentEvent::Cancelled` first
+                    // with its own partial-cost snapshot. This emission
+                    // only runs when the grace window expires without the
+                    // primary path checking in, in which case we have no
+                    // cost-broker handle here — leave the cost+metrics
+                    // payload zero rather than fabricate a number.
+                    let _ = tx
+                        .send(AgentEvent::Cancelled {
+                            turn_id,
+                            cost: CostSnapshot::default(),
+                            metrics: TurnMetrics::default(),
+                        })
+                        .await;
                 }
                 done.notify_waiters();
             }
@@ -4993,12 +5006,29 @@ impl TurnRuntime {
             let mut stop_reason: Option<StopReason> = None;
             let mut reasoning_only_stop = false;
             let mut round_text_started = false;
+            // Running byte counters for the in-flight round, used to
+            // estimate token cost on cancel before the provider has had
+            // a chance to emit a `Completed` event with usage. Both
+            // counters cover redactor-flushed text plus reasoning
+            // deltas; together with `request_input_bytes` they feed
+            // `partial_cancel_cost` so a mid-stream cancel attributes
+            // the work the provider already did instead of reporting
+            // zero.
+            let mut round_output_bytes: u64 = 0;
 
             while let Some(event) =
                 next_llm_stream_event(&mut stream, &self.cancel, self.config.stream_idle_timeout)
                     .await?
             {
                 if self.cancel.is_cancelled() {
+                    self.fold_partial_cancel_cost(
+                        &mut total_cost,
+                        &mut broker,
+                        request_model.as_ref(),
+                        request_input_bytes,
+                        round_output_bytes,
+                    )
+                    .await;
                     self.finish_cancelled_turn(
                         &task_title,
                         &total_cost,
@@ -5023,6 +5053,16 @@ impl TurnRuntime {
                         }
                     }
                     LlmEvent::TextDelta(delta) => {
+                        // Bill the raw provider delta against output
+                        // bytes immediately, before the redactor's tail
+                        // buffer can hide the work behind its
+                        // `STREAM_TAIL_BYTES` window. A mid-stream cancel
+                        // arriving before the redactor releases its
+                        // first chunk would otherwise see
+                        // `round_output_bytes = 0` and skip cost
+                        // attribution even though the provider already
+                        // sent the bytes.
+                        round_output_bytes = round_output_bytes.saturating_add(delta.len() as u64);
                         let chunk = assistant_stream.push(&delta);
                         if chunk.text.is_empty() {
                             continue;
@@ -5073,6 +5113,7 @@ impl TurnRuntime {
                         }
                     }
                     LlmEvent::ReasoningDelta { text, .. } => {
+                        round_output_bytes = round_output_bytes.saturating_add(text.len() as u64);
                         if self
                             .tx
                             .send(AgentEvent::ReasoningDelta {
@@ -5172,6 +5213,14 @@ impl TurnRuntime {
                         break;
                     }
                     LlmEvent::Cancelled => {
+                        self.fold_partial_cancel_cost(
+                            &mut total_cost,
+                            &mut broker,
+                            request_model.as_ref(),
+                            request_input_bytes,
+                            round_output_bytes,
+                        )
+                        .await;
                         self.finish_cancelled_turn(
                             &task_title,
                             &total_cost,
@@ -5925,6 +5974,47 @@ impl TurnRuntime {
         let _ = SessionStore::open(&self.config).save_global_calibration(&calibration_for_global);
     }
 
+    /// Fold a best-effort partial cost into `total_cost` and the broker's
+    /// per-turn metrics for an in-flight round that is about to exit via
+    /// the cancel path. Provider streams emit usage payloads only on
+    /// [`LlmEvent::Completed`]; a mid-stream cancel never reaches that
+    /// arm, so without this step both the cost broker and the persisted
+    /// `frames.jsonl` would report `input=0, output=0, cost=0` for the
+    /// cancelled turn even though the provider did real work. The
+    /// estimate is derived from the request's input byte count plus the
+    /// running byte total of streamed assistant text + reasoning, fed
+    /// through the per-provider calibration and the pricing registry —
+    /// the same machinery [`estimate_cost`] already uses for cost
+    /// rendering when a provider stream stays silent on usage. No-op
+    /// when the round has done nothing observable yet (cancel landed
+    /// before any provider work).
+    async fn fold_partial_cancel_cost(
+        &self,
+        total_cost: &mut CostSnapshot,
+        broker: &mut CostBroker,
+        request_model: &str,
+        request_input_bytes: u64,
+        round_output_bytes: u64,
+    ) {
+        let Some(partial) = partial_cancel_cost(
+            self.provider.name(),
+            request_model,
+            request_input_bytes,
+            round_output_bytes,
+            &broker.calibration,
+        ) else {
+            return;
+        };
+        // Fold into the broker so per-turn `TurnMetrics.provider` and the
+        // session-level cost cap state both see the partial spend. The
+        // returned `CostCapStatus` is intentionally dropped: a cancelled
+        // turn already terminates the round loop, so emitting a warning
+        // event here would just race the `AgentEvent::Cancelled` we are
+        // about to send.
+        let _ = broker.record_provider_cost(&partial);
+        merge_cost(total_cost, &partial);
+    }
+
     async fn finish_cancelled_turn(
         &self,
         task_title: &str,
@@ -5944,13 +6034,18 @@ impl TurnRuntime {
             "cancelled",
             Some(self.turn_id),
             Some("turn cancelled".to_string()),
-            json!({}),
+            json!({
+                "cost": cost,
+                "metrics": metrics,
+            }),
         );
         self.record_replay(SessionReplayEventKind::ModelCancelled, json!({}));
         let _ = self
             .tx
             .send(AgentEvent::Cancelled {
                 turn_id: self.turn_id,
+                cost: cost.clone(),
+                metrics: metrics.clone(),
             })
             .await;
     }
@@ -11573,6 +11668,48 @@ fn merge_cost(total: &mut CostSnapshot, next: &CostSnapshot) {
         add_optional(total.estimated_usd_micros, next.estimated_usd_micros);
 }
 
+/// Build a best-effort [`CostSnapshot`] for a round that was cancelled
+/// mid-stream — before the provider emitted a `Completed` event with
+/// usage. Returns `None` when no assistant or reasoning bytes were
+/// observed; in that case the provider may or may not have already
+/// charged us for the input prompt (its decision-to-cancel races with
+/// our send), so attributing input tokens would be guesswork. Once any
+/// output byte has streamed back we know the provider definitely read
+/// the prompt, so both input and output sides of the estimate are
+/// folded in. Tokens come from the per-provider calibration; the
+/// dollar cost comes from the pricing registry via [`estimate_cost`],
+/// the same fallback the `Completed` arm uses when the provider stays
+/// silent on `estimated_usd_micros`.
+fn partial_cancel_cost(
+    provider: &str,
+    model: &str,
+    request_input_bytes: u64,
+    round_output_bytes: u64,
+    calibration: &squeezy_llm::TokenCalibration,
+) -> Option<CostSnapshot> {
+    if round_output_bytes == 0 {
+        return None;
+    }
+    let bytes_per_token = calibration.bytes_per_token(provider);
+    let input_tokens = bytes_to_tokens(request_input_bytes, bytes_per_token);
+    let output_tokens = bytes_to_tokens(round_output_bytes, bytes_per_token);
+    let mut snapshot = CostSnapshot {
+        input_tokens: (input_tokens > 0).then_some(input_tokens),
+        output_tokens: (output_tokens > 0).then_some(output_tokens),
+        ..CostSnapshot::default()
+    };
+    snapshot.estimated_usd_micros = estimate_cost(provider, model, &snapshot);
+    Some(snapshot)
+}
+
+fn bytes_to_tokens(bytes: u64, bytes_per_token: f64) -> u64 {
+    if bytes == 0 {
+        return 0;
+    }
+    let bpt = bytes_per_token.max(0.1);
+    ((bytes as f64) / bpt).ceil() as u64
+}
+
 fn start_session_log(config: &AppConfig, provider: &str) -> Option<SessionHandle> {
     let store = SessionStore::open(config);
     let metadata = SessionMetadata::new(config, provider);
@@ -12334,6 +12471,19 @@ pub enum AgentEvent {
     },
     Cancelled {
         turn_id: TurnId,
+        /// Cumulative cost for the turn at the moment of cancel, including
+        /// the partial work of the in-flight round. Mirrors the shape of
+        /// [`AgentEvent::Completed::cost`] so cost-reporting consumers
+        /// (eval frames, TUI footer, `/cost`) read the same field on both
+        /// terminal paths. Defaults to zero for cancel paths that fire
+        /// before any provider work has happened (e.g. cancel landing
+        /// before the first round's stream starts).
+        cost: CostSnapshot,
+        /// Per-turn metrics snapshot at the moment of cancel, again
+        /// mirroring [`AgentEvent::Completed::metrics`] so consumers can
+        /// account for partial spend on a cancelled turn the same way
+        /// they do on a completed one.
+        metrics: TurnMetrics,
     },
     Failed {
         turn_id: TurnId,

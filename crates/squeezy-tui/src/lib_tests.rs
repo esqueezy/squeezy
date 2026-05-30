@@ -691,6 +691,8 @@ async fn cancelled_turn_auto_drains_next_queued_prompt() {
     // Simulate the agent emitting Cancelled.
     tx.send(AgentEvent::Cancelled {
         turn_id: TurnId::new(1),
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
     })
     .await
     .expect("send cancelled");
@@ -6584,6 +6586,8 @@ async fn cancel_restores_prompt_into_composer() {
     app.turn_rx = Some(rx);
     tx.send(AgentEvent::Cancelled {
         turn_id: TurnId::new(1),
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
     })
     .await
     .expect("send cancelled");
@@ -6612,6 +6616,8 @@ async fn cancel_does_not_clobber_draft_typed_during_interrupt() {
     app.turn_rx = Some(rx);
     tx.send(AgentEvent::Cancelled {
         turn_id: TurnId::new(1),
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
     })
     .await
     .expect("send cancelled");
