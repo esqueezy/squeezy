@@ -7740,9 +7740,13 @@ async fn dispatch_command_session_lookup_for_missing_id() {
 
 #[tokio::test]
 async fn dispatch_command_tui_only_for_renderer_owned_commands() {
+    // `/diff` and `/undo` deliberately omitted: both now resolve to
+    // typed `DispatchOutcome::DiffSnapshot` / `CheckpointUndo`
+    // outcomes so non-TUI drivers (eval / RPC) can audit them. See
+    // `dispatch_command_diff_returns_typed_snapshot` and
+    // `dispatch_command_undo_returns_typed_result` below.
     let agent = mock_agent_for_dispatch();
     let cases: &[(DispatchCommand, &str)] = &[
-        (DispatchCommand::Diff, "diff"),
         (DispatchCommand::Keymap, "keymap"),
         (DispatchCommand::Statusline, "statusline"),
         (DispatchCommand::Help { topic: None }, "help"),
@@ -7795,7 +7799,6 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
             },
             "checkpoint",
         ),
-        (DispatchCommand::Undo, "undo"),
         (
             DispatchCommand::RevertTurn {
                 group_id: "t".to_string(),
@@ -7825,6 +7828,90 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
             }
             other => panic!("expected TuiOnly for {cmd:?}, got {other:?}"),
         }
+    }
+}
+
+/// `/diff` returns a typed `DispatchOutcome::DiffSnapshot` payload
+/// so headless drivers (eval / RPC) can audit the same diff the TUI
+/// renders into a card. The mock agent runs against
+/// `AppConfig::default()`, so `vcs_kind` is `"git"` when the test
+/// host is a git checkout and `"none"` otherwise; the variant shape
+/// is the same either way.
+#[tokio::test]
+async fn dispatch_command_diff_returns_typed_snapshot() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent.dispatch_command(DispatchCommand::Diff).await;
+    match outcome {
+        DispatchOutcome::DiffSnapshot {
+            vcs_kind,
+            files_changed,
+            additions,
+            deletions,
+            untracked_files,
+            snapshot,
+        } => {
+            // `vcs_kind` is the only serializable summary the eval
+            // driver records up front; it must be one of the two
+            // tags the `VcsKind` enum serializes to.
+            assert!(
+                vcs_kind == "git" || vcs_kind == "none",
+                "vcs_kind must be git|none, got {vcs_kind}"
+            );
+            // The lifted summary counters must mirror the boxed
+            // snapshot exactly — the eval driver formats them
+            // without unboxing the full `DiffSnapshot`.
+            assert_eq!(files_changed, snapshot.summary.files_changed);
+            assert_eq!(additions, snapshot.summary.additions);
+            assert_eq!(deletions, snapshot.summary.deletions);
+            assert_eq!(untracked_files, snapshot.summary.untracked_files);
+        }
+        other => panic!("expected DiffSnapshot for /diff, got {other:?}"),
+    }
+}
+
+/// `/undo` returns a typed `DispatchOutcome::CheckpointUndo`
+/// payload, not `TuiOnly`. The default mock agent has no
+/// `CheckpointStore` wired up (checkpoints disabled), so `result`
+/// is `None` and the driver records a structured "nothing to undo
+/// — checkpoints disabled" signal. When checkpoints are enabled but
+/// the journal is empty, `result` is `Some(_)` with
+/// `applied=false, skipped=true`. Both shapes are valid eval
+/// evidence — the test asserts the typed variant only.
+#[tokio::test]
+async fn dispatch_command_undo_returns_typed_result() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent.dispatch_command(DispatchCommand::Undo).await;
+    match outcome {
+        DispatchOutcome::CheckpointUndo {
+            applied,
+            skipped,
+            checkpoint_ids: _,
+            result,
+        } => {
+            // No rollback can have applied: the test runs against
+            // a fresh registry whose checkpoint journal is either
+            // disabled (`result = None`) or empty
+            // (`result = Some(_), skipped = true`). Either way
+            // `applied` must be false.
+            assert!(!applied, "no rollback should have applied");
+            match result {
+                None => assert!(
+                    skipped,
+                    "disabled-checkpoint path must surface skipped=true"
+                ),
+                Some(rollback) => {
+                    assert!(
+                        rollback.skipped && !rollback.applied,
+                        "empty-journal rollback must report skipped=true, applied=false"
+                    );
+                    assert!(
+                        rollback.checkpoint_ids.is_empty(),
+                        "empty-journal rollback must report no checkpoint ids"
+                    );
+                }
+            }
+        }
+        other => panic!("expected CheckpointUndo for /undo, got {other:?}"),
     }
 }
 

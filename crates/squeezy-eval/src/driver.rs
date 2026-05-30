@@ -883,6 +883,31 @@ impl Driver {
             squeezy_agent::DispatchOutcome::Pinned { id } => format!("pinned:{id}"),
             squeezy_agent::DispatchOutcome::Unpinned { id } => format!("unpinned:{id}"),
             squeezy_agent::DispatchOutcome::PinsList { count } => format!("pins_list:{count}"),
+            squeezy_agent::DispatchOutcome::DiffSnapshot {
+                vcs_kind,
+                files_changed,
+                additions,
+                deletions,
+                untracked_files,
+                ..
+            } => format!(
+                "diff_snapshot:vcs={vcs_kind}:files={files_changed}:+{additions}-{deletions}:untracked={untracked_files}"
+            ),
+            // `None` is the checkpoints-disabled path (no store wired
+            // up); `Some(_)` with `applied=false, skipped=true` is the
+            // clean-tree path where rollback found no journal entry.
+            squeezy_agent::DispatchOutcome::CheckpointUndo {
+                applied,
+                skipped,
+                checkpoint_ids,
+                result,
+            } => match result {
+                None => "checkpoint_undo:disabled".to_string(),
+                Some(_) => format!(
+                    "checkpoint_undo:applied={applied}:skipped={skipped}:checkpoints={}",
+                    checkpoint_ids.join(",")
+                ),
+            },
             squeezy_agent::DispatchOutcome::TuiOnly { command } => {
                 format!("tui_only:{command}")
             }
