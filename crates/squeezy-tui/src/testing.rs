@@ -19,10 +19,13 @@ use squeezy_agent::{Agent, ToolApprovalDecision};
 use squeezy_core::{AppConfig, Result, Role, SessionMode, SqueezyError};
 use squeezy_llm::LlmProvider;
 
+use squeezy_tools::{McpElicitationKind, McpElicitationRequest, McpElicitationResponse};
+use tokio::sync::oneshot;
+
 use crate::{
-    Clipboard, TranscriptEntryKind, TuiApp, apply_theme_overrides, drain_agent_events,
-    drain_job_events, drain_pending_diff, handle_key, keymap::parse_keyspec, render,
-    start_user_turn,
+    Clipboard, PendingMcpElicitation, TranscriptEntryKind, TuiApp, apply_theme_overrides,
+    drain_agent_events, drain_job_events, drain_pending_diff, format_mcp_elicitation_status_line,
+    handle_key, keymap::parse_keyspec, render, start_user_turn,
 };
 
 /// Opaque driver wrapping a TuiApp + Agent + headless terminal.
@@ -254,6 +257,58 @@ impl TuiHarness {
             last = self.send_key(*key).await?;
         }
         Ok(last)
+    }
+
+    /// Inject a synthesized `McpElicitationRequest` straight into the
+    /// TUI's `pending_mcp_elicitation` slot. Bypasses the
+    /// MCP transport and `install_mcp_elicitation_handler` round-trip
+    /// so a scenario can exercise the modal layer
+    /// (`format_mcp_elicitation_menu_lines`, key-driven Accept/Decline/
+    /// Cancel routing) without standing up a fake MCP server. The
+    /// returned receiver resolves when the user (driven by `send_key`)
+    /// answers the modal; dropping it is harmless.
+    ///
+    /// Mirrors the production handler in
+    /// `events.rs:286` (`AgentEvent::McpElicitationRequested`) so the
+    /// resulting `TuiApp` state — `status` line, selection index reset,
+    /// previous-request cancellation — matches a real elicitation.
+    pub fn push_pending_mcp_elicitation(
+        &mut self,
+        request: McpElicitationRequest,
+    ) -> oneshot::Receiver<McpElicitationResponse> {
+        let (response_tx, response_rx) = oneshot::channel();
+        if let Some(previous) = self.app.pending_mcp_elicitation.take() {
+            let _ = previous.response_tx.send(McpElicitationResponse::cancel());
+        }
+        self.app.status = format_mcp_elicitation_status_line(&request);
+        self.app.mcp_elicitation_selection_index = 0;
+        self.app.pending_mcp_elicitation = Some(PendingMcpElicitation {
+            request,
+            response_tx,
+        });
+        response_rx
+    }
+
+    /// Construct an `McpElicitationRequest` from the loose fields a
+    /// scenario author supplies. Centralizes the request_id /
+    /// elicitation_id defaulting so callers don't have to spell out
+    /// fields the modal doesn't read.
+    pub fn make_mcp_elicitation_request(
+        server: impl Into<String>,
+        kind: McpElicitationKind,
+        message: impl Into<String>,
+        schema: Option<serde_json::Value>,
+        url: Option<String>,
+    ) -> McpElicitationRequest {
+        McpElicitationRequest {
+            server: server.into(),
+            request_id: "eval-inject".into(),
+            kind,
+            message: message.into(),
+            schema,
+            url,
+            elicitation_id: None,
+        }
     }
 
     /// Render one frame to the backing `TestBackend` and return its

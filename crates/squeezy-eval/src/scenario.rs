@@ -244,6 +244,20 @@ pub enum Action {
         #[serde(default)]
         when: Option<When>,
     },
+    /// Synthesize an MCP `Form` or `Url` elicitation directly into the
+    /// live `TuiHarness`'s `pending_mcp_elicitation` slot. Bypasses the
+    /// MCP transport so a scenario can exercise the modal layer (palette,
+    /// menu text, key-driven Accept/Decline/Cancel routing) without
+    /// standing up an in-process fake MCP server. Requires
+    /// `[tui_capture] drive_tui = true`. The synthesized request mirrors
+    /// production state (status line, selection index reset) so palette
+    /// and frame assertions bind to the same shape a real elicitation
+    /// would produce.
+    InjectMcpElicitation {
+        request: InjectedMcpElicitation,
+        #[serde(default)]
+        when: Option<When>,
+    },
     /// Scripted response to a `RequestUserInputRequested` event.
     /// Mirrors `RespondElicitation` for the agent-side
     /// `RequestUserInputResponse` channel (choice / freeform / cancel).
@@ -325,6 +339,7 @@ impl Action {
             | Action::Assert { when, .. }
             | Action::InjectUserText { when, .. }
             | Action::RespondElicitation { when, .. }
+            | Action::InjectMcpElicitation { when, .. }
             | Action::RespondUserInput { when, .. }
             | Action::ApplyDiff { when, .. }
             | Action::SwitchMode { when, .. }
@@ -364,6 +379,27 @@ pub enum ElicitationDecision {
     Decline,
     /// Cancel — same effect as the pre-Phase-2 auto-cancel.
     Cancel,
+}
+
+/// Loose scenario-author shape used by `Action::InjectMcpElicitation`.
+/// Maps 1:1 onto `squeezy_tools::McpElicitationRequest` with sensible
+/// defaults for the fields the modal does not read (`request_id`,
+/// `elicitation_id`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InjectedMcpElicitation {
+    /// MCP server name shown in the modal header.
+    pub server: String,
+    /// `"form"` (default) or `"url"`. Case-insensitive at parse time.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// User-facing question. Rendered in violet+bold as the modal body.
+    pub message: String,
+    /// Optional JSON schema for `Form` kind. Pass-through.
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
+    /// Required for `Url` kind.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 /// Matcher used by `Action::RespondUserInput`. Both fields are
@@ -615,6 +651,30 @@ impl Scenario {
                 return Err(EvalError::ScenarioParse(format!(
                     "step {idx}: edit_file requires either `content` or `replace`"
                 )));
+            }
+            if let Step::Action(Action::InjectMcpElicitation { request, .. }) = step {
+                let kind = request
+                    .kind
+                    .as_deref()
+                    .map(|s| s.to_ascii_lowercase())
+                    .unwrap_or_else(|| "form".to_string());
+                if !matches!(kind.as_str(), "form" | "url") {
+                    return Err(EvalError::ScenarioParse(format!(
+                        "step {idx}: inject_mcp_elicitation kind must be \
+                         \"form\" or \"url\" (got {kind:?})"
+                    )));
+                }
+                if kind == "url" && request.url.is_none() {
+                    return Err(EvalError::ScenarioParse(format!(
+                        "step {idx}: inject_mcp_elicitation kind=\"url\" \
+                         requires `url`"
+                    )));
+                }
+                if request.server.trim().is_empty() {
+                    return Err(EvalError::ScenarioParse(format!(
+                        "step {idx}: inject_mcp_elicitation requires non-empty `server`"
+                    )));
+                }
             }
         }
         Ok(())
