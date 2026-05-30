@@ -1670,7 +1670,31 @@ async fn agent_shares_state_store_with_tool_registry_for_graph_persistence() {
     drain_turn(agent.start_turn("warm graph".to_string(), CancellationToken::new())).await;
     drop(agent);
 
-    let store = SqueezyStore::open(&root, None).expect("reopen state store");
+    // `start_turn` spawns background tasks (notably the MCP warmup)
+    // that hold a clone of the tool registry's `Arc<SqueezyStore>`.
+    // `drop(agent)` releases the agent's own reference but those tasks
+    // may still be in flight. On Linux redb tolerates the transient
+    // overlap; on Windows the file lock is exclusive and a same-process
+    // re-open fails until every background task finishes. Retry briefly
+    // so the test pins the persistence contract without taking a
+    // Windows-only flake on the lifecycle of an unrelated background
+    // task.
+    let store = (|| {
+        let mut last_err = None;
+        for attempt in 0..50 {
+            match SqueezyStore::open(&root, None) {
+                Ok(store) => return store,
+                Err(err) => {
+                    last_err = Some(err);
+                    std::thread::sleep(std::time::Duration::from_millis(100 + attempt * 20));
+                }
+            }
+        }
+        panic!(
+            "reopen state store: {:?}",
+            last_err.expect("retry attempts")
+        );
+    })();
     let partition: Option<serde_json::Value> = store
         .graph_partition(&squeezy_core::FileId::new("src/lib.rs"))
         .expect("graph_partition");
