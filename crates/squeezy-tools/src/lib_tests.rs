@@ -7846,7 +7846,10 @@ pub mod service {
             .unwrap()
             .contains("helper();")
     );
-    assert_uniform_evidence_packet(&read.content["packets"][0]);
+    // Slice-mode reads do not emit a `packets` array; the resolved window
+    // is already on the top-level fields, so the content body is the only
+    // signal worth asserting on here.
+    assert!(read.content["packets"].as_array().is_none());
 
     let upstream = registry
         .execute(

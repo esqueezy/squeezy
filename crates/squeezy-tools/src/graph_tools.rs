@@ -2788,43 +2788,31 @@ impl ToolRegistry {
             truncated,
             ..ToolCostHint::default()
         };
-        let mut packet = evidence_packet(
-            "read_slice returned a bounded exact file slice",
-            vec![span_for_path_json(&rel_str, resolved_span)],
-            confidence,
-            Freshness::Fresh,
-            provenance,
-            cost.clone(),
-            json!({
-                "tool": "read_file",
-                "arguments": {
-                    "path": &rel_str,
-                    "offset": end,
-                    "limit": DEFAULT_READ_LIMIT
-                },
-                "reason": "continue reading after this slice if more context is needed"
-            }),
-        );
-        if let Some(object) = packet.as_object_mut() {
-            object.insert("path".to_string(), json!(&rel_str));
-            object.insert("offset".to_string(), json!(offset));
-            object.insert("bytes_returned".to_string(), json!(bytes.len()));
-        }
+        // Slice-mode wire payload carries only the fields the agent cannot
+        // already derive from its call site: the resolved window
+        // (path/offset/bytes_returned), a `truncated` flag, and the bytes
+        // themselves. The full sha256 stays on
+        // `ToolResult.receipt.content_sha256` for cost-broker / receipt
+        // consumers; graph status, span coordinates, and a single-element
+        // `packets` array would just restate fields the model already sees,
+        // so they live on diff-mode reads (where the span describes a hunk
+        // the model has not seen) and are omitted here.
         let mut payload = serde_json::Map::new();
         payload.insert("tool".to_string(), json!("read_slice"));
-        payload.insert("graph_available".to_string(), json!(graph.is_some()));
-        payload.insert("graph_status".to_string(), json!(graph_status));
         payload.insert("path".to_string(), json!(&rel_str));
         payload.insert("offset".to_string(), json!(offset));
         payload.insert("bytes_returned".to_string(), json!(bytes.len()));
-        payload.insert("total_bytes".to_string(), json!(total_bytes));
-        payload.insert("sha256".to_string(), json!(&content_sha256));
         payload.insert("truncated".to_string(), json!(truncated));
+        if truncated {
+            // total_bytes only informs the agent of further bytes to fetch
+            // when we actually clipped the read; otherwise it duplicates
+            // `offset + bytes_returned`.
+            payload.insert("total_bytes".to_string(), json!(total_bytes));
+        }
         if let Some(reason) = ignored_reason {
             payload.insert("ignored".to_string(), json!(true));
             payload.insert("ignored_reason".to_string(), json!(reason));
         }
-        payload.insert("packets".to_string(), json!([packet]));
         payload.insert("content".to_string(), json!(content));
         make_result(
             call,
