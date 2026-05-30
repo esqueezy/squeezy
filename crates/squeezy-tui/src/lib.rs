@@ -41,8 +41,9 @@ use squeezy_agent::{
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
     PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
-    SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity,
-    TranscriptDefault, TranscriptItem, TuiAlternateScreen, TuiSynchronizedOutput, TuiTheme,
+    ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig,
+    ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
+    TuiSynchronizedOutput, TuiTheme,
 };
 use squeezy_llm::LlmProvider;
 use squeezy_skills::PromptTemplateCatalog;
@@ -108,12 +109,12 @@ use input::{
 };
 
 use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
-use render::palette::{
-    self, AMBER, BANG_RED, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET,
-    SUCCESS_GREEN, blend_color,
-};
 #[cfg(test)]
-use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG, WORKING_SHIMMER_HIGHLIGHT};
+use render::palette::WORKING_SHIMMER_HIGHLIGHT;
+use render::palette::{
+    self, AMBER, BANG_RED, DIFF_ADD_FG, DIFF_DEL_FG, ERROR_RED, GOLD, MODE_BUILD_GREEN,
+    MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN, blend_color,
+};
 use terminal_writer::TerminalWriter;
 use toast::ToastQueue;
 
@@ -141,6 +142,44 @@ const INLINE_VIEWPORT_HEIGHT: u16 = 18;
 // prompt + status row and matches the picker height used by /options
 // search and the model picker.
 const SLASH_MENU_MAX_ITEMS: usize = 10;
+
+/// Process-wide override for `tui.shell_diff_inline`, pinned by the TuiApp
+/// at startup and re-applied on settings hot-reload. Encoded as `0 = Full
+/// (default)`, `1 = Folded`. A static lets the deeply-nested render path
+/// consult the setting without threading it through every formatter, the
+/// same pattern the palette uses for tone/accent overrides.
+static SHELL_DIFF_INLINE_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+fn shell_diff_inline_setting() -> ShellDiffInline {
+    match SHELL_DIFF_INLINE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => ShellDiffInline::Folded,
+        _ => ShellDiffInline::Full,
+    }
+}
+
+fn set_shell_diff_inline(setting: ShellDiffInline) {
+    let encoded = match setting {
+        ShellDiffInline::Full => 0,
+        ShellDiffInline::Folded => 1,
+    };
+    SHELL_DIFF_INLINE_OVERRIDE.store(encoded, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when this tool is `shell` (or `verify`, the structured-shell sibling)
+/// and its stdout looks like unified-diff output. Used by the preview-cap
+/// bypass and the BG-color renderer to treat `git diff` cards as first-class
+/// diff content the way `apply_patch` already is.
+fn shell_output_is_unified_diff(tool: &ToolTranscript) -> bool {
+    if !matches!(tool.result.tool_name.as_str(), "shell" | "verify") {
+        return false;
+    }
+    let stdout = tool.result.content["stdout"].as_str().unwrap_or("");
+    stdout
+        .lines()
+        .any(|line| line.starts_with("@@ -") && line.contains(" @@"))
+}
+
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 /// Enable basic button-press/release reporting (1000) with SGR
 /// coordinate encoding (1006). Required for the clickable queue
@@ -879,6 +918,10 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     // immediately — the agent's config_snapshot already carries the new
     // value, but the palette layer reads the override directly.
     apply_theme_overrides(new_cfg.tui.theme);
+    // Same pattern for the shell-diff inline preference: TuiApp keeps the
+    // canonical value, but the deep render path reads the static.
+    app.shell_diff_inline = new_cfg.tui.shell_diff_inline;
+    set_shell_diff_inline(new_cfg.tui.shell_diff_inline);
     let old_provider = agent.provider_name();
     let new_provider = squeezy_llm::provider_name(&new_cfg.provider);
     if old_provider == new_provider {
@@ -6605,7 +6648,7 @@ fn tool_run_info(
 /// defensively for snapshot / overlay paths.
 fn tool_run_coalesce_eligible(tool: &ToolTranscript) -> bool {
     tool.repeat_count == 1
-        && !tool_bypasses_preview_cap(tool.result.tool_name.as_str())
+        && !tool_bypasses_preview_cap_for_tool(tool)
         && !tool_result_hidden_by_default(&tool.result)
 }
 
@@ -6838,12 +6881,30 @@ fn tool_bypasses_preview_cap(tool_name: &str) -> bool {
     )
 }
 
+/// Same intent as [`tool_bypasses_preview_cap`] but consults the result
+/// content too: a shell command whose stdout is a unified diff (`git diff`,
+/// `git show`, …) should render in full unless the user explicitly opted
+/// into folded shell diffs via `tui.shell_diff_inline = "folded"`. The
+/// diff IS the card; head/tail-capping it discards every hunk past the
+/// first or last five lines.
+fn tool_bypasses_preview_cap_for_tool(tool: &ToolTranscript) -> bool {
+    if tool_bypasses_preview_cap(tool.result.tool_name.as_str()) {
+        return true;
+    }
+    if matches!(shell_diff_inline_setting(), ShellDiffInline::Full)
+        && shell_output_is_unified_diff(tool)
+    {
+        return true;
+    }
+    false
+}
+
 fn collapsed_tool_preview_lines(
     tool: &ToolTranscript,
     tool_output_verbosity: ToolOutputVerbosity,
     _width: Option<u16>,
 ) -> Vec<Line<'static>> {
-    if tool_bypasses_preview_cap(tool.result.tool_name.as_str()) {
+    if tool_bypasses_preview_cap_for_tool(tool) {
         return expanded_tool_detail_lines(tool, tool_output_verbosity);
     }
     let detail = expanded_tool_detail_lines(tool, tool_output_verbosity);
@@ -7994,10 +8055,15 @@ fn shell_output_block_lines(
         .unwrap_or_else(|| tool.result.tool_name.clone());
     let workdir = string_arg(&tool.result.content, "workdir").unwrap_or_else(|| ".".to_string());
     let limit = preview_limit.unwrap_or(usize::MAX);
+    let is_diff = output
+        .lines()
+        .any(|line| line.starts_with("@@ -") && line.contains(" @@"));
     let mut lines = vec![shell_output_title_line(&command, &workdir)];
     lines.extend(head_tail_lines(&output, limit).into_iter().map(|line| {
         if line.truncated_marker {
             detail_line(false, QUIET, line.text)
+        } else if is_diff {
+            shell_output_diff_line(&line.text)
         } else {
             shell_output_line(&line.text)
         }
@@ -8026,6 +8092,49 @@ fn shell_output_title_line(command: &str, workdir: &str) -> Line<'static> {
 fn shell_output_line(content: &str) -> Line<'static> {
     let mut spans = vec![Span::raw("  ")];
     spans.extend(styled_output_spans(content));
+    Line::from(spans)
+}
+
+/// Diff-aware variant of [`shell_output_line`]. Lines that begin with `+`
+/// or `-` (but NOT `+++` / `---` file headers) get a tinted background to
+/// mirror the inline-diff styling reviewers expect from GitHub / Claude
+/// Code. Hunk headers (`@@ ... @@`) get a muted accent so the eye still
+/// finds the section breaks; everything else falls through to the default
+/// styled output.
+fn shell_output_diff_line(content: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+    let trimmed = content.trim_start_matches(' ');
+    let leading_ws = &content[..content.len() - trimmed.len()];
+    if !leading_ws.is_empty() {
+        spans.push(Span::raw(leading_ws.to_string()));
+    }
+    let style = if trimmed.starts_with("+++") || trimmed.starts_with("---") {
+        Style::default().fg(palette::muted_fg())
+    } else if let Some(rest) = trimmed.strip_prefix('+') {
+        let mut style = Style::default().fg(DIFF_ADD_FG);
+        if let Some(bg) = palette::surface_bg(DIFF_ADD_FG) {
+            style = style.bg(bg);
+        }
+        spans.push(Span::styled("+".to_string(), style));
+        spans.push(Span::styled(rest.to_string(), style));
+        return Line::from(spans);
+    } else if let Some(rest) = trimmed.strip_prefix('-') {
+        let mut style = Style::default().fg(DIFF_DEL_FG);
+        if let Some(bg) = palette::surface_bg(DIFF_DEL_FG) {
+            style = style.bg(bg);
+        }
+        spans.push(Span::styled("-".to_string(), style));
+        spans.push(Span::styled(rest.to_string(), style));
+        return Line::from(spans);
+    } else if trimmed.starts_with("@@") {
+        Style::default()
+            .fg(palette::MODE_PURPLE)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        spans.extend(styled_output_spans(trimmed));
+        return Line::from(spans);
+    };
+    spans.push(Span::styled(trimmed.to_string(), style));
     Line::from(spans)
 }
 
@@ -10391,6 +10500,12 @@ pub(crate) struct TuiApp {
     /// `true`. Independent of the push-time retry coalescer
     /// ([`coalesce_tool_transcript_entry`]).
     pub(crate) coalesce_tool_runs: bool,
+    /// Mirrors `config.tui.shell_diff_inline`. The active value also lives
+    /// in the process-wide [`SHELL_DIFF_INLINE_OVERRIDE`] so the deep
+    /// render path can consult it without a parameter cascade — this
+    /// field is the source of truth for runtime mutation, the static is
+    /// derived.
+    pub(crate) shell_diff_inline: ShellDiffInline,
     pub(crate) repo: RepoStatus,
     pub(crate) permissions: PermissionStatus,
     pub(crate) telemetry: TelemetryStatus,
@@ -10804,6 +10919,10 @@ impl TuiApp {
             transcript_default: config.tui.transcript_default,
             show_reasoning_usage: config.tui.show_reasoning_usage,
             coalesce_tool_runs: config.tui.coalesce_tool_runs,
+            shell_diff_inline: {
+                set_shell_diff_inline(config.tui.shell_diff_inline);
+                config.tui.shell_diff_inline
+            },
             repo: RepoStatus::detect(config),
             permissions: PermissionStatus::from_policy(&config.permissions),
             telemetry: TelemetryStatus::from_config(&config.telemetry),
