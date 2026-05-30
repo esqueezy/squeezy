@@ -10,6 +10,7 @@ pub enum BenchmarkLanguage {
     Go,
     Java,
     JavaScript,
+    Php,
     Python,
     Rust,
     TypeScript,
@@ -24,6 +25,7 @@ impl BenchmarkLanguage {
             "go" => Ok(Self::Go),
             "java" => Ok(Self::Java),
             "javascript" | "js" => Ok(Self::JavaScript),
+            "php" => Ok(Self::Php),
             "python" => Ok(Self::Python),
             "rust" => Ok(Self::Rust),
             "typescript" | "ts" | "js-ts" => Ok(Self::TypeScript),
@@ -41,6 +43,7 @@ impl BenchmarkLanguage {
             Self::Go => "go",
             Self::Java => "java",
             Self::JavaScript => "javascript",
+            Self::Php => "php",
             Self::Python => "python",
             Self::Rust => "rust",
             Self::TypeScript => "typescript",
@@ -55,6 +58,7 @@ impl BenchmarkLanguage {
             Self::Go => LanguageKind::Go,
             Self::Java => LanguageKind::Java,
             Self::JavaScript => LanguageKind::JavaScript,
+            Self::Php => LanguageKind::Php,
             Self::Python => LanguageKind::Python,
             Self::Rust => LanguageKind::Rust,
             Self::TypeScript => LanguageKind::TypeScript,
@@ -80,6 +84,7 @@ impl BenchmarkLanguage {
                 | Self::Cpp
                 | Self::Go
                 | Self::JavaScript
+                | Self::Php
                 | Self::Rust
                 | Self::TypeScript
         )
@@ -87,16 +92,18 @@ impl BenchmarkLanguage {
 
     pub fn comment_text(self) -> &'static str {
         match self {
-            // C/Cpp/CSharp/Go/Java/JavaScript/Rust/TypeScript all share `//`
-            // line comments at any position. C# specifically: a `//` line
-            // stays valid both at file scope (alongside `using` directives or
-            // file-scoped namespaces) and inside any member body.
+            // C/Cpp/CSharp/Go/Java/JavaScript/Php/Rust/TypeScript all share
+            // `//` line comments at any position. C# and PHP specifically: a
+            // `//` line stays valid both at file scope and inside any member
+            // body (PHP's `//` works wherever a statement is legal — i.e.
+            // inside a `<?php ... ?>` block).
             Self::C
             | Self::CSharp
             | Self::Cpp
             | Self::Go
             | Self::Java
             | Self::JavaScript
+            | Self::Php
             | Self::Rust
             | Self::TypeScript => "\n// squeezy refresh benchmark edit\n",
             Self::Python => "\n# squeezy refresh benchmark edit\n",
@@ -248,6 +255,7 @@ impl BenchmarkCommand {
                     | "js-ts"
                     | "javascript"
                     | "typescript"
+                    | "php"
             ) {
                 return Err(SqueezyError::Graph(format!(
                     "unknown corpus family {family}"

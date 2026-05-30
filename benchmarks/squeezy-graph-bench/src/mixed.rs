@@ -20,7 +20,7 @@ use crate::{
     oracles::{
         collect_c_family_accuracy, collect_csharp_oracle_accuracy, collect_go_oracle_accuracy,
         collect_js_ts_accuracy, csharp_oracle_to_accuracy, go_oracle_to_accuracy,
-        time_js_ts_oracle, time_rust_analyzer,
+        time_js_ts_oracle, time_php_oracle_optional, time_rust_analyzer,
     },
     report::{MixedWorkloadReport, RefreshProbeReport},
     util::{DeterministicRng, increment, temp_dir},
@@ -46,6 +46,10 @@ pub(crate) fn run_mixed_workload(
             "mixed workload compiler check not used for Java".to_string(),
         ),
         BenchmarkLanguage::Rust => time_cargo_check_optional(repo),
+        BenchmarkLanguage::Php => {
+            let (ms, status) = time_php_oracle_optional(repo);
+            (if ms == 0 { None } else { Some(ms) }, status)
+        }
         BenchmarkLanguage::Python => (None, "mixed workload unsupported for Python".to_string()),
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
             match time_js_ts_oracle(repo) {
@@ -84,6 +88,9 @@ pub(crate) fn run_mixed_workload(
         },
         BenchmarkLanguage::Java => {
             empty_accuracy("mixed workload accuracy oracle not used for Java")
+        }
+        BenchmarkLanguage::Php => {
+            empty_accuracy("mixed workload accuracy oracle not used for PHP")
         }
         BenchmarkLanguage::Python => empty_accuracy("mixed workload unsupported for Python"),
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {

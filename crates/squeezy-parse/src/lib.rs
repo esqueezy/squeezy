@@ -232,6 +232,7 @@ pub struct LanguageParser {
     go_parser: Parser,
     javascript_parser: Parser,
     jsx_parser: Parser,
+    php_parser: Parser,
     rust_parser: Parser,
     java_parser: Parser,
     python_parser: Parser,
@@ -265,6 +266,7 @@ impl LanguageParser {
         let go_parser = parser_with_go_language()?;
         let javascript_parser = parser_with_javascript_language()?;
         let jsx_parser = parser_with_jsx_language()?;
+        let php_parser = parser_with_php_language()?;
         let rust_parser = parser_with_rust_language()?;
         let java_parser = parser_with_java_language()?;
         let python_parser = parser_with_python_language()?;
@@ -277,6 +279,7 @@ impl LanguageParser {
             go_parser,
             javascript_parser,
             jsx_parser,
+            php_parser,
             rust_parser,
             java_parser,
             python_parser,
@@ -465,6 +468,7 @@ impl LanguageParser {
             LanguageKind::Java => Ok(&mut self.java_parser),
             LanguageKind::JavaScript => Ok(&mut self.javascript_parser),
             LanguageKind::Jsx => Ok(&mut self.jsx_parser),
+            LanguageKind::Php => Ok(&mut self.php_parser),
             LanguageKind::Rust => Ok(&mut self.rust_parser),
             LanguageKind::Python => Ok(&mut self.python_parser),
             LanguageKind::TypeScript => Ok(&mut self.typescript_parser),
@@ -485,6 +489,7 @@ fn parser_for_language_kind(language: LanguageKind) -> Result<Parser> {
         LanguageKind::Java => parser_with_java_language(),
         LanguageKind::JavaScript => parser_with_javascript_language(),
         LanguageKind::Jsx => parser_with_jsx_language(),
+        LanguageKind::Php => parser_with_php_language(),
         LanguageKind::Python => parser_with_python_language(),
         LanguageKind::Rust => parser_with_rust_language(),
         LanguageKind::TypeScript => parser_with_typescript_language(),
@@ -503,6 +508,7 @@ fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
         go: parser_with_go_language()?,
         javascript: parser_with_javascript_language()?,
         jsx: parser_with_jsx_language()?,
+        php: parser_with_php_language()?,
         rust: parser_with_rust_language()?,
         java: parser_with_java_language()?,
         python: parser_with_python_language()?,
@@ -523,6 +529,7 @@ struct WorkerParsers {
     go: Parser,
     javascript: Parser,
     jsx: Parser,
+    php: Parser,
     rust: Parser,
     java: Parser,
     python: Parser,
@@ -540,6 +547,7 @@ impl WorkerParsers {
             LanguageKind::Java => Ok(&mut self.java),
             LanguageKind::JavaScript => Ok(&mut self.javascript),
             LanguageKind::Jsx => Ok(&mut self.jsx),
+            LanguageKind::Php => Ok(&mut self.php),
             LanguageKind::Rust => Ok(&mut self.rust),
             LanguageKind::Python => Ok(&mut self.python),
             LanguageKind::TypeScript => Ok(&mut self.typescript),
@@ -706,6 +714,15 @@ fn parser_with_jsx_language() -> Result<Parser> {
     Ok(parser)
 }
 
+fn parser_with_php_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = php_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load PHP grammar: {err}")))?;
+    Ok(parser)
+}
+
 fn parser_with_typescript_language() -> Result<Parser> {
     let mut parser = Parser::new();
     let language = typescript_language();
@@ -779,6 +796,14 @@ fn jsx_language() -> tree_sitter::Language {
     tree_sitter_javascript::LANGUAGE.into()
 }
 
+fn php_language() -> tree_sitter::Language {
+    // PHP files routinely interleave inline HTML and `<?php ... ?>` blocks
+    // even when the file is "pure PHP", so the mixed-template grammar is the
+    // single right choice for the workspace. Pure-PHP files still parse fine
+    // under `LANGUAGE_PHP` (the leading `<?php` is just another `php_tag`).
+    tree_sitter_php::LANGUAGE_PHP.into()
+}
+
 fn typescript_language() -> tree_sitter::Language {
     tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
 }
@@ -808,8 +833,8 @@ fn language_for_kind(language: LanguageKind) -> Option<tree_sitter::Language> {
         LanguageKind::Rust => Some(rust_language()),
         LanguageKind::TypeScript => Some(typescript_language()),
         LanguageKind::Tsx => Some(tsx_language()),
+        LanguageKind::Php => Some(php_language()),
         LanguageKind::Ruby
-        | LanguageKind::Php
         | LanguageKind::Kotlin
         | LanguageKind::Swift
         | LanguageKind::Scala

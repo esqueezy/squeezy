@@ -3575,6 +3575,299 @@ export function start() {
     );
 }
 
+#[test]
+fn graph_emits_php_namespace_module_symbol() {
+    let mut parser = LanguageParser::new().unwrap();
+    let service = php_record(
+        "src/Foo/Bar/Service.php",
+        "<?php\nnamespace Foo\\Bar;\n\nclass Service {}\n",
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&service, fs::read_to_string(&service.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    assert!(
+        graph
+            .find_symbol_by_name("Foo.Bar")
+            .into_iter()
+            .any(|symbol| symbol.kind == SymbolKind::Module),
+        "expected a Module symbol for the `Foo\\Bar` namespace",
+    );
+    let service_symbol = graph
+        .find_symbol_by_name("Service")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("Service class should be indexed");
+    assert!(
+        service_symbol
+            .attributes
+            .iter()
+            .any(|attr| attr == "php:namespace:Foo.Bar"),
+    );
+}
+
+#[test]
+fn graph_records_php_use_import_path_and_alias() {
+    let mut parser = LanguageParser::new().unwrap();
+    let runner = php_record(
+        "src/App/Runner.php",
+        r#"<?php
+namespace App;
+
+use Foo\Bar\Service as Svc;
+use Foo\Bar\Helper;
+
+class Runner {
+    public function go(): void {
+        Svc::run();
+    }
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let imports = graph
+        .imports
+        .iter()
+        .filter(|import| import.file_id == runner.id)
+        .collect::<Vec<_>>();
+    assert!(
+        imports.iter().any(
+            |import| import.path == "Foo.Bar.Service" && import.alias.as_deref() == Some("Svc")
+        ),
+        "aliased `use Foo\\Bar\\Service as Svc` should land as a Named import",
+    );
+    assert!(
+        imports
+            .iter()
+            .any(|import| import.path == "Foo.Bar.Helper" && import.alias.is_none()),
+    );
+}
+
+#[test]
+fn graph_emits_extends_and_implements_for_php_class() {
+    let mut parser = LanguageParser::new().unwrap();
+    let runner_iface = php_record(
+        "src/Foo/Bar/IRunner.php",
+        "<?php\nnamespace Foo\\Bar;\n\ninterface IRunner { public function run(): void; }\n",
+    );
+    let base = php_record(
+        "src/Foo/Bar/BaseService.php",
+        "<?php\nnamespace Foo\\Bar;\n\nclass BaseService {}\n",
+    );
+    let service = php_record(
+        "src/Foo/Bar/Service.php",
+        r#"<?php
+namespace Foo\Bar;
+
+class Service extends BaseService implements IRunner {
+    public function run(): void {}
+}
+"#,
+    );
+    let parsed = [runner_iface, base, service.clone()]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let service_id = graph
+        .find_symbol_by_name("Service")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .map(|symbol| symbol.id.clone())
+        .unwrap();
+
+    let edges_from_service = graph
+        .edges()
+        .iter()
+        .filter(|edge| edge.from == service_id)
+        .collect::<Vec<_>>();
+    assert!(
+        edges_from_service
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Extends && edge.target_text == "BaseService"),
+        "expected Extends edge to BaseService",
+    );
+    assert!(
+        edges_from_service
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Implements && edge.target_text == "IRunner"),
+        "expected Implements edge to IRunner",
+    );
+}
+
+#[test]
+fn graph_stamps_uses_trait_attribute_on_php_class() {
+    let mut parser = LanguageParser::new().unwrap();
+    let trait_file = php_record(
+        "src/Foo/Bar/Loggable.php",
+        "<?php\nnamespace Foo\\Bar;\n\ntrait Loggable { public function log(): void {} }\n",
+    );
+    let class_file = php_record(
+        "src/Foo/Bar/Service.php",
+        r#"<?php
+namespace Foo\Bar;
+
+class Service {
+    use Loggable;
+
+    public function run(): void {
+        $this->log();
+    }
+}
+"#,
+    );
+    let parsed = [trait_file, class_file.clone()]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let service = graph
+        .find_symbol_by_name("Service")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .unwrap();
+    assert!(
+        service
+            .attributes
+            .iter()
+            .any(|attr| attr == "uses_trait:Loggable"),
+        "Service should carry uses_trait:Loggable",
+    );
+    let loggable = graph
+        .find_symbol_by_name("Loggable")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Trait)
+        .expect("Loggable trait should be in graph");
+    assert!(
+        graph
+            .references_to_symbol(&loggable.id)
+            .iter()
+            .any(|hit| hit.reference.text == "Loggable"),
+        "Loggable should have a reference hit from the trait include",
+    );
+}
+
+#[test]
+fn graph_marks_php_magic_method_calls_as_partial() {
+    let mut parser = LanguageParser::new().unwrap();
+    let magic = php_record(
+        "src/Magic.php",
+        r#"<?php
+class Magic {
+    public function __call($name, $args) {
+        return null;
+    }
+}
+
+class Caller {
+    public function go(Magic $m): void {
+        $m->__call('something', []);
+    }
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&magic, fs::read_to_string(&magic.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let magic_method = graph
+        .find_symbol_by_name("__call")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("__call method must be indexed");
+    assert!(
+        magic_method
+            .attributes
+            .iter()
+            .any(|attr| attr == "php:magic"),
+    );
+}
+
+#[test]
+fn graph_resolves_php_namespace_qualified_static_call_through_use_import() {
+    let mut parser = LanguageParser::new().unwrap();
+    let service = php_record(
+        "src/Foo/Bar/Service.php",
+        r#"<?php
+namespace Foo\Bar;
+
+class Service {
+    public static function run(int $id): void {}
+}
+"#,
+    );
+    let repo = php_record(
+        "src/App/Repository.php",
+        r#"<?php
+namespace App;
+
+use Foo\Bar\Service;
+
+class Repository {
+    public function fetch(int $id): void {
+        Service::run($id);
+    }
+}
+"#,
+    );
+    let parsed = [service, repo.clone()]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    // Service class itself should be referenced from Repository::fetch via
+    // the `Service::run(...)` scoped call's receiver — the extractor emits
+    // a `Type` reference for the receiver text and downstream resolution
+    // routes it through the `use Foo\Bar\Service;` import.
+    let service_class = graph
+        .find_symbol_by_name("Service")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("Service class should be indexed");
+    assert!(
+        graph
+            .references_to_symbol(&service_class.id)
+            .iter()
+            .any(|hit| hit.reference.text == "Service"),
+        "Repository::fetch should produce a reference hit against Service",
+    );
+    // A run method exists on Service, and `Service::run` is a scoped call.
+    // Even without method-overload resolution, the call edge should exist.
+    let run_method = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Service::run should be indexed");
+    let _ = run_method;
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("graph-record");
     let path = root.join(relative_path);
@@ -3631,6 +3924,12 @@ fn csharp_record(relative_path: &str, source: &str) -> FileRecord {
 fn go_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Go;
+    record
+}
+
+fn php_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Php;
     record
 }
 

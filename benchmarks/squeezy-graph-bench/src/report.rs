@@ -82,6 +82,7 @@ pub(crate) struct BenchmarkReport {
     pub(crate) java_oracle: Option<JavaOracleReport>,
     pub(crate) csharp_oracle: Option<CsharpOracleReport>,
     pub(crate) go_oracle: Option<GoOracleReport>,
+    pub(crate) php_oracle: Option<PhpOracleReport>,
     pub(crate) refresh_probe: Option<RefreshProbeReport>,
     pub(crate) heuristic_iterations: Vec<HeuristicIterationReport>,
     pub(crate) queries: Vec<QueryReport>,
@@ -321,6 +322,18 @@ pub(crate) struct GoOracleReport {
     pub(crate) oracle_unparseable_files: usize,
     pub(crate) oracle_unparseable_examples: Vec<String>,
     pub(crate) symbols: AccuracySetReport,
+    pub(crate) limitations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PhpOracleReport {
+    pub(crate) oracle_ms: Option<u128>,
+    pub(crate) status: String,
+    pub(crate) oracle_unparseable_files: usize,
+    pub(crate) oracle_unparseable_examples: Vec<String>,
+    pub(crate) symbols: AccuracySetReport,
+    pub(crate) edges: AccuracySetReport,
+    pub(crate) navigation: QueryOracleReport,
     pub(crate) limitations: Vec<String>,
 }
 
