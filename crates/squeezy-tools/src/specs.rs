@@ -381,7 +381,7 @@ pub(crate) fn decl_search_spec() -> ToolSpec {
 pub(crate) fn definition_search_spec() -> ToolSpec {
     ToolSpec {
         name: "definition_search".to_string(),
-        description: "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?' or 'name one nearby declaration'. Use before flow tools when a name may be ambiguous, but do not also call decl_search or symbol_context for the same query unless this result is insufficient.".to_string(),
+        description: "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?' or 'name one nearby declaration'. Pass the bare symbol name (e.g. `castPath`), not a file path — use `path=` to restrict to a file. Use before flow tools when a name may be ambiguous, but do not also call decl_search or symbol_context for the same query unless this result is insufficient.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -523,7 +523,7 @@ pub(crate) fn read_slice_spec() -> ToolSpec {
 pub(crate) fn symbol_context_spec() -> ToolSpec {
     ToolSpec {
         name: "symbol_context".to_string(),
-        description: "Return compact graph-backed context for symbols matching a declaration query, including callers, callees, references, dirty/diff annotations, and evidence packets. Use when the user asks for relationships, callers, references, or impact. Avoid for simple definition/file lookup already answered by definition_search.".to_string(),
+        description: "Return compact graph-backed context for symbols matching a declaration query, including callers, callees, references, dirty/diff annotations, and evidence packets. Use when the user asks for relationships, callers, references, or impact. Pass the bare symbol name (e.g. `castPath`), not a file path — use `path=` to restrict to a file. Avoid for simple definition/file lookup already answered by definition_search.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
