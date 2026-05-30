@@ -322,6 +322,23 @@ impl SemanticGraph {
             );
         }
 
+        // PHP's `$this->method()` and `self::`/`static::`/`parent::method()`
+        // need the cross-file ancestor walk to traverse `UsesTrait` edges
+        // alongside the `Extends` parent and `Implements` interfaces. The
+        // generic `inherited_python_method` only knows about `base:`
+        // attributes, so trait methods cross-file would otherwise fall
+        // through to the candidate-set rule and stay unresolved.
+        if call.kind == ParsedCallKind::Method
+            && let Some(callee) = self.inherited_php_method(caller_id, call)
+        {
+            return (
+                Some(callee),
+                Confidence::Heuristic,
+                "inherited php trait or class",
+                Vec::new(),
+            );
+        }
+
         let candidates = self
             .symbols_by_name_or_scan(&call.name)
             .into_iter()

@@ -4676,6 +4676,310 @@ class Repository {
 }
 
 #[test]
+fn graph_resolves_php_this_call_through_single_trait() {
+    let mut parser = LanguageParser::new().unwrap();
+    let trait_file = php_record(
+        "src/Foo/Bar/Loggable.php",
+        "<?php\nnamespace Foo\\Bar;\n\ntrait Loggable { public function log(): void {} }\n",
+    );
+    let class_file = php_record(
+        "src/Foo/Bar/Service.php",
+        r#"<?php
+namespace Foo\Bar;
+
+class Service {
+    use Loggable;
+
+    public function run(): void {
+        $this->log();
+    }
+}
+"#,
+    );
+    let parsed = [trait_file, class_file.clone()]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let run = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Service::run should be indexed");
+    let log = graph
+        .find_symbol_by_name("log")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Loggable::log should be indexed");
+
+    let call_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == run.id && edge.kind == EdgeKind::Calls)
+        .expect("expected a Calls edge from Service::run");
+    assert_eq!(
+        call_edge.to.as_ref(),
+        Some(&log.id),
+        "$this->log() should resolve to Loggable::log via the UsesTrait ancestor walk",
+    );
+    assert_eq!(call_edge.confidence, Confidence::Heuristic);
+}
+
+#[test]
+fn graph_resolves_php_this_call_through_multiple_traits_in_order() {
+    let mut parser = LanguageParser::new().unwrap();
+    let trait_a = php_record(
+        "src/Foo/TraitA.php",
+        "<?php\nnamespace Foo;\n\ntrait TraitA { public function a(): void {} }\n",
+    );
+    let trait_b = php_record(
+        "src/Foo/TraitB.php",
+        "<?php\nnamespace Foo;\n\ntrait TraitB { public function b(): void {} }\n",
+    );
+    let class_file = php_record(
+        "src/Foo/Multi.php",
+        r#"<?php
+namespace Foo;
+
+class Multi {
+    use TraitA, TraitB;
+
+    public function run(): void {
+        $this->b();
+    }
+}
+"#,
+    );
+    let parsed = [trait_a, trait_b, class_file.clone()]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let run = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Multi::run should be indexed");
+    let b_method = graph
+        .find_symbol_by_name("b")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("TraitB::b should be indexed");
+
+    let call_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == run.id && edge.kind == EdgeKind::Calls)
+        .expect("expected a Calls edge from Multi::run");
+    assert_eq!(
+        call_edge.to.as_ref(),
+        Some(&b_method.id),
+        "$this->b() should land on TraitB::b via the trait walk; got {:?}",
+        call_edge.to,
+    );
+}
+
+#[test]
+fn graph_resolves_php_own_method_over_trait_method() {
+    let mut parser = LanguageParser::new().unwrap();
+    let trait_file = php_record(
+        "src/Foo/Bar/Loggable.php",
+        "<?php\nnamespace Foo\\Bar;\n\ntrait Loggable { public function log(): void {} }\n",
+    );
+    let class_file = php_record(
+        "src/Foo/Bar/Service.php",
+        r#"<?php
+namespace Foo\Bar;
+
+class Service {
+    use Loggable;
+
+    public function log(): void {}
+
+    public function run(): void {
+        $this->log();
+    }
+}
+"#,
+    );
+    let parsed = [trait_file, class_file.clone()]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let run = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Service::run should be indexed");
+    let service_class = graph
+        .find_symbol_by_name("Service")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("Service class should be indexed");
+    // The own method on the class is the `log` whose parent_id is the
+    // Service class — distinguish it from the trait's `log`.
+    let own_log = graph
+        .find_symbol_by_name("log")
+        .into_iter()
+        .find(|symbol| {
+            symbol.kind == SymbolKind::Method
+                && symbol.parent_id.as_ref() == Some(&service_class.id)
+        })
+        .expect("Service::log should be indexed");
+
+    let call_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == run.id && edge.kind == EdgeKind::Calls)
+        .expect("expected a Calls edge from Service::run");
+    assert_eq!(
+        call_edge.to.as_ref(),
+        Some(&own_log.id),
+        "Service::log must shadow the trait's log; got {:?}",
+        call_edge.to,
+    );
+}
+
+#[test]
+fn graph_resolves_php_diamond_trait_inclusion() {
+    let mut parser = LanguageParser::new().unwrap();
+    let trait_b = php_record(
+        "src/Foo/B.php",
+        "<?php\nnamespace Foo;\n\ntrait B { public function ping(): void {} }\n",
+    );
+    let trait_a = php_record(
+        "src/Foo/A.php",
+        r#"<?php
+namespace Foo;
+
+trait A {
+    use B;
+}
+"#,
+    );
+    let class_file = php_record(
+        "src/Foo/Diamond.php",
+        r#"<?php
+namespace Foo;
+
+class Diamond {
+    use A;
+
+    public function run(): void {
+        $this->ping();
+    }
+}
+"#,
+    );
+    let parsed = [trait_b, trait_a, class_file.clone()]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let run = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Diamond::run should be indexed");
+    let ping = graph
+        .find_symbol_by_name("ping")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("B::ping should be indexed");
+
+    let call_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == run.id && edge.kind == EdgeKind::Calls)
+        .expect("expected a Calls edge from Diamond::run");
+    assert_eq!(
+        call_edge.to.as_ref(),
+        Some(&ping.id),
+        "$this->ping() must follow the A→B trait chain to reach B::ping; got {:?}",
+        call_edge.to,
+    );
+}
+
+#[test]
+fn graph_resolves_php_this_call_across_files_through_trait() {
+    let mut parser = LanguageParser::new().unwrap();
+    // The trait lives in `lib/`, the class in `src/`. Cross-directory
+    // placement is the case the cross-file walker is built for: the
+    // resolver must traverse the `UsesTrait` edge regardless of where the
+    // trait file sits in the workspace.
+    let trait_file = php_record(
+        "lib/Loggable.php",
+        "<?php\nnamespace Foo\\Bar;\n\ntrait Loggable { public function log(): void {} }\n",
+    );
+    let class_file = php_record(
+        "src/User.php",
+        r#"<?php
+namespace Foo\Bar;
+
+class User {
+    use Loggable;
+
+    public function emit(): void {
+        $this->log();
+    }
+}
+"#,
+    );
+    let parsed = [trait_file, class_file.clone()]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let emit = graph
+        .find_symbol_by_name("emit")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("User::emit should be indexed");
+    let log = graph
+        .find_symbol_by_name("log")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Loggable::log should be indexed");
+
+    let call_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == emit.id && edge.kind == EdgeKind::Calls)
+        .expect("expected a Calls edge from User::emit");
+    assert_eq!(
+        call_edge.to.as_ref(),
+        Some(&log.id),
+        "$this->log() must reach Loggable::log across files via the UsesTrait edge",
+    );
+}
+
+#[test]
 fn ruby_top_level_function_emitted_as_function_symbol() {
     let mut parser = LanguageParser::new().unwrap();
     let record = ruby_record(
