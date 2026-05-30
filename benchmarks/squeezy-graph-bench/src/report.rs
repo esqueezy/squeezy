@@ -332,6 +332,7 @@ pub(crate) struct SwiftOracleReport {
     pub(crate) oracle_unparseable_files: usize,
     pub(crate) oracle_unparseable_examples: Vec<String>,
     pub(crate) symbols: AccuracySetReport,
+    pub(crate) navigation_accuracy: NavigationAccuracyReport,
     pub(crate) limitations: Vec<String>,
 }
 

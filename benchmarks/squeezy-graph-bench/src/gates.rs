@@ -74,6 +74,35 @@ pub(crate) fn enforce_gates(report: &BenchmarkReport, no_speed_gate: bool) -> Re
                 )));
             }
         }
+        // Spec §10: navigation probe gates. Only enforce when probes
+        // actually ran (sourcekit-lsp present + probe_limit > 0). When
+        // the LSP is unavailable the probe report is empty and the
+        // accuracy stays at the f64 default of 1.0; gate that off the
+        // `probes` count so a missing toolchain does not trip the
+        // gate. Mirrors the symbol gate pattern above and the existing
+        // Rust-side nav-accuracy treatment (no hard gate — observed by
+        // hand on rust corpus today).
+        let nav = &swift.navigation_accuracy;
+        if nav.definitions.probes > 0 && nav.definitions.precision < 0.85 {
+            return Err(SqueezyError::Graph(format!(
+                "Swift definition precision {:.3} below 0.85 gate (probes={} tp={} fp={} fn={})",
+                nav.definitions.precision,
+                nav.definitions.probes,
+                nav.definitions.true_positive,
+                nav.definitions.false_positive,
+                nav.definitions.false_negative,
+            )));
+        }
+        if nav.references.symbols_sampled > 0 && nav.references.precision < 0.80 {
+            return Err(SqueezyError::Graph(format!(
+                "Swift reference precision {:.3} below 0.80 gate (symbols={} tp={} fp={} fn={})",
+                nav.references.precision,
+                nav.references.symbols_sampled,
+                nav.references.true_positive,
+                nav.references.false_positive,
+                nav.references.false_negative,
+            )));
+        }
     }
 
     if let Some(mixed) = &report.mixed_workload

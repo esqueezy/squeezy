@@ -269,6 +269,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         BenchmarkLanguage::Swift => Some(crate::oracles::swift_sourcekit::collect_swift_oracle_accuracy(
             &args.fixture,
             &graph,
+            args.ra_lsp_probes,
         )?),
         _ => None,
     };

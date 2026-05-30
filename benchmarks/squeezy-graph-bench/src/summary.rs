@@ -148,6 +148,7 @@ pub(crate) fn print_summary(report: &BenchmarkReport) {
             swift.oracle_ms,
             swift.status,
         );
+        print_navigation_summary("swift_oracle", &swift.navigation_accuracy);
     }
     if let Some(refresh) = &report.refresh_probe {
         println!(
