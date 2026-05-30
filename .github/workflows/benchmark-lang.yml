@@ -35,6 +35,7 @@ on:
           - rust
           - python
           - java
+          - scala
           - go
           - c-family
           - csharp
@@ -61,7 +62,7 @@ jobs:
   benchmark:
     name: ${{ inputs.language }} benchmark
     runs-on: ${{ inputs.language == 'rust' && 'macos-latest' || 'ubuntu-latest' }}
-    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp') && 90 || inputs.language == 'go' && 60 || 120 }}
+    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp') && 90 || inputs.language == 'go' && 60 || inputs.language == 'scala' && 90 || 120 }}
 
     steps:
       - name: Checkout

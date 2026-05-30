@@ -80,6 +80,7 @@ pub(crate) struct BenchmarkReport {
     pub(crate) python_oracle: Option<PythonOracleReport>,
     pub(crate) js_ts_oracle: Option<JsTsOracleReport>,
     pub(crate) java_oracle: Option<JavaOracleReport>,
+    pub(crate) scala_oracle: Option<ScalaOracleReport>,
     pub(crate) csharp_oracle: Option<CsharpOracleReport>,
     pub(crate) go_oracle: Option<GoOracleReport>,
     pub(crate) refresh_probe: Option<RefreshProbeReport>,
@@ -311,6 +312,16 @@ pub(crate) struct CsharpOracleReport {
     pub(crate) oracle_unparseable_examples: Vec<String>,
     pub(crate) symbols: AccuracySetReport,
     pub(crate) edges: AccuracySetReport,
+    pub(crate) limitations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ScalaOracleReport {
+    pub(crate) oracle_ms: Option<u128>,
+    pub(crate) status: String,
+    pub(crate) oracle_unparseable_files: usize,
+    pub(crate) oracle_unparseable_examples: Vec<String>,
+    pub(crate) symbols: AccuracySetReport,
     pub(crate) limitations: Vec<String>,
 }
 

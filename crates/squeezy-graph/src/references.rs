@@ -161,7 +161,7 @@ impl SemanticGraph {
     ) -> bool {
         self.imports_for_file(&reference.file_id)
             .filter(|import| self.import_visible_from_reference(import, reference))
-            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
+            .filter(|import| !crate::is_package_marker_alias(import.alias.as_deref()))
             .filter(|import| import.alias.as_deref() == Some(reference.text.as_str()))
             .any(|import| self.import_matches_symbol(import, symbol))
     }
@@ -230,7 +230,7 @@ impl SemanticGraph {
         let reference_name = last_path_segment(&reference.text);
         if self
             .imports_for_file(&reference.file_id)
-            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
+            .filter(|import| !crate::is_package_marker_alias(import.alias.as_deref()))
             .any(|import| {
                 if import.is_glob
                     || !import.span.contains_byte(reference.span.start_byte)
@@ -263,7 +263,7 @@ impl SemanticGraph {
             return false;
         }
         self.imports_for_file(&reference.file_id).any(|import| {
-            if import.alias.as_deref() == Some("__java_package__") {
+            if crate::is_package_marker_alias(import.alias.as_deref()) {
                 return false;
             }
             if path_starts_with_external_root(&import.path, self.reference_language(reference)) {
@@ -321,7 +321,7 @@ impl SemanticGraph {
             return true;
         }
         self.imports_for_file(&reference.file_id)
-            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
+            .filter(|import| !crate::is_package_marker_alias(import.alias.as_deref()))
             .any(|import| {
                 let alias_or_name = import
                     .alias
@@ -342,6 +342,9 @@ impl SemanticGraph {
         let symbol_language = self.files.get(&symbol.file_id).map(|file| file.language);
         if symbol_language == Some(squeezy_core::LanguageKind::Java) {
             return self.java_import_matches_symbol(import, symbol);
+        }
+        if symbol_language == Some(squeezy_core::LanguageKind::Scala) {
+            return self.scala_import_matches_symbol(import, symbol);
         }
         if symbol_language.map(is_js_ts_language).unwrap_or(false) {
             return self.js_ts_import_matches_symbol(import, symbol);

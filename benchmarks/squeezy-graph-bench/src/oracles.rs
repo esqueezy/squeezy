@@ -9,6 +9,7 @@ pub(crate) mod go_types;
 pub(crate) mod javac;
 pub(crate) mod roslyn;
 pub(crate) mod rust_analyzer;
+pub(crate) mod scala_semanticdb;
 pub(crate) mod tsc;
 
 pub(crate) use clang::*;
@@ -18,6 +19,7 @@ pub(crate) use go_types::*;
 pub(crate) use javac::*;
 pub(crate) use roslyn::*;
 pub(crate) use rust_analyzer::*;
+pub(crate) use scala_semanticdb::*;
 pub(crate) use tsc::*;
 
 pub trait LanguageOracle: Sync {
@@ -64,6 +66,11 @@ static JAVAC: OracleDescriptor = OracleDescriptor {
     family: LanguageFamily::Java,
     language: BenchmarkLanguage::Java,
 };
+static SCALA_SEMANTICDB: OracleDescriptor = OracleDescriptor {
+    id: "scala_semanticdb",
+    family: LanguageFamily::Scala,
+    language: BenchmarkLanguage::Scala,
+};
 static ROSLYN: OracleDescriptor = OracleDescriptor {
     id: "roslyn",
     family: LanguageFamily::CSharp,
@@ -85,10 +92,11 @@ static TSC: OracleDescriptor = OracleDescriptor {
     language: BenchmarkLanguage::TypeScript,
 };
 
-static ORACLES: [&'static dyn LanguageOracle; 7] = [
+static ORACLES: [&'static dyn LanguageOracle; 8] = [
     &RUST_ANALYZER,
     &CPYTHON_AST,
     &JAVAC,
+    &SCALA_SEMANTICDB,
     &ROSLYN,
     &GO_TYPES,
     &CLANG,

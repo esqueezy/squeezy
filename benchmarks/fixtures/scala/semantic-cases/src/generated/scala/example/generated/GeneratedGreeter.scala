@@ -1,0 +1,7 @@
+package example.generated
+
+// Marker file used to exercise the `src/generated/scala` source-root
+// classification. Mirrors the Java fixture; not consumed by the runtime.
+final case class GeneratedGreeter(channel: String) {
+  def greet(name: String): String = s"[$channel] hi $name"
+}

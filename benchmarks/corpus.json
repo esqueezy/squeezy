@@ -39,6 +39,16 @@
       "ra_lsp_probes": 0
     },
     {
+      "name": "scala-smoke",
+      "family": "scala",
+      "language": "scala",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/scala/semantic-cases",
+      "spec": "benchmarks/specs/scala-smoke-queries.json",
+      "report": "scala/scala-smoke.json",
+      "ra_lsp_probes": 0
+    },
+    {
       "name": "go-smoke",
       "family": "go",
       "language": "go",
@@ -696,6 +706,22 @@
         "url": "https://github.com/prettier/prettier",
         "rev": "6ae5fecd46f1a787c9cac9531420c510ec8d2c0d",
         "checkout": "target/benchmark-repos/prettier"
+      }
+    },
+    {
+      "name": "utest",
+      "family": "scala",
+      "language": "scala",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/utest/utest/src",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "scala/utest.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/com-lihaoyi/utest",
+        "rev": "fb8aa9ddb73153e1693d072464d2ddf6976631ba",
+        "checkout": "target/benchmark-repos/utest"
       }
     }
   ]

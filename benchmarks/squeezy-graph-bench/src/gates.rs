@@ -46,6 +46,17 @@ pub(crate) fn enforce_gates(report: &BenchmarkReport, no_speed_gate: bool) -> Re
         )));
     }
 
+    if !no_speed_gate
+        && let Some(scala) = &report.scala_oracle
+        && !scala.status.starts_with("skipped")
+        && (scala.symbols.precision < 0.90 || scala.symbols.recall < 0.75)
+    {
+        return Err(SqueezyError::Graph(format!(
+            "Scala oracle accuracy below gate: precision={:.3} recall={:.3}",
+            scala.symbols.precision, scala.symbols.recall
+        )));
+    }
+
     if let Some(mixed) = &report.mixed_workload
         && mixed.refresh_probe.reparsed_files != mixed.refresh_probe.edited_files
     {
