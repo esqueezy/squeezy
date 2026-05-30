@@ -6318,6 +6318,42 @@ fn common_errors_get_actionable_status_text() {
 }
 
 #[test]
+fn non_retryable_provider_request_drops_retry_hint() {
+    let marker = squeezy_llm::anthropic_error::NON_RETRYABLE_MARKER;
+    let payload = format!(
+        "{marker}Anthropic rejected request (invalid_request_error): thinking.enabled.budget_tokens must be >= 1024. Raise max_output_tokens to at least 1025 or lower reasoning_effort.",
+    );
+    let status = format_error_status(&SqueezyError::ProviderRequest(payload));
+    assert!(
+        !status.contains("retry or check provider/network status"),
+        "non-retryable status must not advertise a bogus retry: {status}",
+    );
+    assert!(
+        !status.contains("[non-retryable]"),
+        "sentinel marker must not leak into the user-facing status: {status}",
+    );
+    assert!(
+        status.contains("Anthropic rejected request"),
+        "human prose must survive: {status}",
+    );
+    assert!(
+        status.contains("max_output_tokens"),
+        "next-step hint must survive: {status}",
+    );
+}
+
+#[test]
+fn retryable_provider_request_keeps_retry_hint() {
+    let status = format_error_status(&SqueezyError::ProviderRequest(
+        "Anthropic rejected request (overloaded_error): Overloaded".into(),
+    ));
+    assert!(
+        status.contains("retry or check provider/network status"),
+        "5xx-style errors keep the retry suffix: {status}",
+    );
+}
+
+#[test]
 fn repo_status_handles_non_git_roots() {
     let config = AppConfig {
         workspace_root: std::env::temp_dir(),
