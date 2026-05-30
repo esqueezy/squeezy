@@ -128,6 +128,12 @@ pub(crate) struct ConfigScreenState {
     /// user presses Enter on a Reset-section row; cleared by `y` (after the
     /// delete fires) or `n` / Esc (cancel).
     pub reset_confirm: Option<ConfigScope>,
+    /// Pending "discard everything written this session" awaiting `y/n`
+    /// confirmation. Set when the user presses Shift+X in browse mode;
+    /// cleared by `y` (after the discard fires) or `n` / Esc (cancel).
+    /// Without a confirmation gate, a stray capital X would silently
+    /// undo every save made since the screen opened.
+    pub discard_confirm: bool,
     pub effective: AppConfig,
     pub sources: SeparatedSources,
     pub dirty: bool,
@@ -302,7 +308,12 @@ impl ConfigScreenState {
             ),
         ];
         Self {
-            scope: ConfigScope::Local,
+            // Default to the User tab — it's the most relevant tier for
+            // first-time users (and the only one writable when there is
+            // no repo / project file yet). The tab strip renders
+            // User → Repo → Local left-to-right, so opening on the
+            // leftmost tab also matches reading order.
+            scope: ConfigScope::User,
             section_index,
             field_index: 0,
             editor: None,
@@ -310,6 +321,7 @@ impl ConfigScreenState {
             search: None,
             secret_entry: None,
             reset_confirm: None,
+            discard_confirm: false,
             effective,
             sources,
             dirty: false,
