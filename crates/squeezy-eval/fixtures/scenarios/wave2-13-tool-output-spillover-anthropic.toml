@@ -44,7 +44,7 @@ max_output_tokens = 2048
 
 [[steps]]
 kind = "prompt"
-text = "Run `grep -rE 'fn ' crates/ --include='*.rs'` via the shell tool and summarise the busiest module (which crate has the most function definitions). Use the shell tool exactly once."
+text = "Run `grep -rE 'fn ' crates/ --include='*.rs'` via the shell tool exactly once and summarise the busiest module (which crate has the most function definitions). Do not modify the command — the literal grep must run unaltered as a single shell call, with no pipes, redirections, `wc`, `head`, `sort`, or `&&` chains appended. Pass the command through verbatim."
 wait_for = "turn_completed"
 
 [expect]
