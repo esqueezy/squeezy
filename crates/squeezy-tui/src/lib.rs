@@ -9677,23 +9677,25 @@ const CONTEXT_BUDGET_HINT_PCT: u64 = 85;
 pub(crate) const CONTEXT_NUDGE_THRESHOLD_RATIO_PCT: u64 = 70;
 
 fn format_status_hints(app: &TuiApp) -> String {
+    let base = format_status_hint_base(app);
     // `app.status` carries the per-action acknowledgement string set
     // by `toggle_*`, `dispatch_command`, mode-switch, and friends.
-    // Until this prepend it was a write-only field — every handler
-    // dutifully reported "expanded transcript entry N" or "mode
-    // switched to plan" while no render site read the value, so the
-    // user pressing Ctrl+O / Ctrl+E got no visible feedback at all.
-    // Render the status alongside the help row whenever it's set to
-    // something other than the idle defaults so the keystroke
-    // confirms itself on screen.
+    // Before this branch surfaced anything visible the field was
+    // effectively write-only — keystrokes confirmed silently. When
+    // the value matches a user-action allowlist (toggle, mode switch,
+    // slash result, etc.), prepend it as a transient badge in FRONT
+    // of the full hint row so the user gets visible feedback without
+    // losing the help text. The ack stays put until the next state
+    // change overwrites `app.status` — that's fine: it's always
+    // adjacent to, not in place of, the affordance list.
     if let Some(transient) = transient_status_message(app) {
-        let suffix = format_status_hint_suffix(app);
-        return if suffix.is_empty() {
-            transient
-        } else {
-            format!("{transient} · {suffix}")
-        };
+        format!("{transient} · {base}")
+    } else {
+        base
     }
+}
+
+fn format_status_hint_base(app: &TuiApp) -> String {
     if let Some(pending) = app.pending_request_user_input.as_ref() {
         if pending.request.choices.is_empty() && pending.request.allow_freeform {
             return "type your answer · Enter send · Esc cancel".to_string();
@@ -9798,18 +9800,6 @@ fn transient_status_message(app: &TuiApp) -> Option<String> {
         .iter()
         .any(|prefix| status.starts_with(prefix))
         .then(|| status.to_string())
-}
-
-/// Suffix the help string that should accompany a transient status
-/// message. Mirrors the closest-fit default for the current TUI mode
-/// so the user always has the basic affordances visible alongside the
-/// acknowledgement.
-fn format_status_hint_suffix(app: &TuiApp) -> String {
-    if !app.prompt_queue.is_empty() {
-        format!("queued: {} · Ctrl+X Q reorder", app.prompt_queue.len())
-    } else {
-        "Ctrl-T full transcript · /help".to_string()
-    }
 }
 
 pub(crate) fn format_mcp_status(app: &TuiApp) -> String {
