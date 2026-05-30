@@ -4480,7 +4480,7 @@ fn reasoning_delta_renders_with_dim_italic() {
         .first()
         .expect("streaming reasoning emits a header line");
     assert!(
-        header.spans.iter().any(|s| s.content.contains("thinking…")
+        header.spans.iter().any(|s| s.content.contains("reasoning…")
             && s.style.add_modifier.contains(expected_modifiers)),
         "streaming header missing dim+italic: {header:?}",
     );
