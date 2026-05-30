@@ -9992,6 +9992,23 @@ const CONTEXT_BUDGET_HINT_PCT: u64 = 85;
 pub(crate) const CONTEXT_NUDGE_THRESHOLD_RATIO_PCT: u64 = 70;
 
 fn format_status_hints(app: &TuiApp) -> String {
+    // `app.status` carries the per-action acknowledgement string set
+    // by `toggle_*`, `dispatch_command`, mode-switch, and friends.
+    // Until this prepend it was a write-only field — every handler
+    // dutifully reported "expanded transcript entry N" or "mode
+    // switched to plan" while no render site read the value, so the
+    // user pressing Ctrl+O / Ctrl+E got no visible feedback at all.
+    // Render the status alongside the help row whenever it's set to
+    // something other than the idle defaults so the keystroke
+    // confirms itself on screen.
+    if let Some(transient) = transient_status_message(app) {
+        let suffix = format_status_hint_suffix(app);
+        return if suffix.is_empty() {
+            transient
+        } else {
+            format!("{transient} · {suffix}")
+        };
+    }
     if let Some(pending) = app.pending_request_user_input.as_ref() {
         if pending.request.choices.is_empty() && pending.request.allow_freeform {
             return "type your answer · Enter send · Esc cancel".to_string();
@@ -10051,6 +10068,63 @@ fn format_status_hints(app: &TuiApp) -> String {
         ));
     }
     base
+}
+
+/// Allowlisted prefixes for status strings the user explicitly
+/// triggered (toggle, mode switch, slash command result, prompt
+/// queue op). The agent's mid-turn `app.status` writes ("running
+/// grep", "queued shell", "thinking", subagent lifecycle) are NOT
+/// listed — those already surface via `turn_progress_segment` /
+/// `active_tool`, and double-rendering them would make every
+/// tool-call event flicker the hint row.
+const USER_ACTION_STATUS_PREFIXES: &[&str] = &[
+    "expanded ",
+    "collapsed ",
+    "mode switched ",
+    "already in ",
+    "stay in ",
+    "plan prompt dismissed",
+    "chord cancelled",
+    "exit cancelled",
+    "Ctrl+X…",
+    "transcript overlay",
+    "task panel ",
+    "/expand",
+    "/collapse",
+    "/statusline cancelled",
+    "no recent session",
+    "session quick-switch",
+    "resume failed",
+    "restored last prompt",
+    "nothing expandable",
+    "select a transcript entry",
+];
+
+/// `app.status` value to surface as a transient acknowledgement, or
+/// `None` when the current value is a lifecycle placeholder
+/// (`"ready"`, `"thinking"`, tool-progress writes) that the hint row
+/// shouldn't clobber.
+fn transient_status_message(app: &TuiApp) -> Option<String> {
+    let status = app.status.trim();
+    if status.is_empty() {
+        return None;
+    }
+    USER_ACTION_STATUS_PREFIXES
+        .iter()
+        .any(|prefix| status.starts_with(prefix))
+        .then(|| status.to_string())
+}
+
+/// Suffix the help string that should accompany a transient status
+/// message. Mirrors the closest-fit default for the current TUI mode
+/// so the user always has the basic affordances visible alongside the
+/// acknowledgement.
+fn format_status_hint_suffix(app: &TuiApp) -> String {
+    if !app.prompt_queue.is_empty() {
+        format!("queued: {} · Ctrl+X Q reorder", app.prompt_queue.len())
+    } else {
+        "Ctrl-O expand · Ctrl-E expand all · /help".to_string()
+    }
 }
 
 pub(crate) fn format_mcp_status(app: &TuiApp) -> String {
