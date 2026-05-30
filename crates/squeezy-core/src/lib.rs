@@ -237,8 +237,8 @@ pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
 // aborts on real workloads where the cost broker is already the
 // load-bearing safeguard.
 pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 10_000;
-pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 100_000_000;
-pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 50_000;
+pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 1_000_000_000;
+pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 1_000_000;
 // Last-resort belt on subagent model rounds. 1 000 rounds is well
 // above what real long-running agent sessions reach — by then the
 // `max_session_cost_usd_micros` broker has already capped the
