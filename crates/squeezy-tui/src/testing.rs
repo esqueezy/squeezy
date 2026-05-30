@@ -8,6 +8,7 @@
 //! frame, read transcript / status state. The internal struct keeps
 //! its 150-plus `pub(crate)` fields private to the crate.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use crossterm::event::KeyEvent;
@@ -40,22 +41,31 @@ impl TuiHarness {
     /// Build a harness around `config + provider`. Mirrors the
     /// preamble of `run_inner` (`apply_theme_overrides` then construct
     /// TuiApp + Agent) so palette and state line up with production.
+    ///
+    /// `settings_path_override` pins the user-scope settings file that
+    /// in-session slash commands (`/theme`, `/statusline`, …) persist
+    /// into. The eval driver passes a per-run scratch path so scenarios
+    /// can't clobber the operator's real `~/.squeezy/settings.toml`;
+    /// `None` keeps the production fallback
+    /// (`squeezy_core::default_settings_path`).
     pub fn new(
         config: AppConfig,
         mode: SessionMode,
         provider: Arc<dyn LlmProvider>,
         width: u16,
         height: u16,
+        settings_path_override: Option<PathBuf>,
     ) -> Result<Self> {
         apply_theme_overrides(config.tui.theme);
         let agent = Agent::new(config.clone(), provider);
-        let app = TuiApp::new_with_clipboard(
+        let mut app = TuiApp::new_with_clipboard(
             "eval-harness",
             &config,
             mode,
             None,
             Box::new(NoopClipboard),
         );
+        app.set_settings_path_override(settings_path_override);
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend)
             .map_err(|e| SqueezyError::Terminal(format!("test backend init: {e}")))?;
@@ -75,6 +85,29 @@ impl TuiHarness {
         self.agent
             .as_mut()
             .expect("agent dropped before harness; this is a bug in TuiHarness")
+    }
+
+    /// In-crate access to the wrapped [`TuiApp`] for internal unit
+    /// tests that need to inspect or drive private TUI state directly
+    /// (e.g. asserting `settings_path_override` plumbing). Not part of
+    /// the public eval-driver API — external callers go through
+    /// [`send_keys`](Self::send_keys) and [`render_frame`](Self::render_frame).
+    #[cfg(test)]
+    pub(crate) fn app_mut(&mut self) -> &mut TuiApp {
+        &mut self.app
+    }
+
+    /// In-crate access to both [`TuiApp`] and [`Agent`] in one borrow,
+    /// for unit tests that need to drive `handle_slash_command` (which
+    /// takes both mutably) against the harness's internal state without
+    /// going through the async key-pump.
+    #[cfg(test)]
+    pub(crate) fn app_and_agent_mut(&mut self) -> (&mut TuiApp, &mut Agent) {
+        let agent = self
+            .agent
+            .as_mut()
+            .expect("agent dropped before harness; this is a bug in TuiHarness");
+        (&mut self.app, agent)
     }
 
     /// Start a user turn through the same code path the TUI uses for
