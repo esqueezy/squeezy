@@ -476,10 +476,15 @@ fn apply_overlay(
     if let Some(pm) = &overlay.permission_mode {
         let mode = PermissionMode::parse(pm)
             .ok_or_else(|| EvalError::Config(format!("unknown permission_mode: {pm}")))?;
-        // Apply uniformly to the gates the scenario most often wants to
-        // pin. Power users can shape these individually via settings.
+        // Apply uniformly across every gate the agent can request so a
+        // scenario's `permission_mode = "allow"` actually un-gates
+        // navigation tools (repo_map, grep) alongside the
+        // mutate-the-world gates. Power users can shape these
+        // individually via settings.
+        config.permissions.read = mode;
         config.permissions.edit = mode;
         config.permissions.shell = mode;
+        config.permissions.ignored_search = mode;
         config.permissions.web = mode;
         config.permissions.mcp = mode;
     }
