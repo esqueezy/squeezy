@@ -690,12 +690,16 @@ pub struct ToolResult {
 
 impl ToolResult {
     /// JSON-serialized payload sent to the LLM as the body of a
-    /// `FunctionCallOutput`. Only `self.content` is projected — the call
-    /// id is already carried by the wrapping `FunctionCallOutput` and the
-    /// rest of `ToolResult` (status, cost_hint, receipt) is telemetry the
-    /// model neither needs nor benefits from.
+    /// `FunctionCallOutput`. Only `status` and `content` are projected —
+    /// the call id is already carried by the wrapping `FunctionCallOutput`,
+    /// `tool_name` is already known to the model from the matching
+    /// `FunctionCall`, and `cost_hint` / `receipt` are telemetry-only.
     pub fn model_output(&self) -> String {
-        serde_json::to_string(&self.content)
+        let payload = json!({
+            "status": self.status,
+            "content": self.content,
+        });
+        serde_json::to_string(&payload)
             .unwrap_or_else(|_| json!({"error": "tool result serialization failed"}).to_string())
     }
 
