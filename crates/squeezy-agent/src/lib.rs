@@ -4904,7 +4904,30 @@ impl TurnRuntime {
                 .await;
                 return Ok(());
             }
-            if let Some(status) = broker.session_cap_reached() {
+            // Two-stage cost-cap check: the post-hoc `session_cap_reached`
+            // catches a session that crossed the cap on a prior round's
+            // recorded provider cost, while `projected_session_cap_overrun`
+            // is the *pre-flight* gate that refuses to dispatch the next
+            // round when the upcoming spend would push the running total
+            // past the cap. Without the second stage the cap can only fire
+            // after the over-cap tokens have already been billed (see
+            // bd ticket squeezy-xt2o / wave2-16 finding 2: anthropic run
+            // landed at 124% of cap before the post-hoc check tripped).
+            let cap_status = broker.session_cap_reached().or_else(|| {
+                let projected_input_tokens = estimate_context(&conversation).estimated_tokens;
+                let projected_output_tokens = CostBroker::projected_output_tokens(
+                    self.config.max_output_tokens,
+                    squeezy_llm::model_info_for(self.provider.name(), &self.config.model)
+                        .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
+                );
+                broker.projected_session_cap_overrun(
+                    self.provider.name(),
+                    &self.config.model,
+                    projected_input_tokens,
+                    projected_output_tokens,
+                )
+            });
+            if let Some(status) = cap_status {
                 self.publish_terminal_task_state(
                     TaskStateStatus::Failed,
                     Some(format_cap_reached_reason(status)),
