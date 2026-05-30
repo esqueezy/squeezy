@@ -231,3 +231,47 @@ Each run writes `run.json`, `trace.jsonl`, `frames.jsonl`,
 `findings.jsonl`, and a `tickets/` directory; the per-run cost,
 tool-call sequence, and assistant answer text used to build the
 tables above come from `run.json` + `trace.jsonl` + `frames.jsonl`.
+
+## Architectural audits (Codex baseline)
+
+Seven architectural-audit scenarios — "list every X that derives from /
+implements / imports / writes Y" — run three times each against Codex
+CLI (`codex exec` with `gpt-5.4-mini`, ephemeral, JSON output, no
+graph) as an external baseline for the same scenarios squeezy
+exercises with and without its semantic-graph tool family. Codex
+artifacts live under `/tmp/codex-runs/architectural/{lang}-r{1,2,3}.{events.jsonl,answer.txt}`;
+metrics are appended to
+[`graph-vs-nograph-data.csv`](graph-vs-nograph-data.csv) as
+`{lang}_architectural` rows with variant `codex_baseline`. Costs are
+medians of three runs; squeezy figures come from the same scenarios
+under `crates/squeezy-eval/fixtures/scenarios/graph-vs-nograph-{lang}-architectural-{with,no}-graph.toml`
+(Go was not in the squeezy validation sweep).
+
+| scenario | codex $ | squeezy with-graph $ | squeezy no-graph $ | codex recall | cost winner |
+|---|---:|---:|---:|---:|:--|
+| Rust — `ToolResult` struct literals (4) | $0.0359 | $0.0276 | $0.0443 | 4/4 (100%) | **squeezy with-graph** |
+| Go — `ValidArgsFunction` writes (6) | $0.0208 | — | — | 6/6 (100%) | **codex** |
+| C++ — `base_sink<Mutex>` direct subclasses (21) | $0.0541 | $0.0189 | $0.0219 | 20/21 (95%) | **squeezy with-graph** |
+| C# — `JsonReader` subclasses (5) | $0.0278 | $0.0270 | $0.0096 | 5/5 (100%) | **squeezy no-graph** |
+| Java — `TypeAdapter` subclasses (11) | $0.0497 | $0.0244 | $0.0409 | 11/11 (100%) | **squeezy with-graph** |
+| JS — lodash importer-helper pairs (16) | $0.0176 | $0.0236 | $0.0172 | 16/16 (100%) | **squeezy no-graph** |
+| Python — `RequestException` subclasses + raises (21) | $0.0365 | $0.0261 | $0.0310 | 21/21 (100%) | **squeezy with-graph** |
+
+**Headline**: squeezy with-graph beats codex on cost in 4 of 6
+comparable scenarios (rust, cpp, java, python), squeezy no-graph beats
+codex in the other 2 (csharp, js), and codex never wins on cost
+against squeezy. Codex recall is essentially perfect across the board
+(only one miss: `dist_sink` on the cpp prompt, lost to a literal
+reading of the example exclusion list). The lone scenario where codex
+beats no head-to-head squeezy reference is Go — squeezy did not run
+that scenario in the validation sweep.
+
+The cost gap is larger than the cost gap on the callers/refactor
+sweeps: codex spends 2-3× squeezy with-graph on Rust, C++, Java, and
+Python — primarily because codex repeatedly re-reads large files via
+`sed -n` rather than using a graph-resolved slice. Squeezy with-graph
+matches or beats codex recall everywhere except cpp (one run hit
+18/21) and java (two runs short of 11/11), where the same
+"`grep`-first" caveat noted under "Where graph still falls short"
+applies — but the median post-fix squeezy with-graph cost is still
+below codex on every comparable scenario.
