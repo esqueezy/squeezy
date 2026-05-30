@@ -8596,7 +8596,7 @@ fn slash_parameter_hint_appears_in_render() {
 }
 
 #[test]
-fn slash_parameter_hint_uses_arg_hint_color() {
+fn slash_parameter_hint_uses_status_model_color() {
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/attach".to_string());
 
@@ -8623,8 +8623,8 @@ fn slash_parameter_hint_uses_arg_hint_color() {
     );
     assert_eq!(
         hint_span.style.fg,
-        Some(crate::render::palette::SLASH_ARG_HINT),
-        "parameter hints should render with the slash arg hint color"
+        Some(crate::render::palette::ACCENT_CYAN),
+        "parameter hints should render with the status-line model color"
     );
 }
 

@@ -40,7 +40,6 @@ pub(crate) const SEPARATOR_BLUE: Color = Color::Rgb(96, 165, 250);
 pub(crate) const ACCENT_CYAN: Color = Color::Rgb(64, 158, 158);
 pub(crate) const ACCENT_GREEN: Color = Color::Rgb(64, 158, 64);
 pub(crate) const ACCENT_MAGENTA: Color = Color::Rgb(158, 64, 158);
-pub(crate) const SLASH_ARG_HINT: Color = Color::Rgb(63, 67, 198);
 
 /// Inline-code foreground for the default branch in
 /// `inline_code_style_for` and for link text. Same cyan hue family as
