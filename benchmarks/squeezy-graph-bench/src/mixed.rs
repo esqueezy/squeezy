@@ -49,6 +49,10 @@ pub(crate) fn run_mixed_workload(
             None,
             "mixed workload unsupported for Kotlin".to_string(),
         ),
+        BenchmarkLanguage::Scala => (
+            None,
+            "mixed workload compiler check not used for Scala".to_string(),
+        ),
         BenchmarkLanguage::Rust => time_cargo_check_optional(repo),
         BenchmarkLanguage::Php => {
             let (ms, status) = time_php_oracle_optional(repo);
@@ -101,6 +105,9 @@ pub(crate) fn run_mixed_workload(
         }
         BenchmarkLanguage::Python => empty_accuracy("mixed workload unsupported for Python"),
         BenchmarkLanguage::Ruby => empty_accuracy("mixed workload unsupported for Ruby"),
+        BenchmarkLanguage::Scala => {
+            empty_accuracy("mixed workload accuracy oracle not used for Scala")
+        }
         BenchmarkLanguage::Swift => empty_accuracy("mixed workload unsupported for Swift"),
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
             collect_js_ts_accuracy(repo, &graph, ra_lsp_probes)

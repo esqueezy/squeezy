@@ -12,6 +12,7 @@ pub(crate) mod php_oracle;
 pub(crate) mod roslyn;
 pub(crate) mod ruby_oracle;
 pub(crate) mod rust_analyzer;
+pub(crate) mod scala_semanticdb;
 pub(crate) mod swift_sourcekit;
 pub(crate) mod tsc;
 
@@ -25,6 +26,7 @@ pub(crate) use php_oracle::*;
 pub(crate) use roslyn::*;
 pub(crate) use ruby_oracle::*;
 pub(crate) use rust_analyzer::*;
+pub(crate) use scala_semanticdb::*;
 pub(crate) use tsc::*;
 
 pub trait LanguageOracle: Sync {
@@ -76,6 +78,11 @@ static KOTLIN_ORACLE: OracleDescriptor = OracleDescriptor {
     family: LanguageFamily::Kotlin,
     language: BenchmarkLanguage::Kotlin,
 };
+static SCALA_SEMANTICDB: OracleDescriptor = OracleDescriptor {
+    id: "scala_semanticdb",
+    family: LanguageFamily::Scala,
+    language: BenchmarkLanguage::Scala,
+};
 static ROSLYN: OracleDescriptor = OracleDescriptor {
     id: "roslyn",
     family: LanguageFamily::CSharp,
@@ -112,11 +119,12 @@ static SOURCEKIT_LSP: OracleDescriptor = OracleDescriptor {
     language: BenchmarkLanguage::Swift,
 };
 
-static ORACLES: [&'static dyn LanguageOracle; 11] = [
+static ORACLES: [&'static dyn LanguageOracle; 12] = [
     &RUST_ANALYZER,
     &CPYTHON_AST,
     &JAVAC,
     &KOTLIN_ORACLE,
+    &SCALA_SEMANTICDB,
     &ROSLYN,
     &GO_TYPES,
     &CLANG,

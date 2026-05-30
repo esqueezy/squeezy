@@ -5011,6 +5011,469 @@ class B {}
     assert!(results.iter().all(|s| s.name != "B"));
 }
 
+#[test]
+fn graph_extracts_scala_package_imports_and_aliased_selectors() {
+    let mut parser = LanguageParser::new().unwrap();
+    let runner = scala_record(
+        "src/main/scala/example/app/Runner.scala",
+        r#"
+package example.app
+
+import example.util.Names.*
+import example.services.{Greeter, FriendlyGreeter as FG}
+import example.opaque.given
+
+class Runner
+"#,
+    );
+    let parsed = parser
+        .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+        .unwrap();
+    let package_import = parsed
+        .imports
+        .iter()
+        .find(|import| import.alias.as_deref() == Some("__scala_package__"))
+        .expect("scala package marker import");
+    assert_eq!(package_import.path, "example.app");
+
+    let star = parsed
+        .imports
+        .iter()
+        .find(|import| import.path == "example.util.Names.*")
+        .expect("wildcard");
+    assert!(star.is_glob);
+
+    let renamed = parsed
+        .imports
+        .iter()
+        .find(|import| {
+            import.path == "example.services.FriendlyGreeter"
+                && import.alias.as_deref() == Some("FG")
+        })
+        .expect("renamed selector via `as`");
+    assert_eq!(renamed.imported_name.as_deref(), Some("FriendlyGreeter"));
+
+    let plain = parsed
+        .imports
+        .iter()
+        .find(|import| import.path == "example.services.Greeter" && import.alias.is_none())
+        .expect("plain selector");
+    assert_eq!(plain.imported_name.as_deref(), Some("Greeter"));
+
+    let given_import = parsed
+        .imports
+        .iter()
+        .find(|import| import.alias.as_deref() == Some("__scala_import_given__"))
+        .expect("import a.b.given encoded with sentinel alias");
+    assert_eq!(given_import.path, "example.opaque");
+    assert!(given_import.is_glob);
+}
+
+#[test]
+fn graph_emits_case_class_as_struct_with_field_children() {
+    let mut parser = LanguageParser::new().unwrap();
+    let file = scala_record(
+        "src/main/scala/example/Point.scala",
+        r#"
+package example
+
+case class Point(x: Int, y: Int)
+"#,
+    );
+    let parsed = parser
+        .parse_source(&file, fs::read_to_string(&file.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let point = graph
+        .find_symbol_by_name("Point")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Struct)
+        .expect("case class emits Struct");
+    assert!(
+        point
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "scala:case-class"),
+        "case-class attribute is present"
+    );
+    for field_name in ["x", "y"] {
+        assert!(
+            graph
+                .find_symbol_by_name(field_name)
+                .into_iter()
+                .any(|symbol| symbol.kind == SymbolKind::Field
+                    && symbol.parent_id.as_ref() == Some(&point.id)),
+            "missing primary-constructor field {field_name}"
+        );
+    }
+}
+
+#[test]
+fn graph_pairs_class_and_object_as_companions() {
+    let mut parser = LanguageParser::new().unwrap();
+    let file = scala_record(
+        "src/main/scala/example/services/Greeter.scala",
+        r#"
+package example.services
+
+sealed trait Greeter {
+  def greet(name: String): String
+}
+
+object Greeter {
+  def default: Greeter = ???
+}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&file, fs::read_to_string(&file.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let trait_symbol = graph
+        .find_symbol_by_name("Greeter")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Trait)
+        .expect("Greeter trait");
+    let object_symbol = graph
+        .find_symbol_by_name("Greeter")
+        .into_iter()
+        .find(|symbol| {
+            symbol.kind == SymbolKind::Class
+                && symbol
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute == "scala:object")
+        })
+        .expect("Greeter companion object");
+    assert!(
+        trait_symbol
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "scala:companion-object:Greeter"),
+        "trait records companion-object attribute"
+    );
+    assert!(
+        object_symbol
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "scala:companion-of:Greeter"),
+        "object records companion-of attribute"
+    );
+}
+
+#[test]
+fn graph_emits_scala_enum_with_variants() {
+    let mut parser = LanguageParser::new().unwrap();
+    let file = scala_record(
+        "src/main/scala/example/util/Names.scala",
+        r#"
+package example.util
+
+enum Names {
+  case Alice, Bob, Carol
+}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&file, fs::read_to_string(&file.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let names_enum = graph
+        .find_symbol_by_name("Names")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Enum)
+        .expect("enum Names");
+    for variant in ["Alice", "Bob", "Carol"] {
+        assert!(
+            graph
+                .find_symbol_by_name(variant)
+                .into_iter()
+                .any(|symbol| symbol.kind == SymbolKind::Variant
+                    && symbol.parent_id.as_ref() == Some(&names_enum.id)),
+            "missing variant {variant}"
+        );
+    }
+}
+
+#[test]
+fn graph_emits_extension_method_with_receiver_identity() {
+    let mut parser = LanguageParser::new().unwrap();
+    let file = scala_record(
+        "src/main/scala/example/ext/StringOps.scala",
+        r#"
+package example.ext
+
+extension (s: String)
+  def shout: String = s.toUpperCase
+"#,
+    );
+    let parsed = parser
+        .parse_source(&file, fs::read_to_string(&file.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let shout = graph
+        .find_symbol_by_name("shout")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Function)
+        .expect("extension method shout");
+    assert_eq!(shout.language_identity.as_deref(), Some("String"));
+    assert!(
+        shout
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "scala:extension"),
+        "extension attribute marker present"
+    );
+}
+
+#[test]
+fn graph_emits_given_definition_as_partial_const() {
+    let mut parser = LanguageParser::new().unwrap();
+    let file = scala_record(
+        "src/main/scala/example/opaque/Money.scala",
+        r#"
+package example.opaque
+
+opaque type Money = BigDecimal
+
+given Ordering[Money] = ???
+"#,
+    );
+    let parsed = parser
+        .parse_source(&file, fs::read_to_string(&file.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let money_alias = graph
+        .find_symbol_by_name("Money")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::TypeAlias)
+        .expect("opaque type emits TypeAlias");
+    assert!(
+        money_alias
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "scala:opaque"),
+        "opaque modifier annotated"
+    );
+    let given = graph
+        .find_symbol_by_name("given_OrderingMoney")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Const)
+        .expect("anonymous given emits synthesized Const");
+    assert!(
+        given
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "scala:given"),
+        "given attribute"
+    );
+    assert!(
+        given
+            .attributes
+            .iter()
+            .any(|attribute| attribute.starts_with("scala:given-for:")),
+        "given-for attribute"
+    );
+    assert_eq!(given.confidence, Confidence::Partial);
+}
+
+#[test]
+fn graph_resolves_scala_top_level_def_call_within_same_package() {
+    let mut parser = LanguageParser::new().unwrap();
+    let helpers = scala_record(
+        "src/main/scala/example/util/Helpers.scala",
+        r#"
+package example.util
+
+def shared(): Int = 1
+"#,
+    );
+    let app = scala_record(
+        "src/main/scala/example/util/App.scala",
+        r#"
+package example.util
+
+class App {
+  def entry(): Int = shared()
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&helpers, fs::read_to_string(&helpers.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&app, fs::read_to_string(&app.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let shared = graph
+        .find_symbol_by_name("shared")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Function)
+        .expect("top-level def shared");
+    let entry = graph
+        .find_symbol_by_name("entry")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("App.entry method");
+    assert!(
+        graph.call_chain(&entry.id, &shared.id, 3).is_some(),
+        "same-package top-level def resolves unqualified"
+    );
+}
+
+#[test]
+fn graph_resolves_scala_companion_object_factory_call() {
+    let mut parser = LanguageParser::new().unwrap();
+    let greeter = scala_record(
+        "src/main/scala/example/services/Greeter.scala",
+        r#"
+package example.services
+
+trait Greeter {
+  def greet(name: String): String
+}
+
+object Greeter {
+  def default: Greeter = ???
+}
+"#,
+    );
+    let app = scala_record(
+        "src/main/scala/example/app/Runner.scala",
+        r#"
+package example.app
+
+import example.services.Greeter
+
+def buildDefault(): Greeter = Greeter.default
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&greeter, fs::read_to_string(&greeter.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&app, fs::read_to_string(&app.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let default_method = graph
+        .find_symbol_by_name("default")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Greeter.default factory");
+    let build_default = graph
+        .find_symbol_by_name("buildDefault")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Function)
+        .expect("buildDefault function");
+    assert!(
+        graph
+            .call_chain(&build_default.id, &default_method.id, 3)
+            .is_some(),
+        "Greeter.default resolves through companion object scope"
+    );
+}
+
+#[test]
+fn graph_resolves_scala_extension_method_on_string_receiver() {
+    let mut parser = LanguageParser::new().unwrap();
+    let ops = scala_record(
+        "src/main/scala/example/ext/StringOps.scala",
+        r#"
+package example.ext
+
+extension (s: String)
+  def shout: String = s.toUpperCase
+"#,
+    );
+    let app = scala_record(
+        "src/main/scala/example/app/Runner.scala",
+        r#"
+package example.app
+
+import example.ext.*
+
+def loud(): String = "hello".shout
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&ops, fs::read_to_string(&ops.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&app, fs::read_to_string(&app.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let shout = graph
+        .find_symbol_by_name("shout")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Function)
+        .expect("shout extension");
+    let loud = graph
+        .find_symbol_by_name("loud")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Function)
+        .expect("loud function");
+    assert!(
+        graph.call_chain(&loud.id, &shout.id, 3).is_some(),
+        "extension call resolves to monomorphic receiver"
+    );
+}
+
+#[test]
+fn graph_records_scala_package_marker_in_scala_package_by_file() {
+    let mut parser = LanguageParser::new().unwrap();
+    let file = scala_record(
+        "src/main/scala/example/app/Runner.scala",
+        r#"
+package example.app
+
+class Runner
+"#,
+    );
+    let parsed = parser
+        .parse_source(&file, fs::read_to_string(&file.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let package = graph
+        .scala_package_for_file(&FileId::new(file.relative_path.as_str()))
+        .expect("scala package indexed by file id");
+    assert_eq!(package, vec!["example", "app"]);
+}
+
+#[test]
+fn graph_emits_one_symbol_per_scala_multibinding_val() {
+    let mut parser = LanguageParser::new().unwrap();
+    let file = scala_record(
+        "src/main/scala/example/multi/Values.scala",
+        r#"
+package example.multi
+
+class Values {
+  val a, b, c: Int = 0
+}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&file, fs::read_to_string(&file.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    for name in ["a", "b", "c"] {
+        assert!(
+            graph
+                .find_symbol_by_name(name)
+                .into_iter()
+                .any(|symbol| symbol.kind == SymbolKind::Const),
+            "missing val binding {name}",
+        );
+    }
+}
+
 fn parsed_imports(graph: &SemanticGraph) -> impl Iterator<Item = &ParsedImport> {
     graph.imports.iter()
 }
@@ -5089,6 +5552,12 @@ fn kotlin_record(relative_path: &str, source: &str) -> FileRecord {
 fn php_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Php;
+    record
+}
+
+fn scala_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Scala;
     record
 }
 

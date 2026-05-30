@@ -104,6 +104,17 @@ pub(crate) fn enforce_gates(report: &BenchmarkReport, no_speed_gate: bool) -> Re
         )));
     }
 
+    if !no_speed_gate
+        && let Some(scala) = &report.scala_oracle
+        && !scala.status.starts_with("skipped")
+        && (scala.symbols.precision < 0.90 || scala.symbols.recall < 0.75)
+    {
+        return Err(SqueezyError::Graph(format!(
+            "Scala oracle accuracy below gate: precision={:.3} recall={:.3}",
+            scala.symbols.precision, scala.symbols.recall
+        )));
+    }
+
     // Spec §10: Swift first-PR thresholds. precision >= 0.92, recall >=
     // 0.80. The speed gate stays disabled per the corpus entry
     // (`no_speed_gate: true`). We enforce thresholds only when the

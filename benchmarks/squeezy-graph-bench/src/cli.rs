@@ -15,6 +15,7 @@ pub enum BenchmarkLanguage {
     Python,
     Ruby,
     Rust,
+    Scala,
     Swift,
     TypeScript,
 }
@@ -33,6 +34,7 @@ impl BenchmarkLanguage {
             "python" => Ok(Self::Python),
             "ruby" | "rb" => Ok(Self::Ruby),
             "rust" => Ok(Self::Rust),
+            "scala" => Ok(Self::Scala),
             "swift" => Ok(Self::Swift),
             "typescript" | "ts" | "js-ts" => Ok(Self::TypeScript),
             other => Err(SqueezyError::Graph(format!(
@@ -54,6 +56,7 @@ impl BenchmarkLanguage {
             Self::Python => "python",
             Self::Ruby => "ruby",
             Self::Rust => "rust",
+            Self::Scala => "scala",
             Self::Swift => "swift",
             Self::TypeScript => "typescript",
         }
@@ -72,6 +75,7 @@ impl BenchmarkLanguage {
             Self::Python => LanguageKind::Python,
             Self::Ruby => LanguageKind::Ruby,
             Self::Rust => LanguageKind::Rust,
+            Self::Scala => LanguageKind::Scala,
             Self::Swift => LanguageKind::Swift,
             Self::TypeScript => LanguageKind::TypeScript,
         }
@@ -119,6 +123,7 @@ impl BenchmarkLanguage {
             | Self::Kotlin
             | Self::Php
             | Self::Rust
+            | Self::Scala
             | Self::Swift
             | Self::TypeScript => "\n// squeezy refresh benchmark edit\n",
             Self::Python | Self::Ruby => "\n# squeezy refresh benchmark edit\n",
@@ -245,7 +250,7 @@ impl BenchmarkCommand {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: squeezy-graph-bench [--list-languages|--list-oracles]\n       squeezy-graph-bench --corpus <path> [--family all|rust|python|java|kotlin|go|c-family|csharp|js-ts|php|ruby|swift] [--tier smoke|full] [--report-dir <path>]\n       squeezy-graph-bench [--language rust|python|java|kotlin|c|cpp|csharp|go|javascript|typescript|js-ts|php|ruby|swift] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--oracle-files <n, default=250, 0=all>] [--no-speed-gate]"
+                        "usage: squeezy-graph-bench [--list-languages|--list-oracles]\n       squeezy-graph-bench --corpus <path> [--family all|rust|python|java|kotlin|scala|go|c-family|csharp|js-ts|php|ruby|swift] [--tier smoke|full] [--report-dir <path>]\n       squeezy-graph-bench [--language rust|python|java|kotlin|scala|c|cpp|csharp|go|javascript|typescript|js-ts|php|ruby|swift] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--oracle-files <n, default=250, 0=all>] [--no-speed-gate]"
                     );
                     std::process::exit(0);
                 }
@@ -273,6 +278,7 @@ impl BenchmarkCommand {
                     | "kotlin"
                     | "php"
                     | "ruby"
+                    | "scala"
                     | "swift"
             ) {
                 return Err(SqueezyError::Graph(format!(

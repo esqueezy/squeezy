@@ -129,6 +129,11 @@ export const languageRows: MatrixRow[] = [
     status: "first-class graph"
   },
   {
+    name: "Scala",
+    detail: "Packages, classes, traits, case classes, enums, companion objects, extension methods, given declarations, top-level defs, and Scala 3 imports.",
+    status: "first-class graph"
+  },
+  {
     name: "C#",
     detail: "Namespaces, types, members, partial links, inheritance, references, and .csproj/.sln project facts.",
     status: "first-class graph"

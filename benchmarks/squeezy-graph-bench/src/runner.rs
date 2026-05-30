@@ -17,9 +17,9 @@ use crate::{
         collect_java_oracle_accuracy, collect_js_ts_accuracy, collect_js_ts_oracle_accuracy,
         collect_kotlin_oracle_accuracy, collect_php_oracle_accuracy,
         collect_python_oracle_accuracy, collect_ruby_oracle_accuracy,
-        heuristic_iteration_reports, time_go_ast_oracle, time_java_oracle_optional,
-        time_js_ts_oracle, time_kotlin_oracle_optional, time_php_oracle_optional,
-        time_python_ast_oracle,
+        collect_scala_oracle_accuracy, heuristic_iteration_reports, time_go_ast_oracle,
+        time_java_oracle_optional, time_js_ts_oracle, time_kotlin_oracle_optional,
+        time_php_oracle_optional, time_python_ast_oracle, time_scala_oracle_optional,
     },
     report::*,
     summary::{print_summary, write_report},
@@ -185,6 +185,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         ),
         BenchmarkLanguage::Java => time_java_oracle_optional(&args.fixture),
         BenchmarkLanguage::Kotlin => time_kotlin_oracle_optional(&args.fixture),
+        BenchmarkLanguage::Scala => time_scala_oracle_optional(&args.fixture),
         BenchmarkLanguage::Rust => (time_cargo_check(&args.fixture)?, "cargo check".to_string()),
         BenchmarkLanguage::Python => (
             time_python_ast_oracle(&args.fixture)?,
@@ -237,6 +238,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
     let accuracy = match args.language {
         BenchmarkLanguage::Java => empty_accuracy("rust-analyzer oracle not used for Java"),
         BenchmarkLanguage::Kotlin => empty_accuracy("rust-analyzer oracle not used for Kotlin"),
+        BenchmarkLanguage::Scala => empty_accuracy("rust-analyzer oracle not used for Scala"),
         BenchmarkLanguage::Rust => collect_accuracy(&args.fixture, &graph, args.ra_lsp_probes),
         BenchmarkLanguage::CSharp => empty_accuracy("rust-analyzer oracle not used for C#"),
         BenchmarkLanguage::C | BenchmarkLanguage::Cpp => {
@@ -297,6 +299,10 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         )?),
         _ => None,
     };
+    let scala_oracle = match args.language {
+        BenchmarkLanguage::Scala => Some(collect_scala_oracle_accuracy(&args.fixture, &graph)?),
+        _ => None,
+    };
     let swift_oracle = match args.language {
         BenchmarkLanguage::Swift => Some(
             crate::oracles::swift_sourcekit::collect_swift_oracle_accuracy(&args.fixture, &graph)?,
@@ -336,6 +342,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         &js_ts_oracle,
         &java_oracle,
         &kotlin_oracle,
+        &scala_oracle,
         &csharp_oracle,
         &go_oracle,
         &php_oracle,
@@ -374,6 +381,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         js_ts_oracle,
         java_oracle,
         kotlin_oracle,
+        scala_oracle,
         csharp_oracle,
         go_oracle,
         php_oracle,
@@ -418,6 +426,7 @@ fn answer_quality_report(
     js_ts_oracle: &Option<JsTsOracleReport>,
     java_oracle: &Option<JavaOracleReport>,
     kotlin_oracle: &Option<KotlinOracleReport>,
+    scala_oracle: &Option<ScalaOracleReport>,
     csharp_oracle: &Option<CsharpOracleReport>,
     go_oracle: &Option<GoOracleReport>,
     php_oracle: &Option<PhpOracleReport>,
@@ -447,6 +456,7 @@ fn answer_quality_report(
         js_ts_oracle,
         java_oracle,
         kotlin_oracle,
+        scala_oracle,
         csharp_oracle,
         go_oracle,
         php_oracle,
@@ -476,6 +486,7 @@ fn oracle_summary(
     js_ts_oracle: &Option<JsTsOracleReport>,
     java_oracle: &Option<JavaOracleReport>,
     kotlin_oracle: &Option<KotlinOracleReport>,
+    scala_oracle: &Option<ScalaOracleReport>,
     csharp_oracle: &Option<CsharpOracleReport>,
     go_oracle: &Option<GoOracleReport>,
     php_oracle: &Option<PhpOracleReport>,
@@ -502,6 +513,12 @@ fn oracle_summary(
                 symbol_oracle_tuple(&accuracy.rust_analyzer_symbol_status, &accuracy.symbols)
             }),
         BenchmarkLanguage::Kotlin => kotlin_oracle
+            .as_ref()
+            .map(|oracle| symbol_oracle_tuple(&oracle.status, &oracle.symbols))
+            .unwrap_or_else(|| {
+                symbol_oracle_tuple(&accuracy.rust_analyzer_symbol_status, &accuracy.symbols)
+            }),
+        BenchmarkLanguage::Scala => scala_oracle
             .as_ref()
             .map(|oracle| symbol_oracle_tuple(&oracle.status, &oracle.symbols))
             .unwrap_or_else(|| {

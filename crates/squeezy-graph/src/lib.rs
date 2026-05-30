@@ -383,6 +383,7 @@ pub struct SemanticGraph {
     wildcard_aliased_imports: Vec<usize>,
     java_package_by_file: HashMap<FileId, Vec<String>>,
     kotlin_package_by_file: HashMap<FileId, Vec<String>>,
+    scala_package_by_file: HashMap<FileId, Vec<String>>,
     js_ts_resolver: JsTsResolver,
     /// Parallel index of `(file, name, arity) -> symbol` so the resolver
     /// can disambiguate overloaded callees by exact positional-parameter
@@ -455,6 +456,7 @@ impl SemanticGraph {
             wildcard_aliased_imports: Vec::new(),
             java_package_by_file: HashMap::new(),
             kotlin_package_by_file: HashMap::new(),
+            scala_package_by_file: HashMap::new(),
             js_ts_resolver: JsTsResolver::default(),
             arity_index: HashMap::new(),
             importers_by_file: HashMap::new(),
@@ -1385,7 +1387,7 @@ impl SemanticGraph {
             }
         }
         for import in &self.imports {
-            if is_package_marker(import) {
+            if crate::is_package_marker_alias(import.alias.as_deref()) {
                 continue;
             }
             let Some(slot) = self.resolver_slots.get_mut(&import.file_id) else {
@@ -1412,7 +1414,7 @@ impl SemanticGraph {
         // the same loop.
         let mut updates: HashMap<FileId, Vec<FileId>> = HashMap::new();
         for import in &self.imports {
-            if is_package_marker(import) {
+            if crate::is_package_marker_alias(import.alias.as_deref()) {
                 continue;
             }
             let target_name = import
@@ -1445,27 +1447,33 @@ impl SemanticGraph {
         self.wildcard_aliased_imports.clear();
         self.java_package_by_file.clear();
         self.kotlin_package_by_file.clear();
+        self.scala_package_by_file.clear();
         for (index, import) in self.imports.iter().enumerate() {
             self.imports_by_file
                 .entry(import.file_id.clone())
                 .or_default()
                 .push(index);
-            if import.alias.as_deref() == Some("__java_package__") {
+            if crate::is_package_marker_alias(import.alias.as_deref()) {
                 let segments = path_segments(&import.path);
                 if !segments.is_empty() {
-                    self.java_package_by_file
-                        .insert(import.file_id.clone(), segments);
+                    let alias = import.alias.as_deref().unwrap_or_default();
+                    match alias {
+                        "__scala_package__" => {
+                            self.scala_package_by_file
+                                .insert(import.file_id.clone(), segments);
+                        }
+                        "__kotlin_package__" => {
+                            self.kotlin_package_by_file
+                                .insert(import.file_id.clone(), segments);
+                        }
+                        _ => {
+                            self.java_package_by_file
+                                .insert(import.file_id.clone(), segments);
+                        }
+                    }
                 }
-                // Java package markers never name a target symbol; they live
-                // only in the by-file index. Skip both alias-target buckets.
-                continue;
-            }
-            if import.alias.as_deref() == Some("__kotlin_package__") {
-                let segments = path_segments(&import.path);
-                if !segments.is_empty() {
-                    self.kotlin_package_by_file
-                        .insert(import.file_id.clone(), segments);
-                }
+                // Package markers never name a target symbol; they live only
+                // in the by-file index. Skip both alias-target buckets.
                 continue;
             }
             if import.alias.is_none() {
@@ -2916,6 +2924,17 @@ fn path_starts_with_external_root(path: &str, language: LanguageKind) -> bool {
     externals.contains(&first_segment)
 }
 
+/// Returns true when `alias` is one of the package-marker sentinel aliases
+/// that language extractors stash on file-level `ParsedImport`s to encode
+/// the file's package path without inventing a dedicated field. These
+/// imports must be filtered out of regular import-resolution traversals.
+pub(crate) fn is_package_marker_alias(alias: Option<&str>) -> bool {
+    matches!(
+        alias,
+        Some("__java_package__") | Some("__kotlin_package__") | Some("__scala_package__"),
+    )
+}
+
 fn path_segments(path: &str) -> Vec<String> {
     path.split("::")
         .flat_map(|segment| segment.split('/'))
@@ -3164,10 +3183,7 @@ fn single_unique<I: IntoIterator<Item = SymbolId>>(iter: I) -> Option<SymbolId> 
 /// resolver, the importers index, and any code that maps imports to
 /// candidate symbols by name.
 pub(crate) fn is_package_marker(import: &ParsedImport) -> bool {
-    matches!(
-        import.alias.as_deref(),
-        Some("__java_package__") | Some("__kotlin_package__"),
-    )
+    is_package_marker_alias(import.alias.as_deref())
 }
 
 fn package_key(path: &str) -> String {

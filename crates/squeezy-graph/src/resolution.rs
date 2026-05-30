@@ -48,7 +48,7 @@ impl SemanticGraph {
 
     pub(crate) fn add_import_edges(&mut self, imports: &[ParsedImport]) {
         for import in imports {
-            if import.alias.as_deref() == Some("__java_package__") {
+            if crate::is_package_marker_alias(import.alias.as_deref()) {
                 continue;
             }
             let file_symbol_id = file_symbol_id(&import.file_id);
@@ -406,6 +406,22 @@ impl SemanticGraph {
                     Vec::new(),
                 );
             }
+            if let Some(id) = self.scala_companion_method(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "scala companion object",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.scala_extension_method(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "scala extension method",
+                    Vec::new(),
+                );
+            }
             if let Some(id) = self.arity_unique_candidate(&candidates, call) {
                 return (Some(id), Confidence::Heuristic, "arity match", Vec::new());
             }
@@ -481,6 +497,14 @@ impl SemanticGraph {
         }
         if let Some(id) = self.package_local_direct_call(&candidates, caller_id) {
             return (Some(id), Confidence::Heuristic, "package local", Vec::new());
+        }
+        if let Some(id) = self.scala_top_level_def(&candidates, caller_id, call) {
+            return (
+                Some(id),
+                Confidence::ImportResolved,
+                "scala top-level def",
+                Vec::new(),
+            );
         }
         if let Some(id) = self.arity_unique_candidate(&candidates, call) {
             return (Some(id), Confidence::Heuristic, "arity match", Vec::new());
@@ -668,7 +692,7 @@ impl SemanticGraph {
         for import in self
             .imports_for_file(&caller.file_id)
             .filter(|import| self.import_visible_from_symbol(import, caller))
-            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
+            .filter(|import| !crate::is_package_marker_alias(import.alias.as_deref()))
         {
             let alias_or_name = import
                 .alias
@@ -877,6 +901,9 @@ impl SemanticGraph {
         }
         if file.language == squeezy_core::LanguageKind::Kotlin {
             return self.kotlin_import_matches_symbol(import, symbol);
+        }
+        if file.language == squeezy_core::LanguageKind::Scala {
+            return self.scala_import_matches_symbol(import, symbol);
         }
         if is_js_ts_language(file.language) {
             return self.js_ts_import_matches_symbol(import, symbol);

@@ -7,4 +7,5 @@ pub(crate) mod kotlin;
 pub(crate) mod php;
 pub(crate) mod python;
 pub(crate) mod ruby;
+pub(crate) mod scala;
 pub(crate) mod swift;
