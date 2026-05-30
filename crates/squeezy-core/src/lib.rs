@@ -227,26 +227,49 @@ pub const DEFAULT_PROVIDER_POOL_MAX_IDLE_PER_HOST: u32 = u32::MAX;
 /// for hours by claiming a multi-day cooldown.
 pub const DEFAULT_PROVIDER_MAX_RETRY_DELAY_MS: u64 = 60_000;
 pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
-// Per-subagent-invocation budgets, sized so they never bind in
-// realistic use; the subagent's natural exit is the model emitting a
-// final answer with no tool calls.
+// Per-subagent-invocation budgets, sized so each is only ever
+// reached when something has demonstrably gone wrong (a stuck
+// retry loop, a runaway scan, a model that won't emit a final
+// answer). The natural exit path is the model emitting a final
+// answer with no tool calls; legitimate research work has plenty of
+// headroom under these numbers. Do NOT lower any of these in a
+// "more conservative defaults" pass — that creates false-positive
+// aborts on real workloads where the cost broker is already the
+// load-bearing safeguard.
 pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 10_000;
 pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 100_000_000;
 pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 50_000;
-// Emergency belt on subagent model rounds. Plan/Delegate/Review
-// subagents run full agent work, sized to match what real long-running
-// agent sessions reach in practice. The cost broker, cancellation
-// token, and per-tool-call truncations are the load-bearing safeguards;
-// this is the last-resort belt.
+// Last-resort belt on subagent model rounds. 1 000 rounds is well
+// above what real long-running agent sessions reach — by then the
+// `max_session_cost_usd_micros` broker has already capped the
+// subagent (1 000 rounds at gpt-5.4-mini pricing is roughly $5–$10
+// of spend, comfortably beyond the $5 default cap). Reaching this
+// cap is a signal that the cost broker was either disabled or
+// raised much higher than usual AND the model is failing to
+// converge, both of which already indicate "something went wrong"
+// — so it's safe to keep as a belt even when the user's principle
+// rules out false-positive limits.
 pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 1_000;
-// Wall-clock ceiling for a single subagent run. None of the per-call
-// budgets (tool calls, bytes, model rounds, summary tokens) measure elapsed
-// time, so a slow model stream or a chain of slow tool calls can pin the
-// parent indefinitely without ever tripping them. 300s sits well above the
-// median Explore/Plan/Review run while still guaranteeing the parent's turn
-// loop reclaims control on the order of minutes. Set to `0` in TOML or
-// `SQUEEZY_SUBAGENT_MAX_RUNTIME_SECS=0` to disable.
-pub const DEFAULT_SUBAGENT_MAX_RUNTIME_SECS: u64 = 300;
+// Wall-clock ceiling for a single subagent run. Disabled by default
+// (`0` = no cap). The earlier 300s default was a legacy carryover
+// from when the subagent's event channel didn't heartbeat back to
+// the parent: a subagent could go silent from the parent's
+// perspective for >60s, the parent's per-event timeout would fire,
+// and the parent would abort the turn while the subagent was still
+// legitimately working. That root cause is fixed now (the
+// subagent's `ToolProgress` heartbeats forward to the parent's tx,
+// so the parent's window resets on every subagent tool tick), so we
+// no longer need a wall-clock fallback to compensate. A subagent
+// doing real research work — `explore` walking a 50-file callgraph,
+// `delegate` reasoning through a multi-step plan — is no different
+// from the main agent's right to run for as long as the user is
+// willing to pay. The load-bearing safeguards are the cost broker
+// (`max_session_cost_usd_micros`), the agent-side cancellation
+// token, and the provider's own rate limits / connection timeouts.
+// Re-enable with `max_runtime_secs = <secs>` in TOML or
+// `SQUEEZY_SUBAGENT_MAX_RUNTIME_SECS=<secs>` for environments that
+// want a wall-clock belt.
+pub const DEFAULT_SUBAGENT_MAX_RUNTIME_SECS: u64 = 0;
 // Generous default sized for Plan/Delegate/Review summaries under a
 // reasoning model: thinking tokens burn first, then the actual summary.
 // 64K leaves room for both across every model we ship a preset for. The
@@ -3766,7 +3789,7 @@ impl SubagentSettings {
                 source,
                 &field(path, "max_summary_tokens"),
             )?,
-            max_runtime_secs: u64_value(
+            max_runtime_secs: u64_nonnegative_value(
                 table,
                 "max_runtime_secs",
                 source,
@@ -3898,7 +3921,7 @@ impl Default for SubagentConfig {
             max_search_files_per_call: DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
             max_model_rounds: DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
             max_summary_tokens: DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
-            max_runtime_secs: Some(DEFAULT_SUBAGENT_MAX_RUNTIME_SECS),
+            max_runtime_secs: None,
             include_transcript: false,
         }
     }

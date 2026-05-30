@@ -8,8 +8,8 @@ use crate::web::{
     MAX_WEB_TIMEOUT_MS,
 };
 use crate::{
-    DEFAULT_MAX_BYTES_PER_FILE, DEFAULT_MAX_FILES, MAX_GRAPH_MAX_DEPTH, MAX_GRAPH_MAX_RESULTS,
-    MAX_READ_LIMIT, MAX_SHELL_TIMEOUT_MS, PermissionCapability, ToolSpec,
+    DEFAULT_MAX_FILES, MAX_GRAPH_MAX_DEPTH, MAX_GRAPH_MAX_RESULTS, MAX_READ_LIMIT,
+    MAX_SHELL_TIMEOUT_MS, PermissionCapability, ToolSpec,
 };
 
 /// Strict-parse a first-party tool schema literal into [`JsonSchema`]. A

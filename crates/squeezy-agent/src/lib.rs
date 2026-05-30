@@ -7603,8 +7603,26 @@ async fn run_subagent(
     // active drain a high-fanout round (>~4 parallel tool calls) would fill
     // the channel buffer and the `send().await` inside the tool dispatcher
     // would block forever.
+    //
+    // BUT: `ToolProgress` events from inside the subagent must still reach
+    // the parent's `tx`. Without them, a long-running subagent (e.g.
+    // explore with `DEFAULT_SUBAGENT_MAX_RUNTIME_SECS = 300`) goes silent
+    // from the parent's perspective for longer than the parent's per-event
+    // timeout (`event_timeout_seconds`, 60s default in the eval driver),
+    // and the parent gives up on the whole turn while the subagent is
+    // still alive and billing. The drain loop forwards exactly those
+    // heartbeat-shaped events so the parent's timeout window resets each
+    // time the subagent reports liveness; everything else is dropped to
+    // keep the parent's transcript clean.
     let (hidden_tx, mut hidden_rx) = mpsc::channel::<AgentEvent>(64);
-    let drain_handle = tokio::spawn(async move { while hidden_rx.recv().await.is_some() {} });
+    let parent_tx_heartbeat = parent.tx.clone();
+    let drain_handle = tokio::spawn(async move {
+        while let Some(event) = hidden_rx.recv().await {
+            if matches!(event, AgentEvent::ToolProgress { .. }) {
+                let _ = parent_tx_heartbeat.send(event).await;
+            }
+        }
+    });
     let local_jobs = JobRegistry::new();
     let local_task_state = Arc::new(Mutex::new(None));
     let local_loaded_schemas = Arc::new(Mutex::new(Vec::new()));
