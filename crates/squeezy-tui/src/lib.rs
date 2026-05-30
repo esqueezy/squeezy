@@ -207,6 +207,34 @@ const TITLE_SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"
 const TITLE_SPINNER_INTERVAL_MS: u64 = 100;
 const TITLE_NOTIFICATION_GLYPH: &str = "●";
 
+fn enter_transcript_overlay_screen<W: Write>(writer: &mut W) -> io::Result<()> {
+    execute!(
+        writer,
+        EnterAlternateScreen,
+        Print(DISABLE_MOUSE_MODES),
+        EnableAlternateScroll,
+        Print(ENABLE_MOUSE_CLICK_CAPTURE),
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    )
+}
+
+fn leave_transcript_overlay_screen<W: Write>(
+    writer: &mut W,
+    restore_mouse_capture: bool,
+) -> io::Result<()> {
+    execute!(
+        writer,
+        DisableAlternateScroll,
+        Print(DISABLE_MOUSE_MODES),
+        LeaveAlternateScreen
+    )?;
+    if restore_mouse_capture {
+        execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))?;
+    }
+    Ok(())
+}
+
 /// Tracks what we want the terminal window/tab title to convey. Most
 /// terminal emulators surface their own "activity" indicator that
 /// flickers any time stdout sees output, which leaves users staring at
@@ -8330,21 +8358,31 @@ fn shell_output_diff_line(content: &str) -> Line<'static> {
     let style = if trimmed.starts_with("+++") || trimmed.starts_with("---") {
         Style::default().fg(palette::muted_fg())
     } else if let Some(rest) = trimmed.strip_prefix('+') {
-        let mut style = Style::default().fg(DIFF_ADD_FG);
-        if let Some(bg) = palette::surface_bg(DIFF_ADD_FG) {
+        let mut style = Style::default();
+        let bg = palette::surface_bg(DIFF_ADD_FG);
+        if let Some(bg) = bg {
             style = style.bg(bg);
         }
         spans.push(Span::styled("+".to_string(), style));
         spans.push(Span::styled(rest.to_string(), style));
-        return Line::from(spans);
+        let mut line = Line::from(spans);
+        if let Some(bg) = bg {
+            line = line.style(Style::default().bg(bg));
+        }
+        return line;
     } else if let Some(rest) = trimmed.strip_prefix('-') {
-        let mut style = Style::default().fg(DIFF_DEL_FG);
-        if let Some(bg) = palette::surface_bg(DIFF_DEL_FG) {
+        let mut style = Style::default();
+        let bg = palette::surface_bg(DIFF_DEL_FG);
+        if let Some(bg) = bg {
             style = style.bg(bg);
         }
         spans.push(Span::styled("-".to_string(), style));
         spans.push(Span::styled(rest.to_string(), style));
-        return Line::from(spans);
+        let mut line = Line::from(spans);
+        if let Some(bg) = bg {
+            line = line.style(Style::default().bg(bg));
+        }
+        return line;
     } else if trimmed.starts_with("@@") {
         Style::default()
             .fg(palette::MODE_PURPLE)
@@ -8887,6 +8925,7 @@ fn detail_spans_line(content: Vec<Span<'static>>) -> Line<'static> {
 }
 
 fn detail_rendered_line(line: Line<'static>) -> Line<'static> {
+    let style = line.style;
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
@@ -8895,7 +8934,7 @@ fn detail_rendered_line(line: Line<'static>) -> Line<'static> {
         ),
     ];
     spans.extend(line.spans);
-    Line::from(spans)
+    Line::from(spans).style(style)
 }
 
 fn command_spans(command: &str) -> Vec<Span<'static>> {
@@ -12194,6 +12233,10 @@ struct TerminalGuard {
     /// `mode == AlternateScreen` (that mode is already fullscreen —
     /// no swap needed).
     overlay_screen_active: bool,
+    /// Whether the user opted into mouse capture for the ordinary TUI.
+    /// The transcript overlay enables mouse capture temporarily so wheel
+    /// gestures reach the modal panel; on close we restore this setting.
+    mouse_capture: bool,
     exit_hint: Option<String>,
     startup_flushed: bool,
     transcript_flushed_len: usize,
@@ -12300,6 +12343,7 @@ impl TerminalGuard {
             overlay_terminal: None,
             mode,
             overlay_screen_active: false,
+            mouse_capture,
             exit_hint: None,
             startup_flushed: false,
             transcript_flushed_len: 0,
@@ -12457,13 +12501,8 @@ impl TerminalGuard {
                 .terminal
                 .as_mut()
                 .expect("primary inline terminal lost — unreachable after `enter`");
-            execute!(
-                inline.backend_mut(),
-                EnterAlternateScreen,
-                Clear(ClearType::All),
-                MoveTo(0, 0)
-            )
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+            enter_transcript_overlay_screen(inline.backend_mut())
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         }
         // Force the overlay terminal to paint from scratch — its
         // internal "previously drawn" buffer is stale (from the
@@ -12488,7 +12527,7 @@ impl TerminalGuard {
                 .overlay_terminal
                 .as_mut()
                 .expect("overlay terminal must be built when overlay-screen is active");
-            execute!(overlay.backend_mut(), LeaveAlternateScreen)
+            leave_transcript_overlay_screen(overlay.backend_mut(), self.mouse_capture)
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         }
         // The terminal emulator has restored the main buffer. The
@@ -12594,7 +12633,7 @@ impl Drop for TerminalGuard {
         if self.overlay_screen_active
             && let Some(overlay) = self.overlay_terminal.as_mut()
         {
-            let _ = execute!(overlay.backend_mut(), LeaveAlternateScreen);
+            let _ = leave_transcript_overlay_screen(overlay.backend_mut(), false);
             self.overlay_screen_active = false;
         }
         // Drop the overlay terminal explicitly so its writer

@@ -37,6 +37,10 @@ fn added_lines_carry_green_background_tint() {
 
     let add_sign = find_span(&lines, "+");
     assert_eq!(
+        add_sign.style.fg, None,
+        "+ sign should not carry a diff foreground color",
+    );
+    assert_eq!(
         add_sign.style.bg,
         Some(diff_add_bg()),
         "+ sign should carry add bg tint",
@@ -49,6 +53,10 @@ fn removed_lines_carry_red_background_tint() {
     let lines = render_diff_file(&file);
 
     let del_sign = find_span(&lines, "-");
+    assert_eq!(
+        del_sign.style.fg, None,
+        "- sign should not carry a diff foreground color",
+    );
     assert_eq!(
         del_sign.style.bg,
         Some(diff_del_bg()),
@@ -101,6 +109,8 @@ fn gutter_on_changed_lines_shares_the_tint() {
         .expect("del line");
 
     // Every span on a +/- line (gutter, sign, content) carries the tint.
+    assert_eq!(add_line.style.bg, Some(diff_add_bg()));
+    assert_eq!(del_line.style.bg, Some(diff_del_bg()));
     for span in &add_line.spans {
         assert_eq!(span.style.bg, Some(diff_add_bg()));
     }
@@ -139,7 +149,7 @@ fn rust_content_picks_up_syntax_highlight_in_diff() {
 }
 
 #[test]
-fn unknown_extension_falls_back_to_diff_foreground() {
+fn unknown_extension_keeps_default_foreground_on_diff_background() {
     let file = sample_file("notes.unknownext", "@@ -1 +1 @@\n-old line\n+new line\n");
     let lines = render_diff_file(&file);
 
@@ -149,11 +159,8 @@ fn unknown_extension_falls_back_to_diff_foreground() {
         .find(|span| span.content.as_ref() == "new line")
         .expect("add content span");
     assert_eq!(
-        add_content.style.fg,
-        Some(palette::best_color(palette::rgb_components(
-            palette::DIFF_ADD_FG,
-        ))),
-        "without a known language hint we keep the diff fg color",
+        add_content.style.fg, None,
+        "without a known language hint diff rows should not color text red/green",
     );
     assert_eq!(add_content.style.bg, Some(diff_add_bg()));
 }

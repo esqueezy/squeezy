@@ -3826,34 +3826,33 @@ fn edit_diff_preview_uses_dedicated_diff_colors() {
     assert!(!rendered.contains("index 123"), "{rendered}");
 
     // Patch content is "old" / "new" — short strings that the highlighter
-    // labels as plain identifiers, so the sign + body fall back to the
-    // diff-foreground color. The bg tint, however, is always applied on
-    // +/- rows.
+    // labels as plain identifiers, so the sign + body keep the default
+    // foreground. The row background is what carries the diff state.
     let add_sign = lines
         .iter()
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.as_ref() == "+")
         .expect("add sign span");
-    assert_eq!(
-        add_sign.style.fg,
-        Some(render::palette::best_color(
-            render::palette::rgb_components(DIFF_ADD_FG,)
-        ))
-    );
+    assert_eq!(add_sign.style.fg, None);
     assert_eq!(add_sign.style.bg, Some(render::diff::diff_add_bg()));
+    let add_line = lines
+        .iter()
+        .find(|line| line.spans.iter().any(|span| span.content.as_ref() == "+"))
+        .expect("add line");
+    assert_eq!(add_line.style.bg, Some(render::diff::diff_add_bg()));
 
     let del_sign = lines
         .iter()
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.as_ref() == "-")
         .expect("delete sign span");
-    assert_eq!(
-        del_sign.style.fg,
-        Some(render::palette::best_color(
-            render::palette::rgb_components(DIFF_DEL_FG,)
-        ))
-    );
+    assert_eq!(del_sign.style.fg, None);
     assert_eq!(del_sign.style.bg, Some(render::diff::diff_del_bg()));
+    let del_line = lines
+        .iter()
+        .find(|line| line.spans.iter().any(|span| span.content.as_ref() == "-"))
+        .expect("delete line");
+    assert_eq!(del_line.style.bg, Some(render::diff::diff_del_bg()));
 }
 
 #[test]
@@ -4043,9 +4042,8 @@ fn diff_render_colorizes_gutter() {
     };
 
     let lines = render::diff::render_diff_file(&file);
-    // The sign character carries the line's foreground colour; gutter,
-    // sign and content are split into separate spans so per-token syntax
-    // highlighting can attach colours to the body.
+    // The sign character is split from the body so the diff background can
+    // cover the whole row without coloring text red/green.
     let add_sign = lines
         .iter()
         .flat_map(|line| line.spans.iter())
@@ -4057,18 +4055,8 @@ fn diff_render_colorizes_gutter() {
         .find(|span| span.content.as_ref() == "-")
         .expect("delete sign span");
 
-    assert_eq!(
-        add_sign.style.fg,
-        Some(render::palette::best_color(
-            render::palette::rgb_components(DIFF_ADD_FG,)
-        ))
-    );
-    assert_eq!(
-        del_sign.style.fg,
-        Some(render::palette::best_color(
-            render::palette::rgb_components(DIFF_DEL_FG,)
-        ))
-    );
+    assert_eq!(add_sign.style.fg, None);
+    assert_eq!(del_sign.style.fg, None);
     assert!(
         lines
             .iter()
@@ -4773,6 +4761,50 @@ fn alternate_scroll_commands_use_xterm_private_mode() {
         .write_ansi(&mut disable)
         .expect("disable alternate scroll");
     assert_eq!(disable, "\x1b[?1007l");
+}
+
+#[test]
+fn transcript_overlay_screen_enables_scroll_capture() {
+    let mut bytes = Vec::new();
+    enter_transcript_overlay_screen(&mut bytes).expect("enter transcript overlay screen");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    assert!(ansi.contains("\x1b[?1049h"), "must enter alt screen");
+    assert!(
+        ansi.contains("\x1b[?1007h"),
+        "must enable alternate-scroll mode for wheel-to-key fallback"
+    );
+    assert!(
+        ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
+        "must capture wheel events while the overlay is modal"
+    );
+}
+
+#[test]
+fn transcript_overlay_screen_exit_restores_inline_mouse_setting() {
+    let mut without_restore = Vec::new();
+    leave_transcript_overlay_screen(&mut without_restore, false)
+        .expect("leave transcript overlay screen");
+    let without_restore = String::from_utf8(without_restore).expect("ansi");
+    assert!(
+        !without_restore.contains(ENABLE_MOUSE_CLICK_CAPTURE),
+        "default inline mode should not keep mouse capture enabled"
+    );
+
+    let mut with_restore = Vec::new();
+    leave_transcript_overlay_screen(&mut with_restore, true)
+        .expect("leave transcript overlay screen");
+    let with_restore = String::from_utf8(with_restore).expect("ansi");
+    let leave_pos = with_restore
+        .find("\x1b[?1049l")
+        .expect("must leave alt screen");
+    let restore_pos = with_restore
+        .find(ENABLE_MOUSE_CLICK_CAPTURE)
+        .expect("must restore opt-in mouse capture");
+    assert!(
+        restore_pos > leave_pos,
+        "opt-in inline mouse capture should be restored after returning to the main buffer"
+    );
 }
 
 #[test]
