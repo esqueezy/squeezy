@@ -1,0 +1,162 @@
+id = "wave2-03-slash-help-discovery-openai"
+title = "Wave-2 / 03 slash-help-discovery — OpenAI gpt-5.4-mini"
+description = """
+Wave-2 row 03 (slash-help-discovery) — probes the user-visible
+`/help` surface on the OpenAI live provider. Drives both the bare
+`/help` index and a topic head that is NOT a curated alias
+(`/help compact` — `compact` is not in the `TOPICS` table in
+`crates/squeezy-skills/src/help.rs:194-506` and is not aliased by any
+existing topic).
+
+Surface paths under probe:
+  - typed dispatch: `Agent::dispatch_command_raw("/help …")` →
+    `DispatchOutcome::TuiOnly { command: "help" }`
+    (`crates/squeezy-agent/src/lib.rs:2598`,
+    `crates/squeezy-agent/src/dispatch.rs:248`). This is the structured
+    record the eval driver captures from the `slash_command` action.
+  - actual help-body render: `Agent::start_turn` calls
+    `matches_squeezy_help_input` and routes the curated topic index
+    through `resolve_help_turn`
+    (`crates/squeezy-agent/src/lib.rs:3164`). The TUI harness pumps
+    that turn so the curated body lands in the rendered frame.
+  - curated topic index: `SqueezyHelp::topic_index`
+    (`crates/squeezy-skills/src/help.rs:73`) renders the canonical
+    "Supported topics:" body.
+
+Per the EVAL_COVERAGE_PLAN_WAVE2 palette guardrails, the dark-only
+rule applies: any rendered cell whose foreground RGB has luminance
+`0.299*R + 0.587*G + 0.114*B` exceeds ~160 is a finding regardless of
+where it appears in the help surface.
+
+Cross-model consistency is the wave-2 dimension we use this row for:
+the rendered help body should be byte-identical across providers
+because the curated path short-circuits before the model is called
+(`crates/squeezy-agent/src/lib_tests.rs:1925`). A per-provider
+divergence in the bare `/help` body is itself the finding.
+
+Requires `OPENAI_API_KEY` exported in the shell. Run with:
+
+    cargo run -p squeezy-eval -- run \\
+        crates/squeezy-eval/fixtures/scenarios/wave2-03-slash-help-discovery-openai.toml \\
+        --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 512
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+# 1. Record the typed dispatch entry-point for bare `/help`. The
+# eval driver calls `Agent::dispatch_command_raw("/help")` which
+# resolves to `DispatchOutcome::TuiOnly { command: "help" }`. The
+# action_step.status string ("tui_only:help") is the canary for a
+# future regression where the head drops out of the dispatch table
+# (see `crates/squeezy-agent/src/dispatch.rs:243`).
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/help"
+
+# 2. Actually exercise `/help` through the TUI harness so the
+# curated `topic_index` body lands in the rendered frame. The
+# harness's `start_user_turn` calls `agent.start_turn`, which
+# pattern-matches `matches_squeezy_help_input` and short-circuits
+# into `resolve_help_turn` before any provider request is sent
+# (verified by `known_help_topic_short_circuits_without_provider_request`
+# in `crates/squeezy-agent/src/lib_tests.rs:1925`).
+[[steps]]
+kind = "prompt"
+text = "/help"
+wait_for = "turn_completed"
+
+# 3. The curated topic index always opens with "Supported topics".
+# A missing string here means either the topic-index render
+# regressed, the TUI failed to repaint after the turn, or the
+# slash command was hijacked by an upstream router.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Supported topics"
+
+# 4. The bare `/help` index lists every topic id verbatim
+# (`SqueezyHelp::topic_index` formats `- \`{id}\`: {title}` per
+# `crates/squeezy-skills/src/help.rs:75`). `providers` is a stable
+# curated topic that must always appear; a missing entry is a
+# coverage regression in `TOPICS`.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "providers"
+
+# 5. `permissions` is the other always-present curated topic; pairing
+# it with `providers` catches partial-render bugs that lose the back
+# half of the list (line-wrap or table truncation in the help card).
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "permissions"
+
+# 6. Record the typed dispatch for `/help compact`. Same TuiOnly
+# outcome as bare `/help`; the action_step.status string distinguishes
+# the typed entry-point from the rendered behaviour. Because `compact`
+# is NOT a curated topic alias, `SqueezyHelp::answer_for_input`
+# returns `HelpStatus::Unsupported` and the doc-help subagent runs
+# (see `run_doc_help_subagent` in
+# `crates/squeezy-agent/src/lib.rs:3478`).
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/help compact"
+
+# 7. Drive the unsupported-topic path through the TUI harness. With
+# the curated layer returning Unsupported, the doc-help subagent
+# resolves an answer from the inlined bundled-docs corpus
+# (`crates/squeezy-skills/src/help.rs:517`). The provider IS called
+# for this turn (one subagent request, cost ~few cents on
+# gpt-5.4-mini).
+[[steps]]
+kind = "prompt"
+text = "/help compact"
+wait_for = "turn_completed"
+
+# 8. Belt-and-braces: the user's literal slash-command echo must
+# survive into the rendered transcript so an operator can scroll
+# back and see what they asked. The substring is verbatim from the
+# typed prompt; missing it indicates the TUI swallowed the echo.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "/help compact"
+
+[expect]
+# `/help compact` is the only provider-billed turn; bare `/help` is
+# curated-only. Wide ceiling for the subagent doc-help round-trip.
+max_wall_clock_seconds = 180
+event_timeout_seconds = 90
+max_input_tokens = 200000
+max_tools_per_turn = 4
+no_tool_errors = true
+
+[triage]
+enabled = false

@@ -1,0 +1,128 @@
+id = "wave2-03-slash-help-discovery-portkey"
+title = "Wave-2 / 03 slash-help-discovery — Portkey @openrouter/qwen3"
+description = """
+Wave-2 row 03 (slash-help-discovery) cross-provider companion via
+Portkey's OpenRouter route to Qwen3-35b-a3b. The probe shape mirrors
+the OpenAI / Anthropic scenarios.
+
+Surface paths under probe (see the OpenAI scenario header for full
+file:line citations):
+  - typed dispatch via `Agent::dispatch_command_raw` →
+    `DispatchOutcome::TuiOnly { command: "help" }`.
+  - curated bare-`/help` → `SqueezyHelp::topic_index` body. Curated
+    content is provider-independent; a Portkey-only divergence is a
+    cross-model consistency finding.
+  - unsupported `/help compact` → doc-help subagent. The subagent
+    answer DOES depend on the model; this scenario asserts only on
+    invariants the user must see so a different Qwen phrasing does not
+    produce a false positive.
+
+The Portkey leg also probes the Qwen3 dropped-tool-call wave-1
+pattern indirectly: the curated path emits no tool calls and the
+subagent path does not require tool calls (it answers from inlined
+docs), so a `stop_with_intent_text_no_tool_call` finding here would
+indicate the subagent prompt template tripped the wave-1 regression.
+
+Requires `[providers.portkey].api_key` already configured in
+`~/.squeezy/settings.toml`. NEVER embed the key in this file.
+
+Run with:
+
+    cargo run -p squeezy-eval -- run \\
+        crates/squeezy-eval/fixtures/scenarios/wave2-03-slash-help-discovery-portkey.toml \\
+        --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+tool_choice = "required"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 512
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+# 1. Typed dispatch for bare `/help` (status: tui_only:help).
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/help"
+
+# 2. Curated topic index runs without any provider request because of
+# the `matches_squeezy_help_input` short-circuit in
+# `Agent::start_turn` (`crates/squeezy-agent/src/lib.rs:3164`). The
+# Portkey `tool_choice = "required"` setting therefore does not
+# apply on this turn — no provider call happens.
+[[steps]]
+kind = "prompt"
+text = "/help"
+wait_for = "turn_completed"
+
+# 3. Topic index opens with "Supported topics". Provider-independent.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Supported topics"
+
+# 4. Stable curated topic ids must always appear.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "providers"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "permissions"
+
+# 5. Typed dispatch for `/help compact` (status: tui_only:help).
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/help compact"
+
+# 6. Unsupported topic — doc-help subagent runs via Portkey + Qwen3.
+# The subagent prompt explicitly forbids tools (the corpus is inlined)
+# so `tool_choice = "required"` may force the model into a degenerate
+# path; a non-empty assistant_text means the subagent recovered. The
+# wave-1 Qwen3 "dropped tool-call frames" finding would show up here
+# as `stop_with_intent_text_no_tool_call`.
+[[steps]]
+kind = "prompt"
+text = "/help compact"
+wait_for = "turn_completed"
+
+# 7. User-visible echo of the slash command must survive into the
+# rendered transcript.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "/help compact"
+
+[expect]
+max_wall_clock_seconds = 240
+event_timeout_seconds = 120
+max_input_tokens = 200000
+max_tools_per_turn = 4
+no_tool_errors = true
+
+[triage]
+enabled = false
