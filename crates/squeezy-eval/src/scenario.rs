@@ -615,6 +615,14 @@ pub enum Assertion {
         #[serde(default)]
         region: Option<CellRegion>,
     },
+    /// The TUI's current foreground modal matches `name`, or no modal
+    /// is active when `name` is `"none"`/empty. Names mirror
+    /// `TuiHarness::current_modal`: `"approval"`, `"mcp_elicitation"`,
+    /// `"user_input"`, `"transcript_overlay"`, `"config"`, `"model"`,
+    /// `"verbosity"`, `"tool_verbosity"`, `"permissions"`,
+    /// `"prompt_queue"`, `"plan_choice"`, `"feedback"`, `"report"`.
+    /// Requires `[tui_capture] drive_tui = true`.
+    ModalActive { name: String },
 }
 
 /// Inclusive rectangular region in the rendered cell grid. All four

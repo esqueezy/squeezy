@@ -2588,16 +2588,16 @@ impl Agent {
                     count: entries.len(),
                 }
             }
-            DispatchCommand::Tasks | DispatchCommand::Jobs => {
+            DispatchCommand::Tasks => {
                 let jobs = self.jobs_snapshot();
                 DispatchOutcome::JobsList { count: jobs.len() }
             }
-            DispatchCommand::Task { id } | DispatchCommand::Job { id } => {
+            DispatchCommand::Task { id } => {
                 let job_id = id.parse::<JobId>().ok();
                 let found = job_id.and_then(|id| self.job_snapshot(id)).is_some();
                 DispatchOutcome::TaskDetail { id, found }
             }
-            DispatchCommand::TaskCancel { id } | DispatchCommand::JobCancel { id } => {
+            DispatchCommand::TaskCancel { id } => {
                 let cancelled = id
                     .parse::<JobId>()
                     .ok()

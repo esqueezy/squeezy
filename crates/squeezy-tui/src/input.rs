@@ -190,15 +190,9 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         true,
         &[PermissionCapability::Git, PermissionCapability::Read],
     ),
-    slash("/tasks", "list background tasks (jobs + AI reviewer)"),
+    slash("/tasks", "list background tasks"),
     slash_args("/task", "show a background task", true, "<id>"),
     slash_args("/task-cancel", "cancel a background task", true, "<id>"),
-    // `/jobs`, `/job`, `/job-cancel` are retained as aliases for one release
-    // window so muscle memory keeps working; the documented surface is now
-    // `/tasks` (see F07-cc-tasks-and-background-jobs).
-    slash("/jobs", "alias for /tasks"),
-    slash_args("/job", "alias for /task", true, "<id>"),
-    slash_args("/job-cancel", "alias for /task-cancel", true, "<id>"),
     slash_args("/pin", "pin transcript context", false, "<id>"),
     slash("/pins", "list pinned context"),
     slash_args("/unpin", "remove pinned context", false, "<id>"),

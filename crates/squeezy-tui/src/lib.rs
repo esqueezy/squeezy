@@ -2051,7 +2051,7 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
     }
 }
 
-async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
+pub(crate) async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
     let cmd = match DispatchCommand::parse(input) {
         Ok(cmd) => cmd,
         // Unknown heads fall through to the user-authored prompt
@@ -2401,16 +2401,16 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             };
             app.push_transcript_item(TranscriptItem::system(body));
         }
-        DispatchCommand::Tasks | DispatchCommand::Jobs => {
+        DispatchCommand::Tasks => {
             sync_jobs_from_agent(app, agent);
             let body = format_tasks_list(app, agent);
             app.status = format!("{} tasks", app.jobs.len());
             app.push_transcript_item(TranscriptItem::system(body));
         }
-        DispatchCommand::Task { id } | DispatchCommand::Job { id } => {
+        DispatchCommand::Task { id } => {
             apply_task_detail(app, agent, &id);
         }
-        DispatchCommand::TaskCancel { id } | DispatchCommand::JobCancel { id } => {
+        DispatchCommand::TaskCancel { id } => {
             apply_task_cancel(app, agent, &id);
         }
         DispatchCommand::Sessions => match agent.list_sessions(&SessionQuery::default()) {

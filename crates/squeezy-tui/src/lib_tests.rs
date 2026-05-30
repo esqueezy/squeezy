@@ -6003,18 +6003,6 @@ mod slash_commands {
                 "expected /tasks output to include a reviewer line: {body}"
             );
         }
-
-        #[tokio::test]
-        async fn jobs_alias_renders_same_surface() {
-            let mut agent = test_agent(SessionMode::Build);
-            let mut app = test_app(SessionMode::Build);
-            assert!(handle_slash_command(&mut app, &mut agent, "/jobs").await);
-            let body = last_message_content(&app).unwrap_or_default().to_string();
-            assert!(
-                body.contains("reviewer"),
-                "expected /jobs alias to render the /tasks surface: {body}"
-            );
-        }
     }
 }
 

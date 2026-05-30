@@ -1,0 +1,127 @@
+# Slash command & options audit — 2026-05-30
+
+Systematic validation of all 46 slash commands defined in
+`crates/squeezy-tui/src/input.rs::SLASH_COMMANDS`, driven via
+`squeezy-eval`. Goal was to surface broken / redundant / UX-suboptimal /
+unnecessary commands and to identify harness gaps blocking future
+testing.
+
+## Method
+
+- Pre-audit coverage: 7 of 46 commands had any eval scenario (15%); 0 of 10 CLI subcommands had eval coverage.
+- One small harness primitive added: `Assertion::ModalActive { name }` + `TuiHarness::current_modal` (`crates/squeezy-tui/src/testing.rs`).
+- One latent harness bug fixed: when `drive_tui = true`, slash commands now route through the TUI's `handle_slash_command` instead of the agent-only dispatcher; previously TuiOnly commands (`/options`, `/model`, `/theme`, `/effort`, `/keymap`, ...) never reached the TUI from eval. Without this, ~half the slash surface was unreachable from any scenario.
+- Four parallel subagents authored TOML scenarios (one + variants per command) and ran them; orchestrator triaged.
+- Final corpus: **77 new scenarios** (76 from subagents + 1 smoke) under `crates/squeezy-eval/fixtures/scenarios/audit-*.toml`. All passed.
+- Two primitives originally planned (`Assertion::SettingsValue`, `Action::KeyChord`) were dropped after discovering existing facilities cover them: `/effort`-style persistence already sets `app.status` (assertable via `tui_status_contains`); `Action::SendKeys` already pumps between keys.
+
+## Coverage outcome
+
+| Category | Commands | Scenarios | Pass |
+|---|---|---|---|
+| Config / settings UI | 9 | 17 | 17 |
+| Session + checkpoint | 11 | 19 | 19 |
+| Plan / context / pin / attach | 16 | 27 | 27 |
+| Tasks / aliases / feedback / nav | 10 | 13 | 13 |
+| Smoke (harness gate) | — | 1 | 1 |
+| **Total** | **46** | **77** | **77** |
+
+CLI subcommands (`config`, `repo`, `sessions`, `feedback`, `mcp`, `ask`, `auth`, `doctor`, `refresh-models`, `providers`) remain out of scope — `squeezy-eval` drives the TUI/agent surface, not the CLI binary. Tracked separately.
+
+## Per-command verdicts
+
+| Command | Verdict | Evidence |
+|---|---|---|
+| `/options [section]` | working | `audit-config-options-{bare,permissions,models,reset,unknown}.toml` |
+| `/model` | working / **alias** | `audit-config-model.toml` — 1-line shortcut for `/options models` |
+| `/permissions` | working / **alias** | `audit-config-permissions.toml` — 1-line shortcut for `/options permissions` |
+| `/statusline` | working | `audit-config-statusline.toml` (modal not covered by `current_modal` — see harness gap below) |
+| `/theme` | working | `audit-config-theme-{dark,unknown}.toml` |
+| `/effort` | working | `audit-config-effort-{high,auto,bare}.toml` (bare opens config_screen; with-arg session-scoped) |
+| `/verbosity` | working | `audit-config-verbosity-{bare,concise}.toml` (inconsistent surface vs `/effort` — see below) |
+| `/tool-verbosity` | working | `audit-config-tool-verbosity-verbose.toml` |
+| `/keymap` | working | `audit-config-keymap.toml` |
+| `/sessions` | working | `audit-session-sessions-{empty,after-turn}.toml` |
+| `/session` | working | `audit-session-session-{missing-id,rename,label}.toml` |
+| `/resume` | untestable agent-side | `audit-session-resume-missing.toml` (picker bootstrap requires harness work) |
+| `/fork` | working | `audit-session-fork-{bare,tui}.toml` |
+| `/session-export` | working | `audit-session-session-export-after-turn.toml` |
+| `/session-export-html` | working | `audit-session-export-html-tui.toml` |
+| `/session-cleanup` | working | `audit-session-cleanup-{archive,archive-tui,purge-tui}.toml` |
+| `/checkpoints` | working | `audit-session-checkpoints-{bare,tui}.toml` |
+| `/checkpoint` | untestable agent-side | `audit-session-checkpoint-missing.toml` |
+| `/undo` | working | `audit-session-undo-{disabled,enabled-empty}.toml` |
+| `/revert-turn` | untestable agent-side | `audit-session-revert-turn.toml` (correctly stays TuiOnly — destructive) |
+| `/plan` | working / **partial-bug** | `audit-plan-{bare,with-prompt}.toml` (prompt discarded on agent path) |
+| `/build` | working | `audit-build-{bare,noop}.toml` |
+| `/plans` | working | `audit-plans-{list-empty,show-missing}.toml` (entirely TUI-side; agent path is TuiOnly) |
+| `/cost` | working | `audit-cost{,-after-turn}.toml` |
+| `/context` | **feature gap** | `audit-context.toml` — currently mirrors `/cost` (same `session_accounting_snapshot()`); intended spec is consumed/remaining tokens against budget + per-source breakdown (MCP / Skill / internal tools / system / user). See `squeezy-rw0i`. |
+| `/reviewer` | working | `audit-reviewer-empty.toml` |
+| `/compact` | working / **ux** | `audit-compact-{empty,undo-empty,roundtrip}.toml` — raw error on empty conversation |
+| `/collapse` | working / **ux** | `audit-collapse-expand-{tui,categories}.toml` — "0 transcript entries" message awkward |
+| `/expand` | working | (same files) |
+| `/copy` | working | `audit-copy-{bare,invalid}.toml` |
+| `/attach` | working | `audit-attach-{and-list,missing,detach-roundtrip}.toml` |
+| `/attachments` | working | `audit-attachments-empty.toml` |
+| `/detach` | working | `audit-detach-missing.toml` |
+| `/pin` | working | `audit-pin-{tui,unpin-roundtrip}.toml` |
+| `/pins` | working | `audit-pins-empty.toml` |
+| `/unpin` | working | `audit-unpin-{missing,missing-id}.toml` |
+| `/tasks` | working | `audit-misc-tasks.toml` |
+| `/task` | working | `audit-misc-task-detail-missing.toml` |
+| `/task-cancel` | working | `audit-misc-task-cancel-missing.toml` |
+| `/jobs` | **dropped** | was alias for `/tasks`; removed in this audit |
+| `/job` | **dropped** | was alias for `/task`; removed in this audit |
+| `/job-cancel` | **dropped** | was alias for `/task-cancel`; removed in this audit |
+| `/feedback` | working | `audit-misc-feedback-{preview,bare}.toml` |
+| `/report` | working | `audit-misc-report-preview.toml` |
+| `/help` | working | `audit-misc-help-{bare,topic}.toml` (resolves locally; no provider hits) |
+| `/diff` | working | `audit-misc-diff-with-changes.toml` (exposed driver bug, see below) |
+
+## Notable findings
+
+### Bugs
+
+- **B1 — driver `workspace_root_clone` writes to host workspace** when scenario uses `[workspace] snapshot = true`. Reproduced by `audit-misc-diff-with-changes.toml` — an `edit_file` step targeting `README.md` modified the host repo. `crates/squeezy-eval/src/driver.rs::workspace_root_clone` hardcodes `std::env::current_dir()` instead of `AppConfig.workspace_root`. README.md was restored manually after the audit.
+- **B2 — `pump_until_idle` doesn't drain `pending_diff`** (`crates/squeezy-tui/src/testing.rs:142-188`). Scenarios that dispatch `/diff` cannot reliably observe the result in a single step. Workaround in the scenario uses `wait_seconds = 3` + another slash. Should wait while `app.pending_diff.is_some()` (bounded by deadline).
+- **B3 — `/plan <prompt>` divergence**: `DispatchCommand::Plan { prompt }` agent-side discards the prompt; the TUI handler additionally starts a turn with it. Silent data loss for RPC/eval consumers that send `/plan` with a prompt over the headless dispatch path.
+- **B4 — `/compact` on empty conversation surfaces raw error** (`error:agent error: not enough context to compact`) into the status line. Should be a graceful "nothing to compact yet" message, mirroring `/compact undo`'s `restored=false` path.
+
+### Redundancy
+
+- **R1 — `/jobs`, `/job`, `/job-cancel` dropped** (`squeezy-d0nx`). They were pure aliases for `/tasks`, `/task`, `/task-cancel`; the agent dispatcher's match arms shared branches; alias-parity scenarios confirmed identical outcomes. Per the project's no-deprecation stance, the variants are gone from `DispatchCommand`, the parser, and `SLASH_COMMANDS` in this audit; the alias-parity scenarios are deleted.
+- **R2 — `/context` is a feature gap, not redundancy** (`squeezy-rw0i`). Today it calls `Agent::session_accounting_snapshot()` and shows roughly the same data as `/cost`. The intended spec is: tokens consumed / tokens remaining against the context budget, plus a per-source breakdown (MCP / Skill / internal tools / system / user). `/cost` stays the cost-oriented view; `/context` becomes the budget-oriented view with per-source attribution.
+- **R3 — `/model` and `/permissions` are 1-line aliases** for `/options models` / `/options permissions`. All three open the same `config_screen` modal (focused on different sections); `modal_active = "config"` for all. Keeping them is reasonable (discoverability), but the dispatch arms in `crates/squeezy-tui/src/lib.rs:2200-2213` could note they're aliases.
+
+### UX inconsistencies
+
+- **U1 — `/effort` vs `/verbosity` vs `/tool-verbosity` use different feedback surfaces**: `/effort` updates `app.status` (visible in status line); `/verbosity` and `/tool-verbosity` push `app_notifications` (toast-style). Three commands with near-identical shapes should share a surface.
+- **U2 — bare `/effort`/`/verbosity`/`/tool-verbosity` divert to `config_screen`** while the arg-form is session-scoped. Mode-switch on argument presence is surprising.
+- **U3 — `/collapse <category>` reports "collapsed 0 transcript entries"** when empty — awkward; should be "no <category> entries to collapse".
+
+### Dead code
+
+- **D1 — `overlay::Overlay::Permissions`, `Verbosity`, `ToolVerbosity` variants are unreachable** from these slash commands. All `/permissions`, `/verbosity`, `/tool-verbosity` invocations route through `toggle_config_screen` instead. Either delete the overlay variants or re-wire the slash commands to use them.
+
+## Harness gaps (surfaced by subagents)
+
+- **H1 — `current_modal()` doesn't cover `status_line_setup`** overlay. `/statusline` opens `app.status_line_setup` which is a separate field never folded into the modal-id chain. Scenarios fall back to substring matches on the frame.
+- **H2 — No `config_screen_section { name }` assertion** to disambiguate `/options` vs `/model` vs `/permissions` (which all share `modal_active = "config"`). Today scenarios depend on substring-matching section labels in the rendered frame.
+- **H3 — No `dispatch_outcome_contains` / `action_step_status_contains` assertion** to inspect agent-side command status without driving the full TUI. Lifts the typed `DispatchOutcome` value off the trace.
+- **H4 — No `capture_session_id` (or template var) action** for chained scenarios that need to reference the agent's current session id. Today only the missing-id error path is testable for `/session-export`, `/checkpoint <id>`, `/resume <id>`.
+- **H5 — Driver bug B1** (above) blocks any scenario that combines `[workspace] snapshot = true` with `edit_file`.
+- **H6 — `pump_until_idle` bug B2** (above) blocks reliable `/diff` testing.
+
+## Tickets filed
+
+- `squeezy-nyg8` (epic) — Slash command audit · 2026-05-30 follow-ups.
+- `squeezy-nyg8.1` (P1, bug) — B1: driver `workspace_root_clone` writes to host workspace.
+- `squeezy-nyg8.2` (P2, bug, harness-gap) — B2: `pump_until_idle` doesn't drain `pending_diff`.
+
+Remaining items (B3, B4, R1–R3, U1–U3, D1, H1–H6) are documented in this report and should be filed as individual `bd` children of `squeezy-nyg8` when ready to act on them — the report sections above carry enough detail to copy into ticket bodies verbatim.
+
+## Out-of-scope (separate work)
+
+- 10 CLI subcommands (`config`, `repo`, `sessions`, `feedback`, `mcp`, `ask`, `auth`, `doctor`, `refresh-models`, `providers`) — `squeezy-eval` drives the TUI/agent, not the CLI binary.
+- Pre-existing test failure on `audit/slash-commands` branch (also fails on origin/main): `crates/squeezy-tui/src/lib_tests.rs::tui_harness_settings_override_pins_theme_writes_to_scratch`. Not caused by this audit — flagged separately.

@@ -91,13 +91,6 @@ pub enum DispatchCommand {
     TaskCancel {
         id: String,
     },
-    Jobs,
-    Job {
-        id: String,
-    },
-    JobCancel {
-        id: String,
-    },
     Pin {
         target: Option<String>,
     },
@@ -194,9 +187,6 @@ impl DispatchCommand {
             Self::Tasks => "/tasks",
             Self::Task { .. } => "/task",
             Self::TaskCancel { .. } => "/task-cancel",
-            Self::Jobs => "/jobs",
-            Self::Job { .. } => "/job",
-            Self::JobCancel { .. } => "/job-cancel",
             Self::Pin { .. } => "/pin",
             Self::Pins => "/pins",
             Self::Unpin { .. } => "/unpin",
@@ -314,13 +304,6 @@ impl DispatchCommand {
                 id: require_id(head, rest, "<id>")?,
             },
             "/task-cancel" => Self::TaskCancel {
-                id: require_id(head, rest, "<id>")?,
-            },
-            "/jobs" => Self::Jobs,
-            "/job" => Self::Job {
-                id: require_id(head, rest, "<id>")?,
-            },
-            "/job-cancel" => Self::JobCancel {
                 id: require_id(head, rest, "<id>")?,
             },
             "/pin" => Self::Pin {

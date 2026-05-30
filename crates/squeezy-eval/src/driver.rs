@@ -983,6 +983,30 @@ impl Driver {
     }
 
     async fn dispatch_slash_command(&self, command: &str) -> Result<String, EvalError> {
+        // When the harness is live (drive_tui = true), route the slash
+        // through the TUI's `handle_slash_command` so the visual side
+        // (config_screen toggles, overlay::Overlay openings, status
+        // updates, transcript pushes via `toggle_*`/`handle_slash_*`)
+        // actually runs. The agent-side `dispatch_command_raw` path
+        // only fires for commands that are pure agent-state changes
+        // (e.g. `/attach`, `/pin`, `/undo`) — and for those the TUI's
+        // `apply_dispatch_command` calls into the agent helpers
+        // directly, so we don't double-dispatch.
+        if let Some(harness) = self.harness.as_ref() {
+            let routed = {
+                let mut h = harness.lock().await;
+                h.dispatch_slash_command(command)
+                    .await
+                    .map_err(|err| EvalError::Internal(format!("harness slash: {err}")))?
+            };
+            let status_text = {
+                let h = harness.lock().await;
+                h.status_text().to_string()
+            };
+            return Ok(format!(
+                "tui_dispatched:routed={routed}:status={status_text:?}"
+            ));
+        }
         let outcome = self.agent.dispatch_command_raw(command).await;
         let status = match &outcome {
             squeezy_agent::DispatchOutcome::Compacted => "compacted".to_string(),
@@ -1063,6 +1087,9 @@ impl Driver {
                 ),
             },
             squeezy_agent::DispatchOutcome::TuiOnly { command } => {
+                // Reached only when `drive_tui = false`: nothing more
+                // to do — the command requires a live TUI to take
+                // visual effect, and the scenario opted out.
                 format!("tui_only:{command}")
             }
             squeezy_agent::DispatchOutcome::Unsupported { command } => {
@@ -1249,6 +1276,28 @@ impl Driver {
                 self.assert_tui_cell_luminance_le(*max, channel.as_deref(), region.as_ref())
                     .await
             }
+            Assertion::ModalActive { name } => self.assert_modal_active(name).await,
+        }
+    }
+
+    async fn assert_modal_active(&self, name: &str) -> String {
+        let Some(harness) = self.harness.as_ref() else {
+            return "asserted_fail: modal_active requires [tui_capture] drive_tui = true".into();
+        };
+        let h = harness.lock().await;
+        let current = h.current_modal();
+        let trimmed = name.trim();
+        let expect_none = trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none");
+        match (expect_none, current) {
+            (true, None) => "asserted_pass".into(),
+            (true, Some(actual)) => {
+                format!("asserted_fail: expected no modal, got {actual:?}")
+            }
+            (false, Some(actual)) if actual.eq_ignore_ascii_case(trimmed) => "asserted_pass".into(),
+            (false, actual) => format!(
+                "asserted_fail: expected modal {trimmed:?}, got {:?}",
+                actual.unwrap_or("<none>")
+            ),
         }
     }
 

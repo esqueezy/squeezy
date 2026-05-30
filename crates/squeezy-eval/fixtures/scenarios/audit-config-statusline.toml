@@ -1,0 +1,59 @@
+id = "audit-config-statusline"
+title = "Audit · /statusline opens status-line setup modal"
+description = """
+`/statusline` opens its own dedicated setup modal (status_line_setup),
+NOT the unified config_screen. The `current_modal` accessor does NOT
+cover this overlay, so modal_active reports "none" — we assert via
+status text and frame substring instead. Esc closes it (status reports
+"closed").
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/statusline"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "/statusline"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Esc"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "cancelled"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — no model turn expected)"
+
+[triage]
+enabled = false

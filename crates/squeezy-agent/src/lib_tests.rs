@@ -7656,8 +7656,6 @@ async fn dispatch_command_jobs_permissions_reviewer_snapshots_are_empty_by_defau
     let agent = mock_agent_for_dispatch();
     let jobs = agent.dispatch_command(DispatchCommand::Tasks).await;
     assert!(matches!(jobs, DispatchOutcome::JobsList { count: 0 }));
-    let jobs_alias = agent.dispatch_command(DispatchCommand::Jobs).await;
-    assert!(matches!(jobs_alias, DispatchOutcome::JobsList { count: 0 }));
     let perms = agent.dispatch_command(DispatchCommand::Permissions).await;
     assert!(matches!(
         perms,
