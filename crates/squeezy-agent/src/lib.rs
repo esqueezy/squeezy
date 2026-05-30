@@ -1755,6 +1755,14 @@ impl Agent {
             .await
     }
 
+    /// Refresh the MCP tool palette synchronously. Production turns kick a
+    /// background refresh on each `start_turn`; this helper lets tests
+    /// and the eval harness pre-warm the cache so the very first turn
+    /// can issue `mcp__*` tool calls without racing the background task.
+    pub async fn refresh_mcp_tools(&self) -> squeezy_tools::McpRefreshOutcome {
+        self.tools.refresh_mcp_tools(CancellationToken::new()).await
+    }
+
     pub fn subscribe_jobs(&self) -> broadcast::Receiver<JobEvent> {
         self.jobs.subscribe()
     }
