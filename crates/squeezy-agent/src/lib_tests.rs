@@ -6770,6 +6770,137 @@ fn progress_snapshot_returns_none_before_any_calls() {
     assert!(broker.progress_snapshot_if_due(3).is_none());
 }
 
+/// Repro for bd ticket squeezy-xt2o: with a $0.01 cap and a fresh broker the
+/// pre-flight gate must refuse to dispatch a turn whose projected input/output
+/// pricing already exceeds the cap, so the broker trips *before* the over-cap
+/// spend is billed. claude-haiku-4-5-20251001 prices output at $5/Mtok, so a
+/// 4096-output-token reply is $0.02048 by itself — comfortably over the cap.
+#[test]
+fn cost_cap_fires_pre_flight_on_first_turn_when_projection_exceeds_cap() {
+    let config = AppConfig {
+        max_session_cost_usd_micros: Some(10_000),
+        max_output_tokens: Some(4_096),
+        ..AppConfig::default()
+    };
+    let broker = CostBroker::new(&config);
+    // Pre-flight: nothing has been billed yet, so the post-hoc check is
+    // silent — only the projection should catch the overrun.
+    assert!(
+        broker.session_cap_reached().is_none(),
+        "session_cap_reached must not fire before any provider cost lands"
+    );
+    let status = broker
+        .projected_session_cap_overrun(
+            "anthropic",
+            "claude-haiku-4-5-20251001",
+            1_000, // projected input tokens
+            4_096, // projected output tokens
+        )
+        .expect("projected spend ($0.0205 input + output) must exceed $0.01 cap");
+    assert_eq!(status.cap_usd_micros, 10_000);
+    assert!(
+        status.spent_usd_micros >= status.cap_usd_micros,
+        "projected total ({} micros) must be at or above cap ({} micros)",
+        status.spent_usd_micros,
+        status.cap_usd_micros
+    );
+    // The "spent" reported on the cap-reached event is the *projection*, not
+    // the actual recorded spend, so the operator sees the would-have-been
+    // total they were saved from.
+    assert!(status.percent >= 100, "percent should reflect overrun");
+}
+
+/// Drives the broker through a scripted spent sequence: after a cheap first
+/// round lands, the next round's projection must trip the cap pre-flight even
+/// though the post-hoc check is still under cap.
+#[test]
+fn cost_cap_fires_pre_flight_after_partial_spend_under_cap() {
+    let config = AppConfig {
+        max_session_cost_usd_micros: Some(10_000),
+        max_output_tokens: Some(4_096),
+        ..AppConfig::default()
+    };
+    let mut broker = CostBroker::new(&config);
+    // Round 1 landed at $0.006 spent — still well under the $0.01 cap, so
+    // post-hoc check passes.
+    broker.seed_session(6_000, squeezy_llm::TokenCalibration::default());
+    assert!(
+        broker.session_cap_reached().is_none(),
+        "post-hoc check must not trip at 60% of cap"
+    );
+    // Pre-flight projection for the next round: ~$0.0205 worth of output
+    // tokens at haiku pricing. 6_000 + 20_480 = 26_480 micros — over cap.
+    let status = broker
+        .projected_session_cap_overrun("anthropic", "claude-haiku-4-5-20251001", 512, 4_096)
+        .expect("pre-flight projection must trip at 6_000 spent + projected round");
+    assert!(
+        status.spent_usd_micros >= 10_000,
+        "projected total must be >= cap; got {}",
+        status.spent_usd_micros
+    );
+}
+
+/// Once spent has crossed the cap, the post-hoc check still fires as the
+/// safety-net path, so resuming a session whose prior turn somehow exceeded
+/// the cap (e.g. a recorded provider cost that came in higher than the
+/// pre-flight projection) is still gated before the next round dispatches.
+#[test]
+fn cost_cap_post_hoc_check_still_fires_when_spent_exceeds_cap() {
+    let config = AppConfig {
+        max_session_cost_usd_micros: Some(10_000),
+        ..AppConfig::default()
+    };
+    let mut broker = CostBroker::new(&config);
+    broker.seed_session(12_457, squeezy_llm::TokenCalibration::default());
+    let status = broker
+        .session_cap_reached()
+        .expect("post-hoc check must fire when spent >= cap");
+    assert_eq!(status.spent_usd_micros, 12_457);
+    assert_eq!(status.cap_usd_micros, 10_000);
+    assert_eq!(status.percent, 124);
+}
+
+/// Cap unset → both gates are silent; the broker must not synthesize a cap
+/// from defaults when the operator explicitly disabled it.
+#[test]
+fn cost_cap_pre_flight_silent_when_no_cap_configured() {
+    let config = AppConfig {
+        max_session_cost_usd_micros: None,
+        ..AppConfig::default()
+    };
+    let broker = CostBroker::new(&config);
+    assert!(broker.session_cap_reached().is_none());
+    assert!(
+        broker
+            .projected_session_cap_overrun(
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+                1_000_000,
+                1_000_000
+            )
+            .is_none(),
+        "no cap configured → projection must not trip"
+    );
+}
+
+/// Provider/model pair the registry can't price → projection returns `None`
+/// so the agent falls through to the post-hoc check rather than incorrectly
+/// gating dispatch on an unknown rate.
+#[test]
+fn cost_cap_pre_flight_silent_when_model_has_no_pricing() {
+    let config = AppConfig {
+        max_session_cost_usd_micros: Some(10_000),
+        ..AppConfig::default()
+    };
+    let broker = CostBroker::new(&config);
+    assert!(
+        broker
+            .projected_session_cap_overrun("ollama", "made-up-local-model", 1_000, 4_096)
+            .is_none(),
+        "unpriced model → projection must abstain"
+    );
+}
+
 fn shell_fallback_result(
     backend: &str,
     fallback_count: u64,
