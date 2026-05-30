@@ -489,20 +489,55 @@ fn extract_ruby_import(
     } else {
         kind_label
     };
+    let span = span_from_node(node);
     ctx.imports.push(ParsedImport {
         file_id: ctx.file.id.clone(),
-        owner_id,
+        owner_id: owner_id.clone(),
         path: resolved_path,
         alias: None,
         is_glob: false,
         is_reexport: false,
         is_static: false,
-        span: span_from_node(node),
+        span,
         provenance: Provenance::new("tree-sitter-ruby", provenance_label),
         kind: ImportKind::Named,
         imported_name,
         is_global: false,
     });
+    // Synthesize a Function symbol for the import directive so
+    // `signature_search("require_relative \"user\"")` surfaces it. Without
+    // this the import lives only in `imports` (not in `symbols`) and the
+    // signature index never indexes its source text. The signature uses
+    // the raw call source to keep the trigram lookup tight.
+    let raw = node_text(node, ctx.source).unwrap_or_default().trim();
+    if !raw.is_empty() {
+        let directive_name = kind_label.to_string();
+        let id = symbol_id(
+            &ctx.file,
+            owner_id.as_ref(),
+            SymbolKind::Function,
+            &directive_name,
+            span,
+        );
+        ctx.symbols.push(ParsedSymbol {
+            id,
+            file_id: ctx.file.id.clone(),
+            parent_id: owner_id,
+            name: directive_name,
+            kind: SymbolKind::Function,
+            language_identity: None,
+            span,
+            body_span: None,
+            signature: raw.to_string(),
+            visibility: None,
+            docs: Vec::new(),
+            attributes: vec!["ruby:import-directive".to_string()],
+            provenance: Provenance::new("tree-sitter-ruby", "import directive synthesis"),
+            confidence: Confidence::Heuristic,
+            freshness: Freshness::Fresh,
+            arity: None,
+        });
+    }
     true
 }
 
@@ -674,6 +709,25 @@ fn extract_ruby_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Opt
     } else {
         ParsedCallKind::Direct
     };
+
+    // Emit a Field reference for explicit-receiver dispatch (`obj.method`).
+    // Mirrors Python's `attribute` handling so `references_to_symbol` can
+    // index the dotted form keyed off the method leaf, and the Ruby graph
+    // resolver can bind it to the receiver class via the
+    // `ruby_property_reference_matches` helper. We skip the bare-call
+    // path (`foo`) because the identifier visitor already emits that as a
+    // plain Identifier reference, and double-emitting would inflate
+    // reference_search counts.
+    if receiver_text.is_some() {
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: owner_id.clone(),
+            text: target_text.clone(),
+            kind: ReferenceKind::Field,
+            span: span_from_node(node),
+            provenance: Provenance::new("tree-sitter-ruby", "dotted call reference"),
+        });
+    }
 
     ctx.calls.push(ParsedCall {
         file_id: ctx.file.id.clone(),
