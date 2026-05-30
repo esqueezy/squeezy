@@ -3879,6 +3879,54 @@ async fn large_tool_output_spills_to_handle_and_can_be_read_back() {
 }
 
 #[tokio::test]
+async fn spilled_shell_envelope_preserves_command_and_workdir() {
+    let root = temp_workspace("spill_shell_command");
+    let registry = registry_with_shell_sandbox_off_and_output_config(
+        &root,
+        ToolOutputConfig {
+            spill_threshold_bytes: 256,
+            preview_bytes: 32,
+            retention_days: 1,
+            output_dir: None,
+        },
+    );
+
+    // `yes` head produces a deterministic >256 byte payload.
+    let command = "yes spillover | head -c 4096";
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_shell".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": command,
+                    "workdir": ".",
+                    "description": "force spill",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["spilled"], true);
+    assert_eq!(
+        result.content["command"].as_str(),
+        Some(command),
+        "spill envelope must preserve the original shell command so TUI \
+         summary spans can render it even when the call's arguments are \
+         not threaded into the transcript (resumed sessions, replays)",
+    );
+    assert_eq!(
+        result.content["workdir"].as_str(),
+        Some("."),
+        "spill envelope must preserve workdir alongside command",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn output_spill_uses_registry_config() {
     let root = temp_workspace("spill_config");
     fs::write(root.join("sample.txt"), "x".repeat(200)).expect("write sample");

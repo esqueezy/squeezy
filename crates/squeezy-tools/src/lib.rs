@@ -2338,7 +2338,7 @@ impl ToolRegistry {
         if call.name == "read_tool_output" {
             result
         } else {
-            self.finalize_result(result)
+            self.finalize_result(&call, result)
         }
     }
 
@@ -4048,10 +4048,10 @@ impl ToolRegistry {
         }
     }
 
-    fn finalize_result(&self, result: ToolResult) -> ToolResult {
+    fn finalize_result(&self, call: &ToolCall, result: ToolResult) -> ToolResult {
         let result = redact_tool_result(result, &self.redactor);
         self.output_store
-            .maybe_spill(enforce_web_quote_limit(result))
+            .maybe_spill(call, enforce_web_quote_limit(result))
     }
 }
 
@@ -4141,7 +4141,7 @@ impl ToolOutputStore {
         Ok(store)
     }
 
-    fn maybe_spill(&self, mut result: ToolResult) -> ToolResult {
+    fn maybe_spill(&self, original_call: &ToolCall, mut result: ToolResult) -> ToolResult {
         let model_output = result.model_output();
         if model_output.len() <= self.spill_threshold_bytes {
             return result;
@@ -4167,7 +4167,7 @@ impl ToolOutputStore {
             call_id,
             tool_name,
             status,
-            content: _,
+            content: previous_content,
             mut cost_hint,
             receipt,
             spill_model_output: _,
@@ -4182,22 +4182,19 @@ impl ToolOutputStore {
         cost_hint.truncated = true;
         cost_hint.output_bytes = 0;
 
-        make_result(
-            &call,
-            status,
-            json!({
-                "spilled": true,
-                "handle": sha256,
-                "sha256": sha256,
-                "original_output_sha256": original_output_sha256,
-                "total_bytes": output.len(),
-                "preview_bytes": preview.len(),
-                "preview": preview,
-                "truncated": true,
-            }),
-            cost_hint,
-            content_sha256,
-        )
+        let mut envelope = json!({
+            "spilled": true,
+            "handle": sha256,
+            "sha256": sha256,
+            "original_output_sha256": original_output_sha256,
+            "total_bytes": output.len(),
+            "preview_bytes": preview.len(),
+            "preview": preview,
+            "truncated": true,
+        });
+        carry_identifying_args(&mut envelope, original_call, &previous_content);
+
+        make_result(&call, status, envelope, cost_hint, content_sha256)
     }
 
     fn read(
@@ -4266,6 +4263,61 @@ struct StoredToolOutputSlice {
 
 fn is_valid_handle(handle: &str) -> bool {
     handle.len() == 64 && handle.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Copy short identifying string fields into a spill envelope so TUI
+/// summary spans (and any other renderer that reads
+/// `tool.result.content[key]` as a fallback when `tool.call.arguments`
+/// is not threaded — resumed sessions, replays, transcript
+/// reconstruction) can still surface what ran. Without this, e.g. a
+/// spilled shell card renders as just `"shell"`.
+///
+/// Sources, in order: the just-replaced (redaction-passed) tool result
+/// content, then the original call arguments. The redaction-passed
+/// content is preferred so secrets surfaced in the original command
+/// (e.g. inline tokens that `Redactor` would have rewritten) do not
+/// leak through the envelope.
+fn carry_identifying_args(
+    envelope: &mut Value,
+    original_call: &ToolCall,
+    redacted_content: &Value,
+) {
+    const MAX_FIELD_BYTES: usize = 2048;
+    let keys: &[&str] = match original_call.name.as_str() {
+        "shell" | "verify" => &["command", "workdir"],
+        _ => return,
+    };
+    let Some(envelope) = envelope.as_object_mut() else {
+        return;
+    };
+    let args = original_call.arguments.as_object();
+    for &key in keys {
+        if envelope.contains_key(key) {
+            continue;
+        }
+        let value = redacted_content
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                args.and_then(|args| args.get(key))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            });
+        let Some(trimmed) = value else { continue };
+        let bounded = if trimmed.len() > MAX_FIELD_BYTES {
+            let mut cut = MAX_FIELD_BYTES;
+            while cut > 0 && !trimmed.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            &trimmed[..cut]
+        } else {
+            trimmed
+        };
+        envelope.insert(key.to_string(), Value::String(bounded.to_string()));
+    }
 }
 
 fn nonzero_or(value: usize, default: usize) -> usize {
