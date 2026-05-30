@@ -11817,8 +11817,36 @@ impl TerminalGuard {
     fn leave_overlay_screen(&mut self) -> Result<()> {
         drop(self.terminal.take());
         let mut writer = TerminalWriter::from_env(io::stdout());
+        // 1. Restore the main buffer. Cursor returns to where it
+        //    sat at `EnterAlternateScreen` time — typically inside
+        //    the pre-overlay inline viewport. The old viewport's
+        //    rendered content (input row + status + hint) is still
+        //    sitting in the bottom rows of the main buffer.
         execute!(writer, LeaveAlternateScreen)
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        // 2. Wipe the bottom `INLINE_VIEWPORT_HEIGHT` rows where
+        //    the new inline `Terminal` will install its viewport.
+        //    Without this, ratatui's `compute_inline_size` ->
+        //    `append_lines(N - 1)` scrolls those old viewport rows
+        //    up into the visible area, leaving a duplicate stack
+        //    of [divider / cursor / status / hint] above the
+        //    freshly rendered one. Clearing first means
+        //    `append_lines` scrolls blank rows into scrollback
+        //    instead.
+        let (_, rows) =
+            crossterm::terminal::size().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        let viewport_top = rows.saturating_sub(INLINE_VIEWPORT_HEIGHT);
+        execute!(
+            writer,
+            MoveTo(0, viewport_top),
+            Clear(ClearType::FromCursorDown),
+            // 3. Park the cursor at the bottom row so the new
+            //    inline `Terminal` computes its viewport against
+            //    the bottom of the screen — matches the original
+            //    pre-overlay layout.
+            MoveTo(0, rows.saturating_sub(1)),
+        )
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         drop(writer);
         let writer = TerminalWriter::from_env(io::stdout());
         let backend = CrosstermBackend::new(writer);
