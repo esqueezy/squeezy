@@ -9,6 +9,7 @@ pub(crate) mod go_types;
 pub(crate) mod javac;
 pub(crate) mod roslyn;
 pub(crate) mod rust_analyzer;
+pub(crate) mod swift_sourcekit;
 pub(crate) mod tsc;
 
 pub(crate) use clang::*;
@@ -84,8 +85,13 @@ static TSC: OracleDescriptor = OracleDescriptor {
     family: LanguageFamily::JsTs,
     language: BenchmarkLanguage::TypeScript,
 };
+static SOURCEKIT_LSP: OracleDescriptor = OracleDescriptor {
+    id: "sourcekit_lsp",
+    family: LanguageFamily::Swift,
+    language: BenchmarkLanguage::Swift,
+};
 
-static ORACLES: [&'static dyn LanguageOracle; 7] = [
+static ORACLES: [&'static dyn LanguageOracle; 8] = [
     &RUST_ANALYZER,
     &CPYTHON_AST,
     &JAVAC,
@@ -93,6 +99,7 @@ static ORACLES: [&'static dyn LanguageOracle; 7] = [
     &GO_TYPES,
     &CLANG,
     &TSC,
+    &SOURCEKIT_LSP,
 ];
 
 pub fn inventory() -> &'static [&'static dyn LanguageOracle] {

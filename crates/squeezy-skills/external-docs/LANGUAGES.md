@@ -16,6 +16,7 @@ uses the same family names so coverage claims stay checkable.
 | `go` | Go | `go` | `tree-sitter-go` | `go_types` | yes | `benchmarks/fixtures/go/semantic-cases` | `benchmarks/specs/go-smoke-queries.json` | gin, cobra, prometheus, etcd, zap |
 | `c-family` | C, C++ | `c`, `h`, `cc`, `cpp`, `cxx`, `hh`, `hpp`, `hxx` | `tree-sitter-c`, `tree-sitter-cpp` | `clang` | yes | `benchmarks/fixtures/c/semantic-cases`, `benchmarks/fixtures/cpp/semantic-cases` | `benchmarks/specs/c-smoke-queries.json`, `benchmarks/specs/cpp-smoke-queries.json` | redis, curl, sqlite, protobuf, nlohmann_json |
 | `js-ts` | JavaScript, JSX, TypeScript, TSX | `cjs`, `cts`, `js`, `jsx`, `mjs`, `mts`, `ts`, `tsx` | `tree-sitter-javascript`, `tree-sitter-typescript` | `tsc` | yes | `benchmarks/fixtures/js-ts/semantic-cases` | `benchmarks/specs/js-ts-smoke-queries.json` | vite, redux, axios, express, prettier |
+| `swift` | Swift | `swift` | `tree-sitter-swift` | `sourcekit_lsp` (scan-only fallback) | no | `benchmarks/fixtures/swift/semantic-cases` | `benchmarks/specs/swift-smoke-queries.json` | swift-nio |
 
 ## Rust
 
@@ -131,6 +132,30 @@ framework conventions can improve precision and recall.
 
 Oracle: TypeScript compiler API. CI installs the pinned `typescript` package and
 sets `SQUEEZY_TYPESCRIPT_PATH`.
+
+## Swift
+
+Indexed: classes, structs, actors, protocols, enums (with associated-value cases),
+extensions (members carry `language_identity = ExtendedType` for cross-file
+receiver resolution), `init` / `deinit` / `subscript`, computed and stored
+properties (computed properties carry `swift:computed`), property wrappers
+(`@Published` etc. as attribute references), `@MainActor` / `@objc` /
+`@Sendable` attributes, generic constraints from both the type parameter clause
+and `where` clauses, module imports (`import M`, `import struct M.T`), and
+SwiftPM module hints derived from `Sources/<Module>/...` paths.
+
+Known limitations: `@dynamicMemberLookup` runtime resolution, full protocol
+witness tracking, Objective-C bridging (`.h`/`.m` siblings and `@objc(name)`
+mappings), `#externalMacro`/`#freestanding` macro expansion, and SwiftPM
+`Package.swift` parsing for module facts are deferred follow-ups. Closures
+contribute body hits to their enclosing symbol but do not produce symbols of
+their own.
+
+Oracle: SourceKit-LSP. The first PR ships the scan-only path that exercises the
+Swift extractor against a corpus-shaped fixture; CI installs the Swift 5.10
+toolchain on Linux and uses the bundled `sourcekit-lsp`. macOS-only frameworks
+(`Combine`, `SwiftUI`, `Network`) are intentionally absent from the fixture so
+the smoke run works on `ubuntu-latest`.
 
 ## Benchmark Corpus Reporting
 

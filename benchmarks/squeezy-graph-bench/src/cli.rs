@@ -12,6 +12,7 @@ pub enum BenchmarkLanguage {
     JavaScript,
     Python,
     Rust,
+    Swift,
     TypeScript,
 }
 
@@ -26,6 +27,7 @@ impl BenchmarkLanguage {
             "javascript" | "js" => Ok(Self::JavaScript),
             "python" => Ok(Self::Python),
             "rust" => Ok(Self::Rust),
+            "swift" => Ok(Self::Swift),
             "typescript" | "ts" | "js-ts" => Ok(Self::TypeScript),
             other => Err(SqueezyError::Graph(format!(
                 "unknown benchmark language {other}"
@@ -43,6 +45,7 @@ impl BenchmarkLanguage {
             Self::JavaScript => "javascript",
             Self::Python => "python",
             Self::Rust => "rust",
+            Self::Swift => "swift",
             Self::TypeScript => "typescript",
         }
     }
@@ -57,6 +60,7 @@ impl BenchmarkLanguage {
             Self::JavaScript => LanguageKind::JavaScript,
             Self::Python => LanguageKind::Python,
             Self::Rust => LanguageKind::Rust,
+            Self::Swift => LanguageKind::Swift,
             Self::TypeScript => LanguageKind::TypeScript,
         }
     }
@@ -98,6 +102,7 @@ impl BenchmarkLanguage {
             | Self::Java
             | Self::JavaScript
             | Self::Rust
+            | Self::Swift
             | Self::TypeScript => "\n// squeezy refresh benchmark edit\n",
             Self::Python => "\n# squeezy refresh benchmark edit\n",
         }
@@ -223,7 +228,7 @@ impl BenchmarkCommand {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: squeezy-graph-bench [--list-languages|--list-oracles]\n       squeezy-graph-bench --corpus <path> [--family all|rust|python|java|go|c-family|csharp|js-ts] [--tier smoke|full] [--report-dir <path>]\n       squeezy-graph-bench [--language rust|python|java|c|cpp|csharp|go|javascript|typescript|js-ts] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--oracle-files <n, default=250, 0=all>] [--no-speed-gate]"
+                        "usage: squeezy-graph-bench [--list-languages|--list-oracles]\n       squeezy-graph-bench --corpus <path> [--family all|rust|python|java|go|c-family|csharp|js-ts|swift] [--tier smoke|full] [--report-dir <path>]\n       squeezy-graph-bench [--language rust|python|java|c|cpp|csharp|go|javascript|typescript|js-ts|swift] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--oracle-files <n, default=250, 0=all>] [--no-speed-gate]"
                     );
                     std::process::exit(0);
                 }
@@ -248,6 +253,7 @@ impl BenchmarkCommand {
                     | "js-ts"
                     | "javascript"
                     | "typescript"
+                    | "swift"
             ) {
                 return Err(SqueezyError::Graph(format!(
                     "unknown corpus family {family}"
