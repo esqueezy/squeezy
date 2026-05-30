@@ -5588,7 +5588,10 @@ fn failed_user_turn_marks_status_not_prompt_text() {
     );
     assert_eq!(user_lines[1].spans[0].style.bg, Some(PROMPT_BG));
     assert_eq!(user_lines[1].spans[1].content.as_ref(), "hi");
-    assert_eq!(user_lines[1].spans[1].style.fg, Some(Color::White));
+    assert_eq!(
+        user_lines[1].spans[1].style.fg,
+        Some(render::palette::muted_fg())
+    );
     assert_eq!(user_lines[1].spans[1].style.bg, Some(PROMPT_BG));
 
     let log_lines = format_transcript_entry(
@@ -5615,7 +5618,10 @@ fn user_prompt_text_is_highlighted_in_transcript() {
     assert_eq!(lines[1].spans[1].content.as_ref(), "find getFoo");
     assert_eq!(lines[1].spans[0].style.bg, Some(PROMPT_BG));
     assert_eq!(lines[1].spans[1].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[1].spans[1].style.fg, Some(Color::White));
+    assert_eq!(
+        lines[1].spans[1].style.fg,
+        Some(render::palette::muted_fg())
+    );
     assert!(!text.contains("◐"), "{text}");
 }
 
@@ -5637,7 +5643,7 @@ fn submitted_bang_prompt_marks_first_nonempty_bang_dark_red() {
 
     assert_eq!(bang.style.fg, Some(BANG_RED));
     assert_eq!(bang.style.bg, Some(PROMPT_BG));
-    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(rest.style.fg, Some(render::palette::muted_fg()));
     assert_eq!(rest.style.bg, Some(PROMPT_BG));
 }
 
@@ -5660,7 +5666,7 @@ fn live_prompt_marks_first_nonempty_bang_dark_red() {
 
     assert_eq!(bang.style.fg, Some(BANG_RED));
     assert_eq!(bang.style.bg, Some(PROMPT_BG));
-    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(rest.style.fg, Some(render::palette::muted_fg()));
     assert_eq!(rest.style.bg, Some(PROMPT_BG));
 }
 
@@ -5685,7 +5691,7 @@ fn submitted_double_bang_prompt_marks_both_bangs_dark_red() {
 
     assert_eq!(bang.style.fg, Some(BANG_RED));
     assert_eq!(bang.style.bg, Some(PROMPT_BG));
-    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(rest.style.fg, Some(render::palette::muted_fg()));
     assert_eq!(rest.style.bg, Some(PROMPT_BG));
     assert!(
         lines[1]
@@ -5715,7 +5721,7 @@ fn live_double_bang_prompt_marks_both_bangs_dark_red() {
 
     assert_eq!(bang.style.fg, Some(BANG_RED));
     assert_eq!(bang.style.bg, Some(PROMPT_BG));
-    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(rest.style.fg, Some(render::palette::muted_fg()));
     assert_eq!(rest.style.bg, Some(PROMPT_BG));
 }
 
