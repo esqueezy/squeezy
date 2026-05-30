@@ -788,6 +788,16 @@ impl Driver {
                     },
                 )?;
             }
+            Action::InjectMcpElicitation { request, .. } => {
+                let status = self.inject_mcp_elicitation_into_harness(request).await;
+                self.capture.record(
+                    None,
+                    EvalEventKind::ActionStep {
+                        action: payload,
+                        status,
+                    },
+                )?;
+            }
             Action::SendKeys { keys, delay_ms, .. } => {
                 let status = self.send_harness_keys(keys, *delay_ms).await;
                 self.capture.record(
@@ -1086,6 +1096,46 @@ impl Driver {
             Ok(_) => format!("sent {key} · status={:?}", h.status_text()),
             Err(err) => format!("asserted_fail: send_key {key}: {err}"),
         }
+    }
+
+    async fn inject_mcp_elicitation_into_harness(
+        &self,
+        request: &crate::scenario::InjectedMcpElicitation,
+    ) -> String {
+        let Some(harness) = self.harness.as_ref() else {
+            return "asserted_fail: inject_mcp_elicitation requires \
+                    [tui_capture] drive_tui = true"
+                .into();
+        };
+        let kind = match request
+            .kind
+            .as_deref()
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("url") => squeezy_tools::McpElicitationKind::Url,
+            // Default + explicit "form": modal/Form is the path the
+            // wave-1 finding flagged as untestable.
+            _ => squeezy_tools::McpElicitationKind::Form,
+        };
+        let req = squeezy_tui::testing::TuiHarness::make_mcp_elicitation_request(
+            request.server.clone(),
+            kind,
+            request.message.clone(),
+            request.schema.clone(),
+            request.url.clone(),
+        );
+        let mut h = harness.lock().await;
+        let _rx = h.push_pending_mcp_elicitation(req);
+        // Drop the receiver: the harness drives the modal via `send_key`,
+        // and the response payload is observed through the TuiApp state
+        // (transcript additions, status updates) rather than the oneshot
+        // channel.
+        format!(
+            "injected_mcp_elicitation:server={} status={:?}",
+            request.server,
+            h.status_text()
+        )
     }
 
     async fn send_harness_keys(&self, keys: &[String], delay_ms: u64) -> String {
@@ -2197,6 +2247,7 @@ fn action_kind_label(action: &Action) -> &'static str {
         Action::Assert { .. } => "assert",
         Action::InjectUserText { .. } => "inject_user_text",
         Action::RespondElicitation { .. } => "respond_elicitation",
+        Action::InjectMcpElicitation { .. } => "inject_mcp_elicitation",
         Action::RespondUserInput { .. } => "respond_user_input",
         Action::ApplyDiff { .. } => "apply_diff",
         Action::SwitchMode { .. } => "switch_mode",

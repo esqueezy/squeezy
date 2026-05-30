@@ -1238,3 +1238,54 @@ fn expect_finish_reason_not_quiet_when_stop_has_assistant_text() {
         "stop with assistant text is the OK path even without tool calls"
     );
 }
+
+fn unfired_action_event(seq: u64, action_tag: &str) -> EvalEvent {
+    EvalEvent {
+        schema_version: 2,
+        ts_unix_ms: 0,
+        sequence: seq,
+        turn_id: None,
+        kind: EvalEventKind::ActionStep {
+            action: serde_json::json!({"action": action_tag}),
+            status: "unfired_no_trigger".into(),
+        },
+    }
+}
+
+#[test]
+fn unfired_action_rule_flags_unfired_no_trigger_status() {
+    // Two scripted actions never found a trigger; the rule should emit
+    // one finding per drained step so triage can point at each one.
+    let events = vec![
+        unfired_action_event(7, "respond_elicitation"),
+        unfired_action_event(8, "approve"),
+    ];
+    let ctx = ctx_from_events(events);
+    let out = UnfiredAction.check(&ctx, &empty_scenario());
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].rule_id, "unfired_action");
+    assert_eq!(out[0].severity, Severity::Minor);
+    assert_eq!(out[0].evidence[0].trace_event, Some(7));
+    assert_eq!(out[1].evidence[0].trace_event, Some(8));
+}
+
+#[test]
+fn unfired_action_rule_quiet_when_no_drains() {
+    // ActionStep with status="injected:hello" is the happy path —
+    // the action fired and produced its outcome. No finding expected.
+    let events = vec![EvalEvent {
+        schema_version: 2,
+        ts_unix_ms: 0,
+        sequence: 3,
+        turn_id: None,
+        kind: EvalEventKind::ActionStep {
+            action: serde_json::json!({"action": "inject_user_text"}),
+            status: "injected:hello".into(),
+        },
+    }];
+    let ctx = ctx_from_events(events);
+    assert!(
+        UnfiredAction.check(&ctx, &empty_scenario()).is_empty(),
+        "fired actions must not be flagged"
+    );
+}

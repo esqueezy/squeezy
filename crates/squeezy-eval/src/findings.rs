@@ -1526,6 +1526,7 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
         // Phase 5 additions (TUI-coverage rules)
         Box::new(TuiOverlayUnhandled),
         Box::new(TuiUserInputAutoCancelled),
+        Box::new(UnfiredAction),
         Box::new(DeniedToolCallUx),
         // Phase 7 additions
         Box::new(PlatformMismatch),
@@ -1586,6 +1587,42 @@ impl Rule for TuiOverlayUnhandled {
                         "Overlay-triggering event `{kind}` was auto-cancelled — \
                          no scenario `RespondElicitation` / `RespondUserInput` matched."
                     ),
+                    evidence: vec![EvidencePointer {
+                        trace_event: Some(*seq),
+                        frame: None,
+                    }],
+                });
+            }
+        }
+        out
+    }
+}
+
+/// A scripted scenario `Action` was queued but its trigger never
+/// fired during the run, so the driver drained it post-loop with
+/// `status = "unfired_no_trigger"`. Surfaces a class of bugs the
+/// trace footnote alone hides — e.g. a `respond_elicitation` that
+/// never finds an `McpElicitationRequested` event because no MCP
+/// server is wired into the harness, or an `approve` whose tool
+/// never gets called.
+pub struct UnfiredAction;
+impl Rule for UnfiredAction {
+    fn rule_id(&self) -> &'static str {
+        "unfired_action"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for (seq, _kind, status) in &ctx.action_steps {
+            if status == "unfired_no_trigger" {
+                out.push(Finding {
+                    rule_id: "unfired_action".into(),
+                    severity: Severity::Minor,
+                    category: "tooling".into(),
+                    summary: "Scripted scenario action never fired — the trigger \
+                              (matching event / approval / elicitation) did not \
+                              arrive before the run drained. Often signals a \
+                              harness coverage gap rather than a product bug."
+                        .into(),
                     evidence: vec![EvidencePointer {
                         trace_event: Some(*seq),
                         frame: None,
