@@ -1,14 +1,17 @@
 id = "audit-misc-diff-with-changes"
 title = "Audit · /diff renders the worktree diff card"
 description = """
-Runs against the live workspace. `handle_slash_diff` spawns a
-blocking diff task; `pump_until_idle` now waits for
-`app.pending_diff` to drain (squeezy-nyg8.2) so the assert reads the
-landed transcript entry without a follow-up slash.
+Stages a deterministic uncommitted change against a per-run snapshot
+worktree (B1 / squeezy-nyg8.1 fixed the workspace_root_clone driver
+bug so edit_file lands inside the snapshot, not the host repo), then
+runs /diff and asserts the diff card lands in the transcript.
+pump_until_idle waits for app.pending_diff (B2 / squeezy-nyg8.2) so
+the assert reads the landed entry without extra slashes.
 """
 
 [workspace]
 local = "."
+snapshot = true
 
 [squeezy]
 provider = "mock"
@@ -22,15 +25,18 @@ width = 140
 height = 44
 palette_tone = "dark"
 
+# Stage a deterministic diff inside the snapshot worktree.
+[[steps]]
+kind = "action"
+action = "edit_file"
+path = "audit-diff-probe.md"
+content = "# audit diff probe\nLine added for the /diff scenario.\n"
+
 [[steps]]
 kind = "action"
 action = "slash_command"
 command = "/diff"
 
-# A successful diff card writes a `diff` transcript entry kind via
-# `app.push_diff_card`. The empty-tree path pushes a system log line
-# instead. Asserting on the transcript-entry kind is robust to scroll
-# state because it reads the typed entry, not the rendered frame.
 [[steps]]
 kind = "action"
 action = "assert"

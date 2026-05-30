@@ -1,9 +1,10 @@
 id = "audit-config-tool-verbosity-verbose"
 title = "Audit · /tool-verbosity verbose sets tool output verbosity"
 description = """
-`/tool-verbosity verbose` is a no-modal knob — emits the
-"tool output verbosity → verbose" notification and persists into the
-agent config snapshot. Notification text reaches the frame.
+`/tool-verbosity verbose` is a no-modal session knob — sets the
+status line to "tool output verbosity → verbose" and updates agent
+config. Post-squeezy-a19z (audit U1) the surface is unified on the
+status line (was app_notification before).
 """
 
 [workspace]
@@ -37,15 +38,8 @@ name = "none"
 kind = "action"
 action = "assert"
 [steps.check]
-kind = "tui_frame_contains"
-text = "tool output verbosity"
-
-[[steps]]
-kind = "action"
-action = "assert"
-[steps.check]
-kind = "tui_frame_contains"
-text = "verbose"
+kind = "tui_status_contains"
+text = "tool output verbosity → verbose"
 
 [expect]
 max_wall_clock_seconds = 30

@@ -1,10 +1,10 @@
 id = "audit-config-verbosity-concise"
 title = "Audit · /verbosity concise sets response verbosity"
 description = """
-`/verbosity concise` is a no-modal session knob — emits an
-app_notification ("response verbosity → concise") and updates
-agent config. Notifications render into the frame, so we use
-tui_frame_contains.
+`/verbosity concise` is a no-modal session knob — sets the status
+line to "response verbosity → concise" and updates agent config.
+Post-squeezy-a19z (audit U1) the surface is unified on the status
+line (was app_notification before).
 """
 
 [workspace]
@@ -38,15 +38,8 @@ name = "none"
 kind = "action"
 action = "assert"
 [steps.check]
-kind = "tui_frame_contains"
-text = "response verbosity"
-
-[[steps]]
-kind = "action"
-action = "assert"
-[steps.check]
-kind = "tui_frame_contains"
-text = "concise"
+kind = "tui_status_contains"
+text = "response verbosity → concise"
 
 [expect]
 max_wall_clock_seconds = 30
