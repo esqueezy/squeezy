@@ -426,7 +426,7 @@ fn tool_metrics_report(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // mirrors the per-language oracle fan-out
 fn answer_quality_report(
     query_reports: &[QueryReport],
     language: BenchmarkLanguage,
@@ -487,7 +487,7 @@ fn answer_quality_report(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // mirrors the per-language oracle fan-out
 fn oracle_summary(
     language: BenchmarkLanguage,
     accuracy: &AccuracyReport,

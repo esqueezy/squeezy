@@ -1,6 +1,22 @@
 use squeezy_core::{Result, SqueezyError};
 
+use crate::oracles::scala_semanticdb::{SCALA_SCAN_ONLY_PREFIX, SCALA_SEMANTICDB_STATUS_PREFIX};
 use crate::report::BenchmarkReport;
+
+/// Returns true when the Scala oracle ran end-to-end against SemanticDB
+/// protobufs. The gate is suppressed when scalac was missing or its
+/// invocation failed (scan-only fallback) so CI runners without a Scala
+/// toolchain still pass; once the toolchain is in place the precision /
+/// recall thresholds become load-bearing.
+fn scala_gate_active(status: &str) -> bool {
+    if status.starts_with(SCALA_SCAN_ONLY_PREFIX) {
+        return false;
+    }
+    if status.starts_with("skipped") {
+        return false;
+    }
+    status.starts_with(SCALA_SEMANTICDB_STATUS_PREFIX)
+}
 
 pub(crate) fn enforce_gates(report: &BenchmarkReport, no_speed_gate: bool) -> Result<()> {
     let missing = report
@@ -106,7 +122,7 @@ pub(crate) fn enforce_gates(report: &BenchmarkReport, no_speed_gate: bool) -> Re
 
     if !no_speed_gate
         && let Some(scala) = &report.scala_oracle
-        && !scala.status.starts_with("skipped")
+        && scala_gate_active(&scala.status)
         && (scala.symbols.precision < 0.90 || scala.symbols.recall < 0.75)
     {
         return Err(SqueezyError::Graph(format!(

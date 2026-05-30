@@ -1,0 +1,16 @@
+{
+  "_": "Scala bench baselines. Updated by `cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- --corpus benchmarks/corpus.json --family scala --tier smoke` once the smoke fixture compiles cleanly. The numbers below were recorded against an isolated one-file harness; the smoke fixture itself currently fails scalac with sealed-trait cross-file errors and is excluded from the baseline.",
+  "as_of": "2026-05-31",
+  "fixture": "manual 1-file smoke (class Foo / object Bar / trait Greeter / type Money)",
+  "oracle": "scalac 3.8.3 -Xsemanticdb",
+  "squeezy_build_ms": 4,
+  "oracle_ms": 3390,
+  "validation_ms": 9041,
+  "symbols": {
+    "precision": 0.875,
+    "recall": 0.7778,
+    "true_positive": 7,
+    "false_positive": 1,
+    "false_negative": 2
+  }
+}
