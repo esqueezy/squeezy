@@ -120,32 +120,31 @@ fn gutter_on_changed_lines_shares_the_tint() {
 }
 
 #[test]
-fn rust_content_picks_up_syntax_highlight_in_diff() {
-    // A `fn` keyword inside an added line should land as a `keyword`
-    // capture, picking up the highlighter's keyword color rather than
-    // the bare diff-add foreground.
+fn changed_rows_do_not_syntax_highlight_text() {
     let file = sample_file(
         "src/lib.rs",
         "@@ -1 +1 @@\n-fn old() {}\n+fn brand_new() {}\n",
     );
     let lines = render_diff_file(&file);
 
-    let add_fn_span = lines
+    let add_content = lines
         .iter()
         .find(|line| {
             line.spans
                 .iter()
                 .any(|span| span.content.as_ref().starts_with('+'))
         })
-        .and_then(|line| line.spans.iter().find(|span| span.content.as_ref() == "fn"))
-        .expect("`fn` keyword span on the added line");
+        .and_then(|line| {
+            line.spans
+                .iter()
+                .find(|span| span.content.as_ref().contains("fn brand_new"))
+        })
+        .expect("added line content span");
     assert_eq!(
-        add_fn_span.style.fg,
-        Some(highlight::HighlightPalette::current().keyword),
-        "`fn` should be coloured by the highlighter, not the diff fg",
+        add_content.style.fg, None,
+        "added row content should keep the default foreground",
     );
-    // Highlighted spans on added lines inherit the add-line bg tint.
-    assert_eq!(add_fn_span.style.bg, Some(diff_add_bg()));
+    assert_eq!(add_content.style.bg, Some(diff_add_bg()));
 }
 
 #[test]

@@ -3405,6 +3405,23 @@ async fn slash_collapse_and_expand_apply_to_tool_entries() {
     assert!(app.transcript[0].collapsed);
 }
 
+#[tokio::test]
+async fn bare_slash_expand_opens_full_transcript_overlay() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    app.transcript[0].collapsed = true;
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/expand").await);
+
+    assert!(app.transcript_overlay.is_some());
+    assert_eq!(app.status, "full transcript open");
+    assert!(
+        app.transcript[0].collapsed,
+        "bare /expand should not pretend it can rewrite inline scrollback"
+    );
+}
+
 #[test]
 fn tool_output_verbosity_changes_preview_length() {
     let result = sample_tool_result("grep", &"x".repeat(1_000));
@@ -3959,13 +3976,55 @@ fn plan_mode_question_renders_with_choices_and_freeform_hint() {
         "first choice missing: {output}"
     );
     assert!(
-        output.contains("› Keep the current layout"),
+        output.contains("● Keep the current layout"),
         "selected marker missing on second choice: {output}"
     );
     assert!(
         output.contains("freeform"),
         "freeform hint missing: {output}"
     );
+}
+
+#[test]
+fn plan_mode_question_selected_choice_uses_amber_dot_not_yellow_label() {
+    let request = RequestUserInputRequest {
+        question: "For the modernization pass, should I keep it strict?".to_string(),
+        choices: vec![
+            RequestUserInputChoice {
+                label: "Behavior-preserving only".to_string(),
+                value: "behavior_preserving".to_string(),
+            },
+            RequestUserInputChoice {
+                label: "Allow small internal cleanup".to_string(),
+                value: "small_cleanup".to_string(),
+            },
+        ],
+        allow_freeform: false,
+    };
+
+    let lines = format_request_user_input_menu_lines(&request, 0, "");
+    let selected = lines
+        .iter()
+        .find(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref() == "Behavior-preserving only")
+        })
+        .expect("selected choice line");
+    let marker = selected
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "● ")
+        .expect("selected marker");
+    assert_eq!(marker.style.fg, Some(AMBER));
+
+    let label = selected
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "Behavior-preserving only")
+        .expect("selected label");
+    assert_ne!(label.style.fg, Some(GOLD));
+    assert_ne!(label.style.fg, Some(AMBER));
 }
 
 #[test]

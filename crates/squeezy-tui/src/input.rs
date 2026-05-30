@@ -180,7 +180,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     ),
     slash_args(
         "/expand",
-        "expand transcript entries (default: all)",
+        "open full transcript; args expand entries inline",
         true,
         "[all|tools|logs|diffs|receipts|assistant|reasoning]",
     ),

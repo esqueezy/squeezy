@@ -2426,7 +2426,12 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             apply_collapse_expand(app, "/collapse", category.as_deref(), true);
         }
         DispatchCommand::Expand { category } => {
-            apply_collapse_expand(app, "/expand", category.as_deref(), false);
+            if category.is_none() {
+                app.transcript_overlay = Some(TranscriptOverlayState::default());
+                app.status = "full transcript open".to_string();
+            } else {
+                apply_collapse_expand(app, "/expand", category.as_deref(), false);
+            }
         }
         DispatchCommand::Diff => handle_slash_diff(app),
         DispatchCommand::Effort { value } => handle_slash_effort(app, agent, value.as_deref()),
@@ -4402,18 +4407,21 @@ fn format_request_user_input_menu_lines(
     ]));
     for (index, choice) in request.choices.iter().enumerate() {
         let is_selected = index == selected.min(request.choices.len().saturating_sub(1));
-        let marker = if is_selected { "› " } else { "  " };
+        let marker = if is_selected { "● " } else { "  " };
         let label_style = if is_selected {
-            Style::default().fg(GOLD)
+            Style::default()
+                .fg(palette::footer_fg())
+                .add_modifier(Modifier::BOLD)
         } else {
             // Tone-aware muted grey sits below the luminance budget so
-            // the selected GOLD row wins the eye in the warm-taupe modal.
+            // the amber selection dot carries focus without turning the
+            // label itself yellow.
             Style::default().fg(palette::muted_fg())
         };
         let mut spans = vec![
             Span::styled(
                 marker,
-                Style::default().fg(if is_selected { GOLD } else { QUIET }),
+                Style::default().fg(if is_selected { AMBER } else { QUIET }),
             ),
             Span::styled(compact_text(&choice.label, 180), label_style),
         ];

@@ -198,10 +198,13 @@ fn render_line(line: &DiffLine, gutter_width: usize, language_hint: Option<&str>
     }
     spans.push(Span::styled(sign.to_string(), sign_style));
 
-    // Content spans: try syntax highlighting; fall back to the default
-    // foreground. Diff state is carried by the row background, not red/green
-    // text.
-    let content_spans = content_spans(&line.content, language_hint, fg_style);
+    // Changed rows intentionally skip syntax highlighting: the only add/delete
+    // cue should be the row background, not red/green or token-colored text.
+    let syntax_hint = match line.kind {
+        DiffLineKind::Add | DiffLineKind::Delete => None,
+        DiffLineKind::Context | DiffLineKind::Hunk => language_hint,
+    };
+    let content_spans = content_spans(&line.content, syntax_hint, fg_style);
     for mut span in content_spans {
         if let Some(bg) = bg {
             span.style = span.style.bg(bg);
