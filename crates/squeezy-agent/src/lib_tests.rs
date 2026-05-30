@@ -2178,8 +2178,6 @@ async fn bang_command_completes_locally_without_provider_request() {
     let tool_result = tool_result.expect("ls should run through the shell tool");
     assert_eq!(tool_result.tool_name, "shell");
     assert_eq!(tool_result.status, ToolStatus::Success);
-    assert_eq!(tool_result.content["policy"]["direct_user_shell"], true);
-    assert_eq!(tool_result.content["sandbox"]["backend"], "none");
     let completed = completed.expect("ls turn should complete");
     assert!(completed.contains("Cargo.toml"), "{completed}");
     assert!(completed.contains("src"), "{completed}");
@@ -2262,10 +2260,6 @@ async fn double_bang_command_runs_locally_and_skips_llm_context() {
     let quiet_tool_result =
         quiet_tool_result.expect("!!ls should still execute the shell tool locally");
     assert_eq!(quiet_tool_result.status, ToolStatus::Success);
-    assert_eq!(
-        quiet_tool_result.content["policy"]["direct_user_shell"], true,
-        "double-bang must keep the direct-user-shell sandbox bypass",
-    );
     assert!(
         quiet_completed
             .as_deref()

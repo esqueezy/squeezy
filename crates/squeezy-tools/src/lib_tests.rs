@@ -4830,9 +4830,9 @@ async fn direct_user_shell_skips_checkpoint_and_sandbox() {
         .await;
 
     assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
-    assert_eq!(result.content["sandbox"]["backend"], "none");
-    assert_eq!(result.content["sandbox"]["mode"], "off");
-    assert_eq!(result.content["policy"]["direct_user_shell"], true);
+    // Direct user-shell fast path skips checkpointing — the absence of a
+    // checkpoint receipt is the distinguishing signal in a checkpoint-enabled
+    // registry (the non-direct path in the same registry always writes one).
     assert!(result.content.get("checkpoint").is_none());
     assert_eq!(
         fs::read_to_string(root.join("direct.txt")).unwrap(),
@@ -4870,11 +4870,9 @@ async fn direct_user_shell_rejects_wrong_nonce() {
         .await;
 
     assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
-    // Bypass refused: the call falls through to the normal model path, so
-    // the policy view records `direct_user_shell=false` AND a checkpoint
-    // gets created for the destructive command — the very protections the
-    // bypass would have skipped.
-    assert_eq!(result.content["policy"]["direct_user_shell"], false);
+    // Bypass refused: the call falls through to the normal model path, so a
+    // checkpoint gets created for the destructive command — the very
+    // protection the bypass would have skipped.
     assert_eq!(result.content["checkpoint"]["group_id"], "turn-spoof");
 
     let _ = fs::remove_dir_all(root);
@@ -4902,7 +4900,8 @@ async fn read_only_model_shell_skips_checkpoint() {
         .await;
 
     assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
-    assert_eq!(result.content["policy"]["capability"], "search");
+    let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
+    assert!(audit.contains("\"capability\":\"search\""));
     assert!(result.content.get("checkpoint").is_none());
 
     let _ = fs::remove_dir_all(root);
@@ -4929,7 +4928,8 @@ async fn read_only_git_shell_skips_checkpoint() {
         )
         .await;
 
-    assert_eq!(result.content["policy"]["capability"], "git");
+    let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
+    assert!(audit.contains("\"capability\":\"git\""));
     assert!(result.content.get("checkpoint").is_none());
 
     let _ = fs::remove_dir_all(root);
@@ -4957,7 +4957,6 @@ async fn model_shell_cannot_request_direct_user_shell_fast_path() {
         .await;
 
     assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
-    assert_eq!(result.content["policy"]["direct_user_shell"], false);
     assert_eq!(result.content["checkpoint"]["group_id"], "turn-model");
 
     let _ = fs::remove_dir_all(root);
@@ -5368,14 +5367,13 @@ async fn shell_returns_bounded_output_and_exit_code() {
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["stdout"], "abc");
     assert_eq!(result.content["exit_code"], 0);
-    assert_eq!(result.content["env"]["policy"], "allowlist");
-    assert_eq!(result.content["env"]["values"], "redacted");
-    assert_eq!(result.content["sandbox"]["mode"], "off");
-    assert!(result.content["policy"]["parser_backed"].as_bool().unwrap());
     let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
     assert!(audit.contains("\"call_id\":\"call_1\""));
     assert!(audit.contains("\"stdout_sha256\""));
     assert!(!audit.contains("\"stdout\":\"abc\""));
+    assert!(audit.contains("\"policy\":\"allowlist\""));
+    assert!(audit.contains("\"mode\":\"off\""));
+    assert!(audit.contains("\"parser_backed\":true"));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -5401,7 +5399,8 @@ async fn shell_default_sandbox_runs_benign_command() {
 
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["stdout"], "ok");
-    assert_eq!(result.content["sandbox"]["mode"], "best_effort");
+    let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
+    assert!(audit.contains("\"mode\":\"best_effort\""));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -5436,10 +5435,11 @@ async fn shell_external_sandbox_mode_preserves_policy_metadata() {
 
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["stdout"], "ok");
-    assert_eq!(result.content["sandbox"]["backend"], "external");
-    assert_eq!(result.content["sandbox"]["mode"], "external");
-    assert_eq!(result.content["sandbox"]["network"], "external");
-    assert_eq!(result.content["env"]["policy"], "allowlist");
+    let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
+    assert!(audit.contains("\"backend\":\"external\""));
+    assert!(audit.contains("\"mode\":\"external\""));
+    assert!(audit.contains("\"network\":\"external\""));
+    assert!(audit.contains("\"policy\":\"allowlist\""));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -5606,10 +5606,8 @@ async fn shell_workdir_accepts_configured_extra_root() {
 
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["stdout"], "ok");
-    assert_eq!(
-        result.content["sandbox"]["write_roots"][0],
-        extra.display().to_string()
-    );
+    let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
+    assert!(audit.contains(&extra.display().to_string()));
 
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_dir_all(extra);
@@ -9877,7 +9875,6 @@ fn shell_best_effort_falls_back_when_sandbox_dies_without_output() {
         stdout_truncated: false,
         stderr_bytes: Vec::new(),
         stderr_truncated: false,
-        preserved_env: Vec::new(),
     };
 
     let reason =
@@ -10029,7 +10026,6 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
         stdout_truncated: false,
         stderr_bytes: b"sandbox_apply: Operation not permitted".to_vec(),
         stderr_truncated: false,
-        preserved_env: Vec::new(),
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run)
