@@ -44,19 +44,14 @@ pub(crate) struct GrepBaselineSpec {
     pub(crate) unsupported_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GrepBaselineMode {
+    #[default]
     Paths,
     Count,
     FirstLine,
     Unsupported,
-}
-
-impl Default for GrepBaselineMode {
-    fn default() -> Self {
-        Self::Paths
-    }
 }
 
 #[derive(Debug, Serialize)]
