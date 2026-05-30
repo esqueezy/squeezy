@@ -33,8 +33,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider = provider_from_config(&config.provider)?;
     let mut harness = TuiHarness::new(config, SessionMode::Build, provider, 160, 60)?;
 
-    println!("=== sending prompt ===");
-    harness.start_user_turn("hey");
+    println!("=== sending prompt 1 ===");
+    harness.start_user_turn("what is the hardest problem in life");
+    harness.pump_until_idle().await?;
+    println!("=== sending prompt 2 ===");
+    harness.start_user_turn("how are the sky today?");
     harness.pump_until_idle().await?;
 
     println!("\n=== transcript entries after turn ===");

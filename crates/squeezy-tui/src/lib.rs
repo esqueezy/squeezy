@@ -1711,43 +1711,6 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 false
             }
         }
-        keymap::Action::ExpandSelectedTranscriptEntry => {
-            tracing::debug!(
-                target: "squeezy_tui::keymap",
-                action = "expand_selected_transcript_entry",
-                composer_empty = app.input.is_empty(),
-                config_screen_open = app.config_screen.is_some(),
-                status_line_setup_open = app.status_line_setup.is_some(),
-                key_modifiers = ?key.modifiers,
-                key_code = ?key.code,
-                "Ctrl+O dispatched"
-            );
-            if app.config_screen.is_some() || app.status_line_setup.is_some() {
-                return false;
-            }
-            // `Ctrl+O` is dedicated — fires regardless of composer
-            // state. No need for the readline-line-end fall-through
-            // the previous `Ctrl+E` binding required.
-            toggle_selected_transcript_entry(app);
-            true
-        }
-        keymap::Action::ExpandAllTranscriptEntries => {
-            tracing::debug!(
-                target: "squeezy_tui::keymap",
-                action = "expand_all_transcript_entries",
-                composer_empty = app.input.is_empty(),
-                config_screen_open = app.config_screen.is_some(),
-                status_line_setup_open = app.status_line_setup.is_some(),
-                key_modifiers = ?key.modifiers,
-                key_code = ?key.code,
-                "Ctrl+E dispatched"
-            );
-            if app.config_screen.is_some() || app.status_line_setup.is_some() {
-                return false;
-            }
-            toggle_expand_all_transcript_entries(app);
-            true
-        }
     }
 }
 
@@ -3387,290 +3350,6 @@ fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     }
 }
 
-fn toggle_selected_transcript_entry(app: &mut TuiApp) {
-    let selected_from_entry = app.selected_entry.and_then(|index| {
-        app.transcript
-            .get(index)
-            .filter(|entry| entry_targets_toggle(entry, app.show_reasoning_usage))
-            .map(|_| resolve_toggle_target(&app.transcript, index))
-    });
-    let latest_reasoning = latest_reasoning_toggle_target(app);
-    let picked_by = if selected_from_entry.is_some() {
-        "selected"
-    } else if latest_reasoning.is_some() {
-        "latest_reasoning"
-    } else {
-        "latest"
-    };
-    // Picker order matters for "Ctrl+O on a visible chip toggles
-    // *that* chip" muscle memory. Without the reasoning-first
-    // shortcut, the first press flips the (collapsed) reasoning,
-    // then `latest_collapsed_transcript_entry` falls through to the
-    // assistant message and every subsequent press bounces the
-    // assistant body back and forth — the user perceives "Ctrl+O
-    // stopped working on the reasoning". Preferring the latest
-    // reasoning entry keeps repeated presses sticky on the chip the
-    // user is actually looking at.
-    let Some(index) = selected_from_entry
-        .or(latest_reasoning)
-        .or_else(|| latest_collapsed_transcript_entry(app))
-        .or_else(|| latest_toggleable_transcript_entry(app))
-    else {
-        log_toggle_event("expand_one", "none", 0, None, "nothing toggleable");
-        app.status = "nothing expandable yet · /expand all also works".to_string();
-        app.needs_redraw = true;
-        return;
-    };
-    let Some(entry) = app.transcript.get_mut(index) else {
-        app.selected_entry = None;
-        app.status = "select a transcript entry first".to_string();
-        app.needs_redraw = true;
-        return;
-    };
-    let was_collapsed = entry.collapsed;
-    entry.collapsed = !entry.collapsed;
-    entry.bump_revision();
-    let entry_kind = transcript_entry_kind_label(entry);
-    let entry_id = entry.id;
-    let new_collapsed = entry.collapsed;
-    app.status = format!(
-        "{} transcript entry {} · Ctrl+E expand all",
-        if new_collapsed {
-            "collapsed"
-        } else {
-            "expanded"
-        },
-        entry_id + 1
-    );
-    // Defensive: in case some future caller invokes the toggle
-    // outside `poll_input`'s pre-set-`needs_redraw` envelope, force
-    // a repaint so a flag flip is never silent on screen.
-    app.needs_redraw = true;
-    log_toggle_event(
-        "expand_one",
-        picked_by,
-        entry_id,
-        Some((was_collapsed, new_collapsed)),
-        entry_kind,
-    );
-}
-
-fn transcript_entry_kind_label(entry: &TranscriptEntry) -> &'static str {
-    match &entry.kind {
-        TranscriptEntryKind::Message(item) => match item.role {
-            Role::User => "message:user",
-            Role::Assistant => "message:assistant",
-            Role::System => "message:system",
-        },
-        TranscriptEntryKind::ToolResult(_) => "tool_result",
-        TranscriptEntryKind::Log(_) => "log",
-        TranscriptEntryKind::PlanCard(_) => "plan_card",
-        TranscriptEntryKind::Diff(_) => "diff",
-        TranscriptEntryKind::Reasoning(_) => "reasoning",
-        TranscriptEntryKind::SlashEcho(_) => "slash_echo",
-    }
-}
-
-/// Append a one-line summary of a toggle event to
-/// `SQUEEZY_DEBUG_TOGGLE` when the env var is set. Silent no-op
-/// otherwise; diagnostics must never break the TUI.
-fn log_toggle_event(
-    op: &str,
-    picked_by: &str,
-    entry_id: u64,
-    flip: Option<(bool, bool)>,
-    kind: &str,
-) {
-    use std::io::Write;
-    let Some(path) = std::env::var_os("SQUEEZY_DEBUG_TOGGLE") else {
-        return;
-    };
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
-        return;
-    };
-    let flip_str = match flip {
-        Some((was, now)) => format!("{} -> {}", was, now),
-        None => "noop".to_string(),
-    };
-    let _ = writeln!(
-        f,
-        "{op} picked_by={picked_by} entry_id={entry_id} kind={kind} collapsed={flip_str}"
-    );
-}
-
-/// Bulk expand / collapse across every toggleable transcript entry.
-///
-/// Semantics: if any toggleable entry is currently collapsed, expand
-/// all of them; otherwise (everything already expanded), collapse all
-/// back to default. One-shot toggle so the user can rapidly switch
-/// between "show me everything" and "back to compact" states.
-///
-/// Reports the count operated on via `app.status` so the user always
-/// gets feedback — silent UI is the whole reason the original
-/// transcript expand surface felt broken on small screens.
-fn toggle_expand_all_transcript_entries(app: &mut TuiApp) {
-    let show_reasoning = app.show_reasoning_usage;
-    let mut total_toggleable = 0usize;
-    let mut total_collapsed = 0usize;
-    for entry in &app.transcript {
-        if entry_targets_toggle(entry, show_reasoning) {
-            total_toggleable += 1;
-            if entry.collapsed {
-                total_collapsed += 1;
-            }
-        }
-    }
-    if total_toggleable == 0 {
-        app.status = "nothing expandable yet".to_string();
-        return;
-    }
-    let target_collapsed = total_collapsed == 0;
-    let mut changed = 0usize;
-    for entry in app.transcript.iter_mut() {
-        if !entry_targets_toggle(entry, show_reasoning) {
-            continue;
-        }
-        if entry.collapsed != target_collapsed {
-            entry.collapsed = target_collapsed;
-            entry.bump_revision();
-            changed += 1;
-        }
-    }
-    app.status = if target_collapsed {
-        format!("collapsed {changed} of {total_toggleable} transcript entries · Ctrl+O expand one")
-    } else {
-        format!("expanded {changed} of {total_toggleable} transcript entries · Ctrl+O collapse one")
-    };
-    app.needs_redraw = true;
-    log_toggle_event(
-        "expand_all",
-        if target_collapsed {
-            "collapse"
-        } else {
-            "expand"
-        },
-        changed as u64,
-        Some((!target_collapsed, target_collapsed)),
-        "bulk",
-    );
-}
-
-/// True when `entry` is a candidate for Ctrl-O / Ctrl-E. Mirrors
-/// `is_toggleable` but additionally skips reasoning entries when the
-/// user has hidden them via `show_reasoning_usage = false` — toggling
-/// a reasoning entry that renders zero lines has no visible effect and
-/// looks broken from the keyboard side.
-fn entry_targets_toggle(entry: &TranscriptEntry, show_reasoning: bool) -> bool {
-    if !entry.is_toggleable() {
-        return false;
-    }
-    if !show_reasoning && matches!(entry.kind, TranscriptEntryKind::Reasoning(_)) {
-        return false;
-    }
-    true
-}
-
-/// Walk back through a run of adjacent reasoning entries to find the
-/// Lead — the entry whose `collapsed` flag actually drives what the
-/// user sees on screen. `reasoning_run_info` coalesces adjacent
-/// reasoning entries into one rendered chip; toggling a Suppressed
-/// member flips a flag nothing renders. Mapping the toggle target back
-/// to the Lead ensures Ctrl-O / Ctrl-E acts on the visible chip.
-fn resolve_toggle_target(transcript: &[TranscriptEntry], index: usize) -> usize {
-    let mut cursor = index;
-    while cursor > 0
-        && matches!(
-            transcript.get(cursor).map(|e| &e.kind),
-            Some(TranscriptEntryKind::Reasoning(_))
-        )
-        && matches!(
-            transcript.get(cursor - 1).map(|e| &e.kind),
-            Some(TranscriptEntryKind::Reasoning(_))
-        )
-    {
-        cursor -= 1;
-    }
-    cursor
-}
-
-/// The latest reasoning entry the user can see, mapped to its Lead.
-/// `toggle_selected_transcript_entry` prefers this over the more
-/// generic pickers so repeated Ctrl+O presses stay sticky on the
-/// reasoning chip the user is looking at, rather than flipping the
-/// chip once and then bouncing other toggleable entries.
-fn latest_reasoning_toggle_target(app: &TuiApp) -> Option<usize> {
-    if !app.show_reasoning_usage {
-        return None;
-    }
-    app.transcript
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, entry)| {
-            matches!(entry.kind, TranscriptEntryKind::Reasoning(_)) && entry.is_toggleable()
-        })
-        .map(|(index, _)| index)
-        .map(|index| resolve_toggle_target(&app.transcript, index))
-}
-
-fn latest_toggleable_transcript_entry(app: &TuiApp) -> Option<usize> {
-    let show_reasoning = app.show_reasoning_usage;
-    app.transcript
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, entry)| entry_targets_toggle(entry, show_reasoning))
-        .map(|(index, _)| index)
-        .map(|index| resolve_toggle_target(&app.transcript, index))
-}
-
-fn latest_collapsed_transcript_entry(app: &TuiApp) -> Option<usize> {
-    // Prefer the most recent collapsed reasoning entry when one exists.
-    // Without this preference Ctrl-E falls through to the most recent
-    // collapsed *peer* — which after a turn lands is the assistant
-    // message (also collapsed on `transcript_default = compact`). The
-    // assistant body is usually a short single line, so toggling it has
-    // no visible effect and the reasoning chevron the user actually
-    // wanted to expand stays collapsed. Reasoning blocks are by far the
-    // most common Ctrl-E target, so prefer them when the user hasn't
-    // explicitly navigated to a specific entry.
-    //
-    // Adjacent reasoning entries coalesce into one chip rendered off the
-    // *Lead* entry's `collapsed` flag — toggling a `Suppressed` member
-    // would flip a flag nothing renders. `resolve_toggle_target` maps a
-    // Suppressed reasoning index back to its Lead so the chip the user
-    // sees is the one that actually toggles.
-    let show_reasoning = app.show_reasoning_usage;
-    if show_reasoning {
-        let latest_reasoning = app
-            .transcript
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, entry)| {
-                matches!(entry.kind, TranscriptEntryKind::Reasoning(_))
-                    && entry.collapsed
-                    && entry.is_toggleable()
-            })
-            .map(|(index, _)| index)
-            .map(|index| resolve_toggle_target(&app.transcript, index));
-        if latest_reasoning.is_some() {
-            return latest_reasoning;
-        }
-    }
-    app.transcript
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, entry)| entry.collapsed && entry_targets_toggle(entry, show_reasoning))
-        .map(|(index, _)| index)
-        .map(|index| resolve_toggle_target(&app.transcript, index))
-}
-
 /// Kick off a user-driven turn. Drains any pending config swap, consumes a
 /// queued plan handoff (prepending the plan body to `input`), and hands
 /// the resulting prompt to the agent. Used by the Enter key handler and
@@ -5263,44 +4942,7 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
     }
 }
 
-/// One-shot dump of the reasoning entries' collapsed state at render
-/// time. Append-only, gated on the `SQUEEZY_DEBUG_RENDER` env var so a
-/// user reporting "the chip flag flipped but the screen didn't" can
-/// see exactly what the renderer thought the chip should look like at
-/// the moment the cell grid was written. Triggers per draw; cheap (a
-/// single fmt + writeln when enabled, zero work otherwise).
-fn debug_log_render_chips(app: &TuiApp) {
-    use std::io::Write;
-    let Some(path) = std::env::var_os("SQUEEZY_DEBUG_RENDER") else {
-        return;
-    };
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
-        return;
-    };
-    let _ = writeln!(
-        f,
-        "--- draw at {:?} show_reasoning={} needs_redraw={} entries={}",
-        std::time::SystemTime::now(),
-        app.show_reasoning_usage,
-        app.needs_redraw,
-        app.transcript.len()
-    );
-    for (i, entry) in app.transcript.iter().enumerate() {
-        let kind = transcript_entry_kind_label(entry);
-        let _ = writeln!(
-            f,
-            "  pos={i} id={} kind={kind} collapsed={} revision={}",
-            entry.id, entry.collapsed, entry.revision
-        );
-    }
-}
-
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_startup_card: bool) {
-    debug_log_render_chips(app);
     let lines = transcript_lines_for_render(app, Some(area.width), include_startup_card);
     let scroll =
         transcript_scroll_offset(lines.len(), area.height, app.transcript_scroll_from_bottom);
@@ -6749,7 +6391,10 @@ fn reasoning_block_lines_with_extras(
             .map(|first| compact_text(first, 120))
             .unwrap_or_default();
         let mut suffix = if body_lines.len() > 1 {
-            format!(" … +{} lines (Ctrl-O to expand)", body_lines.len() - 1)
+            format!(
+                " … +{} lines (Ctrl-T for full transcript)",
+                body_lines.len() - 1
+            )
         } else {
             String::new()
         };
@@ -6930,14 +6575,13 @@ fn collapsed_content_summary(content: &str) -> String {
     let lines = content.lines().collect::<Vec<_>>();
     if lines.len() > 1 {
         let first = compact_text(lines.first().copied().unwrap_or_default(), 120);
-        format!("{first} … +{} lines (Ctrl-O to expand)", lines.len() - 1)
+        format!(
+            "{first} … +{} lines (Ctrl-T for full transcript)",
+            lines.len() - 1
+        )
     } else {
         compact_text(content, 160)
     }
-}
-
-fn text_has_collapsible_content(content: &str) -> bool {
-    content.lines().count() > 1 || content.len() > 160
 }
 
 fn format_tool_result_entry(
@@ -6987,7 +6631,7 @@ fn wrap_tool_card(header: Line<'static>, body: Vec<Line<'static>>) -> Vec<Line<'
 /// `extras + 1` consecutive same-tool same-status entries.
 ///
 /// In collapsed form the header reads `"Read 3 files"` etc., the body is
-/// one summary row per member followed by a `(Ctrl-E to expand all)`
+/// one summary row per member followed by a `(Ctrl-T for full transcript)`
 /// affordance row. In expanded form the header is followed by each
 /// member's normal tool-card body rendered inline so the user can scan
 /// their full output.
@@ -7018,7 +6662,7 @@ fn format_grouped_tool_result_entry(
         body.push(detail_line(
             false,
             QUIET,
-            "(Ctrl-E to expand all)".to_string(),
+            "(Ctrl-T for full transcript)".to_string(),
         ));
     } else {
         // Stack each child's full single-tool render. Each is already
@@ -7145,11 +6789,12 @@ fn collapsed_tool_preview_lines(
     head_tail_truncate_lines(detail, cap)
 }
 
-/// Head-tail truncate a list of rendered detail lines, inserting a
-/// single "… +N lines (Ctrl-O to expand)" ellipsis between the head and
-/// tail when the total exceeds `2 * cap`. Cap is the maximum number of
-/// lines to keep on EACH end. Wording stays consistent with the existing
-/// diff renderer (see `render::diff::head_tail`).
+/// Head-tail truncate a list of rendered detail lines, inserting a single
+/// "… +N lines (Ctrl-T for full transcript)" ellipsis between the head and tail
+/// when the total exceeds `2 * cap`. Cap is the maximum number of lines
+/// to keep on EACH end. Mirrors codex's `output_ellipsis_line` UX —
+/// wording stays consistent with the existing diff renderer
+/// (see `render::diff::head_tail`).
 fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'static>> {
     if cap == 0 || lines.len() <= cap.saturating_mul(2) {
         return lines;
@@ -7160,7 +6805,7 @@ fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'
     out.push(detail_line(
         false,
         QUIET,
-        format!("… +{omitted} lines (Ctrl-O to expand)"),
+        format!("… +{omitted} lines (Ctrl-T for full transcript)"),
     ));
     out.extend(
         lines
@@ -8186,7 +7831,10 @@ fn expanded_symbol_context_detail_lines(
         lines.push(detail_line(
             false,
             QUIET,
-            format!("+{} more packets (Ctrl-O to expand)", total - packet_cap),
+            format!(
+                "+{} more packets (Ctrl-T for full transcript)",
+                total - packet_cap
+            ),
         ));
     }
     lines
@@ -8674,7 +8322,10 @@ fn expanded_generic_tool_detail_lines(
         lines.push(detail_line(
             false,
             QUIET,
-            format!("+{} more fields (Ctrl-O to expand)", total_keys - shown),
+            format!(
+                "+{} more fields (Ctrl-T for full transcript)",
+                total_keys - shown
+            ),
         ));
     }
     lines
@@ -8773,7 +8424,7 @@ fn head_tail_lines(content: &str, limit: usize) -> Vec<PreviewLine> {
         })
         .collect::<Vec<_>>();
     preview.push(PreviewLine {
-        text: format!("… +{omitted} lines (Ctrl-O to expand)"),
+        text: format!("… +{omitted} lines (Ctrl-T for full transcript)"),
         truncated_marker: true,
     });
     preview.extend(
@@ -10069,7 +9720,7 @@ fn format_status_hints(app: &TuiApp) -> String {
             .to_string();
     } else if app.cancel.is_some() {
         let mut hint = String::from(
-            "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-O expand · Ctrl-E expand all · Ctrl-T transcript · Ctrl-Y copy · /help",
+            "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-T full transcript · Ctrl-Y copy · /help",
         );
         if !app.prompt_queue.is_empty() {
             hint.push_str(&format!(" · Ctrl+X Q reorder ({})", app.prompt_queue.len()));
@@ -10084,10 +9735,10 @@ fn format_status_hints(app: &TuiApp) -> String {
         return "Ctrl-R restore last prompt · Enter send · Ctrl+J newline · /help".to_string();
     }
     let mut base = if app.alternate_scroll_enabled {
-        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-O expand · Ctrl-E expand all · Ctrl-T transcript · /help"
+        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-T full transcript · /help"
             .to_string()
     } else {
-        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-O expand · Ctrl-E expand all · Ctrl-T transcript · /help"
+        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-T full transcript · /help"
             .to_string()
     };
     if app.context_compaction_threshold > 0
@@ -10160,7 +9811,7 @@ fn format_status_hint_suffix(app: &TuiApp) -> String {
     if !app.prompt_queue.is_empty() {
         format!("queued: {} · Ctrl+X Q reorder", app.prompt_queue.len())
     } else {
-        "Ctrl-O expand · Ctrl-E expand all · /help".to_string()
+        "Ctrl-T full transcript · /help".to_string()
     }
 }
 
@@ -11568,42 +11219,6 @@ impl TranscriptEntry {
                 Some(item.content.clone())
             }
             _ => None,
-        }
-    }
-
-    fn is_toggleable(&self) -> bool {
-        match &self.kind {
-            TranscriptEntryKind::Message(item) => {
-                if item.role == Role::User {
-                    return false;
-                }
-                if text_has_collapsible_content(&item.content) {
-                    return true;
-                }
-                // Assistant messages can carry an embedded reasoning
-                // snapshot whose chip's ▸/▾ state follows the parent
-                // entry's `collapsed` flag (see
-                // `format_assistant_message_entry`). When the
-                // assistant text is short but the embedded reasoning is
-                // multi-line, the entry must still be toggleable —
-                // otherwise the picker rejects it and Ctrl-O / Ctrl-E
-                // surface "nothing expandable yet" even though the
-                // chip is visible on screen.
-                if let Some(snapshot) = item.reasoning.as_deref()
-                    && text_has_collapsible_content(&snapshot.display_text)
-                {
-                    return true;
-                }
-                false
-            }
-            TranscriptEntryKind::ToolResult(_) => true,
-            TranscriptEntryKind::Log(entry) => {
-                entry.kind == LogKind::Normal && text_has_collapsible_content(&entry.message)
-            }
-            TranscriptEntryKind::PlanCard(_) => true,
-            TranscriptEntryKind::Diff(_) => true,
-            TranscriptEntryKind::Reasoning(_) => true,
-            TranscriptEntryKind::SlashEcho(_) => false,
         }
     }
 
