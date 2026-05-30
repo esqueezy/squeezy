@@ -46,6 +46,20 @@ pub(crate) fn enforce_gates(report: &BenchmarkReport, no_speed_gate: bool) -> Re
         )));
     }
 
+    // Dart oracle gate (spec dart.md §10). Threshold is `precision >= 0.93`
+    // and `recall >= 0.85`; the scan-only fallback (dart toolchain missing)
+    // is suppressed because there is no oracle signal to compare against.
+    if !no_speed_gate
+        && let Some(dart) = &report.dart_oracle
+        && dart.mode == "analyzer"
+        && (dart.symbols.precision < 0.93 || dart.symbols.recall < 0.85)
+    {
+        return Err(SqueezyError::Graph(format!(
+            "Dart oracle accuracy regressed: precision={:.3} recall={:.3} (mode={})",
+            dart.symbols.precision, dart.symbols.recall, dart.mode
+        )));
+    }
+
     if let Some(mixed) = &report.mixed_workload
         && mixed.refresh_probe.reparsed_files != mixed.refresh_probe.edited_files
     {

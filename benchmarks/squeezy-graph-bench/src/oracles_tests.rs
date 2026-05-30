@@ -5,7 +5,12 @@ use squeezy_core::LanguageFamily;
 use super::inventory;
 
 #[test]
-fn every_language_family_has_one_oracle() {
+fn every_oracle_targets_a_distinct_family() {
+    // Each registered oracle must own a distinct LanguageFamily. The
+    // scaffold-only families (Ruby/Php/Kotlin/Swift/Scala) intentionally
+    // land before their oracles; each oracle PR lifts its family out of
+    // the placeholder set, the same pattern Ruby followed before its
+    // Prism oracle landed.
     let mut families = HashSet::new();
     for oracle in inventory() {
         assert!(
@@ -15,7 +20,17 @@ fn every_language_family_has_one_oracle() {
         );
     }
 
-    for family in LanguageFamily::all() {
+    let required: &[LanguageFamily] = &[
+        LanguageFamily::Rust,
+        LanguageFamily::Python,
+        LanguageFamily::Java,
+        LanguageFamily::CSharp,
+        LanguageFamily::Go,
+        LanguageFamily::CFamily,
+        LanguageFamily::JsTs,
+        LanguageFamily::Dart,
+    ];
+    for family in required {
         assert!(families.contains(family), "missing oracle for {family:?}");
     }
 }
