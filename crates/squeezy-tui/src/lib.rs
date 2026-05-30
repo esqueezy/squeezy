@@ -4527,7 +4527,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     }
     let include_startup_card = area.height >= 16;
     let input_height = input_panel_height(app, area.width);
-    let approval_height = approval_menu_height(app);
+    let approval_height = approval_menu_height(app, area.width);
     let plan_indicator_height = plan_mode_indicator_height(app);
     let task_height = if should_show_task_panel(app) {
         let h = if approval_height > 0 {
@@ -4755,7 +4755,7 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
         return;
     }
     let input_height = input_panel_height(app, area.width);
-    let approval_height = approval_menu_height(app);
+    let approval_height = approval_menu_height(app, area.width);
     let plan_indicator_height = plan_mode_indicator_height(app);
     let task_height = should_show_task_panel(app).then_some(task_panel_height(app));
     let status_height = 2;
@@ -5105,9 +5105,19 @@ fn task_title(snapshot: &TaskStateSnapshot) -> &str {
     }
 }
 
-fn approval_menu_height(app: &TuiApp) -> u16 {
+fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
+    // The modal renders with `Wrap { trim: false }`, so a single logical
+    // line can occupy multiple visible rows when its content exceeds the
+    // area width. Counting `lines.len()` under-allocates and pushes the
+    // freeform answer box (or the lowest choice) off the modal area on
+    // long verbose labels — see squeezy-xtvg / wave2-06 Anthropic run.
+    // `visual_line_count` mirrors the wrap pass used for the transcript
+    // and live regions and is safe (it rounds up per line, never down).
     if let Some(pending) = app.pending_approval.as_ref() {
-        format_approval_menu_lines(&pending.request, app.approval_selection_index).len() as u16
+        visual_line_count(
+            &format_approval_menu_lines(&pending.request, app.approval_selection_index),
+            width,
+        )
     } else if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
         match pending.request.kind {
             McpElicitationKind::Form => {
@@ -5126,14 +5136,16 @@ fn approval_menu_height(app: &TuiApp) -> u16 {
             }
         }
     } else if let Some(pending) = app.pending_request_user_input.as_ref() {
-        format_request_user_input_menu_lines(
-            &pending.request,
-            pending.selection_index,
-            &pending.answer,
+        visual_line_count(
+            &format_request_user_input_menu_lines(
+                &pending.request,
+                pending.selection_index,
+                &pending.answer,
+            ),
+            width,
         )
-        .len() as u16
     } else if let Some(pending) = app.pending_plan_choice.as_ref() {
-        format_plan_choice_menu_lines(pending).len() as u16
+        visual_line_count(&format_plan_choice_menu_lines(pending), width)
     } else {
         0
     }
