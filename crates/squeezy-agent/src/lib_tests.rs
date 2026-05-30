@@ -327,6 +327,80 @@ async fn llm_stream_observes_cancellation_within_one_yield() {
 }
 
 #[tokio::test]
+async fn cancel_preserves_partial_assistant_text_in_conversation_state() {
+    // Streaming cancel: the model streams a few text deltas, then the
+    // provider raises `LlmEvent::Cancelled` (the synthesised event the
+    // turn runner emits when the cancel token tripped mid-stream). The
+    // partial assistant text accumulated from `AgentEvent::AssistantDelta`
+    // must land in `conversation_state.conversation` so the next turn's
+    // prompt assembly can reference it, and a `cancelled = true`
+    // transcript item must mirror it on the display/persistence path so
+    // `(cancelled)` markers and `/diff`/`/undo` can see what was streamed
+    // before the user pressed Esc. Wave-2-11 eval bug squeezy-3hr4.
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("1. Add tests\n".to_string())),
+        Ok(LlmEvent::TextDelta("2. Wire fix\n".to_string())),
+        Ok(LlmEvent::TextDelta("3. Land it\n".to_string())),
+        Ok(LlmEvent::Cancelled),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider);
+
+    let mut rx = agent.start_turn("draft a plan".to_string(), CancellationToken::new());
+    let mut saw_cancelled = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Cancelled { .. } => saw_cancelled = true,
+            AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(
+        saw_cancelled,
+        "cancel branch must emit AgentEvent::Cancelled"
+    );
+
+    let state = agent.conversation_state.lock().await;
+    let partial = "1. Add tests\n2. Wire fix\n3. Land it\n";
+
+    // Conversation slice: the next turn's prompt assembly must see the
+    // user message AND the partial assistant text. Without the fix the
+    // assistant item is silently dropped (only the user item remains).
+    let assistant_in_conversation = state
+        .conversation
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::AssistantText(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assistant_in_conversation,
+        vec![partial],
+        "partial assistant text must be pushed onto `conversation_state.conversation` on cancel; \
+         next turn's prompt build assembles the wire request from this slice"
+    );
+
+    // Transcript: the display/persistence side carries the partial text
+    // tagged `cancelled = true` so renderers can append a `(cancelled)`
+    // marker and `/undo`/`/diff` can find the cut-off turn. The transcript
+    // path trims a trailing newline (renderers append `(cancelled)` after
+    // the body) while the conversation slice keeps the raw stream — both
+    // are correct for their consumer.
+    let cancelled_assistant = state
+        .transcript
+        .iter()
+        .find(|item| item.role == squeezy_core::Role::Assistant)
+        .expect("transcript must record the cancelled assistant turn");
+    assert_eq!(cancelled_assistant.content, partial.trim_end_matches('\n'));
+    assert!(
+        cancelled_assistant.cancelled,
+        "cancelled assistant transcript item must carry the `cancelled` flag so renderers \
+         can mark it (cancelled) and the next turn can reference it"
+    );
+}
+
+#[tokio::test]
 async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
     let root = temp_workspace("task_state_session");
     let provider = Arc::new(MockProvider::new(vec![
@@ -2423,8 +2497,12 @@ async fn unsupported_squeezy_help_question_falls_back_after_doc_subagent_failure
     let provider = Arc::new(MockProvider::new(Vec::new()));
     let agent = Agent::new(AppConfig::default(), provider.clone());
 
+    // Use an explicit `/help <unknown-topic>` so the help interceptor takes the
+    // turn (it always does for slash-commands) and the curated layer returns
+    // `Unsupported`. The natural-language form is now intentionally routed to
+    // the model when no curated topic matches.
     let mut rx = agent.start_turn(
-        "Does Squeezy support quantum billing?".to_string(),
+        "/help quantum_billing".to_string(),
         CancellationToken::new(),
     );
     let mut completed = None;
@@ -6467,6 +6545,153 @@ async fn plan_mode_request_user_input_pauses_turn_and_resumes_with_choice() {
 }
 
 #[tokio::test]
+async fn plan_mode_request_user_input_rejects_choice_value_not_in_offered_set() {
+    use super::{REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputResponse};
+
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "ask_1".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                arguments: json!({
+                    "question": "Which approach?",
+                    "choices": [
+                        {"label": "Simplify", "value": "simplify"},
+                        {"label": "Split",    "value": "split"},
+                        {"label": "Perf",     "value": "perf"}
+                    ]
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        session_mode: SessionMode::Plan,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("plan it".to_string(), CancellationToken::new());
+    let mut saw_validation_error = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::RequestUserInputRequested { response_tx, .. } => {
+                // Driver/UI responds with a choice_value that is not in the
+                // offered choices — emulates the OpenAI wave2-06 trace.
+                let _ = response_tx.send(RequestUserInputResponse::choice("small"));
+            }
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "ask_1" => {
+                assert_eq!(result.status, squeezy_tools::ToolStatus::Error);
+                let content = serde_json::to_string(&result.content).unwrap();
+                assert!(
+                    content.contains("choice_value not in offered choices"),
+                    "expected typed validation error in payload: {content}",
+                );
+                saw_validation_error = true;
+            }
+            AgentEvent::Completed { .. } => break,
+            AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(
+        saw_validation_error,
+        "agent must surface a typed ToolStatus::Error when choice_value is out of bounds"
+    );
+}
+
+#[tokio::test]
+async fn plan_mode_request_user_input_rejects_freeform_when_disallowed() {
+    use super::{REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputResponse};
+
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "ask_1".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                // allow_freeform omitted → defaults to false (matches the
+                // Anthropic wave2-06 bumped trace).
+                arguments: json!({
+                    "question": "What is the primary goal of this refactor?",
+                    "choices": [
+                        {"label": "Speed",    "value": "speed"},
+                        {"label": "Clarity",  "value": "clarity"}
+                    ]
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        session_mode: SessionMode::Plan,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("plan it".to_string(), CancellationToken::new());
+    let mut saw_validation_error = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::RequestUserInputRequested { response_tx, .. } => {
+                // Driver/UI replies with a freeform string despite the
+                // request not allowing freeform answers.
+                let _ = response_tx.send(RequestUserInputResponse::freeform(
+                    "Yes - focus on the eval driver",
+                ));
+            }
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "ask_1" => {
+                assert_eq!(result.status, squeezy_tools::ToolStatus::Error);
+                let content = serde_json::to_string(&result.content).unwrap();
+                assert!(
+                    content.contains("freeform not allowed for this question"),
+                    "expected typed validation error in payload: {content}",
+                );
+                saw_validation_error = true;
+            }
+            AgentEvent::Completed { .. } => break,
+            AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(
+        saw_validation_error,
+        "agent must surface a typed ToolStatus::Error when freeform is disabled"
+    );
+}
+
+#[tokio::test]
 async fn build_mode_refuses_request_user_input_call() {
     use super::REQUEST_USER_INPUT_TOOL_NAME;
 
@@ -6621,6 +6846,137 @@ fn progress_snapshot_fires_at_stride_multiples() {
 fn progress_snapshot_returns_none_before_any_calls() {
     let broker = CostBroker::new(&AppConfig::default());
     assert!(broker.progress_snapshot_if_due(3).is_none());
+}
+
+/// Repro for bd ticket squeezy-xt2o: with a $0.01 cap and a fresh broker the
+/// pre-flight gate must refuse to dispatch a turn whose projected input/output
+/// pricing already exceeds the cap, so the broker trips *before* the over-cap
+/// spend is billed. claude-haiku-4-5-20251001 prices output at $5/Mtok, so a
+/// 4096-output-token reply is $0.02048 by itself — comfortably over the cap.
+#[test]
+fn cost_cap_fires_pre_flight_on_first_turn_when_projection_exceeds_cap() {
+    let config = AppConfig {
+        max_session_cost_usd_micros: Some(10_000),
+        max_output_tokens: Some(4_096),
+        ..AppConfig::default()
+    };
+    let broker = CostBroker::new(&config);
+    // Pre-flight: nothing has been billed yet, so the post-hoc check is
+    // silent — only the projection should catch the overrun.
+    assert!(
+        broker.session_cap_reached().is_none(),
+        "session_cap_reached must not fire before any provider cost lands"
+    );
+    let status = broker
+        .projected_session_cap_overrun(
+            "anthropic",
+            "claude-haiku-4-5-20251001",
+            1_000, // projected input tokens
+            4_096, // projected output tokens
+        )
+        .expect("projected spend ($0.0205 input + output) must exceed $0.01 cap");
+    assert_eq!(status.cap_usd_micros, 10_000);
+    assert!(
+        status.spent_usd_micros >= status.cap_usd_micros,
+        "projected total ({} micros) must be at or above cap ({} micros)",
+        status.spent_usd_micros,
+        status.cap_usd_micros
+    );
+    // The "spent" reported on the cap-reached event is the *projection*, not
+    // the actual recorded spend, so the operator sees the would-have-been
+    // total they were saved from.
+    assert!(status.percent >= 100, "percent should reflect overrun");
+}
+
+/// Drives the broker through a scripted spent sequence: after a cheap first
+/// round lands, the next round's projection must trip the cap pre-flight even
+/// though the post-hoc check is still under cap.
+#[test]
+fn cost_cap_fires_pre_flight_after_partial_spend_under_cap() {
+    let config = AppConfig {
+        max_session_cost_usd_micros: Some(10_000),
+        max_output_tokens: Some(4_096),
+        ..AppConfig::default()
+    };
+    let mut broker = CostBroker::new(&config);
+    // Round 1 landed at $0.006 spent — still well under the $0.01 cap, so
+    // post-hoc check passes.
+    broker.seed_session(6_000, squeezy_llm::TokenCalibration::default());
+    assert!(
+        broker.session_cap_reached().is_none(),
+        "post-hoc check must not trip at 60% of cap"
+    );
+    // Pre-flight projection for the next round: ~$0.0205 worth of output
+    // tokens at haiku pricing. 6_000 + 20_480 = 26_480 micros — over cap.
+    let status = broker
+        .projected_session_cap_overrun("anthropic", "claude-haiku-4-5-20251001", 512, 4_096)
+        .expect("pre-flight projection must trip at 6_000 spent + projected round");
+    assert!(
+        status.spent_usd_micros >= 10_000,
+        "projected total must be >= cap; got {}",
+        status.spent_usd_micros
+    );
+}
+
+/// Once spent has crossed the cap, the post-hoc check still fires as the
+/// safety-net path, so resuming a session whose prior turn somehow exceeded
+/// the cap (e.g. a recorded provider cost that came in higher than the
+/// pre-flight projection) is still gated before the next round dispatches.
+#[test]
+fn cost_cap_post_hoc_check_still_fires_when_spent_exceeds_cap() {
+    let config = AppConfig {
+        max_session_cost_usd_micros: Some(10_000),
+        ..AppConfig::default()
+    };
+    let mut broker = CostBroker::new(&config);
+    broker.seed_session(12_457, squeezy_llm::TokenCalibration::default());
+    let status = broker
+        .session_cap_reached()
+        .expect("post-hoc check must fire when spent >= cap");
+    assert_eq!(status.spent_usd_micros, 12_457);
+    assert_eq!(status.cap_usd_micros, 10_000);
+    assert_eq!(status.percent, 124);
+}
+
+/// Cap unset → both gates are silent; the broker must not synthesize a cap
+/// from defaults when the operator explicitly disabled it.
+#[test]
+fn cost_cap_pre_flight_silent_when_no_cap_configured() {
+    let config = AppConfig {
+        max_session_cost_usd_micros: None,
+        ..AppConfig::default()
+    };
+    let broker = CostBroker::new(&config);
+    assert!(broker.session_cap_reached().is_none());
+    assert!(
+        broker
+            .projected_session_cap_overrun(
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+                1_000_000,
+                1_000_000
+            )
+            .is_none(),
+        "no cap configured → projection must not trip"
+    );
+}
+
+/// Provider/model pair the registry can't price → projection returns `None`
+/// so the agent falls through to the post-hoc check rather than incorrectly
+/// gating dispatch on an unknown rate.
+#[test]
+fn cost_cap_pre_flight_silent_when_model_has_no_pricing() {
+    let config = AppConfig {
+        max_session_cost_usd_micros: Some(10_000),
+        ..AppConfig::default()
+    };
+    let broker = CostBroker::new(&config);
+    assert!(
+        broker
+            .projected_session_cap_overrun("ollama", "made-up-local-model", 1_000, 4_096)
+            .is_none(),
+        "unpriced model → projection must abstain"
+    );
 }
 
 fn shell_fallback_result(
@@ -7387,9 +7743,13 @@ async fn dispatch_command_session_lookup_for_missing_id() {
 
 #[tokio::test]
 async fn dispatch_command_tui_only_for_renderer_owned_commands() {
+    // `/diff` and `/undo` deliberately omitted: both now resolve to
+    // typed `DispatchOutcome::DiffSnapshot` / `CheckpointUndo`
+    // outcomes so non-TUI drivers (eval / RPC) can audit them. See
+    // `dispatch_command_diff_returns_typed_snapshot` and
+    // `dispatch_command_undo_returns_typed_result` below.
     let agent = mock_agent_for_dispatch();
     let cases: &[(DispatchCommand, &str)] = &[
-        (DispatchCommand::Diff, "diff"),
         (DispatchCommand::Keymap, "keymap"),
         (DispatchCommand::Statusline, "statusline"),
         (DispatchCommand::Help { topic: None }, "help"),
@@ -7442,7 +7802,6 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
             },
             "checkpoint",
         ),
-        (DispatchCommand::Undo, "undo"),
         (
             DispatchCommand::RevertTurn {
                 group_id: "t".to_string(),
@@ -7472,6 +7831,90 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
             }
             other => panic!("expected TuiOnly for {cmd:?}, got {other:?}"),
         }
+    }
+}
+
+/// `/diff` returns a typed `DispatchOutcome::DiffSnapshot` payload
+/// so headless drivers (eval / RPC) can audit the same diff the TUI
+/// renders into a card. The mock agent runs against
+/// `AppConfig::default()`, so `vcs_kind` is `"git"` when the test
+/// host is a git checkout and `"none"` otherwise; the variant shape
+/// is the same either way.
+#[tokio::test]
+async fn dispatch_command_diff_returns_typed_snapshot() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent.dispatch_command(DispatchCommand::Diff).await;
+    match outcome {
+        DispatchOutcome::DiffSnapshot {
+            vcs_kind,
+            files_changed,
+            additions,
+            deletions,
+            untracked_files,
+            snapshot,
+        } => {
+            // `vcs_kind` is the only serializable summary the eval
+            // driver records up front; it must be one of the two
+            // tags the `VcsKind` enum serializes to.
+            assert!(
+                vcs_kind == "git" || vcs_kind == "none",
+                "vcs_kind must be git|none, got {vcs_kind}"
+            );
+            // The lifted summary counters must mirror the boxed
+            // snapshot exactly — the eval driver formats them
+            // without unboxing the full `DiffSnapshot`.
+            assert_eq!(files_changed, snapshot.summary.files_changed);
+            assert_eq!(additions, snapshot.summary.additions);
+            assert_eq!(deletions, snapshot.summary.deletions);
+            assert_eq!(untracked_files, snapshot.summary.untracked_files);
+        }
+        other => panic!("expected DiffSnapshot for /diff, got {other:?}"),
+    }
+}
+
+/// `/undo` returns a typed `DispatchOutcome::CheckpointUndo`
+/// payload, not `TuiOnly`. The default mock agent has no
+/// `CheckpointStore` wired up (checkpoints disabled), so `result`
+/// is `None` and the driver records a structured "nothing to undo
+/// — checkpoints disabled" signal. When checkpoints are enabled but
+/// the journal is empty, `result` is `Some(_)` with
+/// `applied=false, skipped=true`. Both shapes are valid eval
+/// evidence — the test asserts the typed variant only.
+#[tokio::test]
+async fn dispatch_command_undo_returns_typed_result() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent.dispatch_command(DispatchCommand::Undo).await;
+    match outcome {
+        DispatchOutcome::CheckpointUndo {
+            applied,
+            skipped,
+            checkpoint_ids: _,
+            result,
+        } => {
+            // No rollback can have applied: the test runs against
+            // a fresh registry whose checkpoint journal is either
+            // disabled (`result = None`) or empty
+            // (`result = Some(_), skipped = true`). Either way
+            // `applied` must be false.
+            assert!(!applied, "no rollback should have applied");
+            match result {
+                None => assert!(
+                    skipped,
+                    "disabled-checkpoint path must surface skipped=true"
+                ),
+                Some(rollback) => {
+                    assert!(
+                        rollback.skipped && !rollback.applied,
+                        "empty-journal rollback must report skipped=true, applied=false"
+                    );
+                    assert!(
+                        rollback.checkpoint_ids.is_empty(),
+                        "empty-journal rollback must report no checkpoint ids"
+                    );
+                }
+            }
+        }
+        other => panic!("expected CheckpointUndo for /undo, got {other:?}"),
     }
 }
 

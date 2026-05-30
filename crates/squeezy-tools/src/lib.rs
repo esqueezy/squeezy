@@ -79,8 +79,8 @@ use graph_tools::{
 pub use ipc::{IpcEndpoint, IpcStream};
 use patch::{
     ApplyPatchArgs, ApplyPatchOperation, DiffContextArgs, PATCH_SNIPPET_MAX_CHARS, PatchPlan,
-    PlanPatchArgs, SearchReplaceFallback, is_notebook_path, render_apply_patch_diff,
-    render_write_file_diff,
+    PlanPatchArgs, SearchReplaceFallback, apply_patch_paths, is_notebook_path,
+    render_apply_patch_diff, render_write_file_diff,
 };
 pub use safety::{ShellPreClassification, pre_classify_shell};
 use schema::compact_typed_tool_parameters;
@@ -1230,7 +1230,11 @@ impl ToolRegistry {
         }
     }
 
-    pub(crate) fn diff_snapshot(&self, mode: DiffMode, options: DiffOptions) -> DiffSnapshot {
+    /// Compute (and cache) a worktree/branch diff snapshot. Exposed
+    /// publicly so non-TUI dispatch surfaces (eval / RPC) can drive
+    /// `/diff` through `Agent::dispatch_command` and receive the same
+    /// structured payload the TUI renders into a card.
+    pub fn diff_snapshot(&self, mode: DiffMode, options: DiffOptions) -> DiffSnapshot {
         let key = DiffSnapshotKey {
             mode,
             include_patch: options.include_patch,
@@ -1253,6 +1257,28 @@ impl ToolRegistry {
             );
         }
         snapshot
+    }
+
+    /// Roll back the most recent checkpoint. Returns `Ok(None)` when
+    /// checkpointing is disabled (no [`CheckpointStore`] installed);
+    /// callers should treat that as a structured "nothing to undo —
+    /// checkpoints disabled" signal. On a clean tree the inner
+    /// [`squeezy_vcs::RollbackResult`] carries `skipped = true,
+    /// applied = false`; the caller decides whether to render that
+    /// as success or failure.
+    pub fn checkpoint_undo_latest(
+        &self,
+        mode: Option<squeezy_vcs::RollbackMode>,
+    ) -> Result<Option<squeezy_vcs::RollbackResult>> {
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return Ok(None);
+        };
+        let result = checkpoints.rollback(
+            squeezy_vcs::RollbackTarget::Latest,
+            mode.unwrap_or_default(),
+        )?;
+        self.invalidate_diff_cache();
+        Ok(Some(result))
     }
 
     pub(crate) fn invalidate_diff_cache(&self) {
@@ -1619,14 +1645,9 @@ impl ToolRegistry {
         let (capability, target, risk) = match call.name.as_str() {
             "apply_patch" => {
                 let args = serde_json::from_value::<ApplyPatchArgs>(call.arguments.clone()).ok();
-                let paths = args
+                let paths: Vec<String> = args
                     .as_ref()
-                    .map(|args| {
-                        args.patches
-                            .iter()
-                            .map(|patch| patch.path.as_str())
-                            .collect::<Vec<_>>()
-                    })
+                    .map(|args| apply_patch_paths(args).into_iter().collect())
                     .unwrap_or_default();
                 let target = if paths.len() == 1 {
                     format!("path:{}", paths[0])
@@ -2042,9 +2063,8 @@ impl ToolRegistry {
                 let paths = args
                     .as_ref()
                     .map(|args| {
-                        args.patches
-                            .iter()
-                            .map(|patch| patch.path.as_str())
+                        apply_patch_paths(args)
+                            .into_iter()
                             .collect::<Vec<_>>()
                             .join(", ")
                     })
@@ -4182,6 +4202,12 @@ impl ToolOutputStore {
         cost_hint.truncated = true;
         cost_hint.output_bytes = 0;
 
+        let on_disk_path = path.to_string_lossy().into_owned();
+        let recovery_hint = format!(
+            "Full output spilled to disk. Use read_tool_output with handle {sha256} \
+             (optional offset/limit) to recover, or paste the on_disk_path."
+        );
+
         make_result(
             &call,
             status,
@@ -4194,6 +4220,12 @@ impl ToolOutputStore {
                 "preview_bytes": preview.len(),
                 "preview": preview,
                 "truncated": true,
+                "recovery_tool": "read_tool_output",
+                "recovery_args": {
+                    "handle": sha256,
+                },
+                "on_disk_path": on_disk_path,
+                "recovery_hint": recovery_hint,
             }),
             cost_hint,
             content_sha256,

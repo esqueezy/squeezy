@@ -87,3 +87,76 @@ path = "x"
     let scenario: Scenario = toml::from_str(toml).unwrap();
     assert!(scenario.validate().is_err());
 }
+
+#[test]
+fn parses_inject_mcp_elicitation_form() {
+    let toml = r#"
+id = "inject"
+title = "inject MCP"
+
+[workspace]
+local = "/tmp/repo"
+
+[[steps]]
+kind = "action"
+action = "inject_mcp_elicitation"
+
+[steps.request]
+server = "test-server"
+kind = "form"
+message = "What is the API key?"
+"#;
+    let scenario: Scenario = toml::from_str(toml).unwrap();
+    scenario.validate().expect("scenario should validate");
+    match &scenario.steps[0] {
+        Step::Action(Action::InjectMcpElicitation { request, .. }) => {
+            assert_eq!(request.server, "test-server");
+            assert_eq!(request.kind.as_deref(), Some("form"));
+            assert_eq!(request.message, "What is the API key?");
+        }
+        other => panic!("expected inject_mcp_elicitation action, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_inject_mcp_elicitation_url_without_url() {
+    let toml = r#"
+id = "bad-inject"
+title = "bad inject"
+
+[workspace]
+local = "/tmp/repo"
+
+[[steps]]
+kind = "action"
+action = "inject_mcp_elicitation"
+
+[steps.request]
+server = "test-server"
+kind = "url"
+message = "Open this URL"
+"#;
+    let scenario: Scenario = toml::from_str(toml).unwrap();
+    assert!(scenario.validate().is_err());
+}
+
+#[test]
+fn rejects_inject_mcp_elicitation_empty_server() {
+    let toml = r#"
+id = "bad-inject"
+title = "bad inject"
+
+[workspace]
+local = "/tmp/repo"
+
+[[steps]]
+kind = "action"
+action = "inject_mcp_elicitation"
+
+[steps.request]
+server = ""
+message = "Q"
+"#;
+    let scenario: Scenario = toml::from_str(toml).unwrap();
+    assert!(scenario.validate().is_err());
+}

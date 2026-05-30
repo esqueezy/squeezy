@@ -1,9 +1,17 @@
 use serde_json::Value;
 use squeezy_core::{AppConfig, CostSnapshot, TurnMetrics};
-use squeezy_llm::{LlmInputItem, LlmRequest};
+use squeezy_llm::{LlmInputItem, LlmRequest, estimate_cost};
 use squeezy_tools::{ToolResult, ToolStatus};
 
 use crate::is_budget_denied;
+
+/// Fallback projection used when the next-turn output token count is unknown
+/// (e.g. the configured `max_output_tokens` is `None` and the model registry
+/// has no curated `max_output_tokens` for this `(provider, model)` pair).
+/// Picked to cover a "small but non-trivial" reply — keeps the pre-flight
+/// estimate conservative on cheap models without being so high it rejects
+/// every turn the moment a session warms up.
+const PROJECTED_OUTPUT_TOKEN_FALLBACK: u64 = 1024;
 
 /// Snapshot of session-level cost-cap state delivered with
 /// [`AgentEvent::CostWarning`] and [`AgentEvent::Failed`] when the broker
@@ -127,6 +135,69 @@ impl CostBroker {
         } else {
             None
         }
+    }
+
+    /// Pre-flight check: returns `Some(status)` if dispatching another LLM
+    /// round at the supplied `(provider, model)` with `projected_input_tokens`
+    /// on the wire and `projected_output_tokens` of model reply would push the
+    /// running session total at or past the configured cap.
+    ///
+    /// `projected_output_tokens` should be the caller's best estimate of the
+    /// next reply size — typically `AppConfig.max_output_tokens` if set,
+    /// otherwise the model-registry curated `max_output_tokens`, otherwise
+    /// `PROJECTED_OUTPUT_TOKEN_FALLBACK` for unknown providers. We deliberately
+    /// project against the worst case (the model could use every token of its
+    /// max output budget) so the cap stops the dispatch *before* the over-cap
+    /// spend is billed.
+    ///
+    /// Returns `None` when:
+    ///   - no cap is configured,
+    ///   - the model registry has no pricing for `(provider, model)` (we can't
+    ///     project without a per-Mtok price, so we fall through to the
+    ///     post-hoc check),
+    ///   - the projected total is still under the cap.
+    ///
+    /// The returned `spent_usd_micros` is the *projected* total (current
+    /// spend + estimate), so the failure message reflects "we would have
+    /// landed here" rather than the misleading "we already landed here".
+    pub(crate) fn projected_session_cap_overrun(
+        &self,
+        provider: &str,
+        model: &str,
+        projected_input_tokens: u64,
+        projected_output_tokens: u64,
+    ) -> Option<CostCapStatus> {
+        let cap = self.max_session_cost_usd_micros?;
+        let projection = CostSnapshot {
+            input_tokens: Some(projected_input_tokens),
+            output_tokens: Some(projected_output_tokens),
+            ..Default::default()
+        };
+        let projected_round_micros = estimate_cost(provider, model, &projection)?;
+        let projected_total = self
+            .session_cost_usd_micros
+            .saturating_add(projected_round_micros);
+        if projected_total < cap {
+            return None;
+        }
+        Some(CostCapStatus {
+            spent_usd_micros: projected_total,
+            cap_usd_micros: cap,
+            percent: cap_percent(projected_total, cap),
+        })
+    }
+
+    /// Conservative output-token estimate for the upcoming round. Used by the
+    /// agent's pre-flight cap check; centralised here so the broker owns the
+    /// "what's a sensible fallback?" policy.
+    pub(crate) fn projected_output_tokens(
+        configured_max_output_tokens: Option<u32>,
+        model_max_output_tokens: Option<u64>,
+    ) -> u64 {
+        configured_max_output_tokens
+            .map(u64::from)
+            .or(model_max_output_tokens)
+            .unwrap_or(PROJECTED_OUTPUT_TOKEN_FALLBACK)
     }
 
     pub(crate) fn reserve_call(&mut self) -> Result<u64, (u64, String)> {
@@ -258,7 +329,24 @@ pub(crate) fn llm_request_input_bytes(request: &LlmRequest) -> u64 {
 
 pub(crate) fn format_cap_reached_reason(status: CostCapStatus) -> String {
     format!(
-        "session cost cap reached: spent ${:.6} of ${:.6} ({}%)",
+        "session cost cap reached: spent ${:.6} of ${:.6} ({}%). \
+         Run /config to raise `max_session_cost_usd_micros` \
+         (or set SQUEEZY_MAX_SESSION_COST_USD_MICROS), then send the next prompt.",
+        status.spent_usd_micros as f64 / 1_000_000.0,
+        status.cap_usd_micros as f64 / 1_000_000.0,
+        status.percent,
+    )
+}
+
+/// Render the cost-cap *warning* threshold notice with the same next-step
+/// guidance as the cap-reached error. Surfaced by the TUI when the broker
+/// reports a warning-tier `CostCapStatus` so the user can react before the
+/// hard cap actually trips.
+pub fn format_warn_threshold_notice(status: CostCapStatus) -> String {
+    format!(
+        "session cost crossed warning threshold: spent ${:.4} of ${:.2} cap ({}%). \
+         Run /config to raise `max_session_cost_usd_micros` before the cap trips \
+         (or set SQUEEZY_MAX_SESSION_COST_USD_MICROS).",
         status.spent_usd_micros as f64 / 1_000_000.0,
         status.cap_usd_micros as f64 / 1_000_000.0,
         status.percent,
@@ -277,3 +365,7 @@ fn cap_percent(spent_usd_micros: u64, cap_usd_micros: u64) -> u8 {
     let percent = (spent_usd_micros as u128 * 100) / cap_usd_micros as u128;
     percent.min(255) as u8
 }
+
+#[cfg(test)]
+#[path = "cost_broker_tests.rs"]
+mod tests;

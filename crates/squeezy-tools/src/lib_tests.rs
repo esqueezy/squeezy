@@ -635,6 +635,111 @@ fn webfetch_and_websearch_requests_carry_expected_targets() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn apply_patch_summary_and_metadata_walk_operations_shape() {
+    // `apply_patch` accepts both `patches[]` and `operations[]`; the
+    // approval summary line and the `paths` metadata entry must walk
+    // both shapes so the reviewer always sees which files are about to
+    // change — covering create_file, delete_file, search_replace, and
+    // both endpoints of move_file. Paths must be deduped and sorted so
+    // the rendered summary is stable across permutations of the input.
+    let root = temp_workspace("apply_patch_operations_summary");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let call = ToolCall {
+        call_id: "ops".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({
+            "operations": [
+                {
+                    "kind": "create_file",
+                    "path": "crates/squeezy-eval/README-PROBE.md",
+                    "contents": "# Probe one\n",
+                },
+                {
+                    "kind": "create_file",
+                    "path": "crates/squeezy-eval/README-PROBE2.md",
+                    "contents": "# Probe two\n",
+                },
+                {
+                    "kind": "delete_file",
+                    "path": "crates/squeezy-eval/OLD.md",
+                },
+                {
+                    "kind": "search_replace",
+                    "path": "crates/squeezy-eval/lib.rs",
+                    "search": "fn old()",
+                    "replace": "fn new()",
+                },
+                {
+                    "kind": "move_file",
+                    "from": "src/old_name.rs",
+                    "to": "src/new_name.rs",
+                },
+            ],
+        }),
+    };
+
+    let description = registry.describe_call(&call);
+    assert_eq!(
+        description,
+        "apply_patch paths=\"crates/squeezy-eval/OLD.md, \
+         crates/squeezy-eval/README-PROBE.md, \
+         crates/squeezy-eval/README-PROBE2.md, \
+         crates/squeezy-eval/lib.rs, \
+         src/new_name.rs, \
+         src/old_name.rs\"",
+        "summary must list every path touched by operations[] (including \
+         both endpoints of move_file), deduped and sorted",
+    );
+
+    let request = registry.permission_request(&call);
+    assert_eq!(
+        request.metadata["paths"],
+        "crates/squeezy-eval/OLD.md, \
+         crates/squeezy-eval/README-PROBE.md, \
+         crates/squeezy-eval/README-PROBE2.md, \
+         crates/squeezy-eval/lib.rs, \
+         src/new_name.rs, \
+         src/old_name.rs",
+        "approval metadata `paths` must mirror the summary so the audit \
+         line and the metadata stay in sync",
+    );
+    // Multi-path operations land on the generic workspace target rather
+    // than collapsing to a single file path.
+    assert_eq!(request.target, "workspace:patches");
+    // The first five paths should each register a session rule so the
+    // reviewer's "allow this path" choice survives across the call.
+    let rule_targets: Vec<&str> = request
+        .suggested_rules
+        .iter()
+        .map(|rule| rule.target.as_str())
+        .collect();
+    assert!(
+        rule_targets.contains(&"path:crates/squeezy-eval/README-PROBE.md"),
+        "suggested rules must seed at least the create_file paths; got {rule_targets:?}",
+    );
+
+    // Single-op operations[] payload collapses to `path:<that>` so the
+    // session rule from this approval covers the same path for future
+    // edit-family calls (matching the legacy single-patch behaviour).
+    let single = registry.permission_request(&ToolCall {
+        call_id: "single".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({
+            "operations": [{
+                "kind": "create_file",
+                "path": "src/only.rs",
+                "contents": "fn main() {}\n",
+            }],
+        }),
+    });
+    assert_eq!(single.target, "path:src/only.rs");
+    assert_eq!(single.metadata["paths"], "src/only.rs");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn grep_respects_gitignore_by_default_and_can_include_ignored() {
     let root = temp_workspace("grep_ignore");
@@ -3917,6 +4022,109 @@ async fn output_spill_uses_registry_config() {
 }
 
 #[tokio::test]
+async fn spill_envelope_includes_recovery_hint_and_on_disk_path() {
+    // squeezy-uq1g: when a tool result overflows the spill threshold, the
+    // envelope handed back to the model must name the recovery tool, the
+    // recovery arguments, the on-disk path, and carry a short human-
+    // readable hint. Without these the model has to infer recovery from
+    // its tool registry and the TUI has no way to surface a tail command.
+    let root = temp_workspace("spill_recovery_envelope");
+    fs::write(root.join("payload.txt"), "y".repeat(2_048)).expect("write payload");
+    let registry = ToolRegistry::new_with_output_config(
+        &root,
+        ToolOutputConfig {
+            spill_threshold_bytes: 128,
+            preview_bytes: 32,
+            retention_days: 1,
+            output_dir: None,
+        },
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_envelope".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "payload.txt", "limit": 10_000}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let content = &result.content;
+    assert_eq!(content["spilled"], true);
+    let handle = content["handle"].as_str().expect("handle");
+
+    // Recovery shape: tool name + args mirroring the handle.
+    assert_eq!(content["recovery_tool"], "read_tool_output");
+    assert_eq!(content["recovery_args"]["handle"], handle);
+
+    // on_disk_path must point at the spilled file under the workspace.
+    let on_disk_path = content["on_disk_path"]
+        .as_str()
+        .expect("on_disk_path string");
+    let expected_path = root
+        .canonicalize()
+        .expect("canonical root")
+        .join(".squeezy")
+        .join("tool_outputs")
+        .join(format!("{handle}.json"));
+    assert_eq!(
+        PathBuf::from(on_disk_path),
+        expected_path,
+        "on_disk_path must match the file on disk"
+    );
+    assert!(
+        PathBuf::from(on_disk_path).is_file(),
+        "on_disk_path must exist: {on_disk_path}"
+    );
+
+    // recovery_hint must mention the tool, the handle, and the path so a
+    // human reading the raw envelope (or a TUI mirror) can act on it.
+    let hint = content["recovery_hint"].as_str().expect("recovery_hint");
+    assert!(
+        hint.contains("read_tool_output"),
+        "hint must name the tool: {hint}"
+    );
+    assert!(
+        hint.contains(handle),
+        "hint must reference the handle: {hint}"
+    );
+
+    // Snapshot the envelope keys so accidental drops or renames trip the
+    // test instead of silently regressing wave-2 finding squeezy-uq1g.
+    let mut keys = content
+        .as_object()
+        .expect("envelope is an object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "handle".to_string(),
+            "on_disk_path".to_string(),
+            "original_output_sha256".to_string(),
+            "preview".to_string(),
+            "preview_bytes".to_string(),
+            "recovery_args".to_string(),
+            "recovery_hint".to_string(),
+            "recovery_tool".to_string(),
+            "sha256".to_string(),
+            "spilled".to_string(),
+            "total_bytes".to_string(),
+            "truncated".to_string(),
+        ],
+        "spill envelope keys drifted; update squeezy-uq1g snapshot deliberately"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn relative_output_dir_resolves_against_workspace_root() {
     let root = temp_workspace("output_dir_rel");
     fs::write(root.join("sample.txt"), "x".repeat(200)).expect("write sample");
@@ -4880,6 +5088,50 @@ async fn checkpoint_undo_best_effort_restores_clean_files_while_reporting_confli
     );
     assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "user-a");
     assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "before-b");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn checkpoint_undo_on_empty_store_returns_calm_nothing_to_undo_message() {
+    // `/undo` against a fresh checkpoint store is a clean-tree no-op:
+    // nothing has been recorded, so there is nothing to roll back. The
+    // tools layer must distinguish that case from Stale (partial /
+    // conflict) and Error, returning Success with a structured `message`
+    // so downstream chrome can render the calm informational card.
+    let root = temp_workspace("checkpoint_undo_empty_store");
+    let registry = registry_with_checkpoints(&root);
+
+    let undo = registry
+        .execute(
+            ToolCall {
+                call_id: "undo-empty".to_string(),
+                name: "checkpoint_undo".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(
+        undo.status,
+        ToolStatus::Success,
+        "empty checkpoint store is a happy-path no-op, not a failure",
+    );
+    assert_eq!(undo.content["message"], "nothing to undo");
+    assert_eq!(undo.content["rollback"]["skipped"], true);
+    assert_eq!(undo.content["rollback"]["applied"], false);
+    assert!(
+        undo.content["rollback"]["conflicts"]
+            .as_array()
+            .map(|c| c.is_empty())
+            .unwrap_or(false),
+        "skipped rollback should carry no conflicts",
+    );
+    assert!(
+        undo.content.get("error").is_none() && undo.content.get("reason").is_none(),
+        "calm informational result must not carry error/reason fields",
+    );
 
     let _ = fs::remove_dir_all(root);
 }

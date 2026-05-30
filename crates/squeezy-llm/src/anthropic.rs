@@ -29,6 +29,17 @@ const ANTHROPIC_PROVIDER_NAME: &str = "anthropic";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 64_000;
 
+/// Anthropic's hard floor for `thinking.budget_tokens` — the API rejects
+/// any request below this with `invalid_request_error`.
+const ANTHROPIC_MIN_THINKING_BUDGET_TOKENS: u64 = 1024;
+
+/// Tokens we reserve for the assistant's reply on top of the thinking
+/// budget. Anthropic requires `max_tokens > budget_tokens`; a 1024-token
+/// reply headroom keeps the assistant from being truncated immediately
+/// after thinking completes while still leaving thinking the bulk of
+/// the budget.
+const ANTHROPIC_THINKING_REPLY_HEADROOM_TOKENS: u64 = 1024;
+
 /// Identity preamble Anthropic requires on OAuth-driven requests so
 /// the call counts against the Claude Pro/Max subscription quota
 /// rather than failing the OAuth quota check. Anthropic pins the
@@ -136,12 +147,33 @@ impl AnthropicProvider {
             && crate::capabilities_for("anthropic", &request.model)
                 .is_some_and(|caps| caps.reasoning_effort)
         {
-            let budget =
-                u64::from(effort.thinking_budget_tokens()).min(max_tokens.saturating_sub(1));
-            body["thinking"] = json!({
-                "type": "enabled",
-                "budget_tokens": budget,
-            });
+            // Anthropic requires `budget_tokens >= 1024` AND
+            // `max_tokens > budget_tokens`. When `max_output_tokens` is
+            // too small to satisfy both at once, emitting `thinking`
+            // earns a hard 400 on every turn. Skip the block in that
+            // case and warn so the operator can either raise
+            // `max_output_tokens` or unset `reasoning_effort`.
+            let ceiling = max_tokens.saturating_sub(ANTHROPIC_THINKING_REPLY_HEADROOM_TOKENS);
+            if ceiling >= ANTHROPIC_MIN_THINKING_BUDGET_TOKENS {
+                let budget = u64::from(effort.thinking_budget_tokens())
+                    .min(ceiling)
+                    .max(ANTHROPIC_MIN_THINKING_BUDGET_TOKENS);
+                body["thinking"] = json!({
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                });
+            } else {
+                tracing::warn!(
+                    provider = "anthropic",
+                    model = %request.model,
+                    max_output_tokens = max_tokens,
+                    min_required = ANTHROPIC_MIN_THINKING_BUDGET_TOKENS
+                        + ANTHROPIC_THINKING_REPLY_HEADROOM_TOKENS,
+                    "anthropic thinking disabled: max_output_tokens too small to satisfy \
+                     thinking.budget_tokens >= 1024 with a reply headroom; raise \
+                     max_output_tokens or clear reasoning_effort to silence this warning"
+                );
+            }
         }
         if !request.tools.is_empty() {
             let mut tool_values: Vec<Value> = request
@@ -445,19 +477,22 @@ fn anthropic_stream_attempt(
         let response = if status == StatusCode::OK {
             response
         } else {
-            let message = response
+            let body = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "failed to read error response".to_string());
-            let formatted = format!("{status}: {message}");
             // Pre-stream HTTP error path. Anthropic surfaces overflow as a
             // 400 with `prompt is too long: …` in the body; emit the
             // classifier signal additively before propagating the error
             // so the agent can react instead of looping into the same call.
+            // The overflow classifier still inspects the raw body — its
+            // pattern set keys on the verbatim provider prose, not on the
+            // humanised TUI line.
+            let raw_for_classifier = format!("{status}: {body}");
             if let Some(signal) = classify_terminal(
                 ANTHROPIC_PROVIDER_NAME,
                 None,
-                Some(&formatted),
+                Some(&raw_for_classifier),
                 None,
                 true,
             ) {
@@ -466,6 +501,13 @@ fn anthropic_stream_attempt(
                     signal,
                 };
             }
+            // Humanise the JSON envelope before propagating: the status
+            // line and turn-failed banner used to print the raw payload
+            // and a bogus "retry" hint on 400s. The normaliser extracts
+            // `error.message` + `request_id`, encodes a retry verdict
+            // via [`NON_RETRYABLE_MARKER`], and falls back to the raw
+            // shape when the body is not a recognisable envelope.
+            let formatted = crate::anthropic_error::format_for_provider_error(status, &body);
             Err(SqueezyError::ProviderRequest(formatted))?;
             unreachable!("provider error returned above");
         };
@@ -573,19 +615,27 @@ fn anthropic_stream_attempt(
 /// [`LlmEvent::ContextOverflow`] when any path fires; the caller
 /// yields it immediately before the canonical [`LlmEvent::Completed`].
 ///
-/// `used` totals reported `input_tokens + output_tokens` so a turn
-/// that fills the prompt budget *or* spends the budget on output
-/// can both surface as `SilentUsage` when the result equals or
-/// exceeds the model's context window.
+/// `used` totals the normalised `input_tokens + output_tokens` from
+/// the snapshot's `cost()` view (i.e. the full prompt the model saw,
+/// cached + uncached + cache-write, plus output) so a turn that fills
+/// the prompt budget *or* spends the budget on output can both
+/// surface as `SilentUsage` when the result equals or exceeds the
+/// model's context window.
 fn overflow_event_for_completed(
     state: &AnthropicStreamState,
     max_window: Option<u64>,
     saw_visible_output: bool,
 ) -> Option<LlmEvent> {
-    let used = state
+    // Use the normalised cost view so the "used" total reflects the
+    // full prompt the model saw (including cached and cache-write
+    // tokens) rather than the small uncached delta. Reading
+    // `state.input_tokens` directly here would silently under-fire the
+    // SilentUsage classifier on cache-hit turns.
+    let cost = state.cost();
+    let used = cost
         .input_tokens
         .unwrap_or(0)
-        .saturating_add(state.output_tokens.unwrap_or(0));
+        .saturating_add(cost.output_tokens.unwrap_or(0));
     let usage = max_window.map(|max| OverflowUsage { used, max });
     let signal: OverflowSignal = classify_terminal(
         ANTHROPIC_PROVIDER_NAME,
@@ -624,8 +674,21 @@ struct AnthropicStreamState {
 
 impl AnthropicStreamState {
     fn cost(&self) -> CostSnapshot {
+        // Normalise to the cross-provider convention used in
+        // `CostSnapshot`: `input_tokens` is the **total** prompt the
+        // model saw (uncached + cache read + cache write), and the
+        // breakdown lives in `cached_input_tokens` /
+        // `cache_write_input_tokens`. Anthropic's Messages API ships
+        // `usage.input_tokens` as the uncached delta only, so we fold
+        // the cache counters back in here. Without this, a reader of
+        // `frames.jsonl` sees a tiny `input_tokens` value on a cache-hit
+        // turn and is misled into thinking the prompt was short.
+        let base = self.input_tokens;
+        let cache_read = self.cache_read_input_tokens.unwrap_or(0);
+        let cache_write = self.cache_creation_input_tokens.unwrap_or(0);
+        let total_input = base.map(|b| b.saturating_add(cache_read).saturating_add(cache_write));
         CostSnapshot {
-            input_tokens: self.input_tokens,
+            input_tokens: total_input,
             output_tokens: self.output_tokens,
             reasoning_output_tokens: None,
             cached_input_tokens: self.cache_read_input_tokens,

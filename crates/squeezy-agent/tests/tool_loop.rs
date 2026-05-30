@@ -14,6 +14,7 @@ use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision};
 use squeezy_core::{
     AppConfig, ContextCompactionConfig, CostSnapshot, PermissionAction, PermissionMode,
     PermissionPolicy, PermissionRule, PermissionRuleSource, PermissionScope, Result, SessionMode,
+    TurnId,
 };
 use squeezy_hooks::{HookContext, HookEvent, HookHandler, HookRegistry, HookResult};
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
@@ -2758,6 +2759,78 @@ async fn manual_context_compaction_preserves_pins_in_resume_state() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Manual `/compact` must broadcast `AgentEvent::ContextCompacted` on
+/// the agent-level event channel so TUI overlays, eval capture, MCP
+/// listeners, and any other `AgentEvent` subscriber observe a manual
+/// compaction the same way they observe the automatic post-turn and
+/// mid-turn micro-compaction paths. `turn_id` is `TurnId::INVALID`
+/// because manual compaction runs between turns and has no active
+/// per-call `mpsc::Sender<AgentEvent>` to attribute against.
+#[tokio::test]
+async fn manual_context_compaction_broadcasts_context_compacted_event() {
+    let root = temp_workspace("manual_context_compaction_broadcast");
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(format!(
+            "important decision {}",
+            "must ".repeat(200)
+        ))),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_first".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let mut config = config_for(root.clone());
+    // `min_items: 99` keeps the auto-compaction gate closed during
+    // `start_turn` so only the explicit `compact_context_manual` call
+    // below fires; `recent_items: 1` + `estimated_tokens: 10_000` lets a
+    // single seeded turn produce a non-empty older slice once we run a
+    // manual compact.
+    config.context_compaction = ContextCompactionConfig {
+        enabled: true,
+        estimated_tokens: 10_000,
+        min_items: 99,
+        recent_items: 1,
+        max_summary_bytes: 1_200,
+        ..ContextCompactionConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    // Subscribe before driving any work so the broadcast's lag-buffer
+    // holds whatever fires before we reach `recv` below.
+    let mut events = agent.subscribe_events();
+
+    drain_turn(agent.start_turn("first prompt".to_string(), CancellationToken::new())).await;
+    let _pin = agent
+        .pin_context_entry(
+            "decision".to_string(),
+            "Use deterministic compaction".to_string(),
+            "test".to_string(),
+        )
+        .await
+        .expect("pin");
+    let report = agent.compact_context_manual().await.expect("compact");
+    assert_eq!(report.record.trigger.as_str(), "manual");
+
+    let broadcast = events.recv().await.expect("broadcast event");
+    match broadcast.as_ref() {
+        AgentEvent::ContextCompacted { turn_id, report } => {
+            assert_eq!(
+                *turn_id,
+                TurnId::INVALID,
+                "manual /compact runs between turns so the broadcast carries TurnId::INVALID",
+            );
+            assert_eq!(report.record.trigger.as_str(), "manual");
+            assert_eq!(report.record.generation, 1);
+        }
+        _ => panic!("expected ContextCompacted broadcast"),
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn auto_compaction_does_not_orphan_function_call_output() {
     let root = temp_workspace("auto_compaction_pair");
@@ -3197,6 +3270,81 @@ async fn cancelled_turn_persists_partial_cost_and_metrics() {
         snapshot.metrics.tool_calls >= 1,
         "expected at least the grep tool call to be persisted, got {}",
         snapshot.metrics.tool_calls,
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cancelled_turn_attributes_partial_round_cost_to_metrics() {
+    // Reproduces wave2-11 / squeezy-llaj: a single round streams real
+    // assistant text + reasoning before the provider stream is cut by
+    // a `Cancelled` event. Before the fix the cancelled-turn frame
+    // reported `input_tokens=0, output_tokens=0, cost_micro_usd=0`
+    // because the broker only recorded usage on the `Completed` arm.
+    // The cancel path now estimates the partial spend from the
+    // request's input byte size and the streamed output bytes via
+    // the same calibration the `Completed` path falls back to.
+    let root = temp_workspace("cancel_partial_metrics");
+    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+    let mut config = config_for(root.clone());
+    // Force a model with pricing data so the cancel-path's estimate
+    // resolves to a non-zero dollar figure. `gpt-5.4-mini` is in
+    // `crates/squeezy-llm/src/models.json` and so resolves to a
+    // pricing entry via `model_info_for`.
+    config.model = "gpt-5.4-mini".to_string();
+    let provider = Arc::new(ScriptedProvider::named(
+        "openai",
+        vec![vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ReasoningDelta {
+                text: "thinking about the answer in some detail".to_string(),
+                kind: squeezy_llm::ReasoningKind::Text,
+            }),
+            Ok(LlmEvent::TextDelta(
+                "1. first item\n2. second item\n3. third item\n4. fourth item\n5.".to_string(),
+            )),
+            Ok(LlmEvent::Cancelled),
+        ]],
+    ));
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("make a list".to_string(), CancellationToken::new());
+    let mut cancel_event_cost: Option<CostSnapshot> = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Cancelled { cost, .. } = event {
+            cancel_event_cost = Some(cost);
+        }
+    }
+    let cost = cancel_event_cost.expect("expected an AgentEvent::Cancelled event");
+    assert!(
+        cost.input_tokens.unwrap_or(0) > 0,
+        "cancelled-turn event must carry non-zero input_tokens; got {:?}",
+        cost.input_tokens,
+    );
+    assert!(
+        cost.output_tokens.unwrap_or(0) > 0,
+        "cancelled-turn event must carry non-zero output_tokens from streamed deltas; got {:?}",
+        cost.output_tokens,
+    );
+    assert!(
+        cost.estimated_usd_micros.unwrap_or(0) > 0,
+        "cancelled-turn event must carry non-zero estimated_usd_micros; got {:?}",
+        cost.estimated_usd_micros,
+    );
+
+    let snapshot = agent.session_accounting_snapshot().await;
+    assert_eq!(
+        snapshot.cost.input_tokens, cost.input_tokens,
+        "session accounting must agree with the cancel-event snapshot on input_tokens",
+    );
+    assert_eq!(
+        snapshot.cost.output_tokens, cost.output_tokens,
+        "session accounting must agree with the cancel-event snapshot on output_tokens",
+    );
+    assert_eq!(
+        snapshot.cost.estimated_usd_micros, cost.estimated_usd_micros,
+        "session accounting must agree with the cancel-event snapshot on estimated_usd_micros",
     );
 
     let _ = fs::remove_dir_all(root);

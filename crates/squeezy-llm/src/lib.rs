@@ -42,6 +42,7 @@ pub const MODEL_SWITCHED_PLACEHOLDER_NAME: &str = "model_switched";
 
 mod anthropic;
 mod anthropic_betas;
+pub mod anthropic_error;
 mod bedrock;
 mod cache_policy;
 mod compatible;

@@ -153,12 +153,19 @@ pub async fn run_scenario(
         let width = scenario.tui_capture.width.unwrap_or(160);
         let height = scenario.tui_capture.height.unwrap_or(48);
         let session_mode = config.session_mode;
+        // Pin slash-command settings writes (`/theme`, `/statusline`, …)
+        // to a scratch file under the per-run dir so the harness can't
+        // clobber the operator's real `~/.squeezy/settings.toml` mid-run
+        // (squeezy-ramu). The file is created lazily by `apply_edits`
+        // when a scenario actually flips a setting.
+        let scratch_settings = run_dir.join("scratch-settings.toml");
         let harness = squeezy_tui::testing::TuiHarness::new(
             config.clone(),
             session_mode,
             provider.clone(),
             width,
             height,
+            Some(scratch_settings),
         )
         .map_err(|err| EvalError::Internal(format!("init TuiHarness: {err}")))?;
         Some(Arc::new(TokioMutex::new(harness)))
@@ -476,10 +483,16 @@ fn apply_overlay(
     if let Some(pm) = &overlay.permission_mode {
         let mode = PermissionMode::parse(pm)
             .ok_or_else(|| EvalError::Config(format!("unknown permission_mode: {pm}")))?;
-        // Apply uniformly to the gates the scenario most often wants to
-        // pin. Power users can shape these individually via settings.
+        // Apply uniformly to every capability gate so the scenario's
+        // declared permission_mode is comprehensive. Read and
+        // ignored_search must be included so internal recovery
+        // affordances like `read_tool_output` (used to recover a spilled
+        // tool stdout buffer) do not get auto-denied when the operator's
+        // settings.toml carries `[permissions] read = "ask"`.
+        config.permissions.read = mode;
         config.permissions.edit = mode;
         config.permissions.shell = mode;
+        config.permissions.ignored_search = mode;
         config.permissions.web = mode;
         config.permissions.mcp = mode;
     }
@@ -503,6 +516,9 @@ fn apply_overlay(
     }
     if let Some(show) = overlay.show_reasoning_usage {
         config.tui.show_reasoning_usage = show;
+    }
+    if let Some(enabled) = overlay.checkpoints_enabled {
+        config.checkpoints_enabled = enabled;
     }
     Ok(())
 }
@@ -788,6 +804,16 @@ impl Driver {
                     },
                 )?;
             }
+            Action::InjectMcpElicitation { request, .. } => {
+                let status = self.inject_mcp_elicitation_into_harness(request).await;
+                self.capture.record(
+                    None,
+                    EvalEventKind::ActionStep {
+                        action: payload,
+                        status,
+                    },
+                )?;
+            }
             Action::SendKeys { keys, delay_ms, .. } => {
                 let status = self.send_harness_keys(keys, *delay_ms).await;
                 self.capture.record(
@@ -870,6 +896,31 @@ impl Driver {
             squeezy_agent::DispatchOutcome::Pinned { id } => format!("pinned:{id}"),
             squeezy_agent::DispatchOutcome::Unpinned { id } => format!("unpinned:{id}"),
             squeezy_agent::DispatchOutcome::PinsList { count } => format!("pins_list:{count}"),
+            squeezy_agent::DispatchOutcome::DiffSnapshot {
+                vcs_kind,
+                files_changed,
+                additions,
+                deletions,
+                untracked_files,
+                ..
+            } => format!(
+                "diff_snapshot:vcs={vcs_kind}:files={files_changed}:+{additions}-{deletions}:untracked={untracked_files}"
+            ),
+            // `None` is the checkpoints-disabled path (no store wired
+            // up); `Some(_)` with `applied=false, skipped=true` is the
+            // clean-tree path where rollback found no journal entry.
+            squeezy_agent::DispatchOutcome::CheckpointUndo {
+                applied,
+                skipped,
+                checkpoint_ids,
+                result,
+            } => match result {
+                None => "checkpoint_undo:disabled".to_string(),
+                Some(_) => format!(
+                    "checkpoint_undo:applied={applied}:skipped={skipped}:checkpoints={}",
+                    checkpoint_ids.join(",")
+                ),
+            },
             squeezy_agent::DispatchOutcome::TuiOnly { command } => {
                 format!("tui_only:{command}")
             }
@@ -1049,6 +1100,14 @@ impl Driver {
             Assertion::TuiFrameDoesNotContain { text } => {
                 self.assert_tui_frame_does_not_contain(text).await
             }
+            Assertion::TuiCellLuminanceLe {
+                max,
+                channel,
+                region,
+            } => {
+                self.assert_tui_cell_luminance_le(*max, channel.as_deref(), region.as_ref())
+                    .await
+            }
         }
     }
 
@@ -1088,22 +1147,167 @@ impl Driver {
                 "run_prompt_through_harness called without a harness".into(),
             ));
         };
+        let turn_start = Instant::now();
         let mut h = harness.lock().await;
         h.start_user_turn(prompt.clone());
-        h.pump_until_idle()
-            .await
-            .map_err(|err| EvalError::Internal(format!("harness pump: {err}")))?;
+
+        // Cap the number of approval modals we'll route through one
+        // prompt. Without a cap a buggy provider that re-emits the
+        // same ApprovalRequested forever would re-trigger our loop
+        // forever. 64 is well above any wave-2 probe's tool-call
+        // count and keeps the failure mode an `Err(_)` rather than a
+        // silent hang.
+        const MAX_APPROVAL_HOPS: usize = 64;
+        let mut approval_hops = 0usize;
+        loop {
+            h.pump_until_idle()
+                .await
+                .map_err(|err| EvalError::Internal(format!("harness pump: {err}")))?;
+            let Some(tool_name) = h.pending_approval_tool().map(str::to_string) else {
+                break;
+            };
+            // Mirror Driver::decide_approval's queue protocol: pop the
+            // matching Approve/Deny action and route it back into the
+            // harness via the new respond_* helpers. Falling through to
+            // Deny when nothing matches keeps drive_tui parity with the
+            // non-drive_tui path (where decide_approval returns Denied
+            // on an empty queue).
+            let (decision, recorded) = self.decide_approval(&tool_name).await;
+            let routed = match decision {
+                ToolApprovalDecision::Approved
+                | ToolApprovalDecision::AllowOnce
+                | ToolApprovalDecision::AllowSession
+                | ToolApprovalDecision::AllowRuleUser
+                | ToolApprovalDecision::AllowRuleProject => h.respond_approval(),
+                _ => h.respond_deny(),
+            };
+            self.capture.record(
+                None,
+                EvalEventKind::Approval {
+                    request: json!({ "tool": tool_name.clone() }),
+                    decision: format!("{recorded}{}", if routed { "" } else { ":unrouted" }),
+                },
+            )?;
+            approval_hops += 1;
+            if approval_hops >= MAX_APPROVAL_HOPS {
+                return Err(EvalError::Internal(format!(
+                    "harness pump: exceeded {MAX_APPROVAL_HOPS} approval modals on one prompt",
+                )));
+            }
+        }
+
+        // Synthesize a turn id for capture / frame parity. The TUI's
+        // own `TurnId` is consumed inside `drain_agent_events` and never
+        // surfaces back to the harness, so we mint a deterministic
+        // `harness-<n>` label off the existing turn counter that
+        // already drives `last_turn_id` for the non-drive_tui path.
+        let assistant_text = h.last_assistant_text();
+        let status_text = h.status_text().to_string();
+        let transcript_count = h.transcript_entries().len();
+        drop(h);
+
+        let prior_turn = self.last_turn_id.lock().await.clone();
+        let next_index = prior_turn
+            .as_deref()
+            .and_then(|s| s.strip_prefix("harness-"))
+            .and_then(|n| n.parse::<u64>().ok())
+            .map(|n| n + 1)
+            .unwrap_or(1);
+        let turn_str = format!("harness-{next_index}");
+        *self.last_turn_id.lock().await = Some(turn_str.clone());
+
+        // Mirror the run_prompt path so findings rules and downstream
+        // tools see the same shape under drive_tui = true. Order
+        // matters: TurnStarted → AssistantDelta → TurnCompleted so the
+        // findings.rs trace walker fills `per_turn_text` and
+        // `last_completed_turn`.
+        self.capture
+            .record(Some(turn_str.clone()), EvalEventKind::TurnStarted)?;
+        if !assistant_text.is_empty() {
+            self.capture.record(
+                Some(turn_str.clone()),
+                EvalEventKind::AssistantDelta {
+                    delta: assistant_text.clone(),
+                },
+            )?;
+        }
+        self.capture.record(
+            Some(turn_str.clone()),
+            EvalEventKind::TurnCompleted {
+                metrics: Value::Null,
+                cost: Value::Null,
+                stop_reason: None,
+                reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
+            },
+        )?;
         self.capture.record(
             None,
             EvalEventKind::ActionStep {
                 action: json!({"kind": "harness_prompt", "text": prompt}),
                 status: format!(
-                    "drained · {} transcript entries · status={:?}",
-                    h.transcript_entries().len(),
-                    h.status_text(),
+                    "drained · {transcript_count} transcript entries · status={status_text:?}",
                 ),
             },
         )?;
+
+        // Also push the assistant text into `last_assistant_text` so
+        // `Assertion::TextContains` works under the harness path. The
+        // run_prompt path does the same via the AssistantDelta event
+        // handler.
+        {
+            let mut lat = self.last_assistant_text.lock().await;
+            lat.clear();
+            lat.push_str(&assistant_text);
+        }
+
+        // Build a FrameRecord for frames.jsonl + a TuiFrame for
+        // frames_tui.jsonl. Without these, expect_final_text_contains
+        // false-positives on every drive_tui scenario (squeezy-bnz) and
+        // `view` / `replay.tui` report zero rows.
+        let mut frame = FrameRecord {
+            turn_id: turn_str.clone(),
+            prompt: prompt.clone(),
+            assistant_text: assistant_text.clone(),
+            elapsed_ms: turn_start.elapsed().as_millis() as u64,
+            ..Default::default()
+        };
+        let (styled, ansi) = crate::frames::render_styled(&frame.assistant_text);
+        frame.styled_lines = styled;
+        frame.ansi = ansi;
+        self.frames.write(&frame)?;
+
+        if let Some(writer) = self.tui_capture.as_ref() {
+            let overlays = self.pending_overlays.lock().await.clone();
+            let rendered = crate::tui_capture::render_capture_to_grid(
+                &frame.assistant_text,
+                &overlays,
+                writer.width(),
+                writer.height(),
+            )?;
+            let tui_frame = crate::tui_capture::TuiFrame {
+                turn_id: frame.turn_id.clone(),
+                width: writer.width(),
+                height: writer.height(),
+                cells: rendered.cells,
+                plain_text: rendered.plain_text,
+                ansi: rendered.ansi,
+                visual_truncated: rendered.visual_truncated,
+                omitted_line_count: rendered.omitted_line_count,
+                overlays,
+                trigger: Some(crate::tui_capture::TuiFrameTrigger {
+                    kind: "turn_completed".into(),
+                    step_index: None,
+                    key: None,
+                }),
+                transcript: Vec::new(),
+                status_text: Some(status_text),
+            };
+            writer.write(&tui_frame)?;
+        }
+        *self.wall_clock_seconds.lock().await = self.run_start.elapsed().as_secs();
         Ok(())
     }
 
@@ -1119,6 +1323,46 @@ impl Driver {
             Ok(_) => format!("sent {key} · status={:?}", h.status_text()),
             Err(err) => format!("asserted_fail: send_key {key}: {err}"),
         }
+    }
+
+    async fn inject_mcp_elicitation_into_harness(
+        &self,
+        request: &crate::scenario::InjectedMcpElicitation,
+    ) -> String {
+        let Some(harness) = self.harness.as_ref() else {
+            return "asserted_fail: inject_mcp_elicitation requires \
+                    [tui_capture] drive_tui = true"
+                .into();
+        };
+        let kind = match request
+            .kind
+            .as_deref()
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("url") => squeezy_tools::McpElicitationKind::Url,
+            // Default + explicit "form": modal/Form is the path the
+            // wave-1 finding flagged as untestable.
+            _ => squeezy_tools::McpElicitationKind::Form,
+        };
+        let req = squeezy_tui::testing::TuiHarness::make_mcp_elicitation_request(
+            request.server.clone(),
+            kind,
+            request.message.clone(),
+            request.schema.clone(),
+            request.url.clone(),
+        );
+        let mut h = harness.lock().await;
+        let _rx = h.push_pending_mcp_elicitation(req);
+        // Drop the receiver: the harness drives the modal via `send_key`,
+        // and the response payload is observed through the TuiApp state
+        // (transcript additions, status updates) rather than the oneshot
+        // channel.
+        format!(
+            "injected_mcp_elicitation:server={} status={:?}",
+            request.server,
+            h.status_text()
+        )
     }
 
     async fn send_harness_keys(&self, keys: &[String], delay_ms: u64) -> String {
@@ -1252,6 +1496,86 @@ impl Driver {
         }
     }
 
+    async fn assert_tui_cell_luminance_le(
+        &self,
+        max: u8,
+        channel: Option<&str>,
+        region: Option<&crate::scenario::CellRegion>,
+    ) -> String {
+        let Some(harness) = self.harness.as_ref() else {
+            return "asserted_fail: tui_cell_luminance_le requires [tui_capture] drive_tui = true"
+                .into();
+        };
+        let channel = channel.unwrap_or("fg");
+        if channel != "fg" && channel != "bg" {
+            return format!(
+                "asserted_fail: tui_cell_luminance_le channel must be \"fg\" or \"bg\", got {channel:?}"
+            );
+        }
+        let mut h = harness.lock().await;
+        let frame = match h.render_frame() {
+            Ok(f) => f,
+            Err(err) => return format!("asserted_fail: render: {err}"),
+        };
+        // Clip the requested region to the actual frame dimensions so a
+        // scenario authored against width=160 doesn't fail when the
+        // harness rebuilds at a different size.
+        let (x0, y0, x1, y1) = match region {
+            Some(r) => (
+                r.x0,
+                r.y0,
+                r.x1.min(frame.width.saturating_sub(1)),
+                r.y1.min(frame.height.saturating_sub(1)),
+            ),
+            None => (
+                0,
+                0,
+                frame.width.saturating_sub(1),
+                frame.height.saturating_sub(1),
+            ),
+        };
+        // Worst-offending cell: (x, y, colour-name, luminance, rgb).
+        type WorstCell = (u16, u16, String, u8, (u8, u8, u8));
+        let mut worst: Option<WorstCell> = None;
+        for cell in frame.cells.iter() {
+            if cell.x < x0 || cell.x > x1 || cell.y < y0 || cell.y > y1 {
+                continue;
+            }
+            // Skip whitespace-only cells: blanks carry whatever style
+            // the renderer left behind but no visible ink, so they
+            // can't actually be "too bright".
+            if cell.symbol.chars().all(|c| c.is_whitespace()) {
+                continue;
+            }
+            let color = match channel {
+                "fg" => cell.fg.as_deref(),
+                "bg" => cell.bg.as_deref(),
+                _ => unreachable!(),
+            };
+            let Some(color) = color else {
+                continue;
+            };
+            let Some(rgb) = squeezy_tui::testing::cell_rgb(color) else {
+                // Unknown name or indexed(...): we can't compute
+                // luminance for it, so skip rather than falsely fail.
+                continue;
+            };
+            let lum = squeezy_tui::testing::rgb_luminance(rgb);
+            if lum > max {
+                let worst_lum = worst.as_ref().map(|w| w.3).unwrap_or(0);
+                if lum > worst_lum {
+                    worst = Some((cell.x, cell.y, color.to_string(), lum, rgb));
+                }
+            }
+        }
+        match worst {
+            None => "asserted_pass".into(),
+            Some((x, y, color, lum, (r, g, b))) => format!(
+                "asserted_fail: cell ({x},{y}) {channel}={color} (rgb {r},{g},{b}) luminance {lum} > {max}"
+            ),
+        }
+    }
+
     async fn run_prompt(&self, prompt: String, wait_for: WaitFor) -> Result<(), EvalError> {
         let cancel = CancellationToken::new();
         *self.last_cancel.lock().await = Some(cancel.clone());
@@ -1268,6 +1592,7 @@ impl Driver {
 
         let mut frame = FrameRecord {
             prompt: prompt.clone(),
+            cost_display: crate::frames::format_cost_micro_usd(0),
             ..Default::default()
         };
         let mut completed = false;
@@ -1515,12 +1840,13 @@ impl Driver {
                 AgentEvent::ContextCompacted { turn_id, report } => {
                     let turn_str = format!("{turn_id:?}");
                     // `ContextCompactionReport` carries `record` (a
-                    // `ContextCompactionRecord`) + `summary` + a
-                    // `dropped` Vec. The record itself is Serialize via
-                    // `squeezy-core`, so capturing the structured form
-                    // gives findings rules a typed handle on
-                    // before/after token totals and trigger reason.
-                    // Fall back to debug if serialization ever fails.
+                    // `ContextCompactionRecord`) + `summary` + `dropped`
+                    // + `post_compact` Vecs. The record itself is
+                    // Serialize via `squeezy-core`, so capturing the
+                    // structured form gives findings rules a typed
+                    // handle on before/after token totals and trigger
+                    // reason. Fall back to debug if serialization ever
+                    // fails.
                     let report_value = serde_json::to_value(&report.record)
                         .unwrap_or_else(|_| json!({"debug": format!("{:?}", report.record)}));
                     let value = json!({
@@ -1814,9 +2140,34 @@ impl Driver {
                     completed = true;
                     break;
                 }
-                AgentEvent::Cancelled { turn_id } => {
+                AgentEvent::Cancelled {
+                    turn_id,
+                    cost,
+                    metrics: _,
+                } => {
                     let turn_str = format!("{turn_id:?}");
                     frame.elapsed_ms = turn_start.elapsed().as_millis() as u64;
+                    // Mirror the `Completed` arm's accounting on the
+                    // cancel path. A mid-stream cancel still bills for
+                    // whatever input the provider already saw and
+                    // whatever output it already streamed back; reporting
+                    // those as zero would silently under-count the run's
+                    // `totals` in `run.json`. The cost broker on the
+                    // agent side seeds `cost.estimated_usd_micros` from
+                    // the pricing registry when the provider does not
+                    // emit a usage payload, so we re-apply the same
+                    // fallback here in case the cancel surfaced through a
+                    // path that left the field unfilled.
+                    frame.input_tokens = cost.input_tokens.unwrap_or(0);
+                    frame.output_tokens = cost.output_tokens.unwrap_or(0);
+                    let cost_micro = cost.estimated_usd_micros.unwrap_or_else(|| {
+                        squeezy_llm::estimate_cost(self.provider_name, &self.model, &cost)
+                            .unwrap_or(0)
+                    });
+                    frame.cost_micro_usd = cost_micro;
+                    frame.cost_display = crate::frames::format_cost_micro_usd(cost_micro);
+                    *self.total_input_tokens.lock().await += frame.input_tokens;
+                    *self.total_cost_micro_usd.lock().await += cost_micro;
                     frame.finish = FrameFinish::Cancelled;
                     self.capture
                         .record(Some(turn_str), EvalEventKind::TurnCancelled)?;
@@ -2230,6 +2581,7 @@ fn action_kind_label(action: &Action) -> &'static str {
         Action::Assert { .. } => "assert",
         Action::InjectUserText { .. } => "inject_user_text",
         Action::RespondElicitation { .. } => "respond_elicitation",
+        Action::InjectMcpElicitation { .. } => "inject_mcp_elicitation",
         Action::RespondUserInput { .. } => "respond_user_input",
         Action::ApplyDiff { .. } => "apply_diff",
         Action::SwitchMode { .. } => "switch_mode",
@@ -2270,3 +2622,7 @@ impl AgentExt for Agent {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
 }
+
+#[cfg(test)]
+#[path = "driver_tests.rs"]
+mod tests;

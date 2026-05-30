@@ -95,7 +95,7 @@ use roles::{RoleModelPolicy, SubagentRole, role_config};
 
 pub use ai_reviewer::{ReviewerAuditEntry, ReviewerAuditVerdict};
 pub use context_compaction::ContextCompactionReport;
-pub use cost_broker::CostCapStatus;
+pub use cost_broker::{CostCapStatus, format_warn_threshold_notice};
 pub use export_html::{ExportError, ExportOpts, ExportTheme, export_session_to_html};
 pub use plan_mode::{PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG, strip_proposed_plan_blocks};
 pub use subagent_catalog::{
@@ -1189,6 +1189,14 @@ pub struct Agent {
     /// `start_turn` so the running turn (if any) finishes on the old config
     /// and the next turn picks up the new one.
     pending_swap: Option<PendingConfigSwap>,
+    /// Agent-level broadcast channel for events that originate outside a
+    /// turn's per-call `mpsc::Sender<AgentEvent>`. The canonical use is
+    /// manual `/compact` (`compact_context_manual`), which runs between
+    /// turns and so has no per-turn sender to reach TUI overlays, eval
+    /// capture, or MCP listeners on. Events are wrapped in `Arc` because
+    /// `AgentEvent` contains non-`Clone` variants (oneshot senders);
+    /// subscribers receive cheap `Arc<AgentEvent>` clones.
+    event_broadcast: broadcast::Sender<Arc<AgentEvent>>,
 }
 
 /// A configuration change that has been written to disk but is waiting for
@@ -1557,6 +1565,7 @@ impl Agent {
         let initial_session_mode = config.session_mode;
         let session_metrics = Arc::new(Mutex::new(conversation_state.metrics.clone()));
         let next_attachment_id = next_attachment_counter(&conversation_state.context_attachments);
+        let (event_broadcast, _) = broadcast::channel(64);
         Self {
             telemetry: TelemetryClient::from_config(&config),
             config,
@@ -1580,6 +1589,7 @@ impl Agent {
             hooks: None,
             agent_hook_bus: None,
             pending_swap: None,
+            event_broadcast,
         }
     }
 
@@ -1747,6 +1757,19 @@ impl Agent {
 
     pub fn subscribe_jobs(&self) -> broadcast::Receiver<JobEvent> {
         self.jobs.subscribe()
+    }
+
+    /// Subscribe to agent-level events that fire outside a turn's per-call
+    /// `mpsc::Sender<AgentEvent>`. Currently used by manual `/compact`
+    /// (`compact_context_manual`) to fan out `AgentEvent::ContextCompacted`
+    /// to TUI overlays, eval capture, MCP listeners, and any other
+    /// out-of-turn subscriber. The auto-compaction and mid-turn
+    /// micro-compaction paths continue to send through the per-turn
+    /// `mpsc` so in-turn consumers see compaction in the same stream as
+    /// the surrounding tool calls and assistant text; this broadcast is
+    /// the supplementary path for events with no active turn.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<Arc<AgentEvent>> {
+        self.event_broadcast.subscribe()
     }
 
     pub fn jobs_snapshot(&self) -> Vec<JobSnapshot> {
@@ -2442,6 +2465,21 @@ impl Agent {
         }
         drop(state);
         self.log_compaction_event(&report);
+        // Mirror the auto-compaction (`maybe_compact_conversation` post-turn)
+        // and mid-turn micro-compaction broadcasts so any `AgentEvent`
+        // subscriber — TUI overlays, eval capture, MCP listeners — observes
+        // a manual `/compact` the same way it observes an automatic one.
+        // Manual compaction runs between turns and so has no per-call
+        // `mpsc::Sender<AgentEvent>`; the agent-level broadcast at
+        // `event_broadcast` is the supplementary fan-out. `TurnId::INVALID`
+        // marks this as out-of-turn so consumers don't conflate it with a
+        // real turn id.
+        let _ = self
+            .event_broadcast
+            .send(Arc::new(AgentEvent::ContextCompacted {
+                turn_id: TurnId::INVALID,
+                report: report.clone(),
+            }));
         Ok(report)
     }
 
@@ -2617,8 +2655,95 @@ impl Agent {
                     message: format!("{err}"),
                 },
             },
+            // `/diff` returns a worktree `DiffSnapshot` so headless
+            // drivers (eval, RPC) can audit the same payload the TUI
+            // renders into a diff card via `handle_slash_diff`. The
+            // call shells out to `git status` + `git diff` via
+            // `GitVcs::snapshot`; parked on `spawn_blocking` to keep
+            // the async runtime free.
+            DispatchCommand::Diff => {
+                let tools = self.tools.clone();
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    tools.diff_snapshot(
+                        squeezy_vcs::DiffMode::Worktree,
+                        squeezy_vcs::DiffOptions {
+                            include_patch: true,
+                            ..squeezy_vcs::DiffOptions::default()
+                        },
+                    )
+                })
+                .await
+                .unwrap_or_else(|err| squeezy_vcs::DiffSnapshot {
+                    vcs: squeezy_vcs::VcsInfo {
+                        kind: squeezy_vcs::VcsKind::None,
+                        ..squeezy_vcs::VcsInfo::default()
+                    },
+                    mode: squeezy_vcs::DiffMode::Worktree,
+                    summary: squeezy_vcs::DiffSummary::default(),
+                    files: Vec::new(),
+                    truncated: false,
+                    errors: vec![format!("diff snapshot task panicked: {err}")],
+                });
+                let vcs_kind = match snapshot.vcs.kind {
+                    squeezy_vcs::VcsKind::Git => "git",
+                    squeezy_vcs::VcsKind::None => "none",
+                }
+                .to_string();
+                let files_changed = snapshot.summary.files_changed;
+                let additions = snapshot.summary.additions;
+                let deletions = snapshot.summary.deletions;
+                let untracked_files = snapshot.summary.untracked_files;
+                DispatchOutcome::DiffSnapshot {
+                    vcs_kind,
+                    files_changed,
+                    additions,
+                    deletions,
+                    untracked_files,
+                    snapshot: Box::new(snapshot),
+                }
+            }
+            // `/undo` rolls back the most recent checkpoint.
+            // Returns a typed `CheckpointUndo` so headless drivers
+            // see the structured `RollbackResult` (or `None` when
+            // checkpoints are disabled) instead of a string status.
+            // The TUI keeps running the rollback through its local
+            // tool job for card-lifecycle observability.
+            // `CheckpointStore::rollback` writes journal entries and
+            // touches the filesystem; parked on `spawn_blocking`.
+            DispatchCommand::Undo => {
+                let tools = self.tools.clone();
+                let join =
+                    tokio::task::spawn_blocking(move || tools.checkpoint_undo_latest(None)).await;
+                match join {
+                    Err(err) => DispatchOutcome::Error {
+                        command: "/undo".into(),
+                        message: format!("undo task panicked: {err}"),
+                    },
+                    Ok(Ok(Some(result))) => {
+                        let applied = result.applied;
+                        let skipped = result.skipped;
+                        let checkpoint_ids = result.checkpoint_ids.clone();
+                        DispatchOutcome::CheckpointUndo {
+                            applied,
+                            skipped,
+                            checkpoint_ids,
+                            result: Some(Box::new(result)),
+                        }
+                    }
+                    Ok(Ok(None)) => DispatchOutcome::CheckpointUndo {
+                        applied: false,
+                        skipped: true,
+                        checkpoint_ids: Vec::new(),
+                        result: None,
+                    },
+                    Ok(Err(err)) => DispatchOutcome::Error {
+                        command: "/undo".into(),
+                        message: format!("{err}"),
+                    },
+                }
+            }
             // `/fork`, `/resume`, `/session-export-html`, `/session-cleanup`,
-            // `/pin`, `/checkpoint*`, `/undo`, `/revert-turn` require &mut
+            // `/pin`, `/checkpoint*`, `/revert-turn` require &mut
             // self or interact with TUI-owned state (clipboard, transcript
             // selection, vcs background job). The TUI keeps running those
             // through its existing helpers; the agent dispatch records the
@@ -2631,7 +2756,6 @@ impl Agent {
             | DispatchCommand::Pin { .. }
             | DispatchCommand::Checkpoints
             | DispatchCommand::Checkpoint { .. }
-            | DispatchCommand::Undo
             | DispatchCommand::RevertTurn { .. }
             | DispatchCommand::Help { .. }
             | DispatchCommand::Config { .. }
@@ -2640,7 +2764,6 @@ impl Agent {
             | DispatchCommand::Copy { .. }
             | DispatchCommand::Collapse { .. }
             | DispatchCommand::Expand { .. }
-            | DispatchCommand::Diff
             | DispatchCommand::Feedback { .. }
             | DispatchCommand::Report { .. }
             | DispatchCommand::Effort { .. }
@@ -2825,7 +2948,7 @@ impl Agent {
                 "record": report.record,
                 "summary": report.summary,
                 "replacement_id": report.record.replacement_id,
-                "conversation": report.dropped,
+                "conversation": report.post_compact,
             }),
         );
     }
@@ -3396,7 +3519,20 @@ fn spawn_turn_cancel_monitor(
                     });
                 }
                 if let Some(tx) = tx.upgrade() {
-                    let _ = tx.send(AgentEvent::Cancelled { turn_id }).await;
+                    // Watchdog fallback: the round loop's primary cancel
+                    // path normally fires `AgentEvent::Cancelled` first
+                    // with its own partial-cost snapshot. This emission
+                    // only runs when the grace window expires without the
+                    // primary path checking in, in which case we have no
+                    // cost-broker handle here — leave the cost+metrics
+                    // payload zero rather than fabricate a number.
+                    let _ = tx
+                        .send(AgentEvent::Cancelled {
+                            turn_id,
+                            cost: CostSnapshot::default(),
+                            metrics: TurnMetrics::default(),
+                        })
+                        .await;
                 }
                 done.notify_waiters();
             }
@@ -4682,7 +4818,7 @@ impl TurnRuntime {
                     "record": report.record,
                     "summary": report.summary,
                     "replacement_id": report.record.replacement_id,
-                    "conversation": report.dropped,
+                    "conversation": report.post_compact,
                 }),
             );
             let _ = self
@@ -4944,7 +5080,30 @@ impl TurnRuntime {
                 .await;
                 return Ok(());
             }
-            if let Some(status) = broker.session_cap_reached() {
+            // Two-stage cost-cap check: the post-hoc `session_cap_reached`
+            // catches a session that crossed the cap on a prior round's
+            // recorded provider cost, while `projected_session_cap_overrun`
+            // is the *pre-flight* gate that refuses to dispatch the next
+            // round when the upcoming spend would push the running total
+            // past the cap. Without the second stage the cap can only fire
+            // after the over-cap tokens have already been billed (see
+            // bd ticket squeezy-xt2o / wave2-16 finding 2: anthropic run
+            // landed at 124% of cap before the post-hoc check tripped).
+            let cap_status = broker.session_cap_reached().or_else(|| {
+                let projected_input_tokens = estimate_context(&conversation).estimated_tokens;
+                let projected_output_tokens = CostBroker::projected_output_tokens(
+                    self.config.max_output_tokens,
+                    squeezy_llm::model_info_for(self.provider.name(), &self.config.model)
+                        .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
+                );
+                broker.projected_session_cap_overrun(
+                    self.provider.name(),
+                    &self.config.model,
+                    projected_input_tokens,
+                    projected_output_tokens,
+                )
+            });
+            if let Some(status) = cap_status {
                 self.publish_terminal_task_state(
                     TaskStateStatus::Failed,
                     Some(format_cap_reached_reason(status)),
@@ -5033,12 +5192,44 @@ impl TurnRuntime {
             let mut stop_reason: Option<StopReason> = None;
             let mut reasoning_only_stop = false;
             let mut round_text_started = false;
+            // Running byte counters for the in-flight round, used to
+            // estimate token cost on cancel before the provider has had
+            // a chance to emit a `Completed` event with usage. Both
+            // counters cover redactor-flushed text plus reasoning
+            // deltas; together with `request_input_bytes` they feed
+            // `partial_cancel_cost` so a mid-stream cancel attributes
+            // the work the provider already did instead of reporting
+            // zero.
+            let mut round_output_bytes: u64 = 0;
 
             while let Some(event) =
                 next_llm_stream_event(&mut stream, &self.cancel, self.config.stream_idle_timeout)
                     .await?
             {
                 if self.cancel.is_cancelled() {
+                    if let Some(tail) = self
+                        .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                        .await
+                    {
+                        self.record_replay_model_text_delta(&tail);
+                    }
+                    broker.metrics.redactions += assistant_stream.total_redactions();
+                    let partial = std::mem::take(&mut assistant_message);
+                    self.preserve_partial_assistant_on_cancel(
+                        partial,
+                        &mut conversation,
+                        user_transcript.clone(),
+                        context_compaction.clone(),
+                    )
+                    .await;
+                    self.fold_partial_cancel_cost(
+                        &mut total_cost,
+                        &mut broker,
+                        request_model.as_ref(),
+                        request_input_bytes,
+                        round_output_bytes,
+                    )
+                    .await;
                     self.finish_cancelled_turn(
                         &task_title,
                         &total_cost,
@@ -5063,6 +5254,16 @@ impl TurnRuntime {
                         }
                     }
                     LlmEvent::TextDelta(delta) => {
+                        // Bill the raw provider delta against output
+                        // bytes immediately, before the redactor's tail
+                        // buffer can hide the work behind its
+                        // `STREAM_TAIL_BYTES` window. A mid-stream cancel
+                        // arriving before the redactor releases its
+                        // first chunk would otherwise see
+                        // `round_output_bytes = 0` and skip cost
+                        // attribution even though the provider already
+                        // sent the bytes.
+                        round_output_bytes = round_output_bytes.saturating_add(delta.len() as u64);
                         let chunk = assistant_stream.push(&delta);
                         if chunk.text.is_empty() {
                             continue;
@@ -5113,6 +5314,7 @@ impl TurnRuntime {
                         }
                     }
                     LlmEvent::ReasoningDelta { text, .. } => {
+                        round_output_bytes = round_output_bytes.saturating_add(text.len() as u64);
                         if self
                             .tx
                             .send(AgentEvent::ReasoningDelta {
@@ -5212,6 +5414,29 @@ impl TurnRuntime {
                         break;
                     }
                     LlmEvent::Cancelled => {
+                        if let Some(tail) = self
+                            .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                            .await
+                        {
+                            self.record_replay_model_text_delta(&tail);
+                        }
+                        broker.metrics.redactions += assistant_stream.total_redactions();
+                        let partial = std::mem::take(&mut assistant_message);
+                        self.preserve_partial_assistant_on_cancel(
+                            partial,
+                            &mut conversation,
+                            user_transcript.clone(),
+                            context_compaction.clone(),
+                        )
+                        .await;
+                        self.fold_partial_cancel_cost(
+                            &mut total_cost,
+                            &mut broker,
+                            request_model.as_ref(),
+                            request_input_bytes,
+                            round_output_bytes,
+                        )
+                        .await;
                         self.finish_cancelled_turn(
                             &task_title,
                             &total_cost,
@@ -5730,7 +5955,7 @@ impl TurnRuntime {
                         "record": report.record,
                         "summary": report.summary,
                         "replacement_id": report.record.replacement_id,
-                        "conversation": report.dropped,
+                        "conversation": report.post_compact,
                         "phase": "mid_turn",
                     }),
                 );
@@ -5965,6 +6190,47 @@ impl TurnRuntime {
         let _ = SessionStore::open(&self.config).save_global_calibration(&calibration_for_global);
     }
 
+    /// Fold a best-effort partial cost into `total_cost` and the broker's
+    /// per-turn metrics for an in-flight round that is about to exit via
+    /// the cancel path. Provider streams emit usage payloads only on
+    /// [`LlmEvent::Completed`]; a mid-stream cancel never reaches that
+    /// arm, so without this step both the cost broker and the persisted
+    /// `frames.jsonl` would report `input=0, output=0, cost=0` for the
+    /// cancelled turn even though the provider did real work. The
+    /// estimate is derived from the request's input byte count plus the
+    /// running byte total of streamed assistant text + reasoning, fed
+    /// through the per-provider calibration and the pricing registry —
+    /// the same machinery [`estimate_cost`] already uses for cost
+    /// rendering when a provider stream stays silent on usage. No-op
+    /// when the round has done nothing observable yet (cancel landed
+    /// before any provider work).
+    async fn fold_partial_cancel_cost(
+        &self,
+        total_cost: &mut CostSnapshot,
+        broker: &mut CostBroker,
+        request_model: &str,
+        request_input_bytes: u64,
+        round_output_bytes: u64,
+    ) {
+        let Some(partial) = partial_cancel_cost(
+            self.provider.name(),
+            request_model,
+            request_input_bytes,
+            round_output_bytes,
+            &broker.calibration,
+        ) else {
+            return;
+        };
+        // Fold into the broker so per-turn `TurnMetrics.provider` and the
+        // session-level cost cap state both see the partial spend. The
+        // returned `CostCapStatus` is intentionally dropped: a cancelled
+        // turn already terminates the round loop, so emitting a warning
+        // event here would just race the `AgentEvent::Cancelled` we are
+        // about to send.
+        let _ = broker.record_provider_cost(&partial);
+        merge_cost(total_cost, &partial);
+    }
+
     async fn finish_cancelled_turn(
         &self,
         task_title: &str,
@@ -5984,15 +6250,59 @@ impl TurnRuntime {
             "cancelled",
             Some(self.turn_id),
             Some("turn cancelled".to_string()),
-            json!({}),
+            json!({
+                "cost": cost,
+                "metrics": metrics,
+            }),
         );
         self.record_replay(SessionReplayEventKind::ModelCancelled, json!({}));
         let _ = self
             .tx
             .send(AgentEvent::Cancelled {
                 turn_id: self.turn_id,
+                cost: cost.clone(),
+                metrics: metrics.clone(),
             })
             .await;
+    }
+
+    /// Mirror the success path's conversation/transcript push for a turn
+    /// that was cancelled mid-stream. Without this, the partial assistant
+    /// text accumulated from `AgentEvent::AssistantDelta` goes out of
+    /// scope when the cancel branch returns — leaving the next turn (and
+    /// `/diff`/`/undo`) with no in-conversation evidence that anything
+    /// was cancelled.
+    ///
+    /// The partial text is pushed even when empty (the model may have
+    /// been cancelled before producing any visible content) so the
+    /// transcript carries a `(cancelled)` marker either way; the
+    /// conversation buffer skips the push when the text is empty so we
+    /// do not stuff an empty assistant turn into the provider prompt.
+    async fn preserve_partial_assistant_on_cancel(
+        &self,
+        partial_assistant_text: String,
+        conversation: &mut Vec<LlmInputItem>,
+        user_transcript: TranscriptItem,
+        context_compaction: ContextCompactionState,
+    ) {
+        if !partial_assistant_text.is_empty() {
+            conversation.push(redact_input_item(
+                LlmInputItem::AssistantText(partial_assistant_text.clone()),
+                &self.redactor,
+            ));
+        }
+        let assistant = TranscriptItem::assistant_cancelled(plan_mode::strip_proposed_plan_blocks(
+            &partial_assistant_text,
+        ));
+        let mut state = self.conversation_state.lock().await;
+        state.conversation = conversation.clone();
+        // `previous_response_id` is left alone: the provider-side response
+        // chain must not jump past a turn we never persisted as completed.
+        state.transcript.push(user_transcript);
+        state.transcript.push(assistant);
+        let mut merged_compaction = context_compaction;
+        merge_concurrent_pins(&mut merged_compaction, &state.context_compaction.pinned);
+        state.context_compaction = merged_compaction;
     }
 
     async fn current_task_summary(&self) -> Option<String> {
@@ -6486,6 +6796,10 @@ async fn handle_request_user_input_call(
             .collect(),
         allow_freeform: args.allow_freeform,
     };
+    // Capture the question contract for post-response validation; the request
+    // itself is moved into the event below.
+    let offered_values: Vec<String> = request.choices.iter().map(|c| c.value.clone()).collect();
+    let allow_freeform = request.allow_freeform;
 
     let (response_tx, response_rx) = oneshot::channel::<RequestUserInputResponse>();
     if context
@@ -6513,6 +6827,66 @@ async fn handle_request_user_input_call(
         _ = context.cancel.cancelled() => RequestUserInputResponse::cancelled(),
         result = response_rx => result.unwrap_or_else(|_| RequestUserInputResponse::cancelled()),
     };
+
+    // Validate the response shape against the offered question contract.
+    // A driver/UI that replies with a choice_value not in the offered set, or
+    // a freeform reply when the question disabled freeform, must surface a
+    // typed error so the model sees the violation instead of an opaque
+    // success.
+    match response.action {
+        RequestUserInputAction::Choice => {
+            let Some(choice_value) = response.choice_value.as_deref() else {
+                return control_tool_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({
+                        "ok": false,
+                        "error": "request_user_input choice response missing choice_value"
+                    }),
+                );
+            };
+            if !offered_values.iter().any(|v| v.as_str() == choice_value) {
+                return control_tool_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({
+                        "ok": false,
+                        "error": "choice_value not in offered choices",
+                        "choice_value": choice_value,
+                        "offered": offered_values,
+                    }),
+                );
+            }
+        }
+        RequestUserInputAction::Freeform => {
+            if !allow_freeform {
+                return control_tool_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({
+                        "ok": false,
+                        "error": "freeform not allowed for this question",
+                    }),
+                );
+            }
+            if response
+                .freeform
+                .as_deref()
+                .map(str::is_empty)
+                .unwrap_or(true)
+            {
+                return control_tool_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({
+                        "ok": false,
+                        "error": "request_user_input freeform response missing freeform text"
+                    }),
+                );
+            }
+        }
+        RequestUserInputAction::Cancelled => {}
+    }
 
     let mut payload = json!({
         "ok": true,
@@ -11613,6 +11987,48 @@ fn merge_cost(total: &mut CostSnapshot, next: &CostSnapshot) {
         add_optional(total.estimated_usd_micros, next.estimated_usd_micros);
 }
 
+/// Build a best-effort [`CostSnapshot`] for a round that was cancelled
+/// mid-stream — before the provider emitted a `Completed` event with
+/// usage. Returns `None` when no assistant or reasoning bytes were
+/// observed; in that case the provider may or may not have already
+/// charged us for the input prompt (its decision-to-cancel races with
+/// our send), so attributing input tokens would be guesswork. Once any
+/// output byte has streamed back we know the provider definitely read
+/// the prompt, so both input and output sides of the estimate are
+/// folded in. Tokens come from the per-provider calibration; the
+/// dollar cost comes from the pricing registry via [`estimate_cost`],
+/// the same fallback the `Completed` arm uses when the provider stays
+/// silent on `estimated_usd_micros`.
+fn partial_cancel_cost(
+    provider: &str,
+    model: &str,
+    request_input_bytes: u64,
+    round_output_bytes: u64,
+    calibration: &squeezy_llm::TokenCalibration,
+) -> Option<CostSnapshot> {
+    if round_output_bytes == 0 {
+        return None;
+    }
+    let bytes_per_token = calibration.bytes_per_token(provider);
+    let input_tokens = bytes_to_tokens(request_input_bytes, bytes_per_token);
+    let output_tokens = bytes_to_tokens(round_output_bytes, bytes_per_token);
+    let mut snapshot = CostSnapshot {
+        input_tokens: (input_tokens > 0).then_some(input_tokens),
+        output_tokens: (output_tokens > 0).then_some(output_tokens),
+        ..CostSnapshot::default()
+    };
+    snapshot.estimated_usd_micros = estimate_cost(provider, model, &snapshot);
+    Some(snapshot)
+}
+
+fn bytes_to_tokens(bytes: u64, bytes_per_token: f64) -> u64 {
+    if bytes == 0 {
+        return 0;
+    }
+    let bpt = bytes_per_token.max(0.1);
+    ((bytes as f64) / bpt).ceil() as u64
+}
+
 fn start_session_log(config: &AppConfig, provider: &str) -> Option<SessionHandle> {
     let store = SessionStore::open(config);
     let metadata = SessionMetadata::new(config, provider);
@@ -12374,6 +12790,19 @@ pub enum AgentEvent {
     },
     Cancelled {
         turn_id: TurnId,
+        /// Cumulative cost for the turn at the moment of cancel, including
+        /// the partial work of the in-flight round. Mirrors the shape of
+        /// [`AgentEvent::Completed::cost`] so cost-reporting consumers
+        /// (eval frames, TUI footer, `/cost`) read the same field on both
+        /// terminal paths. Defaults to zero for cancel paths that fire
+        /// before any provider work has happened (e.g. cancel landing
+        /// before the first round's stream starts).
+        cost: CostSnapshot,
+        /// Per-turn metrics snapshot at the moment of cancel, again
+        /// mirroring [`AgentEvent::Completed::metrics`] so consumers can
+        /// account for partial spend on a cancelled turn the same way
+        /// they do on a completed one.
+        metrics: TurnMetrics,
     },
     Failed {
         turn_id: TurnId,

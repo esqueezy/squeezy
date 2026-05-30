@@ -2883,6 +2883,7 @@ dependencies = [
  "squeezy-store",
  "squeezy-telemetry",
  "squeezy-tools",
+ "squeezy-vcs",
  "tokio",
  "tokio-util",
  "tracing",

@@ -671,6 +671,8 @@ async fn cancelled_turn_auto_drains_next_queued_prompt() {
     // Simulate the agent emitting Cancelled.
     tx.send(AgentEvent::Cancelled {
         turn_id: TurnId::new(1),
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
     })
     .await
     .expect("send cancelled");
@@ -4302,7 +4304,7 @@ fn reasoning_delta_renders_with_dim_italic() {
         .first()
         .expect("streaming reasoning emits a header line");
     assert!(
-        header.spans.iter().any(|s| s.content.contains("thinking…")
+        header.spans.iter().any(|s| s.content.contains("reasoning…")
             && s.style.add_modifier.contains(expected_modifiers)),
         "streaming header missing dim+italic: {header:?}",
     );
@@ -5434,7 +5436,7 @@ fn user_prompt_text_is_highlighted_in_transcript() {
     let item = TranscriptItem::user("find getFoo");
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
-    let text = lines[1]
+    let _text = lines[1]
         .spans
         .iter()
         .map(|span| span.content.as_ref())
@@ -6143,6 +6145,42 @@ fn common_errors_get_actionable_status_text() {
 }
 
 #[test]
+fn non_retryable_provider_request_drops_retry_hint() {
+    let marker = squeezy_llm::anthropic_error::NON_RETRYABLE_MARKER;
+    let payload = format!(
+        "{marker}Anthropic rejected request (invalid_request_error): thinking.enabled.budget_tokens must be >= 1024. Raise max_output_tokens to at least 1025 or lower reasoning_effort.",
+    );
+    let status = format_error_status(&SqueezyError::ProviderRequest(payload));
+    assert!(
+        !status.contains("retry or check provider/network status"),
+        "non-retryable status must not advertise a bogus retry: {status}",
+    );
+    assert!(
+        !status.contains("[non-retryable]"),
+        "sentinel marker must not leak into the user-facing status: {status}",
+    );
+    assert!(
+        status.contains("Anthropic rejected request"),
+        "human prose must survive: {status}",
+    );
+    assert!(
+        status.contains("max_output_tokens"),
+        "next-step hint must survive: {status}",
+    );
+}
+
+#[test]
+fn retryable_provider_request_keeps_retry_hint() {
+    let status = format_error_status(&SqueezyError::ProviderRequest(
+        "Anthropic rejected request (overloaded_error): Overloaded".into(),
+    ));
+    assert!(
+        status.contains("retry or check provider/network status"),
+        "5xx-style errors keep the retry suffix: {status}",
+    );
+}
+
+#[test]
 fn repo_status_handles_non_git_roots() {
     let config = AppConfig {
         workspace_root: std::env::temp_dir(),
@@ -6409,6 +6447,8 @@ async fn cancel_restores_prompt_into_composer() {
     app.turn_rx = Some(rx);
     tx.send(AgentEvent::Cancelled {
         turn_id: TurnId::new(1),
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
     })
     .await
     .expect("send cancelled");
@@ -6437,6 +6477,8 @@ async fn cancel_does_not_clobber_draft_typed_during_interrupt() {
     app.turn_rx = Some(rx);
     tx.send(AgentEvent::Cancelled {
         turn_id: TurnId::new(1),
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
     })
     .await
     .expect("send cancelled");
@@ -7807,6 +7849,99 @@ async fn slash_theme_high_contrast_pins_light_tone_and_yellow_accent() {
     assert!(ran);
     assert_eq!(palette::accent_variant(), palette::AccentVariant::Default);
     assert_eq!(palette::accent_primary(), palette::AMBER);
+}
+
+/// Regression for `squeezy-ramu`: when the eval harness pins a settings
+/// path override, `/theme dark` must persist to the scratch file and
+/// must NOT touch the env-resolved (production-style "home") path. The
+/// harness's per-run scratch path beats `$SQUEEZY_SETTINGS_PATH` /
+/// `$HOME/.squeezy/settings.toml` so scenarios can't clobber the
+/// operator's real config mid-run.
+#[tokio::test]
+async fn tui_harness_settings_override_pins_theme_writes_to_scratch() {
+    use crate::render::palette;
+    use crate::testing::TuiHarness;
+
+    let dir = temp_workspace("ramu_harness_override");
+    let scratch_settings = dir.join("scratch-settings.toml");
+    // `fake_home_settings` stands in for `~/.squeezy/settings.toml`:
+    // we point `SQUEEZY_SETTINGS_PATH` at it so `default_settings_path`
+    // (the production fallback) resolves here, then assert the override
+    // wins and this file is never created.
+    let fake_home_settings = dir.join("fake-home-settings.toml");
+    let _guard = ScopedSettingsPath::new(fake_home_settings.clone());
+
+    let mut config = test_config(SessionMode::Build);
+    config.workspace_root = dir.clone();
+    let provider = Arc::new(UnavailableProvider::new(
+        "scripted",
+        "harness override test",
+    ));
+    let mut harness = TuiHarness::new(
+        config,
+        SessionMode::Build,
+        provider,
+        80,
+        24,
+        Some(scratch_settings.clone()),
+    )
+    .expect("harness builds with override");
+
+    // Sanity: the override is the resolved persistence target.
+    assert_eq!(
+        harness.app_mut().user_settings_path(),
+        scratch_settings,
+        "override should win over $SQUEEZY_SETTINGS_PATH",
+    );
+
+    // Drive `/theme dark` through the live slash dispatch — same code
+    // path the eval composer hits via `send_keys` typing `/theme dark`
+    // + Enter. We invoke the dispatcher directly to keep the test
+    // fast and decoupled from key-event parsing.
+    let ran = {
+        let (app, agent) = harness.app_and_agent_mut();
+        handle_slash_command(app, agent, "/theme dark").await
+    };
+    assert!(ran, "/theme dark should dispatch");
+    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
+
+    // Scratch file got the override; the env-pointed "home" file did
+    // NOT — that's the whole point of the fix.
+    let saved = std::fs::read_to_string(&scratch_settings).expect("scratch settings file written");
+    assert!(
+        saved.contains("theme = \"dark\""),
+        "scratch should record the theme; got {saved}",
+    );
+    assert!(
+        !fake_home_settings.exists(),
+        "env-pointed fallback path must not be created when override is set; \
+         leaked write to {}",
+        fake_home_settings.display(),
+    );
+}
+
+/// Companion regression: with the override left `None` the harness
+/// still resolves the production path via `default_settings_path()` —
+/// i.e. we did not accidentally break the non-eval default branch.
+#[tokio::test]
+async fn tui_harness_without_override_falls_through_to_default_path() {
+    use crate::testing::TuiHarness;
+
+    let dir = temp_workspace("ramu_harness_default");
+    let env_settings = dir.join("env-settings.toml");
+    let _guard = ScopedSettingsPath::new(env_settings.clone());
+
+    let mut config = test_config(SessionMode::Build);
+    config.workspace_root = dir.clone();
+    let provider = Arc::new(UnavailableProvider::new("scripted", "harness default test"));
+    let mut harness = TuiHarness::new(config, SessionMode::Build, provider, 80, 24, None)
+        .expect("harness builds without override");
+
+    assert_eq!(
+        harness.app_mut().user_settings_path(),
+        env_settings,
+        "no override ⇒ default_settings_path (env-backed) should win",
+    );
 }
 
 /// `/keymap` lists the current bindings — even with no overrides it

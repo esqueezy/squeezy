@@ -224,6 +224,14 @@ that preset. You still need the matching API-key env var exported
 (`OPENAI_API_KEY`, `PORTKEY_API_KEY`, etc.) — the scenario references
 the provider by name only.
 
+Scenarios that exercise the `/diff` and `/undo` git-and-vcs surfaces
+need Squeezy's checkpoint tracking enabled. Either set
+`[squeezy] checkpoints_enabled = true` in the scenario overlay (the
+recommended path — keeps the scenario self-contained) or export
+`SQUEEZY_CHECKPOINTS_ENABLED=1` in the shell before running. Without
+one of those, edits do not produce checkpoint metadata and `/undo`
+becomes a no-op.
+
 ### Steps: prompts and actions
 
 `steps` is an ordered array. Two kinds: `prompt` and `action`.
@@ -242,8 +250,8 @@ wait_for = "turn_completed"      # default; see below
 | `wait_for` | Meaning |
 |---|---|
 | `"turn_completed"` (default) | wait for `AgentEvent::Completed`/`Failed`/`Cancelled` |
-| `{ kind = "tool_call", tool = "grep" }` | record a signal event when this tool fires; do **not** cancel the turn; concurrent dispatch lives on `when.on_tool` actions |
-| `{ kind = "text_contains", text = "compiles" }` | cancel the turn the moment that substring appears in the assistant stream |
+| `{ tool_call = { tool = "grep" } }` | record a signal event when this tool fires; do **not** cancel the turn; concurrent dispatch lives on `when.on_tool` actions |
+| `{ text_contains = { text = "compiles" } }` | cancel the turn the moment that substring appears in the assistant stream |
 
 #### `action` step
 
@@ -441,6 +449,14 @@ One record per assistant turn:
 - `styled_lines` flattens ratatui `Line`/`Span` into plain JSON; ratatui
   types do not leak into the schema.
 - `ansi` is a re-rendering you can `cat` into a terminal.
+- `input_tokens` is the **total** prompt the model saw — uncached
+  delta + cache reads + cache writes — across every provider. Provider
+  bindings normalise to this convention at the snapshot boundary
+  (see `AnthropicStreamState::cost` and `BedrockStreamState::cost`),
+  so an OpenAI cache-hit turn and an Anthropic cache-hit turn on the
+  same prompt shape report comparable totals. The cached share is
+  preserved separately on the `cost` payload in `trace.jsonl` as
+  `cached_input_tokens` / `cache_write_input_tokens`.
 - `cost_micro_usd` is the result of `squeezy_llm::estimate_cost`;
   `0` means no pricing entry for the model.
 - `finish_reason` is the provider-reported terminal reason

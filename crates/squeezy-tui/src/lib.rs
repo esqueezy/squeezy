@@ -1895,7 +1895,7 @@ fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: TuiTheme) {
     next.tui.theme = theme;
     agent.replace_config(next);
 
-    let target_path = squeezy_core::default_settings_path();
+    let target_path = app.user_settings_path();
     let scope_target = SettingsScope::user(&target_path);
     let edits = [SettingsEdit {
         path: &["tui", "theme"],
@@ -1931,7 +1931,7 @@ fn save_status_line(
 ) {
     use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
 
-    let target_path = squeezy_core::default_settings_path();
+    let target_path = app.user_settings_path();
     let scope_target = SettingsScope::user(&target_path);
     let slug_list: Vec<String> = items.iter().map(|i| i.slug().to_string()).collect();
     let edits = [
@@ -4126,7 +4126,7 @@ fn format_mcp_elicitation_menu_lines(
         let label_style = if is_selected {
             Style::default().fg(GOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(palette::muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
@@ -4172,7 +4172,7 @@ fn format_plan_choice_menu_lines(pending: &PendingPlanChoice) -> Vec<Line<'stati
         Span::raw("  "),
         Span::styled(
             compact_path(&pending.plan_path),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette::muted_fg()),
         ),
     ]));
     for (idx, option) in PLAN_CHOICES.iter().enumerate() {
@@ -4181,7 +4181,7 @@ fn format_plan_choice_menu_lines(pending: &PendingPlanChoice) -> Vec<Line<'stati
         let label_style = if is_selected {
             Style::default().fg(GOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(palette::muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
@@ -4231,7 +4231,9 @@ fn format_request_user_input_menu_lines(
         let label_style = if is_selected {
             Style::default().fg(GOLD)
         } else {
-            Style::default().fg(Color::White)
+            // Tone-aware muted grey sits below the luminance budget so
+            // the selected GOLD row wins the eye in the warm-taupe modal.
+            Style::default().fg(palette::muted_fg())
         };
         let mut spans = vec![
             Span::styled(
@@ -4251,9 +4253,15 @@ fn format_request_user_input_menu_lines(
     if request.allow_freeform {
         // Dedicated answer-entry box. Lives inside the modal area so the
         // main composer below stays untouched for the user's next prompt.
-        let entry_style = Style::default().fg(Color::White);
-        let label_style = Style::default().fg(Color::Indexed(33));
-        let cursor_style = Style::default().fg(Color::Black).bg(Color::Indexed(33));
+        // Label + cursor share the `MODE_PURPLE` warm-taupe accent so the
+        // whole modal reads as one semantic surface; the typed body uses
+        // a dim+bold tone-aware foreground for legibility without
+        // overpowering the question line.
+        let entry_style = Style::default()
+            .fg(palette::footer_fg())
+            .add_modifier(Modifier::BOLD);
+        let label_style = Style::default().fg(MODE_PURPLE);
+        let cursor_style = Style::default().fg(Color::Black).bg(MODE_PURPLE);
         let mut spans = vec![Span::raw("  "), Span::styled("Answer › ", label_style)];
         if input.is_empty() {
             spans.push(Span::styled(
@@ -4288,7 +4296,7 @@ fn format_approval_menu_lines(
         let label_style = if is_selected {
             Style::default().fg(GOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(palette::muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
@@ -4343,7 +4351,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     }
     let include_startup_card = area.height >= 16;
     let input_height = input_panel_height(app, area.width);
-    let approval_height = approval_menu_height(app);
+    let approval_height = approval_menu_height(app, area.width);
     let plan_indicator_height = plan_mode_indicator_height(app);
     let task_height = if should_show_task_panel(app) {
         let h = if approval_height > 0 {
@@ -4464,7 +4472,10 @@ fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(current.message.as_str(), Style::default().fg(Color::White)),
+        Span::styled(
+            current.message.as_str(),
+            Style::default().fg(palette::muted_fg()),
+        ),
     ];
     if let Some(hint) = current.action_hint {
         spans.push(Span::raw("  "));
@@ -4568,7 +4579,7 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
         return;
     }
     let input_height = input_panel_height(app, area.width);
-    let approval_height = approval_menu_height(app);
+    let approval_height = approval_menu_height(app, area.width);
     let plan_indicator_height = plan_mode_indicator_height(app);
     let task_height = should_show_task_panel(app).then_some(task_panel_height(app));
     let status_height = 2;
@@ -4918,9 +4929,19 @@ fn task_title(snapshot: &TaskStateSnapshot) -> &str {
     }
 }
 
-fn approval_menu_height(app: &TuiApp) -> u16 {
+fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
+    // The modal renders with `Wrap { trim: false }`, so a single logical
+    // line can occupy multiple visible rows when its content exceeds the
+    // area width. Counting `lines.len()` under-allocates and pushes the
+    // freeform answer box (or the lowest choice) off the modal area on
+    // long verbose labels — see squeezy-xtvg / wave2-06 Anthropic run.
+    // `visual_line_count` mirrors the wrap pass used for the transcript
+    // and live regions and is safe (it rounds up per line, never down).
     if let Some(pending) = app.pending_approval.as_ref() {
-        format_approval_menu_lines(&pending.request, app.approval_selection_index).len() as u16
+        visual_line_count(
+            &format_approval_menu_lines(&pending.request, app.approval_selection_index),
+            width,
+        )
     } else if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
         match pending.request.kind {
             McpElicitationKind::Form => {
@@ -4939,14 +4960,16 @@ fn approval_menu_height(app: &TuiApp) -> u16 {
             }
         }
     } else if let Some(pending) = app.pending_request_user_input.as_ref() {
-        format_request_user_input_menu_lines(
-            &pending.request,
-            pending.selection_index,
-            &pending.answer,
+        visual_line_count(
+            &format_request_user_input_menu_lines(
+                &pending.request,
+                pending.selection_index,
+                &pending.answer,
+            ),
+            width,
         )
-        .len() as u16
     } else if let Some(pending) = app.pending_plan_choice.as_ref() {
-        format_plan_choice_menu_lines(pending).len() as u16
+        visual_line_count(&format_plan_choice_menu_lines(pending), width)
     } else {
         0
     }
@@ -5305,7 +5328,7 @@ fn transcript_lines_for_render(
 
 fn streaming_reasoning_lines(text: &str) -> Vec<Line<'static>> {
     let style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
-    let mut lines = vec![Line::from(Span::styled("▾ thinking…".to_string(), style))];
+    let mut lines = vec![Line::from(Span::styled("▾ reasoning…".to_string(), style))];
     for raw in text.lines() {
         lines.push(Line::from(Span::styled(format!("▏ {}", raw), style)));
     }
@@ -6446,8 +6469,9 @@ fn reasoning_block_lines_with_extras(
         if extras > 0 {
             suffix.push_str(&format!(" · +{extras} more"));
         }
+        let summary_sep = if summary.is_empty() { "" } else { " · " };
         lines.push(Line::from(Span::styled(
-            format!("{marker}▸ reasoning: {summary}{suffix}"),
+            format!("{marker}▸ reasoning{summary_sep}{summary}{suffix}"),
             style,
         )));
     } else {
@@ -6913,7 +6937,7 @@ fn role_action(role: &Role) -> (&'static str, Color) {
 
 fn message_content_style(role: &Role) -> Style {
     match role {
-        Role::User => Style::default().fg(Color::White).bg(PROMPT_BG),
+        Role::User => Style::default().fg(palette::muted_fg()).bg(PROMPT_BG),
         Role::Assistant | Role::System => Style::default(),
     }
 }
@@ -7117,7 +7141,7 @@ fn tool_result_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     if is_invalid_argument_result(result) {
         let mut spans = vec![Span::styled(
             result.tool_name.clone(),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette::muted_fg()),
         )];
         if let Some(call) = tool.call.as_ref() {
             let label = tool_call_label(call);
@@ -7154,7 +7178,7 @@ fn tool_result_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         "webfetch" | "websearch" => web_summary_spans(tool),
         _ => vec![Span::styled(
             result.tool_name.clone(),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette::muted_fg()),
         )],
     };
     if tool_result_not_run(tool) {
@@ -7257,7 +7281,10 @@ fn decl_search_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         label.push_str(" for ");
         label.push_str(&query);
     }
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(palette::muted_fg()),
+    )];
     if let Some(total) = number_field(&tool.result.content, "total_matches")
         .or_else(|| number_field(&tool.result.content, "returned_matches"))
     {
@@ -7278,7 +7305,10 @@ fn decl_search_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 
 fn semantic_tool_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let label = tool_call_label_or_name(tool);
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(palette::muted_fg()),
+    )];
     if let Some(matches) = number_field(&tool.result.content, "total_matches")
         .or_else(|| number_field(&tool.result.content, "returned_matches"))
         .or_else(|| {
@@ -7297,7 +7327,10 @@ fn semantic_tool_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 }
 
 fn repo_map_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled("repo map", Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        "repo map",
+        Style::default().fg(palette::muted_fg()),
+    )];
     if let Some(files) = tool.result.content["stats"]["files"].as_u64() {
         spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
         spans.push(Span::styled(
@@ -7327,7 +7360,10 @@ fn read_search_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 
 fn grep_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let label = tool_call_label_or_name(tool);
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(palette::muted_fg()),
+    )];
     if let Some(matches) = number_field(&tool.result.content, "matches_returned")
         .or_else(|| number_field(&tool.result.content, "count"))
         .or_else(|| {
@@ -7360,7 +7396,10 @@ fn glob_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let label = pattern
         .map(|pattern| format!("list files matching {pattern}"))
         .unwrap_or_else(|| "list files".to_string());
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(palette::muted_fg()),
+    )];
     if let Some(paths) = tool.result.content["paths"]
         .as_array()
         .map(|items| items.len() as u64)
@@ -7377,7 +7416,10 @@ fn glob_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 
 fn read_file_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let label = tool_call_label_or_name(tool);
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(palette::muted_fg()),
+    )];
     if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
         spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
         spans.push(Span::styled(format_bytes(bytes), Style::default().fg(GOLD)));
@@ -7398,7 +7440,7 @@ fn read_file_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 fn read_tool_output_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(
         "expand saved tool output",
-        Style::default().fg(Color::White),
+        Style::default().fg(palette::muted_fg()),
     )];
     if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
         spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
@@ -7417,7 +7459,10 @@ fn edit_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     } else {
         format!("{} files", files.len())
     };
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(palette::muted_fg()),
+    )];
     let additions = files.iter().map(|file| file.additions).sum::<u64>();
     let deletions = files.iter().map(|file| file.deletions).sum::<u64>();
     if additions > 0 || deletions > 0 {
@@ -7530,7 +7575,7 @@ fn diff_context_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let mode = string_arg(&tool.result.content, "mode")
         .map(|mode| format!("diff context ({mode})"))
         .unwrap_or_else(|| "diff context".to_string());
-    let mut spans = vec![Span::styled(mode, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(mode, Style::default().fg(palette::muted_fg()))];
     let files = tool.result.content["summary"]["files_changed"]
         .as_u64()
         .or_else(|| {
@@ -7567,7 +7612,10 @@ fn plan_patch_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let label = objective
         .map(|objective| format!("plan patch for {}", compact_text(&objective, 64)))
         .unwrap_or_else(|| "plan patch".to_string());
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(palette::muted_fg()),
+    )];
     if let Some(symbols) = tool.result.content["symbols"]
         .as_array()
         .map(|items| items.len() as u64)
@@ -7603,7 +7651,7 @@ fn plan_patch_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 fn web_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     vec![Span::styled(
         tool_call_label_or_name(tool),
-        Style::default().fg(Color::White),
+        Style::default().fg(palette::muted_fg()),
     )]
 }
 
@@ -7700,7 +7748,7 @@ fn active_tool_spans(call: &ToolCall) -> Vec<Span<'static>> {
     } else {
         spans.push(Span::styled(
             compact_text(&args, 80),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette::muted_fg()),
         ));
     }
     spans
@@ -7981,7 +8029,7 @@ fn shell_output_title_line(command: &str, workdir: &str) -> Line<'static> {
     spans.push(Span::styled(" in ", Style::default().fg(QUIET)));
     spans.push(Span::styled(
         workdir.to_string(),
-        Style::default().fg(Color::White),
+        Style::default().fg(palette::muted_fg()),
     ));
     spans.push(Span::styled(":", Style::default().fg(QUIET)));
     Line::from(spans)
@@ -8523,7 +8571,7 @@ fn command_spans(command: &str) -> Vec<Span<'static>> {
     if tokens.is_empty() {
         return vec![Span::styled(
             command.to_string(),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette::muted_fg()),
         )];
     }
     let mut command_seen = false;
@@ -8540,7 +8588,7 @@ fn command_spans(command: &str) -> Vec<Span<'static>> {
         } else if token.starts_with('"') || token.starts_with('\'') {
             Style::default().fg(SUCCESS_GREEN)
         } else if token.contains('/') || token.contains('.') {
-            Style::default().fg(Color::White)
+            Style::default().fg(palette::muted_fg())
         } else {
             Style::default().fg(QUIET)
         };
@@ -8802,6 +8850,21 @@ fn tool_result_error_detail(result: &ToolResult) -> String {
         {
             return compact_text(line, 140);
         }
+    }
+    // Informational tool results (no error / reason / stderr, no exit
+    // code) can still carry a structured `message` summarising the
+    // outcome — e.g. an empty-store undo's "nothing to undo". Surface
+    // that here so the detail line stays actionable instead of
+    // tombstoning to "no output" whenever this helper is consulted off
+    // the failure path.
+    if let Some(message) = result
+        .content
+        .get("message")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return compact_text(message, 140);
     }
     if result.cost_hint.truncated {
         "output shortened".to_string()
@@ -9477,7 +9540,7 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
             let style = if selected {
                 Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(palette::muted_fg())
             };
             Line::from(vec![
                 Span::styled(
@@ -9957,8 +10020,25 @@ pub(crate) fn format_error_status(error: &SqueezyError) -> String {
         SqueezyError::ProviderNotConfigured(_) => {
             format!("{error}; configure provider credentials or pick another provider")
         }
-        SqueezyError::ProviderRequest(_) | SqueezyError::ProviderStream(_) => {
-            format!("{error}; retry or check provider/network status")
+        SqueezyError::ProviderRequest(message) | SqueezyError::ProviderStream(message) => {
+            // The provider layer humanises Anthropic 4xx envelopes and
+            // tags non-transient ones with [`NON_RETRYABLE_MARKER`] so
+            // the status line and turn-failed banner can suppress the
+            // "retry or check provider/network status" suffix on
+            // genuinely terminal errors (400 invalid_request, 401, 403,
+            // 404). 5xx, 429, and unknown shapes keep the retry hint.
+            // See `crates/squeezy-llm/src/anthropic_error.rs`.
+            let (non_retryable, stripped) =
+                squeezy_llm::anthropic_error::strip_non_retryable_marker(message);
+            let prefix = match error {
+                SqueezyError::ProviderRequest(_) => "provider request failed",
+                _ => "provider stream failed",
+            };
+            if non_retryable {
+                format!("{prefix}: {stripped}")
+            } else {
+                format!("{prefix}: {stripped}; retry or check provider/network status")
+            }
         }
         SqueezyError::Permission(_) => {
             format!("{error}; approve, adjust policy, or change request")
@@ -10523,6 +10603,14 @@ pub(crate) struct TuiApp {
     /// `DispatchCommand`; a match expands the template body and routes
     /// it through [`start_user_turn`] like any other typed prompt.
     pub(crate) prompt_templates: PromptTemplateCatalog,
+    /// Override for the user-scope settings file that slash commands
+    /// (`/theme`, `/statusline`, …) persist into. `None` ⇒ production
+    /// path: `squeezy_core::default_settings_path()` (which itself
+    /// honours `$SQUEEZY_SETTINGS_PATH` then `$HOME/.squeezy/settings.toml`).
+    /// `Some(path)` ⇒ writes are pinned to `path`, used by the eval
+    /// harness so scenario runs cannot clobber the operator's real
+    /// `~/.squeezy/settings.toml`.
+    pub(crate) settings_path_override: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10794,7 +10882,27 @@ impl TuiApp {
             pending_chord: None,
             clickables: std::cell::RefCell::new(Vec::new()),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
+            settings_path_override: None,
         }
+    }
+
+    /// Resolve the user-scope settings path slash commands should write
+    /// to. Returns the [`settings_path_override`](Self::settings_path_override)
+    /// when one has been pinned (eval harness path), else the production
+    /// [`squeezy_core::default_settings_path`] (which itself honours
+    /// `$SQUEEZY_SETTINGS_PATH` then `$HOME/.squeezy/settings.toml`).
+    pub(crate) fn user_settings_path(&self) -> PathBuf {
+        self.settings_path_override
+            .clone()
+            .unwrap_or_else(squeezy_core::default_settings_path)
+    }
+
+    /// Pin the user-scope settings path. Used by the eval harness so
+    /// `/theme` etc. cannot escape the per-run scratch directory. Has
+    /// no effect on production sessions, which never call this.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn set_settings_path_override(&mut self, path: Option<PathBuf>) {
+        self.settings_path_override = path;
     }
 
     /// Open `content` as a typed slash-command overlay and return a

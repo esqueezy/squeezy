@@ -12,7 +12,9 @@ use super::{
     ConfigScope, ConfigScreenState, FieldEditor, ModelPickerState, SearchOverlayState,
     SecretEntryState, inheritance_label, picker_matches, provider_api_key_env, tier_path,
 };
-use crate::render::palette::{AMBER, GOLD, MODE_PURPLE, QUIET, SEPARATOR_BLUE, SUCCESS_GREEN};
+use crate::render::palette::{
+    AMBER, GOLD, MODE_PURPLE, QUIET, SEPARATOR_BLUE, SUCCESS_GREEN, footer_fg, muted_fg,
+};
 
 /// Pretty-print an absolute config path: replace `$HOME` with `~` so the
 /// tab subtitle stays compact, while still surfacing the per-machine
@@ -27,6 +29,33 @@ fn display_path(path: &std::path::Path) -> String {
         return format!("~{rest}");
     }
     full
+}
+
+/// Shrink `s` to at most `max` display columns with a middle ellipsis,
+/// keeping both the head and the tail so the user can still recognise the
+/// home prefix and the trailing filename. Used to keep the /options tab
+/// strip on a single row when long repo paths (worktrees, deep nested
+/// project layouts) would otherwise push the rightmost tab off-screen.
+fn middle_ellipsize(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    if len <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".chars().take(max).collect();
+    }
+    // Reserve one column for the ellipsis; split the remainder so the
+    // tail wins ties — the basename (e.g. `squeezy.toml`) is the most
+    // load-bearing part of a config path.
+    let budget = max - 1;
+    let tail = budget.div_ceil(2);
+    let head = budget - tail;
+    let mut out = String::with_capacity(max);
+    out.extend(chars.iter().take(head));
+    out.push('…');
+    out.extend(chars.iter().skip(len - tail));
+    out
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
@@ -66,7 +95,7 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         let label_style = if active {
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(muted_fg())
         };
         let dot = if exists { "●" } else { "○" };
         // Active dot is amber, inactive dots are quiet (grey). File
@@ -77,16 +106,45 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         } else {
             Style::default().fg(QUIET)
         };
+        let subtitle_text = if subtitle.is_empty() {
+            String::new()
+        } else {
+            format!(" {subtitle}")
+        };
         vec![
             Span::styled(label, label_style),
             Span::raw(" "),
             Span::styled(dot, dot_style),
-            Span::styled(format!(" {subtitle}"), Style::default().fg(QUIET)),
+            Span::styled(subtitle_text, Style::default().fg(QUIET)),
         ]
     }
     let user_exists = std::fs::metadata(&state.sources.user_path_default).is_ok();
     let repo_exists = std::fs::metadata(&state.sources.project_path_default).is_ok();
     let local_exists = std::fs::metadata(&state.sources.repo_path_default).is_ok();
+
+    // Reserve width for the three path subtitles so the rightmost tab
+    // ("Local") stays on the row even when a worktree pushes the Repo
+    // path well past 100 columns. The Paragraph below renders a single
+    // Line and any spans past `area.width` are silently clipped, which
+    // hid the Local tab entirely at default eval width=140.
+    let user_full = display_path(&state.sources.user_path_default);
+    let repo_full = display_path(&state.sources.project_path_default);
+    let local_full = display_path(&state.sources.repo_path_default);
+    // Fixed (non-subtitle) characters on the row, in display columns:
+    //   "  Config  " (10) + " │ " (3)
+    //   + 3 × tab chrome: label + " ● " (or " ○ ") prefix on the subtitle —
+    //     "User ● x" / "Repo ● x" / "Local ● x", i.e. label_len + 3 each →
+    //     4+3 + 4+3 + 5+3 = 22 (subtitle bytes themselves go in `budget`)
+    //   + 2 × " ▸ " separators (6)
+    //   + Repo " (committed)" suffix (12)
+    //   + dirty marker "    (changes applied)" (21) when applicable
+    let dirty_suffix_len = if state.dirty { 21 } else { 0 };
+    let fixed = 10 + 3 + 22 + 6 + 12 + dirty_suffix_len;
+    let total = area.width as usize;
+    let budget_for_paths = total.saturating_sub(fixed);
+    let (user_sub, repo_sub, local_sub) =
+        budget_subtitles(&user_full, &repo_full, &local_full, budget_for_paths);
+
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled(
         "  Config  ",
@@ -95,24 +153,28 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
     spans.push(Span::styled(" │ ", Style::default().fg(QUIET)));
     spans.extend(tab(
         "User",
-        display_path(&state.sources.user_path_default),
+        user_sub,
         state.scope == ConfigScope::User,
         user_exists,
     ));
     spans.push(Span::styled(" ▸ ", Style::default().fg(SEPARATOR_BLUE)));
+    let repo_subtitle = if repo_sub.is_empty() {
+        String::new()
+    } else if repo_exists {
+        format!("{repo_sub} (committed)")
+    } else {
+        repo_sub.clone()
+    };
     spans.extend(tab(
         "Repo",
-        format!(
-            "{} (committed)",
-            display_path(&state.sources.project_path_default)
-        ),
+        repo_subtitle,
         state.scope == ConfigScope::Repo,
         repo_exists,
     ));
     spans.push(Span::styled(" ▸ ", Style::default().fg(SEPARATOR_BLUE)));
     spans.extend(tab(
         "Local",
-        display_path(&state.sources.repo_path_default),
+        local_sub,
         state.scope == ConfigScope::Local,
         local_exists,
     ));
@@ -126,6 +188,67 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(QUIET));
     frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+}
+
+/// Allocate `budget` display columns across the three tab subtitles.
+/// Short paths get rendered in full; the remaining width is split
+/// equally among the still-oversized ones and each is middle-ellipsized
+/// to fit. When `budget` is too small even for stubs (≤ ~12 cols),
+/// returns empty subtitles so the tab labels themselves stay visible.
+fn budget_subtitles(
+    user: &str,
+    repo: &str,
+    local: &str,
+    budget: usize,
+) -> (String, String, String) {
+    let lens = [
+        user.chars().count(),
+        repo.chars().count(),
+        local.chars().count(),
+    ];
+    let total: usize = lens.iter().sum();
+    if total <= budget {
+        return (user.to_string(), repo.to_string(), local.to_string());
+    }
+    // Per-subtitle minimum that still surfaces a recognisable basename
+    // (`…/squeezy.toml` is ~14 chars). Below that, drop the subtitle
+    // entirely so the label and dot survive.
+    let min_per = 14usize;
+    if budget < min_per * 3 {
+        return (String::new(), String::new(), String::new());
+    }
+    // Two-pass allocation: short subtitles get their natural width;
+    // the remainder is split evenly among the long ones.
+    let mut quotas = [0usize; 3];
+    let mut remaining = budget;
+    let mut long_idx: Vec<usize> = Vec::new();
+    let fair_share = budget / 3;
+    for (i, &len) in lens.iter().enumerate() {
+        if len <= fair_share {
+            quotas[i] = len;
+            remaining = remaining.saturating_sub(len);
+        } else {
+            long_idx.push(i);
+        }
+    }
+    if !long_idx.is_empty() {
+        let per_long = remaining / long_idx.len();
+        for i in long_idx {
+            quotas[i] = per_long;
+        }
+    }
+    let trunc = |s: &str, q: usize| -> String {
+        if s.chars().count() <= q {
+            s.to_string()
+        } else {
+            middle_ellipsize(s, q)
+        }
+    };
+    (
+        trunc(user, quotas[0]),
+        trunc(repo, quotas[1]),
+        trunc(local, quotas[2]),
+    )
 }
 
 fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
@@ -284,7 +407,7 @@ fn render_reset_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
                 Span::raw("    "),
                 Span::styled(
                     format!("{}.{}", entry.section_label, entry.field_label),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(muted_fg()),
                 ),
             ]));
             lines.push(Line::from(vec![
@@ -393,12 +516,12 @@ fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntrySta
         ]),
         Line::from(vec![
             Span::styled("env  ", Style::default().fg(QUIET)),
-            Span::styled(entry.env_var.as_str(), Style::default().fg(Color::White)),
+            Span::styled(entry.env_var.as_str(), Style::default().fg(muted_fg())),
         ]),
         Line::raw(""),
         Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled(display, Style::default().fg(Color::White)),
+            Span::styled(display, Style::default().fg(muted_fg())),
             Span::styled("_", Style::default().fg(AMBER)),
         ]),
         Line::raw(""),
@@ -481,7 +604,7 @@ fn render_search_overlay(frame: &mut Frame<'_>, area: Rect, search: &SearchOverl
             let style = if active {
                 Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(muted_fg())
             };
             lines.push(Line::from(vec![
                 Span::styled(
@@ -564,7 +687,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerSt
             let style = if active {
                 Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(muted_fg())
             };
             let mut row = vec![
                 Span::styled(
@@ -618,7 +741,7 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) 
         let style = if active {
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
@@ -710,7 +833,7 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                 let label_style = if active {
                     Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(muted_fg())
                 };
                 let mut spans = vec![
                     Span::styled(prefix, prefix_style),
@@ -720,7 +843,7 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                     ),
                     Span::styled(
                         value_str,
-                        Style::default().fg(if active { GOLD } else { Color::White }),
+                        Style::default().fg(if active { GOLD } else { muted_fg() }),
                     ),
                 ];
                 if !source_label.is_empty() {
@@ -880,7 +1003,7 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                 } else {
                     spans.push(Span::styled(
                         format!(" {opt} "),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(muted_fg()),
                     ));
                 }
             }
@@ -900,7 +1023,7 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                     if sel {
                         Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(muted_fg())
                     },
                 )
             };
@@ -937,12 +1060,12 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
             let on_style = if *v {
                 Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(muted_fg())
             };
             let off_style = if !*v {
                 Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(muted_fg())
             };
             spans.push(Span::styled(
                 if !*v {
@@ -1029,7 +1152,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, _state: &ConfigScreenState) 
         .border_style(Style::default().fg(QUIET));
     frame.render_widget(
         Paragraph::new(vec![primary, secondary])
-            .style(Style::default().fg(Color::White))
+            .style(Style::default().fg(footer_fg()))
             .block(block),
         area,
     );

@@ -28,7 +28,7 @@ pub(crate) const ERROR_RED: Color = Color::Rgb(248, 113, 113);
 pub(crate) const BANG_RED: Color = Color::Rgb(153, 27, 27);
 pub(crate) const QUIET: Color = Color::DarkGray;
 pub(crate) const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
-pub(crate) const WORKING_SHIMMER_HIGHLIGHT: Color = Color::Rgb(255, 251, 235);
+pub(crate) const WORKING_SHIMMER_HIGHLIGHT: Color = Color::Rgb(220, 190, 130);
 pub(crate) const DIFF_ADD_FG: Color = Color::Rgb(21, 128, 61);
 pub(crate) const DIFF_DEL_FG: Color = Color::Rgb(252, 165, 165);
 pub(crate) const DIFF_HUNK_FG: Color = Color::Rgb(254, 240, 138);
@@ -40,6 +40,19 @@ pub(crate) const SEPARATOR_BLUE: Color = Color::Rgb(96, 165, 250);
 pub(crate) const ACCENT_CYAN: Color = Color::Rgb(64, 158, 158);
 pub(crate) const ACCENT_GREEN: Color = Color::Rgb(64, 158, 64);
 pub(crate) const ACCENT_MAGENTA: Color = Color::Rgb(158, 64, 158);
+
+/// Inline-code foreground for the default branch in
+/// `inline_code_style_for` and for link text. Same cyan hue family as
+/// `ACCENT_CYAN` but a touch lighter so it reads as an inline accent
+/// rather than a status-line chip; luminance ~130 stays inside the
+/// dark-only ≤160 guardrail.
+pub(crate) const INLINE_CODE_FG: Color = Color::Rgb(96, 158, 158);
+
+/// Inline-code foreground for the `model` / `@` branch. Dark rosy
+/// magenta — distinct from `Color::Magenta` (branch/path) below it and
+/// well clear of the bright `Color::LightMagenta` it replaces;
+/// luminance ~137 keeps the dark-only guardrail.
+pub(crate) const INLINE_MODEL_FG: Color = Color::Rgb(176, 110, 176);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaletteTone {
@@ -174,8 +187,16 @@ pub(crate) fn set_accent_variant(variant: AccentVariant) {
 pub(crate) fn accent_primary() -> Color {
     match accent_variant() {
         AccentVariant::Default => AMBER,
-        AccentVariant::Catppuccin => Color::Rgb(203, 166, 247), // catppuccin mauve
-        AccentVariant::HighContrast => Color::Rgb(255, 255, 0), // pure yellow
+        // Darker mauve in the catppuccin violet family. Luminance
+        // 0.299*140 + 0.587*100 + 0.114*200 = 41.86 + 58.70 + 22.80 =
+        // 123.36, comfortably under the 160 dark-only cap while still
+        // reading as the canonical catppuccin mauve hue.
+        AccentVariant::Catppuccin => Color::Rgb(140, 100, 200),
+        // Strong-yellow identity preserved for accessibility (R==G with
+        // zero blue keeps the WCAG-grade yellow signal) but darkened
+        // under the cap. Luminance 0.299*160 + 0.587*130 + 0.114*0 =
+        // 47.84 + 76.31 = 124.15.
+        AccentVariant::HighContrast => Color::Rgb(160, 130, 0),
     }
 }
 
@@ -184,8 +205,14 @@ pub(crate) fn accent_primary() -> Color {
 pub(crate) fn accent_working_highlight() -> Color {
     match accent_variant() {
         AccentVariant::Default => WORKING_SHIMMER_HIGHLIGHT,
-        AccentVariant::Catppuccin => Color::Rgb(245, 224, 220), // catppuccin rosewater
-        AccentVariant::HighContrast => Color::Rgb(255, 255, 255),
+        // Darker catppuccin rosewater. Luminance 0.299*150 + 0.587*130
+        // + 0.114*125 = 44.85 + 76.31 + 14.25 = 135.41, under the cap
+        // and still warm enough to pop against the mauve primary.
+        AccentVariant::Catppuccin => Color::Rgb(150, 130, 125),
+        // Neutral gray substituting the white peak. Luminance 155
+        // (0.299*155 + 0.587*155 + 0.114*155), just under the cap and
+        // still bright relative to the dark-gold HighContrast primary.
+        AccentVariant::HighContrast => Color::Rgb(155, 155, 155),
     }
 }
 
