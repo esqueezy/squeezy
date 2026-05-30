@@ -697,6 +697,16 @@
         "rev": "6ae5fecd46f1a787c9cac9531420c510ec8d2c0d",
         "checkout": "target/benchmark-repos/prettier"
       }
+    },
+    {
+      "name": "dart-smoke",
+      "family": "dart",
+      "language": "dart",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/dart/semantic-cases",
+      "spec": "benchmarks/specs/dart-smoke-queries.json",
+      "report": "dart/dart-smoke.json",
+      "ra_lsp_probes": 25
     }
   ]
 }

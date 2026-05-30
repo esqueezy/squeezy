@@ -56,6 +56,7 @@ pub(crate) fn run_mixed_workload(
                 ),
             }
         }
+        BenchmarkLanguage::Dart => (None, "mixed workload unsupported for Dart".to_string()),
     };
     let (rust_analyzer_ms, rust_analyzer_status) = if language == BenchmarkLanguage::Rust {
         time_rust_analyzer(repo)
@@ -89,6 +90,7 @@ pub(crate) fn run_mixed_workload(
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
             collect_js_ts_accuracy(repo, &graph, ra_lsp_probes)
         }
+        BenchmarkLanguage::Dart => empty_accuracy("mixed workload unsupported for Dart"),
     };
 
     let scenarios = build_mixed_scenarios(&graph);

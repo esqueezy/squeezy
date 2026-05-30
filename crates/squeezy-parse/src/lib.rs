@@ -229,6 +229,7 @@ pub struct LanguageParser {
     csharp_parser: Parser,
     c_parser: Parser,
     cpp_parser: Parser,
+    dart_parser: Parser,
     go_parser: Parser,
     javascript_parser: Parser,
     jsx_parser: Parser,
@@ -262,6 +263,7 @@ impl LanguageParser {
         let csharp_parser = parser_with_csharp_language()?;
         let c_parser = parser_with_c_language()?;
         let cpp_parser = parser_with_cpp_language()?;
+        let dart_parser = parser_with_dart_language()?;
         let go_parser = parser_with_go_language()?;
         let javascript_parser = parser_with_javascript_language()?;
         let jsx_parser = parser_with_jsx_language()?;
@@ -274,6 +276,7 @@ impl LanguageParser {
             csharp_parser,
             c_parser,
             cpp_parser,
+            dart_parser,
             go_parser,
             javascript_parser,
             jsx_parser,
@@ -461,6 +464,7 @@ impl LanguageParser {
             LanguageKind::C => Ok(&mut self.c_parser),
             LanguageKind::CSharp => Ok(&mut self.csharp_parser),
             LanguageKind::Cpp => Ok(&mut self.cpp_parser),
+            LanguageKind::Dart => Ok(&mut self.dart_parser),
             LanguageKind::Go => Ok(&mut self.go_parser),
             LanguageKind::Java => Ok(&mut self.java_parser),
             LanguageKind::JavaScript => Ok(&mut self.javascript_parser),
@@ -481,6 +485,7 @@ fn parser_for_language_kind(language: LanguageKind) -> Result<Parser> {
         LanguageKind::C => parser_with_c_language(),
         LanguageKind::CSharp => parser_with_csharp_language(),
         LanguageKind::Cpp => parser_with_cpp_language(),
+        LanguageKind::Dart => parser_with_dart_language(),
         LanguageKind::Go => parser_with_go_language(),
         LanguageKind::Java => parser_with_java_language(),
         LanguageKind::JavaScript => parser_with_javascript_language(),
@@ -500,6 +505,7 @@ fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
         csharp: parser_with_csharp_language()?,
         c: parser_with_c_language()?,
         cpp: parser_with_cpp_language()?,
+        dart: parser_with_dart_language()?,
         go: parser_with_go_language()?,
         javascript: parser_with_javascript_language()?,
         jsx: parser_with_jsx_language()?,
@@ -520,6 +526,7 @@ struct WorkerParsers {
     csharp: Parser,
     c: Parser,
     cpp: Parser,
+    dart: Parser,
     go: Parser,
     javascript: Parser,
     jsx: Parser,
@@ -536,6 +543,7 @@ impl WorkerParsers {
             LanguageKind::C => Ok(&mut self.c),
             LanguageKind::CSharp => Ok(&mut self.csharp),
             LanguageKind::Cpp => Ok(&mut self.cpp),
+            LanguageKind::Dart => Ok(&mut self.dart),
             LanguageKind::Go => Ok(&mut self.go),
             LanguageKind::Java => Ok(&mut self.java),
             LanguageKind::JavaScript => Ok(&mut self.javascript),
@@ -751,6 +759,15 @@ fn parser_with_cpp_language() -> Result<Parser> {
     Ok(parser)
 }
 
+fn parser_with_dart_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = dart_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load Dart grammar: {err}")))?;
+    Ok(parser)
+}
+
 fn csharp_language() -> tree_sitter::Language {
     tree_sitter_c_sharp::LANGUAGE.into()
 }
@@ -795,11 +812,16 @@ fn cpp_language() -> tree_sitter::Language {
     tree_sitter_cpp::LANGUAGE.into()
 }
 
+fn dart_language() -> tree_sitter::Language {
+    tree_sitter_dart::LANGUAGE.into()
+}
+
 fn language_for_kind(language: LanguageKind) -> Option<tree_sitter::Language> {
     match language {
         LanguageKind::C => Some(c_language()),
         LanguageKind::CSharp => Some(csharp_language()),
         LanguageKind::Cpp => Some(cpp_language()),
+        LanguageKind::Dart => Some(dart_language()),
         LanguageKind::Go => Some(go_language()),
         LanguageKind::Java => Some(java_language()),
         LanguageKind::JavaScript => Some(javascript_language()),
@@ -813,7 +835,6 @@ fn language_for_kind(language: LanguageKind) -> Option<tree_sitter::Language> {
         | LanguageKind::Kotlin
         | LanguageKind::Swift
         | LanguageKind::Scala
-        | LanguageKind::Dart
         | LanguageKind::Unsupported
         | LanguageKind::Unknown => None,
     }
