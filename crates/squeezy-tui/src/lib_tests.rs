@@ -8596,7 +8596,7 @@ fn slash_parameter_hint_appears_in_render() {
 }
 
 #[test]
-fn slash_parameter_hint_uses_cyan_style() {
+fn slash_parameter_hint_uses_arg_hint_color() {
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/attach".to_string());
 
@@ -8605,6 +8605,11 @@ fn slash_parameter_hint_uses_cyan_style() {
         .iter()
         .find(|line| line.spans.iter().any(|span| span.content == "/attach"))
         .expect("attach suggestion line");
+    let description_span = attach_line
+        .spans
+        .iter()
+        .find(|span| span.content.contains("attach a file as prompt context"))
+        .expect("attach description span");
     let hint_span = attach_line
         .spans
         .iter()
@@ -8612,9 +8617,14 @@ fn slash_parameter_hint_uses_cyan_style() {
         .expect("attach parameter hint span");
 
     assert_eq!(
+        description_span.style.fg,
+        Some(QUIET),
+        "description color should stay unchanged"
+    );
+    assert_eq!(
         hint_span.style.fg,
-        Some(crate::render::palette::ACCENT_CYAN),
-        "parameter hints should render in cyan"
+        Some(crate::render::palette::SLASH_ARG_HINT),
+        "parameter hints should render with the slash arg hint color"
     );
 }
 

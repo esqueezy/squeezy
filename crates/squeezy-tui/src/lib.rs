@@ -9621,7 +9621,7 @@ fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
                 spans.push(Span::styled(
                     hint_text,
                     Style::default()
-                        .fg(palette::ACCENT_CYAN)
+                        .fg(palette::SLASH_ARG_HINT)
                         .add_modifier(Modifier::ITALIC),
                 ));
             }
