@@ -76,6 +76,13 @@ fn render_plan_card_uses_amber_box_not_full_amber_body() {
 
     assert!(top.starts_with("╭─ Plan "), "{top}");
     assert_eq!(lines[0].spans[0].style.fg, Some(palette::AMBER));
+    assert!(
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .all(|span| span.style.bg.is_none()),
+        "plan card should not set a background color: {lines:?}"
+    );
     assert!(path.starts_with("│ "), "{path}");
     assert!(
         body.spans

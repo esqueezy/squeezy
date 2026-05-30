@@ -36,19 +36,6 @@ pub(crate) struct PlanCardData {
     pub parent_plan_id: Option<String>,
 }
 
-/// Background tint applied to every line of the card. Picked to read
-/// well against both light and dark backgrounds via the existing
-/// palette adapter; falls back to no background on `NO_COLOR` to stay
-/// accessible.
-fn card_background() -> Style {
-    let tone = palette::palette_tone();
-    let (r, g, b) = match tone {
-        palette::PaletteTone::Dark => (28, 25, 38),
-        palette::PaletteTone::Light => (245, 240, 255),
-    };
-    Style::default().bg(palette::best_color((r, g, b)))
-}
-
 /// Top-of-card render entry point. Pulls the body from disk and
 /// composes the styled lines. Returns a single-line fallback ("plan
 /// file missing") when the file has been deleted out from under us so
@@ -109,19 +96,6 @@ fn blank_card_line() -> Line<'static> {
     Line::from("")
 }
 
-fn apply_card_background(line: Line<'static>) -> Line<'static> {
-    let bg = card_background();
-    let spans: Vec<Span<'static>> = line
-        .spans
-        .into_iter()
-        .map(|span| {
-            let style = span.style.patch(bg);
-            Span::styled(span.content, style)
-        })
-        .collect();
-    Line::from(spans)
-}
-
 fn boxed_card_lines(title: String, inner: Vec<Line<'static>>) -> Vec<Line<'static>> {
     let title_width = text_width(&title);
     let content_width = inner.iter().map(line_width).max().unwrap_or(0);
@@ -129,11 +103,9 @@ fn boxed_card_lines(title: String, inner: Vec<Line<'static>>) -> Vec<Line<'stati
         .saturating_add(2)
         .max(title_width.saturating_add(3))
         .max(24);
-    let bg = card_background();
     let border = Style::default()
         .fg(palette::AMBER)
-        .add_modifier(Modifier::BOLD)
-        .patch(bg);
+        .add_modifier(Modifier::BOLD);
     let mut lines = Vec::with_capacity(inner.len() + 2);
     let title_fill = inner_width.saturating_sub(title_width.saturating_add(3));
     lines.push(Line::from(vec![
@@ -152,17 +124,15 @@ fn boxed_card_lines(title: String, inner: Vec<Line<'static>>) -> Vec<Line<'stati
 }
 
 fn boxed_content_line(line: Line<'static>, inner_width: usize) -> Line<'static> {
-    let bg = card_background();
     let border = Style::default()
         .fg(palette::AMBER)
-        .add_modifier(Modifier::BOLD)
-        .patch(bg);
+        .add_modifier(Modifier::BOLD);
     let content_width = line_width(&line);
     let padding = inner_width.saturating_sub(content_width.saturating_add(2));
     let mut spans = vec![Span::styled("│ ", border)];
-    spans.extend(apply_card_background(line).spans);
+    spans.extend(line.spans);
     if padding > 0 {
-        spans.push(Span::styled(" ".repeat(padding), bg));
+        spans.push(Span::raw(" ".repeat(padding)));
     }
     spans.push(Span::styled(" │", border));
     Line::from(spans)
@@ -204,7 +174,6 @@ fn sibling_plan_path(path: &Path, sibling_id: &str) -> PathBuf {
 /// rendered with the same color scheme as the patch viewer. Lines are
 /// indented two spaces so they read as a sub-section of the card.
 pub(crate) fn render_plan_diff(parent: &str, current: &str) -> Vec<Line<'static>> {
-    let bg = card_background();
     let diff = TextDiff::from_lines(parent, current);
     let mut out = Vec::new();
     for change in diff.iter_all_changes() {
@@ -218,7 +187,7 @@ pub(crate) fn render_plan_diff(parent: &str, current: &str) -> Vec<Line<'static>
         let span_text = format!("  {sigil} {text}");
         out.push(Line::from(vec![Span::styled(
             span_text,
-            Style::default().fg(fg).patch(bg),
+            Style::default().fg(fg),
         )]));
     }
     out
