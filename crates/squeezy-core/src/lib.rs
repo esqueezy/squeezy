@@ -9152,6 +9152,12 @@ fn merge_profiles_maps(
 pub struct TurnId(u64);
 
 impl TurnId {
+    /// Sentinel value for events that originate outside any specific turn
+    /// (e.g. manual `/compact` invoked between turns). Subscribers that
+    /// key off `turn_id` can match on this to recognise out-of-turn events
+    /// without conflating them with a real turn-0.
+    pub const INVALID: Self = Self(u64::MAX);
+
     pub const fn new(value: u64) -> Self {
         Self(value)
     }

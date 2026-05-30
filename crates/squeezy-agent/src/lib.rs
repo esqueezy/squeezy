@@ -1181,6 +1181,14 @@ pub struct Agent {
     /// `start_turn` so the running turn (if any) finishes on the old config
     /// and the next turn picks up the new one.
     pending_swap: Option<PendingConfigSwap>,
+    /// Agent-level broadcast channel for events that originate outside a
+    /// turn's per-call `mpsc::Sender<AgentEvent>`. The canonical use is
+    /// manual `/compact` (`compact_context_manual`), which runs between
+    /// turns and so has no per-turn sender to reach TUI overlays, eval
+    /// capture, or MCP listeners on. Events are wrapped in `Arc` because
+    /// `AgentEvent` contains non-`Clone` variants (oneshot senders);
+    /// subscribers receive cheap `Arc<AgentEvent>` clones.
+    event_broadcast: broadcast::Sender<Arc<AgentEvent>>,
 }
 
 /// A configuration change that has been written to disk but is waiting for
@@ -1517,6 +1525,7 @@ impl Agent {
         let initial_session_mode = config.session_mode;
         let session_metrics = Arc::new(Mutex::new(conversation_state.metrics.clone()));
         let next_attachment_id = next_attachment_counter(&conversation_state.context_attachments);
+        let (event_broadcast, _) = broadcast::channel(64);
         Self {
             telemetry: TelemetryClient::from_config(&config),
             config,
@@ -1540,6 +1549,7 @@ impl Agent {
             hooks: None,
             agent_hook_bus: None,
             pending_swap: None,
+            event_broadcast,
         }
     }
 
@@ -1707,6 +1717,19 @@ impl Agent {
 
     pub fn subscribe_jobs(&self) -> broadcast::Receiver<JobEvent> {
         self.jobs.subscribe()
+    }
+
+    /// Subscribe to agent-level events that fire outside a turn's per-call
+    /// `mpsc::Sender<AgentEvent>`. Currently used by manual `/compact`
+    /// (`compact_context_manual`) to fan out `AgentEvent::ContextCompacted`
+    /// to TUI overlays, eval capture, MCP listeners, and any other
+    /// out-of-turn subscriber. The auto-compaction and mid-turn
+    /// micro-compaction paths continue to send through the per-turn
+    /// `mpsc` so in-turn consumers see compaction in the same stream as
+    /// the surrounding tool calls and assistant text; this broadcast is
+    /// the supplementary path for events with no active turn.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<Arc<AgentEvent>> {
+        self.event_broadcast.subscribe()
     }
 
     pub fn jobs_snapshot(&self) -> Vec<JobSnapshot> {
@@ -2402,6 +2425,21 @@ impl Agent {
         }
         drop(state);
         self.log_compaction_event(&report);
+        // Mirror the auto-compaction (`maybe_compact_conversation` post-turn)
+        // and mid-turn micro-compaction broadcasts so any `AgentEvent`
+        // subscriber — TUI overlays, eval capture, MCP listeners — observes
+        // a manual `/compact` the same way it observes an automatic one.
+        // Manual compaction runs between turns and so has no per-call
+        // `mpsc::Sender<AgentEvent>`; the agent-level broadcast at
+        // `event_broadcast` is the supplementary fan-out. `TurnId::INVALID`
+        // marks this as out-of-turn so consumers don't conflate it with a
+        // real turn id.
+        let _ = self
+            .event_broadcast
+            .send(Arc::new(AgentEvent::ContextCompacted {
+                turn_id: TurnId::INVALID,
+                report: report.clone(),
+            }));
         Ok(report)
     }
 
