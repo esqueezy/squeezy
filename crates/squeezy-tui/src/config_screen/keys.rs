@@ -22,6 +22,9 @@ pub(crate) fn handle_key(
     if state.reset_confirm.is_some() {
         return handle_reset_confirm_key(state, agent, notifications, key);
     }
+    if state.discard_confirm {
+        return handle_discard_confirm_key(state, agent, notifications, key);
+    }
     if state.secret_entry.is_some() {
         return handle_secret_entry_key(state, agent, notifications, key);
     }
@@ -276,7 +279,19 @@ pub(crate) fn handle_key(
             // The model field opens a registry-driven picker; every other
             // field goes through the regular per-kind editor.
             if field.toml_path == ["model", "model"] {
-                let current_provider = match (CONFIG_SECTIONS[0].fields[0].get)(&state.effective) {
+                // Look up by toml_path instead of the hard-coded
+                // `CONFIG_SECTIONS[0].fields[0]` so reordering Models'
+                // field list never silently retargets the provider value.
+                let provider_field = CONFIG_SECTIONS
+                    .iter()
+                    .find(|s| s.id == squeezy_core::config_schema::SectionId::Models)
+                    .and_then(|s| {
+                        s.fields
+                            .iter()
+                            .find(|f| f.toml_path == ["model", "provider"])
+                    })
+                    .expect("Models section always exposes [model].provider");
+                let current_provider = match (provider_field.get)(&state.effective) {
                     FieldValue::Enum(s) => s,
                     _ => "openai",
                 };
@@ -353,10 +368,13 @@ pub(crate) fn handle_key(
             KeyOutcome::KeepOpen
         }
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-            // The current design saves on every commit (Enter / Space), so
-            // Ctrl+S is a no-op affordance for muscle memory.
+            // /options saves on every commit (Enter / Space), so Ctrl+S
+            // is a no-op affordance for muscle memory. Surface the same
+            // message regardless of where the cursor sits so the user
+            // doesn't think the screen swallowed the chord; mention
+            // Ctrl+Z so they know an undo path exists.
             notifications.push(
-                "Changes auto-save on commit (Enter / Space).",
+                "Saves are automatic on Enter / Space. Ctrl+Z to revert the last write.",
                 NotifySeverity::Info,
             );
             KeyOutcome::KeepOpen
@@ -383,7 +401,18 @@ pub(crate) fn handle_key(
             KeyOutcome::KeepOpen
         }
         (KeyCode::Char('X'), m) if m == KeyModifiers::SHIFT || m.is_empty() => {
-            discard_all_session_writes(state, agent, notifications);
+            // Wiping every save made this session is destructive — a
+            // single stray Shift+X used to skip straight past the undo
+            // stack. Arm a y/n confirmation overlay instead so the user
+            // sees what they're about to lose.
+            if state.undo_stack.is_empty() {
+                notifications.push(
+                    "Nothing to discard — no writes this session.",
+                    NotifySeverity::Info,
+                );
+            } else {
+                state.discard_confirm = true;
+            }
             KeyOutcome::KeepOpen
         }
         _ => KeyOutcome::KeepOpen,
@@ -405,6 +434,26 @@ fn handle_reset_confirm_key(
         (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
             state.reset_confirm = None;
             notifications.push("Reset cancelled.", NotifySeverity::Info);
+        }
+        _ => {}
+    }
+    KeyOutcome::KeepOpen
+}
+
+fn handle_discard_confirm_key(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    key: KeyEvent,
+) -> KeyOutcome {
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
+            state.discard_confirm = false;
+            discard_all_session_writes(state, agent, notifications);
+        }
+        (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
+            state.discard_confirm = false;
+            notifications.push("Discard cancelled.", NotifySeverity::Info);
         }
         _ => {}
     }
@@ -493,13 +542,19 @@ fn commit_model_picker(
     model_id: String,
 ) {
     state.picker = None;
-    // If the chosen id belongs to a different provider in the registry
-    // (only possible when the picker was in `all_providers` mode), swap
-    // the provider field first. This keeps the on-disk pair consistent
-    // and avoids the symmetric bug we just guarded for the Space-cycle
-    // path — a registry lookup that fails (custom Ctrl+Enter id) simply
-    // skips the provider swap, since we can't infer the provider.
-    let provider_field = &CONFIG_SECTIONS[0].fields[0];
+    // Look the provider field up by SectionId/toml_path instead of the
+    // brittle `CONFIG_SECTIONS[0].fields[0]` index — if Models ever
+    // grew a field before `provider`, the old code would silently
+    // overwrite something else.
+    let provider_field = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == squeezy_core::config_schema::SectionId::Models)
+        .and_then(|s| {
+            s.fields
+                .iter()
+                .find(|f| f.toml_path == ["model", "provider"])
+        })
+        .expect("Models section always exposes [model].provider");
     let current_provider = match (provider_field.get)(&state.effective) {
         FieldValue::Enum(s) => s,
         _ => "openai",
@@ -508,30 +563,30 @@ fn commit_model_picker(
         .iter()
         .find(|m| m.id == model_id)
         .map(|m| m.provider);
-    if let Some(new_provider) = picked_provider
-        && new_provider != current_provider
-        && let Err(msg) = (provider_field.set)(&mut state.effective, FieldValue::Enum(new_provider))
-    {
-        notifications.push(format!("invalid provider: {msg}"), NotifySeverity::Error);
-        return;
-    }
-    // After a provider swap `set_provider` rewrote `cfg.model` to that
-    // provider's default; overwrite it again with the user's chosen id
-    // and save through the regular pipeline, which now persists
-    // (provider, model) together.
     let model_field = model_field_meta();
-    let model_value = FieldValue::String(model_id);
-    if let Err(msg) = (model_field.set)(&mut state.effective, model_value.clone()) {
-        notifications.push(format!("invalid: {msg}"), NotifySeverity::Error);
-        return;
-    }
-    state.dirty = true;
+    let model_value = FieldValue::String(model_id.clone());
     if let Some(new_provider) = picked_provider
         && new_provider != current_provider
     {
-        // Persist the provider swap first (which chains the model write
-        // via the provider→model pairing in `save_field_inner`), then
-        // persist the explicit model id the user picked.
+        // Apply the provider swap in memory first — `set_provider` will
+        // reset `cfg.model` to that provider's default, then we overwrite
+        // with the picked id.
+        if let Err(msg) = (provider_field.set)(&mut state.effective, FieldValue::Enum(new_provider))
+        {
+            notifications.push(format!("invalid provider: {msg}"), NotifySeverity::Error);
+            return;
+        }
+        if let Err(msg) = (model_field.set)(&mut state.effective, model_value.clone()) {
+            notifications.push(format!("invalid: {msg}"), NotifySeverity::Error);
+            return;
+        }
+        state.dirty = true;
+        // `save_field_inner` for `[model].provider` already chains a
+        // second SettingsEdit that persists the current `[model].model`
+        // value in the same write. Issuing a separate `save_field` for
+        // the model field used to add a second tier-file write, a
+        // second undo-stack entry, and a second "saved …" notification
+        // for one user pick. Trust the chained edit.
         save_field(
             state,
             agent,
@@ -539,8 +594,14 @@ fn commit_model_picker(
             provider_field,
             FieldValue::Enum(new_provider),
         );
+    } else {
+        if let Err(msg) = (model_field.set)(&mut state.effective, model_value.clone()) {
+            notifications.push(format!("invalid: {msg}"), NotifySeverity::Error);
+            return;
+        }
+        state.dirty = true;
+        save_field(state, agent, notifications, model_field, model_value);
     }
-    save_field(state, agent, notifications, model_field, model_value);
 }
 
 fn open_api_key_entry_for_current_provider(
