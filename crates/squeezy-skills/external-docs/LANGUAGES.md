@@ -20,6 +20,7 @@ uses the same family names so coverage claims stay checkable.
 | `php` | PHP | `php` | `tree-sitter-php` | `nikic/php-parser` | yes | `benchmarks/fixtures/php/semantic-cases` | `benchmarks/specs/php-smoke-queries.json` | symfony-console |
 | `ruby` | Ruby | `rb` | `tree-sitter-ruby` | `ruby_prism` | no | `benchmarks/fixtures/ruby/semantic-cases` | `benchmarks/specs/ruby-smoke-queries.json` | sinatra |
 | `swift` | Swift | `swift` | `tree-sitter-swift` | `sourcekit_lsp` (scan-only fallback) | no | `benchmarks/fixtures/swift/semantic-cases` | `benchmarks/specs/swift-smoke-queries.json` | swift-nio |
+| `dart` | Dart | `dart` | `tree-sitter-dart` | scan-only (analyzer oracle deferred) | no | `benchmarks/fixtures/dart/semantic-cases` | `benchmarks/specs/dart-smoke-queries.json` | _(deferred to follow-up PR)_ |
 
 ## Rust
 
@@ -232,6 +233,24 @@ Swift extractor against a corpus-shaped fixture; CI installs the Swift 5.10
 toolchain on Linux and uses the bundled `sourcekit-lsp`. macOS-only frameworks
 (`Combine`, `SwiftUI`, `Network`) are intentionally absent from the fixture so
 the smoke run works on `ubuntu-latest`.
+
+## Dart
+
+Indexed: libraries, classes (including sealed and abstract), mixins, mixin-class
+declarations, extensions (anonymous and named), extension types, enums (with
+enhanced-enum methods), top-level functions, methods, named constructors,
+factory constructors, getters/setters, fields, typedefs, imports with prefixes
+and `show`/`hide` combinators, exports, `part`/`part of` directives, async
+modifiers, calls, type references, and library identifiers.
+
+Known limitations: `noSuchMethod` runtime dispatch is excluded (mirrors Ruby's
+`method_missing` stance). Conditional imports record both primary and
+alternate URIs as separate imports; the resolver prefers the primary when both
+exist. Generated `*.g.dart` / `*.freezed.dart` / `*.mocks.dart` files parse but
+are excluded from oracle precision/recall accounting via glob.
+
+Oracle: deferred to a follow-up PR. The first PR runs in scan-only mode while
+the `package:analyzer`-backed Dart oracle is wired up in CI.
 
 ## Benchmark Corpus Reporting
 

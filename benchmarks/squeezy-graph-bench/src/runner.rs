@@ -213,6 +213,10 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
             0,
             "Swift validation oracle not run in first-iteration CI (SwiftPM build is expensive)".to_string(),
         ),
+        BenchmarkLanguage::Dart => (
+            0,
+            "Dart analyzer oracle deferred; scan-only mode".to_string(),
+        ),
     };
 
     let build = build_graph(&args.fixture)?;
@@ -252,6 +256,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
             collect_js_ts_accuracy(&args.fixture, &graph, args.ra_lsp_probes)
         }
         BenchmarkLanguage::Swift => empty_accuracy("rust-analyzer oracle not used for Swift"),
+        BenchmarkLanguage::Dart => empty_accuracy("rust-analyzer oracle not used for Dart"),
     };
     let python_oracle = match args.language {
         BenchmarkLanguage::Python => Some(collect_python_oracle_accuracy(&args.fixture, &graph)?),
@@ -557,6 +562,11 @@ fn oracle_summary(
         BenchmarkLanguage::Rust | BenchmarkLanguage::C | BenchmarkLanguage::Cpp => {
             symbol_oracle_tuple(&accuracy.rust_analyzer_symbol_status, &accuracy.symbols)
         }
+        BenchmarkLanguage::Dart => (
+            "Dart analyzer oracle deferred; scan-only mode".to_string(),
+            None,
+            None,
+        ),
     }
 }
 

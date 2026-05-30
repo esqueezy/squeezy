@@ -177,6 +177,11 @@ export const languageRows: MatrixRow[] = [
     name: "Swift",
     detail: "Imports, classes, structs, actors, protocols, enums with associated cases, extensions, generics with constraints, property wrappers, and module hints.",
     status: "first-class graph"
+  },
+  {
+    name: "Dart",
+    detail: "Libraries, parts, classes, mixins, extensions, extension types, sealed classes, enums, named and factory constructors, getters/setters, async modifiers, and prefix imports with show/hide combinators.",
+    status: "first-class graph"
   }
 ];
 

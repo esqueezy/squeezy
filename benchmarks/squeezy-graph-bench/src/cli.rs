@@ -7,6 +7,7 @@ pub enum BenchmarkLanguage {
     C,
     CSharp,
     Cpp,
+    Dart,
     Go,
     Java,
     JavaScript,
@@ -26,6 +27,7 @@ impl BenchmarkLanguage {
             "c" => Ok(Self::C),
             "csharp" | "cs" => Ok(Self::CSharp),
             "cpp" | "c++" => Ok(Self::Cpp),
+            "dart" => Ok(Self::Dart),
             "go" => Ok(Self::Go),
             "java" => Ok(Self::Java),
             "javascript" | "js" => Ok(Self::JavaScript),
@@ -48,6 +50,7 @@ impl BenchmarkLanguage {
             Self::C => "c",
             Self::CSharp => "csharp",
             Self::Cpp => "cpp",
+            Self::Dart => "dart",
             Self::Go => "go",
             Self::Java => "java",
             Self::JavaScript => "javascript",
@@ -67,6 +70,7 @@ impl BenchmarkLanguage {
             Self::C => LanguageKind::C,
             Self::CSharp => LanguageKind::CSharp,
             Self::Cpp => LanguageKind::Cpp,
+            Self::Dart => LanguageKind::Dart,
             Self::Go => LanguageKind::Go,
             Self::Java => LanguageKind::Java,
             Self::JavaScript => LanguageKind::JavaScript,
@@ -108,8 +112,8 @@ impl BenchmarkLanguage {
 
     pub fn comment_text(self) -> &'static str {
         match self {
-            // C/Cpp/CSharp/Go/Java/JavaScript/Kotlin/Php/Rust/TypeScript all
-            // share `//` line comments at any position. C# and PHP
+            // C/Cpp/CSharp/Dart/Go/Java/JavaScript/Kotlin/Php/Rust/TypeScript
+            // all share `//` line comments at any position. C# and PHP
             // specifically: a `//` line stays valid both at file scope and
             // inside any member body (PHP's `//` works wherever a statement
             // is legal — i.e. inside a `<?php ... ?>` block). Kotlin's `//`
@@ -117,6 +121,7 @@ impl BenchmarkLanguage {
             Self::C
             | Self::CSharp
             | Self::Cpp
+            | Self::Dart
             | Self::Go
             | Self::Java
             | Self::JavaScript
@@ -250,7 +255,7 @@ impl BenchmarkCommand {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: squeezy-graph-bench [--list-languages|--list-oracles]\n       squeezy-graph-bench --corpus <path> [--family all|rust|python|java|kotlin|scala|go|c-family|csharp|js-ts|php|ruby|swift] [--tier smoke|full] [--report-dir <path>]\n       squeezy-graph-bench [--language rust|python|java|kotlin|scala|c|cpp|csharp|go|javascript|typescript|js-ts|php|ruby|swift] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--oracle-files <n, default=250, 0=all>] [--no-speed-gate]"
+                        "usage: squeezy-graph-bench [--list-languages|--list-oracles]\n       squeezy-graph-bench --corpus <path> [--family all|rust|python|java|kotlin|scala|go|c-family|csharp|js-ts|php|ruby|swift|dart] [--tier smoke|full] [--report-dir <path>]\n       squeezy-graph-bench [--language rust|python|java|kotlin|scala|c|cpp|csharp|go|javascript|typescript|js-ts|php|ruby|swift|dart] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--oracle-files <n, default=250, 0=all>] [--no-speed-gate]"
                     );
                     std::process::exit(0);
                 }
@@ -280,6 +285,7 @@ impl BenchmarkCommand {
                     | "ruby"
                     | "scala"
                     | "swift"
+                    | "dart"
             ) {
                 return Err(SqueezyError::Graph(format!(
                     "unknown corpus family {family}"

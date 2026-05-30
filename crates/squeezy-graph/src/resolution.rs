@@ -313,6 +313,15 @@ impl SemanticGraph {
             );
         }
 
+        if let Some(callee) = self.dart_inherited_method(caller_id, call) {
+            return (
+                Some(callee),
+                Confidence::Heuristic,
+                "dart inherited",
+                Vec::new(),
+            );
+        }
+
         let candidates = self
             .symbols_by_name_or_scan(&call.name)
             .into_iter()
@@ -419,6 +428,22 @@ impl SemanticGraph {
                     Some(id),
                     Confidence::Heuristic,
                     "scala extension method",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.dart_import_prefix_method_call(&candidates, caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::ImportResolved,
+                    "dart prefix import",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.dart_extension_method_call(&candidates, caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "dart extension method",
                     Vec::new(),
                 );
             }

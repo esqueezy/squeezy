@@ -44,6 +44,7 @@ on:
           - php
           - ruby
           - swift
+          - dart
       tier:
         description: Benchmark tier.
         required: true
@@ -66,7 +67,7 @@ jobs:
   benchmark:
     name: ${{ inputs.language }} benchmark
     runs-on: ${{ inputs.language == 'rust' && 'macos-latest' || 'ubuntu-latest' }}
-    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp' || inputs.language == 'kotlin' || inputs.language == 'scala') && 90 || (inputs.language == 'go' || inputs.language == 'php' || inputs.language == 'swift') && 60 || inputs.language == 'ruby' && 45 || 120 }}
+    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp' || inputs.language == 'kotlin' || inputs.language == 'scala') && 90 || (inputs.language == 'go' || inputs.language == 'php' || inputs.language == 'swift') && 60 || (inputs.language == 'ruby' || inputs.language == 'dart') && 45 || 120 }}
 
     steps:
       - name: Checkout
@@ -131,6 +132,24 @@ jobs:
           echo "/opt/swift/usr/bin" >> "$GITHUB_PATH"
           /opt/swift/usr/bin/swift --version
           /opt/swift/usr/bin/sourcekit-lsp --version || true
+
+      - name: Setup Dart 3.x (analyzer oracle)
+        if: inputs.language == 'dart'
+        continue-on-error: true
+        uses: dart-lang/setup-dart@e51d8e571e22473a2ddebf0ef8a2123f0ab2c02c # v1.6.5
+        with:
+          sdk: stable
+
+      - name: Install Dart oracle helper deps
+        if: inputs.language == 'dart'
+        continue-on-error: true
+        working-directory: benchmarks/oracle-helpers/dart-oracle
+        run: dart pub get
+
+      - name: Verify Dart analyzer availability
+        if: inputs.language == 'dart'
+        continue-on-error: true
+        run: dart --version
 
       - name: Run semantic graph benchmark corpus
         run: |
