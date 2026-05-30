@@ -93,8 +93,10 @@ fn build_harness() -> TuiHarness {
 
 #[test]
 fn harness_banner_uses_real_provider_name_not_eval_harness() {
-    let mut config = AppConfig::default();
-    config.model = "test-model".to_string();
+    let config = AppConfig {
+        model: "test-model".to_string(),
+        ..AppConfig::default()
+    };
     let provider: Arc<dyn LlmProvider> = Arc::new(NamedProvider("anthropic"));
     let mut harness = TuiHarness::new(config, SessionMode::default(), provider, 120, 36, None)
         .expect("build TuiHarness");

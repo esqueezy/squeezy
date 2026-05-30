@@ -5436,7 +5436,7 @@ fn user_prompt_text_is_highlighted_in_transcript() {
     let item = TranscriptItem::user("find getFoo");
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
-    let text = lines[1]
+    let _text = lines[1]
         .spans
         .iter()
         .map(|span| span.content.as_ref())

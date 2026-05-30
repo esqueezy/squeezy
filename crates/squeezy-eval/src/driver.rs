@@ -1534,7 +1534,9 @@ impl Driver {
                 frame.height.saturating_sub(1),
             ),
         };
-        let mut worst: Option<(u16, u16, String, u8, (u8, u8, u8))> = None;
+        // Worst-offending cell: (x, y, colour-name, luminance, rgb).
+        type WorstCell = (u16, u16, String, u8, (u8, u8, u8));
+        let mut worst: Option<WorstCell> = None;
         for cell in frame.cells.iter() {
             if cell.x < x0 || cell.x > x1 || cell.y < y0 || cell.y > y1 {
                 continue;
