@@ -171,7 +171,7 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
     // require instrumenting tool frames with a kind tag — out of
     // scope for this pass.
     out.push_str("\nConsumption by source\n");
-    let approx = |bytes: usize| (bytes + 3) / 4;
+    let approx = |bytes: usize| bytes.div_ceil(4);
     let user_tokens = approx(snapshot.conversation.text_bytes);
     let tool_tokens = approx(snapshot.conversation.tool_output_bytes);
     let reasoning_tokens = approx(snapshot.conversation.reasoning_bytes);

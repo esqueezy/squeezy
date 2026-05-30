@@ -1043,7 +1043,7 @@ impl Driver {
                         format!("captured_session_id:var={var}:id={id}")
                     }
                     None => {
-                        format!("asserted_fail: capture_session_id: agent has no session id yet")
+                        "asserted_fail: capture_session_id: agent has no session id yet".to_string()
                     }
                 };
                 self.capture.record(
