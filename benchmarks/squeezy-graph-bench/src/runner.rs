@@ -15,9 +15,10 @@ use crate::{
     oracles::{
         collect_c_family_accuracy, collect_csharp_oracle_accuracy, collect_go_oracle_accuracy,
         collect_java_oracle_accuracy, collect_js_ts_accuracy, collect_js_ts_oracle_accuracy,
-        collect_python_oracle_accuracy, collect_ruby_oracle_accuracy,
-        heuristic_iteration_reports, time_go_ast_oracle, time_java_oracle_optional,
-        time_js_ts_oracle, time_python_ast_oracle,
+        collect_php_oracle_accuracy, collect_python_oracle_accuracy,
+        collect_ruby_oracle_accuracy, heuristic_iteration_reports, time_go_ast_oracle,
+        time_java_oracle_optional, time_js_ts_oracle, time_php_oracle_optional,
+        time_python_ast_oracle,
     },
     report::*,
     summary::{print_summary, write_report},
@@ -191,6 +192,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
             time_go_ast_oracle(&args.fixture)?,
             "Go parser/type oracle".to_string(),
         ),
+        BenchmarkLanguage::Php => time_php_oracle_optional(&args.fixture),
         BenchmarkLanguage::Ruby => match crate::oracles::time_ruby_prism_oracle(&args.fixture) {
             Ok(ms) => (ms, "Ruby Prism oracle".to_string()),
             Err(err) => (0, format!("Ruby Prism oracle unavailable: {err}")),
@@ -235,6 +237,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         }
         BenchmarkLanguage::Python => empty_accuracy("rust-analyzer oracle not used for Python"),
         BenchmarkLanguage::Go => empty_accuracy("rust-analyzer oracle not used for Go"),
+        BenchmarkLanguage::Php => empty_accuracy("rust-analyzer oracle not used for PHP"),
         BenchmarkLanguage::Ruby => empty_accuracy("Ruby LSP navigation oracle not used"),
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
             collect_js_ts_accuracy(&args.fixture, &graph, args.ra_lsp_probes)
@@ -264,6 +267,14 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
     };
     let java_oracle = match args.language {
         BenchmarkLanguage::Java => Some(collect_java_oracle_accuracy(
+            &args.fixture,
+            &graph,
+            &query_reports,
+        )?),
+        _ => None,
+    };
+    let php_oracle = match args.language {
+        BenchmarkLanguage::Php => Some(collect_php_oracle_accuracy(
             &args.fixture,
             &graph,
             &query_reports,
@@ -304,6 +315,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         &java_oracle,
         &csharp_oracle,
         &go_oracle,
+        &php_oracle,
         &ruby_oracle,
     );
 
@@ -339,6 +351,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         java_oracle,
         csharp_oracle,
         go_oracle,
+        php_oracle,
         ruby_oracle,
         refresh_probe,
         heuristic_iterations,
@@ -380,6 +393,7 @@ fn answer_quality_report(
     java_oracle: &Option<JavaOracleReport>,
     csharp_oracle: &Option<CsharpOracleReport>,
     go_oracle: &Option<GoOracleReport>,
+    php_oracle: &Option<PhpOracleReport>,
     ruby_oracle: &Option<RubyOracleReport>,
 ) -> AnswerQualityReport {
     let expected_checks = query_reports
@@ -406,6 +420,7 @@ fn answer_quality_report(
         java_oracle,
         csharp_oracle,
         go_oracle,
+        php_oracle,
         ruby_oracle,
     );
 
@@ -432,6 +447,7 @@ fn oracle_summary(
     java_oracle: &Option<JavaOracleReport>,
     csharp_oracle: &Option<CsharpOracleReport>,
     go_oracle: &Option<GoOracleReport>,
+    php_oracle: &Option<PhpOracleReport>,
     ruby_oracle: &Option<RubyOracleReport>,
 ) -> (String, Option<f64>, Option<f64>) {
     match language {
@@ -454,6 +470,12 @@ fn oracle_summary(
                 symbol_oracle_tuple(&accuracy.rust_analyzer_symbol_status, &accuracy.symbols)
             }),
         BenchmarkLanguage::CSharp => csharp_oracle
+            .as_ref()
+            .map(|oracle| symbol_oracle_tuple(&oracle.status, &oracle.symbols))
+            .unwrap_or_else(|| {
+                symbol_oracle_tuple(&accuracy.rust_analyzer_symbol_status, &accuracy.symbols)
+            }),
+        BenchmarkLanguage::Php => php_oracle
             .as_ref()
             .map(|oracle| symbol_oracle_tuple(&oracle.status, &oracle.symbols))
             .unwrap_or_else(|| {

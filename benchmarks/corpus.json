@@ -81,6 +81,34 @@
       "ra_lsp_probes": 0
     },
     {
+      "name": "php-smoke",
+      "family": "php",
+      "language": "php",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/php/semantic-cases",
+      "spec": "benchmarks/specs/php-smoke-queries.json",
+      "report": "php/php-smoke.json",
+      "ra_lsp_probes": 0
+    },
+    {
+      "name": "symfony-console",
+      "family": "php",
+      "language": "php",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/symfony-console/src/Symfony/Component/Console",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "php/symfony-console.json",
+      "mixed_repo": "target/benchmark-repos/symfony-console/src/Symfony/Component/Console",
+      "mixed_iterations": 1500,
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/symfony/console",
+        "rev": "TBD-pin-v7.2.0-commit-sha-when-landing",
+        "checkout": "target/benchmark-repos/symfony-console"
+      }
+    },
+    {
       "name": "js-ts-smoke",
       "family": "js-ts",
       "language": "typescript",

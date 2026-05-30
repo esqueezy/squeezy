@@ -39,6 +39,7 @@ on:
           - c-family
           - csharp
           - js-ts
+          - php
           - ruby
       tier:
         description: Benchmark tier.
@@ -62,7 +63,7 @@ jobs:
   benchmark:
     name: ${{ inputs.language }} benchmark
     runs-on: ${{ inputs.language == 'rust' && 'macos-latest' || 'ubuntu-latest' }}
-    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp') && 90 || inputs.language == 'go' && 60 || inputs.language == 'ruby' && 45 || 120 }}
+    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp') && 90 || (inputs.language == 'go' || inputs.language == 'php') && 60 || inputs.language == 'ruby' && 45 || 120 }}
 
     steps:
       - name: Checkout
@@ -91,6 +92,15 @@ jobs:
         run: |
           dotnet build benchmarks/oracle/csharp/CsharpOracle.csproj \
             -c Release --nologo -v minimal
+
+      - name: Install PHP oracle toolchain
+        if: inputs.language == 'php'
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y php8.3-cli php8.3-mbstring php8.3-xml composer
+          ( cd benchmarks/oracle-helpers/php-oracle \
+            && composer install --no-interaction --prefer-dist )
 
       - name: Run semantic graph benchmark corpus
         run: |

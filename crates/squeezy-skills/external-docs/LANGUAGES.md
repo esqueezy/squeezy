@@ -16,6 +16,7 @@ uses the same family names so coverage claims stay checkable.
 | `go` | Go | `go` | `tree-sitter-go` | `go_types` | yes | `benchmarks/fixtures/go/semantic-cases` | `benchmarks/specs/go-smoke-queries.json` | gin, cobra, prometheus, etcd, zap |
 | `c-family` | C, C++ | `c`, `h`, `cc`, `cpp`, `cxx`, `hh`, `hpp`, `hxx` | `tree-sitter-c`, `tree-sitter-cpp` | `clang` | yes | `benchmarks/fixtures/c/semantic-cases`, `benchmarks/fixtures/cpp/semantic-cases` | `benchmarks/specs/c-smoke-queries.json`, `benchmarks/specs/cpp-smoke-queries.json` | redis, curl, sqlite, protobuf, nlohmann_json |
 | `js-ts` | JavaScript, JSX, TypeScript, TSX | `cjs`, `cts`, `js`, `jsx`, `mjs`, `mts`, `ts`, `tsx` | `tree-sitter-javascript`, `tree-sitter-typescript` | `tsc` | yes | `benchmarks/fixtures/js-ts/semantic-cases` | `benchmarks/specs/js-ts-smoke-queries.json` | vite, redux, axios, express, prettier |
+| `php` | PHP | `php` | `tree-sitter-php` | `nikic/php-parser` | yes | `benchmarks/fixtures/php/semantic-cases` | `benchmarks/specs/php-smoke-queries.json` | symfony-console |
 | `ruby` | Ruby | `rb` | `tree-sitter-ruby` | `ruby_prism` | no | `benchmarks/fixtures/ruby/semantic-cases` | `benchmarks/specs/ruby-smoke-queries.json` | sinatra |
 
 ## Rust
@@ -132,6 +133,32 @@ framework conventions can improve precision and recall.
 
 Oracle: TypeScript compiler API. CI installs the pinned `typescript` package and
 sets `SQUEEZY_TYPESCRIPT_PATH`.
+
+## PHP
+
+Indexed: namespaces, `use` imports (named, aliased, group, `use function`,
+`use const`), classes, interfaces, traits, enums (including backed enums),
+methods, properties, class constants, magic-method attribution, attribute
+heads (`#[Foo]`), calls (direct, member, scoped), object creation, and
+references. Trait inclusion (`use TraitA;`) is recorded as a `uses_trait`
+attribute on the consuming class plus a Type reference to the trait.
+
+Known limitations: dynamic class names (`new $cls`), variable variables
+(`$$x`), `eval`, heredoc/nowdoc interpolations, and magic-method dispatch
+(`__call`, `__get`, etc.) lower to Partial confidence or are excluded by
+design. Trait conflict resolution (`insteadof`/`as`) is recorded as an
+attribute but not modelled in detail. Inline HTML in mixed-template files
+is surfaced as fallback body content, not graph confidence.
+
+Known follow-ups: Symfony attribute heuristics beyond `#[Route]`,
+`#[AsCommand]`, `#[AsController]`; composer autoload-aware resolution; and
+a navigation oracle backed by phpactor LSP probes remain bounded
+deferrals.
+
+Oracle: nikic/PHP-Parser declaration scan invoked via a subprocess. CI
+installs PHP 8.3 + Composer + `composer install` in the oracle helper
+directory; absent any of those, the oracle status is `skipped` and only
+fixture-query truth gates run.
 
 ## Ruby
 

@@ -1579,6 +1579,120 @@ public:
 }
 
 #[test]
+fn parser_extracts_php_symbols_imports_calls_and_references() {
+    let source = r#"<?php
+namespace Foo\Bar;
+
+use Foo\Traits\Loggable;
+use Foo\Bar\Service as Svc;
+
+interface IRunner {
+    public function run(int $id): void;
+}
+
+trait Loggable {
+    protected function log(string $msg): void {
+    }
+}
+
+class Service implements IRunner {
+    use Loggable;
+
+    public string $prefix = 'svc-';
+
+    public function run(int $id): void {
+        $this->log("running $id");
+    }
+}
+
+enum Status: string {
+    case Ok = 'ok';
+    case Failed = 'fail';
+}
+
+class Magic {
+    public function __call($name, $args) {
+        return null;
+    }
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = php_record("src/all.php", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert_eq!(parsed.package.as_deref(), Some("Foo.Bar"));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.kind == SymbolKind::Interface && symbol.name == "IRunner" })
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.kind == SymbolKind::Trait && symbol.name == "Loggable" })
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.kind == SymbolKind::Class && symbol.name == "Service" })
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.kind == SymbolKind::Enum
+            && symbol.name == "Status"
+            && symbol
+                .attributes
+                .iter()
+                .any(|attr| attr == "php:backed:string")
+    }));
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.kind == SymbolKind::Method
+            && symbol.name == "__call"
+            && symbol.attributes.iter().any(|attr| attr == "php:magic")
+    }));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.kind == SymbolKind::Field && symbol.name == "prefix" })
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.kind == SymbolKind::Variant && symbol.name == "Ok" })
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "Foo.Traits.Loggable" && import.alias.is_none())
+    );
+    assert!(
+        parsed.imports.iter().any(
+            |import| import.path == "Foo.Bar.Service" && import.alias.as_deref() == Some("Svc")
+        )
+    );
+    let service = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Service")
+        .unwrap();
+    assert!(
+        service
+            .attributes
+            .iter()
+            .any(|attr| attr == "uses_trait:Loggable"),
+        "Service should carry uses_trait:Loggable attribute"
+    );
+    assert!(service.attributes.iter().any(|attr| attr == "base:IRunner"));
+    assert!(parsed.calls.iter().any(|call| call.name == "log"));
+}
+
+#[test]
 fn parser_parallel_records_preserve_order_and_cache_changes() {
     let mut parser = LanguageParser::new().unwrap();
     let mut records = (0..10)
@@ -2253,6 +2367,12 @@ fn cpp_record(relative_path: &str, source: &str) -> FileRecord {
 fn go_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Go;
+    record
+}
+
+fn php_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Php;
     record
 }
 

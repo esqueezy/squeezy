@@ -46,6 +46,26 @@ pub(crate) fn enforce_gates(report: &BenchmarkReport, no_speed_gate: bool) -> Re
         )));
     }
 
+    if !no_speed_gate
+        && let Some(php) = &report.php_oracle
+        && php.oracle_ms.is_some()
+    {
+        const PHP_PRECISION_FLOOR: f64 = 0.92;
+        const PHP_RECALL_FLOOR: f64 = 0.80;
+        if php.symbols.precision < PHP_PRECISION_FLOOR {
+            return Err(SqueezyError::Graph(format!(
+                "PHP oracle precision {:.3} below floor {:.2}",
+                php.symbols.precision, PHP_PRECISION_FLOOR
+            )));
+        }
+        if php.symbols.recall < PHP_RECALL_FLOOR {
+            return Err(SqueezyError::Graph(format!(
+                "PHP oracle recall {:.3} below floor {:.2}",
+                php.symbols.recall, PHP_RECALL_FLOOR
+            )));
+        }
+    }
+
     // Ruby uses precision/recall thresholds rather than fp/fn counts because
     // the dynamic-dispatch recall gap (`method_missing`, `define_method`)
     // produces a steady stream of FNs we accept (spec §10). When the oracle

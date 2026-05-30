@@ -19,6 +19,7 @@ impl SemanticGraph {
         // the cost of rebuilding the entire workspace path map.
         self.js_ts_resolver.update_from_files(&self.files);
         self.add_csharp_type_edges();
+        self.add_php_type_edges();
 
         // Move-out, mutate, move-back. Each builder iterates a single
         // field's data while writing edges, and the borrow checker won't
@@ -83,6 +84,21 @@ impl SemanticGraph {
                     self.symbols
                         .get(id)
                         .map(|symbol| csharp_import_matches_symbol(import, symbol))
+                        .unwrap_or(false)
+                });
+            }
+            if self
+                .files
+                .get(&import.file_id)
+                .map(|file| file.language == squeezy_core::LanguageKind::Php)
+                .unwrap_or(false)
+            {
+                candidates.retain(|id| {
+                    self.symbols
+                        .get(id)
+                        .map(|symbol| {
+                            crate::languages::php::php_import_matches_symbol(import, symbol)
+                        })
                         .unwrap_or(false)
                 });
             }

@@ -7,6 +7,7 @@ pub(crate) mod common_scan;
 pub(crate) mod cpython_ast;
 pub(crate) mod go_types;
 pub(crate) mod javac;
+pub(crate) mod php_oracle;
 pub(crate) mod roslyn;
 pub(crate) mod ruby_oracle;
 pub(crate) mod rust_analyzer;
@@ -17,6 +18,7 @@ pub(crate) use common_scan::*;
 pub(crate) use cpython_ast::*;
 pub(crate) use go_types::*;
 pub(crate) use javac::*;
+pub(crate) use php_oracle::*;
 pub(crate) use roslyn::*;
 pub(crate) use ruby_oracle::*;
 pub(crate) use rust_analyzer::*;
@@ -86,13 +88,18 @@ static TSC: OracleDescriptor = OracleDescriptor {
     family: LanguageFamily::JsTs,
     language: BenchmarkLanguage::TypeScript,
 };
+static PHP_PARSER: OracleDescriptor = OracleDescriptor {
+    id: "nikic_php_parser",
+    family: LanguageFamily::Php,
+    language: BenchmarkLanguage::Php,
+};
 static RUBY_PRISM: OracleDescriptor = OracleDescriptor {
     id: "ruby_prism",
     family: LanguageFamily::Ruby,
     language: BenchmarkLanguage::Ruby,
 };
 
-static ORACLES: [&'static dyn LanguageOracle; 8] = [
+static ORACLES: [&'static dyn LanguageOracle; 9] = [
     &RUST_ANALYZER,
     &CPYTHON_AST,
     &JAVAC,
@@ -100,6 +107,7 @@ static ORACLES: [&'static dyn LanguageOracle; 8] = [
     &GO_TYPES,
     &CLANG,
     &TSC,
+    &PHP_PARSER,
     &RUBY_PRISM,
 ];
 

@@ -154,6 +154,11 @@ export const languageRows: MatrixRow[] = [
     status: "first-class graph"
   },
   {
+    name: "PHP",
+    detail: "Namespaces, use imports (named/aliased/group/function/const), classes, interfaces, traits, enums, backed enums, methods, properties, attributes, calls, and references.",
+    status: "first-class graph"
+  },
+  {
     name: "Ruby",
     detail: "Classes, modules, methods, singleton methods, attr_* synthesis, require_relative imports, include/extend/prepend mixins, calls, and references.",
     status: "first-class graph"

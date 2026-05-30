@@ -207,6 +207,115 @@ pub(crate) fn collect_csharp_squeezy_symbol_scan_excluding_files(
     scan
 }
 
+fn normalize_php_squeezy_kind(kind: SymbolKind) -> Option<String> {
+    match kind {
+        SymbolKind::Class => Some("Class".to_string()),
+        SymbolKind::Interface => Some("Interface".to_string()),
+        SymbolKind::Trait => Some("Trait".to_string()),
+        SymbolKind::Enum => Some("Enum".to_string()),
+        SymbolKind::Module => Some("Module".to_string()),
+        SymbolKind::Function | SymbolKind::Test => Some("Function".to_string()),
+        SymbolKind::Method => Some("Method".to_string()),
+        SymbolKind::Field => Some("Field".to_string()),
+        SymbolKind::Variant => Some("Variant".to_string()),
+        SymbolKind::Struct
+        | SymbolKind::Crate
+        | SymbolKind::File
+        | SymbolKind::Union
+        | SymbolKind::TypeAlias
+        | SymbolKind::Impl
+        | SymbolKind::Const
+        | SymbolKind::Static
+        | SymbolKind::Macro
+        | SymbolKind::Unknown => None,
+    }
+}
+
+pub(crate) fn collect_php_squeezy_symbol_scan_excluding_files(
+    graph: &SemanticGraph,
+    excluded_files: &BTreeSet<String>,
+) -> SymbolScan {
+    let mut scan = SymbolScan::default();
+    for symbol in graph.symbols.values() {
+        let Some(file) = graph.files.get(&symbol.file_id) else {
+            increment(&mut scan.excluded_by_kind, "MissingFile");
+            continue;
+        };
+        if file.language != LanguageKind::Php {
+            continue;
+        }
+        scan.raw_total += 1;
+        if excluded_files.contains(&file.relative_path) {
+            increment(&mut scan.excluded_by_kind, "OracleUnparseableFile");
+            continue;
+        }
+        // Exclude PHP-specific noise per spec §4 and §9: heredoc/nowdoc
+        // bodies (extractor never emits identifier symbols from these),
+        // eval-argument identifiers (suppressed in the extractor), magic
+        // methods (declarations stay but call sites lower confidence;
+        // declarations stay countable here too — only `Method:__call`
+        // would diverge if the oracle had no equivalent, but nikic emits
+        // it).
+        if symbol
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "php:eval-argument")
+        {
+            increment(&mut scan.excluded_by_kind, "PhpEvalArgument");
+            continue;
+        }
+        match normalize_php_squeezy_kind(symbol.kind) {
+            Some(kind) => {
+                increment_symbol(
+                    &mut scan.counts,
+                    SymbolKey {
+                        file: file.relative_path.clone(),
+                        kind,
+                        name: normalize_symbol_name(&symbol.name),
+                    },
+                );
+            }
+            None => increment(&mut scan.excluded_by_kind, &format!("{:?}", symbol.kind)),
+        }
+    }
+    scan
+}
+
+pub(crate) fn collect_php_squeezy_edge_scan_excluding_files(
+    graph: &SemanticGraph,
+    excluded_files: &BTreeSet<String>,
+) -> SymbolScan {
+    let mut scan = SymbolScan::default();
+    for edge in graph.edges() {
+        if !matches!(edge.kind, EdgeKind::Extends | EdgeKind::Implements) {
+            continue;
+        }
+        let Some(from) = graph.symbols.get(&edge.from) else {
+            continue;
+        };
+        let Some(file) = graph.files.get(&from.file_id) else {
+            continue;
+        };
+        if file.language != LanguageKind::Php {
+            continue;
+        }
+        scan.raw_total += 1;
+        if excluded_files.contains(&file.relative_path) {
+            increment(&mut scan.excluded_by_kind, "OracleUnparseableFile");
+            continue;
+        }
+        increment_symbol(
+            &mut scan.counts,
+            SymbolKey {
+                file: file.relative_path.clone(),
+                kind: format!("{:?}", edge.kind),
+                name: format!("{}->{}", from.name, edge.target_text),
+            },
+        );
+    }
+    scan
+}
+
 /// Symmetric exclusion list for the Ruby Prism oracle (spec §9):
 /// - synthesized `attr_*` methods (squeezy emits them, Prism does not)
 /// - block-local / method-local identifiers (extractor doesn't emit these
