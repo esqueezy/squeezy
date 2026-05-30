@@ -15,8 +15,9 @@ use crate::{
     oracles::{
         collect_c_family_accuracy, collect_csharp_oracle_accuracy, collect_go_oracle_accuracy,
         collect_java_oracle_accuracy, collect_js_ts_accuracy, collect_js_ts_oracle_accuracy,
-        collect_python_oracle_accuracy, heuristic_iteration_reports, time_go_ast_oracle,
-        time_java_oracle_optional, time_js_ts_oracle, time_python_ast_oracle,
+        collect_kotlin_oracle_accuracy, collect_python_oracle_accuracy,
+        heuristic_iteration_reports, time_go_ast_oracle, time_java_oracle_optional,
+        time_js_ts_oracle, time_kotlin_oracle_optional, time_python_ast_oracle,
     },
     report::*,
     summary::{print_summary, write_report},
@@ -181,6 +182,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
             "dotnet build".to_string(),
         ),
         BenchmarkLanguage::Java => time_java_oracle_optional(&args.fixture),
+        BenchmarkLanguage::Kotlin => time_kotlin_oracle_optional(&args.fixture),
         BenchmarkLanguage::Rust => (time_cargo_check(&args.fixture)?, "cargo check".to_string()),
         BenchmarkLanguage::Python => (
             time_python_ast_oracle(&args.fixture)?,
@@ -223,6 +225,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
 
     let accuracy = match args.language {
         BenchmarkLanguage::Java => empty_accuracy("rust-analyzer oracle not used for Java"),
+        BenchmarkLanguage::Kotlin => empty_accuracy("rust-analyzer oracle not used for Kotlin"),
         BenchmarkLanguage::Rust => collect_accuracy(&args.fixture, &graph, args.ra_lsp_probes),
         BenchmarkLanguage::CSharp => empty_accuracy("rust-analyzer oracle not used for C#"),
         BenchmarkLanguage::C | BenchmarkLanguage::Cpp => {
@@ -254,6 +257,14 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
     };
     let java_oracle = match args.language {
         BenchmarkLanguage::Java => Some(collect_java_oracle_accuracy(
+            &args.fixture,
+            &graph,
+            &query_reports,
+        )?),
+        _ => None,
+    };
+    let kotlin_oracle = match args.language {
+        BenchmarkLanguage::Kotlin => Some(collect_kotlin_oracle_accuracy(
             &args.fixture,
             &graph,
             &query_reports,
@@ -292,6 +303,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         &python_oracle,
         &js_ts_oracle,
         &java_oracle,
+        &kotlin_oracle,
         &csharp_oracle,
         &go_oracle,
     );
@@ -326,6 +338,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         python_oracle,
         js_ts_oracle,
         java_oracle,
+        kotlin_oracle,
         csharp_oracle,
         go_oracle,
         refresh_probe,
@@ -365,6 +378,7 @@ fn answer_quality_report(
     python_oracle: &Option<PythonOracleReport>,
     js_ts_oracle: &Option<JsTsOracleReport>,
     java_oracle: &Option<JavaOracleReport>,
+    kotlin_oracle: &Option<KotlinOracleReport>,
     csharp_oracle: &Option<CsharpOracleReport>,
     go_oracle: &Option<GoOracleReport>,
 ) -> AnswerQualityReport {
@@ -390,6 +404,7 @@ fn answer_quality_report(
         python_oracle,
         js_ts_oracle,
         java_oracle,
+        kotlin_oracle,
         csharp_oracle,
         go_oracle,
     );
@@ -414,6 +429,7 @@ fn oracle_summary(
     python_oracle: &Option<PythonOracleReport>,
     js_ts_oracle: &Option<JsTsOracleReport>,
     java_oracle: &Option<JavaOracleReport>,
+    kotlin_oracle: &Option<KotlinOracleReport>,
     csharp_oracle: &Option<CsharpOracleReport>,
     go_oracle: &Option<GoOracleReport>,
 ) -> (String, Option<f64>, Option<f64>) {
@@ -431,6 +447,12 @@ fn oracle_summary(
                 symbol_oracle_tuple(&accuracy.rust_analyzer_symbol_status, &accuracy.symbols)
             }),
         BenchmarkLanguage::Java => java_oracle
+            .as_ref()
+            .map(|oracle| symbol_oracle_tuple(&oracle.status, &oracle.symbols))
+            .unwrap_or_else(|| {
+                symbol_oracle_tuple(&accuracy.rust_analyzer_symbol_status, &accuracy.symbols)
+            }),
+        BenchmarkLanguage::Kotlin => kotlin_oracle
             .as_ref()
             .map(|oracle| symbol_oracle_tuple(&oracle.status, &oracle.symbols))
             .unwrap_or_else(|| {

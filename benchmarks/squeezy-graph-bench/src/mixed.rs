@@ -45,6 +45,10 @@ pub(crate) fn run_mixed_workload(
             None,
             "mixed workload compiler check not used for Java".to_string(),
         ),
+        BenchmarkLanguage::Kotlin => (
+            None,
+            "mixed workload unsupported for Kotlin".to_string(),
+        ),
         BenchmarkLanguage::Rust => time_cargo_check_optional(repo),
         BenchmarkLanguage::Python => (None, "mixed workload unsupported for Python".to_string()),
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
@@ -85,6 +89,7 @@ pub(crate) fn run_mixed_workload(
         BenchmarkLanguage::Java => {
             empty_accuracy("mixed workload accuracy oracle not used for Java")
         }
+        BenchmarkLanguage::Kotlin => empty_accuracy("mixed workload unsupported for Kotlin"),
         BenchmarkLanguage::Python => empty_accuracy("mixed workload unsupported for Python"),
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
             collect_js_ts_accuracy(repo, &graph, ra_lsp_probes)

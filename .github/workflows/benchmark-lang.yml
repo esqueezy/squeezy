@@ -39,6 +39,7 @@ on:
           - c-family
           - csharp
           - js-ts
+          - kotlin
       tier:
         description: Benchmark tier.
         required: true
@@ -78,6 +79,16 @@ jobs:
         run: |
           dotnet build benchmarks/oracle/csharp/CsharpOracle.csproj \
             -c Release --nologo -v minimal
+
+      - name: Build Kotlin oracle jar
+        if: inputs.language == 'kotlin'
+        shell: bash
+        run: |
+          # Requires kotlinc + JDK 17, installed by the setup-bench action's
+          # Kotlin steps. The build script writes
+          # benchmarks/oracle/kotlin/kotlin-oracle.jar (~20MB), which the
+          # Rust harness looks up by exact path. Not checked into the repo.
+          bash benchmarks/oracle/kotlin/build.sh
 
       - name: Run semantic graph benchmark corpus
         run: |

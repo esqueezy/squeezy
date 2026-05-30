@@ -10,6 +10,7 @@ pub enum BenchmarkLanguage {
     Go,
     Java,
     JavaScript,
+    Kotlin,
     Python,
     Rust,
     TypeScript,
@@ -24,6 +25,7 @@ impl BenchmarkLanguage {
             "go" => Ok(Self::Go),
             "java" => Ok(Self::Java),
             "javascript" | "js" => Ok(Self::JavaScript),
+            "kotlin" | "kt" => Ok(Self::Kotlin),
             "python" => Ok(Self::Python),
             "rust" => Ok(Self::Rust),
             "typescript" | "ts" | "js-ts" => Ok(Self::TypeScript),
@@ -41,6 +43,7 @@ impl BenchmarkLanguage {
             Self::Go => "go",
             Self::Java => "java",
             Self::JavaScript => "javascript",
+            Self::Kotlin => "kotlin",
             Self::Python => "python",
             Self::Rust => "rust",
             Self::TypeScript => "typescript",
@@ -55,6 +58,7 @@ impl BenchmarkLanguage {
             Self::Go => LanguageKind::Go,
             Self::Java => LanguageKind::Java,
             Self::JavaScript => LanguageKind::JavaScript,
+            Self::Kotlin => LanguageKind::Kotlin,
             Self::Python => LanguageKind::Python,
             Self::Rust => LanguageKind::Rust,
             Self::TypeScript => LanguageKind::TypeScript,
@@ -87,16 +91,18 @@ impl BenchmarkLanguage {
 
     pub fn comment_text(self) -> &'static str {
         match self {
-            // C/Cpp/CSharp/Go/Java/JavaScript/Rust/TypeScript all share `//`
-            // line comments at any position. C# specifically: a `//` line
-            // stays valid both at file scope (alongside `using` directives or
-            // file-scoped namespaces) and inside any member body.
+            // C/Cpp/CSharp/Go/Java/JavaScript/Kotlin/Rust/TypeScript all
+            // share `//` line comments at any position. C# specifically:
+            // a `//` line stays valid both at file scope (alongside `using`
+            // directives or file-scoped namespaces) and inside any member
+            // body. Kotlin's `//` is also a top-level legal line comment.
             Self::C
             | Self::CSharp
             | Self::Cpp
             | Self::Go
             | Self::Java
             | Self::JavaScript
+            | Self::Kotlin
             | Self::Rust
             | Self::TypeScript => "\n// squeezy refresh benchmark edit\n",
             Self::Python => "\n# squeezy refresh benchmark edit\n",
@@ -223,7 +229,7 @@ impl BenchmarkCommand {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: squeezy-graph-bench [--list-languages|--list-oracles]\n       squeezy-graph-bench --corpus <path> [--family all|rust|python|java|go|c-family|csharp|js-ts] [--tier smoke|full] [--report-dir <path>]\n       squeezy-graph-bench [--language rust|python|java|c|cpp|csharp|go|javascript|typescript|js-ts] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--oracle-files <n, default=250, 0=all>] [--no-speed-gate]"
+                        "usage: squeezy-graph-bench [--list-languages|--list-oracles]\n       squeezy-graph-bench --corpus <path> [--family all|rust|python|java|go|c-family|csharp|js-ts|kotlin] [--tier smoke|full] [--report-dir <path>]\n       squeezy-graph-bench [--language rust|python|java|kotlin|c|cpp|csharp|go|javascript|typescript|js-ts] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--oracle-files <n, default=250, 0=all>] [--no-speed-gate]"
                     );
                     std::process::exit(0);
                 }
@@ -248,6 +254,7 @@ impl BenchmarkCommand {
                     | "js-ts"
                     | "javascript"
                     | "typescript"
+                    | "kotlin"
             ) {
                 return Err(SqueezyError::Graph(format!(
                     "unknown corpus family {family}"
