@@ -25,6 +25,7 @@ squeezy-skills.workspace = true
 squeezy-store.workspace = true
 squeezy-telemetry.workspace = true
 squeezy-tools.workspace = true
+squeezy-vcs.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

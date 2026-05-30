@@ -33,6 +33,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use squeezy_vcs::{DiffSnapshot as VcsDiffSnapshot, RollbackResult as VcsRollbackResult};
 
 /// Typed slash command parsed from a slash-prefixed input string. Each
 /// variant matches exactly one entry in `SLASH_COMMANDS` (with `/jobs`,
@@ -564,6 +565,34 @@ pub enum DispatchOutcome {
     Unpinned { id: String },
     /// `/pins` — number of pinned items.
     PinsList { count: usize },
+    /// `/diff` worktree snapshot. Carries the structured
+    /// [`squeezy_vcs::DiffSnapshot`] the TUI would render into a card
+    /// so a headless driver (eval / RPC) can audit the same payload.
+    /// `vcs_kind` is the short tag from the snapshot (`"git"` or
+    /// `"none"`) lifted out for easy logging without traversing the
+    /// nested `vcs` struct.
+    DiffSnapshot {
+        vcs_kind: String,
+        files_changed: usize,
+        additions: u64,
+        deletions: u64,
+        untracked_files: usize,
+        snapshot: Box<VcsDiffSnapshot>,
+    },
+    /// `/undo` checkpoint rollback. `result` is `None` when the agent
+    /// has no checkpoint store wired up (checkpoints disabled);
+    /// otherwise it carries the structured
+    /// [`squeezy_vcs::RollbackResult`] from
+    /// `CheckpointStore::rollback(Latest, …)`. `applied` mirrors
+    /// `result.applied` for easy `match` patterns; on a clean tree
+    /// with no checkpoint to undo, `applied` is `false` and
+    /// `skipped` is `true`.
+    CheckpointUndo {
+        applied: bool,
+        skipped: bool,
+        checkpoint_ids: Vec<String>,
+        result: Option<Box<VcsRollbackResult>>,
+    },
     /// TUI-only directive. The agent has no side effect for this
     /// command; the TUI matches on `command` to dispatch to its
     /// pre-existing handler (overlay toggle, diff job spawn, …).

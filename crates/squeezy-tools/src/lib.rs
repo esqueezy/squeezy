@@ -1230,7 +1230,11 @@ impl ToolRegistry {
         }
     }
 
-    pub(crate) fn diff_snapshot(&self, mode: DiffMode, options: DiffOptions) -> DiffSnapshot {
+    /// Compute (and cache) a worktree/branch diff snapshot. Exposed
+    /// publicly so non-TUI dispatch surfaces (eval / RPC) can drive
+    /// `/diff` through `Agent::dispatch_command` and receive the same
+    /// structured payload the TUI renders into a card.
+    pub fn diff_snapshot(&self, mode: DiffMode, options: DiffOptions) -> DiffSnapshot {
         let key = DiffSnapshotKey {
             mode,
             include_patch: options.include_patch,
@@ -1253,6 +1257,28 @@ impl ToolRegistry {
             );
         }
         snapshot
+    }
+
+    /// Roll back the most recent checkpoint. Returns `Ok(None)` when
+    /// checkpointing is disabled (no [`CheckpointStore`] installed);
+    /// callers should treat that as a structured "nothing to undo —
+    /// checkpoints disabled" signal. On a clean tree the inner
+    /// [`squeezy_vcs::RollbackResult`] carries `skipped = true,
+    /// applied = false`; the caller decides whether to render that
+    /// as success or failure.
+    pub fn checkpoint_undo_latest(
+        &self,
+        mode: Option<squeezy_vcs::RollbackMode>,
+    ) -> Result<Option<squeezy_vcs::RollbackResult>> {
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return Ok(None);
+        };
+        let result = checkpoints.rollback(
+            squeezy_vcs::RollbackTarget::Latest,
+            mode.unwrap_or_default(),
+        )?;
+        self.invalidate_diff_cache();
+        Ok(Some(result))
     }
 
     pub(crate) fn invalidate_diff_cache(&self) {

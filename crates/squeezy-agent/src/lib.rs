@@ -2577,8 +2577,95 @@ impl Agent {
                     message: format!("{err}"),
                 },
             },
+            // `/diff` returns a worktree `DiffSnapshot` so headless
+            // drivers (eval, RPC) can audit the same payload the TUI
+            // renders into a diff card via `handle_slash_diff`. The
+            // call shells out to `git status` + `git diff` via
+            // `GitVcs::snapshot`; parked on `spawn_blocking` to keep
+            // the async runtime free.
+            DispatchCommand::Diff => {
+                let tools = self.tools.clone();
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    tools.diff_snapshot(
+                        squeezy_vcs::DiffMode::Worktree,
+                        squeezy_vcs::DiffOptions {
+                            include_patch: true,
+                            ..squeezy_vcs::DiffOptions::default()
+                        },
+                    )
+                })
+                .await
+                .unwrap_or_else(|err| squeezy_vcs::DiffSnapshot {
+                    vcs: squeezy_vcs::VcsInfo {
+                        kind: squeezy_vcs::VcsKind::None,
+                        ..squeezy_vcs::VcsInfo::default()
+                    },
+                    mode: squeezy_vcs::DiffMode::Worktree,
+                    summary: squeezy_vcs::DiffSummary::default(),
+                    files: Vec::new(),
+                    truncated: false,
+                    errors: vec![format!("diff snapshot task panicked: {err}")],
+                });
+                let vcs_kind = match snapshot.vcs.kind {
+                    squeezy_vcs::VcsKind::Git => "git",
+                    squeezy_vcs::VcsKind::None => "none",
+                }
+                .to_string();
+                let files_changed = snapshot.summary.files_changed;
+                let additions = snapshot.summary.additions;
+                let deletions = snapshot.summary.deletions;
+                let untracked_files = snapshot.summary.untracked_files;
+                DispatchOutcome::DiffSnapshot {
+                    vcs_kind,
+                    files_changed,
+                    additions,
+                    deletions,
+                    untracked_files,
+                    snapshot: Box::new(snapshot),
+                }
+            }
+            // `/undo` rolls back the most recent checkpoint.
+            // Returns a typed `CheckpointUndo` so headless drivers
+            // see the structured `RollbackResult` (or `None` when
+            // checkpoints are disabled) instead of a string status.
+            // The TUI keeps running the rollback through its local
+            // tool job for card-lifecycle observability.
+            // `CheckpointStore::rollback` writes journal entries and
+            // touches the filesystem; parked on `spawn_blocking`.
+            DispatchCommand::Undo => {
+                let tools = self.tools.clone();
+                let join =
+                    tokio::task::spawn_blocking(move || tools.checkpoint_undo_latest(None)).await;
+                match join {
+                    Err(err) => DispatchOutcome::Error {
+                        command: "/undo".into(),
+                        message: format!("undo task panicked: {err}"),
+                    },
+                    Ok(Ok(Some(result))) => {
+                        let applied = result.applied;
+                        let skipped = result.skipped;
+                        let checkpoint_ids = result.checkpoint_ids.clone();
+                        DispatchOutcome::CheckpointUndo {
+                            applied,
+                            skipped,
+                            checkpoint_ids,
+                            result: Some(Box::new(result)),
+                        }
+                    }
+                    Ok(Ok(None)) => DispatchOutcome::CheckpointUndo {
+                        applied: false,
+                        skipped: true,
+                        checkpoint_ids: Vec::new(),
+                        result: None,
+                    },
+                    Ok(Err(err)) => DispatchOutcome::Error {
+                        command: "/undo".into(),
+                        message: format!("{err}"),
+                    },
+                }
+            }
             // `/fork`, `/resume`, `/session-export-html`, `/session-cleanup`,
-            // `/pin`, `/checkpoint*`, `/undo`, `/revert-turn` require &mut
+            // `/pin`, `/checkpoint*`, `/revert-turn` require &mut
             // self or interact with TUI-owned state (clipboard, transcript
             // selection, vcs background job). The TUI keeps running those
             // through its existing helpers; the agent dispatch records the
@@ -2591,7 +2678,6 @@ impl Agent {
             | DispatchCommand::Pin { .. }
             | DispatchCommand::Checkpoints
             | DispatchCommand::Checkpoint { .. }
-            | DispatchCommand::Undo
             | DispatchCommand::RevertTurn { .. }
             | DispatchCommand::Help { .. }
             | DispatchCommand::Config { .. }
@@ -2600,7 +2686,6 @@ impl Agent {
             | DispatchCommand::Copy { .. }
             | DispatchCommand::Collapse { .. }
             | DispatchCommand::Expand { .. }
-            | DispatchCommand::Diff
             | DispatchCommand::Feedback { .. }
             | DispatchCommand::Report { .. }
             | DispatchCommand::Effort { .. }
