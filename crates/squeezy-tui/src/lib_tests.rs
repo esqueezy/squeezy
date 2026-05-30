@@ -3308,7 +3308,9 @@ fn transcript_item_formats_role_label() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(text, "  │ hello │");
+    // Open bubble: leading indent + cycling phase-glyph bullet + space + text.
+    assert!(text.starts_with("  "), "{text}");
+    assert!(text.ends_with(" hello"), "{text}");
 }
 
 #[test]
@@ -4789,7 +4791,7 @@ fn render_keeps_header_when_transcript_has_content() {
     let output = render_to_string(&app, 120, 24);
     assert!(output.contains("Squeezy v"), "{output}");
     assert!(output.contains("scripted:gpt-test"), "{output}");
-    assert!(output.contains("│ hello"), "{output}");
+    assert!(output.contains("hello"), "{output}");
     assert!(output.contains("● answer"), "{output}");
     assert!(!output.contains("Answered"), "{output}");
 }
@@ -4904,7 +4906,7 @@ fn inline_history_flush_contains_startup_and_new_transcript() {
     let rendered = lines_to_plain_text(&first);
 
     assert!(rendered.contains("Squeezy v0.1.0"), "{rendered}");
-    assert!(rendered.contains("│ find getFoo"), "{rendered}");
+    assert!(rendered.contains("find getFoo"), "{rendered}");
     assert!(rendered.contains("● No definition found."), "{rendered}");
 
     let next = inline_history_lines_for_flush(&app, 100, false, app.transcript.len());
@@ -5194,7 +5196,7 @@ fn running_prompt_keeps_working_line_below_submitted_prompt() {
 
     let output = render_to_string(&app, 120, 18);
 
-    assert!(output.contains("│ why?"), "{output}");
+    assert!(output.contains("why?"), "{output}");
     assert!(output.contains("• Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
     assert!(!output.contains("• Done"), "{output}");
@@ -5361,8 +5363,8 @@ fn submitted_prompt_renders_bubble_around_text() {
 
     assert!(top.starts_with("  ╭"), "{top}");
     assert!(top.ends_with('╮'), "{top}");
-    assert!(content.starts_with("  │ find getFoo"), "{content}");
-    assert!(content.ends_with(" │"), "{content}");
+    assert!(content.starts_with("  "), "{content}");
+    assert!(content.ends_with("find getFoo"), "{content}");
     assert!(bottom.starts_with("  ╰─◖"), "{bottom}");
     assert!(bottom.ends_with('╯'), "{bottom}");
     assert_eq!(lines.last().expect("separator").spans.len(), 0);
@@ -5390,13 +5392,13 @@ fn submitted_prompt_preserves_empty_lines() {
         })
         .collect::<Vec<_>>();
 
-    // Bubble structure: top border + 4 content rows ("one", "", "three", "") + bottom border + separator
+    // Open bubble: top corners + 4 content rows ("one", "", "three", "") + bottom corners + separator
     assert_eq!(lines.len(), 7);
     assert!(rendered[0].starts_with("  ╭"), "{rendered:?}");
     assert!(rendered[1].contains("one"), "{rendered:?}");
-    assert!(rendered[2].contains('│'), "{rendered:?}");
+    assert_eq!(rendered[2].trim(), "");
     assert!(rendered[3].contains("three"), "{rendered:?}");
-    assert!(rendered[4].contains('│'), "{rendered:?}");
+    assert_eq!(rendered[4].trim(), "");
     assert!(rendered[5].starts_with("  ╰─◖"), "{rendered:?}");
     assert_eq!(rendered[6], "");
 }
@@ -5408,7 +5410,7 @@ fn failure_log_renders_as_detail_under_user_turn() {
     app.push_log("turn failed: provider stream failed".to_string());
 
     let output = render_to_string(&app, 120, 16);
-    assert!(output.contains("│ hi"), "{output}");
+    assert!(output.contains(" hi"), "{output}");
     assert!(
         output.contains("│ turn failed: provider stream failed"),
         "{output}"
@@ -5584,9 +5586,13 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         app.tool_output_verbosity,
         message_outcome(&app.transcript, 0),
     );
-    // Bubble: lines[0] = top border, lines[1] = content row with bubble sides + text
-    assert_eq!(user_lines[1].spans[1].content.as_ref(), "│ ");
+    // Open bubble: lines[0] = top corners, lines[1] = bullet + content text
     assert_eq!(user_lines[1].spans[1].style.fg, Some(AMBER));
+    assert!(
+        user_lines[1].spans[1].content.ends_with(' '),
+        "{:?}",
+        user_lines[1].spans[1].content
+    );
     assert_eq!(user_lines[1].spans[2].content.as_ref(), "hi");
     assert_eq!(user_lines[1].spans[2].style.fg, Some(Color::White));
 
@@ -5611,12 +5617,15 @@ fn user_prompt_text_is_highlighted_in_transcript() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    // Bubble: lines[1].spans = [indent "  ", left "│ ", text, padding, right " │"]
-    assert_eq!(lines[1].spans[1].content.as_ref(), "│ ");
+    // Open bubble: lines[1].spans = [indent "  ", bullet (phase + space), text]
     assert_eq!(lines[1].spans[1].style.fg, Some(AMBER));
+    assert!(
+        lines[1].spans[1].content.ends_with(' '),
+        "{:?}",
+        lines[1].spans[1].content
+    );
     assert_eq!(lines[1].spans[2].content.as_ref(), "find getFoo");
     assert_eq!(lines[1].spans[2].style.fg, Some(Color::White));
-    assert!(!text.contains("◐"), "{text}");
 }
 
 #[test]
