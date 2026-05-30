@@ -3604,7 +3604,7 @@ fn tool_rows_summarize_diff_glob_read_and_plan_outputs() {
         "{output}"
     );
     assert!(
-        output.contains("✔ Explored read src/lib.rs · 128B · more available"),
+        output.contains("✔ Explored read src/lib.rs · 128B · partial result"),
         "{output}"
     );
     assert!(!output.contains("plan patch"), "{output}");

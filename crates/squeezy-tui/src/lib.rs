@@ -5051,6 +5051,11 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 /// to its expanded form. Skips the pending-assistant tail since the
 /// overlay is a snapshot of committed transcript content.
 fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'static>> {
+    // The overlay is the "Ctrl-T for full transcript" escape hatch — body
+    // content blocks (e.g. read_tool_output payloads, shell stdout/stderr)
+    // honour this verbosity, so pin Verbose to defeat the per-mode line cap
+    // even when the user has `/verbosity compact` set for inline cards.
+    let overlay_verbosity = ToolOutputVerbosity::Verbose;
     let mut lines = Vec::new();
     for (index, entry) in app.transcript.iter().enumerate() {
         match reasoning_run_info(&app.transcript, index) {
@@ -5081,7 +5086,7 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
                     &members,
                     false,
                     app.selected_entry == Some(index),
-                    app.tool_output_verbosity,
+                    overlay_verbosity,
                     width,
                 ));
                 continue;
@@ -5092,7 +5097,7 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             app.render_cache_session,
             entry,
             app.selected_entry == Some(index),
-            app.tool_output_verbosity,
+            overlay_verbosity,
             message_outcome(&app.transcript, index),
             width,
             app.show_reasoning_usage,
@@ -7294,12 +7299,7 @@ fn decl_search_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
             Style::default().fg(GOLD),
         ));
     }
-    if tool.result.content["truncated"].as_bool().unwrap_or(false) {
-        spans.push(Span::styled(
-            " · more available",
-            Style::default().fg(QUIET),
-        ));
-    }
+    append_truncation_hint(&mut spans, tool);
     spans
 }
 
@@ -8364,7 +8364,26 @@ fn expanded_read_tool_output_detail_lines(
         ));
     }
     if let Some(content) = string_arg(&tool.result.content, "content") {
-        lines.extend(output_block_lines("content", &content, verbosity));
+        // Spilled tool payloads are routinely hundreds of lines of raw JSON,
+        // so fold inline even on the expanded card — the overlay (which
+        // pins Verbose) still hands the full content to anyone hitting
+        // Ctrl-T. Generic `output_block_lines` stays unbounded so the
+        // existing "expand grep → see every match" behaviour is preserved.
+        let limit = match verbosity {
+            ToolOutputVerbosity::Compact => 12,
+            ToolOutputVerbosity::Normal => 40,
+            ToolOutputVerbosity::Verbose => usize::MAX,
+        };
+        if !content.trim().is_empty() {
+            lines.push(detail_line(false, QUIET, "content"));
+            for line in head_tail_lines(&content, limit) {
+                if line.truncated_marker {
+                    lines.push(detail_line(false, QUIET, line.text));
+                } else {
+                    lines.push(detail_spans_line(styled_output_spans(&line.text)));
+                }
+            }
+        }
     }
     lines
 }
@@ -8728,14 +8747,27 @@ fn path_detail_lines(
 }
 
 fn append_truncation_hint(spans: &mut Vec<Span<'static>>, tool: &ToolTranscript) {
-    if tool.result.cost_hint.truncated
+    // Two distinct truncation modes share `cost_hint.truncated`:
+    //   * Spill: result was too large for the model context, so the full
+    //     payload was written to disk and the model gets a handle it can
+    //     pass to `read_tool_output`. The card body shows a preview; the
+    //     rest is NOT in the transcript and Ctrl-T can't surface it.
+    //   * Tool-cap: the tool itself returned a partial slice (repo_map
+    //     packet cap, decl_search row cap, etc.). The model needs to
+    //     re-query with narrower filters to see more.
+    // The old shared "more available" label promised something Ctrl-T
+    // couldn't deliver — distinguish both so the affordance matches reality.
+    let spilled = tool.result.content["spilled"].as_bool().unwrap_or(false);
+    let label = if spilled {
+        " · spilled to disk"
+    } else if tool.result.cost_hint.truncated
         || tool.result.content["truncated"].as_bool().unwrap_or(false)
     {
-        spans.push(Span::styled(
-            " · more available",
-            Style::default().fg(QUIET),
-        ));
-    }
+        " · partial result"
+    } else {
+        return;
+    };
+    spans.push(Span::styled(label, Style::default().fg(QUIET)));
 }
 
 fn format_bytes(bytes: u64) -> String {
