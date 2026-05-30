@@ -82,6 +82,7 @@ pub(crate) struct BenchmarkReport {
     pub(crate) php_oracle: Option<PhpOracleReport>,
     pub(crate) ruby_oracle: Option<RubyOracleReport>,
     pub(crate) swift_oracle: Option<SwiftOracleReport>,
+    pub(crate) dart_oracle: Option<DartOracleReport>,
     pub(crate) refresh_probe: Option<RefreshProbeReport>,
     pub(crate) heuristic_iterations: Vec<HeuristicIterationReport>,
     pub(crate) queries: Vec<QueryReport>,
@@ -377,6 +378,17 @@ pub(crate) struct SwiftOracleReport {
     pub(crate) oracle_unparseable_examples: Vec<String>,
     pub(crate) symbols: AccuracySetReport,
     pub(crate) navigation_accuracy: NavigationAccuracyReport,
+    pub(crate) limitations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DartOracleReport {
+    pub(crate) oracle_ms: u128,
+    pub(crate) status: String,
+    pub(crate) mode: String,
+    pub(crate) oracle_unparseable_files: usize,
+    pub(crate) oracle_unparseable_examples: Vec<String>,
+    pub(crate) symbols: AccuracySetReport,
     pub(crate) limitations: Vec<String>,
 }
 

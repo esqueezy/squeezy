@@ -5,6 +5,7 @@ use crate::cli::BenchmarkLanguage;
 pub(crate) mod clang;
 pub(crate) mod common_scan;
 pub(crate) mod cpython_ast;
+pub(crate) mod dart_oracle;
 pub(crate) mod go_types;
 pub(crate) mod javac;
 pub(crate) mod kotlin_oracle;
@@ -19,6 +20,7 @@ pub(crate) mod tsc;
 pub(crate) use clang::*;
 pub(crate) use common_scan::*;
 pub(crate) use cpython_ast::*;
+pub(crate) use dart_oracle::*;
 pub(crate) use go_types::*;
 pub(crate) use javac::*;
 pub(crate) use kotlin_oracle::*;
@@ -118,8 +120,13 @@ static SOURCEKIT_LSP: OracleDescriptor = OracleDescriptor {
     family: LanguageFamily::Swift,
     language: BenchmarkLanguage::Swift,
 };
+static DART_ANALYZER: OracleDescriptor = OracleDescriptor {
+    id: "dart_analyzer",
+    family: LanguageFamily::Dart,
+    language: BenchmarkLanguage::Dart,
+};
 
-static ORACLES: [&'static dyn LanguageOracle; 12] = [
+static ORACLES: [&'static dyn LanguageOracle; 13] = [
     &RUST_ANALYZER,
     &CPYTHON_AST,
     &JAVAC,
@@ -132,6 +139,7 @@ static ORACLES: [&'static dyn LanguageOracle; 12] = [
     &PHP_PARSER,
     &RUBY_PRISM,
     &SOURCEKIT_LSP,
+    &DART_ANALYZER,
 ];
 
 pub fn inventory() -> &'static [&'static dyn LanguageOracle] {

@@ -7,9 +7,10 @@ use super::inventory;
 #[test]
 fn every_oracle_targets_a_distinct_family() {
     // Each registered oracle must own a distinct LanguageFamily. We do NOT
-    // assert that every `LanguageFamily` has an oracle: the scaffold
-    // families (Php/Kotlin/Swift/Scala/Dart) intentionally land before
-    // their oracles do. Each oracle PR lifts its language out of this list.
+    // assert that every `LanguageFamily` has an oracle: scaffold families
+    // intentionally land before their oracles do. Each oracle PR lifts its
+    // language out of the placeholder set, the same pattern Ruby followed
+    // before its Prism oracle landed.
     let mut families = HashSet::new();
     for oracle in inventory() {
         assert!(
@@ -28,6 +29,7 @@ fn every_oracle_targets_a_distinct_family() {
         LanguageFamily::CFamily,
         LanguageFamily::JsTs,
         LanguageFamily::Ruby,
+        LanguageFamily::Dart,
     ];
     for family in required {
         assert!(families.contains(family), "missing oracle for {family:?}");

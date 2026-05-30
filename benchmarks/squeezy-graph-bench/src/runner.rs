@@ -13,13 +13,14 @@ use crate::{
     harness::toolchain::{time_cargo_check, time_clang_syntax, time_dotnet_build},
     mixed::{run_mixed_workload, run_refresh_probe},
     oracles::{
-        collect_c_family_accuracy, collect_csharp_oracle_accuracy, collect_go_oracle_accuracy,
-        collect_java_oracle_accuracy, collect_js_ts_accuracy, collect_js_ts_oracle_accuracy,
-        collect_kotlin_oracle_accuracy, collect_php_oracle_accuracy,
-        collect_python_oracle_accuracy, collect_ruby_oracle_accuracy,
-        collect_scala_oracle_accuracy, heuristic_iteration_reports, time_go_ast_oracle,
-        time_java_oracle_optional, time_js_ts_oracle, time_kotlin_oracle_optional,
-        time_php_oracle_optional, time_python_ast_oracle, time_scala_oracle_optional,
+        collect_c_family_accuracy, collect_csharp_oracle_accuracy, collect_dart_oracle_accuracy,
+        collect_go_oracle_accuracy, collect_java_oracle_accuracy, collect_js_ts_accuracy,
+        collect_js_ts_oracle_accuracy, collect_kotlin_oracle_accuracy,
+        collect_php_oracle_accuracy, collect_python_oracle_accuracy,
+        collect_ruby_oracle_accuracy, collect_scala_oracle_accuracy, heuristic_iteration_reports,
+        time_dart_oracle_optional, time_go_ast_oracle, time_java_oracle_optional,
+        time_js_ts_oracle, time_kotlin_oracle_optional, time_php_oracle_optional,
+        time_python_ast_oracle, time_scala_oracle_optional,
     },
     report::*,
     summary::{print_summary, write_report},
@@ -213,10 +214,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
             0,
             "Swift validation oracle not run in first-iteration CI (SwiftPM build is expensive)".to_string(),
         ),
-        BenchmarkLanguage::Dart => (
-            0,
-            "Dart analyzer oracle deferred; scan-only mode".to_string(),
-        ),
+        BenchmarkLanguage::Dart => time_dart_oracle_optional(&args.fixture),
     };
 
     let build = build_graph(&args.fixture)?;
@@ -268,6 +266,10 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
     };
     let ruby_oracle = match args.language {
         BenchmarkLanguage::Ruby => Some(collect_ruby_oracle_accuracy(&args.fixture, &graph)?),
+        _ => None,
+    };
+    let dart_oracle = match args.language {
+        BenchmarkLanguage::Dart => Some(collect_dart_oracle_accuracy(&args.fixture, &graph)?),
         _ => None,
     };
     let js_ts_oracle = match args.language {
@@ -357,6 +359,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         &php_oracle,
         &ruby_oracle,
         &swift_oracle,
+        &dart_oracle,
     );
 
     Ok(BenchmarkReport {
@@ -396,6 +399,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         php_oracle,
         ruby_oracle,
         swift_oracle,
+        dart_oracle,
         refresh_probe,
         heuristic_iterations,
         queries: query_reports,
@@ -441,6 +445,7 @@ fn answer_quality_report(
     php_oracle: &Option<PhpOracleReport>,
     ruby_oracle: &Option<RubyOracleReport>,
     swift_oracle: &Option<SwiftOracleReport>,
+    dart_oracle: &Option<DartOracleReport>,
 ) -> AnswerQualityReport {
     let expected_checks = query_reports
         .iter()
@@ -471,6 +476,7 @@ fn answer_quality_report(
         php_oracle,
         ruby_oracle,
         swift_oracle,
+        dart_oracle,
     );
 
     AnswerQualityReport {
@@ -501,6 +507,7 @@ fn oracle_summary(
     php_oracle: &Option<PhpOracleReport>,
     ruby_oracle: &Option<RubyOracleReport>,
     swift_oracle: &Option<SwiftOracleReport>,
+    dart_oracle: &Option<DartOracleReport>,
 ) -> (String, Option<f64>, Option<f64>) {
     match language {
         BenchmarkLanguage::Python => python_oracle
@@ -566,12 +573,26 @@ fn oracle_summary(
         BenchmarkLanguage::Rust | BenchmarkLanguage::C | BenchmarkLanguage::Cpp => {
             symbol_oracle_tuple(&accuracy.rust_analyzer_symbol_status, &accuracy.symbols)
         }
-        BenchmarkLanguage::Dart => (
-            "Dart analyzer oracle deferred; scan-only mode".to_string(),
-            None,
-            None,
-        ),
+        BenchmarkLanguage::Dart => dart_oracle
+            .as_ref()
+            .map(symbol_oracle_tuple_for_dart)
+            .unwrap_or_else(|| {
+                (
+                    "Dart analyzer oracle unavailable".to_string(),
+                    None,
+                    None,
+                )
+            }),
     }
+}
+
+fn symbol_oracle_tuple_for_dart(
+    oracle: &DartOracleReport,
+) -> (String, Option<f64>, Option<f64>) {
+    if oracle.mode == "scan-only" {
+        return (oracle.status.clone(), None, None);
+    }
+    symbol_oracle_tuple(&oracle.status, &oracle.symbols)
 }
 
 fn symbol_oracle_tuple(
