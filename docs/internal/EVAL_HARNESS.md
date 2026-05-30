@@ -208,7 +208,7 @@ model = "gpt-5.4-mini"
 reasoning_effort = "low"          # optional: low | medium | high | xhigh
 tool_choice = "required"          # optional: auto | required | none
 mode = "build"                    # "plan" | "build"
-permission_mode = "ask"           # "allow" | "ask" | "deny"; applied to edit/shell/web/mcp
+permission_mode = "ask"           # "allow" | "ask" | "deny"; applied to read/edit/shell/web/mcp/ignored_search
 instructions = "..."              # optional system instructions override
 max_output_tokens = 1024
 ```

@@ -476,12 +476,14 @@ fn apply_overlay(
     if let Some(pm) = &overlay.permission_mode {
         let mode = PermissionMode::parse(pm)
             .ok_or_else(|| EvalError::Config(format!("unknown permission_mode: {pm}")))?;
-        // Apply uniformly to the gates the scenario most often wants to
-        // pin. Power users can shape these individually via settings.
+        // Apply uniformly to every gate the scenario might want to pin.
+        // Power users can shape these individually via settings.
+        config.permissions.read = mode;
         config.permissions.edit = mode;
         config.permissions.shell = mode;
         config.permissions.web = mode;
         config.permissions.mcp = mode;
+        config.permissions.ignored_search = mode;
     }
     // Provider is now resolved at AppConfig construction time in
     // `run_scenario` via `from_env_and_settings_with_provider`, so it's
