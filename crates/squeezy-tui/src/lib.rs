@@ -533,7 +533,7 @@ async fn run_inner(
         app.push_log(banner);
     }
     for item in initial_transcript {
-        app.push_transcript_item(item);
+        hydrate_transcript_item(&mut app, item);
     }
     app.attachments = agent.context_attachments_snapshot().await;
     app.context_compaction = agent.context_compaction_snapshot().await;
@@ -983,7 +983,7 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             app.selected_entry = None;
             app.next_entry_id = 0;
             for item in transcript {
-                app.push_transcript_item(item);
+                hydrate_transcript_item(app, item);
             }
             app.attachments = agent.context_attachments_snapshot().await;
             app.pending_assistant.clear();
@@ -994,6 +994,39 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             app.status = format!("resumed session {session_id}");
         }
         Err(error) => app.status = format!("resume failed: {error}"),
+    }
+}
+
+/// Apply one `HydratedTranscriptItem` from the resume state to the
+/// live `TuiApp`, routing each variant to the matching `push_*`
+/// helper so the rebuilt transcript renders the same shape a fresh
+/// turn would. Tool-result cards need a roundtrip from
+/// `serde_json::Value` back to the typed `squeezy_tools::ToolResult`
+/// — done here so `squeezy-store` can stay independent of
+/// `squeezy-tools`. Malformed entries log a transcript warning and
+/// otherwise no-op rather than abort the whole hydration.
+fn hydrate_transcript_item(app: &mut TuiApp, item: squeezy_store::HydratedTranscriptItem) {
+    match item {
+        squeezy_store::HydratedTranscriptItem::Message { item } => {
+            app.push_transcript_item(item);
+        }
+        squeezy_store::HydratedTranscriptItem::ToolResult { call, result } => {
+            let parsed_result: ToolResult = match serde_json::from_value(result) {
+                Ok(result) => result,
+                Err(err) => {
+                    app.push_warn(format!(
+                        "resume: dropped a malformed tool-result card ({err})"
+                    ));
+                    return;
+                }
+            };
+            let parsed_call = call.map(|call| ToolCall {
+                call_id: call.call_id,
+                name: call.tool,
+                arguments: call.arguments,
+            });
+            app.push_tool_result_with_call(parsed_result, parsed_call);
+        }
     }
 }
 
