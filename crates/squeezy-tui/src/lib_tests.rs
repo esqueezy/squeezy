@@ -422,26 +422,6 @@ fn raw_control_byte_normalises_to_char_plus_control() {
 }
 
 #[tokio::test]
-async fn raw_ctrl_e_dispatches_expand_action() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-    assert!(app.transcript[0].collapsed);
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('\u{05}'), KeyModifiers::NONE),
-    )
-    .await
-    .expect("raw ctrl+e");
-    assert!(
-        !app.transcript[0].collapsed,
-        "raw \\x05 must reach the ExpandSelectedTranscriptEntry keymap arm",
-    );
-}
-
-#[tokio::test]
 async fn chord_leader_accepts_raw_ctrl_x_byte() {
     // Some terminals emit Ctrl+X as the literal ASCII control byte
     // (`\x18`) with no modifiers when they don't fully honour kitty's
@@ -2342,37 +2322,6 @@ async fn prompt_line_editing_matches_common_terminal_shortcuts() {
 }
 
 #[tokio::test]
-async fn prompt_ctrl_o_expands_single_entry() {
-    // Ctrl+O is dedicated to single-entry expand. It fires regardless
-    // of composer state — no more dual-mode readline fall-through.
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-    )
-    .await
-    .expect("ctrl-o expands");
-    assert!(!app.transcript[0].collapsed);
-
-    // With text in the composer, Ctrl+O still toggles the entry.
-    set_input(&mut app, "abc".to_string());
-    app.input_cursor = 0;
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-    )
-    .await
-    .expect("ctrl-o collapses");
-    assert!(app.transcript[0].collapsed);
-    assert_eq!(app.input, "abc", "composer must be untouched by Ctrl+O");
-}
-
-#[tokio::test]
 async fn prompt_word_editing_matches_codex_shortcuts() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -3310,15 +3259,20 @@ fn transcript_item_formats_role_label() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(text, "> hello");
+    // Open bubble: leading indent + cycling phase-glyph bullet + space + text.
+    assert!(text.starts_with("  "), "{text}");
+    assert!(text.ends_with(" hello"), "{text}");
 }
 
 #[test]
-fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
-    // Long-output regression: under the 5-line collapsed cap, a short
-    // grep result fits inside the preview window so the body shows even
-    // in the collapsed state — but a long body must be head-tail truncated
-    // with the Ctrl-E ellipsis, then fully expand when toggled.
+fn tool_result_entries_collapse_by_default_and_carry_overlay_hint() {
+    // Long tool outputs collapse to a head-tail preview by default,
+    // with the chip's truncation hint pointing the user at the
+    // full-screen transcript overlay (Ctrl+T) — the only mode that
+    // can reliably show every line regardless of inline vs alt-screen
+    // rendering. Single-entry expand keys were removed because they
+    // worked only in alt-screen mode (inline writes entries to
+    // terminal scrollback, which is immutable once flushed).
     let mut app = test_app(SessionMode::Build);
     let payload = (0..30)
         .map(|i| format!("match-{i:02}"))
@@ -3333,155 +3287,24 @@ fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
     assert!(!collapsed.contains("receipt="), "{collapsed}");
     assert!(!collapsed.contains("B receipt"), "{collapsed}");
     assert!(
-        collapsed.contains("Ctrl-O to expand"),
-        "collapsed view should show truncation hint: {collapsed}"
+        collapsed.contains("Ctrl-T for full transcript"),
+        "collapsed view should point at the overlay: {collapsed}"
     );
     assert!(
         !collapsed.contains("match-15"),
         "middle of the body must be elided: {collapsed}"
     );
 
-    select_previous_transcript_entry(&mut app);
-    toggle_selected_transcript_entry(&mut app);
+    // `/expand all` is the slash-command path for users who want the
+    // expanded view inline (works in alt-screen; in inline mode the
+    // most recent turn's entries flip but already-flushed ones stay
+    // in scrollback — a limitation the overlay sidesteps entirely).
+    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
 
     assert!(!app.transcript[0].collapsed);
     let expanded = render_to_string(&app, 100, 40);
     assert!(expanded.contains("match-15"), "{expanded}");
     assert!(!expanded.contains("receipt output="), "{expanded}");
-}
-
-#[test]
-fn toggle_selected_without_selection_expands_latest_collapsed_entry() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-
-    assert!(app.selected_entry.is_none());
-    assert!(app.transcript[0].collapsed);
-
-    toggle_selected_transcript_entry(&mut app);
-    assert!(!app.transcript[0].collapsed);
-    assert_eq!(
-        app.status,
-        "expanded transcript entry 1 · Ctrl+E expand all"
-    );
-
-    // Ctrl+O is bound to `ExpandSelectedTranscriptEntry`; with nothing
-    // left collapsed and no explicit selection it must not fold the
-    // entry we just opened. Status reports the no-op so the user gets
-    // feedback instead of silent re-folding.
-    toggle_selected_transcript_entry(&mut app);
-    assert!(!app.transcript[0].collapsed);
-    assert_eq!(app.status, "nothing to expand");
-}
-
-#[test]
-fn ctrl_o_does_not_collapse_assistant_when_no_reasoning_entry_exists() {
-    // squeezy-a88 regression. OpenAI gpt-5.4-mini @ reasoning_effort=low
-    // ships no reasoning summary, so the transcript drains to
-    // [user, assistant] with both entries already expanded (assistant
-    // messages skip the compact-default collapse). Ctrl+O used to fall
-    // through to the assistant body and collapse it — the binding is
-    // named `ExpandSelectedTranscriptEntry`, so collapsing on press is
-    // wrong. The fix: with no collapsed entry to target, Ctrl+O is a
-    // no-op and the status hints "nothing to expand".
-    let mut app = test_app(SessionMode::Build);
-    app.show_reasoning_usage = true;
-    app.push_transcript_item(TranscriptItem::user("Think briefly…"));
-    app.push_transcript_item(TranscriptItem::assistant(
-        "For a tiny ~100-entry keyed cache, a hash map is usually the better fit.",
-    ));
-
-    assert!(app.selected_entry.is_none());
-    assert!(
-        app.transcript.iter().all(|entry| !entry.collapsed),
-        "fixture must start with no collapsed entries to reproduce the bug"
-    );
-    assert!(
-        !app.transcript
-            .iter()
-            .any(|entry| matches!(entry.kind, TranscriptEntryKind::Reasoning(_))),
-        "fixture must have no Reasoning entry (the OpenAI no-summary case)"
-    );
-
-    toggle_selected_transcript_entry(&mut app);
-
-    let assistant_index = app
-        .transcript
-        .iter()
-        .position(|entry| {
-            matches!(
-                &entry.kind,
-                TranscriptEntryKind::Message(item) if item.role == Role::Assistant
-            )
-        })
-        .expect("assistant message present");
-    assert!(
-        !app.transcript[assistant_index].collapsed,
-        "Ctrl+O must not collapse the assistant body when nothing is collapsed"
-    );
-    assert_eq!(app.status, "nothing to expand");
-}
-
-#[test]
-fn toggle_selected_skips_prompt_rows_and_expands_collapsed_content() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-    app.push_transcript_item(TranscriptItem::user("next prompt"));
-
-    assert!(app.transcript[0].collapsed);
-    assert!(!app.transcript[1].is_toggleable());
-
-    toggle_selected_transcript_entry(&mut app);
-
-    assert!(!app.transcript[0].collapsed);
-    assert_eq!(
-        app.status,
-        "expanded transcript entry 1 · Ctrl+E expand all"
-    );
-}
-
-#[test]
-fn toggle_expand_all_expands_every_collapsed_entry_when_any_are_collapsed() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-    app.push_tool_result(sample_tool_result("read", "file body"));
-    app.push_tool_result(sample_tool_result("glob", "file list"));
-
-    assert!(app.transcript.iter().all(|e| e.collapsed));
-
-    toggle_expand_all_transcript_entries(&mut app);
-
-    assert!(
-        app.transcript.iter().all(|e| !e.collapsed),
-        "every toggleable entry should be expanded"
-    );
-    assert!(app.status.contains("expanded 3 of 3"));
-}
-
-#[test]
-fn toggle_expand_all_collapses_all_when_already_expanded() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-    app.push_tool_result(sample_tool_result("read", "file body"));
-
-    toggle_expand_all_transcript_entries(&mut app);
-    assert!(app.transcript.iter().all(|e| !e.collapsed));
-
-    toggle_expand_all_transcript_entries(&mut app);
-    assert!(
-        app.transcript.iter().all(|e| e.collapsed),
-        "second press should collapse every entry"
-    );
-    assert!(app.status.contains("collapsed 2 of 2"));
-}
-
-#[test]
-fn toggle_expand_all_reports_nothing_to_expand_when_transcript_empty() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("just a prompt"));
-
-    toggle_expand_all_transcript_entries(&mut app);
-    assert_eq!(app.status, "nothing expandable yet");
 }
 
 #[test]
@@ -3501,109 +3324,6 @@ fn failed_tool_result_starts_expanded_so_error_is_visible() {
 }
 
 #[test]
-fn checkpoint_undo_empty_store_renders_calm_not_red() {
-    // When `/undo` runs on a clean tree (no checkpoints to roll back),
-    // the tools layer surfaces a Success ToolResult with a structured
-    // "nothing to undo" message. The render path must pick the calm
-    // success chrome (green coin, "✔ Ran" label) and the detail helper
-    // must surface the structured message instead of falling through to
-    // the generic "no output" tombstone.
-    let result = ToolResult {
-        call_id: "tui-checkpoint_undo".to_string(),
-        tool_name: "checkpoint_undo".to_string(),
-        status: ToolStatus::Success,
-        content: serde_json::json!({
-            "rollback": {
-                "mode": "atomic",
-                "checkpoint_ids": [],
-                "planned_files": 0,
-                "restored_files": [],
-                "deleted_files": [],
-                "conflicts": [],
-                "skipped": true,
-                "applied": false,
-            },
-            "message": "nothing to undo",
-        }),
-        cost_hint: ToolCostHint::default(),
-        receipt: ToolReceipt {
-            output_sha256: "0".repeat(64),
-            content_sha256: None,
-        },
-        spill_model_output: None,
-    };
-    let tool = ToolTranscript {
-        call: Some(ToolCall {
-            call_id: "tui-checkpoint_undo".to_string(),
-            name: "checkpoint_undo".to_string(),
-            arguments: serde_json::json!({}),
-        }),
-        result,
-        repeat_count: 1,
-    };
-
-    assert_eq!(
-        tool_result_display_color(&tool),
-        SUCCESS_GREEN,
-        "empty-store /undo must paint with the calm success accent, not ERROR_RED",
-    );
-    assert_ne!(
-        tool_result_display_color(&tool),
-        ERROR_RED,
-        "empty-store /undo must not paint red",
-    );
-
-    let (glyph, label) = tool_result_action(&tool);
-    assert_eq!(
-        glyph, "✔ ",
-        "empty-store /undo must use the success check glyph"
-    );
-    assert_eq!(
-        label, "Ran",
-        "empty-store /undo must not display the Failed label"
-    );
-
-    // Status text is built off the Success branch, so neither the
-    // failure label nor the "no output" tombstone may appear.
-    let status_text = tool_result_status_text(&tool.result);
-    assert!(
-        !status_text.contains("no output"),
-        "calm /undo status text must not fall through to \"no output\": {status_text}",
-    );
-    assert!(
-        !status_text.contains("failed"),
-        "calm /undo status text must not contain the failure label: {status_text}",
-    );
-
-    // The detail helper surfaces the structured `message` field rather
-    // than the generic "no output" tombstone, so any caller that
-    // consults it for an empty-store result gets an actionable line.
-    assert_eq!(tool_result_error_detail(&tool.result), "nothing to undo");
-}
-
-#[tokio::test]
-async fn ctrl_e_dispatches_expand_all() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-    app.push_tool_result(sample_tool_result("read", "file body"));
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
-    )
-    .await
-    .expect("ctrl+e fires expand-all");
-
-    assert!(
-        app.transcript.iter().all(|e| !e.collapsed),
-        "Ctrl+E should expand both transcript entries"
-    );
-    assert!(app.status.contains("expanded"));
-}
-
-#[test]
 fn parse_transcript_category_accepts_reasoning_and_thinking_aliases() {
     assert!(matches!(
         parse_transcript_category("reasoning"),
@@ -3614,32 +3334,6 @@ fn parse_transcript_category_accepts_reasoning_and_thinking_aliases() {
         Some(TranscriptCategory::Reasoning)
     ));
     assert!(parse_transcript_category("rambling").is_none());
-}
-
-#[tokio::test]
-async fn ctrl_e_with_composer_text_still_expands_transcript() {
-    // Ctrl+E now fires expand-all unconditionally — composer state
-    // does not gate it (use `End` for cursor-to-line-end).
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-    set_input(&mut app, "abc".to_string());
-    app.input_cursor = 0;
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
-    )
-    .await
-    .expect("ctrl-e expands transcript");
-
-    assert!(
-        !app.transcript[0].collapsed,
-        "Ctrl+E should expand the tool result"
-    );
-    assert_eq!(app.input, "abc", "composer text untouched");
-    assert_eq!(app.input_cursor, 0, "composer cursor untouched");
 }
 
 #[tokio::test]
@@ -3721,7 +3415,7 @@ fn missing_cargo_manifest_shell_failure_renders_as_not_run_warning() {
     });
     app.push_tool_result(result);
 
-    let output = render_to_string(&app, 140, 12);
+    let output = render_to_string(&app, 140, 16);
 
     assert!(
         output.contains("⚠ Not run cargo check -p sonar-arch-graph · no Cargo.toml found"),
@@ -3748,8 +3442,7 @@ fn shell_tool_rows_show_command_and_highlight_output() {
         "stderr": "",
     });
     app.push_tool_result_with_call(result, Some(call));
-    select_previous_transcript_entry(&mut app);
-    toggle_selected_transcript_entry(&mut app);
+    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
 
     let output = render_to_string(&app, 140, 18);
 
@@ -3943,8 +3636,7 @@ fn edit_tool_row_summarizes_checkpoint_diff_and_expands_patch() {
             arguments: serde_json::json!({}),
         }),
     );
-    select_previous_transcript_entry(&mut app);
-    toggle_selected_transcript_entry(&mut app);
+    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
 
     let output = render_to_string(&app, 120, 16);
 
@@ -3983,7 +3675,7 @@ fn expanded_edit_diff_does_not_claim_ctrl_e_can_expand_further() {
             arguments: serde_json::json!({}),
         }),
     );
-    toggle_selected_transcript_entry(&mut app);
+    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
 
     let lines = format_transcript_entry_with_width(
         &app.transcript[0],
@@ -4874,7 +4566,7 @@ fn render_uses_two_line_status_footer() {
     };
 
     let output = render_to_string(&app, 140, 18);
-    assert!(output.contains(">_ Squeezy v"), "{output}");
+    assert!(output.contains("Squeezy v"), "{output}");
     assert!(output.contains("openai:gpt-test"), "{output}");
     assert!(output.contains("dir "), "{output}");
     assert!(output.contains("feature"), "{output}");
@@ -4918,10 +4610,10 @@ fn render_keeps_header_when_transcript_has_content() {
     app.push_transcript_item(TranscriptItem::user("hello"));
     app.push_transcript_item(TranscriptItem::assistant("answer"));
 
-    let output = render_to_string(&app, 120, 18);
-    assert!(output.contains(">_ Squeezy v"), "{output}");
+    let output = render_to_string(&app, 120, 24);
+    assert!(output.contains("Squeezy v"), "{output}");
     assert!(output.contains("scripted:gpt-test"), "{output}");
-    assert!(output.contains("> hello"), "{output}");
+    assert!(output.contains("hello"), "{output}");
     assert!(output.contains("● answer"), "{output}");
     assert!(!output.contains("Answered"), "{output}");
 }
@@ -4961,11 +4653,11 @@ fn startup_card_scrolls_with_transcript_history() {
     }
 
     let at_bottom = render_to_string(&app, 120, 20);
-    assert!(!at_bottom.contains(">_ Squeezy v"), "{at_bottom}");
+    assert!(!at_bottom.contains("Squeezy v"), "{at_bottom}");
 
     app.transcript_scroll_from_bottom = u16::MAX;
     let at_top = render_to_string(&app, 120, 20);
-    assert!(at_top.contains(">_ Squeezy v"), "{at_top}");
+    assert!(at_top.contains("Squeezy v"), "{at_top}");
 }
 
 #[test]
@@ -5035,8 +4727,8 @@ fn inline_history_flush_contains_startup_and_new_transcript() {
     let first = inline_history_lines_for_flush(&app, 100, true, 0);
     let rendered = lines_to_plain_text(&first);
 
-    assert!(rendered.contains(">_ Squeezy v0.1.0"), "{rendered}");
-    assert!(rendered.contains("> find getFoo"), "{rendered}");
+    assert!(rendered.contains("Squeezy v0.1.0"), "{rendered}");
+    assert!(rendered.contains("find getFoo"), "{rendered}");
     assert!(rendered.contains("● No definition found."), "{rendered}");
 
     let next = inline_history_lines_for_flush(&app, 100, false, app.transcript.len());
@@ -5052,7 +4744,7 @@ fn inline_live_viewport_excludes_flushed_history() {
 
     let output = render_inline_to_string(&app, 100, 12);
 
-    assert!(!output.contains(">_ Squeezy v"), "{output}");
+    assert!(!output.contains("Squeezy v"), "{output}");
     assert!(!output.contains("old prompt"), "{output}");
     assert!(!output.contains("old answer"), "{output}");
     assert!(output.contains("new prompt┃"), "{output}");
@@ -5106,7 +4798,7 @@ fn active_prompt_keeps_one_blank_line_after_header() {
     let lines = output.lines().collect::<Vec<_>>();
     let header_bottom = lines
         .iter()
-        .position(|line| line.contains('╯'))
+        .rposition(|line| line.contains("languages"))
         .expect("header bottom");
 
     assert!(
@@ -5119,35 +4811,39 @@ fn active_prompt_keeps_one_blank_line_after_header() {
         lines
             .iter()
             .skip(header_bottom + 2)
-            .take(2)
+            .take(6)
             .any(|line| line.contains('┃')),
         "{output}"
     );
 }
 
 #[test]
-fn footer_mentions_expand_and_transcript_shortcuts() {
+fn footer_mentions_transcript_shortcut() {
     let app = test_app(SessionMode::Build);
 
     let output = render_to_string(&app, 140, 16);
 
-    assert!(output.contains("Ctrl-E expand"), "{output}");
-    assert!(output.contains("Ctrl-T transcript"), "{output}");
+    assert!(output.contains("Ctrl-T full transcript"), "{output}");
+    assert!(
+        !output.contains("Ctrl-O expand") && !output.contains("Ctrl-E expand all"),
+        "the removed per-entry expand keys must not be advertised: {output}"
+    );
 }
 
 #[test]
 fn active_prompt_cursor_is_vertically_centered() {
     let app = test_app(SessionMode::Build);
 
-    let lines = prompt_input_lines(&app, PROMPT_MIN_HEIGHT);
+    let lines = prompt_input_lines(&app, PROMPT_MIN_HEIGHT, 80);
 
-    assert_eq!(lines.len(), 3);
-    assert!(!lines[0].spans.iter().any(|span| span.content.contains('┃')));
-    assert!(
-        lines[1].spans.iter().any(|span| span.content.contains('┃')),
-        "{lines:?}"
-    );
-    assert!(!lines[2].spans.iter().any(|span| span.content.contains('┃')));
+    // Composer at min height: top rule + top pad + content + bot pad + bottom rule = 5 rows
+    assert_eq!(lines.len(), 5);
+    let has_coin = |line: &Line<'_>| line.spans.iter().any(|s| s.content.contains('●'));
+    assert!(!has_coin(&lines[0]), "{lines:?}");
+    assert!(!has_coin(&lines[1]), "{lines:?}");
+    assert!(has_coin(&lines[2]), "{lines:?}");
+    assert!(!has_coin(&lines[3]), "{lines:?}");
+    assert!(!has_coin(&lines[4]), "{lines:?}");
 }
 
 #[test]
@@ -5325,7 +5021,7 @@ fn running_prompt_keeps_working_line_below_submitted_prompt() {
 
     let output = render_to_string(&app, 120, 18);
 
-    assert!(output.contains("> why?"), "{output}");
+    assert!(output.contains("why?"), "{output}");
     assert!(output.contains("• Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
     assert!(!output.contains("• Done"), "{output}");
@@ -5462,7 +5158,7 @@ fn submitted_prompt_keeps_prompt_surface_and_working_line() {
 }
 
 #[test]
-fn submitted_prompt_surface_extends_to_render_width() {
+fn submitted_prompt_renders_bubble_around_text() {
     let item = TranscriptItem::user("find getFoo");
 
     let lines = format_message_entry_with_width(
@@ -5473,29 +5169,29 @@ fn submitted_prompt_surface_extends_to_render_width() {
         Some(40),
         true,
     );
-    let rendered = lines[1]
+
+    let top = lines[0]
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let content = lines[1]
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let bottom = lines[2]
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(lines.len(), PROMPT_MIN_HEIGHT as usize + 1);
-    assert_eq!(
-        lines[0]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>()
-            .chars()
-            .count(),
-        40
-    );
-    assert_eq!(rendered.chars().count(), 40);
-    assert!(rendered.starts_with("> find getFoo"), "{rendered}");
-    assert_eq!(lines[0].spans[0].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[1].spans[1].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[1].spans[2].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[2].spans[1].style.bg, Some(PROMPT_BG));
+    assert!(top.starts_with("  ╭"), "{top}");
+    assert!(top.ends_with('╮'), "{top}");
+    assert!(content.starts_with("  "), "{content}");
+    assert!(content.ends_with("find getFoo"), "{content}");
+    assert!(bottom.starts_with("  ╰─◖"), "{bottom}");
+    assert!(bottom.ends_with('╯'), "{bottom}");
     assert_eq!(lines.last().expect("separator").spans.len(), 0);
 }
 
@@ -5521,18 +5217,15 @@ fn submitted_prompt_preserves_empty_lines() {
         })
         .collect::<Vec<_>>();
 
+    // Open bubble: top corners + 4 content rows ("one", "", "three", "") + bottom corners + separator
     assert_eq!(lines.len(), 7);
+    assert!(rendered[0].starts_with("  ╭"), "{rendered:?}");
     assert!(rendered[1].contains("one"), "{rendered:?}");
     assert_eq!(rendered[2].trim(), "");
     assert!(rendered[3].contains("three"), "{rendered:?}");
     assert_eq!(rendered[4].trim(), "");
+    assert!(rendered[5].starts_with("  ╰─◖"), "{rendered:?}");
     assert_eq!(rendered[6], "");
-    assert!(lines[..6].iter().all(|line| {
-        line.spans
-            .iter()
-            .filter(|span| !span.content.is_empty())
-            .all(|span| span.style.bg == Some(PROMPT_BG))
-    }));
 }
 
 #[test]
@@ -5542,7 +5235,7 @@ fn failure_log_renders_as_detail_under_user_turn() {
     app.push_log("turn failed: provider stream failed".to_string());
 
     let output = render_to_string(&app, 120, 16);
-    assert!(output.contains("> hi"), "{output}");
+    assert!(output.contains(" hi"), "{output}");
     assert!(
         output.contains("│ turn failed: provider stream failed"),
         "{output}"
@@ -5718,13 +5411,15 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         app.tool_output_verbosity,
         message_outcome(&app.transcript, 0),
     );
-    assert_eq!(user_lines[1].spans[0].style.bg, Some(PROMPT_BG));
-    assert_eq!(user_lines[1].spans[1].content.as_ref(), "hi");
-    assert_eq!(
-        user_lines[1].spans[1].style.fg,
-        Some(render::palette::muted_fg())
+    // Open bubble: lines[0] = top corners, lines[1] = bullet + content text
+    assert_eq!(user_lines[1].spans[1].style.fg, Some(AMBER));
+    assert!(
+        user_lines[1].spans[1].content.ends_with(' '),
+        "{:?}",
+        user_lines[1].spans[1].content
     );
-    assert_eq!(user_lines[1].spans[1].style.bg, Some(PROMPT_BG));
+    assert_eq!(user_lines[1].spans[2].content.as_ref(), "hi");
+    assert_eq!(user_lines[1].spans[2].style.fg, Some(Color::White));
 
     let log_lines = format_transcript_entry(
         &app.transcript[1],
@@ -5747,14 +5442,15 @@ fn user_prompt_text_is_highlighted_in_transcript() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(lines[1].spans[1].content.as_ref(), "find getFoo");
-    assert_eq!(lines[1].spans[0].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[1].spans[1].style.bg, Some(PROMPT_BG));
-    assert_eq!(
-        lines[1].spans[1].style.fg,
-        Some(render::palette::muted_fg())
+    // Open bubble: lines[1].spans = [indent "  ", bullet (phase + space), text]
+    assert_eq!(lines[1].spans[1].style.fg, Some(AMBER));
+    assert!(
+        lines[1].spans[1].content.ends_with(' '),
+        "{:?}",
+        lines[1].spans[1].content
     );
-    assert!(!text.contains("◐"), "{text}");
+    assert_eq!(lines[1].spans[2].content.as_ref(), "find getFoo");
+    assert_eq!(lines[1].spans[2].style.fg, Some(Color::White));
 }
 
 #[test]
@@ -5762,6 +5458,7 @@ fn submitted_bang_prompt_marks_first_nonempty_bang_dark_red() {
     let item = TranscriptItem::user("  !ls");
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    // Content row is lines[1] (lines[0] is the bubble top border).
     let bang = lines[1]
         .spans
         .iter()
@@ -5774,9 +5471,7 @@ fn submitted_bang_prompt_marks_first_nonempty_bang_dark_red() {
         .expect("command body span");
 
     assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(bang.style.bg, Some(PROMPT_BG));
-    assert_eq!(rest.style.fg, Some(render::palette::muted_fg()));
-    assert_eq!(rest.style.bg, Some(PROMPT_BG));
+    assert_eq!(rest.style.fg, Some(Color::White));
 }
 
 #[test]
@@ -5797,9 +5492,7 @@ fn live_prompt_marks_first_nonempty_bang_dark_red() {
         .expect("command body span");
 
     assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(bang.style.bg, Some(PROMPT_BG));
-    assert_eq!(rest.style.fg, Some(render::palette::muted_fg()));
-    assert_eq!(rest.style.bg, Some(PROMPT_BG));
+    assert_eq!(rest.style.fg, Some(Color::White));
 }
 
 #[test]
@@ -5822,9 +5515,7 @@ fn submitted_double_bang_prompt_marks_both_bangs_dark_red() {
         .expect("command body span");
 
     assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(bang.style.bg, Some(PROMPT_BG));
-    assert_eq!(rest.style.fg, Some(render::palette::muted_fg()));
-    assert_eq!(rest.style.bg, Some(PROMPT_BG));
+    assert_eq!(rest.style.fg, Some(Color::White));
     assert!(
         lines[1]
             .spans
@@ -5852,22 +5543,20 @@ fn live_double_bang_prompt_marks_both_bangs_dark_red() {
         .expect("command body span");
 
     assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(bang.style.bg, Some(PROMPT_BG));
-    assert_eq!(rest.style.fg, Some(render::palette::muted_fg()));
-    assert_eq!(rest.style.bg, Some(PROMPT_BG));
+    assert_eq!(rest.style.fg, Some(Color::White));
 }
 
 #[test]
 fn prompt_height_grows_for_multiline_input() {
     let mut app = test_app(SessionMode::Build);
-    assert_eq!(input_panel_height(&app, 100), 3);
+    assert_eq!(input_panel_height(&app, 100), PROMPT_MIN_HEIGHT);
 
     set_input(&mut app, "one\ntwo\nthree".to_string());
-    assert_eq!(input_panel_height(&app, 100), 5);
+    assert_eq!(input_panel_height(&app, 100), 7);
 
     set_input(
         &mut app,
-        (0..20)
+        (0..30)
             .map(|index| format!("line {index}"))
             .collect::<Vec<_>>()
             .join("\n"),
@@ -9098,7 +8787,7 @@ fn tool_card_truncates_model_shell_to_five_lines_with_head_tail() {
         "middle should be elided: {output}"
     );
     assert!(
-        output.contains("Ctrl-O to expand"),
+        output.contains("Ctrl-T for full transcript"),
         "ellipsis hint missing: {output}"
     );
 }

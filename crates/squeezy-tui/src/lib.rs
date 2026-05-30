@@ -100,10 +100,11 @@ use input::{
     clear_input, complete_selected_slash_command, delete_at_cursor, delete_before_cursor,
     delete_next_word, delete_previous_word, delete_to_line_end, delete_to_line_start,
     handle_mention_popup_key, handle_overlay_key, handle_request_user_input_key, input_cursor,
-    insert_input_char, insert_input_text, move_input_cursor_left, move_input_cursor_line_end,
-    move_input_cursor_line_start, move_input_cursor_right, move_input_cursor_word_left,
-    move_input_cursor_word_right, move_slash_menu_selection, push_input_history,
-    recall_prompt_history, reject_unknown_slash_command, slash_suggestions,
+    insert_input_char, insert_input_text, move_input_cursor_down, move_input_cursor_left,
+    move_input_cursor_line_end, move_input_cursor_line_start, move_input_cursor_right,
+    move_input_cursor_up, move_input_cursor_word_left, move_input_cursor_word_right,
+    move_slash_menu_selection, push_input_history, recall_prompt_history,
+    reject_unknown_slash_command, slash_suggestions,
 };
 
 use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
@@ -131,8 +132,8 @@ const TOOL_CALL_MAX_LINES: usize = 5;
 /// `local_shell_command_call` in the agent). 50 lines fits a typical
 /// command's full output without truncation.
 const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
-const PROMPT_MIN_HEIGHT: u16 = 3;
-const PROMPT_MAX_HEIGHT: u16 = 8;
+const PROMPT_MIN_HEIGHT: u16 = 5;
+const PROMPT_MAX_HEIGHT: u16 = 30;
 const INLINE_VIEWPORT_HEIGHT: u16 = 18;
 // The slash-command roster grew well past 30 entries, so a 5-row
 // window forced users to scroll for almost any non-top-5 command.
@@ -533,7 +534,7 @@ async fn run_inner(
         app.push_log(banner);
     }
     for item in initial_transcript {
-        app.push_transcript_item(item);
+        hydrate_transcript_item(&mut app, item);
     }
     app.attachments = agent.context_attachments_snapshot().await;
     app.context_compaction = agent.context_compaction_snapshot().await;
@@ -663,12 +664,9 @@ fn maybe_pick_resume_session(
     if candidates.is_empty() {
         return Ok(ResumeStartup::Fresh);
     }
-    let choice = resume_picker::run_picker(
-        &mut terminal.terminal,
-        candidates,
-        config.workspace_root.clone(),
-    )
-    .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+    let choice =
+        resume_picker::run_picker(terminal.term(), candidates, config.workspace_root.clone())
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
     match choice {
         resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
         // `branch_tip` is captured by the picker but not yet wired through
@@ -986,7 +984,7 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             app.selected_entry = None;
             app.next_entry_id = 0;
             for item in transcript {
-                app.push_transcript_item(item);
+                hydrate_transcript_item(app, item);
             }
             app.attachments = agent.context_attachments_snapshot().await;
             app.pending_assistant.clear();
@@ -997,6 +995,39 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             app.status = format!("resumed session {session_id}");
         }
         Err(error) => app.status = format!("resume failed: {error}"),
+    }
+}
+
+/// Apply one `HydratedTranscriptItem` from the resume state to the
+/// live `TuiApp`, routing each variant to the matching `push_*`
+/// helper so the rebuilt transcript renders the same shape a fresh
+/// turn would. Tool-result cards need a roundtrip from
+/// `serde_json::Value` back to the typed `squeezy_tools::ToolResult`
+/// — done here so `squeezy-store` can stay independent of
+/// `squeezy-tools`. Malformed entries log a transcript warning and
+/// otherwise no-op rather than abort the whole hydration.
+fn hydrate_transcript_item(app: &mut TuiApp, item: squeezy_store::HydratedTranscriptItem) {
+    match item {
+        squeezy_store::HydratedTranscriptItem::Message { item } => {
+            app.push_transcript_item(item);
+        }
+        squeezy_store::HydratedTranscriptItem::ToolResult { call, result } => {
+            let parsed_result: ToolResult = match serde_json::from_value(result) {
+                Ok(result) => result,
+                Err(err) => {
+                    app.push_warn(format!(
+                        "resume: dropped a malformed tool-result card ({err})"
+                    ));
+                    return;
+                }
+            };
+            let parsed_call = call.map(|call| ToolCall {
+                call_id: call.call_id,
+                name: call.tool,
+                arguments: call.arguments,
+            });
+            app.push_tool_result_with_call(parsed_result, parsed_call);
+        }
     }
 }
 
@@ -1456,6 +1487,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 select_previous_transcript_entry(app);
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 recall_prompt_history(app, HistoryDirection::Previous);
+            } else if move_input_cursor_up(app) {
+                // Multi-line input: step the cursor up one line. Falls
+                // through to history/scroll when the cursor is already on
+                // the first line so the single-line behaviour is intact.
             } else if should_route_plain_arrow_to_scroll(app) {
                 scroll_transcript_up(app, 3);
             } else {
@@ -1471,6 +1506,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 select_next_transcript_entry(app);
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 recall_prompt_history(app, HistoryDirection::Next);
+            } else if move_input_cursor_down(app) {
+                // Same as Up — when there's a next line in the composer
+                // step into it; only when on the last line do we fall
+                // through to history/scroll.
             } else if should_route_plain_arrow_to_scroll(app) {
                 scroll_transcript_down(app, 3);
             } else {
@@ -1710,43 +1749,6 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             } else {
                 false
             }
-        }
-        keymap::Action::ExpandSelectedTranscriptEntry => {
-            tracing::debug!(
-                target: "squeezy_tui::keymap",
-                action = "expand_selected_transcript_entry",
-                composer_empty = app.input.is_empty(),
-                config_screen_open = app.config_screen.is_some(),
-                status_line_setup_open = app.status_line_setup.is_some(),
-                key_modifiers = ?key.modifiers,
-                key_code = ?key.code,
-                "Ctrl+O dispatched"
-            );
-            if app.config_screen.is_some() || app.status_line_setup.is_some() {
-                return false;
-            }
-            // `Ctrl+O` is dedicated — fires regardless of composer
-            // state. No need for the readline-line-end fall-through
-            // the previous `Ctrl+E` binding required.
-            toggle_selected_transcript_entry(app);
-            true
-        }
-        keymap::Action::ExpandAllTranscriptEntries => {
-            tracing::debug!(
-                target: "squeezy_tui::keymap",
-                action = "expand_all_transcript_entries",
-                composer_empty = app.input.is_empty(),
-                config_screen_open = app.config_screen.is_some(),
-                status_line_setup_open = app.status_line_setup.is_some(),
-                key_modifiers = ?key.modifiers,
-                key_code = ?key.code,
-                "Ctrl+E dispatched"
-            );
-            if app.config_screen.is_some() || app.status_line_setup.is_some() {
-                return false;
-            }
-            toggle_expand_all_transcript_entries(app);
-            true
         }
     }
 }
@@ -3385,184 +3387,6 @@ fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         }
         prompt_queue::QueueDispatch::Ignored => true, // stay modal
     }
-}
-
-fn toggle_selected_transcript_entry(app: &mut TuiApp) {
-    let selected = app
-        .selected_entry
-        .filter(|index| {
-            app.transcript
-                .get(*index)
-                .is_some_and(|entry| entry_targets_toggle(entry, app.show_reasoning_usage))
-        })
-        .map(|index| resolve_toggle_target(&app.transcript, index));
-    let Some(index) = selected
-        .or_else(|| latest_collapsed_transcript_entry(app))
-        .or_else(|| latest_toggleable_transcript_entry(app))
-    else {
-        app.status = "nothing to expand".to_string();
-        return;
-    };
-    let Some(entry) = app.transcript.get_mut(index) else {
-        app.selected_entry = None;
-        app.status = "select a transcript entry first".to_string();
-        return;
-    };
-    entry.collapsed = !entry.collapsed;
-    entry.bump_revision();
-    app.status = format!(
-        "{} transcript entry {} · Ctrl+E expand all",
-        if entry.collapsed {
-            "collapsed"
-        } else {
-            "expanded"
-        },
-        entry.id + 1
-    );
-}
-
-/// Bulk expand / collapse across every toggleable transcript entry.
-///
-/// Semantics: if any toggleable entry is currently collapsed, expand
-/// all of them; otherwise (everything already expanded), collapse all
-/// back to default. One-shot toggle so the user can rapidly switch
-/// between "show me everything" and "back to compact" states.
-///
-/// Reports the count operated on via `app.status` so the user always
-/// gets feedback — silent UI is the whole reason the original
-/// transcript expand surface felt broken on small screens.
-fn toggle_expand_all_transcript_entries(app: &mut TuiApp) {
-    let show_reasoning = app.show_reasoning_usage;
-    let mut total_toggleable = 0usize;
-    let mut total_collapsed = 0usize;
-    for entry in &app.transcript {
-        if entry_targets_toggle(entry, show_reasoning) {
-            total_toggleable += 1;
-            if entry.collapsed {
-                total_collapsed += 1;
-            }
-        }
-    }
-    if total_toggleable == 0 {
-        app.status = "nothing expandable yet".to_string();
-        return;
-    }
-    let target_collapsed = total_collapsed == 0;
-    let mut changed = 0usize;
-    for entry in app.transcript.iter_mut() {
-        if !entry_targets_toggle(entry, show_reasoning) {
-            continue;
-        }
-        if entry.collapsed != target_collapsed {
-            entry.collapsed = target_collapsed;
-            entry.bump_revision();
-            changed += 1;
-        }
-    }
-    app.status = if target_collapsed {
-        format!("collapsed {changed} of {total_toggleable} transcript entries · Ctrl+O expand one")
-    } else {
-        format!("expanded {changed} of {total_toggleable} transcript entries · Ctrl+O collapse one")
-    };
-}
-
-/// True when `entry` is a candidate for Ctrl-O / Ctrl-E. Mirrors
-/// `is_toggleable` but additionally skips reasoning entries when the
-/// user has hidden them via `show_reasoning_usage = false` — toggling
-/// a reasoning entry that renders zero lines has no visible effect and
-/// looks broken from the keyboard side.
-fn entry_targets_toggle(entry: &TranscriptEntry, show_reasoning: bool) -> bool {
-    if !entry.is_toggleable() {
-        return false;
-    }
-    if !show_reasoning && matches!(entry.kind, TranscriptEntryKind::Reasoning(_)) {
-        return false;
-    }
-    true
-}
-
-/// Walk back through a run of adjacent reasoning entries to find the
-/// Lead — the entry whose `collapsed` flag actually drives what the
-/// user sees on screen. `reasoning_run_info` coalesces adjacent
-/// reasoning entries into one rendered chip; toggling a Suppressed
-/// member flips a flag nothing renders. Mapping the toggle target back
-/// to the Lead ensures Ctrl-O / Ctrl-E acts on the visible chip.
-fn resolve_toggle_target(transcript: &[TranscriptEntry], index: usize) -> usize {
-    let mut cursor = index;
-    while cursor > 0
-        && matches!(
-            transcript.get(cursor).map(|e| &e.kind),
-            Some(TranscriptEntryKind::Reasoning(_))
-        )
-        && matches!(
-            transcript.get(cursor - 1).map(|e| &e.kind),
-            Some(TranscriptEntryKind::Reasoning(_))
-        )
-    {
-        cursor -= 1;
-    }
-    cursor
-}
-
-/// Ctrl+O is bound to `ExpandSelectedTranscriptEntry` and must never
-/// collapse an already-expanded entry when the user has not explicitly
-/// selected one. Restricting this picker to `collapsed = true` entries
-/// keeps an OpenAI turn that emitted no reasoning summary from being
-/// silently folded by a press the user meant as "show me more". The
-/// caller treats `None` as "nothing to expand" and surfaces a status
-/// hint rather than falling through to an expand-by-collapsing footgun.
-fn latest_toggleable_transcript_entry(app: &TuiApp) -> Option<usize> {
-    let show_reasoning = app.show_reasoning_usage;
-    app.transcript
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, entry)| entry.collapsed && entry_targets_toggle(entry, show_reasoning))
-        .map(|(index, _)| index)
-        .map(|index| resolve_toggle_target(&app.transcript, index))
-}
-
-fn latest_collapsed_transcript_entry(app: &TuiApp) -> Option<usize> {
-    // Prefer the most recent collapsed reasoning entry when one exists.
-    // Without this preference Ctrl-E falls through to the most recent
-    // collapsed *peer* — which after a turn lands is the assistant
-    // message (also collapsed on `transcript_default = compact`). The
-    // assistant body is usually a short single line, so toggling it has
-    // no visible effect and the reasoning chevron the user actually
-    // wanted to expand stays collapsed. Reasoning blocks are by far the
-    // most common Ctrl-E target, so prefer them when the user hasn't
-    // explicitly navigated to a specific entry.
-    //
-    // Adjacent reasoning entries coalesce into one chip rendered off the
-    // *Lead* entry's `collapsed` flag — toggling a `Suppressed` member
-    // would flip a flag nothing renders. `resolve_toggle_target` maps a
-    // Suppressed reasoning index back to its Lead so the chip the user
-    // sees is the one that actually toggles.
-    let show_reasoning = app.show_reasoning_usage;
-    if show_reasoning {
-        let latest_reasoning = app
-            .transcript
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, entry)| {
-                matches!(entry.kind, TranscriptEntryKind::Reasoning(_))
-                    && entry.collapsed
-                    && entry.is_toggleable()
-            })
-            .map(|(index, _)| index)
-            .map(|index| resolve_toggle_target(&app.transcript, index));
-        if latest_reasoning.is_some() {
-            return latest_reasoning;
-        }
-    }
-    app.transcript
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, entry)| entry.collapsed && entry_targets_toggle(entry, show_reasoning))
-        .map(|(index, _)| index)
-        .map(|index| resolve_toggle_target(&app.transcript, index))
 }
 
 /// Kick off a user-driven turn. Drains any pending config swap, consumes a
@@ -5530,70 +5354,81 @@ fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
 
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     let card_width = width.clamp(36, 64) as usize;
-    let inner = card_width.saturating_sub(2);
-    let border = "─".repeat(inner);
     vec![
-        Line::from(Span::styled(
-            format!("╭{border}╮"),
-            Style::default().fg(GOLD),
-        )),
-        startup_card_row(
-            inner,
-            "",
-            format!(">_ Squeezy v{}", app.version),
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-        ),
-        startup_card_row(
-            inner,
+        startup_phase_strip(card_width, app.version),
+        Line::from(""),
+        startup_meta_row(
             "model",
             format!("{}:{}", app.provider_name, app.model),
-            Style::default().fg(GOLD),
+            card_width,
         ),
-        startup_card_row(
-            inner,
-            "directory",
-            app.directory.clone(),
-            Style::default().fg(palette::muted_fg()),
-        ),
-        startup_card_row(
-            inner,
-            "languages",
-            app.language_summary.clone(),
-            Style::default().fg(palette::muted_fg()),
-        ),
-        Line::from(Span::styled(
-            format!("╰{border}╯"),
-            Style::default().fg(GOLD),
-        )),
+        startup_meta_row("directory", app.directory.clone(), card_width),
+        startup_meta_row("languages", app.language_summary.clone(), card_width),
     ]
 }
 
-fn startup_card_row(
-    inner_width: usize,
-    label: &'static str,
-    value: String,
-    value_style: Style,
-) -> Line<'static> {
-    let label_width = if label.is_empty() { 0 } else { 11 };
-    let value_width = inner_width.saturating_sub(label_width + 2);
-    let value = fit_chars(&value, value_width);
-    let used = 1 + label_width + value.chars().count();
-    let padding = " ".repeat(inner_width.saturating_sub(used));
-    if label.is_empty() {
-        return Line::from(vec![
-            Span::styled("│ ", Style::default().fg(GOLD)),
-            Span::styled(value, value_style),
-            Span::raw(padding),
-            Span::styled("│", Style::default().fg(GOLD)),
-        ]);
+fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {
+    const FULL: &[&str] = &["◌", "◔", "◑", "◕", "●"];
+    const COMPACT: &[&str] = &["◔", "◑", "◕", "●"];
+    const TIGHT: &[&str] = &["◑", "◕", "●"];
+    const MINIMAL: &[&str] = &["●"];
+
+    let title = "Squeezy";
+    let version_text = format!(" v{version}");
+    let title_total = title.chars().count() + version_text.chars().count();
+
+    for glyphs in [FULL, COMPACT, TIGHT, MINIMAL] {
+        let strip_chars = glyphs.len() * 2 - 1;
+        let content_total = strip_chars + 2 + title_total + 2 + strip_chars;
+        if content_total <= card_width {
+            let left_strip = glyphs.join(" ");
+            let right_strip = glyphs.iter().rev().copied().collect::<Vec<_>>().join(" ");
+            let pad_total = card_width.saturating_sub(content_total);
+            let pad_left = pad_total / 2;
+            let pad_right = pad_total.saturating_sub(pad_left);
+            return Line::from(vec![
+                Span::raw(" ".repeat(pad_left)),
+                Span::styled(left_strip, Style::default().fg(AMBER)),
+                Span::raw("  "),
+                Span::styled(
+                    title.to_string(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(version_text.clone(), Style::default().fg(AMBER)),
+                Span::raw("  "),
+                Span::styled(right_strip, Style::default().fg(AMBER)),
+                Span::raw(" ".repeat(pad_right)),
+            ]);
+        }
     }
+
+    let pad = card_width.saturating_sub(title_total) / 2;
     Line::from(vec![
-        Span::styled("│ ", Style::default().fg(GOLD)),
-        Span::styled(format!("{label}:"), Style::default().fg(AMBER)),
-        Span::raw(" ".repeat(label_width.saturating_sub(label.len() + 1))),
-        Span::styled(value, value_style),
-        Span::raw(padding),
-        Span::styled("│", Style::default().fg(GOLD)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(version_text, Style::default().fg(AMBER)),
+    ])
+}
+
+fn startup_meta_row(label: &'static str, value: String, card_width: usize) -> Line<'static> {
+    const INDENT: usize = 4;
+    const LABEL_WIDTH: usize = 11;
+    let label_len = label.chars().count();
+    let trailing = LABEL_WIDTH.saturating_sub(label_len);
+    let max_value = card_width.saturating_sub(INDENT + LABEL_WIDTH);
+    let value = fit_chars(&value, max_value);
+    Line::from(vec![
+        Span::raw(" ".repeat(INDENT)),
+        Span::styled(label.to_string(), Style::default().fg(AMBER)),
+        Span::raw(" ".repeat(trailing)),
+        Span::styled(value, Style::default().fg(Color::White)),
     ])
 }
 
@@ -6459,73 +6294,83 @@ fn accounting_value_style(value: &str) -> Style {
 fn format_user_prompt_entry(
     item: &TranscriptItem,
     _selected: bool,
-    width: Option<u16>,
+    _width: Option<u16>,
 ) -> Vec<Line<'static>> {
     let bang_range = bang_command_marker_range(&item.content);
     let mut content = item.content.split('\n').collect::<Vec<_>>();
     if content.is_empty() {
         content.push("");
     }
+    let max_text_width = content
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let amber = Style::default().fg(AMBER);
+    let bullet_style = amber.add_modifier(Modifier::BOLD);
+    const INDENT: &str = "  ";
+    // Cycle through the moon-phase set so consecutive prompts get a
+    // visually different bullet — content-hashed (not index-based) so
+    // the marker is stable per message even when prompts are
+    // reordered/collapsed in the transcript.
+    const BULLETS: &[&str] = &["◌", "◔", "◑", "◕", "◒", "◓"];
+    let bullet_idx = item
+        .content
+        .bytes()
+        .fold(0usize, |acc, b| acc.wrapping_add(b as usize))
+        % BULLETS.len();
+    let bullet = BULLETS[bullet_idx];
+
+    let top = Line::from(vec![
+        Span::raw(INDENT.to_string()),
+        Span::styled(format!("╭{}╮", "─".repeat(max_text_width + 2)), amber),
+    ]);
+
     let mut lines = Vec::with_capacity(content.len() + 3);
-    lines.push(user_prompt_blank_line(width));
+    lines.push(top);
+
     let mut line_start = 0usize;
-    lines.extend(content.into_iter().enumerate().map(|(index, line)| {
-        let marker = if index == 0 { "> " } else { "  " };
-        let rendered =
-            user_prompt_content_line(marker, line, line_start, bang_range.as_ref(), width);
-        line_start = line_start.saturating_add(line.len()).saturating_add(1);
-        rendered
-    }));
-    lines.push(user_prompt_blank_line(width));
+    for (index, line_text) in content.iter().enumerate() {
+        let slash_len = if index == 0 {
+            input::match_slash_command_prefix(line_text)
+        } else {
+            None
+        };
+        let bang_ref = bang_range.as_ref();
+        let style_text_at = |abs_offset: usize| -> Style {
+            if bang_ref.is_some_and(|range| range.contains(&abs_offset)) {
+                Style::default().fg(BANG_RED)
+            } else if let Some(len) = slash_len {
+                if abs_offset < len {
+                    Style::default().fg(AMBER)
+                } else {
+                    Style::default().fg(Color::White)
+                }
+            } else {
+                Style::default().fg(Color::White)
+            }
+        };
+        // First line gets the cycling moon-phase bullet; continuation
+        // lines indent in line with where the bullet sat.
+        let prefix_span = if index == 0 {
+            Span::styled(format!("{bullet} "), bullet_style)
+        } else {
+            Span::raw("  ".to_string())
+        };
+        let mut spans = vec![Span::raw(INDENT.to_string()), prefix_span];
+        push_styled_segments(&mut spans, line_text, line_start, style_text_at);
+        lines.push(Line::from(spans));
+        line_start = line_start.saturating_add(line_text.len()).saturating_add(1);
+    }
+
+    let bottom = Line::from(vec![
+        Span::raw(INDENT.to_string()),
+        Span::styled(format!("╰─◖{}╯", "─".repeat(max_text_width)), amber),
+    ]);
+    lines.push(bottom);
     lines.push(Line::from(""));
     lines
-}
-
-fn user_prompt_blank_line(width: Option<u16>) -> Line<'static> {
-    let marker = "  ";
-    let surface_width = user_prompt_surface_width(marker, width).unwrap_or(1);
-    Line::from(vec![
-        user_prompt_marker_span(marker),
-        Span::styled(" ".repeat(surface_width), Style::default().bg(PROMPT_BG)),
-    ])
-}
-
-fn user_prompt_content_line(
-    marker: &'static str,
-    line: &str,
-    line_start: usize,
-    bang_range: Option<&std::ops::Range<usize>>,
-    width: Option<u16>,
-) -> Line<'static> {
-    let text_width = line.chars().count();
-    let padding = user_prompt_surface_width(marker, width)
-        .map(|surface_width| " ".repeat(surface_width.saturating_sub(text_width)))
-        .unwrap_or_default();
-    let mut spans = vec![user_prompt_marker_span(marker)];
-    // First content line of a user message can carry a `/<command>` prefix.
-    // We keep the rest of the line in white so multi-word prompts like
-    // `/help changing the model` stay legible while the recognised command
-    // pops in amber.
-    let slash_len = (marker == "> ")
-        .then(|| input::match_slash_command_prefix(line))
-        .flatten();
-    let style_text_at = |abs_offset: usize| -> Style {
-        let base = Style::default().bg(PROMPT_BG);
-        if bang_range.is_some_and(|range| range.contains(&abs_offset)) {
-            base.fg(BANG_RED)
-        } else if let Some(len) = slash_len {
-            if marker == "> " && abs_offset < len {
-                base.fg(AMBER)
-            } else {
-                base.fg(palette::muted_fg())
-            }
-        } else {
-            base.fg(palette::muted_fg())
-        }
-    };
-    push_styled_segments(&mut spans, line, line_start, style_text_at);
-    spans.push(Span::styled(padding, Style::default().bg(PROMPT_BG)));
-    Line::from(spans)
 }
 
 /// Byte range covering the leading `!` (single-bang) or `!!`
@@ -6546,19 +6391,6 @@ fn bang_command_marker_range(text: &str) -> Option<std::ops::Range<usize>> {
         end += next.len_utf8();
     }
     Some(start..end)
-}
-
-fn user_prompt_surface_width(marker: &str, width: Option<u16>) -> Option<usize> {
-    width.map(|width| (width as usize).saturating_sub(marker.chars().count()))
-}
-
-fn user_prompt_marker_span(marker: &'static str) -> Span<'static> {
-    let style = if marker.trim().is_empty() {
-        Style::default().bg(PROMPT_BG)
-    } else {
-        Style::default().fg(GOLD).bg(PROMPT_BG)
-    };
-    Span::styled(marker, style)
 }
 
 fn format_assistant_message_entry(
@@ -6627,7 +6459,10 @@ fn reasoning_block_lines_with_extras(
             .map(|first| compact_text(first, 120))
             .unwrap_or_default();
         let mut suffix = if body_lines.len() > 1 {
-            format!(" … +{} lines (Ctrl-O to expand)", body_lines.len() - 1)
+            format!(
+                " … +{} lines (Ctrl-T for full transcript)",
+                body_lines.len() - 1
+            )
         } else {
             String::new()
         };
@@ -6809,14 +6644,13 @@ fn collapsed_content_summary(content: &str) -> String {
     let lines = content.lines().collect::<Vec<_>>();
     if lines.len() > 1 {
         let first = compact_text(lines.first().copied().unwrap_or_default(), 120);
-        format!("{first} … +{} lines (Ctrl-O to expand)", lines.len() - 1)
+        format!(
+            "{first} … +{} lines (Ctrl-T for full transcript)",
+            lines.len() - 1
+        )
     } else {
         compact_text(content, 160)
     }
-}
-
-fn text_has_collapsible_content(content: &str) -> bool {
-    content.lines().count() > 1 || content.len() > 160
 }
 
 fn format_tool_result_entry(
@@ -6866,7 +6700,7 @@ fn wrap_tool_card(header: Line<'static>, body: Vec<Line<'static>>) -> Vec<Line<'
 /// `extras + 1` consecutive same-tool same-status entries.
 ///
 /// In collapsed form the header reads `"Read 3 files"` etc., the body is
-/// one summary row per member followed by a `(Ctrl-E to expand all)`
+/// one summary row per member followed by a `(Ctrl-T for full transcript)`
 /// affordance row. In expanded form the header is followed by each
 /// member's normal tool-card body rendered inline so the user can scan
 /// their full output.
@@ -6897,7 +6731,7 @@ fn format_grouped_tool_result_entry(
         body.push(detail_line(
             false,
             QUIET,
-            "(Ctrl-E to expand all)".to_string(),
+            "(Ctrl-T for full transcript)".to_string(),
         ));
     } else {
         // Stack each child's full single-tool render. Each is already
@@ -7024,11 +6858,12 @@ fn collapsed_tool_preview_lines(
     head_tail_truncate_lines(detail, cap)
 }
 
-/// Head-tail truncate a list of rendered detail lines, inserting a
-/// single "… +N lines (Ctrl-O to expand)" ellipsis between the head and
-/// tail when the total exceeds `2 * cap`. Cap is the maximum number of
-/// lines to keep on EACH end. Wording stays consistent with the existing
-/// diff renderer (see `render::diff::head_tail`).
+/// Head-tail truncate a list of rendered detail lines, inserting a single
+/// "… +N lines (Ctrl-T for full transcript)" ellipsis between the head and tail
+/// when the total exceeds `2 * cap`. Cap is the maximum number of lines
+/// to keep on EACH end. Mirrors codex's `output_ellipsis_line` UX —
+/// wording stays consistent with the existing diff renderer
+/// (see `render::diff::head_tail`).
 fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'static>> {
     if cap == 0 || lines.len() <= cap.saturating_mul(2) {
         return lines;
@@ -7039,7 +6874,7 @@ fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'
     out.push(detail_line(
         false,
         QUIET,
-        format!("… +{omitted} lines (Ctrl-O to expand)"),
+        format!("… +{omitted} lines (Ctrl-T for full transcript)"),
     ));
     out.extend(
         lines
@@ -7070,11 +6905,14 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
         ])];
     }
     if entry.kind == LogKind::Warn {
-        // Single-line `⚠ message` rendering for turn-end signals so the
-        // user can spot a cancel/fail at a glance instead of scanning a
-        // `│`-prefixed body that visually matches every other log row.
+        // `⚠ message` rendering for turn-end signals so the user can spot
+        // a cancel/fail at a glance. Newlines are flattened to spaces so
+        // the whole error reads as one bullet, and the transcript
+        // paragraph's `Wrap { trim: false }` line-wraps anything long —
+        // errors from providers can be hundreds of characters and need to
+        // stay fully visible rather than being cut off with `…`.
         let marker = if selected { "> " } else { "  " };
-        let preview = compact_text(message, 200);
+        let preview = message.replace('\n', " ");
         return vec![Line::from(vec![
             Span::raw(marker),
             Span::styled("⚠ ", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
@@ -8089,7 +7927,10 @@ fn expanded_symbol_context_detail_lines(
         lines.push(detail_line(
             false,
             QUIET,
-            format!("+{} more packets (Ctrl-O to expand)", total - packet_cap),
+            format!(
+                "+{} more packets (Ctrl-T for full transcript)",
+                total - packet_cap
+            ),
         ));
     }
     lines
@@ -8577,7 +8418,10 @@ fn expanded_generic_tool_detail_lines(
         lines.push(detail_line(
             false,
             QUIET,
-            format!("+{} more fields (Ctrl-O to expand)", total_keys - shown),
+            format!(
+                "+{} more fields (Ctrl-T for full transcript)",
+                total_keys - shown
+            ),
         ));
     }
     lines
@@ -8676,7 +8520,7 @@ fn head_tail_lines(content: &str, limit: usize) -> Vec<PreviewLine> {
         })
         .collect::<Vec<_>>();
     preview.push(PreviewLine {
-        text: format!("… +{omitted} lines (Ctrl-O to expand)"),
+        text: format!("… +{omitted} lines (Ctrl-T for full transcript)"),
         truncated_marker: true,
     });
     preview.extend(
@@ -9213,14 +9057,17 @@ fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
     // activity indicators buzzing forever even though the agent was
     // doing nothing.
     if app.turn_visual == TurnVisualState::Idle {
-        return Span::styled("●", Style::default().fg(AMBER));
+        return Span::styled("●", Style::default().fg(AMBER).add_modifier(Modifier::BOLD));
     }
     let color = if (prompt_elapsed_ms(app) / 800).is_multiple_of(2) {
         GOLD
     } else {
         AMBER
     };
-    Span::styled(prompt_coin_frame(app), Style::default().fg(color))
+    Span::styled(
+        prompt_coin_frame(app),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
 }
 
 fn prompt_coin_frame(app: &TuiApp) -> &'static str {
@@ -9244,7 +9091,7 @@ fn prompt_elapsed_ms(app: &TuiApp) -> u64 {
 }
 
 fn prompt_cursor_span() -> Span<'static> {
-    Span::styled("┃", Style::default().fg(GOLD).bg(PROMPT_BG))
+    Span::styled("┃", Style::default().fg(AMBER))
 }
 
 pub(crate) fn compact_text(text: &str, limit: usize) -> String {
@@ -9322,7 +9169,7 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
         queue_overlay_lines + overlay_lines + mention_lines + suggestion_lines + indicator_lines;
     let max_height = (PROMPT_MAX_HEIGHT as usize).max(popup_height + PROMPT_MIN_HEIGHT as usize);
     prompt_visual_line_count(&app.input, width)
-        .saturating_add(2)
+        .saturating_add(4)
         .saturating_add(queue_overlay_lines)
         .saturating_add(overlay_lines)
         .saturating_add(mention_lines)
@@ -9348,9 +9195,8 @@ fn prompt_visual_line_count(input: &str, width: u16) -> usize {
 fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     if app.input.is_empty() {
         return vec![Line::from(vec![
-            Span::styled(" ", Style::default().bg(PROMPT_BG)),
             prompt_coin_span(app),
-            Span::styled("  ", Style::default().bg(PROMPT_BG)),
+            Span::raw("  "),
             prompt_cursor_span(),
         ])];
     }
@@ -9368,31 +9214,23 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .enumerate()
         .map(|(index, line)| {
             let prefix = if index == 0 {
-                vec![
-                    Span::styled(" ", Style::default().bg(PROMPT_BG)),
-                    prompt_coin_span(app),
-                    Span::styled("  ", Style::default().bg(PROMPT_BG)),
-                ]
+                vec![prompt_coin_span(app), Span::raw("  ")]
             } else {
-                vec![Span::styled(
-                    "    ",
-                    Style::default().fg(QUIET).bg(PROMPT_BG),
-                )]
+                vec![Span::raw("   ")]
             };
             let mut spans = prefix;
             let line_end = line_start + line.len();
             let slash_split = if index == 0 { slash_len } else { None };
             let style_text_at = |abs_offset: usize| -> Style {
-                let base = Style::default().bg(PROMPT_BG);
                 if bang_range
                     .as_ref()
                     .is_some_and(|range| range.contains(&abs_offset))
                 {
-                    base.fg(BANG_RED)
+                    Style::default().fg(BANG_RED)
                 } else {
                     match slash_split {
-                        Some(len) if abs_offset < len => base.fg(AMBER),
-                        _ => base.fg(palette::muted_fg()),
+                        Some(len) if abs_offset < len => Style::default().fg(AMBER),
+                        _ => Style::default().fg(Color::White),
                     }
                 }
             };
@@ -9444,19 +9282,67 @@ fn push_styled_segments(
     }
 }
 
-fn prompt_blank_line() -> Line<'static> {
-    Line::from(Span::styled(" ", Style::default().bg(PROMPT_BG)))
+fn prompt_input_lines(app: &TuiApp, height: u16, width: u16) -> Vec<Line<'static>> {
+    let content = prompt_input_content_lines(app);
+    let cursor_line = app.input[..input_cursor(app)].matches('\n').count();
+    composer_bubble_lines(content, cursor_line, height, width)
 }
 
-fn prompt_input_lines(app: &TuiApp, height: u16) -> Vec<Line<'static>> {
-    let content = prompt_input_content_lines(app);
-    let spare = (height as usize).saturating_sub(content.len());
-    let top_padding = spare / 2;
-    let bottom_padding = spare.saturating_sub(top_padding);
-    let mut lines = Vec::with_capacity(top_padding + content.len() + bottom_padding);
-    lines.extend((0..top_padding).map(|_| prompt_blank_line()));
-    lines.extend(content);
-    lines.extend((0..bottom_padding).map(|_| prompt_blank_line()));
+fn composer_bubble_lines(
+    content: Vec<Line<'static>>,
+    cursor_line: usize,
+    height: u16,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let width = width as usize;
+    let height = height as usize;
+    if width < 4 || height < 3 {
+        return content;
+    }
+    let amber = Style::default().fg(AMBER);
+
+    // Open layout: just a top and bottom horizontal rule with the typed
+    // content sandwiched between blank padding rows. No vertical sides —
+    // they read as visual noise when the composer is on the default
+    // terminal background.
+    let rule = Line::from(Span::styled("─".repeat(width), amber));
+
+    let interior_rows = height.saturating_sub(2);
+    let mut content = content;
+    if content.len() > interior_rows {
+        // Pick the visible window so the cursor's line stays on screen.
+        // Center the cursor in the window when there's room; clamp to
+        // the content's start/end so Up at the top doesn't show phantom
+        // rows above line 0 and Down at the bottom doesn't show rows
+        // past the last typed line.
+        let cursor_line = cursor_line.min(content.len() - 1);
+        let half = interior_rows / 2;
+        let max_start = content.len() - interior_rows;
+        let window_start = cursor_line.saturating_sub(half).min(max_start);
+        let window_end = window_start + interior_rows;
+        content = content[window_start..window_end].to_vec();
+    }
+
+    // Center the content vertically inside the interior so the coin
+    // hovers between the rules instead of hugging the top one.
+    let spare = interior_rows.saturating_sub(content.len());
+    let top_pad = spare / 2;
+    let bot_pad = spare - top_pad;
+
+    let mut lines = Vec::with_capacity(height);
+    lines.push(rule.clone());
+    for _ in 0..top_pad {
+        lines.push(Line::from(""));
+    }
+    for line in content {
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
+    }
+    for _ in 0..bot_pad {
+        lines.push(Line::from(""));
+    }
+    lines.push(rule);
     lines
 }
 
@@ -9594,7 +9480,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         + suggestion_lines.len()
         + indicator_line.iter().count();
     let prompt_height = area.height.saturating_sub(extra_height as u16);
-    let mut lines = prompt_input_lines(app, prompt_height);
+    let mut lines = prompt_input_lines(app, prompt_height, area.width);
     let indicator_row_offset = lines.len() as u16;
     let indicator_present = indicator_line.is_some();
     if let Some(line) = indicator_line {
@@ -9623,7 +9509,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     lines.extend(suggestion_lines);
     let scroll = lines.len().saturating_sub(area.height as usize) as u16;
     let paragraph = Paragraph::new(lines)
-        .style(Style::default().fg(palette::muted_fg()).bg(PROMPT_BG))
+        .style(Style::default().fg(Color::White))
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
@@ -9947,6 +9833,25 @@ const CONTEXT_BUDGET_HINT_PCT: u64 = 85;
 pub(crate) const CONTEXT_NUDGE_THRESHOLD_RATIO_PCT: u64 = 70;
 
 fn format_status_hints(app: &TuiApp) -> String {
+    let base = format_status_hint_base(app);
+    // `app.status` carries the per-action acknowledgement string set
+    // by `toggle_*`, `dispatch_command`, mode-switch, and friends.
+    // Before this branch surfaced anything visible the field was
+    // effectively write-only — keystrokes confirmed silently. When
+    // the value matches a user-action allowlist (toggle, mode switch,
+    // slash result, etc.), prepend it as a transient badge in FRONT
+    // of the full hint row so the user gets visible feedback without
+    // losing the help text. The ack stays put until the next state
+    // change overwrites `app.status` — that's fine: it's always
+    // adjacent to, not in place of, the affordance list.
+    if let Some(transient) = transient_status_message(app) {
+        format!("{transient} · {base}")
+    } else {
+        base
+    }
+}
+
+fn format_status_hint_base(app: &TuiApp) -> String {
     if let Some(pending) = app.pending_request_user_input.as_ref() {
         if pending.request.choices.is_empty() && pending.request.allow_freeform {
             return "type your answer · Enter send · Esc cancel".to_string();
@@ -9970,7 +9875,7 @@ fn format_status_hints(app: &TuiApp) -> String {
             .to_string();
     } else if app.cancel.is_some() {
         let mut hint = String::from(
-            "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-O expand · Ctrl-E expand all · Ctrl-T transcript · Ctrl-Y copy · /help",
+            "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-T full transcript · Ctrl-Y copy · /help",
         );
         if !app.prompt_queue.is_empty() {
             hint.push_str(&format!(" · Ctrl+X Q reorder ({})", app.prompt_queue.len()));
@@ -9985,10 +9890,10 @@ fn format_status_hints(app: &TuiApp) -> String {
         return "Ctrl-R restore last prompt · Enter send · Ctrl+J newline · /help".to_string();
     }
     let mut base = if app.alternate_scroll_enabled {
-        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-O expand · Ctrl-E expand all · Ctrl-T transcript · /help"
+        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-T full transcript · /help"
             .to_string()
     } else {
-        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-O expand · Ctrl-E expand all · Ctrl-T transcript · /help"
+        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-T full transcript · /help"
             .to_string()
     };
     if app.context_compaction_threshold > 0
@@ -10006,6 +9911,51 @@ fn format_status_hints(app: &TuiApp) -> String {
         ));
     }
     base
+}
+
+/// Allowlisted prefixes for status strings the user explicitly
+/// triggered (toggle, mode switch, slash command result, prompt
+/// queue op). The agent's mid-turn `app.status` writes ("running
+/// grep", "queued shell", "thinking", subagent lifecycle) are NOT
+/// listed — those already surface via `turn_progress_segment` /
+/// `active_tool`, and double-rendering them would make every
+/// tool-call event flicker the hint row.
+const USER_ACTION_STATUS_PREFIXES: &[&str] = &[
+    "expanded ",
+    "collapsed ",
+    "mode switched ",
+    "already in ",
+    "stay in ",
+    "plan prompt dismissed",
+    "chord cancelled",
+    "exit cancelled",
+    "Ctrl+X…",
+    "transcript overlay",
+    "task panel ",
+    "/expand",
+    "/collapse",
+    "/statusline cancelled",
+    "no recent session",
+    "session quick-switch",
+    "resume failed",
+    "restored last prompt",
+    "nothing expandable",
+    "select a transcript entry",
+];
+
+/// `app.status` value to surface as a transient acknowledgement, or
+/// `None` when the current value is a lifecycle placeholder
+/// (`"ready"`, `"thinking"`, tool-progress writes) that the hint row
+/// shouldn't clobber.
+fn transient_status_message(app: &TuiApp) -> Option<String> {
+    let status = app.status.trim();
+    if status.is_empty() {
+        return None;
+    }
+    USER_ACTION_STATUS_PREFIXES
+        .iter()
+        .any(|prefix| status.starts_with(prefix))
+        .then(|| status.to_string())
 }
 
 pub(crate) fn format_mcp_status(app: &TuiApp) -> String {
@@ -11460,42 +11410,6 @@ impl TranscriptEntry {
         }
     }
 
-    fn is_toggleable(&self) -> bool {
-        match &self.kind {
-            TranscriptEntryKind::Message(item) => {
-                if item.role == Role::User {
-                    return false;
-                }
-                if text_has_collapsible_content(&item.content) {
-                    return true;
-                }
-                // Assistant messages can carry an embedded reasoning
-                // snapshot whose chip's ▸/▾ state follows the parent
-                // entry's `collapsed` flag (see
-                // `format_assistant_message_entry`). When the
-                // assistant text is short but the embedded reasoning is
-                // multi-line, the entry must still be toggleable —
-                // otherwise the picker rejects it and the toggle paths
-                // surface a no-op even though the chip is visible on
-                // screen.
-                if let Some(snapshot) = item.reasoning.as_deref()
-                    && text_has_collapsible_content(&snapshot.display_text)
-                {
-                    return true;
-                }
-                false
-            }
-            TranscriptEntryKind::ToolResult(_) => true,
-            TranscriptEntryKind::Log(entry) => {
-                entry.kind == LogKind::Normal && text_has_collapsible_content(&entry.message)
-            }
-            TranscriptEntryKind::PlanCard(_) => true,
-            TranscriptEntryKind::Diff(_) => true,
-            TranscriptEntryKind::Reasoning(_) => true,
-            TranscriptEntryKind::SlashEcho(_) => false,
-        }
-    }
-
     /// True when the entry is a tool-result card whose status already
     /// communicates a turn-ending cancellation (rendered with `⚠`).
     /// Used to suppress the redundant `⚠ turn cancelled` log that the
@@ -11818,8 +11732,31 @@ impl From<TuiAlternateScreen> for TerminalMode {
 }
 
 struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<TerminalWriter>>,
+    /// `Option` so we can drop and rebuild the ratatui `Terminal`
+    /// Primary terminal in the user-configured mode. For inline
+    /// mode this is a `Viewport::Inline(N)` terminal pinned to the
+    /// bottom N rows of the main buffer; for alt-screen mode it's
+    /// a fullscreen terminal. Always `Some` after `enter`.
+    terminal: Option<Terminal<CrosstermBackend<TerminalWriter>>>,
+    /// Secondary fullscreen terminal used only when the configured
+    /// mode is inline and the transcript overlay is open. Built
+    /// lazily on the first overlay open so a session that never
+    /// opens the overlay never pays for it. Once constructed it
+    /// stays alive for the rest of the session — re-using it
+    /// avoids ratatui's `Terminal::with_options(Inline(N))`
+    /// `append_lines` scroll-up that fires on every fresh inline
+    /// Terminal construction (the bug that ghosted the pre-overlay
+    /// viewport above the new one on overlay close).
+    overlay_terminal: Option<Terminal<CrosstermBackend<TerminalWriter>>>,
+    /// User-configured mode (`Inline` or `AlternateScreen`). Stays
+    /// constant for the session — overlay-screen swaps only flip
+    /// `overlay_screen_active`, not `mode`.
     mode: TerminalMode,
+    /// True while the inline guard is currently routing draws to
+    /// the alt-screen overlay terminal. Always `false` when
+    /// `mode == AlternateScreen` (that mode is already fullscreen —
+    /// no swap needed).
+    overlay_screen_active: bool,
     exit_hint: Option<String>,
     startup_flushed: bool,
     transcript_flushed_len: usize,
@@ -11828,6 +11765,23 @@ struct TerminalGuard {
     /// terminal-capability detection; consulted around every frame
     /// draw to wrap output in Begin/End Synchronized Update sequences.
     synchronized_output: bool,
+}
+
+impl TerminalGuard {
+    /// The terminal that should receive the next draw. Routes to
+    /// `overlay_terminal` while the alt-screen overlay is up, back
+    /// to the primary `terminal` otherwise.
+    fn term(&mut self) -> &mut Terminal<CrosstermBackend<TerminalWriter>> {
+        if self.overlay_screen_active {
+            self.overlay_terminal
+                .as_mut()
+                .expect("overlay terminal must be built when overlay-screen is active")
+        } else {
+            self.terminal
+                .as_mut()
+                .expect("primary terminal lost — unreachable after `enter`")
+        }
+    }
 }
 
 impl TerminalGuard {
@@ -11905,8 +11859,10 @@ impl TerminalGuard {
         }
         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         Ok(Self {
-            terminal,
+            terminal: Some(terminal),
+            overlay_terminal: None,
             mode,
+            overlay_screen_active: false,
             exit_hint: None,
             startup_flushed: false,
             transcript_flushed_len: 0,
@@ -11924,7 +11880,7 @@ impl TerminalGuard {
     /// user just stares at empty space until the main loop starts.
     fn draw_startup_placeholder(&mut self, message: &str) -> Result<()> {
         let message = message.to_string();
-        self.terminal
+        self.term()
             .draw(|frame| {
                 let area = frame.area();
                 if area.width == 0 || area.height == 0 {
@@ -11953,7 +11909,7 @@ impl TerminalGuard {
             })
             .map(|_| ())
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        let _ = self.terminal.backend_mut().flush();
+        let _ = self.term().backend_mut().flush();
         Ok(())
     }
 
@@ -11963,15 +11919,32 @@ impl TerminalGuard {
             self.wipe_inline_viewport_for_resize()?;
         }
         self.apply_terminal_title(app)?;
+        // Promote into / demote out of the alt-screen buffer based on
+        // whether the user has the transcript overlay open. No-op when
+        // `mode == AlternateScreen` (the whole terminal is already
+        // fullscreen there). Must run BEFORE we borrow the terminal
+        // for the draw, because it swaps `self.terminal`.
+        self.sync_overlay_screen(app.transcript_overlay.is_some())?;
+        // After the swap, decide which render path to take. Inline
+        // mode + no overlay = `render_inline` (small viewport painted
+        // over scrollback). Alt-screen mode OR overlay-screen swap =
+        // `render` (fullscreen draw, with the overlay branch picking
+        // the right widget).
+        let use_fullscreen_render =
+            self.mode == TerminalMode::AlternateScreen || self.overlay_screen_active;
+        if !use_fullscreen_render {
+            self.flush_history(app)?;
+        }
+        let synchronized = self.synchronized_output;
+        let terminal = self.term();
         // DEC 2026 Begin Synchronized Update bracket. Writing it through
         // the backend buffer puts it ahead of the cell-diff bytes that
         // `terminal.draw` is about to emit; capable terminals start
         // buffering at parse time and commit the whole frame when they
         // see the matching End Synchronized Update written below.
         // Unsupported terminals silently ignore both sequences.
-        if self.synchronized_output {
-            let _ = self
-                .terminal
+        if synchronized {
+            let _ = terminal
                 .backend_mut()
                 .write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes());
         }
@@ -11979,27 +11952,126 @@ impl TerminalGuard {
         // which would block the post-draw `backend_mut` reborrow below.
         // Collapse to `Result<(), io::Error>` immediately so the borrow
         // ends before we reach for the backend again.
-        let draw_outcome: io::Result<()> = match self.mode {
-            TerminalMode::Inline => {
-                self.flush_history(app)?;
-                self.terminal
-                    .draw(|frame| render_inline(frame, app))
-                    .map(|_| ())
-            }
-            TerminalMode::AlternateScreen => {
-                self.terminal.draw(|frame| render(frame, app)).map(|_| ())
-            }
+        let draw_outcome: io::Result<()> = if use_fullscreen_render {
+            terminal.draw(|frame| render(frame, app)).map(|_| ())
+        } else {
+            terminal.draw(|frame| render_inline(frame, app)).map(|_| ())
         };
         // Always emit ESU (even when draw fails) so the terminal does
         // not stay parked in a buffered-update state — the spec lets a
         // capable terminal time the bracket out on its own, but closing
         // it promptly keeps the visible frame in sync with our state.
-        if self.synchronized_output {
-            let backend = self.terminal.backend_mut();
+        if synchronized {
+            let backend = terminal.backend_mut();
             let _ = backend.write_all(END_SYNCHRONIZED_UPDATE.as_bytes());
             let _ = backend.flush();
         }
         draw_outcome.map_err(|err| SqueezyError::Terminal(err.to_string()))
+    }
+
+    /// Reconcile the alt-screen-for-overlay swap state with the
+    /// caller's request. No-op when we're already in alt-screen mode
+    /// for the whole session, or when the requested state already
+    /// matches. Otherwise:
+    ///
+    /// - **Inline → overlay**: drop the inline `Terminal` so its
+    ///   writer releases stdout, send `EnterAlternateScreen`
+    ///   directly, then build a fresh fullscreen `Terminal` over a
+    ///   new stdout writer. The original inline-mode terminal
+    ///   scrollback is preserved by the terminal emulator's main
+    ///   buffer; the overlay paints into the separate alt-screen
+    ///   buffer.
+    /// - **Overlay → inline**: reverse — drop the alt-screen
+    ///   `Terminal`, send `LeaveAlternateScreen` (which restores the
+    ///   main buffer with all the pre-overlay scrollback intact),
+    ///   then build a fresh `Viewport::Inline` `Terminal` to resume
+    ///   painting the bottom-anchored TUI viewport.
+    fn sync_overlay_screen(&mut self, want_overlay_full: bool) -> Result<()> {
+        if self.mode != TerminalMode::Inline {
+            return Ok(());
+        }
+        match (self.overlay_screen_active, want_overlay_full) {
+            (false, true) => self.enter_overlay_screen(),
+            (true, false) => self.leave_overlay_screen(),
+            _ => Ok(()),
+        }
+    }
+
+    fn enter_overlay_screen(&mut self) -> Result<()> {
+        // Lazily build the alt-screen ratatui `Terminal` the first
+        // time the overlay opens. `Viewport::Fullscreen` is the
+        // important detail: ratatui's fullscreen construction does
+        // NOT call `append_lines`, so it never scrolls main-buffer
+        // content. The terminal stays alive for the rest of the
+        // session — subsequent opens just re-enter alt-screen via
+        // ANSI without rebuilding the ratatui state.
+        if self.overlay_terminal.is_none() {
+            let writer = TerminalWriter::from_env(io::stdout());
+            let backend = CrosstermBackend::new(writer);
+            self.overlay_terminal = Some(
+                Terminal::new(backend).map_err(|err| SqueezyError::Terminal(err.to_string()))?,
+            );
+        }
+        // Switch the terminal emulator into the alt-screen buffer.
+        // Write through the inline Terminal's backend so the bytes
+        // serialize with any pending inline output.
+        {
+            let inline = self
+                .terminal
+                .as_mut()
+                .expect("primary inline terminal lost — unreachable after `enter`");
+            execute!(
+                inline.backend_mut(),
+                EnterAlternateScreen,
+                Clear(ClearType::All),
+                MoveTo(0, 0)
+            )
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        }
+        // Force the overlay terminal to paint from scratch — its
+        // internal "previously drawn" buffer is stale (from the
+        // last overlay open, or empty on first use) but the
+        // alt-screen buffer we're about to draw into is blank.
+        self.overlay_terminal
+            .as_mut()
+            .expect("just built / persistent")
+            .clear()
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        self.overlay_screen_active = true;
+        Ok(())
+    }
+
+    fn leave_overlay_screen(&mut self) -> Result<()> {
+        // Last write through the overlay Terminal's backend before
+        // we leave alt-screen — same reasoning as
+        // `enter_overlay_screen`: serialize the escape sequence
+        // with any final overlay-render bytes.
+        {
+            let overlay = self
+                .overlay_terminal
+                .as_mut()
+                .expect("overlay terminal must be built when overlay-screen is active");
+            execute!(overlay.backend_mut(), LeaveAlternateScreen)
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        }
+        // The terminal emulator has restored the main buffer. The
+        // pre-overlay inline TUI viewport content (input row,
+        // status, hint) is still sitting in the bottom rows where
+        // it was when alt-screen entered, because we never touched
+        // the main buffer during the overlay. The inline Terminal's
+        // internal "last drawn" state still matches that visible
+        // content, so the next `draw` diffs against the correct
+        // baseline and only emits cells that genuinely changed.
+        //
+        // What CAN have changed during the overlay: new transcript
+        // entries (committed reasoning, assistant message) that
+        // arrived while we were suppressing `flush_history`. The
+        // next `draw_app` call will pick them up and push them
+        // into scrollback via `insert_before`, scrolling the
+        // pre-overlay viewport down into its new position
+        // naturally.
+        self.overlay_screen_active = false;
+        Ok(())
     }
 
     fn apply_terminal_title(&mut self, app: &mut TuiApp) -> Result<()> {
@@ -12008,7 +12080,7 @@ impl TerminalGuard {
         if desired == app.last_terminal_title {
             return Ok(());
         }
-        let backend = self.terminal.backend_mut();
+        let backend = self.term().backend_mut();
         match &desired {
             Some(title) => write!(backend, "\x1b]0;{title}\x07"),
             None => write!(backend, "\x1b]0;\x07"),
@@ -12027,27 +12099,28 @@ impl TerminalGuard {
     /// scroll to pull up. Alternate-screen mode handles resize cleanly via
     /// the terminal itself, so the work is inline-only.
     fn wipe_inline_viewport_for_resize(&mut self) -> Result<()> {
-        if self.mode != TerminalMode::Inline {
+        if self.mode != TerminalMode::Inline || self.overlay_screen_active {
             return Ok(());
         }
-        let viewport_top = self.terminal.get_frame().area().y;
+        let viewport_top = self.term().get_frame().area().y;
+        let terminal = self.term();
         execute!(
-            self.terminal.backend_mut(),
+            terminal.backend_mut(),
             MoveTo(0, viewport_top),
             Clear(ClearType::FromCursorDown)
         )
         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        self.terminal
+        terminal
             .clear()
             .map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
 
     fn flush_history(&mut self, app: &TuiApp) -> Result<()> {
-        if self.mode != TerminalMode::Inline {
+        if self.mode != TerminalMode::Inline || self.overlay_screen_active {
             return Ok(());
         }
         let width = self
-            .terminal
+            .term()
             .size()
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?
             .width;
@@ -12067,7 +12140,7 @@ impl TerminalGuard {
             return Ok(());
         }
         let height = visual_line_count(&lines, width);
-        self.terminal
+        self.term()
             .insert_before(height, |buffer| render_lines_to_buffer(buffer, lines))
             .map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
@@ -12076,10 +12149,28 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        // If we exited while the overlay-screen swap was active,
+        // leave the alt-screen buffer first so the user's main-buffer
+        // scrollback (the inline conversation history) is what stays
+        // visible after the process tears down. The overlay terminal
+        // owns the writer that's currently routed to alt-screen.
+        if self.overlay_screen_active
+            && let Some(overlay) = self.overlay_terminal.as_mut()
+        {
+            let _ = execute!(overlay.backend_mut(), LeaveAlternateScreen);
+            self.overlay_screen_active = false;
+        }
+        // Drop the overlay terminal explicitly so its writer
+        // releases stdout before the primary terminal does its
+        // teardown writes below.
+        drop(self.overlay_terminal.take());
+        let Some(terminal) = self.terminal.as_mut() else {
+            return;
+        };
         match self.mode {
             TerminalMode::Inline => {
                 let _ = execute!(
-                    self.terminal.backend_mut(),
+                    terminal.backend_mut(),
                     PopKeyboardEnhancementFlags,
                     Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
                     DisableModifyOtherKeys,
@@ -12093,7 +12184,7 @@ impl Drop for TerminalGuard {
             }
             TerminalMode::AlternateScreen => {
                 let _ = execute!(
-                    self.terminal.backend_mut(),
+                    terminal.backend_mut(),
                     PopKeyboardEnhancementFlags,
                     Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
                     DisableModifyOtherKeys,
@@ -12108,9 +12199,9 @@ impl Drop for TerminalGuard {
                 );
             }
         }
-        let _ = self.terminal.show_cursor();
+        let _ = terminal.show_cursor();
         if let Some(hint) = &self.exit_hint {
-            let _ = writeln!(self.terminal.backend_mut(), "{hint}");
+            let _ = writeln!(terminal.backend_mut(), "{hint}");
         }
     }
 }
