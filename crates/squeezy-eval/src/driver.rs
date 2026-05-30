@@ -1315,6 +1315,7 @@ impl Driver {
 
         let mut frame = FrameRecord {
             prompt: prompt.clone(),
+            cost_display: crate::frames::format_cost_micro_usd(0),
             ..Default::default()
         };
         let mut completed = false;
