@@ -9352,6 +9352,39 @@ fn status_line_configured_replaces_overview_dir_and_branch() {
 }
 
 #[test]
+fn status_line_languages_use_squeezy_gold() {
+    use crate::status::StatusLineItem;
+    let mut app = test_app(SessionMode::Build);
+    app.directory = "~/project".to_string();
+    app.language_summary = "Python 10, Rust 247".to_string();
+    app.status_line_items = Some(vec![StatusLineItem::CurrentDir, StatusLineItem::Languages]);
+    app.status_line_use_colors = true;
+
+    let lines = format_status_lines(&app, 200);
+    let dir_span = lines[0]
+        .spans
+        .iter()
+        .find(|s| s.content == "~/project")
+        .expect("directory span");
+    let language_span = lines[0]
+        .spans
+        .iter()
+        .find(|s| s.content.contains("Python 10, Rust 247"))
+        .expect("languages span");
+
+    assert_eq!(
+        language_span.style.fg,
+        Some(GOLD),
+        "languages should use Squeezy gold"
+    );
+    assert_eq!(
+        dir_span.style.fg,
+        Some(crate::render::palette::ACCENT_GREEN),
+        "other path-family status items should keep their existing color"
+    );
+}
+
+#[test]
 fn status_line_items_stay_compact_for_paths_tokens_and_session_ids() {
     use crate::status::StatusLineItem;
     let mut app = test_app(SessionMode::Build);
