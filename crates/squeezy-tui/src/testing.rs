@@ -14,7 +14,7 @@ pub use crossterm::event::KeyEvent;
 use crossterm::event::{KeyEventKind, KeyEventState};
 use ratatui::{Terminal, backend::TestBackend};
 use squeezy_agent::Agent;
-use squeezy_core::{AppConfig, Result, SessionMode, SqueezyError};
+use squeezy_core::{AppConfig, Result, Role, SessionMode, SqueezyError};
 use squeezy_llm::LlmProvider;
 
 use crate::{
@@ -208,6 +208,25 @@ impl TuiHarness {
                 preview: transcript_preview(&entry.kind),
             })
             .collect()
+    }
+
+    /// Full content of the most recent `Role::Assistant` Message entry,
+    /// or empty when the harness has no assistant turn yet. Unlike
+    /// `transcript_entries(...).preview`, this returns the entry text
+    /// untruncated so eval scenarios can run `final_text_contains` and
+    /// frame-record reconstruction on the harness-driven path.
+    pub fn last_assistant_text(&self) -> String {
+        self.app
+            .transcript
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.kind {
+                TranscriptEntryKind::Message(item) if item.role == Role::Assistant => {
+                    Some(item.content.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     /// True while a turn's `AgentEvent` channel is still attached —
