@@ -1522,8 +1522,12 @@ impl AppConfig {
         ));
         output.push_str(&format!("core = {}\n", toml_string_array(&self.tools.core)));
         output.push_str(&format!(
-            "discoverable = {}\n\n",
+            "discoverable = {}\n",
             toml_string_array(&self.tools.discoverable)
+        ));
+        output.push_str(&format!(
+            "excluded = {}\n\n",
+            toml_string_array(&self.tools.excluded)
         ));
 
         output.push_str("[tui]\n");
@@ -3121,6 +3125,12 @@ pub struct ToolSchemaConfig {
     pub lazy_schema_loading: bool,
     pub core: Vec<String>,
     pub discoverable: Vec<String>,
+    /// Names that must be filtered out before tools are advertised to
+    /// the model, even if they would otherwise be in `core` or
+    /// `discoverable`. Used by graph-vs-no-graph eval scenarios to
+    /// hide the semantic-graph family (`repo_map`, `decl_search`, …)
+    /// so the model is forced to fall back to lexical tools.
+    pub excluded: Vec<String>,
 }
 
 impl Default for ToolSchemaConfig {
@@ -3132,6 +3142,7 @@ impl Default for ToolSchemaConfig {
                 .map(|name| (*name).to_string())
                 .collect(),
             discoverable: Vec::new(),
+            excluded: Vec::new(),
         }
     }
 }
@@ -3152,12 +3163,14 @@ impl ToolSchemaConfig {
         }
         let discoverable = settings.discoverable.unwrap_or(defaults.discoverable);
         core.retain(|tool| !discoverable.contains(tool));
+        let excluded = settings.excluded.unwrap_or(defaults.excluded);
         Ok(Self {
             lazy_schema_loading: settings
                 .lazy_schema_loading
                 .unwrap_or(defaults.lazy_schema_loading),
             core,
             discoverable,
+            excluded,
         })
     }
 
@@ -3168,6 +3181,10 @@ impl ToolSchemaConfig {
     pub fn discoverable_contains(&self, name: &str) -> bool {
         self.discoverable.iter().any(|tool| tool == name)
     }
+
+    pub fn is_excluded(&self, name: &str) -> bool {
+        self.excluded.iter().any(|tool| tool == name)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -3176,6 +3193,7 @@ pub struct ToolSchemaSettings {
     pub lazy_schema_loading: Option<bool>,
     pub core: Option<Vec<String>>,
     pub discoverable: Option<Vec<String>>,
+    pub excluded: Option<Vec<String>>,
 }
 
 impl ToolSchemaSettings {
@@ -3187,6 +3205,7 @@ impl ToolSchemaSettings {
                 "lazy_schema_loading",
                 "core",
                 "discoverable",
+                "excluded",
             ],
             source,
             path,
@@ -3211,6 +3230,7 @@ impl ToolSchemaSettings {
                 source,
                 &field(path, "discoverable"),
             )?,
+            excluded: string_array_value(table, "excluded", source, &field(path, "excluded"))?,
         })
     }
 
@@ -3219,6 +3239,7 @@ impl ToolSchemaSettings {
         replace_if_some(&mut self.lazy_schema_loading, next.lazy_schema_loading);
         merge_string_lists(&mut self.core, next.core);
         merge_string_lists(&mut self.discoverable, next.discoverable);
+        merge_string_lists(&mut self.excluded, next.excluded);
     }
 }
 

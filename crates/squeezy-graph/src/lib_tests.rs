@@ -3575,6 +3575,105 @@ export function start() {
     );
 }
 
+#[test]
+fn references_to_symbol_finds_qualified_self_crate_call_across_modules() {
+    // Reproduces the squeezy A/B finding: `reference_search` missed
+    // `squeezy_eval::run_scenario` in main.rs even though the function
+    // lives in driver.rs of the same crate. The graph could not
+    // resolve `<crate-name-in-underscores>::foo` as a self-crate
+    // alias, so the call edge had `to = None` and binding fell
+    // through to a Function rejection in `qualified_reference_matches_symbol`.
+    let mut parser = LanguageParser::new().unwrap();
+    let driver_record = record(
+        "crates/sample/src/driver.rs",
+        "pub fn run_scenario() -> u32 { 1 }\n",
+    );
+    let lib_record = record(
+        "crates/sample/src/lib.rs",
+        "pub mod driver;\npub use driver::run_scenario;\n",
+    );
+    let main_record = record(
+        "crates/sample/src/main.rs",
+        r#"
+fn run_cmd() -> u32 {
+    sample::run_scenario()
+}
+
+fn main() {
+    let _ = run_cmd();
+}
+"#,
+    );
+    let parsed = [driver_record, lib_record, main_record]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let run_scenario = graph.find_symbol_by_name("run_scenario").pop().unwrap();
+    let hits = graph.references_to_symbol(&run_scenario.id);
+    assert!(
+        hits.iter()
+            .any(|hit| hit.reference.file_id.0 == "crates/sample/src/main.rs"
+                && hit.reference.text.contains("run_scenario")),
+        "expected reference_search to surface the `sample::run_scenario` call \
+         from `crates/sample/src/main.rs`, got {:?}",
+        hits.iter()
+            .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn self_crate_qualified_callable_does_not_bind_when_name_is_ambiguous_in_crate() {
+    // Conservatism guard for the qualified-self-crate fallback:
+    // two functions in the same crate share a name → the fallback
+    // refuses to bind either, so a `mycrate::foo()` call from a
+    // sibling module is left unresolved rather than being attached
+    // to an arbitrary candidate.
+    let mut parser = LanguageParser::new().unwrap();
+    let a_record = record("crates/sample/src/a.rs", "pub fn shared() -> u32 { 1 }\n");
+    let b_record = record("crates/sample/src/b.rs", "pub fn shared() -> u32 { 2 }\n");
+    let main_record = record(
+        "crates/sample/src/main.rs",
+        r#"
+fn caller() -> u32 {
+    sample::shared()
+}
+
+fn main() {
+    let _ = caller();
+}
+"#,
+    );
+    let parsed = [a_record, b_record, main_record]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    for shared in graph.find_symbol_by_name("shared") {
+        let hits = graph.references_to_symbol(&shared.id);
+        let main_hits: Vec<_> = hits
+            .iter()
+            .filter(|hit| hit.reference.file_id.0 == "crates/sample/src/main.rs")
+            .collect();
+        assert!(
+            main_hits.is_empty(),
+            "ambiguous same-crate name `shared` must not bind via the \
+             self-crate fallback; got {} main.rs hits for {}",
+            main_hits.len(),
+            shared.id.0,
+        );
+    }
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("graph-record");
     let path = root.join(relative_path);
