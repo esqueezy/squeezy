@@ -112,6 +112,9 @@ impl SemanticGraph {
         if self.python_property_reference_matches(symbol, reference) {
             return Some(Confidence::Heuristic);
         }
+        if self.ruby_property_reference_matches(symbol, reference) {
+            return Some(Confidence::Heuristic);
+        }
         if self.reference_alias_matches_symbol(symbol, reference)
             && reference_kind_can_bind_symbol(reference, symbol)
         {

@@ -84,7 +84,7 @@
       "kind": "signature_search",
       "text": "require_relative \"user\"",
       "expected_contains": [
-        "require_relative"
+        "Function:require_relative"
       ]
     },
     {

@@ -362,6 +362,19 @@ pub(crate) fn collect_squeezy_ruby_symbol_scan_excluding_files(
             increment(&mut scan.excluded_by_kind, "RubyAttrSynthesized");
             continue;
         }
+        // Synthetic Function symbols emitted for `require`/`require_relative`
+        // import directives exist only to surface in `signature_search`;
+        // Prism doesn't emit them, so excluding them keeps the scan-only
+        // self-compare in lockstep with the Prism oracle when it's
+        // available.
+        if symbol
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "ruby:import-directive")
+        {
+            increment(&mut scan.excluded_by_kind, "RubyImportDirective");
+            continue;
+        }
         let kind = match symbol.kind {
             SymbolKind::Class => "Class".to_string(),
             SymbolKind::Module => "Module".to_string(),

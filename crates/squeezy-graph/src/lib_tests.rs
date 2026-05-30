@@ -4956,6 +4956,61 @@ class Repo {
 }
 
 #[test]
+fn ruby_cross_file_dotted_call_binds_to_receiver_class_method() {
+    // `user.full_name` from Greeter#greet should resolve to User#full_name
+    // via the receiver-name -> class heuristic, even though `user` is just
+    // a parameter with no static type info. Mirrors the
+    // `ruby-call-chain-cross-file` smoke probe.
+    let user = ruby_record(
+        "app/models/user.rb",
+        r#"
+class User
+  def full_name
+    "name"
+  end
+end
+"#,
+    );
+    let greeter = ruby_record(
+        "app/services/greeter.rb",
+        r#"
+class Greeter
+  def greet(user)
+    "hi #{user.full_name}"
+  end
+end
+"#,
+    );
+
+    let mut parser = LanguageParser::new().unwrap();
+    let parsed = [user, greeter]
+        .into_iter()
+        .map(|r| parser.parse_record(&r).unwrap())
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let greet = graph
+        .find_symbol_by_name("greet")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Method)
+        .expect("Greeter#greet");
+    let full_name = graph
+        .find_symbol_by_name("full_name")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Method)
+        .expect("User#full_name");
+    assert!(graph.call_chain(&greet.id, &full_name.id, 3).is_some());
+
+    // `references_to_symbol(User#full_name)` should surface the dotted
+    // form `user.full_name` so smoke-query probes pick it up.
+    let hits = graph.references_to_symbol(&full_name.id);
+    assert!(
+        hits.iter()
+            .any(|hit| hit.reference.text == "user.full_name")
+    );
+}
+
+#[test]
 fn graph_swift_actor_attribute_searchable_via_signature_query() {
     let mut parser = LanguageParser::new().unwrap();
     let cache = swift_record(
@@ -5671,6 +5726,87 @@ class Values {
             "missing val binding {name}",
         );
     }
+}
+
+#[test]
+fn ruby_require_relative_synthesizes_signature_searchable_directive() {
+    // `require_relative "user"` should produce a Function symbol named
+    // `require_relative` so `signature_search("require_relative \"user\"")`
+    // surfaces it. Mirrors the `ruby-import-resolution` smoke probe.
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ruby_record(
+        "app/models/admin.rb",
+        r#"
+require_relative "user"
+
+class Admin < User
+end
+"#,
+    );
+    let parsed = parser.parse_record(&record).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let hits = graph.signature_search(&SignatureQuery {
+        text: "require_relative \"user\"".to_string(),
+        kind: None,
+        visibility: None,
+        attribute: None,
+    });
+    assert!(
+        hits.iter()
+            .any(|s| s.kind == SymbolKind::Function && s.name == "require_relative"),
+        "expected Function:require_relative in signature_search hits, got {:?}",
+        hits.iter()
+            .map(|s| format!("{:?}:{}", s.kind, s.name))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn ruby_explicit_class_receiver_dotted_call_binds_method() {
+    // `User.find_by_email(...)` inside another class should bind to the
+    // `self.find_by_email` singleton method on User across files. Covers
+    // the existing `Class.method` resolver path with the new Field
+    // reference emission.
+    let user = ruby_record(
+        "app/models/user.rb",
+        r#"
+class User
+  def self.find_by_email(email)
+    nil
+  end
+end
+"#,
+    );
+    let admin = ruby_record(
+        "app/services/lookup.rb",
+        r#"
+class Lookup
+  def search(email)
+    User.find_by_email(email)
+  end
+end
+"#,
+    );
+
+    let mut parser = LanguageParser::new().unwrap();
+    let parsed = [user, admin]
+        .into_iter()
+        .map(|r| parser.parse_record(&r).unwrap())
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let search = graph
+        .find_symbol_by_name("search")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Method)
+        .expect("Lookup#search");
+    let find_by_email = graph
+        .find_symbol_by_name("find_by_email")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Method)
+        .expect("User#find_by_email");
+    assert!(graph.call_chain(&search.id, &find_by_email.id, 3).is_some());
 }
 
 fn parsed_imports(graph: &SemanticGraph) -> impl Iterator<Item = &ParsedImport> {
