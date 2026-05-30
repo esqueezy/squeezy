@@ -212,7 +212,7 @@ fn supported_language_list() -> String {
 /// `LanguageFamily::all()` at runtime.
 fn graph_first_preamble(fallback_tool: &str) -> String {
     format!(
-        "Prefer `decl_search`, `reference_search`, or `symbol_context` first for symbol-shaped queries in {languages} files. Use `{fallback_tool}` for free-form text, unsupported languages, or after the graph returned zero packets.",
+        "Prefer `decl_search`, `reference_search`, or `symbol_context` for any code-symbol query in {languages} files — they follow imports, aliases, and re-exports that regex misses. Use `{fallback_tool}` only for literal text (strings, comments, config keys) or files outside {languages}.",
         languages = supported_language_list(),
     )
 }
@@ -403,7 +403,7 @@ pub(crate) fn definition_search_spec() -> ToolSpec {
 pub(crate) fn reference_search_spec() -> ToolSpec {
     ToolSpec {
         name: "reference_search".to_string(),
-        description: "Find references through the graph. Use symbol_id for conservative symbol-bound references or text/query for broad heuristic reference search.".to_string(),
+        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when one was returned by a prior graph call.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
