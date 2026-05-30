@@ -1,0 +1,120 @@
+id = "wave2-03-slash-help-discovery-anthropic"
+title = "Wave-2 / 03 slash-help-discovery — Anthropic claude-haiku-4-5"
+description = """
+Wave-2 row 03 (slash-help-discovery) cross-provider companion to the
+OpenAI scenario. Drives the same `/help` and `/help compact` probe on
+Anthropic Haiku 4.5 so we can compare the curated-vs-subagent paths
+across providers.
+
+Surface paths under probe (see the OpenAI scenario header for full
+file:line citations):
+  - typed dispatch via `Agent::dispatch_command_raw` →
+    `DispatchOutcome::TuiOnly { command: "help" }`.
+  - curated bare-`/help` → `SqueezyHelp::topic_index` body. Curated
+    content is provider-independent by construction; a per-provider
+    divergence is a coverage rubric "cross-model consistency" finding.
+  - unsupported `/help compact` → doc-help subagent. The subagent
+    answer DOES depend on the model; this scenario asserts only on
+    invariants the user must see (the typed prompt echo) so a slightly
+    different Haiku phrasing does not produce a false positive.
+
+Per the EVAL_COVERAGE_PLAN_WAVE2 palette guardrails, the dark-only
+rule applies: any rendered cell whose foreground RGB has luminance
+`0.299*R + 0.587*G + 0.114*B` exceeds ~160 is a finding regardless of
+where it appears in the help surface.
+
+Requires `ANTHROPIC_API_KEY` exported in the shell. Run with:
+
+    cargo run -p squeezy-eval -- run \\
+        crates/squeezy-eval/fixtures/scenarios/wave2-03-slash-help-discovery-anthropic.toml \\
+        --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 512
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+# 1. Typed dispatch for bare `/help` (status: tui_only:help).
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/help"
+
+# 2. Run `/help` as a prompt so the curated topic index renders into
+# the frame. The curated path never calls the provider — verified by
+# `known_help_topic_short_circuits_without_provider_request` in
+# `crates/squeezy-agent/src/lib_tests.rs:1925`.
+[[steps]]
+kind = "prompt"
+text = "/help"
+wait_for = "turn_completed"
+
+# 3. Topic index opens with "Supported topics". Provider-independent.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Supported topics"
+
+# 4. Stable curated topic ids must always appear.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "providers"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "permissions"
+
+# 5. Typed dispatch for `/help compact` (status: tui_only:help).
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/help compact"
+
+# 6. `compact` is not a curated alias; the doc-help subagent runs and
+# produces a grounded answer from the bundled docs. The provider IS
+# called for this turn — one Anthropic Haiku exchange.
+[[steps]]
+kind = "prompt"
+text = "/help compact"
+wait_for = "turn_completed"
+
+# 7. User-visible echo of the slash command must survive into the
+# rendered transcript so the operator can scroll back.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "/help compact"
+
+[expect]
+max_wall_clock_seconds = 180
+event_timeout_seconds = 90
+max_input_tokens = 200000
+max_tools_per_turn = 4
+no_tool_errors = true
+
+[triage]
+enabled = false
