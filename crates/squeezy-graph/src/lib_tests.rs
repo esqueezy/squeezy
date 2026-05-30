@@ -1910,7 +1910,16 @@ trait Sink {
 }
 
 #[test]
-fn graph_symbol_references_are_package_local_until_cargo_resolution_exists() {
+fn graph_symbol_references_surface_qualified_workspace_cross_crate_uses() {
+    // Pre-fix this test asserted package-local references only,
+    // documenting the absence of cargo-style cross-crate resolution.
+    // With the workspace-cross-crate qualified-match fallback the
+    // qualified `use source::Shared;` from `crates/user/` is now
+    // surfaced as a reference to the unique `Shared` symbol in
+    // `crates/source/`. The bare-name occurrence inside `fn user(_:
+    // Shared)` is intentionally still skipped — without a scope
+    // prefix or an import alias edge the graph cannot conclude that
+    // it binds to the same `Shared` across crates.
     let mut parser = LanguageParser::new().unwrap();
     let source_package = record("crates/source/src/lib.rs", "pub struct Shared;\n");
     let user_package = record(
@@ -1935,13 +1944,16 @@ pub fn user(_: Shared) {}
         .unwrap();
     let graph = SemanticGraph::from_parsed(vec![source_parsed, user_parsed]);
     let shared = graph.find_symbol_by_name("Shared").pop().unwrap();
-
+    let hits = graph.references_to_symbol(&shared.id);
     assert!(
-        graph.references_to_symbol(&shared.id).iter().all(|hit| hit
-            .reference
-            .file_id
-            .0
-            .starts_with("crates/source/"))
+        hits.iter()
+            .any(|hit| hit.reference.file_id.0 == "crates/user/src/lib.rs"
+                && hit.reference.text.contains("source::Shared")),
+        "expected the qualified `use source::Shared;` in crates/user/src/lib.rs \
+         to surface, got {:?}",
+        hits.iter()
+            .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -3624,6 +3636,144 @@ fn main() {
         hits.iter()
             .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
             .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn references_to_symbol_finds_workspace_cross_crate_qualified_trait_impl() {
+    // A/B Task 2 finding: the graph missed every `impl
+    // squeezy_llm::LlmProvider for ...` block that lived outside the
+    // `squeezy-llm` crate because `reference_is_in_symbol_package`
+    // gated cross-crate references out before the binding logic
+    // could see the qualified path.
+    let mut parser = LanguageParser::new().unwrap();
+    let trait_record = record(
+        "crates/sample-llm/src/lib.rs",
+        "pub trait LlmProvider {\n    fn name(&self) -> &str;\n}\n",
+    );
+    let impl_record = record(
+        "crates/sample-tui/src/config_screen_tests.rs",
+        r#"
+struct NoOpProvider;
+
+impl sample_llm::LlmProvider for NoOpProvider {
+    fn name(&self) -> &str { "noop" }
+}
+"#,
+    );
+    let parsed = [trait_record, impl_record]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+    let llm_provider = graph
+        .find_symbol_by_name("LlmProvider")
+        .pop()
+        .expect("trait symbol indexed");
+    let hits = graph.references_to_symbol(&llm_provider.id);
+    assert!(
+        hits.iter().any(|hit| hit.reference.file_id.0
+            == "crates/sample-tui/src/config_screen_tests.rs"
+            && hit.reference.text.contains("LlmProvider")),
+        "expected `impl sample_llm::LlmProvider for NoOpProvider` to surface \
+         on reference_search, got {:?}",
+        hits.iter()
+            .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn references_to_symbol_finds_workspace_cross_crate_bare_call_after_use_import() {
+    // A/B Task 3 finding: `estimate_cost(...)` calls inside
+    // `crates/squeezy-agent/` after a `use squeezy_llm::estimate_cost;`
+    // were missed. The qualifier never appears in the source bytes
+    // adjacent to the call, but the import is recoverable from the
+    // file's `use` statements. The workspace-cross-crate fallback now
+    // checks `use <crate>::Name [as alias]` and binds when the
+    // symbol's crate matches the import's first segment.
+    let mut parser = LanguageParser::new().unwrap();
+    let registry_record = record(
+        "crates/sample-llm/src/lib.rs",
+        "pub fn estimate_cost() -> u32 { 1 }\n",
+    );
+    let agent_record = record(
+        "crates/sample-agent/src/lib.rs",
+        r#"
+use sample_llm::estimate_cost;
+
+pub fn driver() -> u32 {
+    estimate_cost()
+}
+"#,
+    );
+    let parsed = [registry_record, agent_record]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+    let estimate_cost = graph
+        .find_symbol_by_name("estimate_cost")
+        .pop()
+        .expect("function indexed");
+    let hits = graph.references_to_symbol(&estimate_cost.id);
+    assert!(
+        hits.iter().any(
+            |hit| hit.reference.file_id.0 == "crates/sample-agent/src/lib.rs"
+                && hit.reference.text == "estimate_cost"
+        ),
+        "expected import-resolved bare call to surface, got {:?}",
+        hits.iter()
+            .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn workspace_cross_crate_qualified_match_does_not_bind_ambiguous_workspace_name() {
+    // Conservatism guard for the workspace-cross-crate fallback:
+    // when the workspace has two `LlmProvider` traits in different
+    // crates, neither must be bound through the fallback. Falls back
+    // to existing path-based heuristics (which won't bind in this
+    // synthetic test) so the reference remains unresolved.
+    let mut parser = LanguageParser::new().unwrap();
+    let llm_a = record("crates/sample-llm/src/lib.rs", "pub trait LlmProvider {}\n");
+    let llm_b = record(
+        "crates/sample-llm-mirror/src/lib.rs",
+        "pub trait LlmProvider {}\n",
+    );
+    let impl_record = record(
+        "crates/sample-tui/src/lib.rs",
+        r#"
+struct NoOpProvider;
+impl sample_llm::LlmProvider for NoOpProvider {}
+"#,
+    );
+    let parsed = [llm_a, llm_b, impl_record]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+    let mirror_provider = graph
+        .find_symbol_by_name("LlmProvider")
+        .into_iter()
+        .find(|sym| sym.id.0.contains("sample-llm-mirror"))
+        .expect("mirror trait indexed");
+    let hits = graph.references_to_symbol(&mirror_provider.id);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.reference.file_id.0 != "crates/sample-tui/src/lib.rs"),
+        "ambiguous workspace name `LlmProvider` must not bind through the \
+         workspace fallback; got hit on the mirror trait from sample-tui",
     );
 }
 

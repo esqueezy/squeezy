@@ -106,6 +106,19 @@ impl SemanticGraph {
         if self.reference_is_symbol_declaration(symbol, reference) {
             return None;
         }
+        // Workspace-cross-crate qualified reference fallback runs
+        // BEFORE the package-key gate because that gate rejects every
+        // cross-crate reference by default. A reference of the shape
+        // `<workspace-crate-alias>::Name` whose target is the unique
+        // workspace symbol named `Name` is the standard Rust monorepo
+        // cross-crate access pattern (e.g.
+        // `impl squeezy_llm::LlmProvider for ...` from another
+        // crate); without this fallback `reference_search` silently
+        // misses every such call/impl site outside the symbol's own
+        // crate.
+        if self.workspace_cross_crate_qualified_match(symbol, reference) {
+            return Some(Confidence::Heuristic);
+        }
         if !self.reference_is_in_symbol_package(symbol, reference) {
             return None;
         }
@@ -258,6 +271,167 @@ impl SemanticGraph {
             }
         }
         symbol_seen && same_crate_callable_count == 1
+    }
+
+    /// Bind a `<workspace-crate-alias>::Name` reference from one
+    /// workspace crate to a symbol named `Name` that lives in
+    /// `crates/<workspace-crate-alias-kebab>/`. Mirrors
+    /// [`Self::self_crate_qualified_callable_matches`] but for the
+    /// cross-crate direction: a reference of this shape in
+    /// `crates/other/` must bind to the symbol in the alias crate
+    /// even though `reference_is_in_symbol_package` would otherwise
+    /// reject the pair on package-key mismatch.
+    ///
+    /// Conservatism: requires the symbol to be the unique
+    /// workspace-wide candidate of its name within the alias's crate
+    /// (Function / Method / Test / Trait / Class / Struct / Enum /
+    /// Union / TypeAlias / Const / Static / Module). Ambiguous names
+    /// stay unresolved.
+    pub(crate) fn workspace_cross_crate_qualified_match(
+        &self,
+        symbol: &GraphSymbol,
+        reference: &ParsedReference,
+    ) -> bool {
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Function
+                | SymbolKind::Method
+                | SymbolKind::Test
+                | SymbolKind::Trait
+                | SymbolKind::Class
+                | SymbolKind::Struct
+                | SymbolKind::Enum
+                | SymbolKind::Union
+                | SymbolKind::TypeAlias
+                | SymbolKind::Const
+                | SymbolKind::Static
+                | SymbolKind::Module
+        ) {
+            return false;
+        }
+        // Pull the qualifying first segment from one of three places,
+        // in order of confidence:
+        //  1. The reference text itself (full `crate::Name` path).
+        //  2. The source-byte scope prefix that immediately precedes
+        //     the reference (covers the bare-leaf reference the
+        //     parser emits alongside a scoped_identifier).
+        //  3. A non-glob `use <crate>::Name` or `use <crate>::Name as
+        //     <alias>` import that brings the symbol into scope as
+        //     either `Name` or the alias the reference uses. This
+        //     covers the very common bare call (`estimate_cost(...)`)
+        //     after `use squeezy_llm::estimate_cost;`.
+        let qualified_first_segment: Option<String> = if reference.text.contains("::") {
+            let segments = path_segments(&reference.text);
+            if segments.last().map(String::as_str) != Some(symbol.name.as_str())
+                || segments.len() < 2
+            {
+                return false;
+            }
+            segments.first().cloned()
+        } else if reference.text == symbol.name {
+            self.reference_source_scope_prefix_first_segment(reference)
+                .or_else(|| self.import_root_for_workspace_reference(symbol, reference))
+        } else {
+            // The reference text might be an alias (`use crate::foo as
+            // bar; bar()`). Check imports for `bar` mapping to the
+            // symbol via a workspace crate alias.
+            self.import_root_for_workspace_reference(symbol, reference)
+        };
+        let Some(first_segment) = qualified_first_segment else {
+            return false;
+        };
+        let Some(symbol_file) = self.files.get(&symbol.file_id) else {
+            return false;
+        };
+        let Some(symbol_crate_alias) =
+            crate_underscore_alias_for_relative_path(&symbol_file.relative_path)
+        else {
+            return false;
+        };
+        if first_segment != symbol_crate_alias {
+            return false;
+        }
+        // Self-crate path is already handled by
+        // `self_crate_qualified_callable_matches`; bail here so the
+        // two helpers don't overlap.
+        let Some(reference_file) = self.files.get(&reference.file_id) else {
+            return false;
+        };
+        if package_key(&symbol_file.relative_path) == package_key(&reference_file.relative_path) {
+            return false;
+        }
+        let symbol_crate_key = package_key(&symbol_file.relative_path);
+        let mut candidates_in_symbol_crate = 0u32;
+        let mut symbol_seen = false;
+        for id in self.symbols_by_name_or_scan(&symbol.name) {
+            let Some(candidate) = self.symbols.get(&id) else {
+                continue;
+            };
+            if !matches!(
+                candidate.kind,
+                SymbolKind::Function
+                    | SymbolKind::Method
+                    | SymbolKind::Test
+                    | SymbolKind::Trait
+                    | SymbolKind::Class
+                    | SymbolKind::Struct
+                    | SymbolKind::Enum
+                    | SymbolKind::Union
+                    | SymbolKind::TypeAlias
+                    | SymbolKind::Const
+                    | SymbolKind::Static
+                    | SymbolKind::Module
+            ) {
+                continue;
+            }
+            let Some(candidate_file) = self.files.get(&candidate.file_id) else {
+                continue;
+            };
+            if package_key(&candidate_file.relative_path) != symbol_crate_key {
+                continue;
+            }
+            candidates_in_symbol_crate += 1;
+            if candidate.id == symbol.id {
+                symbol_seen = true;
+            }
+            if candidates_in_symbol_crate > 1 {
+                return false;
+            }
+        }
+        symbol_seen && candidates_in_symbol_crate == 1
+    }
+
+    /// For a bare-identifier reference whose enclosing file contains
+    /// an explicit `use <crate>::Name [as <alias>]` import that names
+    /// `symbol`, return the workspace crate's first path segment.
+    /// `None` when no such import is present.
+    fn import_root_for_workspace_reference(
+        &self,
+        symbol: &GraphSymbol,
+        reference: &ParsedReference,
+    ) -> Option<String> {
+        for import in self.imports_for_file(&reference.file_id) {
+            if import.is_glob || import.alias.as_deref() == Some("__java_package__") {
+                continue;
+            }
+            // The leaf of the import path must name the symbol.
+            if last_path_segment(&import.path) != symbol.name {
+                continue;
+            }
+            // The reference text must either be the symbol name
+            // (default) or the alias.
+            let expected_name = import.alias.clone().unwrap_or_else(|| symbol.name.clone());
+            if reference.text != expected_name {
+                continue;
+            }
+            // First path segment is the workspace crate alias.
+            let mut segments = path_segments(&import.path);
+            if segments.len() < 2 {
+                continue;
+            }
+            return Some(segments.swap_remove(0));
+        }
+        None
     }
 
     /// Read the source-byte scope prefix that immediately precedes a
