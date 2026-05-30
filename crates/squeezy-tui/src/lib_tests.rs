@@ -4783,6 +4783,25 @@ fn active_prompt_keeps_one_blank_line_after_header() {
 }
 
 #[test]
+fn startup_banner_is_centered_in_viewport() {
+    let app = test_app(SessionMode::Build);
+
+    let output = render_to_string(&app, 120, 16);
+    let banner = output
+        .lines()
+        .find(|line| line.contains("Squeezy v"))
+        .expect("startup banner");
+    let leading = banner.chars().take_while(|ch| *ch == ' ').count();
+    let content_width = banner.trim().chars().count();
+    let expected = (120usize.saturating_sub(content_width)) / 2;
+
+    assert!(
+        leading.abs_diff(expected) <= 1,
+        "banner should be centered: leading={leading} expected={expected}\n{output}"
+    );
+}
+
+#[test]
 fn footer_mentions_transcript_shortcut() {
     let app = test_app(SessionMode::Build);
 

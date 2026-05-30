@@ -5493,12 +5493,11 @@ fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
 }
 
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
-    let card_width = width.clamp(36, 64) as usize;
     // Dynamic metadata belongs in the live status line. In inline mode
     // the startup card lives in scrollback and cannot be rewritten, so
     // repeating fields such as directory/model/languages here makes the
     // first frame stale and visually redundant.
-    vec![startup_phase_strip(card_width, app.version)]
+    vec![startup_phase_strip(width as usize, app.version)]
 }
 
 fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {
