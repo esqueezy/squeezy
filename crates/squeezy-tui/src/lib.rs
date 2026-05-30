@@ -7857,7 +7857,7 @@ fn active_tool_spans(call: &ToolCall) -> Vec<Span<'static>> {
     } else {
         spans.push(Span::styled(
             compact_text(&args, 80),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette::muted_fg()),
         ));
     }
     spans
