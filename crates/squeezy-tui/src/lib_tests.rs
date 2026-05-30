@@ -3765,6 +3765,38 @@ fn collapsed_edit_row_shows_diff_preview() {
 }
 
 #[test]
+fn edit_row_uses_apply_patch_unified_diff_when_checkpoint_is_absent() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("apply_patch", "");
+    result.content = serde_json::json!({
+        "files": [{
+            "after_sha256": "after",
+            "before_sha256": "before",
+            "bytes_after": 20,
+            "bytes_before": 10,
+            "changed": true,
+            "path": "src/cli/paths.rs"
+        }],
+        "unified_diff": "--- a/src/cli/paths.rs\n+++ b/src/cli/paths.rs\n@@ -1,3 +1,4 @@\n unchanged\n-old\n+new\n+added\n"
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 140, 16);
+
+    assert!(
+        output.contains("✔ Edited src/cli/paths.rs · +2 -1"),
+        "{output}"
+    );
+    assert!(output.contains("file src/cli/paths.rs +2 -1"), "{output}");
+    assert!(output.contains("-old"), "{output}");
+    assert!(output.contains("+new"), "{output}");
+    assert!(
+        !output.contains("\"unified_diff\""),
+        "renderer should show the diff, not raw JSON: {output}"
+    );
+}
+
+#[test]
 fn edit_diff_preview_uses_dedicated_diff_colors() {
     let mut app = test_app(SessionMode::Build);
     let mut result = sample_tool_result("apply_patch", "");

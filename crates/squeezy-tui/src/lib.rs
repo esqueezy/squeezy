@@ -7688,6 +7688,16 @@ fn edit_changed_files(tool: &ToolTranscript) -> Vec<EditChangedFile> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    if files.is_empty()
+        && let Some(patch) = tool.result.content["unified_diff"]
+            .as_str()
+            .filter(|patch| !patch.trim().is_empty())
+    {
+        files.extend(edit_files_from_unified_diff(
+            patch,
+            edit_file_paths(&tool.result.content),
+        ));
+    }
     if files.is_empty() {
         if let Some(items) = tool.result.content["files"].as_array() {
             files.extend(items.iter().filter_map(|item| {
@@ -7710,6 +7720,123 @@ fn edit_changed_files(tool: &ToolTranscript) -> Vec<EditChangedFile> {
         }
     }
     files
+}
+
+fn edit_file_paths(content: &serde_json::Value) -> Vec<String> {
+    content["files"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["path"].as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn edit_files_from_unified_diff(patch: &str, fallback_paths: Vec<String>) -> Vec<EditChangedFile> {
+    let mut files = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+    let mut fallback_index = 0;
+
+    for line in patch.lines() {
+        if line.starts_with("--- ") && !current_lines.is_empty() {
+            push_edit_diff_file(
+                &mut files,
+                current_path.take(),
+                &fallback_paths,
+                &mut fallback_index,
+                std::mem::take(&mut current_lines),
+            );
+        }
+        if line.starts_with("+++ ") {
+            current_path = diff_header_path(line).or_else(|| current_path.take());
+        } else if line.starts_with("--- ") {
+            current_path = diff_header_path(line);
+        }
+        current_lines.push(line.to_string());
+    }
+    push_edit_diff_file(
+        &mut files,
+        current_path,
+        &fallback_paths,
+        &mut fallback_index,
+        current_lines,
+    );
+
+    if files.is_empty() && !patch.trim().is_empty() {
+        let path = fallback_paths
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "patch".to_string());
+        let (additions, deletions) = count_unified_diff_changes(patch);
+        files.push(EditChangedFile {
+            path,
+            additions,
+            deletions,
+            patch: Some(patch.to_string()),
+            patch_truncated: false,
+        });
+    }
+    files
+}
+
+fn push_edit_diff_file(
+    files: &mut Vec<EditChangedFile>,
+    path: Option<String>,
+    fallback_paths: &[String],
+    fallback_index: &mut usize,
+    lines: Vec<String>,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    let patch = lines.join("\n");
+    let path = path.or_else(|| {
+        let value = fallback_paths.get(*fallback_index).cloned();
+        *fallback_index += 1;
+        value
+    });
+    let Some(path) = path else {
+        return;
+    };
+    let (additions, deletions) = count_unified_diff_changes(&patch);
+    files.push(EditChangedFile {
+        path,
+        additions,
+        deletions,
+        patch: Some(patch),
+        patch_truncated: false,
+    });
+}
+
+fn diff_header_path(line: &str) -> Option<String> {
+    let path = line
+        .strip_prefix("+++ ")
+        .or_else(|| line.strip_prefix("--- "))?
+        .trim();
+    if path == "/dev/null" || path.is_empty() {
+        return None;
+    }
+    Some(
+        path.strip_prefix("a/")
+            .or_else(|| path.strip_prefix("b/"))
+            .unwrap_or(path)
+            .to_string(),
+    )
+}
+
+fn count_unified_diff_changes(patch: &str) -> (u64, u64) {
+    let additions = patch
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .count() as u64;
+    let deletions = patch
+        .lines()
+        .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+        .count() as u64;
+    (additions, deletions)
 }
 
 fn diff_context_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
