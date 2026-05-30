@@ -7616,18 +7616,32 @@ async fn slash_effort_rejects_unknown_value() {
 }
 
 #[tokio::test]
-async fn slash_verbosity_opens_config_when_called_without_arg() {
+async fn slash_verbosity_without_arg_prints_current_value_and_usage_hint() {
+    // squeezy-3ys0 (audit U2): bare /verbosity no longer diverts into
+    // the config_screen modal. It prints the current value + usage
+    // hint into the transcript (matching /effort's surface) so users
+    // get consistent shape between bare and arg-form invocations.
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let ran = handle_slash_command(&mut app, &mut agent, "/verbosity").await;
     assert!(ran);
-    let state = app
-        .config_screen
-        .as_ref()
-        .expect("config screen should be open");
-    assert_eq!(
-        state.current_section().id,
-        squeezy_core::config_schema::SectionId::Verbosity
+    assert!(
+        app.config_screen.is_none(),
+        "bare /verbosity should not open config_screen"
+    );
+    assert!(
+        app.status.starts_with("response verbosity:"),
+        "status should report the current verbosity; got {:?}",
+        app.status
+    );
+    let body = last_message_content(&app).expect("transcript usage hint");
+    assert!(
+        body.contains("response verbosity"),
+        "transcript should include the usage hint; got {body:?}"
+    );
+    assert!(
+        body.contains("/verbosity [concise|normal|verbose]"),
+        "transcript should include the usage line; got {body:?}"
     );
 }
 
