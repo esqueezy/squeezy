@@ -2794,22 +2794,18 @@ fn transcript_text(item: &squeezy_core::TranscriptItem) -> String {
     item.content.clone()
 }
 
-/// Internal extension: the agent's workspace_root is stored in its config
-/// but not exposed as a getter. Eval needs it to resolve relative
-/// edit_file paths. We approximate via env::current_dir if the agent
-/// doesn't expose it — but the agent does carry an `AppConfig` so we
-/// expose a tiny accessor via a trait below.
+/// Internal extension: lift the agent's workspace_root off its
+/// AppConfig. Scenarios with `[workspace] snapshot = true` build the
+/// agent against a snapshot worktree; resolving relative edit_file
+/// paths via `env::current_dir()` (the previous fallback) wrote into
+/// the host repo instead. squeezy-nyg8.1.
 trait AgentExt {
     fn workspace_root_clone(&self) -> PathBuf;
 }
 
 impl AgentExt for Agent {
     fn workspace_root_clone(&self) -> PathBuf {
-        // Squeezy's Agent does not currently expose its config. As a
-        // first-cut fallback, use the process cwd which `Agent::new`
-        // inherits via `AppConfig::workspace_root`. Improving this is a
-        // one-line change in squeezy-agent once we want it.
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        self.config().workspace_root.clone()
     }
 }
 

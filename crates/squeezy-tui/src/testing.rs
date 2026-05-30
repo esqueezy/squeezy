@@ -173,7 +173,16 @@ impl TuiHarness {
             if waiting_on_operator {
                 return Ok(());
             }
-            if !queued && self.app.turn_rx.is_none() && self.app.prompt_queue.is_empty() {
+            // Keep pumping while a spawn_blocking diff task is still
+            // outstanding — otherwise an immediate idle return drops
+            // the scenario back before `drain_pending_diff` had a
+            // chance to land the result. squeezy-nyg8.2.
+            let waiting_on_pending_diff = self.app.pending_diff.is_some();
+            if !queued
+                && self.app.turn_rx.is_none()
+                && self.app.prompt_queue.is_empty()
+                && !waiting_on_pending_diff
+            {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {

@@ -1,22 +1,10 @@
 id = "audit-misc-diff-with-changes"
 title = "Audit · /diff renders the worktree diff card"
 description = """
-Runs against the live workspace (no snapshot) because the harness
-limitation in `workspace_root_clone` (`crates/squeezy-eval/src/driver.rs:2809`)
-hardcodes `std::env::current_dir()` for `edit_file` actions — so
-edits made by an `edit_file` step land in the live repo, not in the
-snapshot the agent and `/diff` see. Until that is fixed (see
-HARNESS_REQUESTS), we rely on whatever uncommitted state the runner
-has when `cargo run` fires; the assertion just pins that the diff
-card lands in the transcript (either an unchanged-tree log line or
-a real file marker).
-
-Under `drive_tui = true`, the TUI's `handle_slash_diff` spawns a
-blocking diff task. `pump_until_idle` does call `drain_pending_diff`
-but exits as soon as no turn / prompt / operator-input is pending —
-even when the diff is still computing — so we follow up with a
-benign `/tasks` slash to force a second pump cycle that consumes
-the result.
+Runs against the live workspace. `handle_slash_diff` spawns a
+blocking diff task; `pump_until_idle` now waits for
+`app.pending_diff` to drain (squeezy-nyg8.2) so the assert reads the
+landed transcript entry without a follow-up slash.
 """
 
 [workspace]
@@ -38,19 +26,6 @@ palette_tone = "dark"
 kind = "action"
 action = "slash_command"
 command = "/diff"
-
-[[steps]]
-kind = "action"
-action = "wait_seconds"
-seconds = 3
-
-# Re-pump so `drain_pending_diff` picks up the result the blocking
-# task wrote. pump_until_idle drains pending_diff but exits when
-# turn_rx is none even if the result isn't ready yet.
-[[steps]]
-kind = "action"
-action = "slash_command"
-command = "/tasks"
 
 # A successful diff card writes a `diff` transcript entry kind via
 # `app.push_diff_card`. The empty-tree path pushes a system log line

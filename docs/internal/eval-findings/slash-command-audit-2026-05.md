@@ -83,8 +83,8 @@ CLI subcommands (`config`, `repo`, `sessions`, `feedback`, `mcp`, `ask`, `auth`,
 
 ### Bugs
 
-- **B1 — driver `workspace_root_clone` writes to host workspace** when scenario uses `[workspace] snapshot = true`. Reproduced by `audit-misc-diff-with-changes.toml` — an `edit_file` step targeting `README.md` modified the host repo. `crates/squeezy-eval/src/driver.rs::workspace_root_clone` hardcodes `std::env::current_dir()` instead of `AppConfig.workspace_root`. README.md was restored manually after the audit.
-- **B2 — `pump_until_idle` doesn't drain `pending_diff`** (`crates/squeezy-tui/src/testing.rs:142-188`). Scenarios that dispatch `/diff` cannot reliably observe the result in a single step. Workaround in the scenario uses `wait_seconds = 3` + another slash. Should wait while `app.pending_diff.is_some()` (bounded by deadline).
+- **B1 — driver `workspace_root_clone` fixed** (`squeezy-nyg8.1`). Now reads `agent.config().workspace_root` instead of `std::env::current_dir()`. `edit_file` actions land in the agent's actual workspace (snapshot worktree when `snapshot = true`); previously they wrote to the host repo (corrupted README.md mid-audit).
+- **B2 — `pump_until_idle` now waits for `pending_diff`** (`squeezy-nyg8.2`). The idle return predicate gained an `&& !app.pending_diff.is_some()` guard so `/diff`'s spawn_blocking task can land its result before the next assertion. `audit-misc-diff-with-changes.toml` simplified — no more `wait_seconds = 3` + extra slash workaround.
 - **B3 — `/plan <prompt>` divergence**: `DispatchCommand::Plan { prompt }` agent-side discards the prompt; the TUI handler additionally starts a turn with it. Silent data loss for RPC/eval consumers that send `/plan` with a prompt over the headless dispatch path.
 - **B4 — `/compact` on empty conversation surfaces raw error** (`error:agent error: not enough context to compact`) into the status line. Should be a graceful "nothing to compact yet" message, mirroring `/compact undo`'s `restored=false` path.
 
