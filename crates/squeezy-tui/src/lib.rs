@@ -3388,36 +3388,104 @@ fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
 }
 
 fn toggle_selected_transcript_entry(app: &mut TuiApp) {
-    let selected = app
-        .selected_entry
-        .filter(|index| {
-            app.transcript
-                .get(*index)
-                .is_some_and(|entry| entry_targets_toggle(entry, app.show_reasoning_usage))
-        })
-        .map(|index| resolve_toggle_target(&app.transcript, index));
-    let Some(index) = selected
+    let selected_from_entry = app.selected_entry.and_then(|index| {
+        app.transcript
+            .get(index)
+            .filter(|entry| entry_targets_toggle(entry, app.show_reasoning_usage))
+            .map(|_| resolve_toggle_target(&app.transcript, index))
+    });
+    let picked_by = if selected_from_entry.is_some() {
+        "selected"
+    } else {
+        "latest"
+    };
+    let Some(index) = selected_from_entry
         .or_else(|| latest_collapsed_transcript_entry(app))
         .or_else(|| latest_toggleable_transcript_entry(app))
     else {
+        log_toggle_event("expand_one", "none", 0, None, "nothing toggleable");
         app.status = "nothing expandable yet · /expand all also works".to_string();
+        app.needs_redraw = true;
         return;
     };
     let Some(entry) = app.transcript.get_mut(index) else {
         app.selected_entry = None;
         app.status = "select a transcript entry first".to_string();
+        app.needs_redraw = true;
         return;
     };
+    let was_collapsed = entry.collapsed;
     entry.collapsed = !entry.collapsed;
     entry.bump_revision();
+    let entry_kind = transcript_entry_kind_label(entry);
+    let entry_id = entry.id;
+    let new_collapsed = entry.collapsed;
     app.status = format!(
         "{} transcript entry {} · Ctrl+E expand all",
-        if entry.collapsed {
+        if new_collapsed {
             "collapsed"
         } else {
             "expanded"
         },
-        entry.id + 1
+        entry_id + 1
+    );
+    // Defensive: in case some future caller invokes the toggle
+    // outside `poll_input`'s pre-set-`needs_redraw` envelope, force
+    // a repaint so a flag flip is never silent on screen.
+    app.needs_redraw = true;
+    log_toggle_event(
+        "expand_one",
+        picked_by,
+        entry_id,
+        Some((was_collapsed, new_collapsed)),
+        entry_kind,
+    );
+}
+
+fn transcript_entry_kind_label(entry: &TranscriptEntry) -> &'static str {
+    match &entry.kind {
+        TranscriptEntryKind::Message(item) => match item.role {
+            Role::User => "message:user",
+            Role::Assistant => "message:assistant",
+            Role::System => "message:system",
+        },
+        TranscriptEntryKind::ToolResult(_) => "tool_result",
+        TranscriptEntryKind::Log(_) => "log",
+        TranscriptEntryKind::PlanCard(_) => "plan_card",
+        TranscriptEntryKind::Diff(_) => "diff",
+        TranscriptEntryKind::Reasoning(_) => "reasoning",
+        TranscriptEntryKind::SlashEcho(_) => "slash_echo",
+    }
+}
+
+/// Append a one-line summary of a toggle event to
+/// `SQUEEZY_DEBUG_TOGGLE` when the env var is set. Silent no-op
+/// otherwise; diagnostics must never break the TUI.
+fn log_toggle_event(
+    op: &str,
+    picked_by: &str,
+    entry_id: u64,
+    flip: Option<(bool, bool)>,
+    kind: &str,
+) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("SQUEEZY_DEBUG_TOGGLE") else {
+        return;
+    };
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let flip_str = match flip {
+        Some((was, now)) => format!("{} -> {}", was, now),
+        None => "noop".to_string(),
+    };
+    let _ = writeln!(
+        f,
+        "{op} picked_by={picked_by} entry_id={entry_id} kind={kind} collapsed={flip_str}"
     );
 }
 
@@ -3464,6 +3532,18 @@ fn toggle_expand_all_transcript_entries(app: &mut TuiApp) {
     } else {
         format!("expanded {changed} of {total_toggleable} transcript entries · Ctrl+O collapse one")
     };
+    app.needs_redraw = true;
+    log_toggle_event(
+        "expand_all",
+        if target_collapsed {
+            "collapse"
+        } else {
+            "expand"
+        },
+        changed as u64,
+        Some((!target_collapsed, target_collapsed)),
+        "bulk",
+    );
 }
 
 /// True when `entry` is a candidate for Ctrl-O / Ctrl-E. Mirrors
