@@ -13,7 +13,7 @@ use std::str::FromStr;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::render::palette::{ACCENT_CYAN, ACCENT_GREEN, ACCENT_MAGENTA, GOLD};
+use crate::render::palette::{ACCENT_CYAN, ACCENT_GREEN, ACCENT_MAGENTA, AMBER};
 use crate::{TuiApp, compact_text, context_window_pct};
 
 /// Separator drawn between rendered items.
@@ -331,7 +331,7 @@ pub(crate) fn render_status_detail_line(
         }
         let mut style = if use_theme_colors {
             let color = if matches!(*item, StatusLineItem::Languages) {
-                GOLD
+                AMBER
             } else {
                 StatusLineAccent::for_item(*item).fallback_color()
             };

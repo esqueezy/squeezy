@@ -9352,7 +9352,7 @@ fn status_line_configured_replaces_overview_dir_and_branch() {
 }
 
 #[test]
-fn status_line_languages_use_squeezy_gold() {
+fn status_line_languages_use_squeezy_amber() {
     use crate::status::StatusLineItem;
     let mut app = test_app(SessionMode::Build);
     app.directory = "~/project".to_string();
@@ -9374,8 +9374,8 @@ fn status_line_languages_use_squeezy_gold() {
 
     assert_eq!(
         language_span.style.fg,
-        Some(GOLD),
-        "languages should use Squeezy gold"
+        Some(AMBER),
+        "languages should use Squeezy's darker brand accent"
     );
     assert_eq!(
         dir_span.style.fg,
