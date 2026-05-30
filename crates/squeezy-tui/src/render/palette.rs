@@ -23,6 +23,13 @@ use ratatui::style::Color;
 //   dark-mode user reading the screen at a glance can pick the brand
 //   amber out from the cooler semantic markers without being shouted
 //   at.
+// - **Exception:** the working-shimmer crest (`WORKING_SHIMMER_HIGHLIGHT`)
+//   is an animated brand cue that needs perceptible contrast against the
+//   AMBER base (lum ~156.5). Because AMBER already sits within ~3.5 points
+//   of the cap, any highlight that meaningfully shimmers must peak above
+//   it; the crest is permitted to exceed 160 for animation contrast only,
+//   and only at the band centre of a moving sweep (per-character peak is
+//   transient, not a steady-state surface colour).
 // - Catppuccin / HighContrast variants override these defaults via the
 //   `accent_*` accessors; the constants below are the baseline every
 //   un-themed install renders against.
@@ -35,7 +42,7 @@ pub(crate) const ERROR_RED: Color = Color::Rgb(180, 60, 60);
 pub(crate) const BANG_RED: Color = Color::Rgb(153, 27, 27);
 pub(crate) const QUIET: Color = Color::DarkGray;
 pub(crate) const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
-pub(crate) const WORKING_SHIMMER_HIGHLIGHT: Color = Color::Rgb(255, 251, 235);
+pub(crate) const WORKING_SHIMMER_HIGHLIGHT: Color = Color::Rgb(220, 190, 130);
 pub(crate) const DIFF_ADD_FG: Color = Color::Rgb(21, 128, 61);
 pub(crate) const DIFF_DEL_FG: Color = Color::Rgb(185, 88, 88);
 pub(crate) const DIFF_HUNK_FG: Color = Color::Rgb(184, 124, 38);
