@@ -383,13 +383,16 @@ async fn cancel_preserves_partial_assistant_text_in_conversation_state() {
 
     // Transcript: the display/persistence side carries the partial text
     // tagged `cancelled = true` so renderers can append a `(cancelled)`
-    // marker and `/undo`/`/diff` can find the cut-off turn.
+    // marker and `/undo`/`/diff` can find the cut-off turn. The transcript
+    // path trims a trailing newline (renderers append `(cancelled)` after
+    // the body) while the conversation slice keeps the raw stream — both
+    // are correct for their consumer.
     let cancelled_assistant = state
         .transcript
         .iter()
         .find(|item| item.role == squeezy_core::Role::Assistant)
         .expect("transcript must record the cancelled assistant turn");
-    assert_eq!(cancelled_assistant.content, partial);
+    assert_eq!(cancelled_assistant.content, partial.trim_end_matches('\n'));
     assert!(
         cancelled_assistant.cancelled,
         "cancelled assistant transcript item must carry the `cancelled` flag so renderers \
