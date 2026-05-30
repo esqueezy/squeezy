@@ -4341,7 +4341,7 @@ fn format_plan_choice_menu_lines(pending: &PendingPlanChoice) -> Vec<Line<'stati
         Span::raw("  "),
         Span::styled(
             compact_path(&pending.plan_path),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette::muted_fg()),
         ),
     ]));
     for (idx, option) in PLAN_CHOICES.iter().enumerate() {
@@ -4350,7 +4350,7 @@ fn format_plan_choice_menu_lines(pending: &PendingPlanChoice) -> Vec<Line<'stati
         let label_style = if is_selected {
             Style::default().fg(GOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(palette::muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
@@ -4400,7 +4400,7 @@ fn format_request_user_input_menu_lines(
         let label_style = if is_selected {
             Style::default().fg(GOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(palette::muted_fg())
         };
         let mut spans = vec![
             Span::styled(
@@ -4457,7 +4457,7 @@ fn format_approval_menu_lines(
         let label_style = if is_selected {
             Style::default().fg(GOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(palette::muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
@@ -6490,10 +6490,10 @@ fn user_prompt_content_line(
             if marker == "> " && abs_offset < len {
                 base.fg(AMBER)
             } else {
-                base.fg(Color::White)
+                base.fg(palette::muted_fg())
             }
         } else {
-            base.fg(Color::White)
+            base.fg(palette::muted_fg())
         }
     };
     push_styled_segments(&mut spans, line, line_start, style_text_at);
@@ -7071,7 +7071,7 @@ fn role_action(role: &Role) -> (&'static str, Color) {
 
 fn message_content_style(role: &Role) -> Style {
     match role {
-        Role::User => Style::default().fg(Color::White).bg(PROMPT_BG),
+        Role::User => Style::default().fg(palette::muted_fg()).bg(PROMPT_BG),
         Role::Assistant | Role::System => Style::default(),
     }
 }
@@ -7275,7 +7275,7 @@ fn tool_result_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     if is_invalid_argument_result(result) {
         let mut spans = vec![Span::styled(
             result.tool_name.clone(),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette::muted_fg()),
         )];
         if let Some(call) = tool.call.as_ref() {
             let label = tool_call_label(call);
@@ -7312,7 +7312,7 @@ fn tool_result_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         "webfetch" | "websearch" => web_summary_spans(tool),
         _ => vec![Span::styled(
             result.tool_name.clone(),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette::muted_fg()),
         )],
     };
     if tool_result_not_run(tool) {
@@ -7415,7 +7415,10 @@ fn decl_search_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         label.push_str(" for ");
         label.push_str(&query);
     }
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(palette::muted_fg()),
+    )];
     if let Some(total) = number_field(&tool.result.content, "total_matches")
         .or_else(|| number_field(&tool.result.content, "returned_matches"))
     {
@@ -7436,7 +7439,10 @@ fn decl_search_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 
 fn semantic_tool_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let label = tool_call_label_or_name(tool);
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(palette::muted_fg()),
+    )];
     if let Some(matches) = number_field(&tool.result.content, "total_matches")
         .or_else(|| number_field(&tool.result.content, "returned_matches"))
         .or_else(|| {
@@ -7455,7 +7461,10 @@ fn semantic_tool_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 }
 
 fn repo_map_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled("repo map", Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        "repo map",
+        Style::default().fg(palette::muted_fg()),
+    )];
     if let Some(files) = tool.result.content["stats"]["files"].as_u64() {
         spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
         spans.push(Span::styled(
@@ -7485,7 +7494,10 @@ fn read_search_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 
 fn grep_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let label = tool_call_label_or_name(tool);
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(palette::muted_fg()),
+    )];
     if let Some(matches) = number_field(&tool.result.content, "matches_returned")
         .or_else(|| number_field(&tool.result.content, "count"))
         .or_else(|| {
@@ -7518,7 +7530,10 @@ fn glob_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let label = pattern
         .map(|pattern| format!("list files matching {pattern}"))
         .unwrap_or_else(|| "list files".to_string());
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(palette::muted_fg()),
+    )];
     if let Some(paths) = tool.result.content["paths"]
         .as_array()
         .map(|items| items.len() as u64)
@@ -7535,7 +7550,10 @@ fn glob_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 
 fn read_file_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let label = tool_call_label_or_name(tool);
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(palette::muted_fg()),
+    )];
     if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
         spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
         spans.push(Span::styled(format_bytes(bytes), Style::default().fg(GOLD)));
@@ -7556,7 +7574,7 @@ fn read_file_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 fn read_tool_output_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(
         "expand saved tool output",
-        Style::default().fg(Color::White),
+        Style::default().fg(palette::muted_fg()),
     )];
     if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
         spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
@@ -7575,7 +7593,10 @@ fn edit_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     } else {
         format!("{} files", files.len())
     };
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(palette::muted_fg()),
+    )];
     let additions = files.iter().map(|file| file.additions).sum::<u64>();
     let deletions = files.iter().map(|file| file.deletions).sum::<u64>();
     if additions > 0 || deletions > 0 {
@@ -7688,7 +7709,7 @@ fn diff_context_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let mode = string_arg(&tool.result.content, "mode")
         .map(|mode| format!("diff context ({mode})"))
         .unwrap_or_else(|| "diff context".to_string());
-    let mut spans = vec![Span::styled(mode, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(mode, Style::default().fg(palette::muted_fg()))];
     let files = tool.result.content["summary"]["files_changed"]
         .as_u64()
         .or_else(|| {
@@ -7725,7 +7746,10 @@ fn plan_patch_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let label = objective
         .map(|objective| format!("plan patch for {}", compact_text(&objective, 64)))
         .unwrap_or_else(|| "plan patch".to_string());
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White))];
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(palette::muted_fg()),
+    )];
     if let Some(symbols) = tool.result.content["symbols"]
         .as_array()
         .map(|items| items.len() as u64)
@@ -7761,7 +7785,7 @@ fn plan_patch_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 fn web_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     vec![Span::styled(
         tool_call_label_or_name(tool),
-        Style::default().fg(Color::White),
+        Style::default().fg(palette::muted_fg()),
     )]
 }
 
@@ -8136,7 +8160,7 @@ fn shell_output_title_line(command: &str, workdir: &str) -> Line<'static> {
     spans.push(Span::styled(" in ", Style::default().fg(QUIET)));
     spans.push(Span::styled(
         workdir.to_string(),
-        Style::default().fg(Color::White),
+        Style::default().fg(palette::muted_fg()),
     ));
     spans.push(Span::styled(":", Style::default().fg(QUIET)));
     Line::from(spans)
@@ -8675,7 +8699,7 @@ fn command_spans(command: &str) -> Vec<Span<'static>> {
     if tokens.is_empty() {
         return vec![Span::styled(
             command.to_string(),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette::muted_fg()),
         )];
     }
     let mut command_seen = false;
@@ -8692,7 +8716,7 @@ fn command_spans(command: &str) -> Vec<Span<'static>> {
         } else if token.starts_with('"') || token.starts_with('\'') {
             Style::default().fg(SUCCESS_GREEN)
         } else if token.contains('/') || token.contains('.') {
-            Style::default().fg(Color::White)
+            Style::default().fg(palette::muted_fg())
         } else {
             Style::default().fg(QUIET)
         };
@@ -9325,7 +9349,7 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
                 } else {
                     match slash_split {
                         Some(len) if abs_offset < len => base.fg(AMBER),
-                        _ => base.fg(Color::White),
+                        _ => base.fg(palette::muted_fg()),
                     }
                 }
             };
@@ -9556,7 +9580,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     lines.extend(suggestion_lines);
     let scroll = lines.len().saturating_sub(area.height as usize) as u16;
     let paragraph = Paragraph::new(lines)
-        .style(Style::default().fg(Color::White).bg(PROMPT_BG))
+        .style(Style::default().fg(palette::muted_fg()).bg(PROMPT_BG))
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
@@ -9587,7 +9611,7 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
             let style = if selected {
                 Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(palette::muted_fg())
             };
             Line::from(vec![
                 Span::styled(
