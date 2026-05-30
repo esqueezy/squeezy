@@ -443,6 +443,19 @@ impl TuiHarness {
         self.height
     }
 
+    /// Slug for the currently-focused section in the config_screen
+    /// modal, or `None` when no config_screen is open. Maps onto
+    /// `squeezy_core::config_schema::SectionId::slug` so scenarios
+    /// can disambiguate `/options` vs `/model` (`"models"`) vs
+    /// `/permissions` (`"permissions"`) when `current_modal()` only
+    /// reports `"config"` for all three. squeezy-qr9e (audit H2).
+    pub fn config_section(&self) -> Option<&'static str> {
+        self.app
+            .config_screen
+            .as_ref()
+            .map(|state| state.current_section().id.slug())
+    }
+
     /// Stable identifier for the modal/overlay currently occupying the
     /// foreground, or `None` when the composer holds focus. The
     /// returned id is the audit-stable name an eval scenario asserts

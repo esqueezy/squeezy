@@ -92,7 +92,7 @@ CLI subcommands (`config`, `repo`, `sessions`, `feedback`, `mcp`, `ask`, `auth`,
 
 - **R1 — `/jobs`, `/job`, `/job-cancel` dropped** (`squeezy-d0nx`). They were pure aliases for `/tasks`, `/task`, `/task-cancel`; the agent dispatcher's match arms shared branches; alias-parity scenarios confirmed identical outcomes. Per the project's no-deprecation stance, the variants are gone from `DispatchCommand`, the parser, and `SLASH_COMMANDS` in this audit; the alias-parity scenarios are deleted.
 - **R2 — `/context` is a feature gap, not redundancy** (`squeezy-rw0i`). Today it calls `Agent::session_accounting_snapshot()` and shows roughly the same data as `/cost`. The intended spec is: tokens consumed / tokens remaining against the context budget, plus a per-source breakdown (MCP / Skill / internal tools / system / user). `/cost` stays the cost-oriented view; `/context` becomes the budget-oriented view with per-source attribution.
-- **R3 — `/model` and `/permissions` are 1-line aliases** for `/options models` / `/options permissions`. All three open the same `config_screen` modal (focused on different sections); `modal_active = "config"` for all. Keeping them is reasonable (discoverability), but the dispatch arms in `crates/squeezy-tui/src/lib.rs:2200-2213` could note they're aliases.
+- **R3 — `/model` and `/permissions` kept as discoverability aliases** (`squeezy-00fy`). They are 1-line shortcuts for `/options models` / `/options permissions`; all three open the same `config_screen` modal (focused on different sections). The dispatch arms (`crates/squeezy-tui/src/lib.rs:2200-2213`) already route through the shared `toggle_config_screen` helper — they're four lines each, not duplicated logic. Kept for muscle-memory and slash-menu discoverability; closing ticket no-action.
 
 ### UX inconsistencies
 
@@ -107,9 +107,9 @@ CLI subcommands (`config`, `repo`, `sessions`, `feedback`, `mcp`, `ask`, `auth`,
 ## Harness gaps (surfaced by subagents)
 
 - **H1 — `current_modal()` now covers `status_line_setup`** (`squeezy-nq30`). Returns `Some("statusline")` when `/statusline` opens its modal; `audit-config-statusline.toml` was migrated from substring fallback to `modal_active = "statusline"`.
-- **H2 — No `config_screen_section { name }` assertion** to disambiguate `/options` vs `/model` vs `/permissions` (which all share `modal_active = "config"`). Today scenarios depend on substring-matching section labels in the rendered frame.
-- **H3 — No `dispatch_outcome_contains` / `action_step_status_contains` assertion** to inspect agent-side command status without driving the full TUI. Lifts the typed `DispatchOutcome` value off the trace.
-- **H4 — No `capture_session_id` (or template var) action** for chained scenarios that need to reference the agent's current session id. Today only the missing-id error path is testable for `/session-export`, `/checkpoint <id>`, `/resume <id>`.
+- **H2 — `config_screen_section { name }` assertion shipped** (`squeezy-qr9e`). Reads `app.config_screen.as_ref().map(|s| s.current_section().id.slug())` via the new `TuiHarness::config_section()`. Smoke at `audit-smoke-config-section.toml` — `/model` reports section `"models"`, `/permissions` reports `"permissions"`.
+- **H3 — `action_step_status_contains { command?, contains }` assertion shipped** (`squeezy-7hgd`). Lets non-`drive_tui` scenarios assert on the typed `DispatchOutcome` status string (`jobs_list:N`, `prompt_len=12`, ...) recorded for the most-recent slash. Backed by an in-memory action-step buffer in `Capture`. Smoke at `audit-smoke-action-step-status.toml`.
+- **H4 — `capture_session_id { var }` action + `${var}` substitution shipped** (`squeezy-wtxu`). Reads `agent.session_id()` at action time (so `/fork`'d ids are captured fresh), stores into a scenario-local var map; subsequent `slash_command` strings get `${var}` substituted before dispatch. Smoke at `audit-smoke-capture-session-id.toml` — captures id, runs `/session ${id}`, asserts `exists=true`. Unlocks the success path for `/session-export <id>`, `/resume <id>`, `/checkpoint <id>`.
 - **H5 — Driver bug B1** (above) blocks any scenario that combines `[workspace] snapshot = true` with `edit_file`.
 - **H6 — `pump_until_idle` bug B2** (above) blocks reliable `/diff` testing.
 

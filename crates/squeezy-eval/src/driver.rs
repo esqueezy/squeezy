@@ -229,6 +229,7 @@ pub async fn run_scenario(
         tui_capture: tui_capture.clone(),
         pending_overlays: TokioMutex::new(Vec::new()),
         harness,
+        scenario_vars: TokioMutex::new(std::collections::BTreeMap::new()),
     };
 
     driver.dispatch_steps().await?;
@@ -726,6 +727,47 @@ struct Driver {
     /// through it instead of through `agent` directly. None for the
     /// default markdown-only render path.
     harness: Option<Arc<TokioMutex<squeezy_tui::testing::TuiHarness>>>,
+    /// Scenario-local variable bag populated by
+    /// `Action::CaptureSessionId` and consumed by `${var}`
+    /// substitution in slash-command strings. squeezy-wtxu (audit H4).
+    scenario_vars: TokioMutex<std::collections::BTreeMap<String, String>>,
+}
+
+/// Replace `${var}` occurrences in `text` with the matching entry
+/// from `vars`. Unknown vars are left in place — the caller decides
+/// whether to error or pass through.
+fn substitute_scenario_vars(
+    text: &str,
+    vars: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' && chars.peek() == Some(&'{') {
+            chars.next();
+            let mut name = String::new();
+            let mut closed = false;
+            for next in chars.by_ref() {
+                if next == '}' {
+                    closed = true;
+                    break;
+                }
+                name.push(next);
+            }
+            if closed && let Some(value) = vars.get(&name) {
+                out.push_str(value);
+                continue;
+            }
+            out.push_str("${");
+            out.push_str(&name);
+            if closed {
+                out.push('}');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl Driver {
@@ -792,13 +834,26 @@ impl Driver {
         let payload = action_to_value(action);
         match action {
             Action::SlashCommand { command, .. } => {
-                let status = self.dispatch_slash_command(command).await?;
+                // ${var} substitution from prior `capture_session_id`
+                // (and any future capture_*) so chained scenarios can
+                // build the slash text from runtime-only values.
+                let resolved = {
+                    let vars = self.scenario_vars.lock().await;
+                    substitute_scenario_vars(command, &vars)
+                };
+                let status = self.dispatch_slash_command(&resolved).await?;
                 self.capture.record(
                     None,
                     EvalEventKind::SlashCommand {
-                        command: command.clone(),
+                        command: resolved.clone(),
                     },
                 )?;
+                let mut payload = payload;
+                if resolved != *command
+                    && let Some(obj) = payload.as_object_mut()
+                {
+                    obj.insert("command".into(), Value::from(resolved));
+                }
                 self.capture.record(
                     None,
                     EvalEventKind::ActionStep {
@@ -969,6 +1024,27 @@ impl Driver {
                 let status = match self.agent.detach_context_attachment(id).await {
                     Ok(attachment) => format!("detached:id={}", attachment.id),
                     Err(err) => format!("asserted_fail: detach_attachment: {err}"),
+                };
+                self.capture.record(
+                    None,
+                    EvalEventKind::ActionStep {
+                        action: payload,
+                        status,
+                    },
+                )?;
+            }
+            Action::CaptureSessionId { var, .. } => {
+                let status = match self.agent.session_id() {
+                    Some(id) => {
+                        self.scenario_vars
+                            .lock()
+                            .await
+                            .insert(var.clone(), id.clone());
+                        format!("captured_session_id:var={var}:id={id}")
+                    }
+                    None => {
+                        format!("asserted_fail: capture_session_id: agent has no session id yet")
+                    }
                 };
                 self.capture.record(
                     None,
@@ -1287,6 +1363,48 @@ impl Driver {
                     .await
             }
             Assertion::ModalActive { name } => self.assert_modal_active(name).await,
+            Assertion::ConfigScreenSection { name } => self.assert_config_section(name).await,
+            Assertion::ActionStepStatusContains { command, contains } => {
+                self.assert_action_step_status_contains(command.as_deref(), contains)
+            }
+        }
+    }
+
+    async fn assert_config_section(&self, name: &str) -> String {
+        let Some(harness) = self.harness.as_ref() else {
+            return "asserted_fail: config_screen_section requires [tui_capture] drive_tui = true"
+                .into();
+        };
+        let h = harness.lock().await;
+        let actual = h.config_section();
+        let trimmed = name.trim();
+        match actual {
+            Some(slug) if slug.eq_ignore_ascii_case(trimmed) => "asserted_pass".into(),
+            Some(slug) => {
+                format!("asserted_fail: expected config_screen section {trimmed:?}, got {slug:?}")
+            }
+            None => format!(
+                "asserted_fail: expected config_screen section {trimmed:?}, but no config_screen is open"
+            ),
+        }
+    }
+
+    fn assert_action_step_status_contains(
+        &self,
+        command_filter: Option<&str>,
+        needle: &str,
+    ) -> String {
+        match self.capture.last_slash_status(command_filter) {
+            Some((_, status)) if status.contains(needle) => "asserted_pass".into(),
+            Some((cmd, status)) => format!(
+                "asserted_fail: latest slash {cmd:?} status {status:?} does not contain {needle:?}"
+            ),
+            None => match command_filter {
+                Some(cmd) => {
+                    format!("asserted_fail: no slash_command action step recorded for {cmd:?}")
+                }
+                None => "asserted_fail: no slash_command action step recorded".into(),
+            },
         }
     }
 
@@ -2789,6 +2907,7 @@ fn action_kind_label(action: &Action) -> &'static str {
         Action::DetachAttachment { .. } => "detach_attachment",
         Action::SendKey { .. } => "send_key",
         Action::SendKeys { .. } => "send_keys",
+        Action::CaptureSessionId { .. } => "capture_session_id",
     }
 }
 
