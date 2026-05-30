@@ -100,12 +100,17 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         user_exists,
     ));
     spans.push(Span::styled(" ▸ ", Style::default().fg(SEPARATOR_BLUE)));
-    spans.extend(tab(
-        "Repo",
+    let repo_subtitle = if repo_exists {
         format!(
             "{} (committed)",
             display_path(&state.sources.project_path_default)
-        ),
+        )
+    } else {
+        display_path(&state.sources.project_path_default)
+    };
+    spans.extend(tab(
+        "Repo",
+        repo_subtitle,
         state.scope == ConfigScope::Repo,
         repo_exists,
     ));
