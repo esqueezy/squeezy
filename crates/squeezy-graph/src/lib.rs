@@ -1636,12 +1636,18 @@ pub struct LanguageReport {
     pub c_files: usize,
     pub csharp_files: usize,
     pub cpp_files: usize,
+    pub dart_files: usize,
     pub go_files: usize,
     pub java_files: usize,
     pub javascript_files: usize,
     pub jsx_files: usize,
+    pub kotlin_files: usize,
+    pub php_files: usize,
     pub python_files: usize,
+    pub ruby_files: usize,
     pub rust_files: usize,
+    pub scala_files: usize,
+    pub swift_files: usize,
     pub typescript_files: usize,
     pub tsx_files: usize,
     pub supported_files: usize,
@@ -2330,6 +2336,24 @@ fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> Lan
             LanguageKind::Tsx => {
                 report.tsx_files += 1;
             }
+            LanguageKind::Ruby => {
+                report.ruby_files += 1;
+            }
+            LanguageKind::Php => {
+                report.php_files += 1;
+            }
+            LanguageKind::Kotlin => {
+                report.kotlin_files += 1;
+            }
+            LanguageKind::Swift => {
+                report.swift_files += 1;
+            }
+            LanguageKind::Scala => {
+                report.scala_files += 1;
+            }
+            LanguageKind::Dart => {
+                report.dart_files += 1;
+            }
             LanguageKind::Unsupported => report.unsupported_files += 1,
             LanguageKind::Unknown => report.unknown_files += 1,
         }
@@ -2847,6 +2871,12 @@ fn path_starts_with_external_root(path: &str, language: LanguageKind) -> bool {
         | LanguageKind::TypeScript
         | LanguageKind::Tsx
         | LanguageKind::Python
+        | LanguageKind::Ruby
+        | LanguageKind::Php
+        | LanguageKind::Kotlin
+        | LanguageKind::Swift
+        | LanguageKind::Scala
+        | LanguageKind::Dart
         | LanguageKind::Unknown
         | LanguageKind::Unsupported => return false,
     };

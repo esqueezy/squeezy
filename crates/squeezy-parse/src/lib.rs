@@ -15,8 +15,10 @@ use squeezy_workspace::FileRecord;
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
 pub(crate) use languages::{
-    c_family::extract_c_family, csharp::extract_csharp, go::extract_go, java::extract_java,
-    js_ts::extract_js_ts, python::extract_python, rust::extract_rust,
+    c_family::extract_c_family, csharp::extract_csharp, dart::extract_dart, go::extract_go,
+    java::extract_java, js_ts::extract_js_ts, kotlin::extract_kotlin, php::extract_php,
+    python::extract_python, ruby::extract_ruby, rust::extract_rust, scala::extract_scala,
+    swift::extract_swift,
 };
 
 pub const CRATE_NAME: &str = "squeezy-parse";
@@ -806,7 +808,14 @@ fn language_for_kind(language: LanguageKind) -> Option<tree_sitter::Language> {
         LanguageKind::Rust => Some(rust_language()),
         LanguageKind::TypeScript => Some(typescript_language()),
         LanguageKind::Tsx => Some(tsx_language()),
-        LanguageKind::Unsupported | LanguageKind::Unknown => None,
+        LanguageKind::Ruby
+        | LanguageKind::Php
+        | LanguageKind::Kotlin
+        | LanguageKind::Swift
+        | LanguageKind::Scala
+        | LanguageKind::Dart
+        | LanguageKind::Unsupported
+        | LanguageKind::Unknown => None,
     }
 }
 
