@@ -6463,7 +6463,19 @@ fn format_user_prompt_entry(
         .unwrap_or(0)
         .max(1);
     let amber = Style::default().fg(AMBER);
+    let bullet_style = amber.add_modifier(Modifier::BOLD);
     const INDENT: &str = "  ";
+    // Cycle through the moon-phase set so consecutive prompts get a
+    // visually different bullet — content-hashed (not index-based) so
+    // the marker is stable per message even when prompts are
+    // reordered/collapsed in the transcript.
+    const BULLETS: &[&str] = &["◌", "◔", "◑", "◕", "◒", "◓"];
+    let bullet_idx = item
+        .content
+        .bytes()
+        .fold(0usize, |acc, b| acc.wrapping_add(b as usize))
+        % BULLETS.len();
+    let bullet = BULLETS[bullet_idx];
 
     let top = Line::from(vec![
         Span::raw(INDENT.to_string()),
@@ -6494,16 +6506,15 @@ fn format_user_prompt_entry(
                 Style::default().fg(Color::White)
             }
         };
-        let mut spans = vec![
-            Span::raw(INDENT.to_string()),
-            Span::styled("│ ".to_string(), amber),
-        ];
+        // First line gets the cycling moon-phase bullet; continuation
+        // lines indent in line with where the bullet sat.
+        let prefix_span = if index == 0 {
+            Span::styled(format!("{bullet} "), bullet_style)
+        } else {
+            Span::raw("  ".to_string())
+        };
+        let mut spans = vec![Span::raw(INDENT.to_string()), prefix_span];
         push_styled_segments(&mut spans, line_text, line_start, style_text_at);
-        let pad = max_text_width.saturating_sub(line_text.chars().count());
-        if pad > 0 {
-            spans.push(Span::raw(" ".repeat(pad)));
-        }
-        spans.push(Span::styled(" │".to_string(), amber));
         lines.push(Line::from(spans));
         line_start = line_start.saturating_add(line_text.len()).saturating_add(1);
     }
