@@ -37,7 +37,7 @@ pub(crate) const QUIET: Color = Color::DarkGray;
 pub(crate) const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
 pub(crate) const WORKING_SHIMMER_HIGHLIGHT: Color = Color::Rgb(255, 251, 235);
 pub(crate) const DIFF_ADD_FG: Color = Color::Rgb(21, 128, 61);
-pub(crate) const DIFF_DEL_FG: Color = Color::Rgb(252, 165, 165);
+pub(crate) const DIFF_DEL_FG: Color = Color::Rgb(185, 88, 88);
 pub(crate) const DIFF_HUNK_FG: Color = Color::Rgb(184, 124, 38);
 pub(crate) const SEPARATOR_BLUE: Color = Color::Rgb(96, 165, 250);
 
