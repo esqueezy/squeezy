@@ -9,6 +9,7 @@
 //! [`crate::ToolRegistry::preview_for`].
 use std::path::Path;
 
+use serde::Deserialize;
 use serde_json::Value;
 use squeezy_core::PermissionRequest;
 
@@ -61,7 +62,7 @@ impl PermissionPreview for CatalogPreview {
         match call.name.as_str() {
             "apply_patch" => apply_patch_preview(call),
             "write_file" => write_file_preview(call),
-            "shell" => shell_preview(call),
+            "shell" => shell_preview(request, call),
             "webfetch" => webfetch_preview(call),
             "websearch" => websearch_preview(call),
             _ => fallback_preview(request),
@@ -80,7 +81,7 @@ fn push_diff(out: &mut Vec<PreviewLine>, body: &str, added: bool) {
 }
 
 fn apply_patch_preview(call: &ToolCall) -> Vec<PreviewLine> {
-    let Ok(args) = serde_json::from_value::<ApplyPatchArgs>(call.arguments.clone()) else {
+    let Ok(args) = deserialize_args::<ApplyPatchArgs>(&call.arguments) else {
         return vec![PreviewLine::Warning {
             text: "apply_patch arguments did not parse — preview unavailable".to_string(),
         }];
@@ -152,8 +153,8 @@ fn write_file_preview(call: &ToolCall) -> Vec<PreviewLine> {
     out
 }
 
-fn shell_preview(call: &ToolCall) -> Vec<PreviewLine> {
-    let Ok(args) = serde_json::from_value::<ShellArgs>(call.arguments.clone()) else {
+fn shell_preview(request: &PermissionRequest, call: &ToolCall) -> Vec<PreviewLine> {
+    let Ok(args) = deserialize_args::<ShellArgs>(&call.arguments) else {
         return vec![PreviewLine::Warning {
             text: "shell arguments did not parse — preview unavailable".to_string(),
         }];
@@ -167,13 +168,27 @@ fn shell_preview(call: &ToolCall) -> Vec<PreviewLine> {
             text: format!("cwd: {workdir}"),
         });
     }
-    let analysis = crate::shell_parse::analyze_shell_command(&args.command);
-    if analysis.network {
+    let analysis = (!request.metadata.contains_key("network")
+        || !request.metadata.contains_key("destructive"))
+    .then(|| crate::shell_parse::analyze_shell_command(&args.command));
+    let network = request
+        .metadata
+        .get("network")
+        .map(|value| value == "classified")
+        .or_else(|| analysis.as_ref().map(|analysis| analysis.network))
+        .unwrap_or(false);
+    let destructive = request
+        .metadata
+        .get("destructive")
+        .and_then(|value| value.parse::<bool>().ok())
+        .or_else(|| analysis.as_ref().map(|analysis| analysis.destructive))
+        .unwrap_or(false);
+    if network {
         out.push(PreviewLine::Warning {
             text: "command appears to access the network".to_string(),
         });
     }
-    if analysis.destructive {
+    if destructive {
         out.push(PreviewLine::Warning {
             text: "command flagged as destructive by static analysis".to_string(),
         });
@@ -182,7 +197,7 @@ fn shell_preview(call: &ToolCall) -> Vec<PreviewLine> {
 }
 
 fn webfetch_preview(call: &ToolCall) -> Vec<PreviewLine> {
-    let Ok(args) = serde_json::from_value::<WebFetchArgs>(call.arguments.clone()) else {
+    let Ok(args) = deserialize_args::<WebFetchArgs>(&call.arguments) else {
         return vec![PreviewLine::Warning {
             text: "webfetch arguments did not parse — preview unavailable".to_string(),
         }];
@@ -200,7 +215,7 @@ fn webfetch_preview(call: &ToolCall) -> Vec<PreviewLine> {
 }
 
 fn websearch_preview(call: &ToolCall) -> Vec<PreviewLine> {
-    let Ok(args) = serde_json::from_value::<WebSearchArgs>(call.arguments.clone()) else {
+    let Ok(args) = deserialize_args::<WebSearchArgs>(&call.arguments) else {
         return vec![PreviewLine::Warning {
             text: "websearch arguments did not parse — preview unavailable".to_string(),
         }];
@@ -221,6 +236,13 @@ fn fallback_preview(request: &PermissionRequest) -> Vec<PreviewLine> {
         });
     }
     out
+}
+
+fn deserialize_args<'de, T>(arguments: &'de Value) -> Result<T, serde_json::Error>
+where
+    T: Deserialize<'de>,
+{
+    T::deserialize(arguments)
 }
 
 #[cfg(test)]
