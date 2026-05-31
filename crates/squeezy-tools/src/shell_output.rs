@@ -119,7 +119,12 @@ fn parse_cargo_or_rustc_json(stdout: &str, stderr: &str) -> Option<(String, Stri
     let mut parsed = 0usize;
     let mut finished = None;
     for line in stdout.lines().chain(stderr.lines()) {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+        let value = if line_may_start_json_object(line) {
+            serde_json::from_str::<Value>(line).ok()
+        } else {
+            None
+        };
+        let Some(value) = value else {
             // Cargo emits libtest's plain-text harness output (e.g. "test result:
             // FAILED.", panic backtraces, "FAILED" markers) interleaved with the
             // JSON stream. Preserve those signal lines so shaped output still
@@ -220,6 +225,9 @@ fn parse_nextest_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
     let mut skipped = 0usize;
     let mut last_summary: Option<Value> = None;
     for line in stdout.lines().chain(stderr.lines()) {
+        if !line_may_start_json_object(line) {
+            continue;
+        }
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -287,7 +295,9 @@ fn parse_first_valid_json(text: &str) -> Option<Value> {
     if trimmed.is_empty() {
         return None;
     }
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+    if text_may_start_json_value(trimmed)
+        && let Ok(value) = serde_json::from_str::<Value>(trimmed)
+    {
         return Some(value);
     }
     // Fall back to scanning for the first line that parses as JSON, so a
@@ -295,7 +305,29 @@ fn parse_first_valid_json(text: &str) -> Option<Value> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .filter(|line| text_may_start_json_value(line))
         .find_map(|line| serde_json::from_str::<Value>(line).ok())
+}
+
+fn line_may_start_json_object(line: &str) -> bool {
+    trim_json_whitespace(line).as_bytes().first() == Some(&b'{')
+}
+
+fn text_may_start_json_value(text: &str) -> bool {
+    let text = trim_json_whitespace(text);
+    let bytes = text.as_bytes();
+    match bytes.first().copied() {
+        Some(b'{' | b'[' | b'"' | b'0'..=b'9') => true,
+        Some(b'-') => matches!(bytes.get(1), Some(b'0'..=b'9')),
+        Some(b't') => text.starts_with("true"),
+        Some(b'f') => text.starts_with("false"),
+        Some(b'n') => text.starts_with("null"),
+        _ => false,
+    }
+}
+
+fn trim_json_whitespace(text: &str) -> &str {
+    text.trim_start_matches(|ch| matches!(ch, ' ' | '\n' | '\r' | '\t'))
 }
 
 fn json_test_summary(value: &Value, family: &str) -> String {
