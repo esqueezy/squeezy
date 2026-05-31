@@ -835,8 +835,28 @@ impl SemanticGraph {
     }
 
     pub fn reference_search(&self, text: &str) -> Vec<ReferenceHit> {
-        let mut hits = self
+        let mut indexes = self
             .reference_candidate_indexes(text)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        // Alias-aware lookup: when `text` is the local alias of an aliased
+        // import (e.g. Kotlin / Python / JS-TS `import x.Target as Friendly`),
+        // also surface references to the original `Target` so a search for
+        // the alias finds the underlying name. The reverse direction —
+        // `references_to_symbol` — already does this via
+        // `reference_candidate_indexes_for_symbol`; this is the symmetric
+        // forward path.
+        for import in &self.imports {
+            if import.alias.as_deref() != Some(text) {
+                continue;
+            }
+            let leaf = last_path_segment(&import.path);
+            if leaf.is_empty() || leaf == "*" || leaf == text {
+                continue;
+            }
+            indexes.extend(self.reference_candidate_indexes(&leaf));
+        }
+        let mut hits = indexes
             .into_iter()
             .filter_map(|index| self.references.get(index))
             .map(|reference| self.reference_hit(reference, Confidence::Heuristic))

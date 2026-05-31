@@ -110,7 +110,7 @@ impl SemanticGraph {
         call: &ParsedCall,
     ) -> Option<SymbolId> {
         let receiver = call.receiver.as_deref()?;
-        if matches!(receiver, "this" | "super") || receiver.contains(' ') {
+        if matches!(receiver, "this" | "super") {
             return None;
         }
         let caller = self.symbols.get(caller_id)?;
@@ -119,13 +119,30 @@ impl SemanticGraph {
             return None;
         }
 
-        // Infer the receiver's *type name*. If the receiver is a property of
-        // the caller's enclosing class with a `type:T` attribute, use T;
-        // otherwise fall back to the raw receiver text (covers cases like
-        // `Foo.bar()` where the receiver is itself a type name).
-        let receiver_type = self
-            .kotlin_receiver_type_name(caller_id, receiver)
-            .unwrap_or_else(|| last_path_segment(receiver));
+        // Infer the receiver's *type name*. A literal receiver (`"x".foo()`,
+        // `42.bar()`) binds to its built-in type; a property of the caller's
+        // enclosing class with a `type:T` attribute uses T; otherwise fall
+        // back to the raw receiver text (covers cases like `Foo.bar()` where
+        // the receiver is itself a type name).
+        let receiver_type = kotlin_literal_receiver_type(receiver)
+            .map(str::to_string)
+            .or_else(|| {
+                if receiver.contains(' ') {
+                    None
+                } else {
+                    self.kotlin_receiver_type_name(caller_id, receiver)
+                }
+            })
+            .unwrap_or_else(|| {
+                if receiver.contains(' ') {
+                    String::new()
+                } else {
+                    last_path_segment(receiver)
+                }
+            });
+        if receiver_type.is_empty() {
+            return None;
+        }
 
         let matches = candidates
             .iter()
@@ -283,6 +300,49 @@ impl SemanticGraph {
                 .imports_for_file(&caller_file.id)
                 .any(|import| self.kotlin_import_matches_symbol(import, symbol))
     }
+}
+
+/// Map a literal-shaped extension-call receiver to the Kotlin built-in
+/// type the extractor records as `language_identity` for that extension
+/// (`String`, `Int`, `Long`, `Float`, `Double`, `Boolean`, `Char`). The
+/// receiver text arrives raw from tree-sitter (e.g. `"hello"`, `42`,
+/// `1.5f`, `true`, `'x'`); we pattern-match on the literal form. Returns
+/// `None` if the receiver does not look like a literal.
+fn kotlin_literal_receiver_type(receiver: &str) -> Option<&'static str> {
+    let trimmed = receiver.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // String literals: regular `"…"`, raw `"""…"""`, or any
+    // string-template shape — anything starting with `"` is a `String`.
+    if trimmed.starts_with('"') {
+        return Some("String");
+    }
+    // Character literal: `'x'`.
+    if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+        return Some("Char");
+    }
+    // Boolean literals.
+    if trimmed == "true" || trimmed == "false" {
+        return Some("Boolean");
+    }
+    // Numeric literals. Trailing-letter suffix wins; otherwise a `.` makes
+    // it a `Double`, else `Int`.
+    let first = trimmed.chars().next()?;
+    if first.is_ascii_digit() || (first == '-' && trimmed.len() > 1) {
+        let last = trimmed.chars().last()?;
+        if last == 'L' {
+            return Some("Long");
+        }
+        if last == 'f' || last == 'F' {
+            return Some("Float");
+        }
+        if trimmed.contains('.') {
+            return Some("Double");
+        }
+        return Some("Int");
+    }
+    None
 }
 
 /// Whether `symbol` is a top-level (file-rooted) declaration, matching the

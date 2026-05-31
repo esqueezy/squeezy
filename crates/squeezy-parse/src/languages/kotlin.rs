@@ -719,6 +719,17 @@ fn kotlin_property_symbols(
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
 ) -> Option<Vec<ParsedSymbol>> {
     let parent_kind = parent_symbol.map(|(_, kind)| *kind);
+    // Local `val`/`var` declarations inside a function/method/test body are
+    // not symbols themselves — they should not own calls and should not
+    // appear in the symbol table. Emitting them as `Const` would steal call
+    // attribution from the enclosing function (so a `val x = foo()` inside
+    // `fun run()` would route `foo` to `x` instead of `run`).
+    if matches!(
+        parent_kind,
+        Some(SymbolKind::Function | SymbolKind::Method | SymbolKind::Test),
+    ) {
+        return None;
+    }
     let is_field = matches!(
         parent_kind,
         Some(SymbolKind::Class | SymbolKind::Trait | SymbolKind::Enum | SymbolKind::Struct,)

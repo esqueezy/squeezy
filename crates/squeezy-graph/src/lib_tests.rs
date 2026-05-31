@@ -3813,6 +3813,134 @@ class Runner {
 }
 
 #[test]
+fn graph_resolves_kotlin_block_body_function_calls() {
+    // Regression: a block-bodied `fun run()` with local `val name = ...`
+    // initializers must still attribute the calls inside the val
+    // initializers to `run`, not to the local val. This covers both the
+    // string-literal extension receiver (`"world".prepare()`) and the
+    // top-level suspend call (`fetchDefault()`).
+    let mut parser = LanguageParser::new().unwrap();
+    let strings = kotlin_record(
+        "src/main/kotlin/com/example/util/Strings.kt",
+        r#"package com.example.util
+
+fun String.prepare(): String = this.trim()
+"#,
+    );
+    let names = kotlin_record(
+        "src/main/kotlin/com/example/util/Names.kt",
+        r#"package com.example.util
+
+suspend fun fetchDefault(): String = "default"
+"#,
+    );
+    let runner = kotlin_record(
+        "src/main/kotlin/com/example/app/Runner.kt",
+        r#"package com.example.app
+
+import com.example.util.fetchDefault
+import com.example.util.prepare
+
+class Runner {
+    suspend fun run(): String {
+        val name = "world".prepare()
+        val default = fetchDefault()
+        return default + name
+    }
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&strings, fs::read_to_string(&strings.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&names, fs::read_to_string(&names.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let prepare = graph
+        .find_symbol_by_name("prepare")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Function)
+        .unwrap();
+    let fetch = graph
+        .find_symbol_by_name("fetchDefault")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Function)
+        .unwrap();
+    let run = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .unwrap();
+    assert!(
+        graph.call_chain(&run.id, &fetch.id, 3).is_some(),
+        "run -> fetchDefault inside `val default = fetchDefault()`",
+    );
+    assert!(
+        graph.call_chain(&run.id, &prepare.id, 3).is_some(),
+        "run -> prepare via string-literal extension receiver",
+    );
+    // Local `val name` / `val default` must not appear as graph symbols
+    // (they are scoped to the function body, not file-or-class members).
+    assert!(graph.find_symbol_by_name("name").is_empty());
+    assert!(graph.find_symbol_by_name("default").is_empty());
+}
+
+#[test]
+fn graph_resolves_kotlin_alias_import_reference_search() {
+    // Regression: `reference_search(alias)` must surface references named
+    // by the original import target so a search for the alias finds the
+    // underlying class name.
+    let mut parser = LanguageParser::new().unwrap();
+    let friendly = kotlin_record(
+        "src/main/kotlin/com/example/services/FriendlyGreeter.kt",
+        r#"package com.example.services
+
+class FriendlyGreeter {
+    companion object {
+        fun create(): FriendlyGreeter = FriendlyGreeter()
+    }
+}
+"#,
+    );
+    let runner = kotlin_record(
+        "src/main/kotlin/com/example/app/Runner.kt",
+        r#"package com.example.app
+
+import com.example.services.FriendlyGreeter as Friendly
+
+class Runner {
+    fun build(): Any = Friendly.create()
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&friendly, fs::read_to_string(&friendly.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let hits: Vec<_> = graph
+        .reference_search("Friendly")
+        .into_iter()
+        .map(|hit| hit.reference.text)
+        .collect();
+    assert!(
+        hits.iter().any(|text| text == "FriendlyGreeter"),
+        "expected reference_search(\"Friendly\") to surface \"FriendlyGreeter\"; got {hits:?}",
+    );
+}
+
+#[test]
 fn graph_resolves_kotlin_extension_function_cross_file() {
     let mut parser = LanguageParser::new().unwrap();
     let strings = kotlin_record(
