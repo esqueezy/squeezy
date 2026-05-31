@@ -3259,7 +3259,7 @@ async fn multiline_paste_becomes_attached_context() {
 async fn small_single_line_paste_stays_in_prompt() {
     let root = temp_workspace("tui_inline_paste");
     let config = test_config_with_root(SessionMode::Build, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
 
     handle_paste(&mut app, &mut agent, "small paste".to_string())
@@ -3281,7 +3281,7 @@ async fn slash_attach_and_detach_update_active_context() {
     )
     .expect("write log");
     let config = test_config_with_root(SessionMode::Build, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
 
     assert!(handle_slash_command(&mut app, &mut agent, "/attach error.log").await);
@@ -8168,6 +8168,21 @@ fn test_agent_with_config(config: AppConfig) -> Agent {
     )
 }
 
+fn test_agent_without_session_log(mode: SessionMode) -> Agent {
+    test_agent_without_session_log_with_config(AppConfig {
+        session_mode: mode,
+        workspace_root: temp_workspace("agent"),
+        ..Default::default()
+    })
+}
+
+fn test_agent_without_session_log_with_config(config: AppConfig) -> Agent {
+    Agent::new_ephemeral(
+        config,
+        Arc::new(UnavailableProvider::new("scripted", "test provider")),
+    )
+}
+
 fn temp_workspace(name: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -8296,7 +8311,7 @@ fn sample_attachment(id: &str) -> ContextAttachment {
 
 #[tokio::test]
 async fn slash_verbosity_with_inline_arg_applies_immediately() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     app.response_verbosity = ResponseVerbosity::Normal;
     let ran = handle_slash_command(&mut app, &mut agent, "/verbosity verbose").await;
@@ -8316,7 +8331,7 @@ async fn slash_verbosity_with_inline_arg_applies_immediately() {
 
 #[tokio::test]
 async fn slash_effort_low_sets_session_reasoning_effort() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     assert!(agent.config_snapshot().reasoning_effort.is_none());
 
@@ -8330,7 +8345,7 @@ async fn slash_effort_low_sets_session_reasoning_effort() {
 
 #[tokio::test]
 async fn slash_effort_auto_clears_session_reasoning_effort() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     // Pre-seed a value so `auto` has something to clear.
     let mut seeded = agent.config_snapshot();
     seeded.reasoning_effort = Some(squeezy_core::ReasoningEffort::High);
@@ -8344,7 +8359,7 @@ async fn slash_effort_auto_clears_session_reasoning_effort() {
 
 #[tokio::test]
 async fn slash_effort_rejects_unknown_value() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut seeded = agent.config_snapshot();
     seeded.reasoning_effort = Some(squeezy_core::ReasoningEffort::Medium);
     agent.replace_config(seeded);
@@ -8370,7 +8385,7 @@ async fn slash_verbosity_without_arg_prints_current_value_and_usage_hint() {
     // the config_screen modal. It prints the current value + usage
     // hint into the transcript (matching /effort's surface) so users
     // get consistent shape between bare and arg-form invocations.
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let ran = handle_slash_command(&mut app, &mut agent, "/verbosity").await;
     assert!(ran);
@@ -8400,7 +8415,7 @@ async fn slash_verbosity_without_arg_prints_current_value_and_usage_hint() {
 /// theme and mirrors the choice into the agent's config.
 #[tokio::test]
 async fn slash_theme_dark_selects_default_theme_and_config() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     // Point settings writes at a tempfile so the test never touches HOME.
     let dir = temp_workspace("theme_dark");
@@ -8421,7 +8436,7 @@ async fn slash_theme_dark_selects_default_theme_and_config() {
 /// `/theme light` is a backwards-compatible alias for the brighter builtin.
 #[tokio::test]
 async fn slash_theme_light_selects_bright_theme() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_light");
     let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
@@ -8435,7 +8450,7 @@ async fn slash_theme_light_selects_bright_theme() {
 /// `/theme system` is a backwards-compatible alias for the bundled default.
 #[tokio::test]
 async fn slash_theme_system_selects_default_theme() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_system");
     let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
@@ -8454,7 +8469,7 @@ async fn slash_theme_system_selects_default_theme() {
 /// instead of a silent tone change.
 #[tokio::test]
 async fn slash_theme_unknown_value_does_not_change_palette() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_bad");
     let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
@@ -8479,7 +8494,7 @@ async fn slash_theme_unknown_value_does_not_change_palette() {
 /// and the other no-argument config shortcuts.
 #[tokio::test]
 async fn slash_theme_without_arg_opens_theme_config_section() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
 
     let ran = handle_slash_command(&mut app, &mut agent, "/theme").await;
@@ -8494,7 +8509,7 @@ async fn slash_theme_without_arg_opens_theme_config_section() {
 /// `/theme catppuccin` selects the bundled mauve palette.
 #[tokio::test]
 async fn slash_theme_catppuccin_selects_mauve_theme() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_catppuccin");
     let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
@@ -8515,7 +8530,7 @@ async fn slash_theme_catppuccin_selects_mauve_theme() {
 /// `/theme high-contrast` selects the bundled high-contrast palette.
 #[tokio::test]
 async fn slash_theme_high_contrast_selects_builtin_theme() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_hc");
     let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
