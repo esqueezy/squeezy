@@ -153,6 +153,17 @@ pub enum DispatchCommand {
         theme: Option<String>,
     },
     Keymap,
+    /// `/cheap` — force the next turn onto the provider's small-fast
+    /// tier even when the router would not have routed it cheap.
+    Cheap,
+    /// `/parent` — force the next turn onto the user-configured parent
+    /// model, bypassing the router entirely for one turn.
+    Parent,
+    /// `/router on|off` — toggle session-wide auto-routing. `None`
+    /// reports the current state without changing it.
+    Router {
+        value: Option<String>,
+    },
 }
 
 impl DispatchCommand {
@@ -204,6 +215,9 @@ impl DispatchCommand {
             Self::Statusline => "/statusline",
             Self::Theme { .. } => "/theme",
             Self::Keymap => "/keymap",
+            Self::Cheap => "/cheap",
+            Self::Parent => "/parent",
+            Self::Router { .. } => "/router",
         }
     }
 
@@ -386,6 +400,11 @@ impl DispatchCommand {
                 theme: rest.split_whitespace().next().map(str::to_string),
             },
             "/keymap" => Self::Keymap,
+            "/cheap" => Self::Cheap,
+            "/parent" => Self::Parent,
+            "/router" => Self::Router {
+                value: first_token(rest),
+            },
             unknown => {
                 return Err(DispatchCommandParseError::Unknown {
                     command: unknown.to_string(),

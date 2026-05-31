@@ -298,6 +298,14 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "[low|medium|high|xhigh|auto]",
         &[PermissionCapability::Edit],
     ),
+    slash("/cheap", "force next turn onto the provider's cheap model"),
+    slash("/parent", "force next turn onto the parent model"),
+    slash_args(
+        "/router",
+        "toggle session-wide auto-routing to the cheap tier",
+        true,
+        "[on|off]",
+    ),
     slash_args_caps(
         "/verbosity",
         "open config focused on response verbosity (or set inline)",

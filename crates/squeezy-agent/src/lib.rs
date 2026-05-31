@@ -2880,7 +2880,10 @@ impl Agent {
             | DispatchCommand::ToolVerbosity { .. }
             | DispatchCommand::Statusline
             | DispatchCommand::Theme { .. }
-            | DispatchCommand::Keymap) => DispatchOutcome::TuiOnly {
+            | DispatchCommand::Keymap
+            | DispatchCommand::Cheap
+            | DispatchCommand::Parent
+            | DispatchCommand::Router { .. }) => DispatchOutcome::TuiOnly {
                 command: cmd.slash_name().trim_start_matches('/').to_string(),
             },
         }

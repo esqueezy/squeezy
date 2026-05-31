@@ -2868,7 +2868,9 @@ async fn slash_menu_renders_and_completes_selected_command() {
     assert!(output.contains("/permissions"), "{output}");
     assert!(output.contains("/plan"), "{output}");
 
-    for _ in 0..3 {
+    // `/p` matches /parent, /permissions, /pin, /pins, /plan, /plans
+    // in alphabetical order. Step down four entries to land on /plan.
+    for _ in 0..4 {
         handle_key(
             &mut app,
             &mut agent,
