@@ -145,3 +145,25 @@ fn identifier_extractor_prefers_rust_like_token_over_trailing_word() {
     let plan = compile_exploration_plan("Who calls Runner::run from main?").expect("plan");
     assert_eq!(plan.query.as_deref(), Some("Runner::run"));
 }
+
+#[test]
+fn path_shaped_token_does_not_trigger_planner_preflight() {
+    // Prompts that mention a repo path like `spf13/cobra` must not seed a
+    // `definition_search(query="spf13/cobra")` preflight: the graph index
+    // is keyed on symbols, not file paths, so the call returns ~9.5 KB of
+    // unrelated data the model immediately ignores.
+    assert!(
+        compile_exploration_plan("Which file defines the root command in spf13/cobra?").is_none()
+    );
+    assert!(
+        compile_exploration_plan("Where does the sink registry live under include/spdlog/sinks/?")
+            .is_none()
+    );
+}
+
+#[test]
+fn source_file_extension_token_does_not_trigger_planner_preflight() {
+    // A bare filename like `main.go` is also path-shaped and must be
+    // rejected by the same gate.
+    assert!(compile_exploration_plan("Which file defines main.go?").is_none());
+}

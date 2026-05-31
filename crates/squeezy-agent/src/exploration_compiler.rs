@@ -394,7 +394,44 @@ fn looks_like_rust_symbol(token: &str) -> bool {
 }
 
 fn is_useful_query(token: &str) -> bool {
-    token.len() >= 3 && token.chars().any(|ch| ch.is_ascii_alphabetic())
+    if token.len() < 3 || !token.chars().any(|ch| ch.is_ascii_alphabetic()) {
+        return false;
+    }
+    !looks_like_path(token)
+}
+
+fn looks_like_path(token: &str) -> bool {
+    if token.contains('/') {
+        return true;
+    }
+    let lower = token.to_ascii_lowercase();
+    matches!(
+        std::path::Path::new(lower.as_str())
+            .extension()
+            .and_then(|ext| ext.to_str()),
+        Some(
+            "rs" | "py"
+                | "java"
+                | "cs"
+                | "go"
+                | "cpp"
+                | "hpp"
+                | "c"
+                | "h"
+                | "js"
+                | "ts"
+                | "tsx"
+                | "jsx"
+                | "rb"
+                | "php"
+                | "kt"
+                | "kts"
+                | "swift"
+                | "scala"
+                | "sc"
+                | "dart"
+        )
+    )
 }
 
 fn is_stopword(token: &str) -> bool {
