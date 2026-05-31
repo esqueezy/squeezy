@@ -226,23 +226,7 @@ struct CachedParsedFile {
 }
 
 pub struct LanguageParser {
-    csharp_parser: Parser,
-    c_parser: Parser,
-    cpp_parser: Parser,
-    dart_parser: Parser,
-    go_parser: Parser,
-    javascript_parser: Parser,
-    jsx_parser: Parser,
-    php_parser: Parser,
-    rust_parser: Parser,
-    java_parser: Parser,
-    kotlin_parser: Parser,
-    python_parser: Parser,
-    ruby_parser: Parser,
-    scala_parser: Parser,
-    swift_parser: Parser,
-    typescript_parser: Parser,
-    tsx_parser: Parser,
+    parsers: ParserPool,
     cache: HashMap<FileId, CachedParsedFile>,
 }
 
@@ -265,41 +249,8 @@ struct ParseOutput {
 
 impl LanguageParser {
     pub fn new() -> Result<Self> {
-        let csharp_parser = parser_with_csharp_language()?;
-        let c_parser = parser_with_c_language()?;
-        let cpp_parser = parser_with_cpp_language()?;
-        let dart_parser = parser_with_dart_language()?;
-        let go_parser = parser_with_go_language()?;
-        let javascript_parser = parser_with_javascript_language()?;
-        let jsx_parser = parser_with_jsx_language()?;
-        let php_parser = parser_with_php_language()?;
-        let rust_parser = parser_with_rust_language()?;
-        let java_parser = parser_with_java_language()?;
-        let kotlin_parser = parser_with_kotlin_language()?;
-        let python_parser = parser_with_python_language()?;
-        let ruby_parser = parser_with_ruby_language()?;
-        let scala_parser = parser_with_scala_language()?;
-        let swift_parser = parser_with_swift_language()?;
-        let typescript_parser = parser_with_typescript_language()?;
-        let tsx_parser = parser_with_tsx_language()?;
         Ok(Self {
-            csharp_parser,
-            c_parser,
-            cpp_parser,
-            dart_parser,
-            go_parser,
-            javascript_parser,
-            jsx_parser,
-            php_parser,
-            rust_parser,
-            java_parser,
-            kotlin_parser,
-            python_parser,
-            ruby_parser,
-            scala_parser,
-            swift_parser,
-            typescript_parser,
-            tsx_parser,
+            parsers: ParserPool::default(),
             cache: HashMap::new(),
         })
     }
@@ -475,28 +426,24 @@ impl LanguageParser {
     }
 
     fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser> {
-        match language {
-            LanguageKind::C => Ok(&mut self.c_parser),
-            LanguageKind::CSharp => Ok(&mut self.csharp_parser),
-            LanguageKind::Cpp => Ok(&mut self.cpp_parser),
-            LanguageKind::Dart => Ok(&mut self.dart_parser),
-            LanguageKind::Go => Ok(&mut self.go_parser),
-            LanguageKind::Java => Ok(&mut self.java_parser),
-            LanguageKind::JavaScript => Ok(&mut self.javascript_parser),
-            LanguageKind::Jsx => Ok(&mut self.jsx_parser),
-            LanguageKind::Kotlin => Ok(&mut self.kotlin_parser),
-            LanguageKind::Php => Ok(&mut self.php_parser),
-            LanguageKind::Rust => Ok(&mut self.rust_parser),
-            LanguageKind::Python => Ok(&mut self.python_parser),
-            LanguageKind::Ruby => Ok(&mut self.ruby_parser),
-            LanguageKind::Scala => Ok(&mut self.scala_parser),
-            LanguageKind::Swift => Ok(&mut self.swift_parser),
-            LanguageKind::TypeScript => Ok(&mut self.typescript_parser),
-            LanguageKind::Tsx => Ok(&mut self.tsx_parser),
-            _ => Err(SqueezyError::Parse(format!(
-                "unsupported parser language {language:?}"
-            ))),
+        self.parsers.parser_for_language(language)
+    }
+}
+
+#[derive(Default)]
+struct ParserPool {
+    parsers: HashMap<LanguageKind, Parser>,
+}
+
+impl ParserPool {
+    fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser> {
+        if !self.parsers.contains_key(&language) {
+            let parser = parser_for_language_kind(language)?;
+            self.parsers.insert(language, parser);
         }
+        self.parsers
+            .get_mut(&language)
+            .ok_or_else(|| SqueezyError::Parse(format!("unsupported parser language {language:?}")))
     }
 }
 
@@ -526,25 +473,7 @@ fn parser_for_language_kind(language: LanguageKind) -> Result<Parser> {
 }
 
 fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
-    let mut parsers = WorkerParsers {
-        csharp: parser_with_csharp_language()?,
-        c: parser_with_c_language()?,
-        cpp: parser_with_cpp_language()?,
-        dart: parser_with_dart_language()?,
-        go: parser_with_go_language()?,
-        javascript: parser_with_javascript_language()?,
-        jsx: parser_with_jsx_language()?,
-        php: parser_with_php_language()?,
-        rust: parser_with_rust_language()?,
-        java: parser_with_java_language()?,
-        kotlin: parser_with_kotlin_language()?,
-        python: parser_with_python_language()?,
-        ruby: parser_with_ruby_language()?,
-        scala: parser_with_scala_language()?,
-        swift: parser_with_swift_language()?,
-        typescript: parser_with_typescript_language()?,
-        tsx: parser_with_tsx_language()?,
-    };
+    let mut parsers = ParserPool::default();
     let mut outputs = Vec::with_capacity(jobs.len());
     for job in jobs {
         outputs.push(parse_record_with_cache(&mut parsers, job)?);
@@ -552,54 +481,7 @@ fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
     Ok(outputs)
 }
 
-struct WorkerParsers {
-    csharp: Parser,
-    c: Parser,
-    cpp: Parser,
-    dart: Parser,
-    go: Parser,
-    javascript: Parser,
-    jsx: Parser,
-    php: Parser,
-    rust: Parser,
-    java: Parser,
-    kotlin: Parser,
-    python: Parser,
-    ruby: Parser,
-    scala: Parser,
-    swift: Parser,
-    typescript: Parser,
-    tsx: Parser,
-}
-
-impl WorkerParsers {
-    fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser> {
-        match language {
-            LanguageKind::C => Ok(&mut self.c),
-            LanguageKind::CSharp => Ok(&mut self.csharp),
-            LanguageKind::Cpp => Ok(&mut self.cpp),
-            LanguageKind::Dart => Ok(&mut self.dart),
-            LanguageKind::Go => Ok(&mut self.go),
-            LanguageKind::Java => Ok(&mut self.java),
-            LanguageKind::JavaScript => Ok(&mut self.javascript),
-            LanguageKind::Jsx => Ok(&mut self.jsx),
-            LanguageKind::Kotlin => Ok(&mut self.kotlin),
-            LanguageKind::Php => Ok(&mut self.php),
-            LanguageKind::Rust => Ok(&mut self.rust),
-            LanguageKind::Python => Ok(&mut self.python),
-            LanguageKind::Ruby => Ok(&mut self.ruby),
-            LanguageKind::Scala => Ok(&mut self.scala),
-            LanguageKind::Swift => Ok(&mut self.swift),
-            LanguageKind::TypeScript => Ok(&mut self.typescript),
-            LanguageKind::Tsx => Ok(&mut self.tsx),
-            _ => Err(SqueezyError::Parse(format!(
-                "unsupported parser language {language:?}"
-            ))),
-        }
-    }
-}
-
-fn parse_record_with_cache(parsers: &mut WorkerParsers, job: ParseJob) -> Result<ParseOutput> {
+fn parse_record_with_cache(parsers: &mut ParserPool, job: ParseJob) -> Result<ParseOutput> {
     let ParseJob { index, record, old } = job;
     if !is_supported_language(record.language) {
         return Ok(ParseOutput {
