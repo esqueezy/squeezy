@@ -245,5 +245,18 @@ fun org.jetbrains.kotlin.psi.KtSecondaryConstructor.getContainingClassOrObject()
     throw IllegalStateException("secondary constructor outside class")
 }
 
+fun org.jetbrains.kotlin.psi.KtDeclaration.getContainingClassOrObject(): KtClassOrObject? {
+    // `isSynthesized` needs this for KtNamedFunction; the existing stubs
+    // only cover KtClassOrObject and KtSecondaryConstructor. Walk parents
+    // and return the first enclosing class/object, or null if the
+    // declaration is at file scope.
+    var current: org.jetbrains.kotlin.com.intellij.psi.PsiElement? = this.parent
+    while (current != null) {
+        if (current is KtClassOrObject) return current
+        current = current.parent
+    }
+    return null
+}
+
 fun escape(value: String): String =
     value.replace("\\", "\\\\").replace("\"", "\\\"")
