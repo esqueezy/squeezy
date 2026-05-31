@@ -4061,7 +4061,7 @@ async fn large_tool_output_spills_to_handle_and_can_be_read_back() {
         fetched.content["content"]
             .as_str()
             .expect("content")
-            .contains("\"tool_name\":\"read_file\"")
+            .contains("\"bytes_returned\":30000")
     );
 
     let _ = fs::remove_dir_all(root);
@@ -4914,9 +4914,9 @@ async fn direct_user_shell_skips_checkpoint_and_sandbox() {
         .await;
 
     assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
-    assert_eq!(result.content["sandbox"]["backend"], "none");
-    assert_eq!(result.content["sandbox"]["mode"], "off");
-    assert_eq!(result.content["policy"]["direct_user_shell"], true);
+    // Direct user-shell fast path skips checkpointing — the absence of a
+    // checkpoint receipt is the distinguishing signal in a checkpoint-enabled
+    // registry (the non-direct path in the same registry always writes one).
     assert!(result.content.get("checkpoint").is_none());
     assert_eq!(
         fs::read_to_string(root.join("direct.txt")).unwrap(),
@@ -4954,11 +4954,9 @@ async fn direct_user_shell_rejects_wrong_nonce() {
         .await;
 
     assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
-    // Bypass refused: the call falls through to the normal model path, so
-    // the policy view records `direct_user_shell=false` AND a checkpoint
-    // gets created for the destructive command — the very protections the
-    // bypass would have skipped.
-    assert_eq!(result.content["policy"]["direct_user_shell"], false);
+    // Bypass refused: the call falls through to the normal model path, so a
+    // checkpoint gets created for the destructive command — the very
+    // protection the bypass would have skipped.
     assert_eq!(result.content["checkpoint"]["group_id"], "turn-spoof");
 
     let _ = fs::remove_dir_all(root);
@@ -4986,7 +4984,8 @@ async fn read_only_model_shell_skips_checkpoint() {
         .await;
 
     assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
-    assert_eq!(result.content["policy"]["capability"], "search");
+    let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
+    assert!(audit.contains("\"capability\":\"search\""));
     assert!(result.content.get("checkpoint").is_none());
 
     let _ = fs::remove_dir_all(root);
@@ -5013,7 +5012,8 @@ async fn read_only_git_shell_skips_checkpoint() {
         )
         .await;
 
-    assert_eq!(result.content["policy"]["capability"], "git");
+    let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
+    assert!(audit.contains("\"capability\":\"git\""));
     assert!(result.content.get("checkpoint").is_none());
 
     let _ = fs::remove_dir_all(root);
@@ -5041,7 +5041,6 @@ async fn model_shell_cannot_request_direct_user_shell_fast_path() {
         .await;
 
     assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
-    assert_eq!(result.content["policy"]["direct_user_shell"], false);
     assert_eq!(result.content["checkpoint"]["group_id"], "turn-model");
 
     let _ = fs::remove_dir_all(root);
@@ -5452,14 +5451,13 @@ async fn shell_returns_bounded_output_and_exit_code() {
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["stdout"], "abc");
     assert_eq!(result.content["exit_code"], 0);
-    assert_eq!(result.content["env"]["policy"], "allowlist");
-    assert_eq!(result.content["env"]["values"], "redacted");
-    assert_eq!(result.content["sandbox"]["mode"], "off");
-    assert!(result.content["policy"]["parser_backed"].as_bool().unwrap());
     let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
     assert!(audit.contains("\"call_id\":\"call_1\""));
     assert!(audit.contains("\"stdout_sha256\""));
     assert!(!audit.contains("\"stdout\":\"abc\""));
+    assert!(audit.contains("\"policy\":\"allowlist\""));
+    assert!(audit.contains("\"mode\":\"off\""));
+    assert!(audit.contains("\"parser_backed\":true"));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -5485,7 +5483,8 @@ async fn shell_default_sandbox_runs_benign_command() {
 
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["stdout"], "ok");
-    assert_eq!(result.content["sandbox"]["mode"], "best_effort");
+    let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
+    assert!(audit.contains("\"mode\":\"best_effort\""));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -5520,10 +5519,11 @@ async fn shell_external_sandbox_mode_preserves_policy_metadata() {
 
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["stdout"], "ok");
-    assert_eq!(result.content["sandbox"]["backend"], "external");
-    assert_eq!(result.content["sandbox"]["mode"], "external");
-    assert_eq!(result.content["sandbox"]["network"], "external");
-    assert_eq!(result.content["env"]["policy"], "allowlist");
+    let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
+    assert!(audit.contains("\"backend\":\"external\""));
+    assert!(audit.contains("\"mode\":\"external\""));
+    assert!(audit.contains("\"network\":\"external\""));
+    assert!(audit.contains("\"policy\":\"allowlist\""));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -5690,9 +5690,18 @@ async fn shell_workdir_accepts_configured_extra_root() {
 
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["stdout"], "ok");
-    assert_eq!(
-        result.content["sandbox"]["write_roots"][0],
-        extra.display().to_string()
+    let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
+    // The audit row JSON-encodes paths with whichever separator the host
+    // uses (`\\` on Windows), so assert on the unique basename rather than
+    // the full path string.
+    let extra_basename = extra
+        .file_name()
+        .expect("extra basename")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        audit.contains(&extra_basename),
+        "audit log must mention configured extra write root basename {extra_basename}: {audit}"
     );
 
     let _ = fs::remove_dir_all(root);
@@ -7932,7 +7941,10 @@ pub mod service {
             .unwrap()
             .contains("helper();")
     );
-    assert_uniform_evidence_packet(&read.content["packets"][0]);
+    // Slice-mode reads do not emit a `packets` array; the resolved window
+    // is already on the top-level fields, so the content body is the only
+    // signal worth asserting on here.
+    assert!(read.content["packets"].as_array().is_none());
 
     let upstream = registry
         .execute(
@@ -7945,12 +7957,15 @@ pub mod service {
         )
         .await;
     assert_eq!(upstream.status, ToolStatus::Success);
+    // The per-packet `claim` string was trimmed from the wire payload; the
+    // structured `caller` + `callee` summaries carry the same information.
     assert!(
         upstream.content["packets"]
             .as_array()
             .expect("upstream packets")
             .iter()
-            .any(|packet| packet["claim"].as_str().unwrap_or("").contains("run"))
+            .any(|packet| packet["caller"]["name"].as_str() == Some("run")
+                || packet["callee"]["name"].as_str() == Some("run"))
     );
 
     let hierarchy = registry
@@ -8150,9 +8165,9 @@ async fn graph_navigation_tools_return_unsupported_language_fallback() {
         result.content["fallback"]["reason"].as_str(),
         Some("path_unsupported")
     );
-    assert_eq!(
-        result.content["fallback"]["suggested_tools"][0]["tool"].as_str(),
-        Some("grep")
+    assert!(
+        result.content["fallback"].get("suggested_tools").is_none(),
+        "fallback.suggested_tools must be trimmed from the wire payload"
     );
     assert!(result.content["packets"].as_array().unwrap().is_empty());
 
@@ -8203,11 +8218,9 @@ pub mod pipeline {
         .as_str()
         .expect("definition packet carries a symbol id")
         .to_string();
-    assert_eq!(
-        first_definition["next_action"]["tool"].as_str(),
-        Some("read_slice"),
-        "definition_search must point at read_slice for the exact declaration"
-    );
+    // The per-packet `next_action` recommendation was trimmed from the wire
+    // payload; the model can derive a `read_slice` call from the embedded
+    // symbol id + span without an explicit recommendation.
 
     let reference_by_text = registry
         .execute(
@@ -8308,11 +8321,13 @@ pub mod pipeline {
     let chain_packets = downstream_chain.content["packets"]
         .as_array()
         .expect("downstream_flow chain packets");
+    // The trim drops the per-packet `claim` field; the call-chain packet is
+    // still uniquely identifiable by its `chain` array — call_edge / edge
+    // packets do not carry that shape.
     assert!(
-        chain_packets.iter().any(|packet| packet["claim"]
-            .as_str()
-            .unwrap_or("")
-            .contains("call chain found")),
+        chain_packets
+            .iter()
+            .any(|packet| packet.get("chain").and_then(|v| v.as_array()).is_some()),
         "downstream_flow with target_query must emit a call_chain packet, got {chain_packets:?}"
     );
 
@@ -8624,17 +8639,12 @@ pub fn beta() {}
         Some("supported_language_no_match")
     );
     assert_eq!(fallback["path"].as_str(), Some("src/lib.rs"));
-    let tools = fallback["suggested_tools"]
-        .as_array()
-        .expect("suggested_tools array");
-    let grep = tools
-        .iter()
-        .find(|tool| tool["tool"].as_str() == Some("grep"))
-        .expect("grep entry");
-    assert_eq!(grep["arguments"]["path"].as_str(), Some("src/lib.rs"));
-    assert_eq!(
-        grep["arguments"]["pattern"].as_str(),
-        Some("no_such_symbol")
+    // `suggested_tools` is intentionally dropped from the wire payload — the
+    // reason code carries the load-bearing signal and the model can choose a
+    // retry tool without a verbose recommendation list.
+    assert!(
+        fallback.get("suggested_tools").is_none(),
+        "fallback.suggested_tools must be trimmed from the wire payload, got {fallback}"
     );
 
     let _ = fs::remove_dir_all(root);
@@ -8660,49 +8670,18 @@ async fn decl_search_zero_hit_no_path_scope() {
     let fallback = &result.content["fallback"];
     assert_eq!(fallback["reason"].as_str(), Some("no_path_scope"));
     assert!(fallback["path"].is_null());
-    let tools = fallback["suggested_tools"]
-        .as_array()
-        .expect("suggested_tools array");
-    let grep = tools
-        .iter()
-        .find(|tool| tool["tool"].as_str() == Some("grep"))
-        .expect("grep entry");
-    assert_eq!(grep["arguments"]["path"].as_str(), Some("."));
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn decl_search_zero_hit_regex_escapes_query() {
-    let root = temp_workspace("graph_zero_hit_regex");
-    write_rust_crate(&root, "pub fn alpha() {}\n");
-    let registry = ToolRegistry::new(&root).expect("registry");
-
-    let result = registry
-        .execute(
-            ToolCall {
-                call_id: "zero_regex".to_string(),
-                name: "decl_search".to_string(),
-                arguments: json!({"query": "foo.bar()"}),
-            },
-            CancellationToken::new(),
-        )
-        .await;
-    assert_eq!(result.status, ToolStatus::Success);
-    let pattern = result.content["fallback"]["suggested_tools"][0]["arguments"]["pattern"]
-        .as_str()
-        .expect("pattern string");
     assert!(
-        pattern.contains(r"\."),
-        "regex metacharacters must be escaped; got {pattern:?}"
-    );
-    assert!(
-        pattern.contains(r"\(") && pattern.contains(r"\)"),
-        "parentheses must be escaped; got {pattern:?}"
+        fallback.get("suggested_tools").is_none(),
+        "fallback.suggested_tools must be trimmed from the wire payload, got {fallback}"
     );
 
     let _ = fs::remove_dir_all(root);
 }
+
+// `decl_search_zero_hit_regex_escapes_query` was removed when
+// `fallback.suggested_tools` was trimmed from the wire payload. The dropped
+// field was the only consumer of the regex-escape path; the reason code stays
+// and the model picks its own retry tool.
 
 #[tokio::test]
 async fn decl_search_non_empty_packets_keeps_null_fallback() {
@@ -8804,17 +8783,14 @@ def caller(obj):
     for entry in candidates {
         assert_eq!(entry["name"].as_str(), Some("do_thing"));
     }
-    let fanout = candidate_packet["next_action"]["fanout"]
-        .as_array()
-        .expect("candidate set packet must carry a read_slice fanout");
+    // The per-packet `next_action.fanout` recommendation was trimmed from the
+    // wire payload. The model still gets every candidate's symbol id + span
+    // through the `candidates` array above; the read_slice retry shape was
+    // duplicated decoration.
     assert!(
-        !fanout.is_empty(),
-        "fanout must contain at least one read_slice candidate"
+        candidate_packet.get("next_action").is_none(),
+        "candidate-set packet must not carry trimmed next_action: {candidate_packet}"
     );
-    for entry in fanout {
-        assert_eq!(entry["tool"].as_str(), Some("read_slice"));
-        assert!(entry["arguments"]["path"].as_str().is_some());
-    }
 
     let _ = fs::remove_dir_all(root);
 }
@@ -9217,18 +9193,26 @@ fn match_paths(result: &ToolResult) -> Vec<String> {
 }
 
 fn assert_uniform_evidence_packet(packet: &Value) {
-    for key in [
+    // After the wire-payload trim, graph packets keep only the spans + the
+    // confidence id. `claim`, `freshness`, `provenance`, `cost_hint`, and
+    // `next_action` are dropped from every packet to cut tokens per result;
+    // the same signals still flow to telemetry via the typed graph events.
+    for key in ["spans", "confidence"] {
+        assert!(
+            packet.get(key).is_some(),
+            "missing evidence key {key}: {packet}"
+        );
+    }
+    for trimmed in [
         "claim",
-        "spans",
-        "confidence",
         "freshness",
         "provenance",
         "cost_hint",
         "next_action",
     ] {
         assert!(
-            packet.get(key).is_some(),
-            "missing evidence key {key}: {packet}"
+            packet.get(trimmed).is_none(),
+            "evidence packet must not carry trimmed key {trimmed}: {packet}"
         );
     }
 }
@@ -9961,7 +9945,6 @@ fn shell_best_effort_falls_back_when_sandbox_dies_without_output() {
         stdout_truncated: false,
         stderr_bytes: Vec::new(),
         stderr_truncated: false,
-        preserved_env: Vec::new(),
     };
 
     let reason =
@@ -10113,7 +10096,6 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
         stdout_truncated: false,
         stderr_bytes: b"sandbox_apply: Operation not permitted".to_vec(),
         stderr_truncated: false,
-        preserved_env: Vec::new(),
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run)
@@ -10337,7 +10319,7 @@ fn grep_spec_promotes_graph_first() {
         "decl_search",
         "reference_search",
         "symbol_context",
-        "graph returned zero packets",
+        "imports, qualified paths, and re-exports",
     ] {
         assert!(
             description.contains(marker),
@@ -10360,7 +10342,7 @@ fn grep_spec_promotes_graph_first() {
 fn glob_spec_promotes_graph_first() {
     let description = glob_spec().description;
     assert!(description.contains("decl_search"));
-    assert!(description.contains("graph returned zero packets"));
+    assert!(description.contains("imports, qualified paths, and re-exports"));
     let golden =
         include_str!("../tests/artifacts/tool-spec-descriptions/glob_spec_description.txt").trim();
     assert_eq!(description.trim(), golden);

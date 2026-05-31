@@ -8,8 +8,8 @@ use crate::web::{
     MAX_WEB_TIMEOUT_MS,
 };
 use crate::{
-    DEFAULT_MAX_BYTES_PER_FILE, DEFAULT_MAX_FILES, MAX_GRAPH_MAX_DEPTH, MAX_GRAPH_MAX_RESULTS,
-    MAX_READ_LIMIT, MAX_SHELL_TIMEOUT_MS, PermissionCapability, ToolSpec,
+    DEFAULT_MAX_FILES, MAX_GRAPH_MAX_DEPTH, MAX_GRAPH_MAX_RESULTS, MAX_READ_LIMIT,
+    MAX_SHELL_TIMEOUT_MS, PermissionCapability, ToolSpec,
 };
 
 /// Strict-parse a first-party tool schema literal into [`JsonSchema`]. A
@@ -212,7 +212,7 @@ fn supported_language_list() -> String {
 /// `LanguageFamily::all()` at runtime.
 fn graph_first_preamble(fallback_tool: &str) -> String {
     format!(
-        "Prefer `decl_search`, `reference_search`, or `symbol_context` first for symbol-shaped queries in {languages} files. Use `{fallback_tool}` for free-form text, unsupported languages, or after the graph returned zero packets.",
+        "Prefer `decl_search`, `reference_search`, or `symbol_context` for symbol-shaped queries in {languages} files when the query is a bare name and the languages have nominal type systems (Rust, Go, C#, C++, Java) — they follow imports, qualified paths, and re-exports that regex misses. For Python and JS/TS aliased-import resolution, or any multi-symbol tabulation (count usages across N symbols, aggregate fields per class), `{fallback_tool}` with a focused query or script is usually one shot. Use `{fallback_tool}` for literal text (strings, comments, config keys) or files outside {languages}.",
         languages = supported_language_list(),
     )
 }
@@ -237,7 +237,6 @@ pub(crate) fn grep_spec() -> ToolSpec {
                 "diff_only": {"type": "boolean", "description": "When true, search only files changed in the current Git worktree diff. Default false."},
                 "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Return matching lines, only files containing matches, or only a count. Default content."},
                 "max_files": {"type": "integer", "minimum": 1, "maximum": DEFAULT_MAX_FILES},
-                "max_bytes_per_file": {"type": "integer", "minimum": 1, "maximum": DEFAULT_MAX_BYTES_PER_FILE},
                 "max_matches": {"type": "integer", "minimum": 1, "maximum": 1000},
                 "output_byte_cap": {"type": "integer", "minimum": 1, "maximum": 128000},
                 "offset": {"type": "integer", "minimum": 0, "description": "Number of matching lines to skip for pagination."},
@@ -358,7 +357,7 @@ pub(crate) fn repo_map_spec() -> ToolSpec {
 pub(crate) fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search or count graph-backed declarations by signature/name or filters such as kind, language, path, visibility, and attribute. Use this for broad lists/counts; for a single defining file prefer definition_search. Do not call decl_search plus definition_search or symbol_context with the same query in one turn unless the first result is ambiguous.".to_string(),
+        description: "Search or count graph-backed declarations by signature/name or filters such as kind, language, path, visibility, and attribute. Use this for broad lists/counts; for a single defining file prefer definition_search. For C#/Java/C++ inheritance queries pass `attribute=\"base:<TypeName>\"` to find every direct subclass/implementor in one call; do not embed `base:` in `query`, and do not use this for inheritance in languages without nominal subtyping (Python, JS/TS) — fall through to grep there. Do not call decl_search plus definition_search or symbol_context with the same query in one turn unless the first result is ambiguous.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -382,7 +381,7 @@ pub(crate) fn decl_search_spec() -> ToolSpec {
 pub(crate) fn definition_search_spec() -> ToolSpec {
     ToolSpec {
         name: "definition_search".to_string(),
-        description: "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?' or 'name one nearby declaration'. Use before flow tools when a name may be ambiguous, but do not also call decl_search or symbol_context for the same query unless this result is insufficient.".to_string(),
+        description: "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?' or 'name one nearby declaration'. Pass the bare symbol name (e.g. `castPath`), not a file path — use `path=` to restrict to a file. Use before flow tools when a name may be ambiguous, but do not also call decl_search or symbol_context for the same query unless this result is insufficient.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -404,7 +403,7 @@ pub(crate) fn definition_search_spec() -> ToolSpec {
 pub(crate) fn reference_search_spec() -> ToolSpec {
     ToolSpec {
         name: "reference_search".to_string(),
-        description: "Find references through the graph. Use symbol_id for conservative symbol-bound references or text/query for broad heuristic reference search.".to_string(),
+        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when one was returned by a prior graph call.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -472,7 +471,7 @@ pub(crate) fn downstream_flow_spec() -> ToolSpec {
 pub(crate) fn hierarchy_spec() -> ToolSpec {
     ToolSpec {
         name: "hierarchy".to_string(),
-        description: "Return graph containment hierarchy for the workspace, a symbol_id, or a declaration query.".to_string(),
+        description: "Return graph containment hierarchy (file → module → class → members) for the workspace, a symbol_id, or a declaration query. This is containment, NOT inheritance — for subclasses/implementors use `decl_search` with `attribute=\"base:<TypeName>\"`.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -524,7 +523,7 @@ pub(crate) fn read_slice_spec() -> ToolSpec {
 pub(crate) fn symbol_context_spec() -> ToolSpec {
     ToolSpec {
         name: "symbol_context".to_string(),
-        description: "Return compact graph-backed context for symbols matching a declaration query, including callers, callees, references, dirty/diff annotations, and evidence packets. Use when the user asks for relationships, callers, references, or impact. Avoid for simple definition/file lookup already answered by definition_search.".to_string(),
+        description: "Return compact graph-backed context for symbols matching a declaration query, including callers, callees, references, dirty/diff annotations, and evidence packets. Use when the user asks for relationships, callers, references, or impact. Pass the bare symbol name (e.g. `castPath`), not a file path — use `path=` to restrict to a file. Avoid for simple definition/file lookup already answered by definition_search.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({

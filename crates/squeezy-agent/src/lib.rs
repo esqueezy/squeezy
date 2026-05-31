@@ -1971,6 +1971,7 @@ impl Agent {
         let request_instructions = self.redactor.redact(&raw_instructions).text;
         let mut all_tool_specs = core_control_tools(&self.config.subagents, mode);
         all_tool_specs.extend(self.tools.specs().iter().cloned().map(advertised_tool));
+        retain_non_excluded_tools(&mut all_tool_specs, &self.config.tools);
         let session_id_for_plan_mode = self.session_id();
         let plan_edit_allowed = plan_mode::plan_edit_allowed_in_workspace(
             mode,
@@ -3423,6 +3424,7 @@ impl Agent {
                 let mut all_tool_specs =
                     core_control_tools(&config.subagents, load_session_mode(&session_mode));
                 all_tool_specs.extend(tools.specs().iter().cloned().map(advertised_tool));
+                retain_non_excluded_tools(&mut all_tool_specs, &config.tools);
                 warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
                 refresh_mcp_tools_in_background(
                     tools.clone(),
@@ -3728,6 +3730,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
         load_session_mode(&deps.session_mode),
     );
     all_tool_specs.extend(deps.tools.specs().iter().cloned().map(advertised_tool));
+    retain_non_excluded_tools(&mut all_tool_specs, &deps.config.tools);
     let jobs = JobRegistry::new();
     let parent = ToolExecutionContext {
         turn_id: TurnId::new(0),
@@ -7614,8 +7617,26 @@ async fn run_subagent(
     // active drain a high-fanout round (>~4 parallel tool calls) would fill
     // the channel buffer and the `send().await` inside the tool dispatcher
     // would block forever.
+    //
+    // BUT: `ToolProgress` events from inside the subagent must still reach
+    // the parent's `tx`. Without them, a long-running subagent (e.g.
+    // explore with `DEFAULT_SUBAGENT_MAX_RUNTIME_SECS = 300`) goes silent
+    // from the parent's perspective for longer than the parent's per-event
+    // timeout (`event_timeout_seconds`, 60s default in the eval driver),
+    // and the parent gives up on the whole turn while the subagent is
+    // still alive and billing. The drain loop forwards exactly those
+    // heartbeat-shaped events so the parent's timeout window resets each
+    // time the subagent reports liveness; everything else is dropped to
+    // keep the parent's transcript clean.
     let (hidden_tx, mut hidden_rx) = mpsc::channel::<AgentEvent>(64);
-    let drain_handle = tokio::spawn(async move { while hidden_rx.recv().await.is_some() {} });
+    let parent_tx_heartbeat = parent.tx.clone();
+    let drain_handle = tokio::spawn(async move {
+        while let Some(event) = hidden_rx.recv().await {
+            if matches!(event, AgentEvent::ToolProgress { .. }) {
+                let _ = parent_tx_heartbeat.send(event).await;
+            }
+        }
+    });
     let local_jobs = JobRegistry::new();
     let local_task_state = Arc::new(Mutex::new(None));
     let local_loaded_schemas = Arc::new(Mutex::new(Vec::new()));
@@ -11304,6 +11325,20 @@ pub(crate) fn advertised_tool(spec: ToolSpec) -> AdvertisedTool {
             strict: false,
         }),
     }
+}
+
+/// Drop entries from `tools` whose name appears in
+/// `tools_config.excluded`. The list is small (typically <20 names) and
+/// the excluded set is short (used today by graph-vs-no-graph eval
+/// scenarios), so a per-entry scan is fine.
+pub(crate) fn retain_non_excluded_tools(
+    tools: &mut Vec<AdvertisedTool>,
+    tools_config: &ToolSchemaConfig,
+) {
+    if tools_config.excluded.is_empty() {
+        return;
+    }
+    tools.retain(|tool| !tools_config.is_excluded(tool.spec.name.as_str()));
 }
 
 /// Synthetic control tools that are advertised to the model on every

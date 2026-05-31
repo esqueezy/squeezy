@@ -1910,7 +1910,16 @@ trait Sink {
 }
 
 #[test]
-fn graph_symbol_references_are_package_local_until_cargo_resolution_exists() {
+fn graph_symbol_references_surface_qualified_workspace_cross_crate_uses() {
+    // Pre-fix this test asserted package-local references only,
+    // documenting the absence of cargo-style cross-crate resolution.
+    // With the workspace-cross-crate qualified-match fallback the
+    // qualified `use source::Shared;` from `crates/user/` is now
+    // surfaced as a reference to the unique `Shared` symbol in
+    // `crates/source/`. The bare-name occurrence inside `fn user(_:
+    // Shared)` is intentionally still skipped — without a scope
+    // prefix or an import alias edge the graph cannot conclude that
+    // it binds to the same `Shared` across crates.
     let mut parser = LanguageParser::new().unwrap();
     let source_package = record("crates/source/src/lib.rs", "pub struct Shared;\n");
     let user_package = record(
@@ -1935,13 +1944,16 @@ pub fn user(_: Shared) {}
         .unwrap();
     let graph = SemanticGraph::from_parsed(vec![source_parsed, user_parsed]);
     let shared = graph.find_symbol_by_name("Shared").pop().unwrap();
-
+    let hits = graph.references_to_symbol(&shared.id);
     assert!(
-        graph.references_to_symbol(&shared.id).iter().all(|hit| hit
-            .reference
-            .file_id
-            .0
-            .starts_with("crates/source/"))
+        hits.iter()
+            .any(|hit| hit.reference.file_id.0 == "crates/user/src/lib.rs"
+                && hit.reference.text.contains("source::Shared")),
+        "expected the qualified `use source::Shared;` in crates/user/src/lib.rs \
+         to surface, got {:?}",
+        hits.iter()
+            .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -3573,6 +3585,513 @@ export function start() {
         !graph.imports_by_alias_target.contains_key("*"),
         "wildcard imports must not be keyed by `*` in the target index",
     );
+}
+
+#[test]
+fn references_to_symbol_finds_qualified_self_crate_call_across_modules() {
+    // Reproduces the squeezy A/B finding: `reference_search` missed
+    // `squeezy_eval::run_scenario` in main.rs even though the function
+    // lives in driver.rs of the same crate. The graph could not
+    // resolve `<crate-name-in-underscores>::foo` as a self-crate
+    // alias, so the call edge had `to = None` and binding fell
+    // through to a Function rejection in `qualified_reference_matches_symbol`.
+    let mut parser = LanguageParser::new().unwrap();
+    let driver_record = record(
+        "crates/sample/src/driver.rs",
+        "pub fn run_scenario() -> u32 { 1 }\n",
+    );
+    let lib_record = record(
+        "crates/sample/src/lib.rs",
+        "pub mod driver;\npub use driver::run_scenario;\n",
+    );
+    let main_record = record(
+        "crates/sample/src/main.rs",
+        r#"
+fn run_cmd() -> u32 {
+    sample::run_scenario()
+}
+
+fn main() {
+    let _ = run_cmd();
+}
+"#,
+    );
+    let parsed = [driver_record, lib_record, main_record]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let run_scenario = graph.find_symbol_by_name("run_scenario").pop().unwrap();
+    let hits = graph.references_to_symbol(&run_scenario.id);
+    assert!(
+        hits.iter()
+            .any(|hit| hit.reference.file_id.0 == "crates/sample/src/main.rs"
+                && hit.reference.text.contains("run_scenario")),
+        "expected reference_search to surface the `sample::run_scenario` call \
+         from `crates/sample/src/main.rs`, got {:?}",
+        hits.iter()
+            .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn references_to_symbol_finds_csharp_namespace_qualified_internal_static_call() {
+    // C# A/B Task finding: the with-graph runs on Newtonsoft.Json
+    // missed call sites of
+    // `MiscellaneousUtils.CreateArgumentOutOfRangeException(...)` even
+    // though every caller lives in the same project (single package
+    // key `Src`). The class is `internal static` and the calls are of
+    // the shape `ClassName.Method(...)` from another file in the same
+    // namespace tree under `Src/Newtonsoft.Json/...`.
+    //
+    // Mirrors `references_to_symbol_finds_workspace_cross_crate_qualified_trait_impl`
+    // but uses `csharp_record` + the `Class.Method` qualifier shape
+    // rather than Rust's `crate::Trait` syntax.
+    let mut parser = LanguageParser::new().unwrap();
+    let utils = csharp_record(
+        "Src/Newtonsoft.Json/Utilities/MiscellaneousUtils.cs",
+        r#"
+using System;
+
+namespace Newtonsoft.Json.Utilities
+{
+    internal static class MiscellaneousUtils
+    {
+        public static ArgumentOutOfRangeException CreateArgumentOutOfRangeException(
+            string paramName, object actualValue, string message)
+        {
+            return new ArgumentOutOfRangeException(paramName, actualValue, message);
+        }
+    }
+}
+"#,
+    );
+    let caller = csharp_record(
+        "Src/Newtonsoft.Json/Utilities/DateTimeUtils.cs",
+        r#"
+using System;
+
+namespace Newtonsoft.Json.Utilities
+{
+    internal static class DateTimeUtils
+    {
+        internal static string ToSerializationMode(DateTimeKind kind)
+        {
+            switch (kind)
+            {
+                default:
+                    throw MiscellaneousUtils.CreateArgumentOutOfRangeException(
+                        nameof(kind), kind, "Unexpected DateTimeKind value.");
+            }
+        }
+    }
+}
+"#,
+    );
+    let parsed = [utils, caller]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+    let method = graph
+        .find_symbol_by_name("CreateArgumentOutOfRangeException")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("CreateArgumentOutOfRangeException method indexed");
+    let hits = graph.references_to_symbol(&method.id);
+    assert!(
+        hits.iter().any(|hit| hit.reference.file_id.0
+            == "Src/Newtonsoft.Json/Utilities/DateTimeUtils.cs"
+            && hit
+                .reference
+                .text
+                .contains("CreateArgumentOutOfRangeException")),
+        "expected `MiscellaneousUtils.CreateArgumentOutOfRangeException(...)` call \
+         in DateTimeUtils.cs to surface on reference_search, got {:?}",
+        hits.iter()
+            .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn references_to_symbol_finds_workspace_cross_crate_qualified_trait_impl() {
+    // A/B Task 2 finding: the graph missed every `impl
+    // squeezy_llm::LlmProvider for ...` block that lived outside the
+    // `squeezy-llm` crate because `reference_is_in_symbol_package`
+    // gated cross-crate references out before the binding logic
+    // could see the qualified path.
+    let mut parser = LanguageParser::new().unwrap();
+    let trait_record = record(
+        "crates/sample-llm/src/lib.rs",
+        "pub trait LlmProvider {\n    fn name(&self) -> &str;\n}\n",
+    );
+    let impl_record = record(
+        "crates/sample-tui/src/config_screen_tests.rs",
+        r#"
+struct NoOpProvider;
+
+impl sample_llm::LlmProvider for NoOpProvider {
+    fn name(&self) -> &str { "noop" }
+}
+"#,
+    );
+    let parsed = [trait_record, impl_record]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+    let llm_provider = graph
+        .find_symbol_by_name("LlmProvider")
+        .pop()
+        .expect("trait symbol indexed");
+    let hits = graph.references_to_symbol(&llm_provider.id);
+    assert!(
+        hits.iter().any(|hit| hit.reference.file_id.0
+            == "crates/sample-tui/src/config_screen_tests.rs"
+            && hit.reference.text.contains("LlmProvider")),
+        "expected `impl sample_llm::LlmProvider for NoOpProvider` to surface \
+         on reference_search, got {:?}",
+        hits.iter()
+            .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn references_to_symbol_finds_workspace_cross_crate_bare_call_after_use_import() {
+    // A/B Task 3 finding: `estimate_cost(...)` calls inside
+    // `crates/squeezy-agent/` after a `use squeezy_llm::estimate_cost;`
+    // were missed. The qualifier never appears in the source bytes
+    // adjacent to the call, but the import is recoverable from the
+    // file's `use` statements. The workspace-cross-crate fallback now
+    // checks `use <crate>::Name [as alias]` and binds when the
+    // symbol's crate matches the import's first segment.
+    let mut parser = LanguageParser::new().unwrap();
+    let registry_record = record(
+        "crates/sample-llm/src/lib.rs",
+        "pub fn estimate_cost() -> u32 { 1 }\n",
+    );
+    let agent_record = record(
+        "crates/sample-agent/src/lib.rs",
+        r#"
+use sample_llm::estimate_cost;
+
+pub fn driver() -> u32 {
+    estimate_cost()
+}
+"#,
+    );
+    let parsed = [registry_record, agent_record]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+    let estimate_cost = graph
+        .find_symbol_by_name("estimate_cost")
+        .pop()
+        .expect("function indexed");
+    let hits = graph.references_to_symbol(&estimate_cost.id);
+    assert!(
+        hits.iter().any(
+            |hit| hit.reference.file_id.0 == "crates/sample-agent/src/lib.rs"
+                && hit.reference.text == "estimate_cost"
+        ),
+        "expected import-resolved bare call to surface, got {:?}",
+        hits.iter()
+            .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn workspace_cross_crate_qualified_match_does_not_bind_ambiguous_workspace_name() {
+    // Conservatism guard for the workspace-cross-crate fallback:
+    // when the workspace has two `LlmProvider` traits in different
+    // crates, neither must be bound through the fallback. Falls back
+    // to existing path-based heuristics (which won't bind in this
+    // synthetic test) so the reference remains unresolved.
+    let mut parser = LanguageParser::new().unwrap();
+    let llm_a = record("crates/sample-llm/src/lib.rs", "pub trait LlmProvider {}\n");
+    let llm_b = record(
+        "crates/sample-llm-mirror/src/lib.rs",
+        "pub trait LlmProvider {}\n",
+    );
+    let impl_record = record(
+        "crates/sample-tui/src/lib.rs",
+        r#"
+struct NoOpProvider;
+impl sample_llm::LlmProvider for NoOpProvider {}
+"#,
+    );
+    let parsed = [llm_a, llm_b, impl_record]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+    let mirror_provider = graph
+        .find_symbol_by_name("LlmProvider")
+        .into_iter()
+        .find(|sym| sym.id.0.contains("sample-llm-mirror"))
+        .expect("mirror trait indexed");
+    let hits = graph.references_to_symbol(&mirror_provider.id);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.reference.file_id.0 != "crates/sample-tui/src/lib.rs"),
+        "ambiguous workspace name `LlmProvider` must not bind through the \
+         workspace fallback; got hit on the mirror trait from sample-tui",
+    );
+}
+
+#[test]
+fn self_crate_qualified_callable_does_not_bind_when_name_is_ambiguous_in_crate() {
+    // Conservatism guard for the qualified-self-crate fallback:
+    // two functions in the same crate share a name → the fallback
+    // refuses to bind either, so a `mycrate::foo()` call from a
+    // sibling module is left unresolved rather than being attached
+    // to an arbitrary candidate.
+    let mut parser = LanguageParser::new().unwrap();
+    let a_record = record("crates/sample/src/a.rs", "pub fn shared() -> u32 { 1 }\n");
+    let b_record = record("crates/sample/src/b.rs", "pub fn shared() -> u32 { 2 }\n");
+    let main_record = record(
+        "crates/sample/src/main.rs",
+        r#"
+fn caller() -> u32 {
+    sample::shared()
+}
+
+fn main() {
+    let _ = caller();
+}
+"#,
+    );
+    let parsed = [a_record, b_record, main_record]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    for shared in graph.find_symbol_by_name("shared") {
+        let hits = graph.references_to_symbol(&shared.id);
+        let main_hits: Vec<_> = hits
+            .iter()
+            .filter(|hit| hit.reference.file_id.0 == "crates/sample/src/main.rs")
+            .collect();
+        assert!(
+            main_hits.is_empty(),
+            "ambiguous same-crate name `shared` must not bind via the \
+             self-crate fallback; got {} main.rs hits for {}",
+            main_hits.len(),
+            shared.id.0,
+        );
+    }
+}
+
+#[test]
+fn references_to_symbol_finds_cpp_namespace_qualified_call_through_include() {
+    // C++ A/B finding: spdlog `pattern_formatter-inl.h` calls
+    // `details::os::localtime(0)` through an `#include` of
+    // `spdlog/details/os-inl.h`. The graph used to silently miss this
+    // site for two reasons: (1) parser misnamed the function (a stale
+    // suspicion this test guards against — actual extracted name must
+    // be just `localtime`, not `tm localtime` or similar); (2)
+    // namespace-qualified call binding chain didn't bind the receiver
+    // chain `details::os` to a workspace symbol. Both ride on the
+    // earlier reference-binding fix that fell through when the
+    // `call_edge_for_reference` returns an unresolved edge.
+    let mut parser = LanguageParser::new().unwrap();
+    let header = cpp_record(
+        "include/spdlog/details/os-inl.h",
+        r#"
+#include <ctime>
+namespace spdlog { namespace details { namespace os {
+inline std::tm localtime(const std::time_t &time_tt) {
+    std::tm out{};
+    return out;
+}
+} } }
+"#,
+    );
+    let caller = cpp_record(
+        "include/spdlog/pattern_formatter-inl.h",
+        r#"
+#include "spdlog/details/os-inl.h"
+namespace spdlog {
+class pattern_formatter {
+public:
+    std::tm get_time_() const { return details::os::localtime(0); }
+};
+}
+"#,
+    );
+    let parsed = [header, caller]
+        .into_iter()
+        .map(|r| {
+            let source = fs::read_to_string(&r.path).unwrap();
+            parser.parse_source(&r, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+    let localtime = graph
+        .find_symbol_by_name("localtime")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Function && s.body_span.is_some())
+        .expect("`localtime` (NOT `tm localtime`) must be indexed as a Function");
+    let hits = graph.references_to_symbol(&localtime.id);
+    assert!(
+        hits.iter().any(
+            |hit| hit.reference.file_id.0 == "include/spdlog/pattern_formatter-inl.h"
+                && hit.reference.text.contains("localtime")
+        ),
+        "expected `details::os::localtime(0)` site in pattern_formatter-inl.h to \
+         surface, got {:?}",
+        hits.iter()
+            .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn references_to_symbol_finds_go_cross_package_qualified_call() {
+    // Go A/B finding: cobra's `doc/*.go` files import
+    // `"github.com/spf13/cobra"` and call `cmd.VisitParents(...)` on
+    // a `*cobra.Command` parameter. The graph emits a Field reference
+    // whose package (`doc`) differs from the symbol's package (the
+    // module root), so `reference_is_in_symbol_package` gates it out.
+    // The Rust-only `workspace_cross_crate_qualified_match` fallback
+    // does not fire because `crate_underscore_alias_for_relative_path`
+    // requires `crates/<name>/` paths, and `imported_reference_matches_symbol`
+    // does not fire because the Go import path leaf is the package
+    // (`cobra`), not the symbol name.
+    let mut parser = LanguageParser::new().unwrap();
+    let cobra = go_record(
+        "command.go",
+        r#"
+package cobra
+
+type Command struct {
+    parent *Command
+}
+
+func (c *Command) VisitParents(fn func(*Command)) {
+    if c.HasParent() {
+        fn(c.Parent())
+        c.Parent().VisitParents(fn)
+    }
+}
+
+func (c *Command) HasParent() bool { return c.parent != nil }
+func (c *Command) Parent() *Command { return c.parent }
+"#,
+    );
+    let doc = go_record(
+        "doc/md_docs.go",
+        r#"
+package doc
+
+import "github.com/spf13/cobra"
+
+func GenMarkdownCustom(cmd *cobra.Command) string {
+    name := ""
+    cmd.VisitParents(func(p *cobra.Command) {
+        name = "x"
+    })
+    return name
+}
+"#,
+    );
+    let parsed = [cobra, doc]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+    let visit_parents = graph
+        .find_symbol_by_name("VisitParents")
+        .pop()
+        .expect("VisitParents method indexed");
+    let hits = graph.references_to_symbol(&visit_parents.id);
+    assert!(
+        hits.iter()
+            .any(|hit| hit.reference.file_id.0 == "doc/md_docs.go"
+                && hit.reference.text.contains("VisitParents")),
+        "expected `cmd.VisitParents(...)` in doc/md_docs.go to surface via \
+         cross-package qualified call binding, got {:?}",
+        hits.iter()
+            .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn go_cross_package_method_match_skips_ambiguous_same_package_name() {
+    // Conservatism guard: when the symbol's own Go package has TWO
+    // methods of the same name on different types, the cross-package
+    // fallback refuses to bind either — otherwise a `cmd.Run()` call
+    // from outside the package would arbitrarily pick one. Squeezy
+    // does not track Go variable types yet, so the safest behaviour
+    // is to leave the reference unresolved.
+    let mut parser = LanguageParser::new().unwrap();
+    let cobra = go_record(
+        "cobra/command.go",
+        r#"
+package cobra
+
+type Command struct{}
+func (c *Command) Run() {}
+
+type Runner struct{}
+func (r *Runner) Run() {}
+"#,
+    );
+    let doc = go_record(
+        "doc/md.go",
+        r#"
+package doc
+
+import "github.com/spf13/cobra"
+
+func Render(cmd *cobra.Command) { cmd.Run() }
+"#,
+    );
+    let parsed = [cobra, doc]
+        .into_iter()
+        .map(|r| {
+            let s = fs::read_to_string(&r.path).unwrap();
+            parser.parse_source(&r, s).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+    for run in graph.find_symbol_by_name("Run") {
+        let hits = graph.references_to_symbol(&run.id);
+        assert!(
+            hits.iter().all(|h| h.reference.file_id.0 != "doc/md.go"),
+            "ambiguous `Run` across two types in same Go package must not bind via the cross-package fallback; symbol id={}",
+            run.id.0,
+        );
+    }
 }
 
 fn record(relative_path: &str, source: &str) -> FileRecord {

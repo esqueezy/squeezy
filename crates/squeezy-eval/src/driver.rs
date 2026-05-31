@@ -553,6 +553,25 @@ fn apply_overlay(
     if let Some(enabled) = overlay.checkpoints_enabled {
         config.checkpoints_enabled = enabled;
     }
+    if !overlay.excluded_tools.is_empty() {
+        for name in &overlay.excluded_tools {
+            if !config
+                .tools
+                .excluded
+                .iter()
+                .any(|existing| existing == name)
+            {
+                config.tools.excluded.push(name.clone());
+            }
+        }
+        let excluded: std::collections::BTreeSet<String> =
+            config.tools.excluded.iter().cloned().collect();
+        config.tools.core.retain(|name| !excluded.contains(name));
+        config
+            .tools
+            .discoverable
+            .retain(|name| !excluded.contains(name));
+    }
     Ok(())
 }
 
