@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env, fmt,
+    hash::{Hash, Hasher},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -40,13 +41,15 @@ use squeezy_agent::{
     RequestUserInputRequest, RequestUserInputResponse, ToolApprovalDecision, ToolApprovalRequest,
 };
 use squeezy_core::{
-    AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
+    AppConfig, ConfigWarning, ContextAttachment, ContextAttachmentKind, ContextCompactionRecord,
+    ContextCompactionState, ContextEstimate, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES,
     PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
     ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig,
     ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
-    TuiSynchronizedOutput, TuiTheme,
+    TuiSynchronizedOutput, context_attachment_storage_text, detect_context_attachment_kind,
+    detect_image_mime,
 };
-use squeezy_llm::LlmProvider;
+use squeezy_llm::{LlmInputItem, LlmProvider};
 use squeezy_skills::PromptTemplateCatalog;
 use squeezy_store::{BugReportBundle, BugReportOptions, CleanupMode, SessionQuery};
 use squeezy_telemetry::PreparedFeedback;
@@ -76,6 +79,7 @@ mod proposed_plan;
 mod render;
 mod resume_picker;
 mod settings_watcher;
+mod startup_model_picker;
 mod status;
 mod status_line_setup;
 mod streaming;
@@ -83,6 +87,9 @@ mod streaming_patch;
 mod terminal_writer;
 mod toast;
 pub use render::markdown::render_markdown;
+pub use startup_model_picker::{
+    StartupModelPickerModel, StartupModelPickerProvider, StartupModelPickerSelection,
+};
 pub use streaming_patch::{
     JsonPatchPreviewParser, PatchPartial, PatchPreviewEvent, render_streaming_preview,
 };
@@ -106,20 +113,15 @@ use input::{
     move_input_cursor_line_end, move_input_cursor_line_start, move_input_cursor_right,
     move_input_cursor_up, move_input_cursor_word_left, move_input_cursor_word_right,
     move_slash_menu_selection, push_input_history, recall_prompt_history,
-    reject_unknown_slash_command, slash_suggestions,
+    reject_unknown_slash_command,
 };
 
 use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
-#[cfg(test)]
-use render::palette::WORKING_SHIMMER_HIGHLIGHT;
-use render::palette::{
-    self, AMBER, BANG_RED, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET,
-    SUCCESS_GREEN, blend_color,
-};
+use render::palette::{self, blend_color};
 use terminal_writer::TerminalWriter;
 use toast::ToastQueue;
 
-const INLINE_PASTE_MAX_BYTES: usize = 512;
+const LARGE_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const LONG_ASSISTANT_CHARS: usize = 1_200;
 const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
@@ -187,6 +189,11 @@ const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
 /// requires holding `Shift` on most emulators — the standard tradeoff
 /// when a TUI takes over mouse input.
 const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1006h";
+/// Enable button-motion reporting (1002) in addition to basic click
+/// reporting. This is only used while the transcript overlay is in its
+/// explicit scrollbar-drag mode; native unmodified text selection needs
+/// mouse reporting disabled, so drag capture cannot be the overlay default.
+const ENABLE_MOUSE_DRAG_CAPTURE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 // The matching disable sequence (1000l, 1006l) is already part of
 // `DISABLE_MOUSE_MODES`, so the Drop tear-down covers undoing this
 // without needing a dedicated constant.
@@ -205,6 +212,8 @@ const END_SYNCHRONIZED_UPDATE: &str = "\x1b[?2026l";
 const TITLE_SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TITLE_SPINNER_INTERVAL_MS: u64 = 100;
 const TITLE_NOTIFICATION_GLYPH: &str = "●";
+const MAX_INPUT_EVENTS_PER_POLL: usize = 128;
+const MAX_TRANSCRIPT_DRAG_INPUT_EVENTS_PER_POLL: usize = 4096;
 
 fn enter_transcript_overlay_screen<W: Write>(writer: &mut W) -> io::Result<()> {
     execute!(
@@ -228,6 +237,20 @@ fn leave_transcript_overlay_screen<W: Write>(
         LeaveAlternateScreen
     )?;
     if restore_mouse_capture {
+        execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))?;
+    }
+    Ok(())
+}
+
+fn set_transcript_overlay_mouse_mode<W: Write>(
+    writer: &mut W,
+    scrollbar_drag: bool,
+    restore_main_mouse_capture: bool,
+) -> io::Result<()> {
+    execute!(writer, Print(DISABLE_MOUSE_MODES))?;
+    if scrollbar_drag {
+        execute!(writer, Print(ENABLE_MOUSE_DRAG_CAPTURE))?;
+    } else if restore_main_mouse_capture {
         execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))?;
     }
     Ok(())
@@ -488,6 +511,18 @@ pub async fn run_with_startup_profile(
     run_inner(config, provider, resume, startup).await
 }
 
+pub fn pick_startup_model_selection(
+    config: &AppConfig,
+    settings_path: &Path,
+    choices: Vec<StartupModelPickerProvider>,
+) -> Result<Option<StartupModelPickerSelection>> {
+    apply_theme_overrides(config);
+    let mut terminal =
+        TerminalGuard::enter(config.tui.alternate_screen, config.tui.synchronized_output)?;
+    startup_model_picker::run_picker(terminal.term(), settings_path, choices)
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))
+}
+
 pub async fn resume(
     config: AppConfig,
     provider: Arc<dyn LlmProvider>,
@@ -514,7 +549,7 @@ async fn run_inner(
     // initial paint already reflects the user's choice — without this the
     // first frame uses the auto-detected tone and pops to the override on
     // the next redraw.
-    apply_theme_overrides(config.tui.theme);
+    apply_theme_overrides(&config);
     let mut terminal =
         TerminalGuard::enter(config.tui.alternate_screen, config.tui.synchronized_output)?;
     let resume_session_id =
@@ -649,7 +684,7 @@ async fn run_inner(
         // the title clock, which removes the per-frame draw work that
         // would otherwise keep a background window's GPU and emulator
         // pipeline busy.
-        if app.focused {
+        if should_advance_animation_tick(&app) {
             app.animation_tick = app.animation_tick.wrapping_add(1);
         }
         if app.app_notifications.tick() {
@@ -994,7 +1029,7 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     // Mirror an external theme edit into the runtime palette override
     // immediately — the agent's config_snapshot already carries the new
     // value, but the palette layer reads the override directly.
-    apply_theme_overrides(new_cfg.tui.theme);
+    apply_theme_overrides(&new_cfg);
     // Same pattern for the shell-diff inline preference: TuiApp keeps the
     // canonical value, but the deep render path reads the static.
     app.shell_diff_inline = new_cfg.tui.shell_diff_inline;
@@ -1147,22 +1182,124 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
         return Ok(false);
     }
 
-    // Any event we read here either drives a state mutation directly or
-    // arms `pending_resize` for the next draw. In every non-timeout
-    // branch we flip `needs_redraw` so the main loop knows to repaint.
-    app.needs_redraw = true;
-    match event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))? {
-        Event::Key(key) => handle_key(app, agent, key).await,
+    let mut events = Vec::with_capacity(8);
+    events.push(event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))?);
+    let max_events = input_events_per_poll_limit(app);
+    while events.len() < max_events
+        && event::poll(Duration::ZERO).map_err(|err| SqueezyError::Terminal(err.to_string()))?
+    {
+        events.push(event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))?);
+    }
+    if let Some(key_event) = take_priority_key_event_for_dispatch(app, &mut events) {
+        return handle_input_event(app, agent, key_event).await;
+    }
+    let events = coalesce_input_events_for_dispatch(app, events);
+    for input_event in events {
+        let is_key = matches!(input_event, Event::Key(_));
+        if handle_input_event(app, agent, input_event).await? {
+            return Ok(true);
+        }
+        if is_key {
+            return Ok(false);
+        }
+    }
+    Ok(false)
+}
+
+fn take_priority_key_event_for_dispatch(app: &TuiApp, events: &mut Vec<Event>) -> Option<Event> {
+    if !transcript_overlay_drag_mode_active(app) {
+        return None;
+    }
+    let key_index = events
+        .iter()
+        .position(|event| matches!(event, Event::Key(_)))?;
+    Some(events.remove(key_index))
+}
+
+fn input_events_per_poll_limit(app: &TuiApp) -> usize {
+    if transcript_overlay_drag_mode_active(app) {
+        MAX_TRANSCRIPT_DRAG_INPUT_EVENTS_PER_POLL
+    } else {
+        MAX_INPUT_EVENTS_PER_POLL
+    }
+}
+
+fn coalesce_input_events_for_dispatch(app: &TuiApp, events: Vec<Event>) -> Vec<Event> {
+    let mut coalesced = Vec::with_capacity(events.len());
+    let mut pending_drag: Option<crossterm::event::MouseEvent> = None;
+    for input_event in events {
+        match input_event {
+            Event::Mouse(mouse) if should_coalesce_transcript_overlay_drag(app, &mouse) => {
+                pending_drag = Some(mouse);
+            }
+            other => {
+                if let Some(mouse) = pending_drag.take() {
+                    coalesced.push(Event::Mouse(mouse));
+                }
+                coalesced.push(other);
+            }
+        }
+    }
+    if let Some(mouse) = pending_drag {
+        coalesced.push(Event::Mouse(mouse));
+    }
+    coalesced
+}
+
+fn should_coalesce_transcript_overlay_drag(
+    app: &TuiApp,
+    mouse: &crossterm::event::MouseEvent,
+) -> bool {
+    transcript_overlay_drag_mode_active(app)
+        && matches!(
+            mouse.kind,
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+        )
+}
+
+fn transcript_overlay_drag_mode_active(app: &TuiApp) -> bool {
+    app.transcript_overlay
+        .as_ref()
+        .is_some_and(|state| state.mode.mouse_capture())
+}
+
+async fn handle_input_event(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    input_event: Event,
+) -> Result<bool> {
+    // Preserve a deferred redraw if the frame limiter held one back from
+    // the previous loop iteration. Individual event arms below add to this
+    // instead of blindly repainting for mouse-wheel momentum at scroll
+    // boundaries.
+    let was_dirty = app.needs_redraw;
+    match input_event {
+        Event::Key(key) => {
+            let before_overlay = app.transcript_overlay;
+            let overlay_scroll_key = before_overlay.is_some()
+                && is_transcript_overlay_scroll_key(key.code, key.modifiers);
+            let quit = handle_key(app, agent, key).await?;
+            let unchanged_overlay_scroll =
+                overlay_scroll_key && app.transcript_overlay == before_overlay;
+            app.needs_redraw = was_dirty || app.needs_redraw || !unchanged_overlay_scroll;
+            Ok(quit)
+        }
         Event::Mouse(mouse) => {
-            handle_mouse(app, mouse);
+            if handle_mouse(app, mouse) {
+                app.needs_redraw = true;
+            } else {
+                app.needs_redraw = was_dirty || app.needs_redraw;
+            }
             Ok(false)
         }
         Event::Paste(text) => {
             handle_paste(app, agent, text).await?;
+            app.needs_redraw = true;
             Ok(false)
         }
         Event::Resize(_, _) => {
             app.pending_resize = true;
+            app.needs_redraw = true;
             Ok(false)
         }
         // Crossterm only emits these after `EnableFocusChange` succeeded
@@ -1170,25 +1307,27 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
         // sequence (older xterm / Apple Terminal / SSH targets without
         // focus reporting) simply never reach this arm, so `focused`
         // stays `true` and animations run as before. We force a redraw
-        // on both transitions (via the unconditional `needs_redraw =
-        // true` above): focus-regain wants the spinner to catch up to
-        // wall-clock state, and focus-loss wants the final "paused"
-        // frame to land before the animation tick driver freezes so
-        // the spinner is not stuck mid-cycle when the user tabs back.
+        // on both transitions: focus-regain wants the spinner to catch
+        // up to wall-clock state, and focus-loss wants the final
+        // "paused" frame to land before the animation tick driver
+        // freezes so the spinner is not stuck mid-cycle when the user
+        // tabs back.
         Event::FocusGained => {
             app.focused = true;
+            app.needs_redraw = true;
             Ok(false)
         }
         Event::FocusLost => {
             app.focused = false;
+            app.needs_redraw = true;
             Ok(false)
         }
     }
 }
 
-fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
-    if handle_transcript_overlay_mouse(app, mouse) {
-        return;
+fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
+    if let Some(changed) = handle_transcript_overlay_mouse(app, mouse) {
+        return changed;
     }
 
     // Left-click is dispatched via the per-frame click registry so any
@@ -1198,7 +1337,7 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
         && let Some(action) = app.click_target_at(mouse.column, mouse.row)
     {
         dispatch_click_action(app, action);
-        return;
+        return true;
     }
     // Wheel scroll always scrolls the transcript. The previous
     // `alternate_scroll_enabled` gate dropped wheel events in
@@ -1206,58 +1345,174 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
     // wheel-to-arrow translation is disabled), which left the user
     // with no way to scroll at all once mouse capture was on.
     match mouse.kind {
-        MouseEventKind::ScrollUp => scroll_transcript_up(app, 3),
-        MouseEventKind::ScrollDown => scroll_transcript_down(app, 3),
-        _ => {}
+        MouseEventKind::ScrollUp => {
+            let before = app.transcript_scroll_from_bottom;
+            scroll_transcript_up(app, 3);
+            app.transcript_scroll_from_bottom != before
+        }
+        MouseEventKind::ScrollDown => {
+            let before = app.transcript_scroll_from_bottom;
+            scroll_transcript_down(app, 3);
+            app.transcript_scroll_from_bottom != before
+        }
+        _ => false,
     }
 }
 
-fn handle_transcript_overlay_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
-    if app.transcript_overlay.is_none() {
-        return false;
-    };
-    match mouse.kind {
+fn handle_transcript_overlay_mouse(
+    app: &mut TuiApp,
+    mouse: crossterm::event::MouseEvent,
+) -> Option<bool> {
+    app.transcript_overlay.as_ref()?;
+    let changed = match mouse.kind {
         MouseEventKind::ScrollUp => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = state.scroll.saturating_sub(3);
-            }
+            adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_sub(3))
         }
         MouseEventKind::ScrollDown => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = state.scroll.saturating_add(3);
-            }
+            adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_add(3))
         }
         MouseEventKind::Down(crossterm::event::MouseButton::Left)
         | MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-            if let Some(scroll) = transcript_overlay_scroll_from_mouse(app, mouse.column, mouse.row)
-                && let Some(state) = app.transcript_overlay.as_mut()
+            if app
+                .transcript_overlay
+                .as_ref()
+                .is_some_and(|state| state.mode.mouse_capture())
+                && let Some((scroll, max_scroll)) =
+                    transcript_overlay_scroll_from_mouse(app, mouse.column, mouse.row)
             {
-                state.scroll = scroll;
+                set_transcript_overlay_scroll_from_cached_geometry(app, scroll, max_scroll)
+            } else {
+                false
             }
         }
-        _ => {}
-    }
-    true
+        _ => false,
+    };
+    Some(changed)
 }
 
-fn transcript_overlay_scroll_from_mouse(app: &TuiApp, column: u16, row: u16) -> Option<u16> {
+fn adjust_transcript_overlay_scroll(app: &mut TuiApp, f: impl FnOnce(usize) -> usize) -> bool {
+    let scroll = f(resolved_transcript_overlay_scroll(app));
+    set_transcript_overlay_scroll(app, scroll)
+}
+
+fn set_transcript_overlay_scroll(app: &mut TuiApp, scroll: usize) -> bool {
+    let scroll = clamp_transcript_overlay_scroll(app, scroll);
+    set_transcript_overlay_scroll_known_clamped(app, scroll)
+}
+
+fn set_transcript_overlay_scroll_known_clamped(app: &mut TuiApp, scroll: usize) -> bool {
+    let scroll = transcript_overlay_max_scroll(app)
+        .map(|max_scroll| {
+            if scroll >= max_scroll {
+                TRANSCRIPT_OVERLAY_SCROLL_BOTTOM
+            } else {
+                scroll
+            }
+        })
+        .unwrap_or(scroll);
+    if let Some(state) = app.transcript_overlay.as_mut() {
+        if state.scroll == scroll {
+            return false;
+        }
+        state.scroll = scroll;
+        true
+    } else {
+        false
+    }
+}
+
+fn set_transcript_overlay_scroll_from_cached_geometry(
+    app: &mut TuiApp,
+    scroll: usize,
+    max_scroll: usize,
+) -> bool {
+    let scroll = if scroll >= max_scroll {
+        TRANSCRIPT_OVERLAY_SCROLL_BOTTOM
+    } else {
+        scroll
+    };
+    if let Some(state) = app.transcript_overlay.as_mut() {
+        if state.scroll == scroll {
+            return false;
+        }
+        state.scroll = scroll;
+        true
+    } else {
+        false
+    }
+}
+
+fn resolved_transcript_overlay_scroll(app: &TuiApp) -> usize {
+    let Some(state) = app.transcript_overlay else {
+        return 0;
+    };
+    transcript_overlay_max_scroll(app)
+        .map(|max_scroll| {
+            if state.scroll == TRANSCRIPT_OVERLAY_SCROLL_BOTTOM {
+                max_scroll
+            } else {
+                state.scroll.min(max_scroll)
+            }
+        })
+        .unwrap_or(if state.scroll == TRANSCRIPT_OVERLAY_SCROLL_BOTTOM {
+            0
+        } else {
+            state.scroll
+        })
+}
+
+fn clamp_transcript_overlay_scroll(app: &TuiApp, scroll: usize) -> usize {
+    transcript_overlay_max_scroll(app)
+        .map(|max_scroll| scroll.min(max_scroll))
+        .unwrap_or(scroll)
+}
+
+fn is_transcript_overlay_scroll_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META)
+        && matches!(
+            code,
+            KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+        )
+}
+
+fn transcript_overlay_max_scroll(app: &TuiApp) -> Option<usize> {
     let (width, height) = terminal_size().ok()?;
-    let area = Rect {
+    let full_area = Rect {
         x: 0,
         y: 0,
         width,
         height,
     };
+    let (area, _) = transcript_overlay_content_and_status_areas(full_area);
     let inner = transcript_overlay_inner(area);
-    let (text_area, scrollbar_area) = transcript_overlay_text_and_scrollbar_areas(inner)?;
+    let (text_area, _) = transcript_overlay_text_and_scrollbar_areas(inner)?;
+    Some(with_transcript_overlay_rows(app, text_area.width, |rows| {
+        transcript_overlay_max_scroll_for_content(rows.len(), text_area.height)
+    }))
+}
+
+fn transcript_overlay_scroll_from_mouse(
+    app: &TuiApp,
+    column: u16,
+    row: u16,
+) -> Option<(usize, usize)> {
+    let cached = app.transcript_overlay_scrollbar_cache.get()?;
+    let scrollbar_area = cached.scrollbar_area;
     if column != scrollbar_area.x
         || row < scrollbar_area.y
         || row >= scrollbar_area.y.saturating_add(scrollbar_area.height)
     {
         return None;
     }
-    let lines = transcript_lines_for_overlay(app, Some(text_area.width));
-    transcript_overlay_scroll_for_scrollbar_row(row, scrollbar_area, lines.len())
+    Some((
+        transcript_overlay_scroll_for_cached_scrollbar_row(row, cached),
+        cached.geometry.max_scroll,
+    ))
 }
 
 /// Canonicalise a `KeyEvent` so every downstream dispatcher sees a
@@ -1358,7 +1613,9 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
 
     // Chord follow-ups run BEFORE any single-key dispatch so the second
     // stroke of a chord never accidentally fires a normal keybinding.
-    if let Some(prefix) = app.pending_chord.take() {
+    if app.transcript_overlay.is_some() {
+        app.pending_chord = None;
+    } else if let Some(prefix) = app.pending_chord.take() {
         // Permissive guard: `Q` may arrive as `Char('q')` or `Char('Q')`
         // and may carry stray SHIFT / CAPS_LOCK / KEYPAD bits depending
         // on the kitty keyboard protocol level the terminal advertises.
@@ -1386,6 +1643,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     if matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::ALT)
+        && app.transcript_overlay.is_none()
     {
         app.pending_chord = Some(ChordPrefix::CtrlX);
         app.status = "Ctrl+X… (Q opens queue · Esc cancels)".to_string();
@@ -1448,7 +1706,11 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // `n` dismisses the current notification, `N` clears all. Only fires
     // when the prompt is empty so we don't eat keystrokes the user is
     // typing into the input area.
-    if app.input.is_empty() && !app.app_notifications.is_empty() && key.modifiers.is_empty() {
+    if app.transcript_overlay.is_none()
+        && app.input.is_empty()
+        && !app.app_notifications.is_empty()
+        && key.modifiers.is_empty()
+    {
         if key.code == KeyCode::Char('n') {
             if app.app_notifications.dismiss_current() {
                 return Ok(false);
@@ -1693,7 +1955,8 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 insert_input_char(app, '\n');
                 return Ok(false);
             }
-            let input = app.input.trim().to_string();
+            let raw_input = app.input.clone();
+            let input = raw_input.trim().to_string();
             if input.is_empty() {
                 app.status = "enter a prompt first".to_string();
                 return Ok(false);
@@ -1701,17 +1964,36 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             // Slash commands always execute immediately — they're UI
             // actions, not turn-equivalent prompts, so they shouldn't
             // queue behind a running turn.
+            let before_command_input = app.input.clone();
             if handle_slash_command(app, agent, &input).await {
-                clear_input(app);
+                let preserve_input =
+                    app.preserve_input_after_slash_command || app.input != before_command_input;
+                app.preserve_input_after_slash_command = false;
+                if !preserve_input {
+                    clear_input(app);
+                }
                 app.input_history_index = None;
                 app.input_history_draft.clear();
                 app.slash_menu_index = 0;
+                return Ok(false);
+            }
+            if handle_inline_slash_command(app, agent, &raw_input).await {
                 return Ok(false);
             }
             if reject_unknown_slash_command(app, &input) {
                 return Ok(false);
             }
             if app.turn_rx.is_some() {
+                app.prune_prompt_attachments();
+                if app
+                    .prompt_attachments
+                    .iter()
+                    .any(|attachment| input.contains(&attachment.placeholder))
+                {
+                    app.status = "prompt attachments cannot be queued; wait for the current turn"
+                        .to_string();
+                    return Ok(false);
+                }
                 app.prompt_queue.push_back(input.clone());
                 clear_input(app);
                 push_input_history(app, input);
@@ -1722,9 +2004,9 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             // during the turn can restore it via Ctrl-R. Completion clears
             // this field; only Cancelled/Failed leave it set.
             app.cancelled_prompt = Some(input.clone());
-            clear_input(app);
             push_input_history(app, input.clone());
             start_user_turn(app, agent, input);
+            clear_input(app);
             Ok(false)
         }
         KeyCode::Backspace => {
@@ -1769,7 +2051,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     }
 }
 
-async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Result<()> {
+async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Result<()> {
     let normalized = normalize_pasted_text(&text);
     // The config screen owns its own set of focusable text inputs (secret
     // entry, search, picker filter, field editor). Route paste there
@@ -1786,34 +2068,168 @@ async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Resu
         insert_input_text(app, &normalized);
         return Ok(());
     }
-    if is_inline_paste(&normalized) {
+    if app.pending_approval.is_some() || app.pending_mcp_elicitation.is_some() {
+        app.status = "paste unavailable while a modal prompt is open".to_string();
+        return Ok(());
+    }
+
+    if let Some(status) = insert_pasted_image_path_token(app, &normalized) {
+        app.status = status;
+        return Ok(());
+    }
+
+    if is_large_prompt_paste(&normalized) {
+        let chars = normalized.chars().count();
+        let placeholder =
+            insert_prompt_text_token(app, format!("[Pasted Content {chars} chars]"), normalized);
+        app.status = format!("inserted {placeholder}");
+    } else {
         insert_input_text(app, &normalized);
-        return Ok(());
-    }
-    if app.turn_rx.is_some()
-        || app.pending_approval.is_some()
-        || app.pending_mcp_elicitation.is_some()
-    {
-        app.status = "paste-as-attachment unavailable mid-turn; queue the prompt and retry after"
-            .to_string();
-        return Ok(());
-    }
-    match agent.attach_pasted_context(normalized).await {
-        Ok(update) => {
-            app.attachments = agent.context_attachments_snapshot().await;
-            app.status = attachment_update_status("paste", &update);
-        }
-        Err(error) => app.status = format!("paste attach failed: {error}"),
     }
     Ok(())
+}
+
+fn insert_pasted_image_path_token(app: &mut TuiApp, text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+    let candidate = trimmed.trim_matches('"');
+    let resolved = resolve_workspace_path(&app.workspace_root, candidate);
+    if !resolved.is_file() {
+        return None;
+    }
+    let bytes = match std::fs::read(&resolved) {
+        Ok(bytes) => bytes,
+        Err(error) => return Some(format!("image paste failed: {error}")),
+    };
+    let media_type = detect_image_mime(&bytes)?;
+    let label = file_label(&resolved);
+    let placeholder = insert_prompt_image_token(
+        app,
+        format!("[Image {label}]"),
+        media_type.to_string(),
+        bytes,
+    );
+    Some(format!("inserted {placeholder}"))
+}
+
+fn insert_file_prompt_attachment(app: &mut TuiApp, path: &str) -> Result<String> {
+    let resolved = resolve_workspace_path(&app.workspace_root, path);
+    let bytes = std::fs::read(&resolved)?;
+    let label = file_label(&resolved);
+    let display_path = display_workspace_path(&app.workspace_root, &resolved);
+    let text = std::str::from_utf8(&bytes).ok();
+    let kind = detect_context_attachment_kind(Some(&label), &bytes, text);
+    if kind == ContextAttachmentKind::Image {
+        let media_type = detect_image_mime(&bytes)
+            .map(str::to_string)
+            .unwrap_or_else(|| "image/png".to_string());
+        let placeholder =
+            insert_prompt_image_token(app, format!("[Image {label}]"), media_type, bytes);
+        return Ok(format!("inserted {placeholder}"));
+    }
+    if !kind.is_supported_text() {
+        return Err(SqueezyError::Agent(format!(
+            "unsupported file kind={}",
+            kind.as_str()
+        )));
+    }
+    let text = text.unwrap_or_default();
+    let (bounded_text, truncated) =
+        context_attachment_storage_text(text, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES);
+    let mut replacement = format!("Attached file {display_path}:\n{bounded_text}");
+    if truncated {
+        replacement.push_str("\n[truncated]");
+    }
+    let placeholder =
+        insert_prompt_text_token(app, format!("[Attached file {label}]"), replacement);
+    Ok(format!("inserted {placeholder}"))
+}
+
+fn resolve_workspace_path(root: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file")
+        .to_string()
+}
+
+fn display_workspace_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn insert_prompt_text_token(
+    app: &mut TuiApp,
+    base_placeholder: String,
+    replacement: String,
+) -> String {
+    let placeholder = unique_prompt_placeholder(app, &base_placeholder);
+    insert_input_text(app, &placeholder);
+    app.prompt_attachments.push(PromptAttachment {
+        placeholder: placeholder.clone(),
+        payload: PromptAttachmentPayload::Text { replacement },
+    });
+    placeholder
+}
+
+fn insert_prompt_image_token(
+    app: &mut TuiApp,
+    base_placeholder: String,
+    media_type: String,
+    bytes: Vec<u8>,
+) -> String {
+    let placeholder = unique_prompt_placeholder(app, &base_placeholder);
+    insert_input_text(app, &placeholder);
+    app.prompt_attachments.push(PromptAttachment {
+        placeholder: placeholder.clone(),
+        payload: PromptAttachmentPayload::Image {
+            media_type,
+            bytes: Arc::from(bytes.into_boxed_slice()),
+        },
+    });
+    placeholder
+}
+
+fn unique_prompt_placeholder(app: &TuiApp, base: &str) -> String {
+    if !prompt_placeholder_in_use(app, base) {
+        return base.to_string();
+    }
+    let stem = base.strip_suffix(']').unwrap_or(base);
+    for index in 2.. {
+        let candidate = format!("{stem} #{index}]");
+        if !prompt_placeholder_in_use(app, &candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded placeholder suffix search must return")
+}
+
+fn prompt_placeholder_in_use(app: &TuiApp, placeholder: &str) -> bool {
+    app.input.contains(placeholder)
+        || app
+            .prompt_attachments
+            .iter()
+            .any(|attachment| attachment.placeholder == placeholder)
 }
 
 fn normalize_pasted_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn is_inline_paste(text: &str) -> bool {
-    text.len() <= INLINE_PASTE_MAX_BYTES && !text.contains('\n')
+fn is_large_prompt_paste(text: &str) -> bool {
+    text.chars().count() > LARGE_PASTE_CHAR_THRESHOLD
 }
 
 /// Resolve `key` against the user-configurable keymap and execute the
@@ -1828,6 +2244,9 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
     let Some(action) = app.keymap.lookup(key.code, key.modifiers) else {
         return false;
     };
+    if app.transcript_overlay.is_some() && action != keymap::Action::ToggleTranscriptOverlay {
+        return false;
+    }
     match action {
         keymap::Action::ToggleConfigScreen => {
             toggle_config_screen(app, agent, None);
@@ -1839,6 +2258,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
                 return false;
             }
+            app.transcript_overlay_scrollbar_cache.set(None);
             app.transcript_overlay = if app.transcript_overlay.is_some() {
                 None
             } else {
@@ -1925,7 +2345,10 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
 /// single-Ctrl-letter defaults collide with terminal flow control
 /// (`Ctrl+Q` = `XON`, `Ctrl+S` = `XOFF`) and with macOS shortcuts.
 fn toggle_prompt_queue_overlay(app: &mut TuiApp) {
-    if app.config_screen.is_some() || app.status_line_setup.is_some() {
+    if app.config_screen.is_some()
+        || app.status_line_setup.is_some()
+        || app.transcript_overlay.is_some()
+    {
         return;
     }
     app.prompt_queue_overlay = if app.prompt_queue_overlay.is_some() {
@@ -1958,10 +2381,7 @@ fn scroll_transcript_down(app: &mut TuiApp, lines: u16) {
 }
 
 fn should_route_plain_arrow_to_scroll(app: &TuiApp) -> bool {
-    app.alternate_scroll_enabled
-        && app.input_history_index.is_none()
-        && !app.transcript.is_empty()
-        && (app.transcript_scroll_from_bottom > 0 || !app.input.trim().is_empty())
+    app.alternate_scroll_enabled && app.input_history_index.is_none() && !app.transcript.is_empty()
 }
 
 fn request_turn_interrupt(app: &mut TuiApp) -> bool {
@@ -2017,35 +2437,10 @@ fn toggle_status_line_setup(app: &mut TuiApp) {
     app.status = "/statusline".to_string();
 }
 
-/// Convert a [`TuiTheme`] preference into the runtime palette tone override.
-/// `System` clears the override so terminal detection (`COLORFGBG`) wins;
-/// `Catppuccin` pins Dark and `HighContrast` pins Light because each named
-/// theme expects a specific background tone for its accent palette to read
-/// correctly.
-fn theme_to_tone_override(theme: TuiTheme) -> Option<render::palette::PaletteTone> {
-    match theme {
-        TuiTheme::System => None,
-        TuiTheme::Dark | TuiTheme::Catppuccin => Some(render::palette::PaletteTone::Dark),
-        TuiTheme::Light | TuiTheme::HighContrast => Some(render::palette::PaletteTone::Light),
-    }
-}
-
-/// Map a [`TuiTheme`] to the accent family it owns. The amber/gold default
-/// is shared by `System`, `Dark`, and `Light`; only the named themes flip
-/// the accent.
-fn theme_to_accent_variant(theme: TuiTheme) -> render::palette::AccentVariant {
-    match theme {
-        TuiTheme::Catppuccin => render::palette::AccentVariant::Catppuccin,
-        TuiTheme::HighContrast => render::palette::AccentVariant::HighContrast,
-        _ => render::palette::AccentVariant::Default,
-    }
-}
-
-/// Apply both the tone and accent overrides for `theme` in one shot so
-/// callers don't accidentally update one and forget the other.
-pub(crate) fn apply_theme_overrides(theme: TuiTheme) {
-    render::palette::set_palette_tone_override(theme_to_tone_override(theme));
-    render::palette::set_accent_variant(theme_to_accent_variant(theme));
+/// Apply the resolved theme table in one shot so all token lookups and
+/// render caches observe the same generation.
+pub(crate) fn apply_theme_overrides(config: &AppConfig) {
+    render::theme::set_active_theme(config);
 }
 
 /// Apply a `/theme` switch: flip the runtime palette override, mirror the
@@ -2053,27 +2448,24 @@ pub(crate) fn apply_theme_overrides(theme: TuiTheme) {
 /// scope settings file so the choice survives a restart. Persistence failures
 /// surface in the status line but the live switch still takes effect — the
 /// user can re-run later to retry the save.
-fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: TuiTheme) {
+fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: String) {
     use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
 
-    apply_theme_overrides(theme);
-
     let mut next = agent.config_snapshot();
-    next.tui.theme = theme;
+    next.tui.theme = theme.clone();
+    apply_theme_overrides(&next);
     agent.replace_config(next);
 
     let target_path = app.user_settings_path();
     let scope_target = SettingsScope::user(&target_path);
     let edits = [SettingsEdit {
         path: &["tui", "theme"],
-        op: EditOp::SetString(theme.as_str().to_string()),
+        op: EditOp::SetString(theme.clone()),
     }];
     match apply_edits(&scope_target, &edits) {
         Ok(_) => {
-            app.app_notifications.push(
-                format!("theme → {}", theme.as_str()),
-                NotifySeverity::Success,
-            );
+            app.app_notifications
+                .push(format!("theme → {theme}"), NotifySeverity::Success);
             app.status = format!("theme saved to {}", target_path.display());
         }
         Err(err) => {
@@ -2163,8 +2555,9 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
         return false;
     }
     match command {
-        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/copy"
-        | "/collapse" | "/expand" | "/help" => false,
+        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/copy" | "/help" => {
+            false
+        }
         "/verbosity" | "/tool-verbosity" => !rest.trim().is_empty(),
         _ => true,
     }
@@ -2213,6 +2606,108 @@ pub(crate) async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, in
 
     apply_dispatch_command(app, agent, cmd).await;
     true
+}
+
+async fn handle_inline_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
+    let Some(occurrence) = input::find_inline_slash_dispatch_command(input) else {
+        return false;
+    };
+    let slash = occurrence.command.name;
+    if !occurrence.command.available_during_task && turn_in_progress(app) {
+        app.status = format!("{slash} unavailable during turn");
+        return true;
+    }
+    match slash {
+        "/attach" => handle_inline_attach_command(app, input, occurrence.start, occurrence.end),
+        "/help" | "/plan" | "/build" => {
+            let command_input =
+                inline_prompt_command_input(input, occurrence.start, occurrence.end, slash);
+            let before_command_input = app.input.clone();
+            if handle_slash_command(app, agent, &command_input).await {
+                let preserve_input =
+                    app.preserve_input_after_slash_command || app.input != before_command_input;
+                app.preserve_input_after_slash_command = false;
+                if !preserve_input {
+                    clear_input(app);
+                }
+                app.input_history_index = None;
+                app.input_history_draft.clear();
+                app.slash_menu_index = 0;
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn inline_prompt_command_input(input: &str, start: usize, end: usize, slash: &str) -> String {
+    let before = input[..start].trim();
+    let after = input[end..].trim();
+    let prompt = if slash == "/help" {
+        after.to_string()
+    } else {
+        [before, after]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if prompt.is_empty() {
+        slash.to_string()
+    } else {
+        format!("{slash} {prompt}")
+    }
+}
+
+fn handle_inline_attach_command(
+    app: &mut TuiApp,
+    input: &str,
+    command_start: usize,
+    command_end: usize,
+) -> bool {
+    let Some((path, path_end)) = inline_attach_path(input, command_end) else {
+        app.status = "usage: /attach <path>".to_string();
+        return true;
+    };
+    let original_input = app.input.clone();
+    let original_cursor = app.input_cursor;
+    app.input.replace_range(command_start..path_end, "");
+    app.input_cursor = command_start;
+    match insert_file_prompt_attachment(app, &path) {
+        Ok(status) => app.status = status,
+        Err(error) => {
+            app.input = original_input;
+            app.input_cursor = original_cursor;
+            app.preserve_input_after_slash_command = true;
+            app.status = format!("attach failed: {error}");
+        }
+    }
+    true
+}
+
+fn inline_attach_path(input: &str, command_end: usize) -> Option<(String, usize)> {
+    let (relative_start, first) = input[command_end..]
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())?;
+    let path_start = command_end + relative_start;
+    if first == '"' || first == '\'' {
+        let value_start = path_start + first.len_utf8();
+        let close = input[value_start..]
+            .char_indices()
+            .find(|(_, ch)| *ch == first)
+            .map(|(index, _)| value_start + index)?;
+        let path = input[value_start..close].to_string();
+        let path_end = close + first.len_utf8();
+        return (!path.is_empty()).then_some((path, path_end));
+    }
+    let path_end = input[path_start..]
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(index, _)| path_start + index)
+        .unwrap_or(input.len());
+    let path = input[path_start..path_end].to_string();
+    (!path.is_empty()).then_some((path, path_end))
 }
 
 /// Attempt to resolve an unknown `/foo …` head against the user-
@@ -2341,12 +2836,17 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             handle_report_command(app, agent, &args).await;
         }
         DispatchCommand::Attach { path } => {
-            match agent.attach_file_context(PathBuf::from(&path)).await {
-                Ok(update) => {
-                    app.attachments = agent.context_attachments_snapshot().await;
-                    app.status = attachment_update_status("file", &update);
+            let original_input = app.input.clone();
+            let original_cursor = app.input_cursor;
+            clear_input(app);
+            match insert_file_prompt_attachment(app, &path) {
+                Ok(status) => app.status = status,
+                Err(error) => {
+                    app.input = original_input;
+                    app.input_cursor = original_cursor;
+                    app.preserve_input_after_slash_command = true;
+                    app.status = format!("attach failed: {error}");
                 }
-                Err(error) => app.status = format!("attach failed: {error}"),
             }
         }
         DispatchCommand::Attachments => {
@@ -2456,17 +2956,6 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             }
             Err(error) => app.status = format!("unpin failed: {error}"),
         },
-        DispatchCommand::Collapse { category } => {
-            apply_collapse_expand(app, "/collapse", category.as_deref(), true);
-        }
-        DispatchCommand::Expand { category } => {
-            if category.is_none() {
-                app.transcript_overlay = Some(TranscriptOverlayState::default());
-                app.status = "full transcript open".to_string();
-            } else {
-                apply_collapse_expand(app, "/expand", category.as_deref(), false);
-            }
-        }
         DispatchCommand::Diff => handle_slash_diff(app),
         DispatchCommand::Effort { value } => handle_slash_effort(app, agent, value.as_deref()),
         DispatchCommand::Verbosity { value } => {
@@ -2475,13 +2964,25 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         DispatchCommand::ToolVerbosity { value } => {
             handle_slash_tool_verbosity(app, agent, value.as_deref());
         }
-        DispatchCommand::Theme { theme } => {
-            let Some(parsed) = TuiTheme::parse(&theme) else {
-                app.status = format!(
-                    "unknown theme {theme:?}; expected system, dark, light, catppuccin, or high-contrast",
-                );
+        DispatchCommand::Theme { theme: None } => {
+            toggle_config_screen(
+                app,
+                agent,
+                Some(squeezy_core::config_schema::SectionId::Themes),
+            );
+        }
+        DispatchCommand::Theme { theme: Some(theme) } => {
+            let Some(parsed) = squeezy_core::normalize_tui_theme_name(&theme) else {
+                app.status = format!("unknown theme {theme:?}; expected a theme slug",);
                 return;
             };
+            if !render::theme::theme_exists(&agent.config_snapshot(), &parsed) {
+                app.status = format!(
+                    "unknown theme {theme:?}; available: {}",
+                    render::theme::available_theme_names(&agent.config_snapshot()).join(", ")
+                );
+                return;
+            }
             apply_theme_change(app, agent, parsed);
         }
         DispatchCommand::Keymap => {
@@ -2695,40 +3196,6 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             "checkpoint_revert",
             serde_json::json!({ "group_id": group_id }),
         ),
-    }
-}
-
-fn apply_collapse_expand(app: &mut TuiApp, command: &str, category: Option<&str>, collapsed: bool) {
-    let category_arg = category;
-    let category = match category_arg {
-        Some(value) => match parse_transcript_category(value) {
-            Some(category) => category,
-            None => {
-                app.status =
-                    format!("usage: {command} [all|tools|logs|diffs|receipts|assistant|reasoning]");
-                return;
-            }
-        },
-        None => TranscriptCategory::All,
-    };
-    let changed = set_transcript_collapsed(app, category, collapsed);
-    let verb = if collapsed { "collapse" } else { "expand" };
-    let past = if collapsed { "collapsed" } else { "expanded" };
-    if changed == 0 {
-        // squeezy-o3z0 (audit U3): when nothing matches the requested
-        // category, say so directly instead of leaking a "collapsed 0
-        // transcript entries" line. `category_arg` is the user-typed
-        // slug; falling back to "matching" keeps the bare /collapse
-        // case (TranscriptCategory::All) readable too.
-        let label = category_arg.unwrap_or("matching");
-        app.status = format!("no {label} entries to {verb}");
-    } else {
-        app.status = format!(
-            "{} {} transcript entr{}",
-            past,
-            changed,
-            if changed == 1 { "y" } else { "ies" }
-        );
     }
 }
 
@@ -3122,31 +3589,6 @@ async fn handle_report_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
     }
 }
 
-fn attachment_update_status(
-    source: &str,
-    update: &squeezy_agent::ContextAttachmentUpdate,
-) -> String {
-    let attachment = &update.attachment;
-    if update.duplicate {
-        return format!("deduped {source} as {}", attachment.id);
-    }
-    if !update.active {
-        return format!(
-            "unsupported {source}: {} ({})",
-            attachment.kind.as_str(),
-            attachment.original_bytes
-        );
-    }
-    format!(
-        "attached {source} {} kind={} bytes={} preview={} redactions={}",
-        attachment.id,
-        attachment.kind.as_str(),
-        attachment.original_bytes,
-        attachment.preview_bytes,
-        attachment.redactions,
-    )
-}
-
 fn format_attachment_list(attachments: &[ContextAttachment]) -> String {
     if attachments.is_empty() {
         return "No attached context.".to_string();
@@ -3363,19 +3805,6 @@ fn transcript_plain_text(app: &TuiApp) -> String {
     lines.join("\n")
 }
 
-fn parse_transcript_category(value: &str) -> Option<TranscriptCategory> {
-    match value {
-        "all" => Some(TranscriptCategory::All),
-        "tools" => Some(TranscriptCategory::Tools),
-        "logs" => Some(TranscriptCategory::Logs),
-        "diffs" => Some(TranscriptCategory::Diffs),
-        "receipts" => Some(TranscriptCategory::Receipts),
-        "assistant" => Some(TranscriptCategory::Assistant),
-        "reasoning" | "thinking" => Some(TranscriptCategory::Reasoning),
-        _ => None,
-    }
-}
-
 fn parse_response_verbosity(value: &str) -> Option<ResponseVerbosity> {
     match value {
         "concise" => Some(ResponseVerbosity::Concise),
@@ -3498,14 +3927,11 @@ fn handle_slash_tool_verbosity(app: &mut TuiApp, agent: &mut Agent, value: Optio
     app.status = format!("tool output verbosity → {}", verbosity.as_str());
 }
 
-fn set_transcript_collapsed(
-    app: &mut TuiApp,
-    category: TranscriptCategory,
-    collapsed: bool,
-) -> usize {
+#[cfg(test)]
+fn set_all_transcript_collapsed(app: &mut TuiApp, collapsed: bool) -> usize {
     let mut changed = 0;
     for entry in &mut app.transcript {
-        if entry.matches_category(category) && entry.collapsed != collapsed {
+        if entry.collapsed != collapsed {
             entry.collapsed = collapsed;
             entry.bump_revision();
             changed += 1;
@@ -3547,50 +3973,64 @@ fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if app.transcript_overlay.is_none() {
         return false;
     }
-    const PAGE: u16 = 10;
+    const PAGE: usize = 10;
     match key.code {
         KeyCode::Esc => {
+            app.transcript_overlay_scrollbar_cache.set(None);
             app.transcript_overlay = None;
             app.status = "transcript overlay closed".to_string();
             true
         }
         KeyCode::PageUp => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = state.scroll.saturating_sub(PAGE);
-            }
+            adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_sub(PAGE));
             true
         }
         KeyCode::PageDown => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = state.scroll.saturating_add(PAGE);
-            }
+            adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_add(PAGE));
             true
         }
         KeyCode::Up => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = state.scroll.saturating_sub(1);
-            }
+            adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_sub(1));
             true
         }
         KeyCode::Down => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = state.scroll.saturating_add(1);
-            }
+            adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_add(1));
             true
         }
         KeyCode::Home => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = 0;
-            }
+            set_transcript_overlay_scroll(app, 0);
             true
         }
         KeyCode::End => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = u16::MAX;
-            }
+            let end =
+                transcript_overlay_max_scroll(app).unwrap_or(TRANSCRIPT_OVERLAY_SCROLL_BOTTOM);
+            set_transcript_overlay_scroll(app, end);
+            true
+        }
+        KeyCode::Char('m') | KeyCode::Char('M')
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META) =>
+        {
+            toggle_transcript_overlay_mouse_capture(app);
             true
         }
         _ => true, // swallow everything else so the overlay stays modal
+    }
+}
+
+fn toggle_transcript_overlay_mouse_capture(app: &mut TuiApp) {
+    if let Some(state) = app.transcript_overlay.as_mut() {
+        state.mode = match state.mode {
+            TranscriptOverlayMode::NativeSelection => TranscriptOverlayMode::ScrollbarDrag,
+            TranscriptOverlayMode::ScrollbarDrag => TranscriptOverlayMode::NativeSelection,
+        };
+        app.status = if state.mode.mouse_capture() {
+            "transcript scrollbar drag on (Shift-drag selects text)"
+        } else {
+            "transcript native selection mode"
+        }
+        .to_string();
     }
 }
 
@@ -3615,6 +4055,42 @@ fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
 /// by the post-plan Execute action so both paths share the same plan
 /// prefix and turn-state bookkeeping.
 pub(crate) fn start_user_turn(app: &mut TuiApp, agent: &mut Agent, input: String) {
+    let prompt = prepare_prompt_turn_input(app, input);
+    start_user_turn_prepared(app, agent, prompt);
+}
+
+#[derive(Debug, Clone)]
+struct PreparedPromptTurn {
+    display_input: String,
+    model_input: String,
+    transient_input_items: Vec<LlmInputItem>,
+}
+
+fn prepare_prompt_turn_input(app: &mut TuiApp, input: String) -> PreparedPromptTurn {
+    app.prune_prompt_attachments();
+    let mut model_input = input.clone();
+    let mut transient_input_items = Vec::new();
+    for attachment in app.prompt_attachments.clone() {
+        if !input.contains(&attachment.placeholder) {
+            continue;
+        }
+        match attachment.payload {
+            PromptAttachmentPayload::Text { replacement } => {
+                model_input = model_input.replace(&attachment.placeholder, &replacement);
+            }
+            PromptAttachmentPayload::Image { media_type, bytes } => {
+                transient_input_items.push(LlmInputItem::Image { media_type, bytes });
+            }
+        }
+    }
+    PreparedPromptTurn {
+        display_input: input,
+        model_input,
+        transient_input_items,
+    }
+}
+
+fn start_user_turn_prepared(app: &mut TuiApp, agent: &mut Agent, prompt: PreparedPromptTurn) {
     if let Some(swap) = agent.drain_pending_swap() {
         let note = swap
             .display_note
@@ -3627,12 +4103,17 @@ pub(crate) fn start_user_turn(app: &mut TuiApp, agent: &mut Agent, input: String
     app.task_state = None;
     app.task_panel_collapsed = false;
     app.note_turn_started();
-    let prefixed_input = match take_pending_plan_prefix(app) {
-        Some(prefix) => format!("{prefix}{input}"),
-        None => input,
+    let (display_input, model_input) = match take_pending_plan_prefix(app) {
+        Some(prefix) => (
+            format!("{prefix}{}", prompt.display_input),
+            format!("{prefix}{}", prompt.model_input),
+        ),
+        None => (prompt.display_input, prompt.model_input),
     };
-    app.turn_rx = Some(agent.start_turn_with_response_verbosity(
-        prefixed_input,
+    app.turn_rx = Some(agent.start_turn_with_display_input(
+        display_input,
+        model_input,
+        prompt.transient_input_items,
         cancel.clone(),
         app.response_verbosity,
     ));
@@ -4257,7 +4738,9 @@ fn format_mcp_elicitation_menu_lines(
     let mut lines = vec![Line::from(vec![
         Span::styled(
             "MCP request",
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(
@@ -4265,7 +4748,7 @@ fn format_mcp_elicitation_menu_lines(
                 request.server,
                 mcp_elicitation_kind_label(&request.kind)
             ),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ),
     ])];
     lines.push(Line::from(vec![
@@ -4273,7 +4756,7 @@ fn format_mcp_elicitation_menu_lines(
         Span::styled(
             compact_text(&request.message, 180),
             Style::default()
-                .fg(MODE_PURPLE)
+                .fg(crate::render::theme::magenta())
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -4286,7 +4769,7 @@ fn format_mcp_elicitation_menu_lines(
                     Span::raw("  "),
                     Span::styled(
                         format!("schema {}", compact_text(&schema, 160)),
-                        Style::default().fg(QUIET),
+                        Style::default().fg(crate::render::theme::quiet()),
                     ),
                 ]));
             }
@@ -4294,7 +4777,7 @@ fn format_mcp_elicitation_menu_lines(
                 Span::raw("  "),
                 Span::styled(
                     format!("response {}", mcp_elicitation_response_preview(input)),
-                    Style::default().fg(QUIET),
+                    Style::default().fg(crate::render::theme::quiet()),
                 ),
             ]));
         }
@@ -4302,7 +4785,10 @@ fn format_mcp_elicitation_menu_lines(
             if let Some(url) = request.url.as_ref() {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(compact_text(url, 180), Style::default().fg(QUIET)),
+                    Span::styled(
+                        compact_text(url, 180),
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ),
                 ]));
             }
         }
@@ -4311,17 +4797,24 @@ fn format_mcp_elicitation_menu_lines(
         let is_selected = index == selected.min(mcp_elicitation_options().len() - 1);
         let marker = if is_selected { "› " } else { "  " };
         let label_style = if is_selected {
-            Style::default().fg(GOLD)
+            Style::default().fg(crate::render::theme::secondary())
         } else {
             Style::default().fg(palette::muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
                 marker,
-                Style::default().fg(if is_selected { GOLD } else { QUIET }),
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
             ),
             Span::styled(option.label, label_style),
-            Span::styled(format!(" · {}", option.hint), Style::default().fg(QUIET)),
+            Span::styled(
+                format!(" · {}", option.hint),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
         ]));
     }
     lines
@@ -4348,11 +4841,13 @@ fn format_plan_choice_menu_lines(pending: &PendingPlanChoice) -> Vec<Line<'stati
     let mut lines = vec![Line::from(vec![
         Span::styled(
             "Plan ready",
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(" · {}", pending.plan_id),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ),
     ])];
     lines.push(Line::from(vec![
@@ -4366,20 +4861,27 @@ fn format_plan_choice_menu_lines(pending: &PendingPlanChoice) -> Vec<Line<'stati
         let is_selected = idx == selected;
         let marker = if is_selected { "› " } else { "  " };
         let label_style = if is_selected {
-            Style::default().fg(GOLD)
+            Style::default().fg(crate::render::theme::secondary())
         } else {
             Style::default().fg(palette::muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
                 marker,
-                Style::default().fg(if is_selected { GOLD } else { QUIET }),
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
             ),
             Span::styled(
                 format!("[{}] {}", option.shortcut, option.label),
                 label_style,
             ),
-            Span::styled(format!(" · {}", option.hint), Style::default().fg(QUIET)),
+            Span::styled(
+                format!(" · {}", option.hint),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
         ]));
     }
     lines
@@ -4390,11 +4892,13 @@ fn format_feedback_prompt_lines(feedback: &PreparedFeedback) -> Vec<Line<'static
         Line::from(vec![
             Span::styled(
                 "Send feedback?",
-                Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" · {}", feedback.feedback_id),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ),
         ]),
         Line::from(vec![
@@ -4405,8 +4909,11 @@ fn format_feedback_prompt_lines(feedback: &PreparedFeedback) -> Vec<Line<'static
             ),
         ]),
         Line::from(vec![
-            Span::styled("› Enter/Y Send", Style::default().fg(GOLD)),
-            Span::styled(" · ", Style::default().fg(QUIET)),
+            Span::styled(
+                "› Enter/Y Send",
+                Style::default().fg(crate::render::theme::secondary()),
+            ),
+            Span::styled(" · ", Style::default().fg(crate::render::theme::quiet())),
             Span::styled("Esc/N Discard", Style::default().fg(palette::muted_fg())),
         ]),
     ]
@@ -4420,12 +4927,14 @@ fn format_request_user_input_menu_lines(
     let mut lines = vec![{
         let mut spans = vec![Span::styled(
             "Plan-mode question",
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         )];
         if request.allow_freeform {
             spans.push(Span::styled(
                 " · freeform allowed",
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         }
         Line::from(spans)
@@ -4435,7 +4944,7 @@ fn format_request_user_input_menu_lines(
         Span::styled(
             compact_text(&request.question, 240),
             Style::default()
-                .fg(MODE_PURPLE)
+                .fg(crate::render::theme::magenta())
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -4455,14 +4964,18 @@ fn format_request_user_input_menu_lines(
         let mut spans = vec![
             Span::styled(
                 marker,
-                Style::default().fg(if is_selected { AMBER } else { QUIET }),
+                Style::default().fg(if is_selected {
+                    crate::render::theme::accent()
+                } else {
+                    crate::render::theme::quiet()
+                }),
             ),
             Span::styled(compact_text(&choice.label, 180), label_style),
         ];
         if choice.value != choice.label {
             spans.push(Span::styled(
                 format!(" · {}", compact_text(&choice.value, 120)),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         }
         lines.push(Line::from(spans));
@@ -4470,18 +4983,24 @@ fn format_request_user_input_menu_lines(
     if request.allow_freeform {
         // Dedicated answer-entry box. Lives inside the modal area so the
         // main composer below stays untouched for the user's next prompt.
-        // Label + cursor share the `MODE_PURPLE` warm-taupe accent so the
+        // Label + cursor share the `crate::render::theme::magenta()` warm-taupe accent so the
         // whole modal reads as one semantic surface; the typed body uses
         // a dim+bold tone-aware foreground for legibility without
         // overpowering the question line.
         let is_selected = selected >= request.choices.len();
         let marker = if is_selected { "● " } else { "  " };
-        let marker_style = Style::default().fg(if is_selected { AMBER } else { QUIET });
+        let marker_style = Style::default().fg(if is_selected {
+            crate::render::theme::accent()
+        } else {
+            crate::render::theme::quiet()
+        });
         let entry_style = Style::default()
             .fg(palette::footer_fg())
             .add_modifier(Modifier::BOLD);
-        let label_style = Style::default().fg(MODE_PURPLE);
-        let cursor_style = Style::default().fg(Color::Black).bg(MODE_PURPLE);
+        let label_style = Style::default().fg(crate::render::theme::magenta());
+        let cursor_style = Style::default()
+            .fg(Color::Black)
+            .bg(crate::render::theme::magenta());
         let mut spans = vec![
             Span::styled(marker, marker_style),
             Span::styled("Answer › ", label_style),
@@ -4489,7 +5008,7 @@ fn format_request_user_input_menu_lines(
         if input.is_empty() {
             spans.push(Span::styled(
                 "(type your answer · Enter sends when selected)",
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         } else {
             // Render the answer with an inline cursor block. The cursor
@@ -4517,17 +5036,24 @@ fn format_approval_menu_lines(
         let is_selected = index == selected.min(max_index);
         let marker = if is_selected { "› " } else { "  " };
         let label_style = if is_selected {
-            Style::default().fg(GOLD)
+            Style::default().fg(crate::render::theme::secondary())
         } else {
             Style::default().fg(palette::muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
                 marker,
-                Style::default().fg(if is_selected { GOLD } else { QUIET }),
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
             ),
             Span::styled(option.label.to_string(), label_style),
-            Span::styled(format!(" · {}", option.hint), Style::default().fg(QUIET)),
+            Span::styled(
+                format!(" · {}", option.hint),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
         ]));
     }
     lines
@@ -4537,7 +5063,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     app.begin_frame_clickables();
     let area = frame.area();
     if app.transcript_overlay.is_some() {
-        render_transcript_overlay(frame, area, app);
+        render_transcript_overlay_surface(frame, area, app);
         return;
     }
     if let Some(state) = &app.status_line_setup {
@@ -4702,19 +5228,22 @@ fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     ];
     if let Some(hint) = current.action_hint {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(hint, Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            hint,
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
     }
     if app.app_notifications.len() > 1 {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("({}+)", app.app_notifications.len() - 1),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
     }
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
         format!("· {remaining_secs}s"),
-        Style::default().fg(QUIET),
+        Style::default().fg(crate::render::theme::quiet()),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -4766,7 +5295,7 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     app.begin_frame_clickables();
     let area = frame.area();
     if app.transcript_overlay.is_some() {
-        render_transcript_overlay(frame, area, app);
+        render_transcript_overlay_surface(frame, area, app);
         return;
     }
     if let Some(state) = &app.status_line_setup {
@@ -4928,7 +5457,7 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         }
     }
     let paragraph = Paragraph::new(lines)
-        .style(Style::default().fg(QUIET))
+        .style(Style::default().fg(crate::render::theme::quiet()))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -4942,7 +5471,7 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
     if app.pending_diff.is_some() {
         return Some(Line::from(Span::styled(
             "    ↳ computing diff…",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         )));
     }
     if let Some(snapshot) = app.mcp_status.as_ref() {
@@ -4959,7 +5488,10 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
         }
         if starting > 0 && total > 0 {
             let text = format!("    ↳ mcp: starting {ready}/{total} servers");
-            return Some(Line::from(Span::styled(text, Style::default().fg(QUIET))));
+            return Some(Line::from(Span::styled(
+                text,
+                Style::default().fg(crate::render::theme::quiet()),
+            )));
         }
     }
 
@@ -4975,7 +5507,10 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
             "    ↳ +{extra} more tool call{} queued",
             if extra == 1 { "" } else { "s" }
         );
-        return Some(Line::from(Span::styled(text, Style::default().fg(QUIET))));
+        return Some(Line::from(Span::styled(
+            text,
+            Style::default().fg(crate::render::theme::quiet()),
+        )));
     }
     None
 }
@@ -4991,10 +5526,14 @@ fn turn_in_progress(app: &TuiApp) -> bool {
                 .is_some_and(|snapshot| snapshot.status == squeezy_core::TaskStateStatus::Running))
 }
 
+fn should_advance_animation_tick(app: &TuiApp) -> bool {
+    app.focused || turn_in_progress(app)
+}
+
 fn working_line(app: &TuiApp) -> Line<'static> {
     let interrupting = app.status == "interrupting";
     let activity_color = if interrupting {
-        ERROR_RED
+        crate::render::theme::red()
     } else {
         render::palette::accent_primary()
     };
@@ -5010,7 +5549,9 @@ fn working_line(app: &TuiApp) -> Line<'static> {
     spans.extend(if interrupting {
         vec![Span::styled(
             "Interrupting",
-            Style::default().fg(ERROR_RED).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::red())
+                .add_modifier(Modifier::BOLD),
         )]
     } else {
         working_word_spans(app)
@@ -5020,14 +5561,17 @@ fn working_line(app: &TuiApp) -> Line<'static> {
             " ({} • esc to interrupt)",
             format_turn_duration(current_turn_duration(app))
         ),
-        Style::default().fg(QUIET),
+        Style::default().fg(crate::render::theme::quiet()),
     ));
     if let Some(call) = app
         .active_tool_calls
         .values()
         .find(|call| !is_control_tool_name(&call.name))
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.extend(active_tool_spans(call));
         if let Some(elapsed_ms) = app.active_tool_elapsed_ms {
             spans.extend(active_tool_elapsed_spans(elapsed_ms));
@@ -5088,7 +5632,10 @@ fn worked_divider_line(duration: Duration, width: u16) -> Line<'static> {
     let fill_width = (width as usize).saturating_sub(label_width);
     let mut text = label;
     text.push_str(&"─".repeat(fill_width));
-    Line::from(Span::styled(text, Style::default().fg(QUIET)))
+    Line::from(Span::styled(
+        text,
+        Style::default().fg(crate::render::theme::quiet()),
+    ))
 }
 
 fn compact_task_state_line(snapshot: &TaskStateSnapshot) -> Line<'static> {
@@ -5103,11 +5650,11 @@ fn compact_task_state_line(snapshot: &TaskStateSnapshot) -> Line<'static> {
 
 fn task_status_label_color(status: squeezy_core::TaskStateStatus) -> (&'static str, Color) {
     match status {
-        squeezy_core::TaskStateStatus::Running => ("Working", AMBER),
-        squeezy_core::TaskStateStatus::Blocked => ("Blocked", GOLD),
-        squeezy_core::TaskStateStatus::Completed => ("Done", SUCCESS_GREEN),
-        squeezy_core::TaskStateStatus::Cancelled => ("Cancelled", ERROR_RED),
-        squeezy_core::TaskStateStatus::Failed => ("Failed", ERROR_RED),
+        squeezy_core::TaskStateStatus::Running => ("Working", crate::render::theme::accent()),
+        squeezy_core::TaskStateStatus::Blocked => ("Blocked", crate::render::theme::secondary()),
+        squeezy_core::TaskStateStatus::Completed => ("Done", crate::render::theme::green()),
+        squeezy_core::TaskStateStatus::Cancelled => ("Cancelled", crate::render::theme::red()),
+        squeezy_core::TaskStateStatus::Failed => ("Failed", crate::render::theme::red()),
     }
 }
 
@@ -5125,7 +5672,10 @@ fn turn_state_line(label: &'static str, detail: Option<String>, color: Color) ->
     ];
     if let Some(detail) = detail.filter(|value| !value.trim().is_empty()) {
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(detail, Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            detail,
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
     }
     Line::from(spans)
 }
@@ -5202,7 +5752,7 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
 
 fn render_approval(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let paragraph = Paragraph::new(approval_lines(app))
-        .style(Style::default().fg(QUIET))
+        .style(Style::default().fg(crate::render::theme::quiet()))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -5241,16 +5791,78 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
     frame.render_widget(paragraph, area);
 }
 
+const TRANSCRIPT_OVERLAY_SCROLL_BOTTOM: usize = usize::MAX;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TranscriptOverlayMode {
+    NativeSelection,
+    ScrollbarDrag,
+}
+
+impl TranscriptOverlayMode {
+    fn mouse_capture(self) -> bool {
+        matches!(self, Self::ScrollbarDrag)
+    }
+}
+
 /// State for the full-screen transcript overlay (Ctrl+T). All transcript
 /// entries are rendered in their fully-expanded form regardless of each
 /// entry's collapsed flag; the user scrolls with PgUp/PgDn/arrows.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TranscriptOverlayState {
-    pub(crate) scroll: u16,
+    pub(crate) scroll: usize,
+    pub(crate) mode: TranscriptOverlayMode,
+}
+
+impl Default for TranscriptOverlayState {
+    fn default() -> Self {
+        Self {
+            scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+            mode: TranscriptOverlayMode::NativeSelection,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscriptOverlayRenderKey {
+    width: u16,
+    transcript_len: usize,
+    transcript_revision_hash: u64,
+    selected_entry: Option<usize>,
+    pending_hash: u64,
+    show_reasoning_usage: bool,
+    coalesce_tool_runs: bool,
+    animation_tick: u64,
+    palette_generation: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TranscriptOverlayRenderCache {
+    key: Option<TranscriptOverlayRenderKey>,
+    rows: Vec<Line<'static>>,
 }
 
 /// Render the full-screen transcript overlay. Replaces the normal
 /// transcript + prompt layout while `app.transcript_overlay` is `Some`.
+fn render_transcript_overlay_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let (overlay_area, status_area) = transcript_overlay_content_and_status_areas(area);
+    if overlay_area.height > 0 {
+        render_transcript_overlay(frame, overlay_area, app);
+    }
+    if status_area.height > 0 {
+        render_status(frame, status_area, app);
+    }
+    render_toast_overlay(frame, area, app);
+}
+
+fn transcript_overlay_content_and_status_areas(area: Rect) -> (Rect, Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(area);
+    (chunks[0], chunks[1])
+}
+
 fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let state = match app.transcript_overlay {
         Some(state) => state,
@@ -5260,10 +5872,12 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(GOLD))
+        .border_style(Style::default().fg(crate::render::theme::secondary()))
         .title(Span::styled(
             title,
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = transcript_overlay_inner(area);
     frame.render_widget(block, area);
@@ -5277,21 +5891,132 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 height: 0,
             },
         ));
-    let lines = transcript_lines_for_overlay(app, Some(text_area.width));
-    let line_count = lines.len();
-    let scroll = transcript_overlay_scrollbar_geometry(line_count, text_area.height, state.scroll)
-        .map(|geometry| state.scroll.min(geometry.max_scroll))
-        .unwrap_or(0);
-    let paragraph = Paragraph::new(lines)
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, text_area);
-    if scrollbar_area.width > 0
-        && let Some(geometry) =
-            transcript_overlay_scrollbar_geometry(line_count, scrollbar_area.height, scroll)
-    {
-        render_transcript_overlay_scrollbar(frame, scrollbar_area, geometry);
+    with_transcript_overlay_rows(app, text_area.width, |rows| {
+        let row_count = rows.len();
+        let scroll =
+            resolved_transcript_overlay_scroll_for_state(state, row_count, text_area.height);
+        render_transcript_overlay_rows(frame, text_area, rows, scroll);
+        if scrollbar_area.width > 0
+            && let Some(geometry) =
+                transcript_overlay_scrollbar_geometry(row_count, scrollbar_area.height, scroll)
+        {
+            app.transcript_overlay_scrollbar_cache
+                .set(Some(TranscriptOverlayScrollbarCache {
+                    scrollbar_area,
+                    geometry,
+                }));
+            render_transcript_overlay_scrollbar(frame, scrollbar_area, geometry);
+        } else {
+            app.transcript_overlay_scrollbar_cache.set(None);
+        }
+    });
+}
+
+#[cfg(test)]
+fn transcript_overlay_rows_for_render(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
+    with_transcript_overlay_rows(app, width, |rows| rows.to_vec())
+}
+
+fn with_transcript_overlay_rows<R>(
+    app: &TuiApp,
+    width: u16,
+    f: impl FnOnce(&[Line<'static>]) -> R,
+) -> R {
+    let width = width.max(1);
+    let key = transcript_overlay_render_key(app, width);
+    let mut cache = app.transcript_overlay_render_cache.borrow_mut();
+    if cache.key != Some(key) {
+        let logical_lines = transcript_lines_for_overlay(app, Some(width));
+        cache.rows = wrap_transcript_overlay_rows(&logical_lines, width);
+        cache.key = Some(key);
     }
+    f(&cache.rows)
+}
+
+fn transcript_overlay_render_key(app: &TuiApp, width: u16) -> TranscriptOverlayRenderKey {
+    let mut transcript_hasher = std::collections::hash_map::DefaultHasher::new();
+    for entry in &app.transcript {
+        entry.id.hash(&mut transcript_hasher);
+        entry.revision.hash(&mut transcript_hasher);
+    }
+
+    let mut pending_hasher = std::collections::hash_map::DefaultHasher::new();
+    app.pending_reasoning.hash(&mut pending_hasher);
+    if !app.pending_assistant.trim_is_empty() {
+        app.pending_assistant.text().hash(&mut pending_hasher);
+    }
+
+    TranscriptOverlayRenderKey {
+        width,
+        transcript_len: app.transcript.len(),
+        transcript_revision_hash: transcript_hasher.finish(),
+        selected_entry: app.selected_entry,
+        pending_hash: pending_hasher.finish(),
+        show_reasoning_usage: app.show_reasoning_usage,
+        coalesce_tool_runs: app.coalesce_tool_runs,
+        animation_tick: app.animation_tick,
+        palette_generation: render::palette::palette_generation(),
+    }
+}
+
+fn wrap_transcript_overlay_rows(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let mut rows = Vec::new();
+    for line in lines {
+        wrap_transcript_overlay_line(line, width, &mut rows);
+    }
+    rows
+}
+
+fn wrap_transcript_overlay_line(line: &Line<'static>, width: usize, rows: &mut Vec<Line<'static>>) {
+    let mut row_spans: Vec<Span<'static>> = Vec::new();
+    let mut row_width = 0usize;
+    let mut saw_content = false;
+
+    for span in &line.spans {
+        let style = span.style;
+        let mut chunk = String::new();
+        for ch in span.content.chars() {
+            if row_width >= width {
+                if !chunk.is_empty() {
+                    row_spans.push(Span::styled(std::mem::take(&mut chunk), style));
+                }
+                rows.push(Line::from(std::mem::take(&mut row_spans)));
+                row_width = 0;
+            }
+            chunk.push(ch);
+            row_width += 1;
+            saw_content = true;
+        }
+        if !chunk.is_empty() {
+            row_spans.push(Span::styled(chunk, style));
+        }
+    }
+
+    if saw_content {
+        rows.push(Line::from(row_spans));
+    } else {
+        rows.push(Line::from(""));
+    }
+}
+
+fn render_transcript_overlay_rows(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    rows: &[Line<'static>],
+    scroll: usize,
+) {
+    frame.render_widget(ratatui::widgets::Clear, area);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let visible_rows = rows
+        .iter()
+        .skip(scroll)
+        .take(usize::from(area.height))
+        .cloned()
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible_rows), area);
 }
 
 fn transcript_overlay_inner(area: Rect) -> Rect {
@@ -5324,27 +6049,48 @@ fn transcript_overlay_text_and_scrollbar_areas(inner: Rect) -> Option<(Rect, Rec
 struct TranscriptScrollbarGeometry {
     thumb_top: u16,
     thumb_height: u16,
-    max_scroll: u16,
+    max_scroll: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TranscriptOverlayScrollbarCache {
+    scrollbar_area: Rect,
+    geometry: TranscriptScrollbarGeometry,
+}
+
+fn transcript_overlay_max_scroll_for_content(content_len: usize, viewport_height: u16) -> usize {
+    content_len.saturating_sub(usize::from(viewport_height))
+}
+
+fn resolved_transcript_overlay_scroll_for_state(
+    state: TranscriptOverlayState,
+    content_len: usize,
+    viewport_height: u16,
+) -> usize {
+    let max_scroll = transcript_overlay_max_scroll_for_content(content_len, viewport_height);
+    if state.scroll == TRANSCRIPT_OVERLAY_SCROLL_BOTTOM {
+        max_scroll
+    } else {
+        state.scroll.min(max_scroll)
+    }
 }
 
 fn transcript_overlay_scrollbar_geometry(
     content_len: usize,
     viewport_height: u16,
-    scroll: u16,
+    scroll: usize,
 ) -> Option<TranscriptScrollbarGeometry> {
     let track_height = usize::from(viewport_height);
     if track_height == 0 || content_len <= track_height {
         return None;
     }
-    let max_scroll = content_len
-        .saturating_sub(track_height)
-        .min(usize::from(u16::MAX));
+    let max_scroll = content_len.saturating_sub(track_height);
     if max_scroll == 0 {
         return None;
     }
     let thumb_height = ((track_height * track_height) / content_len).clamp(1, track_height);
     let travel = track_height.saturating_sub(thumb_height);
-    let scroll = usize::from(scroll).min(max_scroll);
+    let scroll = scroll.min(max_scroll);
     let thumb_top = if travel == 0 {
         0
     } else {
@@ -5353,10 +6099,11 @@ fn transcript_overlay_scrollbar_geometry(
     Some(TranscriptScrollbarGeometry {
         thumb_top: thumb_top as u16,
         thumb_height: thumb_height as u16,
-        max_scroll: max_scroll as u16,
+        max_scroll,
     })
 }
 
+#[cfg(test)]
 fn transcript_overlay_scroll_for_scrollbar_row(
     row: u16,
     scrollbar_area: Rect,
@@ -5374,7 +6121,25 @@ fn transcript_overlay_scroll_for_scrollbar_row(
     }
     let centered = usize::from(local_row).saturating_sub(thumb_height / 2);
     let position = centered.min(travel);
-    Some(((position * usize::from(geometry.max_scroll)) / travel) as u16)
+    Some(((position * geometry.max_scroll) / travel).min(usize::from(u16::MAX)) as u16)
+}
+
+fn transcript_overlay_scroll_for_cached_scrollbar_row(
+    row: u16,
+    cache: TranscriptOverlayScrollbarCache,
+) -> usize {
+    let local_row = row
+        .saturating_sub(cache.scrollbar_area.y)
+        .min(cache.scrollbar_area.height.saturating_sub(1));
+    let track_height = usize::from(cache.scrollbar_area.height);
+    let thumb_height = usize::from(cache.geometry.thumb_height);
+    let travel = track_height.saturating_sub(thumb_height);
+    if travel == 0 {
+        return 0;
+    }
+    let centered = usize::from(local_row).saturating_sub(thumb_height / 2);
+    let position = centered.min(travel);
+    (position * cache.geometry.max_scroll) / travel
 }
 
 fn render_transcript_overlay_scrollbar(
@@ -5387,9 +6152,14 @@ fn render_transcript_overlay_scrollbar(
         .map(|offset| {
             let in_thumb = offset >= geometry.thumb_top && offset < thumb_end;
             let (symbol, style) = if in_thumb {
-                ("█", Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
+                (
+                    "█",
+                    Style::default()
+                        .fg(crate::render::theme::accent())
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
-                ("░", Style::default().fg(QUIET))
+                ("░", Style::default().fg(crate::render::theme::quiet()))
             };
             Line::from(Span::styled(symbol, style))
         })
@@ -5397,9 +6167,9 @@ fn render_transcript_overlay_scrollbar(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Build the per-entry line list for the overlay: every entry is forced
-/// to its expanded form. Skips the pending-assistant tail since the
-/// overlay is a snapshot of committed transcript content.
+/// Build the per-entry line list for the overlay: every committed entry is
+/// forced to its expanded form, and the live assistant tail is appended so
+/// opening Ctrl-T mid-turn does not look frozen.
 fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'static>> {
     // The overlay is the "Ctrl-T for full transcript" escape hatch — body
     // content blocks (e.g. read_tool_output payloads, shell stdout/stderr)
@@ -5438,6 +6208,7 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
                     app.selected_entry == Some(index),
                     overlay_verbosity,
                     width,
+                    ToolCardSurface::Plain,
                 ));
                 continue;
             }
@@ -5454,6 +6225,13 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             true,
         ));
     }
+    let pending = pending_assistant_lines(app);
+    if !pending.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.extend(pending);
+    }
     lines
 }
 
@@ -5469,9 +6247,14 @@ fn format_transcript_entry_expanded(
         TranscriptEntryKind::Message(item) => {
             format_message_entry_with_width(item, false, selected, outcome, width, show_reasoning)
         }
-        TranscriptEntryKind::ToolResult(tool) => {
-            format_tool_result_entry(tool, false, selected, tool_output_verbosity, width)
-        }
+        TranscriptEntryKind::ToolResult(tool) => format_tool_result_entry(
+            tool,
+            false,
+            selected,
+            tool_output_verbosity,
+            width,
+            ToolCardSurface::Plain,
+        ),
         TranscriptEntryKind::Log(entry) => format_log_entry(entry, false, selected),
         TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, false),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, false, selected),
@@ -5650,6 +6433,7 @@ fn transcript_lines_for_render(
                     app.selected_entry == Some(index),
                     app.tool_output_verbosity,
                     width,
+                    ToolCardSurface::Tinted,
                 ));
                 continue;
             }
@@ -5736,17 +6520,26 @@ fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {
             let pad_right = pad_total.saturating_sub(pad_left);
             return Line::from(vec![
                 Span::raw(" ".repeat(pad_left)),
-                Span::styled(left_strip, Style::default().fg(AMBER)),
+                Span::styled(
+                    left_strip,
+                    Style::default().fg(crate::render::theme::accent()),
+                ),
                 Span::raw("  "),
                 Span::styled(
                     title.to_string(),
                     Style::default()
-                        .fg(Color::White)
+                        .fg(crate::render::theme::foreground())
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(version_text.clone(), Style::default().fg(AMBER)),
+                Span::styled(
+                    version_text.clone(),
+                    Style::default().fg(crate::render::theme::accent()),
+                ),
                 Span::raw("  "),
-                Span::styled(right_strip, Style::default().fg(AMBER)),
+                Span::styled(
+                    right_strip,
+                    Style::default().fg(crate::render::theme::accent()),
+                ),
                 Span::raw(" ".repeat(pad_right)),
             ]);
         }
@@ -5758,10 +6551,13 @@ fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {
         Span::styled(
             title.to_string(),
             Style::default()
-                .fg(Color::White)
+                .fg(crate::render::theme::foreground())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(version_text, Style::default().fg(AMBER)),
+        Span::styled(
+            version_text,
+            Style::default().fg(crate::render::theme::accent()),
+        ),
     ])
 }
 
@@ -5790,13 +6586,13 @@ fn render_attachments(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let hidden = app.attachments.len() - max_rows;
         if let Some(last) = lines.last_mut() {
             last.spans.push(Span::styled(
-                format!(" · +{hidden} more (/attachments)"),
-                Style::default().fg(QUIET),
+                format!(" · +{hidden} more"),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         }
     }
     let paragraph = Paragraph::new(lines)
-        .style(Style::default().fg(QUIET))
+        .style(Style::default().fg(crate::render::theme::quiet()))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -5813,16 +6609,19 @@ fn plan_mode_indicator_height(app: &TuiApp) -> u16 {
 }
 
 /// Build the styled "[PLAN MODE] Shift+Tab to exit" line. Uses the
-/// existing `MODE_PURPLE` palette entry (no new colors) and ASCII
+/// existing `crate::render::theme::magenta()` palette entry (no new colors) and ASCII
 /// brackets with a Unicode `⊕` glyph — matches the other status glyphs
 /// (`⟳`, `▸`) already used in this file.
 pub(crate) fn format_plan_mode_indicator_line() -> Line<'static> {
     let label_style = Style::default()
-        .fg(MODE_PURPLE)
+        .fg(crate::render::theme::magenta())
         .add_modifier(Modifier::BOLD);
     Line::from(vec![
         Span::styled("⊕ PLAN MODE", label_style),
-        Span::styled(" · Shift+Tab to exit", Style::default().fg(QUIET)),
+        Span::styled(
+            " · Shift+Tab to exit",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
     ])
 }
 
@@ -5909,6 +6708,7 @@ fn format_transcript_entry_with_width(
             selected,
             tool_output_verbosity,
             width,
+            ToolCardSurface::Tinted,
         ),
         TranscriptEntryKind::Log(entry_log) => {
             format_log_entry(entry_log, entry.collapsed, selected)
@@ -5935,16 +6735,23 @@ fn format_slash_echo_line(data: &SlashEchoData, selected: bool) -> Line<'static>
         Span::raw(marker),
         Span::styled(
             "›  ",
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             data.cmd.clone(),
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     if !data.args.is_empty() {
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(data.args.clone(), Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            data.args.clone(),
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
     }
     Line::from(spans)
 }
@@ -6066,7 +6873,9 @@ fn build_diff_card(snapshot: &squeezy_vcs::DiffSnapshot) -> DiffCardData {
         );
         lines.push(Line::from(Span::styled(
             header.clone(),
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         )));
         plain.push_str(&header);
         plain.push('\n');
@@ -6099,12 +6908,12 @@ fn format_diff_card_entry(
     let header = action_line_spans(
         selected,
         "✱",
-        GOLD,
+        crate::render::theme::secondary(),
         "Diff",
-        GOLD,
+        crate::render::theme::secondary(),
         vec![Span::styled(
             data.summary.clone(),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         )],
     );
     if collapsed {
@@ -6496,8 +7305,16 @@ fn format_message_entry_with_width(
     }
     let (action, color) = role_action(&item.role);
     let failed = outcome == MessageOutcome::Failed;
-    let label_color = if failed { ERROR_RED } else { color };
-    let action_color = if failed { ERROR_RED } else { color };
+    let label_color = if failed {
+        crate::render::theme::red()
+    } else {
+        color
+    };
+    let action_color = if failed {
+        crate::render::theme::red()
+    } else {
+        color
+    };
     let content_style = message_content_style(&item.role);
     if collapsed {
         return vec![action_line_styled(
@@ -6528,8 +7345,8 @@ fn format_message_entry_with_width(
 }
 
 /// Render the `/cost` and `/context` outputs with per-token coloring:
-/// group words pop in `GOLD`, `key=` labels dim to `QUIET`, dollar values
-/// pop in `AMBER`, and zero/dash/unknown values fade to `QUIET` so the
+/// group words pop in `crate::render::theme::secondary()`, `key=` labels dim to `crate::render::theme::quiet()`, dollar values
+/// pop in `crate::render::theme::accent()`, and zero/dash/unknown values fade to `crate::render::theme::quiet()` so the
 /// real numbers carry the eye. Returns `None` for any system message that
 /// is not an accounting block — the caller falls through to the default
 /// single-style renderer.
@@ -6541,15 +7358,17 @@ fn format_accounting_block_entry(selected: bool, content: &str) -> Option<Vec<Li
     }
     let header_span = Span::styled(
         header.to_string(),
-        Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(crate::render::theme::secondary())
+            .add_modifier(Modifier::BOLD),
     );
     let mut lines = Vec::with_capacity(content.lines().count());
     lines.push(action_line_spans(
         selected,
         "• ",
-        GOLD,
+        crate::render::theme::secondary(),
         "Noted",
-        GOLD,
+        crate::render::theme::secondary(),
         vec![header_span],
     ));
     for body in iter {
@@ -6564,7 +7383,10 @@ fn accounting_body_spans(line: &str) -> Vec<Span<'static>> {
     // Sentences without any `key=value` token are dimmed wholesale (the
     // accuracy epilogue, the `provider_stored_context=...` narrative line).
     if !line.contains('=') || line.starts_with("accuracy=") {
-        return vec![Span::styled(line.to_string(), Style::default().fg(QUIET))];
+        return vec![Span::styled(
+            line.to_string(),
+            Style::default().fg(crate::render::theme::quiet()),
+        )];
     }
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut first_token = true;
@@ -6577,7 +7399,10 @@ fn accounting_body_spans(line: &str) -> Vec<Span<'static>> {
         if let Some(eq_idx) = text.find('=') {
             let (key, rest) = text.split_at(eq_idx);
             let value = &rest[1..];
-            spans.push(Span::styled(format!("{key}="), Style::default().fg(QUIET)));
+            spans.push(Span::styled(
+                format!("{key}="),
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
             spans.push(Span::styled(
                 value.to_string(),
                 accounting_value_style(value),
@@ -6587,9 +7412,9 @@ fn accounting_body_spans(line: &str) -> Vec<Span<'static>> {
             // `subagents`, `transmitted_request`, …) or a trailing
             // parenthetical like `(estimated from ...)`.
             let style = if first_token {
-                Style::default().fg(GOLD)
+                Style::default().fg(crate::render::theme::secondary())
             } else {
-                Style::default().fg(QUIET)
+                Style::default().fg(crate::render::theme::quiet())
             };
             spans.push(Span::styled(text.to_string(), style));
         }
@@ -6603,10 +7428,10 @@ fn accounting_body_spans(line: &str) -> Vec<Span<'static>> {
 
 fn accounting_value_style(value: &str) -> Style {
     if value.is_empty() {
-        return Style::default().fg(QUIET);
+        return Style::default().fg(crate::render::theme::quiet());
     }
     if value.starts_with('$') {
-        return Style::default().fg(AMBER);
+        return Style::default().fg(crate::render::theme::accent());
     }
     // Values that signal absence/zero fade so the eye lands on the real
     // numbers. Percent strings like `0.00%` count as zero too.
@@ -6619,7 +7444,7 @@ fn accounting_value_style(value: &str) -> Style {
         "-" | "0" | "unknown" | "inactive" | "absent" | "false"
     ) || is_zero_percent
     {
-        return Style::default().fg(QUIET);
+        return Style::default().fg(crate::render::theme::quiet());
     }
     Style::default()
 }
@@ -6640,7 +7465,7 @@ fn format_user_prompt_entry(
         .max()
         .unwrap_or(0)
         .max(1);
-    let amber = Style::default().fg(AMBER);
+    let amber = Style::default().fg(crate::render::theme::accent());
     let bullet_style = amber.add_modifier(Modifier::BOLD);
     const INDENT: &str = "  ";
     // Cycle through the moon-phase set so consecutive prompts get a
@@ -6657,25 +7482,20 @@ fn format_user_prompt_entry(
 
     let mut lines = Vec::with_capacity(content.len() + 2);
 
+    let slash_ranges = input::slash_command_ranges(&item.content);
     let mut line_start = 0usize;
     for (index, line_text) in content.iter().enumerate() {
-        let slash_len = if index == 0 {
-            input::match_slash_command_prefix(line_text)
-        } else {
-            None
-        };
         let bang_ref = bang_range.as_ref();
         let style_text_at = |abs_offset: usize| -> Style {
             if bang_ref.is_some_and(|range| range.contains(&abs_offset)) {
-                Style::default().fg(BANG_RED)
-            } else if let Some(len) = slash_len {
-                if abs_offset < len {
-                    Style::default().fg(AMBER)
-                } else {
-                    Style::default().fg(Color::White)
-                }
+                Style::default().fg(crate::render::theme::red())
+            } else if slash_ranges
+                .iter()
+                .any(|(start, end)| *start <= abs_offset && abs_offset < *end)
+            {
+                Style::default().fg(crate::render::theme::accent())
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(crate::render::theme::foreground())
             }
         };
         // First line gets the cycling moon-phase bullet; continuation
@@ -6704,7 +7524,7 @@ fn format_user_prompt_entry(
 /// (double-bang, runs locally but skips LLM context) marker after any
 /// leading whitespace, or `None` if the line is not a bang command.
 /// Returned as a range — rather than the previous single offset — so the
-/// prompt renderer can paint both bangs in `BANG_RED` for `!!cmd`.
+/// prompt renderer can paint both bangs in `crate::render::theme::red()` for `!!cmd`.
 fn bang_command_marker_range(text: &str) -> Option<std::ops::Range<usize>> {
     let mut chars = text.char_indices().skip_while(|(_, ch)| ch.is_whitespace());
     let (start, first) = chars.next()?;
@@ -6728,9 +7548,9 @@ fn format_assistant_message_entry(
     show_reasoning: bool,
 ) -> Vec<Line<'static>> {
     let color = if outcome == MessageOutcome::Failed {
-        ERROR_RED
+        crate::render::theme::red()
     } else {
-        SUCCESS_GREEN
+        crate::render::theme::green()
     };
     let mut lines = Vec::new();
     if show_reasoning
@@ -6986,6 +7806,7 @@ fn format_tool_result_entry(
     selected: bool,
     tool_output_verbosity: ToolOutputVerbosity,
     width: Option<u16>,
+    card_surface: ToolCardSurface,
 ) -> Vec<Line<'static>> {
     let (marker, action) = tool_result_action(tool);
     let color = tool_result_display_color(tool);
@@ -6996,7 +7817,30 @@ fn format_tool_result_entry(
     } else {
         expanded_tool_detail_lines(tool, tool_output_verbosity)
     };
-    wrap_tool_card(header, body)
+    render_tool_card(header, body, card_surface)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCardSurface {
+    Tinted,
+    Plain,
+}
+
+fn render_tool_card(
+    header: Line<'static>,
+    body: Vec<Line<'static>>,
+    surface: ToolCardSurface,
+) -> Vec<Line<'static>> {
+    match surface {
+        ToolCardSurface::Tinted => wrap_tool_card(header, body),
+        ToolCardSurface::Plain => stack_tool_card(header, body),
+    }
+}
+
+fn stack_tool_card(header: Line<'static>, body: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let mut lines = vec![header];
+    lines.extend(body);
+    lines
 }
 
 /// Visually group an action header with its detail rows by tinting both
@@ -7037,6 +7881,7 @@ fn format_grouped_tool_result_entry(
     selected: bool,
     tool_output_verbosity: ToolOutputVerbosity,
     width: Option<u16>,
+    card_surface: ToolCardSurface,
 ) -> Vec<Line<'static>> {
     debug_assert!(members.len() >= 2, "grouped card needs at least 2 members");
     let lead = members[0];
@@ -7046,7 +7891,7 @@ fn format_grouped_tool_result_entry(
     let action_label = grouped_action_label(lead);
     let header_summary = vec![Span::styled(
         format!("{count} {}", grouped_action_noun(lead, count)),
-        Style::default().fg(QUIET),
+        Style::default().fg(crate::render::theme::quiet()),
     )];
     let header = action_line_spans(selected, marker, color, action_label, color, header_summary);
 
@@ -7057,7 +7902,7 @@ fn format_grouped_tool_result_entry(
         }
         body.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             "(Ctrl-T for full transcript)".to_string(),
         ));
     } else {
@@ -7074,10 +7919,11 @@ fn format_grouped_tool_result_entry(
                 false,
                 tool_output_verbosity,
                 width,
+                card_surface,
             ));
         }
     }
-    wrap_tool_card(header, body)
+    render_tool_card(header, body, card_surface)
 }
 
 /// Verb that titles a grouped run — `"Read"`, `"Searched"`, etc. Falls
@@ -7127,7 +7973,7 @@ fn grouped_action_noun(lead: &ToolTranscript, count: usize) -> String {
 /// card. Reuses [`tool_result_summary_spans`] which already produces a
 /// concise per-tool summary (e.g. `path · 4.9KB of 26.4KB` for reads,
 /// `pattern · N matches` for grep). The group header already carries
-/// the verb and status color, so the row itself stays QUIET.
+/// the verb and status color, so the row itself stays crate::render::theme::quiet().
 fn tool_oneline_summary(tool: &ToolTranscript) -> Vec<Span<'static>> {
     tool_result_summary_spans(tool)
 }
@@ -7218,7 +8064,7 @@ fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'
     out.extend(lines.iter().take(cap).cloned());
     out.push(detail_line(
         false,
-        QUIET,
+        crate::render::theme::quiet(),
         format!("… +{omitted} lines (Ctrl-T for full transcript)"),
     ));
     out.extend(
@@ -7250,8 +8096,8 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
         ])];
     }
     if entry.kind == LogKind::Warn {
-        // `⚠ message` rendering for turn-end signals so the user can spot
-        // a cancel/fail at a glance. Newlines are flattened to spaces so
+        // `⚠ message` rendering for warnings so the user can spot
+        // config issues and turn failures at a glance. Newlines are flattened to spaces so
         // the whole error reads as one bullet, and the transcript
         // paragraph's `Wrap { trim: false }` line-wraps anything long —
         // errors from providers can be hundreds of characters and need to
@@ -7260,7 +8106,12 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
         let preview = message.replace('\n', " ");
         return vec![Line::from(vec![
             Span::raw(marker),
-            Span::styled("⚠ ", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "⚠ ",
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(preview, Style::default().fg(palette::muted_fg())),
         ])];
     }
@@ -7274,24 +8125,26 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
 
 fn role_action(role: &Role) -> (&'static str, Color) {
     match role {
-        Role::User => ("Asked", AMBER),
-        Role::Assistant => ("Answered", SUCCESS_GREEN),
-        Role::System => ("Noted", GOLD),
+        Role::User => ("Asked", crate::render::theme::accent()),
+        Role::Assistant => ("Answered", crate::render::theme::green()),
+        Role::System => ("Noted", crate::render::theme::secondary()),
     }
 }
 
 fn message_content_style(role: &Role) -> Style {
     match role {
-        Role::User => Style::default().fg(palette::muted_fg()).bg(PROMPT_BG),
+        Role::User => Style::default()
+            .fg(palette::muted_fg())
+            .bg(crate::render::theme::prompt_bg()),
         Role::Assistant | Role::System => Style::default(),
     }
 }
 
 fn log_color(message: &str) -> Color {
     if is_failure_log(message) {
-        ERROR_RED
+        crate::render::theme::red()
     } else {
-        GOLD
+        crate::render::theme::secondary()
     }
 }
 
@@ -7491,19 +8344,28 @@ fn tool_result_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         if let Some(call) = tool.call.as_ref() {
             let label = tool_call_label(call);
             if label != result.tool_name {
-                spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
-                spans.push(Span::styled(label, Style::default().fg(QUIET)));
+                spans.push(Span::styled(
+                    " · ",
+                    Style::default().fg(crate::render::theme::quiet()),
+                ));
+                spans.push(Span::styled(
+                    label,
+                    Style::default().fg(crate::render::theme::quiet()),
+                ));
             }
         }
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             tool_result_error_detail(result),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
         if tool.repeat_count > 1 {
             spans.push(Span::styled(
                 format!(" ({}x)", tool.repeat_count),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         }
         return spans;
@@ -7527,43 +8389,55 @@ fn tool_result_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         )],
     };
     if tool_result_not_run(tool) {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             tool_result_error_detail(result),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
         if tool.repeat_count > 1 {
             spans.push(Span::styled(
                 format!(" ({}x)", tool.repeat_count),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         }
         return spans;
     }
     match result.status {
         ToolStatus::Error | ToolStatus::Stale => {
-            spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+            spans.push(Span::styled(
+                " · ",
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
             spans.push(Span::styled(
                 tool_result_error_detail(result),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         }
         ToolStatus::Denied => {
-            spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+            spans.push(Span::styled(
+                " · ",
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
             spans.push(Span::styled(
                 tool_result_denied_detail(result),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         }
         ToolStatus::Cancelled => {
-            spans.push(Span::styled(" · cancelled", Style::default().fg(QUIET)));
+            spans.push(Span::styled(
+                " · cancelled",
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
         }
         ToolStatus::Success => {}
     }
     if tool.repeat_count > 1 {
         spans.push(Span::styled(
             format!(" ({}x)", tool.repeat_count),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
     }
     spans
@@ -7633,10 +8507,13 @@ fn decl_search_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     if let Some(total) = number_field(&tool.result.content, "total_matches")
         .or_else(|| number_field(&tool.result.content, "returned_matches"))
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{total} matches"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     append_truncation_hint(&mut spans, tool);
@@ -7657,10 +8534,13 @@ fn semantic_tool_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
                 .map(|items| items.len() as u64)
         })
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{matches} matches"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     spans
@@ -7672,17 +8552,23 @@ fn repo_map_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         Style::default().fg(palette::muted_fg()),
     )];
     if let Some(files) = tool.result.content["stats"]["files"].as_u64() {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{files} files"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     if let Some(symbols) = tool.result.content["stats"]["symbols"].as_u64() {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{symbols} symbols"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     append_truncation_hint(&mut spans, tool);
@@ -7717,10 +8603,13 @@ fn grep_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
                 .map(|items| items.len() as u64)
         })
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{matches} matches"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     append_truncation_hint(&mut spans, tool);
@@ -7744,10 +8633,13 @@ fn glob_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         .as_array()
         .map(|items| items.len() as u64)
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{paths} paths"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     append_truncation_hint(&mut spans, tool);
@@ -7761,16 +8653,25 @@ fn read_file_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         Style::default().fg(palette::muted_fg()),
     )];
     if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
-        spans.push(Span::styled(format_bytes(bytes), Style::default().fg(GOLD)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+        spans.push(Span::styled(
+            format_bytes(bytes),
+            Style::default().fg(crate::render::theme::secondary()),
+        ));
     } else if let Some(ranges) = tool.result.content["ranges"]
         .as_array()
         .map(|items| items.len() as u64)
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{ranges} ranges"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     append_truncation_hint(&mut spans, tool);
@@ -7789,8 +8690,14 @@ fn read_tool_output_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         Style::default().fg(palette::muted_fg()),
     )];
     if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
-        spans.push(Span::styled(format_bytes(bytes), Style::default().fg(GOLD)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+        spans.push(Span::styled(
+            format_bytes(bytes),
+            Style::default().fg(crate::render::theme::secondary()),
+        ));
     }
     append_truncation_hint(&mut spans, tool);
     spans
@@ -7812,16 +8719,22 @@ fn edit_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let additions = files.iter().map(|file| file.additions).sum::<u64>();
     let deletions = files.iter().map(|file| file.deletions).sum::<u64>();
     if additions > 0 || deletions > 0 {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("+{additions} -{deletions}"),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
     } else if let Some(count) = number_field(&tool.result.content, "matches") {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{count} matches"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     spans
@@ -8115,19 +9028,25 @@ fn diff_context_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
                 .map(|items| items.len() as u64)
         });
     if let Some(files) = files {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{files} files"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     let additions = tool.result.content["summary"]["additions"].as_u64();
     let deletions = tool.result.content["summary"]["deletions"].as_u64();
     if additions.unwrap_or(0) > 0 || deletions.unwrap_or(0) > 0 {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("+{} -{}", additions.unwrap_or(0), deletions.unwrap_or(0)),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
     }
     append_truncation_hint(&mut spans, tool);
@@ -8152,10 +9071,13 @@ fn plan_patch_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         .map(|items| items.len() as u64)
         .filter(|count| *count > 0)
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{symbols} symbols"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     if let Some(paths) = tool.result.content["impact"]["neighborhood_paths"]
@@ -8163,16 +9085,19 @@ fn plan_patch_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         .map(|items| items.len() as u64)
         .filter(|count| *count > 0)
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{paths} paths"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     if tool.result.content["graph_available"].as_bool() == Some(false) {
         spans.push(Span::styled(
             " · graph unavailable",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
     }
     append_truncation_hint(&mut spans, tool);
@@ -8261,7 +9186,9 @@ pub(crate) fn tool_call_label(call: &ToolCall) -> String {
 fn active_tool_spans(call: &ToolCall) -> Vec<Span<'static>> {
     let name_span = Span::styled(
         friendly_tool_name(&call.name),
-        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(crate::render::theme::accent())
+            .add_modifier(Modifier::BOLD),
     );
     let args = active_tool_args(call);
     if args.is_empty() {
@@ -8271,7 +9198,9 @@ fn active_tool_spans(call: &ToolCall) -> Vec<Span<'static>> {
         name_span,
         Span::styled(
             ": ",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     if matches!(call.name.as_str(), "shell" | "verify") {
@@ -8294,8 +9223,11 @@ fn active_tool_elapsed_spans(elapsed_ms: u64) -> Vec<Span<'static>> {
         return Vec::new();
     }
     vec![
-        Span::styled(" · ", Style::default().fg(QUIET)),
-        Span::styled(format!("{secs}s"), Style::default().fg(QUIET)),
+        Span::styled(" · ", Style::default().fg(crate::render::theme::quiet())),
+        Span::styled(
+            format!("{secs}s"),
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
     ]
 }
 
@@ -8413,19 +9345,31 @@ fn expanded_symbol_context_detail_lines(
     if let Some(call) = tool.call.as_ref()
         && let Some(query) = string_arg(&call.arguments, "query")
     {
-        lines.push(detail_line(false, QUIET, format!("query `{query}`")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("query `{query}`"),
+        ));
     }
     let packets = tool.result.content["packets"].as_array();
     let total = packets.map(|p| p.len()).unwrap_or(0);
     if total == 0 {
         if let Some(reason) = string_arg(&tool.result.content, "reason") {
-            lines.push(detail_line(false, QUIET, reason));
+            lines.push(detail_line(false, crate::render::theme::quiet(), reason));
         } else {
-            lines.push(detail_line(false, QUIET, "no symbols matched".to_string()));
+            lines.push(detail_line(
+                false,
+                crate::render::theme::quiet(),
+                "no symbols matched".to_string(),
+            ));
         }
         return lines;
     }
-    lines.push(detail_line(false, QUIET, format!("packets {total}")));
+    lines.push(detail_line(
+        false,
+        crate::render::theme::quiet(),
+        format!("packets {total}"),
+    ));
     if let Some(packets) = packets {
         for packet in packets.iter().take(packet_cap) {
             let name = packet["name"].as_str().unwrap_or("?");
@@ -8449,7 +9393,7 @@ fn expanded_symbol_context_detail_lines(
             };
             lines.push(detail_line(
                 false,
-                QUIET,
+                crate::render::theme::quiet(),
                 format!("{path}:{line} {name}{kind_suffix}{counts}"),
             ));
         }
@@ -8457,7 +9401,7 @@ fn expanded_symbol_context_detail_lines(
     if total > packet_cap {
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!(
                 "+{} more packets (Ctrl-T for full transcript)",
                 total - packet_cap
@@ -8484,7 +9428,11 @@ fn expanded_shell_detail_lines(
     if tool.result.status != ToolStatus::Success
         && let Some(workdir) = string_arg(&tool.result.content, "workdir")
     {
-        lines.push(detail_line(false, QUIET, format!("cwd {workdir}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("cwd {workdir}"),
+        ));
     }
     if tool.result.status != ToolStatus::Success
         && let Some(exit_code) = tool
@@ -8493,7 +9441,11 @@ fn expanded_shell_detail_lines(
             .get("exit_code")
             .and_then(|value| value.as_i64())
     {
-        lines.push(detail_line(false, QUIET, format!("exit {exit_code}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("exit {exit_code}"),
+        ));
     }
     if tool.result.status != ToolStatus::Success {
         lines.extend(output_block_lines(
@@ -8541,7 +9493,7 @@ fn shell_output_block_lines(
     let mut lines = vec![shell_output_title_line(&command, &workdir)];
     lines.extend(head_tail_lines(&output, limit).into_iter().map(|line| {
         if line.truncated_marker {
-            detail_line(false, QUIET, line.text)
+            detail_line(false, crate::render::theme::quiet(), line.text)
         } else if is_diff {
             shell_output_diff_line(&line.text)
         } else {
@@ -8556,16 +9508,24 @@ fn shell_output_title_line(command: &str, workdir: &str) -> Line<'static> {
         Span::raw("  "),
         Span::styled(
             "│ ",
-            Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::quiet())
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     spans.extend(command_spans(command));
-    spans.push(Span::styled(" in ", Style::default().fg(QUIET)));
+    spans.push(Span::styled(
+        " in ",
+        Style::default().fg(crate::render::theme::quiet()),
+    ));
     spans.push(Span::styled(
         workdir.to_string(),
         Style::default().fg(palette::muted_fg()),
     ));
-    spans.push(Span::styled(":", Style::default().fg(QUIET)));
+    spans.push(Span::styled(
+        ":",
+        Style::default().fg(crate::render::theme::quiet()),
+    ));
     Line::from(spans)
 }
 
@@ -8616,7 +9576,9 @@ fn detail_output_diff_line(content: &str) -> Line<'static> {
             Span::raw("  "),
             Span::styled(
                 "│ ",
-                Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(crate::render::theme::quiet())
+                    .add_modifier(Modifier::BOLD),
             ),
         ],
     )
@@ -8649,7 +9611,7 @@ fn diff_output_line(content: &str, mut spans: Vec<Span<'static>>) -> Line<'stati
         return line;
     } else if trimmed.starts_with("@@") {
         Style::default()
-            .fg(palette::MODE_PURPLE)
+            .fg(crate::render::theme::magenta())
             .add_modifier(Modifier::BOLD)
     } else {
         spans.extend(styled_output_spans(trimmed));
@@ -8690,20 +9652,32 @@ fn expanded_decl_search_detail_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(total) = number_field(&tool.result.content, "total_matches") {
-        lines.push(detail_line(false, QUIET, format!("total matches {total}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("total matches {total}"),
+        ));
     }
     if let Some(returned) = number_field(&tool.result.content, "returned_matches") {
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!("shown matches {returned}"),
         ));
     }
     if let Some(languages) = compact_json_object(&tool.result.content["counts_by_language"]) {
-        lines.push(detail_line(false, QUIET, format!("languages {languages}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("languages {languages}"),
+        ));
     }
     if let Some(kinds) = compact_json_object(&tool.result.content["counts_by_kind"]) {
-        lines.push(detail_line(false, QUIET, format!("kinds {kinds}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("kinds {kinds}"),
+        ));
     }
     lines
 }
@@ -8711,13 +9685,25 @@ fn expanded_decl_search_detail_lines(
 fn expanded_repo_map_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(files) = tool.result.content["stats"]["files"].as_u64() {
-        lines.push(detail_line(false, QUIET, format!("files {files}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("files {files}"),
+        ));
     }
     if let Some(symbols) = tool.result.content["stats"]["symbols"].as_u64() {
-        lines.push(detail_line(false, QUIET, format!("symbols {symbols}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("symbols {symbols}"),
+        ));
     }
     if let Some(languages) = compact_json_object(&tool.result.content["languages"]) {
-        lines.push(detail_line(false, QUIET, format!("languages {languages}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("languages {languages}"),
+        ));
     }
     lines
 }
@@ -8725,7 +9711,11 @@ fn expanded_repo_map_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
 fn expanded_diff_context_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(mode) = string_arg(&tool.result.content, "mode") {
-        lines.push(detail_line(false, QUIET, format!("mode {mode}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("mode {mode}"),
+        ));
     }
     let summary = &tool.result.content["summary"];
     if let Some(files) = summary["files_changed"].as_u64() {
@@ -8733,7 +9723,7 @@ fn expanded_diff_context_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static
         let deletions = summary["deletions"].as_u64().unwrap_or(0);
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!("changed {files} files, +{additions} -{deletions}"),
         ));
     }
@@ -8749,7 +9739,7 @@ fn expanded_diff_context_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static
             if file.patch_truncated {
                 summary.push_str(" · diff truncated");
             }
-            lines.push(detail_line(false, QUIET, summary));
+            lines.push(detail_line(false, crate::render::theme::quiet(), summary));
             if file
                 .patch
                 .as_ref()
@@ -8781,27 +9771,44 @@ fn diff_context_files(tool: &ToolTranscript) -> Vec<squeezy_vcs::DiffFile> {
 fn expanded_plan_patch_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(objective) = string_arg(&tool.result.content, "objective") {
-        lines.push(detail_line(false, QUIET, format!("objective {objective}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("objective {objective}"),
+        ));
     }
     if let Some(plan_id) = string_arg(&tool.result.content, "plan_id") {
-        lines.push(detail_line(false, QUIET, format!("plan {plan_id}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("plan {plan_id}"),
+        ));
     }
     if let Some(symbols) = tool.result.content["symbols"].as_array() {
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!("symbols {}", symbols.len()),
         ));
     }
     if let Some(paths) = tool.result.content["impact"]["neighborhood_paths"].as_array() {
-        lines.push(detail_line(false, QUIET, format!("paths {}", paths.len())));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("paths {}", paths.len()),
+        ));
         lines.extend(paths.iter().take(5).filter_map(|path| {
-            path.as_str()
-                .map(|path| detail_line(false, QUIET, format!("path {path}")))
+            path.as_str().map(|path| {
+                detail_line(false, crate::render::theme::quiet(), format!("path {path}"))
+            })
         }));
     }
     if let Some(next) = tool.result.content["next_action"]["reason"].as_str() {
-        lines.push(detail_line(false, QUIET, format!("next {next}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("next {next}"),
+        ));
     }
     lines
 }
@@ -8820,14 +9827,18 @@ fn expanded_edit_detail_lines(
         if file.patch_truncated {
             summary.push_str(" · diff truncated");
         }
-        lines.push(detail_line(false, QUIET, summary));
+        lines.push(detail_line(false, crate::render::theme::quiet(), summary));
         if let Some(patch) = file.patch.as_deref().filter(|patch| !patch.is_empty()) {
-            lines.push(detail_line(false, QUIET, "diff"));
+            lines.push(detail_line(false, crate::render::theme::quiet(), "diff"));
             lines.extend(render_diff_patch_full_lines(patch, file.path.as_str()));
         }
     }
     if let Some(matches) = number_field(&tool.result.content, "matches") {
-        lines.push(detail_line(false, QUIET, format!("matches {matches}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("matches {matches}"),
+        ));
     }
     if let Some(contexts) = tool.result.content["match_contexts"].as_array() {
         lines.extend(contexts.iter().take(5).filter_map(|context| {
@@ -8836,7 +9847,7 @@ fn expanded_edit_detail_lines(
             let preview = context["preview"].as_str()?;
             Some(detail_line(
                 false,
-                QUIET,
+                crate::render::theme::quiet(),
                 format!("match {index} line {line}: {preview}"),
             ))
         }));
@@ -8876,18 +9887,31 @@ fn expanded_glob_detail_lines_v(
     };
     let mut lines = Vec::new();
     if let Some(pattern) = string_arg(&tool.result.content["metadata"], "pattern") {
-        lines.push(detail_line(false, QUIET, format!("pattern {pattern}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("pattern {pattern}"),
+        ));
     }
     if !matches!(verbosity, ToolOutputVerbosity::Compact)
         && let Some(path) = string_arg(&tool.result.content["metadata"], "path")
     {
-        lines.push(detail_line(false, QUIET, format!("root {path}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("root {path}"),
+        ));
     }
     if let Some(paths) = tool.result.content["paths"].as_array() {
-        lines.push(detail_line(false, QUIET, format!("paths {}", paths.len())));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("paths {}", paths.len()),
+        ));
         lines.extend(paths.iter().take(path_cap).filter_map(|path| {
-            path.as_str()
-                .map(|path| detail_line(false, QUIET, format!("path {path}")))
+            path.as_str().map(|path| {
+                detail_line(false, crate::render::theme::quiet(), format!("path {path}"))
+            })
         }));
     }
     lines
@@ -8907,15 +9931,27 @@ fn expanded_grep_detail_lines_v(
     };
     let mut lines = Vec::new();
     if let Some(pattern) = string_arg(&tool.result.content["metadata"], "pattern") {
-        lines.push(detail_line(false, QUIET, format!("pattern {pattern}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("pattern {pattern}"),
+        ));
     }
     if !matches!(verbosity, ToolOutputVerbosity::Compact)
         && let Some(path) = string_arg(&tool.result.content["metadata"], "path")
     {
-        lines.push(detail_line(false, QUIET, format!("root {path}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("root {path}"),
+        ));
     }
     if let Some(count) = number_field(&tool.result.content, "count") {
-        lines.push(detail_line(false, QUIET, format!("matches {count}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("matches {count}"),
+        ));
     }
     lines.extend(path_detail_lines(
         &tool.result.content["paths"],
@@ -8929,7 +9965,7 @@ fn expanded_grep_detail_lines_v(
             let text = item["text"].as_str().unwrap_or_default();
             lines.push(detail_line(
                 false,
-                QUIET,
+                crate::render::theme::quiet(),
                 format!("{path}:{line} {}", compact_text(text, 100)),
             ));
         }
@@ -8966,23 +10002,31 @@ fn expanded_read_file_detail_lines(
         if ranges > 1 {
             summary.push_str(&format!(" · {ranges} ranges"));
         }
-        return vec![detail_line(false, QUIET, summary)];
+        return vec![detail_line(false, crate::render::theme::quiet(), summary)];
     }
 
     let mut lines = Vec::new();
     if let Some(path) = path {
-        lines.push(detail_line(false, QUIET, format!("path {path}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("path {path}"),
+        ));
     }
     if let Some(bytes) = bytes {
         let total = total.unwrap_or(bytes);
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!("bytes {} of {}", format_bytes(bytes), format_bytes(total)),
         ));
     }
     if ranges > 0 {
-        lines.push(detail_line(false, QUIET, format!("ranges {ranges}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("ranges {ranges}"),
+        ));
     }
     if let Some(content) = string_arg(&tool.result.content, "content") {
         lines.extend(output_block_lines("content", &content, verbosity));
@@ -8996,20 +10040,24 @@ fn expanded_read_tool_output_detail_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(handle) = string_arg(&tool.result.content, "handle") {
-        lines.push(detail_line(false, QUIET, format!("handle {handle}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("handle {handle}"),
+        ));
     }
     if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
         let total = number_field(&tool.result.content, "total_bytes").unwrap_or(bytes);
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!("bytes {} of {}", format_bytes(bytes), format_bytes(total)),
         ));
     }
     if let Some(saved) = saved_tool_output_meta(tool) {
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!("saved {}", saved_tool_output_label(&saved.tool_name)),
         ));
         if let Some(result) = saved.parsed {
@@ -9027,33 +10075,41 @@ fn expanded_read_tool_output_detail_lines(
             } else {
                 "content saved tool-result JSON (hidden in normal mode)"
             };
-            lines.push(detail_line(false, QUIET, detail));
+            lines.push(detail_line(false, crate::render::theme::quiet(), detail));
             return lines;
         }
     }
     if let Some(summary) = saved_compiler_output_summary(tool) {
-        lines.push(detail_line(false, QUIET, "saved compiler output"));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            "saved compiler output",
+        ));
         if !summary.messages.is_empty() {
-            lines.push(detail_line(false, QUIET, "compiler messages"));
+            lines.push(detail_line(
+                false,
+                crate::render::theme::quiet(),
+                "compiler messages",
+            ));
             for line in head_tail_lines(
                 &summary.messages.join("\n"),
                 saved_output_preview_limit(verbosity),
             ) {
                 if line.truncated_marker {
-                    lines.push(detail_line(false, QUIET, line.text));
+                    lines.push(detail_line(false, crate::render::theme::quiet(), line.text));
                 } else {
                     lines.push(detail_spans_line(styled_output_spans(&line.text)));
                 }
             }
         }
         if !summary.stderr.is_empty() {
-            lines.push(detail_line(false, QUIET, "stderr"));
+            lines.push(detail_line(false, crate::render::theme::quiet(), "stderr"));
             for line in head_tail_lines(
                 &summary.stderr.join("\n"),
                 saved_output_preview_limit(verbosity),
             ) {
                 if line.truncated_marker {
-                    lines.push(detail_line(false, QUIET, line.text));
+                    lines.push(detail_line(false, crate::render::theme::quiet(), line.text));
                 } else {
                     lines.push(detail_spans_line(styled_output_spans(&line.text)));
                 }
@@ -9067,7 +10123,7 @@ fn expanded_read_tool_output_detail_lines(
             if summary.partial {
                 detail.push_str(" · partial result");
             }
-            lines.push(detail_line(false, QUIET, detail));
+            lines.push(detail_line(false, crate::render::theme::quiet(), detail));
             return lines;
         }
     }
@@ -9079,10 +10135,10 @@ fn expanded_read_tool_output_detail_lines(
         // existing "expand grep → see every match" behaviour is preserved.
         let limit = saved_output_preview_limit(verbosity);
         if !content.trim().is_empty() {
-            lines.push(detail_line(false, QUIET, "content"));
+            lines.push(detail_line(false, crate::render::theme::quiet(), "content"));
             for line in head_tail_lines(&content, limit) {
                 if line.truncated_marker {
-                    lines.push(detail_line(false, QUIET, line.text));
+                    lines.push(detail_line(false, crate::render::theme::quiet(), line.text));
                 } else {
                     lines.push(detail_spans_line(styled_output_spans(&line.text)));
                 }
@@ -9291,13 +10347,17 @@ fn expanded_generic_tool_detail_lines(
             break;
         }
         let summary = summarize_json_value(value);
-        lines.push(detail_line(false, QUIET, format!("{key} {summary}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("{key} {summary}"),
+        ));
         shown += 1;
     }
     if total_keys > shown {
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!(
                 "+{} more fields (Ctrl-T for full transcript)",
                 total_keys - shown
@@ -9357,10 +10417,10 @@ fn output_block_lines(
     let limit = usize::MAX;
     let lines = head_tail_lines(content, limit);
     let is_diff = shell_text_looks_like_diff(content);
-    let mut rendered = vec![detail_line(false, QUIET, label)];
+    let mut rendered = vec![detail_line(false, crate::render::theme::quiet(), label)];
     rendered.extend(lines.into_iter().map(|line| {
         if line.truncated_marker {
-            detail_line(false, QUIET, line.text)
+            detail_line(false, crate::render::theme::quiet(), line.text)
         } else if is_diff {
             detail_output_diff_line(&line.text)
         } else {
@@ -9427,7 +10487,9 @@ fn detail_spans_line(content: Vec<Span<'static>>) -> Line<'static> {
         Span::raw("  "),
         Span::styled(
             "│ ",
-            Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::quiet())
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     spans.extend(content);
@@ -9440,7 +10502,9 @@ fn detail_rendered_line(line: Line<'static>) -> Line<'static> {
         Span::raw("  "),
         Span::styled(
             "│ ",
-            Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::quiet())
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     spans.extend(line.spans);
@@ -9466,15 +10530,17 @@ fn command_spans(command: &str) -> Vec<Span<'static>> {
         }
         let style = if !command_seen && !looks_like_env_assignment(token) {
             command_seen = true;
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
         } else if token.starts_with('-') {
-            Style::default().fg(AMBER)
+            Style::default().fg(crate::render::theme::accent())
         } else if token.starts_with('"') || token.starts_with('\'') {
-            Style::default().fg(SUCCESS_GREEN)
+            Style::default().fg(crate::render::theme::green())
         } else if token.contains('/') || token.contains('.') {
             Style::default().fg(palette::muted_fg())
         } else {
-            Style::default().fg(QUIET)
+            Style::default().fg(crate::render::theme::quiet())
         };
         spans.push(Span::styled(token.clone(), style));
     }
@@ -9515,7 +10581,10 @@ fn keyword_spans(line: &str) -> Vec<Span<'static>> {
             token.push(ch);
         } else {
             push_keyword_token(&mut spans, &mut token);
-            spans.push(Span::styled(ch.to_string(), Style::default().fg(QUIET)));
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
         }
     }
     push_keyword_token(&mut spans, &mut token);
@@ -9534,12 +10603,16 @@ fn push_keyword_token(spans: &mut Vec<Span<'static>>, token: &mut String) {
         lower.as_str(),
         "error" | "failed" | "failure" | "panic" | "fatal"
     ) {
-        Style::default().fg(ERROR_RED).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(crate::render::theme::red())
+            .add_modifier(Modifier::BOLD)
     } else if matches!(lower.as_str(), "warning" | "warn") {
-        Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(crate::render::theme::accent())
+            .add_modifier(Modifier::BOLD)
     } else if matches!(lower.as_str(), "ok" | "passed" | "success" | "done") {
         Style::default()
-            .fg(SUCCESS_GREEN)
+            .fg(crate::render::theme::green())
             .add_modifier(Modifier::BOLD)
     } else if matches!(
         lower.as_str(),
@@ -9557,7 +10630,9 @@ fn push_keyword_token(spans: &mut Vec<Span<'static>>, token: &mut String) {
             | "enum"
             | "impl"
     ) {
-        Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(crate::render::theme::secondary())
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
@@ -9607,7 +10682,7 @@ fn path_detail_lines(
                 item[object_key].as_str()
             }
         })
-        .map(|path| detail_line(false, QUIET, format!("path {path}")))
+        .map(|path| detail_line(false, crate::render::theme::quiet(), format!("path {path}")))
         .collect()
 }
 
@@ -9632,7 +10707,7 @@ fn append_truncation_hint(spans: &mut Vec<Span<'static>>, tool: &ToolTranscript)
             .unwrap_or_else(|| "spilled to disk".to_string());
         spans.push(Span::styled(
             format!(" · saved {path}"),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
         return;
     }
@@ -9641,7 +10716,7 @@ fn append_truncation_hint(spans: &mut Vec<Span<'static>>, tool: &ToolTranscript)
     {
         spans.push(Span::styled(
             " · partial result",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
     }
 }
@@ -9855,15 +10930,15 @@ fn tool_result_output_text(result: &ToolResult) -> Option<String> {
 
 fn status_color(status: ToolStatus) -> Color {
     match status {
-        ToolStatus::Success => SUCCESS_GREEN,
-        ToolStatus::Error | ToolStatus::Stale => ERROR_RED,
-        ToolStatus::Denied | ToolStatus::Cancelled => GOLD,
+        ToolStatus::Success => crate::render::theme::green(),
+        ToolStatus::Error | ToolStatus::Stale => crate::render::theme::red(),
+        ToolStatus::Denied | ToolStatus::Cancelled => crate::render::theme::secondary(),
     }
 }
 
 fn tool_result_display_color(tool: &ToolTranscript) -> Color {
     if tool_result_not_run(tool) || is_retryable_tool_result(&tool.result) {
-        GOLD
+        crate::render::theme::secondary()
     } else {
         status_color(tool.result.status)
     }
@@ -9932,16 +11007,16 @@ pub(crate) enum TurnVisualState {
 impl TurnVisualState {
     fn color(self, tick: u64) -> Color {
         match self {
-            Self::Idle => AMBER,
+            Self::Idle => crate::render::theme::accent(),
             Self::Running => {
                 if tick % 8 < 4 {
-                    GOLD
+                    crate::render::theme::secondary()
                 } else {
-                    AMBER
+                    crate::render::theme::accent()
                 }
             }
-            Self::Succeeded => SUCCESS_GREEN,
-            Self::Failed => ERROR_RED,
+            Self::Succeeded => crate::render::theme::green(),
+            Self::Failed => crate::render::theme::red(),
         }
     }
 }
@@ -9960,17 +11035,22 @@ fn assistant_static_span(color: Color) -> Span<'static> {
 }
 
 fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
-    // At idle the coin is a steady AMBER ●. Animating it forced a real
+    // At idle the coin is a steady crate::render::theme::accent() ●. Animating it forced a real
     // cell change every 320 ms, which kept terminal-emulator per-tab
     // activity indicators buzzing forever even though the agent was
     // doing nothing.
     if app.turn_visual == TurnVisualState::Idle {
-        return Span::styled("●", Style::default().fg(AMBER).add_modifier(Modifier::BOLD));
+        return Span::styled(
+            "●",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        );
     }
     let color = if (prompt_elapsed_ms(app) / 800).is_multiple_of(2) {
-        GOLD
+        crate::render::theme::secondary()
     } else {
-        AMBER
+        crate::render::theme::accent()
     };
     Span::styled(
         prompt_coin_frame(app),
@@ -9999,7 +11079,7 @@ fn prompt_elapsed_ms(app: &TuiApp) -> u64 {
 }
 
 fn prompt_cursor_span() -> Span<'static> {
-    Span::styled("┃", Style::default().fg(AMBER))
+    Span::styled("┃", Style::default().fg(crate::render::theme::accent()))
 }
 
 pub(crate) fn compact_text(text: &str, limit: usize) -> String {
@@ -10059,9 +11139,7 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
         // no slack for the actual window — and the menu rendered the
         // bottom slice of the SLASH_MENU_MAX_ITEMS window instead of
         // the top.
-        slash_suggestions(&app.input)
-            .len()
-            .min(SLASH_MENU_MAX_ITEMS)
+        slash_suggestion_lines(app, width).len()
     } else {
         0
     };
@@ -10110,11 +11188,7 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     }
     let cursor = input_cursor(app);
     let parts = app.input.split('\n').collect::<Vec<_>>();
-    // Slash highlight only applies to the first line of input — slash
-    // commands are always at the start of a prompt, never embedded later.
-    let slash_len = parts
-        .first()
-        .and_then(|first| input::match_slash_command_prefix(first));
+    let slash_ranges = input::slash_command_ranges(&app.input);
     let bang_range = bang_command_marker_range(&app.input);
     let mut line_start = 0usize;
     parts
@@ -10128,18 +11202,21 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
             };
             let mut spans = prefix;
             let line_end = line_start + line.len();
-            let slash_split = if index == 0 { slash_len } else { None };
             let style_text_at = |abs_offset: usize| -> Style {
                 if bang_range
                     .as_ref()
                     .is_some_and(|range| range.contains(&abs_offset))
                 {
-                    Style::default().fg(BANG_RED)
+                    Style::default().fg(crate::render::theme::red())
+                } else if let Some(style) = prompt_attachment_style_at(app, abs_offset) {
+                    style
+                } else if slash_ranges
+                    .iter()
+                    .any(|(start, end)| *start <= abs_offset && abs_offset < *end)
+                {
+                    Style::default().fg(crate::render::theme::accent())
                 } else {
-                    match slash_split {
-                        Some(len) if abs_offset < len => Style::default().fg(AMBER),
-                        _ => Style::default().fg(Color::White),
-                    }
+                    Style::default().fg(crate::render::theme::foreground())
                 }
             };
             if cursor >= line_start && cursor <= line_end {
@@ -10160,6 +11237,22 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
             Line::from(spans)
         })
         .collect()
+}
+
+fn prompt_attachment_style_at(app: &TuiApp, abs_offset: usize) -> Option<Style> {
+    for attachment in &app.prompt_attachments {
+        for (start, _) in app.input.match_indices(&attachment.placeholder) {
+            let end = start + attachment.placeholder.len();
+            if (start..end).contains(&abs_offset) {
+                return Some(
+                    Style::default()
+                        .fg(crate::render::theme::cyan())
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+        }
+    }
+    None
 }
 
 /// Push styled spans for `chunk`, splitting anywhere the computed style
@@ -10207,7 +11300,7 @@ fn composer_bubble_lines(
     if width < 4 || height < 2 {
         return content;
     }
-    let amber = Style::default().fg(AMBER);
+    let amber = Style::default().fg(crate::render::theme::accent());
 
     // Open layout: a single top rule with the typed content floating
     // underneath. No vertical sides or bottom rule — the latter added a
@@ -10253,8 +11346,8 @@ fn composer_bubble_lines(
     lines
 }
 
-fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
-    let suggestions = slash_suggestions(&app.input);
+fn slash_suggestion_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
+    let suggestions = input::slash_suggestions_at(&app.input, app.input_cursor);
     let visible = visible_slash_suggestions(&suggestions, app.slash_menu_index);
     let command_width = visible
         .iter()
@@ -10263,77 +11356,119 @@ fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .unwrap_or(0)
         .max(12);
     let task_active = turn_in_progress(app);
-    visible
-        .iter()
-        .enumerate()
-        .map(|(index, command)| {
-            let absolute_index = slash_menu_window_start(suggestions.len(), app.slash_menu_index)
-                .saturating_add(index);
-            let selected = absolute_index
-                == app
-                    .slash_menu_index
-                    .min(suggestions.len().saturating_sub(1));
-            let dimmed = command.is_dimmed(task_active);
-            let marker = if selected { "› " } else { "  " };
-            let command_padding =
-                " ".repeat(command_width.saturating_sub(command.name.chars().count()) + 2);
-            let name_color = if dimmed {
-                QUIET
-            } else if selected {
-                GOLD
+    let mut lines = Vec::new();
+    for (index, command) in visible.iter().enumerate() {
+        let absolute_index =
+            slash_menu_window_start(suggestions.len(), app.slash_menu_index).saturating_add(index);
+        let selected = absolute_index
+            == app
+                .slash_menu_index
+                .min(suggestions.len().saturating_sub(1));
+        let dimmed = command.is_dimmed(task_active);
+        let marker = if selected { "› " } else { "  " };
+        let command_padding =
+            " ".repeat(command_width.saturating_sub(command.name.chars().count()) + 2);
+        let name_color = if selected {
+            crate::render::theme::secondary()
+        } else if dimmed {
+            crate::render::theme::foreground()
+        } else {
+            crate::render::theme::accent()
+        };
+        let mut name_style = Style::default().fg(name_color);
+        if dimmed {
+            name_style = name_style.add_modifier(Modifier::ITALIC);
+        }
+        let mut description_style = Style::default().fg(crate::render::theme::quiet());
+        if dimmed {
+            description_style = description_style.fg(crate::render::theme::foreground());
+        }
+        let hint_style = Style::default()
+            .fg(crate::render::theme::cyan())
+            .add_modifier(Modifier::ITALIC);
+        let mut spans = vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(command.name, name_style),
+            Span::styled(
+                command_padding,
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(command.description.to_string(), description_style),
+        ];
+        let hint_span = command
+            .parameter_hint
+            .map(|hint| Span::styled(format!(" {hint}"), hint_style));
+        let badges = command.capability_badges();
+        let badge_span = if badges.is_empty() {
+            None
+        } else {
+            Some(Span::styled(
+                format!("  [{}]", badges.join("|")),
+                Style::default()
+                    .fg(if dimmed {
+                        crate::render::theme::foreground()
+                    } else {
+                        crate::render::theme::accent()
+                    })
+                    .add_modifier(Modifier::ITALIC),
+            ))
+        };
+        let dimmed_span = if dimmed {
+            Some(Span::styled(
+                "  (unavailable during turn)",
+                Style::default()
+                    .fg(crate::render::theme::quiet())
+                    .add_modifier(Modifier::ITALIC),
+            ))
+        } else {
+            None
+        };
+        if let Some(hint_span) = hint_span {
+            let mut inline_spans = spans.clone();
+            inline_spans.push(hint_span.clone());
+            if let Some(badge_span) = badge_span.clone() {
+                inline_spans.push(badge_span);
+            }
+            if let Some(dimmed_span) = dimmed_span.clone() {
+                inline_spans.push(dimmed_span);
+            }
+            if spans_width(&inline_spans) <= width.max(1) as usize {
+                lines.push(Line::from(inline_spans));
             } else {
-                AMBER
-            };
-            let mut name_style = Style::default().fg(name_color);
-            if dimmed {
-                name_style = name_style.add_modifier(Modifier::DIM);
+                if let Some(badge_span) = badge_span {
+                    spans.push(badge_span);
+                }
+                if let Some(dimmed_span) = dimmed_span {
+                    spans.push(dimmed_span);
+                }
+                lines.push(Line::from(spans));
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(command_width + 4)),
+                    hint_span,
+                ]));
             }
-            let mut description_style = Style::default().fg(QUIET);
-            if dimmed {
-                description_style = description_style.add_modifier(Modifier::DIM);
+        } else {
+            if let Some(badge_span) = badge_span {
+                spans.push(badge_span);
             }
-            let mut spans = vec![
-                Span::styled(
-                    marker,
-                    Style::default().fg(if selected { GOLD } else { QUIET }),
-                ),
-                Span::styled(command.name, name_style),
-                Span::styled(command_padding, Style::default().fg(QUIET)),
-                Span::styled(compact_text(command.description, 72), description_style),
-            ];
-            if let Some(hint) = command.parameter_hint {
-                let hint_text = format!(" {}", compact_text(hint, 36));
-                spans.push(Span::styled(
-                    hint_text,
-                    Style::default()
-                        .fg(palette::ACCENT_CYAN)
-                        .add_modifier(Modifier::ITALIC),
-                ));
+            if let Some(dimmed_span) = dimmed_span {
+                spans.push(dimmed_span);
             }
-            let badges = command.capability_badges();
-            if !badges.is_empty() {
-                spans.push(Span::styled(
-                    format!("  [{}]", compact_text(&badges.join("|"), 32)),
-                    Style::default()
-                        .fg(if dimmed { QUIET } else { AMBER })
-                        .add_modifier(if dimmed {
-                            Modifier::DIM | Modifier::ITALIC
-                        } else {
-                            Modifier::ITALIC
-                        }),
-                ));
-            }
-            if dimmed {
-                spans.push(Span::styled(
-                    "  (unavailable during turn)",
-                    Style::default()
-                        .fg(QUIET)
-                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
-                ));
-            }
-            Line::from(spans)
-        })
-        .collect()
+            lines.push(Line::from(spans));
+        }
+    }
+    lines
+}
+
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.chars().count()).sum()
 }
 
 fn slash_menu_window_start(total: usize, selected: usize) -> usize {
@@ -10374,7 +11509,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let suggestion_lines = if queue_open || !overlay_lines.is_empty() || !mention_lines.is_empty() {
         Vec::new()
     } else {
-        slash_suggestion_lines(app)
+        slash_suggestion_lines(app, area.width)
     };
     // Keep the indicator visible even when the overlay is open so the
     // same row stays clickable to toggle it back closed. The glyph
@@ -10416,7 +11551,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     lines.extend(suggestion_lines);
     let scroll = lines.len().saturating_sub(area.height as usize) as u16;
     let paragraph = Paragraph::new(lines)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(crate::render::theme::foreground()))
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
@@ -10445,14 +11580,20 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
             let marker = if selected { "› " } else { "  " };
             let display = path.display().to_string();
             let style = if selected {
-                Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(palette::muted_fg())
             };
             Line::from(vec![
                 Span::styled(
                     marker,
-                    Style::default().fg(if selected { GOLD } else { QUIET }),
+                    Style::default().fg(if selected {
+                        crate::render::theme::secondary()
+                    } else {
+                        crate::render::theme::quiet()
+                    }),
                 ),
                 Span::styled(display, style),
             ])
@@ -10465,7 +11606,9 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
     let footer = format!("  {}/{}", popup.selected + 1, total);
     lines.push(Line::from(Span::styled(
         footer,
-        Style::default().fg(QUIET).add_modifier(Modifier::DIM),
+        Style::default()
+            .fg(crate::render::theme::quiet())
+            .add_modifier(Modifier::DIM),
     )));
     lines
 }
@@ -10609,8 +11752,8 @@ pub(crate) fn title_case_mode(mode: SessionMode) -> &'static str {
 
 fn mode_status_color(mode: SessionMode) -> Color {
     match mode {
-        SessionMode::Plan => MODE_PURPLE,
-        SessionMode::Build => MODE_BUILD_GREEN,
+        SessionMode::Plan => crate::render::theme::magenta(),
+        SessionMode::Build => crate::render::theme::green(),
     }
 }
 
@@ -10632,14 +11775,17 @@ fn format_status_tokens(app: &TuiApp) -> String {
 }
 
 fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
-    let hints_span = Span::styled(format_status_hints(app), Style::default().fg(QUIET));
+    let hints_span = Span::styled(
+        format_status_hints(app),
+        Style::default().fg(crate::render::theme::quiet()),
+    );
     let detail = configured_status_line_items(app).and_then(|items| {
         status::render_status_detail_line(app, &items, app.status_line_use_colors)
     });
-    // When the user has configured `[tui].status_line`, the detail items
-    // take the place of `dir … · git …` on row 1 (otherwise both rows
-    // duplicate the same data). Mode label stays right-aligned. Without a
-    // configured list, fall back to the historical overview layout.
+    // Active detail items (configured, or the built-in default list) take the
+    // place of `dir … · git …` on row 1; otherwise both rows duplicate the
+    // same data. Mode label stays right-aligned. An explicit empty list, or a
+    // list whose items all render empty, falls back to the historical overview.
     let top = match detail {
         Some(detail_line) => compose_status_overview_with_detail(detail_line, app, width),
         None => format_status_overview_line(app, width),
@@ -10653,7 +11799,7 @@ fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
                 format_status_details(app),
                 format_status_hints(app)
             ),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ))
     } else {
         Line::from(hints_span)
@@ -10671,15 +11817,18 @@ fn compose_status_overview_with_detail(
 ) -> Line<'static> {
     let right = mode_status_text(app);
     let right_width = right.chars().count();
+    let gap_width = usize::from(width).saturating_sub(right_width).min(1);
+    let detail_limit = usize::from(width).saturating_sub(right_width + gap_width);
+    truncate_line_to_width(&mut detail, detail_limit);
     let detail_width: usize = detail
         .spans
         .iter()
         .map(|span| span.content.chars().count())
         .sum();
-    let padding_width = (width as usize)
-        .saturating_sub(detail_width.saturating_add(right_width))
-        .max(1);
-    detail.spans.push(Span::raw(" ".repeat(padding_width)));
+    let padding_width = usize::from(width).saturating_sub(detail_width + right_width);
+    if padding_width > 0 {
+        detail.spans.push(Span::raw(" ".repeat(padding_width)));
+    }
     detail.spans.push(Span::styled(
         right,
         Style::default().fg(mode_status_color(app.mode)),
@@ -10687,18 +11836,63 @@ fn compose_status_overview_with_detail(
     detail
 }
 
+fn truncate_line_to_width(line: &mut Line<'static>, width: usize) {
+    let current_width: usize = line
+        .spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum();
+    if current_width <= width {
+        return;
+    }
+    if width == 0 {
+        line.spans.clear();
+        return;
+    }
+    let marker = if width <= 3 {
+        ".".repeat(width)
+    } else {
+        "...".to_string()
+    };
+    let content_width = width.saturating_sub(marker.chars().count());
+    let mut used = 0usize;
+    let mut spans = Vec::new();
+    for span in std::mem::take(&mut line.spans) {
+        if used >= content_width {
+            break;
+        }
+        let span_width = span.content.chars().count();
+        if used + span_width <= content_width {
+            used += span_width;
+            spans.push(span);
+            continue;
+        }
+        let take = content_width - used;
+        if take > 0 {
+            let text = span.content.chars().take(take).collect::<String>();
+            spans.push(Span::styled(text, span.style));
+        }
+        break;
+    }
+    let marker_style = spans
+        .last()
+        .map(|span: &Span<'static>| span.style)
+        .unwrap_or_default();
+    spans.push(Span::styled(marker, marker_style));
+    line.spans = spans;
+}
+
 fn detail_was_present(app: &TuiApp) -> bool {
     configured_status_line_items(app).is_some()
 }
 
-/// User-configured `[tui].status_line`. `None` when the TOML key is unset
-/// (so the renderer falls back to the historical hints-only second row)
-/// or when the user deliberately set an empty list (also "no detail row").
+/// User-configured `[tui].status_line`, or the built-in default list when the
+/// TOML key is unset. An explicit empty list still disables the detail row.
 fn configured_status_line_items(app: &TuiApp) -> Option<Vec<status::StatusLineItem>> {
     match &app.status_line_items {
         Some(list) if list.is_empty() => None,
         Some(list) => Some(list.clone()),
-        None => None,
+        None => Some(status::DEFAULT_STATUS_LINE_ITEMS.to_vec()),
     }
 }
 
@@ -10759,6 +11953,14 @@ fn format_status_hints(app: &TuiApp) -> String {
 }
 
 fn format_status_hint_base(app: &TuiApp) -> String {
+    if let Some(overlay) = app.transcript_overlay.as_ref() {
+        return if overlay.mode.mouse_capture() {
+            "PgUp/PgDn/Wheel scroll · M native selection · drag right gutter scroll · Shift-drag select · Esc close"
+                .to_string()
+        } else {
+            "PgUp/PgDn/Wheel scroll · M scrollbar drag · native select/copy · Esc close".to_string()
+        };
+    }
     if let Some(pending) = app.pending_request_user_input.as_ref() {
         if pending.request.choices.is_empty() && pending.request.allow_freeform {
             return "type your answer · Enter send · Esc cancel".to_string();
@@ -10831,8 +12033,6 @@ fn format_status_hint_base(app: &TuiApp) -> String {
 /// `active_tool`, and double-rendering them would make every
 /// tool-call event flicker the hint row.
 const USER_ACTION_STATUS_PREFIXES: &[&str] = &[
-    "expanded ",
-    "collapsed ",
     "mode switched ",
     "already in ",
     "stay in ",
@@ -10842,14 +12042,11 @@ const USER_ACTION_STATUS_PREFIXES: &[&str] = &[
     "Ctrl+X…",
     "transcript overlay",
     "task panel ",
-    "/expand",
-    "/collapse",
     "/statusline cancelled",
     "no recent session",
     "session quick-switch",
     "resume failed",
     "restored last prompt",
-    "nothing expandable",
     "select a transcript entry",
 ];
 
@@ -11275,6 +12472,23 @@ impl TelemetryStatus {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptAttachment {
+    placeholder: String,
+    payload: PromptAttachmentPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptAttachmentPayload {
+    Text {
+        replacement: String,
+    },
+    Image {
+        media_type: String,
+        bytes: Arc<[u8]>,
+    },
+}
+
 pub(crate) struct TuiApp {
     pub(crate) provider_name: &'static str,
     pub(crate) version: &'static str,
@@ -11310,6 +12524,7 @@ pub(crate) struct TuiApp {
     pub(crate) telemetry: TelemetryStatus,
     pub(crate) input: String,
     pub(crate) input_cursor: usize,
+    pub(crate) prompt_attachments: Vec<PromptAttachment>,
     pub(crate) input_history: prompt_history::PromptHistory,
     pub(crate) input_history_index: Option<usize>,
     pub(crate) input_history_draft: String,
@@ -11330,6 +12545,9 @@ pub(crate) struct TuiApp {
     /// a scroll offset. Acts as the escape hatch from the aggressive
     /// default truncation.
     pub(crate) transcript_overlay: Option<TranscriptOverlayState>,
+    pub(crate) transcript_overlay_scrollbar_cache:
+        std::cell::Cell<Option<TranscriptOverlayScrollbarCache>>,
+    pub(crate) transcript_overlay_render_cache: std::cell::RefCell<TranscriptOverlayRenderCache>,
     pub(crate) alternate_scroll_enabled: bool,
     pub(crate) attachments: Vec<ContextAttachment>,
     pub(crate) context_compaction: ContextCompactionState,
@@ -11548,6 +12766,9 @@ pub(crate) struct TuiApp {
     /// `DispatchCommand`; a match expands the template body and routes
     /// it through [`start_user_turn`] like any other typed prompt.
     pub(crate) prompt_templates: PromptTemplateCatalog,
+    /// One-shot slash-command escape hatch for commands that intentionally
+    /// leave editable text in the composer after they run.
+    pub(crate) preserve_input_after_slash_command: bool,
     /// Override for the user-scope settings file that slash commands
     /// (`/theme`, `/statusline`, …) persist into. `None` ⇒ production
     /// path: `squeezy_core::default_settings_path()` (which itself
@@ -11607,7 +12828,23 @@ fn build_keymap_resolver(base: &BTreeMap<String, String>) -> keymap::KeymapResol
     }
 }
 
+fn format_config_warning(warning: &ConfigWarning) -> String {
+    format!(
+        "ignored unknown setting {} in {}",
+        warning.field, warning.source
+    )
+}
+
 impl TuiApp {
+    pub(crate) fn prune_prompt_attachments(&mut self) {
+        self.prompt_attachments
+            .retain(|attachment| self.input.contains(&attachment.placeholder));
+    }
+
+    pub(crate) fn clear_prompt_attachments(&mut self) {
+        self.prompt_attachments.clear();
+    }
+
     /// Clear the click-target registry at the start of each frame.
     /// Called from `render` / `render_inline` before any widget draws.
     pub(crate) fn begin_frame_clickables(&self) {
@@ -11700,7 +12937,7 @@ impl TuiApp {
         let status = "ready".to_string();
         let next_entry_id = transcript.len() as u64;
         let keymap = build_keymap_resolver(&config.tui.keymap);
-        Self {
+        let mut app = Self {
             provider_name,
             version: env!("CARGO_PKG_VERSION"),
             model: config.model.clone(),
@@ -11728,6 +12965,7 @@ impl TuiApp {
             telemetry: TelemetryStatus::from_config(&config.telemetry),
             input: String::new(),
             input_cursor: 0,
+            prompt_attachments: Vec::new(),
             input_history: if config.tui.persist_prompt_history {
                 prompt_history::PromptHistory::with_persistence(
                     prompt_history::DEFAULT_PROMPT_HISTORY_CAPACITY,
@@ -11747,6 +12985,10 @@ impl TuiApp {
             overlay_next_id: 0,
             overlay_active_id: None,
             transcript_overlay: None,
+            transcript_overlay_scrollbar_cache: std::cell::Cell::new(None),
+            transcript_overlay_render_cache: std::cell::RefCell::new(
+                TranscriptOverlayRenderCache::default(),
+            ),
             alternate_scroll_enabled: TerminalMode::from(config.tui.alternate_screen)
                 == TerminalMode::AlternateScreen,
             attachments: Vec::new(),
@@ -11832,8 +13074,13 @@ impl TuiApp {
             pending_chord: None,
             clickables: std::cell::RefCell::new(Vec::new()),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
+            preserve_input_after_slash_command: false,
             settings_path_override: None,
+        };
+        for warning in &config.config_warnings {
+            app.push_warn(format_config_warning(warning));
         }
+        app
     }
 
     /// Mirror every config-derived field the status line and header
@@ -11982,15 +13229,12 @@ impl TuiApp {
     /// content is still moving (working spinner, title spinner, etc.).
     /// When neither is true the main loop skips `draw_app` entirely.
     ///
-    /// Returns `false` whenever the host terminal reports the window
-    /// is unfocused — paired with the animation-tick gate in the main
-    /// loop this stops the spinner from repainting in the background,
-    /// which is the primary battery sink on idle laptops. State
-    /// mutations (e.g. agent events arriving while we are unfocused)
-    /// still flip `needs_redraw` and force a draw, so we never miss a
-    /// material update.
+    /// Returns `false` for unfocused idle animation, but keeps active turns
+    /// moving. That preserves the first-prompt spinner during transient focus
+    /// changes without repainting purely decorative idle motion in the
+    /// background.
     pub(crate) fn has_active_animation(&self) -> bool {
-        if !self.focused {
+        if !self.focused && !turn_in_progress(self) {
             return false;
         }
         matches!(self.turn_visual, TurnVisualState::Running)
@@ -12065,7 +13309,7 @@ impl TuiApp {
         self.push_entry(TranscriptEntry::log(id, message, self.transcript_default));
     }
 
-    /// Push a turn-ending warning log (⚠ prefix). Suppresses the push when
+    /// Push a warning log (⚠ prefix). Suppresses the push when
     /// the most recent transcript entry is already a `⚠ Cancelled` / `⚠ Denied`
     /// tool card — the card already communicates the turn-end at a glance,
     /// and a trailing `⚠ turn cancelled` line is just noise. Returns whether
@@ -12322,38 +13566,6 @@ impl TranscriptEntry {
         }
     }
 
-    fn matches_category(&self, category: TranscriptCategory) -> bool {
-        match category {
-            TranscriptCategory::All => true,
-            TranscriptCategory::Tools => matches!(self.kind, TranscriptEntryKind::ToolResult(_)),
-            TranscriptCategory::Logs => match &self.kind {
-                TranscriptEntryKind::Log(_) => true,
-                TranscriptEntryKind::Message(item) => item.role == Role::System,
-                TranscriptEntryKind::PlanCard(_) => true,
-                TranscriptEntryKind::SlashEcho(_) => true,
-                _ => false,
-            },
-            TranscriptCategory::Diffs => match &self.kind {
-                TranscriptEntryKind::ToolResult(tool) => tool.result.tool_name.contains("diff"),
-                TranscriptEntryKind::Diff(_) => true,
-                _ => false,
-            },
-            TranscriptCategory::Receipts => match &self.kind {
-                TranscriptEntryKind::ToolResult(tool) => {
-                    !tool.result.receipt.output_sha256.is_empty()
-                }
-                _ => false,
-            },
-            TranscriptCategory::Assistant => match &self.kind {
-                TranscriptEntryKind::Message(item) => item.role == Role::Assistant,
-                _ => false,
-            },
-            TranscriptCategory::Reasoning => {
-                matches!(self.kind, TranscriptEntryKind::Reasoning(_))
-            }
-        }
-    }
-
     fn plain_text_lines(&self) -> Vec<String> {
         match &self.kind {
             TranscriptEntryKind::Message(item) => {
@@ -12587,22 +13799,6 @@ fn tool_retry_key(tool: &ToolTranscript) -> Option<String> {
     ))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TranscriptCategory {
-    All,
-    Tools,
-    Logs,
-    Diffs,
-    Receipts,
-    Assistant,
-    /// Streamed model reasoning blocks (greyed-out chevrons in the
-    /// transcript). The most common Ctrl+E target — exposing it as a
-    /// dedicated `/expand reasoning` lets users on terminals where
-    /// Ctrl+E / Alt+E never reach the application still drive the
-    /// expansion surface from a keystroke they control.
-    Reasoning,
-}
-
 /// Mid-turn cost/token snapshot surfaced in the status bar so the user
 /// can watch a turn's spend grow without log spam in the transcript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12711,7 +13907,7 @@ enum TerminalMode {
 impl From<TuiAlternateScreen> for TerminalMode {
     fn from(value: TuiAlternateScreen) -> Self {
         match value {
-            TuiAlternateScreen::Auto => Self::Inline,
+            TuiAlternateScreen::Auto => Self::AlternateScreen,
             TuiAlternateScreen::Never => Self::Inline,
             TuiAlternateScreen::Always => Self::AlternateScreen,
         }
@@ -12744,10 +13940,17 @@ struct TerminalGuard {
     /// `mode == AlternateScreen` (that mode is already fullscreen —
     /// no swap needed).
     overlay_screen_active: bool,
-    /// Whether the user opted into mouse capture. The transcript overlay
-    /// keeps this off by default so ordinary text selection still works;
-    /// when capture is enabled, its right-side scrollbar also receives
-    /// click/drag events.
+    /// True after we have applied the transcript overlay's mouse policy
+    /// to the terminal. Needed because the overlay temporarily overrides
+    /// the main screen's opt-in mouse capture even in alternate-screen mode.
+    overlay_mouse_override_active: bool,
+    /// Whether the overlay currently has drag capture enabled for its
+    /// right-side scrollbar. When false, native terminal selection/copy is
+    /// left available inside the overlay.
+    overlay_mouse_capture: bool,
+    /// Whether the user opted into mouse capture for the main screen.
+    /// The transcript overlay disables mouse reporting so normal text
+    /// selection/copy works there, then restores this setting when it closes.
     mouse_capture: bool,
     exit_hint: Option<String>,
     startup_flushed: bool,
@@ -12855,6 +14058,8 @@ impl TerminalGuard {
             overlay_terminal: None,
             mode,
             overlay_screen_active: false,
+            overlay_mouse_override_active: false,
+            overlay_mouse_capture: false,
             mouse_capture,
             exit_hint: None,
             startup_flushed: false,
@@ -12882,11 +14087,15 @@ impl TerminalGuard {
                 let line = Line::from(vec![
                     Span::styled(
                         "● ",
-                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(crate::render::theme::accent())
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         message,
-                        Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(crate::render::theme::secondary())
+                            .add_modifier(Modifier::BOLD),
                     ),
                 ]);
                 let paragraph =
@@ -12907,6 +14116,7 @@ impl TerminalGuard {
     }
 
     fn draw_app(&mut self, app: &mut TuiApp) -> Result<()> {
+        let overlay_frame = app.transcript_overlay.is_some() || self.overlay_screen_active;
         if app.pending_resize {
             app.pending_resize = false;
             self.wipe_inline_viewport_for_resize()?;
@@ -12918,6 +14128,11 @@ impl TerminalGuard {
         // fullscreen there). Must run BEFORE we borrow the terminal
         // for the draw, because it swaps `self.terminal`.
         self.sync_overlay_screen(app.transcript_overlay.is_some())?;
+        self.sync_overlay_mouse_mode(
+            app.transcript_overlay
+                .as_ref()
+                .map(|state| state.mode.mouse_capture()),
+        )?;
         // After the swap, decide which render path to take. Inline
         // mode + no overlay = `render_inline` (small viewport painted
         // over scrollback). Alt-screen mode OR overlay-screen swap =
@@ -12928,7 +14143,7 @@ impl TerminalGuard {
         if !use_fullscreen_render {
             self.flush_history(app)?;
         }
-        let synchronized = self.synchronized_output;
+        let synchronized = self.synchronized_output && !overlay_frame;
         let terminal = self.term();
         // DEC 2026 Begin Synchronized Update bracket. Writing it through
         // the backend buffer puts it ahead of the cell-diff bytes that
@@ -12936,16 +14151,20 @@ impl TerminalGuard {
         // buffering at parse time and commit the whole frame when they
         // see the matching End Synchronized Update written below.
         // Unsupported terminals silently ignore both sequences.
-        if synchronized {
-            let _ = terminal
+        let begin_outcome = if synchronized {
+            terminal
                 .backend_mut()
-                .write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes());
-        }
+                .write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes())
+        } else {
+            Ok(())
+        };
         // `terminal.draw` returns a value that borrows the terminal,
         // which would block the post-draw `backend_mut` reborrow below.
         // Collapse to `Result<(), io::Error>` immediately so the borrow
         // ends before we reach for the backend again.
-        let draw_outcome: io::Result<()> = if use_fullscreen_render {
+        let draw_outcome: io::Result<()> = if let Err(err) = begin_outcome {
+            Err(err)
+        } else if use_fullscreen_render {
             terminal.draw(|frame| render(frame, app)).map(|_| ())
         } else {
             terminal.draw(|frame| render_inline(frame, app)).map(|_| ())
@@ -12954,12 +14173,18 @@ impl TerminalGuard {
         // not stay parked in a buffered-update state — the spec lets a
         // capable terminal time the bracket out on its own, but closing
         // it promptly keeps the visible frame in sync with our state.
-        if synchronized {
+        let end_outcome = if synchronized {
             let backend = terminal.backend_mut();
-            let _ = backend.write_all(END_SYNCHRONIZED_UPDATE.as_bytes());
-            let _ = backend.flush();
+            backend
+                .write_all(END_SYNCHRONIZED_UPDATE.as_bytes())
+                .and_then(|()| backend.flush())
+        } else {
+            Ok(())
+        };
+        match draw_outcome.and(end_outcome) {
+            Ok(()) => Ok(()),
+            Err(err) => Err(SqueezyError::Terminal(err.to_string())),
         }
-        draw_outcome.map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
 
     /// Reconcile the alt-screen-for-overlay swap state with the
@@ -12987,6 +14212,40 @@ impl TerminalGuard {
             (false, true) => self.enter_overlay_screen(),
             (true, false) => self.leave_overlay_screen(),
             _ => Ok(()),
+        }
+    }
+
+    fn sync_overlay_mouse_mode(&mut self, overlay_mouse_capture: Option<bool>) -> Result<()> {
+        match overlay_mouse_capture {
+            Some(scrollbar_drag) => {
+                if self.overlay_mouse_override_active
+                    && self.overlay_mouse_capture == scrollbar_drag
+                {
+                    return Ok(());
+                }
+                let terminal = self.term();
+                set_transcript_overlay_mouse_mode(terminal.backend_mut(), scrollbar_drag, false)
+                    .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+                self.overlay_mouse_override_active = true;
+                self.overlay_mouse_capture = scrollbar_drag;
+                Ok(())
+            }
+            None => {
+                if !self.overlay_mouse_override_active {
+                    return Ok(());
+                }
+                let restore_main_mouse_capture = self.mouse_capture;
+                let terminal = self.term();
+                set_transcript_overlay_mouse_mode(
+                    terminal.backend_mut(),
+                    false,
+                    restore_main_mouse_capture,
+                )
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+                self.overlay_mouse_override_active = false;
+                self.overlay_mouse_capture = false;
+                Ok(())
+            }
         }
     }
 
@@ -13042,6 +14301,8 @@ impl TerminalGuard {
             leave_transcript_overlay_screen(overlay.backend_mut(), self.mouse_capture)
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         }
+        self.overlay_mouse_override_active = false;
+        self.overlay_mouse_capture = false;
         // The terminal emulator has restored the main buffer. The
         // pre-overlay inline TUI viewport content (input row,
         // status, hint) is still sitting in the bottom rows where
@@ -13147,6 +14408,8 @@ impl Drop for TerminalGuard {
         {
             let _ = leave_transcript_overlay_screen(overlay.backend_mut(), false);
             self.overlay_screen_active = false;
+            self.overlay_mouse_override_active = false;
+            self.overlay_mouse_capture = false;
         }
         // Drop the overlay terminal explicitly so its writer
         // releases stdout before the primary terminal does its
@@ -13240,6 +14503,7 @@ fn inline_history_lines_for_flush(
                     false,
                     app.tool_output_verbosity,
                     Some(width),
+                    ToolCardSurface::Tinted,
                 ));
                 continue;
             }

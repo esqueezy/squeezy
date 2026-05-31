@@ -196,7 +196,7 @@ pub const DEFAULT_TOOL_SPILL_THRESHOLD_BYTES: usize = 25_000;
 pub const DEFAULT_TOOL_PREVIEW_BYTES: usize = 2_000;
 pub const DEFAULT_MAX_TOOL_RESULT_BYTES_PER_ROUND: usize = 50_000;
 pub const DEFAULT_TOOL_OUTPUT_RETENTION_DAYS: u64 = 7;
-pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
+pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 16;
 // Per-turn aggregate budgets across every tool the agent runs in a
 // single turn. These defaults are sized so they never bind in realistic
 // use; users who want strict cost caps can set tighter values in
@@ -239,6 +239,11 @@ pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
 pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 10_000;
 pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 1_000_000_000;
 pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 1_000_000;
+/// Maximum number of subagents that may be active at once for a single
+/// parent Agent. The registry rejects further `start()` calls until an
+/// in-flight subagent finishes (lease drops). Keeps fanout flat and
+/// predictable rather than letting a model spawn an unbounded swarm.
+pub const DEFAULT_SUBAGENT_MAX_CONCURRENT: usize = 20;
 // Last-resort belt on subagent model rounds. 1 000 rounds is well
 // above what real long-running agent sessions reach — by then the
 // `max_session_cost_usd_micros` broker has already capped the
@@ -301,7 +306,7 @@ pub const DEFAULT_SESSION_LOG_RETENTION_DAYS: u64 = 30;
 /// default so an idle workspace keeps roughly 60 days of recoverable
 /// history (30 live + 30 archived) without manual intervention.
 pub const DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS: u64 = 30;
-pub const DEFAULT_SESSION_MAX_EVENT_BYTES: usize = 65_536;
+pub const DEFAULT_SESSION_MAX_EVENT_BYTES: usize = 131_072;
 pub const DEFAULT_SESSION_MAX_SESSION_BYTES: usize = 52_428_800;
 pub const DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES: usize = 1_048_576;
 // Absolute fallback for the per-turn compaction trigger when
@@ -312,16 +317,16 @@ pub const DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES: usize = 1_048_576;
 // unknown-model case.
 pub const DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS: u64 = 60_000;
 pub const DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS: usize = 16;
-pub const DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS: usize = 6;
+pub const DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS: usize = 10;
 pub const DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES: usize = 12_000;
-pub const DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES: usize = 16_384;
-pub const DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES: usize = 8_192;
+pub const DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES: usize = 32_768;
+pub const DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES: usize = 16_384;
 /// Trigger mid-turn compaction once the provider-reported total token usage
 /// reaches this fraction of `model_context_window` (out of 100).
 pub const DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT: u8 = 80;
 /// Max output tokens to request when the model-assisted compaction strategy
 /// is active.
-pub const DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS: u32 = 500;
+pub const DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS: u32 = 1_500;
 /// Timeout for a single model-assisted compaction round-trip. On expiry the
 /// pipeline falls back to the extractive summary.
 pub const DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS: u64 = 30;
@@ -438,6 +443,14 @@ pub struct AppConfig {
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub hardening: HardeningConfig,
     pub config_sources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_warnings: Vec<ConfigWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigWarning {
+    pub source: String,
+    pub field: String,
 }
 
 impl AppConfig {
@@ -464,17 +477,22 @@ impl AppConfig {
     }
 
     pub fn from_settings_path_and_env(path: PathBuf) -> Result<Self> {
-        let (settings, sources) = SettingsFile::load_optional_source(&path, "settings")?;
-        Self::try_from_settings_and_env_vars_with_sources(settings, sources, None, |name| {
-            env::var(name).ok()
-        })
+        let (settings, sources, warnings) = SettingsFile::load_optional_source(&path, "settings")?;
+        Self::try_from_settings_and_env_vars_with_sources_and_warnings(
+            settings,
+            sources,
+            warnings,
+            None,
+            |name| env::var(name).ok(),
+        )
     }
 
     pub fn from_settings_path_and_env_with_provider(path: PathBuf, provider: &str) -> Result<Self> {
-        let (settings, sources) = SettingsFile::load_optional_source(&path, "settings")?;
-        Self::try_from_settings_and_env_vars_with_sources(
+        let (settings, sources, warnings) = SettingsFile::load_optional_source(&path, "settings")?;
+        Self::try_from_settings_and_env_vars_with_sources_and_warnings(
             settings,
             sources,
+            warnings,
             Some(provider),
             |name| env::var(name).ok(),
         )
@@ -525,7 +543,23 @@ impl AppConfig {
 
     fn try_from_settings_and_env_vars_with_sources(
         settings: SettingsFile,
+        sources: Vec<String>,
+        cli_provider: Option<&str>,
+        var: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self> {
+        Self::try_from_settings_and_env_vars_with_sources_and_warnings(
+            settings,
+            sources,
+            Vec::new(),
+            cli_provider,
+            var,
+        )
+    }
+
+    fn try_from_settings_and_env_vars_with_sources_and_warnings(
+        settings: SettingsFile,
         mut sources: Vec<String>,
+        config_warnings: Vec<ConfigWarning>,
         cli_provider: Option<&str>,
         mut var: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self> {
@@ -968,6 +1002,7 @@ impl AppConfig {
             mcp_servers,
             hardening: HardeningConfig::from_settings(settings.hardening.unwrap_or_default()),
             config_sources: sources,
+            config_warnings,
         })
     }
 
@@ -975,14 +1010,18 @@ impl AppConfig {
         provider: Option<&str>,
         profile: Option<&str>,
     ) -> Result<Self> {
-        let (mut settings, mut sources) = load_default_settings_sources()?;
+        let (mut settings, mut sources, warnings) = load_default_settings_sources()?;
         if let Some(name) = profile {
             settings.apply_profile(name)?;
             sources.push(format!("profile:{name}"));
         }
-        Self::try_from_settings_and_env_vars_with_sources(settings, sources, provider, |name| {
-            env::var(name).ok()
-        })
+        Self::try_from_settings_and_env_vars_with_sources_and_warnings(
+            settings,
+            sources,
+            warnings,
+            provider,
+            |name| env::var(name).ok(),
+        )
     }
 
     fn built_in_defaults() -> Self {
@@ -1183,6 +1222,10 @@ impl AppConfig {
         if let Some(model) = &self.subagents.explore_model {
             output.push_str(&format!("explore_model = {}\n", toml_string(model)));
         }
+        output.push_str(&format!(
+            "max_concurrent = {}\n",
+            self.subagents.max_concurrent
+        ));
         output.push_str(&format!(
             "max_tool_calls_per_call = {}\n",
             self.subagents.max_tool_calls_per_call
@@ -1600,10 +1643,7 @@ impl AppConfig {
             "synchronized_output = {}\n",
             toml_string(self.tui.synchronized_output.as_str())
         ));
-        output.push_str(&format!(
-            "theme = {}\n",
-            toml_string(self.tui.theme.as_str())
-        ));
+        output.push_str(&format!("theme = {}\n", toml_string(&self.tui.theme)));
         output.push_str(&format!(
             "show_reasoning_usage = {}\n",
             self.tui.show_reasoning_usage
@@ -1612,6 +1652,25 @@ impl AppConfig {
             "persist_prompt_history = {}\n\n",
             self.tui.persist_prompt_history
         ));
+        for (name, theme) in &self.tui.themes {
+            if theme.colors.is_empty() {
+                continue;
+            }
+            output.push_str(&format!(
+                "[tui.themes.{}.colors]\n",
+                toml_bare_or_quoted_key(name)
+            ));
+            for (token, rgb) in &theme.colors {
+                output.push_str(&format!(
+                    "{} = [{}, {}, {}]\n",
+                    toml_bare_or_quoted_key(token),
+                    rgb[0],
+                    rgb[1],
+                    rgb[2]
+                ));
+            }
+            output.push('\n');
+        }
 
         for (name, server) in &self.mcp_servers {
             output.push_str(&format!(
@@ -2400,31 +2459,24 @@ impl SettingsFile {
         Ok(Self::load_optional_source(path, "settings")?.0)
     }
 
-    fn load_optional_source(path: &Path, label: &str) -> Result<(Self, Vec<String>)> {
+    fn load_optional_source(
+        path: &Path,
+        label: &str,
+    ) -> Result<(Self, Vec<String>, Vec<ConfigWarning>)> {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((Self::default(), vec!["defaults".to_string()]));
+                return Ok((Self::default(), vec!["defaults".to_string()], Vec::new()));
             }
             Err(error) => return Err(error.into()),
         };
-        let settings = Self::from_toml_str(&text, &format!("{label}:{}", path.display()))?;
+        let source = format!("{label}:{}", path.display());
+        let settings = Self::from_toml_str(&text, &source)?;
         let unknowns = take_unknown_fields();
-        if !unknowns.is_empty()
-            && let Err(error) = strip_unknown_fields_from_file(path, &unknowns)
-        {
-            tracing::warn!(
-                path = %path.display(),
-                ?error,
-                "failed to strip unknown fields from settings.toml"
-            );
-        }
         Ok((
             settings,
-            vec![
-                "defaults".to_string(),
-                format!("{label}:{}", path.display()),
-            ],
+            vec!["defaults".to_string(), source.clone()],
+            config_warnings_from_unknown_fields(&source, unknowns),
         ))
     }
 
@@ -3768,6 +3820,7 @@ pub struct SubagentSettings {
     pub enabled: Option<bool>,
     pub explore_enabled: Option<bool>,
     pub explore_model: Option<String>,
+    pub max_concurrent: Option<usize>,
     pub max_tool_calls_per_call: Option<u64>,
     pub max_tool_bytes_read_per_call: Option<u64>,
     pub max_search_files_per_call: Option<u64>,
@@ -3785,6 +3838,7 @@ impl SubagentSettings {
                 "enabled",
                 "explore_enabled",
                 "explore_model",
+                "max_concurrent",
                 "max_tool_calls_per_call",
                 "max_tool_bytes_read_per_call",
                 "max_search_files_per_call",
@@ -3809,6 +3863,12 @@ impl SubagentSettings {
                 "explore_model",
                 source,
                 &field(path, "explore_model"),
+            )?,
+            max_concurrent: usize_value(
+                table,
+                "max_concurrent",
+                source,
+                &field(path, "max_concurrent"),
             )?,
             max_tool_calls_per_call: u64_value(
                 table,
@@ -3859,6 +3919,7 @@ impl SubagentSettings {
         replace_if_some(&mut self.enabled, next.enabled);
         replace_if_some(&mut self.explore_enabled, next.explore_enabled);
         replace_if_some(&mut self.explore_model, next.explore_model);
+        replace_if_some(&mut self.max_concurrent, next.max_concurrent);
         replace_if_some(
             &mut self.max_tool_calls_per_call,
             next.max_tool_calls_per_call,
@@ -3883,6 +3944,7 @@ pub struct SubagentConfig {
     pub enabled: bool,
     pub explore_enabled: bool,
     pub explore_model: Option<String>,
+    pub max_concurrent: usize,
     pub max_tool_calls_per_call: u64,
     pub max_tool_bytes_read_per_call: u64,
     pub max_search_files_per_call: u64,
@@ -3917,6 +3979,15 @@ impl SubagentConfig {
             explore_model: get_var("SQUEEZY_EXPLORE_MODEL")
                 .or(settings.explore_model)
                 .filter(|value| !value.trim().is_empty()),
+            max_concurrent: {
+                let raw = parse_usize(
+                    get_var("SQUEEZY_SUBAGENT_MAX_CONCURRENT"),
+                    settings
+                        .max_concurrent
+                        .unwrap_or(DEFAULT_SUBAGENT_MAX_CONCURRENT),
+                );
+                raw.max(1)
+            },
             max_tool_calls_per_call: parse_u64(
                 get_var("SQUEEZY_SUBAGENT_MAX_TOOL_CALLS_PER_CALL"),
                 settings
@@ -3967,6 +4038,7 @@ impl Default for SubagentConfig {
             enabled: true,
             explore_enabled: true,
             explore_model: None,
+            max_concurrent: DEFAULT_SUBAGENT_MAX_CONCURRENT,
             max_tool_calls_per_call: DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
             max_tool_bytes_read_per_call: DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL,
             max_search_files_per_call: DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
@@ -7015,42 +7087,100 @@ impl TuiSynchronizedOutput {
     }
 }
 
-/// User-controlled palette for the TUI. `System` defers to terminal-tone
-/// detection (`COLORFGBG`); `Dark` and `Light` pin the tone but keep the
-/// default amber/gold accent identity; `Catppuccin` swaps to mauve accents
-/// on a dark background; `HighContrast` pins a light tone with a black/
-/// yellow accent profile for accessibility-strict configs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TuiTheme {
-    System,
-    Dark,
-    Light,
-    Catppuccin,
-    HighContrast,
+pub const DEFAULT_TUI_THEME_NAME: &str = "default";
+
+pub const BUILTIN_TUI_THEME_NAMES: &[&str] =
+    &["default", "bright", "fun", "catppuccin", "high-contrast"];
+
+pub const TUI_THEME_COLOR_TOKENS: &[&str] = &[
+    "palette.accent",
+    "palette.secondary",
+    "palette.red",
+    "palette.green",
+    "palette.yellow",
+    "palette.blue",
+    "palette.magenta",
+    "palette.cyan",
+    "ui.background",
+    "ui.foreground",
+    "ui.border",
+    "ui.muted",
+    "ui.quiet",
+    "ui.footer",
+    "ui.surface",
+    "ui.prompt_bg",
+    "syntax.keyword",
+    "syntax.string",
+    "syntax.comment",
+    "syntax.literal",
+    "syntax.function",
+    "syntax.type",
+    "syntax.operator",
+    "syntax.variable",
+    "status.ok",
+    "status.warn",
+    "status.err",
+    "status.info",
+    "transcript.user",
+    "transcript.assistant",
+    "transcript.tool",
+    "transcript.system",
+    "diff.added",
+    "diff.removed",
+    "diff.added_bg",
+    "diff.removed_bg",
+    "diff.context",
+    "diff.hunk",
+    "effects.shimmer",
+    "separator.primary",
+    "inline.code",
+    "inline.model",
+    "path.hint",
+];
+
+pub type TuiRgb = [u8; 3];
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuiThemeSettings {
+    pub colors: BTreeMap<String, TuiRgb>,
 }
 
-impl TuiTheme {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::Dark => "dark",
-            Self::Light => "light",
-            Self::Catppuccin => "catppuccin",
-            Self::HighContrast => "high-contrast",
+impl TuiThemeSettings {
+    fn merge(&mut self, next: Self) {
+        for (token, rgb) in next.colors {
+            self.colors.insert(token, rgb);
         }
     }
+}
 
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "system" | "auto" => Some(Self::System),
-            "dark" => Some(Self::Dark),
-            "light" => Some(Self::Light),
-            "catppuccin" | "mauve" => Some(Self::Catppuccin),
-            "high-contrast" | "high_contrast" | "highcontrast" | "hc" => Some(Self::HighContrast),
-            _ => None,
-        }
-    }
+pub fn normalize_tui_theme_name(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    let canonical = match normalized.as_str() {
+        "system" | "auto" | "dark" => DEFAULT_TUI_THEME_NAME,
+        "light" => "bright",
+        "mauve" => "catppuccin",
+        "highcontrast" | "hc" => "high-contrast",
+        other if is_valid_tui_theme_name(other) => other,
+        _ => return None,
+    };
+    Some(canonical.to_string())
+}
+
+pub fn is_builtin_tui_theme_name(value: &str) -> bool {
+    BUILTIN_TUI_THEME_NAMES.contains(&value)
+}
+
+pub fn is_tui_theme_color_token(value: &str) -> bool {
+    TUI_THEME_COLOR_TOKENS.contains(&value)
+}
+
+pub fn is_valid_tui_theme_name(value: &str) -> bool {
+    let len = value.len();
+    len > 0
+        && len <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
 /// Off-screen notification surface for turn-complete and approval-pending
@@ -7114,8 +7244,12 @@ pub struct TuiConfig {
     /// Color status-line items with their accent palette.
     /// Defaults to `true`.
     pub status_line_use_colors: bool,
-    /// Palette tone preference. `System` defers to terminal detection.
-    pub theme: TuiTheme,
+    /// Active named TUI theme. Builtins are `default`, `bright`, `fun`,
+    /// `catppuccin`, and `high-contrast`; user settings may add more names.
+    pub theme: String,
+    /// User-defined or overridden theme colors, merged through the normal
+    /// settings precedence chain.
+    pub themes: BTreeMap<String, TuiThemeSettings>,
     /// Off-screen attention surface (OSC 9 desktop notification / BEL).
     /// Fires on turn-complete and approval-pending; default `Off`.
     pub desktop_notifications: NotificationMethod,
@@ -7162,7 +7296,10 @@ impl TuiConfig {
             coalesce_tool_runs: settings.coalesce_tool_runs.unwrap_or(true),
             status_line: settings.status_line,
             status_line_use_colors: settings.status_line_use_colors.unwrap_or(true),
-            theme: settings.theme.unwrap_or(TuiTheme::System),
+            theme: settings
+                .theme
+                .unwrap_or_else(|| DEFAULT_TUI_THEME_NAME.to_string()),
+            themes: settings.themes.unwrap_or_default(),
             desktop_notifications: settings
                 .desktop_notifications
                 .unwrap_or(NotificationMethod::Off),
@@ -7192,7 +7329,8 @@ pub struct TuiSettings {
     pub coalesce_tool_runs: Option<bool>,
     pub status_line: Option<Vec<String>>,
     pub status_line_use_colors: Option<bool>,
-    pub theme: Option<TuiTheme>,
+    pub theme: Option<String>,
+    pub themes: Option<BTreeMap<String, TuiThemeSettings>>,
     pub desktop_notifications: Option<NotificationMethod>,
     pub persist_prompt_history: Option<bool>,
     pub keymap: Option<BTreeMap<String, String>>,
@@ -7216,6 +7354,7 @@ impl TuiSettings {
                 "status_line",
                 "status_line_use_colors",
                 "theme",
+                "themes",
                 "desktop_notifications",
                 "persist_prompt_history",
                 "keymap",
@@ -7287,6 +7426,7 @@ impl TuiSettings {
                 &field(path, "status_line_use_colors"),
             )?,
             theme: tui_theme_value(table, "theme", source, &field(path, "theme"))?,
+            themes: tui_themes_value(table, "themes", source, &field(path, "themes"))?,
             desktop_notifications: notification_method_value(
                 table,
                 "desktop_notifications",
@@ -7324,6 +7464,7 @@ impl TuiSettings {
             next.status_line_use_colors,
         );
         replace_if_some(&mut self.theme, next.theme);
+        merge_option(&mut self.themes, next.themes, merge_tui_theme_maps);
         replace_if_some(&mut self.desktop_notifications, next.desktop_notifications);
         replace_if_some(
             &mut self.persist_prompt_history,
@@ -7541,6 +7682,7 @@ pub fn user_settings_template() -> &'static str {
 # enabled = true
 # explore_enabled = true
 # explore_model = "gpt-5-nano" # optional cheap model override for the current provider
+# max_concurrent = 4           # maximum parallel subagents per parent agent
 # max_tool_calls_per_call = 24
 # max_tool_bytes_read_per_call = 8388608
 # max_search_files_per_call = 2000
@@ -7757,6 +7899,7 @@ pub fn project_settings_template() -> &'static str {
 # enabled = true
 # explore_enabled = true
 # explore_model = "gpt-5-nano" # optional cheap model override for the current provider
+# max_concurrent = 4           # maximum parallel subagents per parent agent
 # max_tool_calls_per_call = 24
 # max_tool_bytes_read_per_call = 8388608
 # max_search_files_per_call = 2000
@@ -7858,7 +8001,7 @@ pub fn project_settings_template() -> &'static str {
 "#
 }
 
-fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>)> {
+fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>, Vec<ConfigWarning>)> {
     let user_path = default_settings_path();
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_path = find_project_settings_path(&cwd);
@@ -8005,9 +8148,10 @@ fn load_settings_from_paths(
     user_path: Option<&Path>,
     project_path: Option<&Path>,
     repo_path: Option<&Path>,
-) -> Result<(SettingsFile, Vec<String>)> {
+) -> Result<(SettingsFile, Vec<String>, Vec<ConfigWarning>)> {
     let mut settings = SettingsFile::default();
     let mut sources = vec!["defaults".to_string()];
+    let mut warnings = Vec::new();
     for (path, label) in [
         (user_path, "user"),
         (project_path, "project"),
@@ -8017,24 +8161,14 @@ fn load_settings_from_paths(
         if !path.is_file() {
             continue;
         }
-        let parsed = SettingsFile::from_toml_str(
-            &fs::read_to_string(path)?,
-            &format!("{label}:{}", path.display()),
-        )?;
+        let source = format!("{label}:{}", path.display());
+        let parsed = SettingsFile::from_toml_str(&fs::read_to_string(path)?, &source)?;
         let unknowns = take_unknown_fields();
-        if !unknowns.is_empty()
-            && let Err(error) = strip_unknown_fields_from_file(path, &unknowns)
-        {
-            tracing::warn!(
-                path = %path.display(),
-                ?error,
-                "failed to strip unknown fields from settings.toml"
-            );
-        }
         settings.merge(parsed);
-        sources.push(format!("{label}:{}", path.display()));
+        sources.push(source.clone());
+        warnings.extend(config_warnings_from_unknown_fields(&source, unknowns));
     }
-    Ok((settings, sources))
+    Ok((settings, sources, warnings))
 }
 
 fn provider_setting(
@@ -8670,8 +8804,8 @@ fn parse_profiles_map(
 thread_local! {
     /// Dotted paths of unknown fields seen during the most recent
     /// `SettingsFile::from_toml_str` call. The file loader clears this
-    /// before parsing and drains it afterwards to rewrite the source
-    /// without the dead keys.
+    /// before parsing and drains it afterwards so the app can warn the
+    /// user without rejecting or rewriting the settings file.
     static UNKNOWN_FIELDS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -8683,8 +8817,8 @@ fn reject_unknown_keys(
 ) -> Result<()> {
     // Pre-1.0 the schema is still moving; silently ignoring renamed or
     // removed fields lets users keep their old settings.toml around while
-    // we iterate. The loader uses `UNKNOWN_FIELDS` to rewrite the source
-    // file without the dead keys after each load.
+    // we iterate. The loader records `UNKNOWN_FIELDS` so startup can show
+    // a warning in the transcript.
     for key in table.keys() {
         if !allowed.iter().any(|allowed| key == allowed) {
             let field_path = field(path, key);
@@ -8699,47 +8833,14 @@ fn take_unknown_fields() -> Vec<String> {
     UNKNOWN_FIELDS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
-fn strip_unknown_fields_from_file(path: &Path, dotted_paths: &[String]) -> std::io::Result<()> {
-    let text = fs::read_to_string(path)?;
-    let mut doc: toml_edit::DocumentMut = match text.parse() {
-        Ok(doc) => doc,
-        Err(error) => {
-            tracing::warn!(
-                path = %path.display(),
-                ?error,
-                "could not re-parse settings.toml for cleanup; leaving file untouched"
-            );
-            return Ok(());
-        }
-    };
-    let mut changed = false;
-    for dotted in dotted_paths {
-        if remove_dotted_path(doc.as_table_mut(), dotted) {
-            changed = true;
-        }
-    }
-    if changed {
-        fs::write(path, doc.to_string())?;
-    }
-    Ok(())
-}
-
-fn remove_dotted_path(root: &mut toml_edit::Table, dotted: &str) -> bool {
-    let mut parts = dotted.split('.').collect::<Vec<_>>();
-    let Some(last) = parts.pop() else {
-        return false;
-    };
-    let mut current: &mut toml_edit::Table = root;
-    for segment in &parts {
-        let next = current
-            .get_mut(segment)
-            .and_then(|item| item.as_table_mut());
-        match next {
-            Some(table) => current = table,
-            None => return false,
-        }
-    }
-    current.remove(last).is_some()
+fn config_warnings_from_unknown_fields(source: &str, fields: Vec<String>) -> Vec<ConfigWarning> {
+    fields
+        .into_iter()
+        .map(|field| ConfigWarning {
+            source: source.to_string(),
+            field,
+        })
+        .collect()
 }
 
 fn optional_table<'a>(
@@ -9500,15 +9601,109 @@ fn tui_theme_value(
     key: &str,
     source: &str,
     path: &str,
-) -> Result<Option<TuiTheme>> {
+) -> Result<Option<String>> {
     let Some(value) = string_value(table, key, source, path)? else {
         return Ok(None);
     };
-    TuiTheme::parse(&value).map(Some).ok_or_else(|| {
+    normalize_tui_theme_name(&value).map(Some).ok_or_else(|| {
         SqueezyError::Config(format!(
-            "{source}: {path}: invalid TUI theme {value:?}; expected system, dark, or light"
+            "{source}: {path}: invalid TUI theme {value:?}; expected a theme slug"
         ))
     })
+}
+
+fn tui_themes_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<BTreeMap<String, TuiThemeSettings>>> {
+    let Some(value) = table.get(key) else {
+        return Ok(None);
+    };
+    let themes = value
+        .as_table()
+        .ok_or_else(|| type_error(source, path, "table"))?;
+    let mut out = BTreeMap::new();
+    for (raw_name, value) in themes {
+        let name = normalize_tui_theme_name(raw_name).ok_or_else(|| {
+            SqueezyError::Config(format!(
+                "{source}: {path}.{raw_name}: invalid TUI theme name"
+            ))
+        })?;
+        let theme_table = value
+            .as_table()
+            .ok_or_else(|| type_error(source, &field(path, raw_name), "table"))?;
+        reject_unknown_keys(theme_table, &["colors"], source, &field(path, raw_name))?;
+        let Some(colors_value) = theme_table.get("colors") else {
+            out.insert(name, TuiThemeSettings::default());
+            continue;
+        };
+        let colors_table = colors_value
+            .as_table()
+            .ok_or_else(|| type_error(source, &field(&field(path, raw_name), "colors"), "table"))?;
+        let mut colors = BTreeMap::new();
+        collect_tui_theme_colors(
+            colors_table,
+            None,
+            source,
+            &field(&field(path, raw_name), "colors"),
+            &mut colors,
+        )?;
+        out.insert(name, TuiThemeSettings { colors });
+    }
+    Ok(Some(out))
+}
+
+fn collect_tui_theme_colors(
+    table: &toml::value::Table,
+    prefix: Option<&str>,
+    source: &str,
+    path: &str,
+    out: &mut BTreeMap<String, TuiRgb>,
+) -> Result<()> {
+    for (key, color_value) in table {
+        let token = match prefix {
+            Some(prefix) => format!("{prefix}.{key}"),
+            None => key.to_string(),
+        };
+        let token_path = field(path, key);
+        if let Some(child) = color_value.as_table() {
+            collect_tui_theme_colors(child, Some(&token), source, &token_path, out)?;
+            continue;
+        }
+        if !is_tui_theme_color_token(&token) {
+            return Err(SqueezyError::Config(format!(
+                "{source}: {token_path}: unknown TUI theme color token {token:?}"
+            )));
+        }
+        out.insert(token, rgb_array_value(color_value, source, &token_path)?);
+    }
+    Ok(())
+}
+
+fn rgb_array_value(value: &toml::Value, source: &str, path: &str) -> Result<TuiRgb> {
+    let array = value
+        .as_array()
+        .ok_or_else(|| type_error(source, path, "RGB array"))?;
+    if array.len() != 3 {
+        return Err(SqueezyError::Config(format!(
+            "{source}: {path}: expected RGB array with exactly 3 integers"
+        )));
+    }
+    let mut rgb = [0u8; 3];
+    for (idx, item) in array.iter().enumerate() {
+        let Some(value) = item.as_integer() else {
+            return Err(type_error(source, path, "RGB integer"));
+        };
+        let Ok(channel) = u8::try_from(value) else {
+            return Err(SqueezyError::Config(format!(
+                "{source}: {path}: RGB channel {value} is outside 0..=255"
+            )));
+        };
+        rgb[idx] = channel;
+    }
+    Ok(rgb)
 }
 
 fn notification_method_value(
@@ -9643,6 +9838,18 @@ fn merge_provider_maps(
             .entry(name)
             .and_modify(|existing| existing.merge(provider.clone()))
             .or_insert(provider);
+    }
+}
+
+fn merge_tui_theme_maps(
+    target: &mut BTreeMap<String, TuiThemeSettings>,
+    next: BTreeMap<String, TuiThemeSettings>,
+) {
+    for (name, theme) in next {
+        target
+            .entry(name)
+            .and_modify(|existing| existing.merge(theme.clone()))
+            .or_insert(theme);
     }
 }
 

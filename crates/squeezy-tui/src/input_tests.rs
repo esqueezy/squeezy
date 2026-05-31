@@ -130,11 +130,7 @@ fn purely_informational_slash_commands_declare_no_capabilities() {
         "/pins",
         "/pin",
         "/unpin",
-        "/expand",
-        "/collapse",
         "/copy",
-        "/attachments",
-        "/detach",
         "/plan",
         "/build",
     ] {
@@ -144,6 +140,12 @@ fn purely_informational_slash_commands_declare_no_capabilities() {
             find_command(name).capabilities,
         );
     }
+}
+
+#[test]
+fn legacy_attachment_commands_are_hidden_from_slash_menu() {
+    assert!(!SLASH_COMMANDS.iter().any(|cmd| cmd.name == "/attachments"));
+    assert!(!SLASH_COMMANDS.iter().any(|cmd| cmd.name == "/detach"));
 }
 
 #[test]
@@ -201,26 +203,19 @@ fn slash_suggestions_match_substring_not_just_prefix() {
 #[test]
 fn slash_suggestions_orders_prefix_matches_before_fuzzy_matches() {
     // `/co` should list prefix matches (`/config`, `/cost`, `/copy`,
-    // `/collapse`, `/compact`, `/context`) before subsequence-only hits.
+    // `/compact`, `/context`) before subsequence-only hits.
     // `/options` is a hidden compatibility alias, so it must not duplicate
     // the visible settings command in the menu.
     let names = slash_suggestions("/co")
         .into_iter()
         .map(|cmd| cmd.name)
         .collect::<Vec<_>>();
-    let first_six: Vec<&str> = names.iter().take(6).copied().collect();
-    let mut expected = vec![
-        "/collapse",
-        "/compact",
-        "/config",
-        "/context",
-        "/copy",
-        "/cost",
-    ];
+    let first_five: Vec<&str> = names.iter().take(5).copied().collect();
+    let mut expected = vec!["/compact", "/config", "/context", "/copy", "/cost"];
     expected.sort();
-    let mut got = first_six.clone();
+    let mut got = first_five.clone();
     got.sort();
-    assert_eq!(got, expected, "first six should be /co* prefix hits");
+    assert_eq!(got, expected, "first five should be /co* prefix hits");
     assert!(
         !names.contains(&"/options"),
         "/options should not be suggested alongside /config"
@@ -230,4 +225,48 @@ fn slash_suggestions_orders_prefix_matches_before_fuzzy_matches() {
 #[test]
 fn slash_suggestions_returns_no_matches_for_unrelated_input() {
     assert!(slash_suggestions("/zzz").is_empty());
+}
+
+#[test]
+fn slash_suggestions_mid_prompt_only_show_inline_commands() {
+    let names = slash_suggestions("please /")
+        .into_iter()
+        .map(|cmd| cmd.name)
+        .collect::<Vec<_>>();
+
+    for expected in ["/attach", "/build", "/help", "/plan"] {
+        assert!(
+            names.contains(&expected),
+            "expected inline command {expected} in {names:?}"
+        );
+    }
+    for prefix_only in ["/config", "/cost", "/model", "/theme"] {
+        assert!(
+            !names.contains(&prefix_only),
+            "prefix-only command {prefix_only} should not appear mid-prompt: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn inline_dispatch_ignores_prefix_only_commands() {
+    assert_eq!(
+        find_inline_slash_dispatch_command("please /plan the refactor")
+            .map(|occurrence| occurrence.command.name),
+        Some("/plan")
+    );
+    assert!(
+        find_inline_slash_dispatch_command("please /cost").is_none(),
+        "/cost remains a start-only command"
+    );
+}
+
+#[test]
+fn slash_command_ranges_highlight_inline_commands_only() {
+    assert_eq!(
+        slash_command_ranges("please /attach Cargo.toml"),
+        vec![(7, 14)]
+    );
+    assert!(slash_command_ranges("please /cost").is_empty());
+    assert_eq!(slash_command_ranges("/cost"), vec![(0, 5)]);
 }

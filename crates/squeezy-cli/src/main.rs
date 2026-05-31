@@ -4,6 +4,7 @@ use std::{
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -532,7 +533,9 @@ async fn main() -> squeezy_core::Result<()> {
     }
 
     if should_run_startup_model_selector(&cli, &config)? {
-        run_startup_model_selector(&config).await?;
+        if !run_startup_model_selector(&config).await? {
+            return Ok(());
+        }
         config = config_from_cli(&cli)?;
     }
 
@@ -540,7 +543,7 @@ async fn main() -> squeezy_core::Result<()> {
 
     show_telemetry_notice_once(&config);
     let telemetry = TelemetryClient::from_config(&config);
-    telemetry.record(TelemetryEvent::app_started(&config)).await;
+    telemetry.spawn(TelemetryEvent::app_started(&config));
 
     let provider = provider_from_app_config(&config);
     // Resolve `--session <prefix>` against the on-disk session store
@@ -589,7 +592,7 @@ async fn main() -> squeezy_core::Result<()> {
         let store = SessionStore::open(&config);
         if !confirm_cross_project_resume_stdio(&store, id, cli.force_cross_project)? {
             println!("resume cancelled");
-            let _ = telemetry.flush().await;
+            flush_telemetry_best_effort(&telemetry).await;
             return Ok(());
         }
         Some(id.to_string())
@@ -636,15 +639,13 @@ async fn main() -> squeezy_core::Result<()> {
             resume_resolution.session_id,
         )
         .await;
-        let _ = telemetry.flush().await;
+        flush_telemetry_best_effort(&telemetry).await;
         return result;
     }
 
-    // Best-effort update probe before the TUI takes over the terminal. The
-    // helper consults a 24h cache, so this is a no-op HTTP-wise on most
-    // startups; the banner stays quiet unless GitHub reports a new release
-    // we haven't already nagged the user about.
-    let update_banner = update::banner_for_startup(&update::check_for_update().await);
+    // Never block first paint on network I/O. Startup may show a cached update
+    // banner, while live update probing remains available through `doctor`.
+    let update_banner = update::cached_banner_for_startup();
     let resume_session_id = resume_session_id_opt;
     let skip_resume_picker = cli.no_resume_picker || resume_session_id.is_some();
     let result = squeezy_tui::run_with_startup_profile(
@@ -659,8 +660,12 @@ async fn main() -> squeezy_core::Result<()> {
         },
     )
     .await;
-    let _ = telemetry.flush().await;
+    flush_telemetry_best_effort(&telemetry).await;
     result
+}
+
+async fn flush_telemetry_best_effort(telemetry: &TelemetryClient) {
+    let _ = tokio::time::timeout(Duration::from_millis(250), telemetry.flush()).await;
 }
 
 fn config_from_cli(cli: &Cli) -> squeezy_core::Result<AppConfig> {
@@ -1655,10 +1660,13 @@ impl ModelSelectionState {
         self.selection_version = self.selection_version.max(next.selection_version);
     }
 
+    fn configured(&self) -> bool {
+        self.provider && self.model
+    }
+
+    #[cfg(test)]
     fn complete(self) -> bool {
-        self.provider
-            && self.model
-            && self.selection_version.unwrap_or(0) >= MODEL_SELECTION_VERSION
+        self.configured() && self.selection_version.unwrap_or(0) >= MODEL_SELECTION_VERSION
     }
 }
 
@@ -1697,7 +1705,7 @@ fn should_run_startup_model_selector(cli: &Cli, config: &AppConfig) -> squeezy_c
     {
         return Ok(false);
     }
-    Ok(!current_model_selection_state(&config.workspace_root)?.complete())
+    Ok(!current_model_selection_state(&config.workspace_root)?.configured())
 }
 
 fn current_model_selection_state(
@@ -1742,7 +1750,7 @@ fn model_selection_state(settings: &SettingsFile) -> ModelSelectionState {
     }
 }
 
-async fn run_startup_model_selector(config: &AppConfig) -> squeezy_core::Result<()> {
+async fn run_startup_model_selector(config: &AppConfig) -> squeezy_core::Result<bool> {
     let settings_path = default_settings_path();
     let choices = detect_provider_choices(config).await;
     if choices.is_empty() {
@@ -1752,53 +1760,45 @@ async fn run_startup_model_selector(config: &AppConfig) -> squeezy_core::Result<
         ));
     }
 
-    eprintln!(
-        "Squeezy will save your provider, model, and supported model options to {} and use them as defaults for future sessions.",
-        settings_path.display()
-    );
-    eprintln!("No API key values will be written; only environment variable names are saved.");
-
-    let provider_index = prompt_choice(
-        "Choose provider/token:",
-        choices.iter().map(|choice| choice.label.as_str()),
-    )?;
-    let provider = &choices[provider_index];
-    let model_index = prompt_choice(
-        "Choose model:",
-        provider.models.iter().map(|model| model.as_str()),
-    )?;
-    let model = parse_model_choice_id(&provider.models[model_index]);
-    let reasoning_effort = if capabilities_for(provider.provider, &model)
-        .is_some_and(|capabilities| capabilities.reasoning_effort)
-    {
-        let efforts = [
-            ReasoningEffort::Low,
-            ReasoningEffort::Medium,
-            ReasoningEffort::High,
-            ReasoningEffort::XHigh,
-        ];
-        let effort_index = prompt_choice(
-            "Choose reasoning effort:",
-            efforts.iter().map(|effort| effort.as_str()),
-        )?;
-        Some(efforts[effort_index])
-    } else {
-        None
+    let picker_choices = choices
+        .iter()
+        .map(|choice| squeezy_tui::StartupModelPickerProvider {
+            label: choice.label.clone(),
+            models: choice
+                .models
+                .iter()
+                .map(|model| {
+                    let model_id = parse_model_choice_id(model);
+                    squeezy_tui::StartupModelPickerModel {
+                        label: model.clone(),
+                        reasoning_effort: capabilities_for(choice.provider, &model_id)
+                            .is_some_and(|capabilities| capabilities.reasoning_effort),
+                    }
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let Some(picked) =
+        squeezy_tui::pick_startup_model_selection(config, &settings_path, picker_choices)?
+    else {
+        return Ok(false);
     };
-
+    let provider = choices
+        .get(picked.provider_index)
+        .ok_or_else(|| SqueezyError::Config("startup provider selection out of range".into()))?;
+    let model_choice = provider
+        .models
+        .get(picked.model_index)
+        .ok_or_else(|| SqueezyError::Config("startup model selection out of range".into()))?;
     let selection = StartupModelSelection {
         provider: provider.provider,
-        model,
+        model: parse_model_choice_id(model_choice),
         api_key_env: provider.api_key_env.clone(),
         base_url: provider.base_url.clone(),
-        reasoning_effort,
+        reasoning_effort: picked.reasoning_effort,
     };
     save_startup_model_selection(&settings_path, &selection)?;
-    eprintln!(
-        "Saved provider/model defaults to {}. Edit that file to change them later.",
-        settings_path.display()
-    );
-    Ok(())
+    Ok(true)
 }
 
 async fn detect_provider_choices(_config: &AppConfig) -> Vec<ProviderChoice> {
@@ -2041,37 +2041,6 @@ fn parse_model_choice_id(choice: &str) -> String {
         .map(|(id, _)| id)
         .unwrap_or(choice)
         .to_string()
-}
-
-fn prompt_choice<'a>(
-    prompt: &str,
-    choices: impl IntoIterator<Item = &'a str>,
-) -> squeezy_core::Result<usize> {
-    let choices = choices.into_iter().collect::<Vec<_>>();
-    if choices.is_empty() {
-        return Err(SqueezyError::Config(format!(
-            "{prompt} no choices available"
-        )));
-    }
-    loop {
-        eprintln!("\n{prompt}");
-        for (index, choice) in choices.iter().enumerate() {
-            eprintln!("  {}. {}", index + 1, choice);
-        }
-        eprint!("Enter choice number: ");
-        io::stderr().flush()?;
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        if let Ok(index) = answer.trim().parse::<usize>()
-            && (1..=choices.len()).contains(&index)
-        {
-            return Ok(index - 1);
-        }
-        eprintln!(
-            "Invalid choice; enter a number from 1 to {}.",
-            choices.len()
-        );
-    }
 }
 
 fn save_startup_model_selection(

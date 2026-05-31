@@ -14,8 +14,8 @@ use squeezy_core::{
     AppConfig, CompactionStrategy, ContextAttachmentKind, ContextCompactionConfig,
     ContextCompactionState, ContextCompactionTrigger, CostSnapshot, PermissionAction,
     PermissionCapability, PermissionMode, PermissionPolicy, PermissionRequest, PermissionRisk,
-    PermissionRuleSource, Result, SessionLogConfig, SessionMode, ShellSandboxMode, SkillsConfig,
-    SubagentConfig, TaskStateStatus,
+    PermissionRuleSource, ResponseVerbosity, Result, SessionLogConfig, SessionMode,
+    ShellSandboxMode, SkillsConfig, SubagentConfig, TaskStateStatus,
 };
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
@@ -909,6 +909,49 @@ async fn pasted_png_bytes_route_into_llm_image_input_item() {
     };
     assert_eq!(media_type, "image/png");
     assert_eq!(bytes.as_ref(), png.as_slice());
+}
+
+#[tokio::test]
+async fn transient_turn_image_items_do_not_persist_as_context_attachments() {
+    let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
+        response_id: Some("resp_1".to_string()),
+        cost: CostSnapshot::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })]]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+    let mut png = Vec::new();
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    png.extend_from_slice(b"inline-turn-image");
+
+    let mut rx = agent.start_turn_with_display_input(
+        "describe [Image shot.png]".to_string(),
+        "describe [Image shot.png]".to_string(),
+        vec![LlmInputItem::Image {
+            media_type: "image/png".to_string(),
+            bytes: Arc::from(png.clone().into_boxed_slice()),
+        }],
+        CancellationToken::new(),
+        ResponseVerbosity::Normal,
+    );
+    let mut displayed_user = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::UserMessage { message, .. } = event {
+            displayed_user = Some(message.content);
+        }
+    }
+
+    assert_eq!(displayed_user.as_deref(), Some("describe [Image shot.png]"));
+    assert!(agent.context_attachments_snapshot().await.is_empty());
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .input
+            .iter()
+            .any(|item| matches!(item, LlmInputItem::Image { .. })),
+        "request should include transient image input"
+    );
 }
 
 #[tokio::test]
@@ -5349,6 +5392,62 @@ async fn subagent_concurrency_cap_emits_rejected_event() {
 }
 
 #[tokio::test]
+async fn subagent_max_concurrent_override_is_honored_by_executor() {
+    const OVERRIDE_CAP: usize = 6;
+    assert_ne!(OVERRIDE_CAP, SUBAGENT_MAX_CONCURRENT);
+
+    let provider = Arc::new(OneDelegateProvider::new());
+    let config = AppConfig {
+        subagents: SubagentConfig {
+            max_concurrent: OVERRIDE_CAP,
+            ..SubagentConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+
+    let registry = agent.subagent_registry_for_test();
+    let cancel = CancellationToken::new();
+    let mut leases = Vec::new();
+    for slot in 0..OVERRIDE_CAP {
+        leases.push(
+            registry
+                .start(
+                    roles::SubagentRole::Explorer,
+                    cancel.child_token(),
+                    OVERRIDE_CAP,
+                    format!("pre-saturate {slot}"),
+                )
+                .expect("under-cap start"),
+        );
+    }
+
+    let mut rx = agent.start_turn("delegate now".to_string(), cancel.clone());
+    let mut rejection: Option<(SubagentRejectionReason, usize, usize)> = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::SubagentRejected {
+                reason,
+                limit,
+                active,
+                ..
+            } => {
+                rejection = Some((reason, limit, active));
+            }
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+    drop(leases);
+
+    let (reason, limit, active) =
+        rejection.expect("expected a SubagentRejected event when the cap is full");
+    assert_eq!(reason, SubagentRejectionReason::ConcurrencyCap);
+    assert_eq!(limit, OVERRIDE_CAP);
+    assert_eq!(active, OVERRIDE_CAP);
+}
+
+#[tokio::test]
 async fn compact_with_strategy_falls_back_to_extractive_when_hanging_provider_times_out() {
     use squeezy_core::Redactor;
     use std::sync::Arc;
@@ -7779,8 +7878,6 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
             "plans",
         ),
         (DispatchCommand::Copy { target: None }, "copy"),
-        (DispatchCommand::Collapse { category: None }, "collapse"),
-        (DispatchCommand::Expand { category: None }, "expand"),
         (
             DispatchCommand::Feedback {
                 args: String::new(),
@@ -7801,7 +7898,7 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
         ),
         (
             DispatchCommand::Theme {
-                theme: "dark".to_string(),
+                theme: Some("dark".to_string()),
             },
             "theme",
         ),
@@ -8552,4 +8649,38 @@ async fn maybe_retry_graph_indexing_skips_when_cancelled_before_sleep() {
     .await;
     assert_eq!(executor_calls.load(std::sync::atomic::Ordering::SeqCst), 0,);
     assert_eq!(observed.content, initial.content);
+}
+
+#[test]
+fn attachment_shape_excludes_removed_stored_bytes() {
+    fn make(id: &str, status: ContextAttachmentStatus, bytes: usize) -> ContextAttachment {
+        ContextAttachment {
+            id: id.to_string(),
+            source: ContextAttachmentSource::Paste,
+            kind: ContextAttachmentKind::Text,
+            status,
+            label: id.to_string(),
+            path: None,
+            original_sha256: String::new(),
+            redacted_sha256: None,
+            original_bytes: bytes,
+            stored_bytes: bytes,
+            preview_bytes: 0,
+            redactions: 0,
+            preview: String::new(),
+            truncated: false,
+            image_media_type: None,
+            image_data_base64: None,
+        }
+    }
+
+    let attachments = vec![
+        make("a", ContextAttachmentStatus::Attached, 1000),
+        make("b", ContextAttachmentStatus::Removed, 500),
+    ];
+    let shape = attachment_shape(&attachments);
+    assert_eq!(shape.stored_bytes, 1000);
+    assert_eq!(shape.active, 1);
+    assert_eq!(shape.removed, 1);
+    assert_eq!(shape.total, 2);
 }

@@ -1,8 +1,8 @@
 //! Status-bar items, accent grouping, and styled-line renderer.
 //!
-//! Each item is an opt-in segment a user can enable through `/statusline`.
-//! Items are grouped into [`StatusLineAccent`] families so the configured
-//! list paints with a consistent color vocabulary across enabled items.
+//! Each item is a segment in the built-in or user-configured status line.
+//! Items are grouped into [`StatusLineAccent`] families so the rendered list
+//! paints with a consistent color vocabulary across enabled items.
 //!
 //! The legacy `render_status_details` plain-text path is kept for tests and
 //! for the historical verbose detail line that fires when no
@@ -13,7 +13,6 @@ use std::str::FromStr;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::render::palette::{ACCENT_CYAN, ACCENT_GREEN, ACCENT_MAGENTA, AMBER};
 use crate::{TuiApp, compact_text, context_window_pct};
 
 /// Separator drawn between rendered items.
@@ -300,11 +299,11 @@ impl StatusLineAccent {
         }
     }
 
-    pub(crate) const fn fallback_color(self) -> Color {
+    pub(crate) fn fallback_color(self) -> Color {
         match self {
-            Self::Model | Self::State | Self::Metadata | Self::Mode => ACCENT_CYAN,
-            Self::Path | Self::Usage | Self::Progress => ACCENT_GREEN,
-            Self::Branch | Self::Limit | Self::Thread => ACCENT_MAGENTA,
+            Self::Model | Self::State | Self::Metadata | Self::Mode => crate::render::theme::cyan(),
+            Self::Path | Self::Usage | Self::Progress => crate::render::theme::green(),
+            Self::Branch | Self::Limit | Self::Thread => crate::render::theme::magenta(),
         }
     }
 }
@@ -331,7 +330,7 @@ pub(crate) fn render_status_detail_line(
         }
         let mut style = if use_theme_colors {
             let color = if matches!(*item, StatusLineItem::Languages) {
-                AMBER
+                crate::render::theme::accent()
             } else {
                 StatusLineAccent::for_item(*item).fallback_color()
             };

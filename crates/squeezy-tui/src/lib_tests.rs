@@ -38,6 +38,40 @@ fn app_starts_ready_with_empty_transcript() {
 }
 
 #[test]
+fn app_starts_with_unknown_config_warnings_in_transcript() {
+    let mut config = test_config(SessionMode::Build);
+    config.config_warnings = vec![squeezy_core::ConfigWarning {
+        source: "user:/tmp/settings.toml".to_string(),
+        field: "permissions.custom.legacy".to_string(),
+    }];
+
+    let app = TuiApp::new_with_clipboard(
+        "openai",
+        &config,
+        SessionMode::Build,
+        None,
+        Box::new(NoopClipboard),
+    );
+
+    assert_eq!(app.transcript.len(), 1);
+    let entry = app.transcript.first().expect("startup warning");
+    let log = match &entry.kind {
+        TranscriptEntryKind::Log(log) => log,
+        _ => panic!("expected startup warning log"),
+    };
+    assert_eq!(log.kind, LogKind::Warn);
+    assert_eq!(
+        log.message,
+        "ignored unknown setting permissions.custom.legacy in user:/tmp/settings.toml"
+    );
+    let rendered = lines_to_plain_text(&format_log_entry(log, false, false));
+    assert!(
+        rendered.contains("⚠ ignored unknown setting permissions.custom.legacy"),
+        "warning must render with the standard warning sign: {rendered}"
+    );
+}
+
+#[test]
 fn app_does_not_seed_onboarding_summary_into_fresh_transcript() {
     let config = test_config(SessionMode::Build);
     let app = TuiApp::new_with_clipboard(
@@ -74,12 +108,16 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
         "missing toggle hint: {status}",
     );
     assert!(
-        status.contains("Up/Down menu/history"),
+        status.contains("Up/Down menu"),
         "missing menu/history hint: {status}"
     );
     assert!(
-        !status.contains("Wheel/PgUp/PgDn scroll"),
-        "default inline mode should leave wheel scrolling to the terminal: {status}"
+        status.contains("Alt+Up/Down history"),
+        "missing prompt history hint: {status}"
+    );
+    assert!(
+        status.contains("Wheel/PgUp/PgDn scroll"),
+        "auto mode uses alternate screen scrolling by default: {status}"
     );
 }
 
@@ -90,14 +128,14 @@ fn status_mode_color_distinguishes_build_and_plan() {
     let build = format_status_overview_line(&app, 120);
     assert_eq!(
         build.spans.last().and_then(|span| span.style.fg),
-        Some(MODE_BUILD_GREEN)
+        Some(crate::render::theme::green())
     );
 
     app.mode = SessionMode::Plan;
     let plan = format_status_overview_line(&app, 120);
     assert_eq!(
         plan.spans.last().and_then(|span| span.style.fg),
-        Some(MODE_PURPLE)
+        Some(crate::render::theme::magenta())
     );
 }
 
@@ -141,7 +179,7 @@ fn plan_mode_indicator_line_uses_existing_mode_purple_palette() {
         .first()
         .expect("plan-mode line must have at least one span");
     assert!(label_span.content.contains("PLAN MODE"));
-    assert_eq!(label_span.style.fg, Some(MODE_PURPLE));
+    assert_eq!(label_span.style.fg, Some(crate::render::theme::magenta()));
 }
 
 #[tokio::test]
@@ -776,8 +814,13 @@ async fn wheel_scroll_works_in_inline_mode() {
 #[tokio::test]
 async fn wheel_scroll_targets_transcript_overlay_when_open() {
     let mut app = test_app(SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    app.transcript_overlay = Some(TranscriptOverlayState::default());
+    for index in 0..80 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::NativeSelection,
+    });
 
     handle_mouse(
         &mut app,
@@ -1654,6 +1697,31 @@ async fn slash_plan_with_trailing_space_still_switches_mode() {
 }
 
 #[tokio::test]
+async fn inline_slash_plan_uses_surrounding_prompt_text() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    set_input(&mut app, "please /plan rethink attachment UX".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.mode, SessionMode::Plan);
+    assert!(app.input.is_empty());
+    wait_for_turn_completion(&mut app).await;
+    assert!(
+        transcript_message_contents(&app)
+            .iter()
+            .any(|content| content.contains("please rethink attachment UX")),
+        "inline /plan should preserve the surrounding prompt text"
+    );
+}
+
+#[tokio::test]
 async fn slash_config_opens_screen() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -1774,11 +1842,8 @@ async fn statusline_picker_toggle_then_save_reflects_in_status_row() {
     ));
     std::fs::create_dir_all(&tmpdir).expect("mkdir");
     let settings_path = tmpdir.join("settings.toml");
-    // SAFETY: tests run sequentially per file with --test-threads=1 if needed;
-    // this env var is read at save time only.
-    unsafe {
-        std::env::set_var("SQUEEZY_SETTINGS_PATH", &settings_path);
-    }
+    let _guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path));
     set_input(&mut app, "/statusline".to_string());
     handle_key(
         &mut app,
@@ -1823,9 +1888,6 @@ async fn statusline_picker_toggle_then_save_reflects_in_status_row() {
         !row1.contains("scripted:gpt-test"),
         "row 1 should no longer show provider-and-model after toggling it off; got: {row1}"
     );
-    unsafe {
-        std::env::remove_var("SQUEEZY_SETTINGS_PATH");
-    }
 }
 
 #[tokio::test]
@@ -1835,6 +1897,10 @@ async fn statusline_save_closes_picker_and_paints_detail_row() {
     // chosen items.
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("statusline_save");
+    let settings_path = dir.join("settings.toml");
+    let _guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path));
     set_input(&mut app, "/statusline".to_string());
     handle_key(
         &mut app,
@@ -2620,7 +2686,7 @@ async fn prompt_history_uses_plain_up_down_when_prompt_is_empty() {
 }
 
 #[tokio::test]
-async fn alternate_screen_arrows_recall_history_when_prompt_is_empty() {
+async fn alternate_screen_arrows_scroll_transcript_when_prompt_is_empty() {
     let mut agent = test_agent(SessionMode::Build);
     let mut config = test_config(SessionMode::Build);
     config.tui.alternate_screen = TuiAlternateScreen::Always;
@@ -2633,6 +2699,29 @@ async fn alternate_screen_arrows_recall_history_when_prompt_is_empty() {
         &mut app,
         &mut agent,
         KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("scroll up");
+
+    assert!(app.input.is_empty());
+    assert_eq!(app.transcript_scroll_from_bottom, 3);
+    assert!(app.input_history_index.is_none());
+}
+
+#[tokio::test]
+async fn alternate_screen_alt_arrows_recall_history_when_prompt_is_empty() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    config.tui.alternate_screen = TuiAlternateScreen::Always;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
+    push_input_history(&mut app, "first prompt".to_string());
+    push_input_history(&mut app, "second prompt".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
     )
     .await
     .expect("history up");
@@ -2800,12 +2889,37 @@ async fn slash_menu_renders_and_completes_selected_command() {
 }
 
 #[tokio::test]
+async fn slash_menu_completes_inline_command_token() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "please /att".to_string());
+
+    let output = render_to_string(&app, 100, 36);
+    assert!(output.contains("/attach"), "{output}");
+    assert!(
+        !output.contains("/cost"),
+        "prefix-only commands should stay out of inline slash completion: {output}"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("complete inline command");
+
+    assert_eq!(app.input, "please /attach ");
+    assert_eq!(app.status, "selected /attach");
+}
+
+#[tokio::test]
 async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/".to_string());
 
-    let suggestions = slash_suggestions(&app.input);
+    let suggestions = input::slash_suggestions(&app.input);
     let names = suggestions
         .iter()
         .map(|command| command.name)
@@ -2819,7 +2933,15 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
         &names[..SLASH_MENU_MAX_ITEMS]
     );
     assert!(names[0] < names[1] && names[1] < names[2], "alphabetical");
-    assert_eq!(slash_suggestion_lines(&app).len(), SLASH_MENU_MAX_ITEMS);
+    let command_rows = slash_suggestion_lines(&app, 120)
+        .iter()
+        .filter(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref().starts_with('/'))
+        })
+        .count();
+    assert_eq!(command_rows, SLASH_MENU_MAX_ITEMS);
 
     // Step the selection forward by one page; the visible window
     // should slide forward by the same offset.
@@ -2928,7 +3050,7 @@ fn slash_suggestion_line_contents_match_command_capabilities() {
     // absence (`/cost` → no badge).
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/help".to_string());
-    let lines = slash_suggestion_lines(&app);
+    let lines = slash_suggestion_lines(&app, 120);
     let serialised = lines
         .iter()
         .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -2940,7 +3062,7 @@ fn slash_suggestion_line_contents_match_command_capabilities() {
     assert!(help_line.contains("[net]"), "{help_line}");
 
     set_input(&mut app, "/cost".to_string());
-    let lines = slash_suggestion_lines(&app);
+    let lines = slash_suggestion_lines(&app, 120);
     let serialised = lines
         .iter()
         .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -2956,20 +3078,49 @@ fn slash_suggestion_line_contents_match_command_capabilities() {
 }
 
 #[test]
-fn slash_suggestion_lines_cap_description_width() {
+fn slash_suggestion_lines_keep_theme_hint_full() {
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/".to_string());
-    for line in slash_suggestion_lines(&app) {
-        let text: String = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(
-            text.chars().count() <= 140,
-            "slash menu line should stay bounded: {text}"
-        );
-    }
+    set_input(&mut app, "/theme".to_string());
+    let rendered = slash_suggestion_lines(&app, 80)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("[default|bright|fun|catppuccin|high-contrast|<custom>]"),
+        "slash menu should render the complete theme hint: {rendered}"
+    );
+    assert!(
+        !rendered.contains("high-..."),
+        "slash menu must not truncate the high-contrast builtin: {rendered}"
+    );
+}
+
+#[test]
+fn slash_suggestion_lines_keep_short_hints_inline_when_width_allows() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/attach".to_string());
+    let lines = slash_suggestion_lines(&app, 120);
+    let attach_line = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .find(|line| line.contains("/attach ") && line.contains("insert a file token"))
+        .expect("attach suggestion line");
+
+    assert!(
+        attach_line.contains("<path>"),
+        "short parameter hint should stay on the command row when it fits: {attach_line}"
+    );
 }
 
 #[tokio::test]
@@ -3182,62 +3333,97 @@ async fn slash_context_uses_registry_fallback_for_unknown_models() {
 }
 
 #[tokio::test]
-async fn multiline_paste_becomes_attached_context() {
-    let root = temp_workspace("tui_paste");
+async fn small_paste_stays_in_prompt() {
+    let root = temp_workspace("tui_inline_paste");
     let config = test_config_with_root(SessionMode::Build, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, "small\r\npaste".to_string())
+        .await
+        .expect("handle paste");
+
+    assert_eq!(app.input, "small\npaste");
+    assert!(app.attachments.is_empty());
+    assert!(app.prompt_attachments.is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn large_paste_uses_visible_prompt_token() {
+    let root = temp_workspace("tui_large_paste");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let pasted = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 7);
+
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("handle paste");
+
+    let placeholder = format!("[Pasted Content {} chars]", pasted.chars().count());
+    assert_eq!(app.input, placeholder);
+    assert_eq!(app.prompt_attachments.len(), 1);
+    assert!(app.attachments.is_empty());
+    let input = app.input.clone();
+    let prepared = prepare_prompt_turn_input(&mut app, input);
+    assert_eq!(prepared.display_input, placeholder);
+    assert_eq!(prepared.model_input, pasted);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn deleting_large_paste_token_drops_payload_before_submit() {
+    let root = temp_workspace("tui_large_paste_delete");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
 
     handle_paste(
         &mut app,
         &mut agent,
-        "2026-05-24 ERROR failed\r\nOPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\r".to_string(),
+        "y".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1),
     )
     .await
     .expect("handle paste");
+    app.input.clear();
+    app.input_cursor = 0;
+    app.prune_prompt_attachments();
 
-    assert_eq!(app.attachments.len(), 1);
-    assert!(app.status.contains("attached paste"), "{}", app.status);
-    assert!(
-        !app.attachments[0]
-            .preview
-            .contains("sk-abcdefghijklmnopqrstuvwxyz")
-    );
-    assert!(
-        app.attachments[0]
-            .preview
-            .contains("2026-05-24 ERROR failed"),
-        "{}",
-        app.attachments[0].preview
-    );
-    let rendered = render_to_string(&app, 100, 20);
-    assert!(
-        rendered.contains(&app.attachments[0].id),
-        "attachment should render: {rendered}"
-    );
+    assert!(app.prompt_attachments.is_empty());
+    let prepared = prepare_prompt_turn_input(&mut app, "summarize".to_string());
+    assert_eq!(prepared.model_input, "summarize");
 
     let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn small_single_line_paste_stays_in_prompt() {
-    let root = temp_workspace("tui_inline_paste");
+async fn duplicate_large_pastes_get_unique_prompt_tokens() {
+    let root = temp_workspace("tui_large_paste_dupe");
     let config = test_config_with_root(SessionMode::Build, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
+    let pasted = "z".repeat(LARGE_PASTE_CHAR_THRESHOLD + 2);
 
-    handle_paste(&mut app, &mut agent, "small paste".to_string())
+    handle_paste(&mut app, &mut agent, pasted.clone())
         .await
-        .expect("handle paste");
+        .expect("first paste");
+    insert_input_char(&mut app, ' ');
+    handle_paste(&mut app, &mut agent, pasted)
+        .await
+        .expect("second paste");
 
-    assert_eq!(app.input, "small paste");
-    assert!(app.attachments.is_empty());
+    assert!(app.input.contains("[Pasted Content 1002 chars]"));
+    assert!(app.input.contains("[Pasted Content 1002 chars #2]"));
+    assert_eq!(app.prompt_attachments.len(), 2);
 
     let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn slash_attach_and_detach_update_active_context() {
+async fn slash_attach_inserts_visible_file_token() {
     let root = temp_workspace("tui_attach");
     fs::write(
         root.join("error.log"),
@@ -3245,39 +3431,74 @@ async fn slash_attach_and_detach_update_active_context() {
     )
     .expect("write log");
     let config = test_config_with_root(SessionMode::Build, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
 
     assert!(handle_slash_command(&mut app, &mut agent, "/attach error.log").await);
-    assert_eq!(app.attachments.len(), 1);
-    assert!(app.status.contains("attached file"), "{}", app.status);
-
-    let id = app.attachments[0].id.clone();
-    let command = format!("/detach {id}");
-    assert!(handle_slash_command(&mut app, &mut agent, &command).await);
     assert!(app.attachments.is_empty());
-    assert_eq!(app.status, format!("detached {id}"));
+    assert_eq!(app.input, "[Attached file error.log]");
+    assert_eq!(app.prompt_attachments.len(), 1);
+    assert!(app.status.contains("inserted [Attached file error.log]"));
+    let input = app.input.clone();
+    let prepared = prepare_prompt_turn_input(&mut app, input);
+    assert!(prepared.model_input.contains("Attached file error.log:"));
+    assert!(prepared.model_input.contains("2026-05-24 ERROR failed"));
 
     let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn slash_attach_routes_canonical_images_to_vision_kind() {
-    // F18 wires PNG/JPEG/GIF/WEBP magic-byte hits through to a
-    // routable `Image` attachment that fans into `LlmInputItem::Image`
-    // on the next turn. The TUI status surfaces the active attach
-    // instead of the legacy "unsupported file" rejection.
-    let root = temp_workspace("tui_attach_image_png");
-    fs::write(root.join("shot.png"), b"\x89PNG\r\n\x1a\nimage").expect("write image");
+async fn inline_slash_attach_inserts_token_without_dropping_prompt_text() {
+    let root = temp_workspace("tui_inline_attach");
+    fs::write(root.join("error.log"), "inline attach fixture\n").expect("write log");
     let config = test_config_with_root(SessionMode::Build, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    set_input(
+        &mut app,
+        "please review /attach error.log before replying".to_string(),
+    );
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(
+        app.input,
+        "please review [Attached file error.log] before replying"
+    );
+    assert_eq!(app.prompt_attachments.len(), 1);
+    assert!(app.status.contains("inserted [Attached file error.log]"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn slash_attach_routes_canonical_images_to_prompt_token() {
+    let root = temp_workspace("tui_attach_image_png");
+    let image_bytes = b"\x89PNG\r\n\x1a\nimage".to_vec();
+    fs::write(root.join("shot.png"), &image_bytes).expect("write image");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
 
     assert!(handle_slash_command(&mut app, &mut agent, "/attach shot.png").await);
-    assert_eq!(app.attachments.len(), 1);
-    assert_eq!(app.attachments[0].kind, ContextAttachmentKind::Image);
-    assert!(app.status.contains("attached file"), "{}", app.status);
-    assert!(app.status.contains("kind=image"), "{}", app.status);
+    assert!(app.attachments.is_empty());
+    assert_eq!(app.input, "[Image shot.png]");
+    let input = app.input.clone();
+    let prepared = prepare_prompt_turn_input(&mut app, input);
+    assert_eq!(prepared.display_input, "[Image shot.png]");
+    assert_eq!(prepared.model_input, "[Image shot.png]");
+    assert_eq!(prepared.transient_input_items.len(), 1);
+    let LlmInputItem::Image { media_type, bytes } = &prepared.transient_input_items[0] else {
+        panic!("expected image item");
+    };
+    assert_eq!(media_type, "image/png");
+    assert_eq!(bytes.as_ref(), image_bytes.as_slice());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -3296,7 +3517,12 @@ async fn slash_attach_surfaces_unsupported_label_only_images() {
 
     assert!(handle_slash_command(&mut app, &mut agent, "/attach snap.heic").await);
     assert!(app.attachments.is_empty());
-    assert!(app.status.contains("unsupported file"), "{}", app.status);
+    assert!(
+        app.status
+            .contains("unsupported file kind=unsupported_image"),
+        "{}",
+        app.status
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -3334,6 +3560,30 @@ async fn slash_help_config_renders_citations_and_config() {
     assert!(content.contains("docs/external/PROVIDERS.md"), "{content}");
     assert!(content.contains("[model]"), "{content}");
     assert!(!content.contains("--api-key"), "{content}");
+}
+
+#[tokio::test]
+async fn inline_slash_help_dispatches_from_prompt_body() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    set_input(&mut app, "please /help providers".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    wait_for_turn_completion(&mut app).await;
+    assert!(app.input.is_empty());
+    assert!(
+        transcript_message_contents(&app).contains(&"/help providers"),
+        "inline /help should dispatch the command from its inline position"
+    );
+    let content = last_message_content(&app).expect("help transcript");
+    assert!(content.contains("docs/external/PROVIDERS.md"), "{content}");
 }
 
 #[tokio::test]
@@ -3469,11 +3719,9 @@ fn tool_result_entries_collapse_by_default_and_carry_overlay_hint() {
         "middle of the body must be elided: {collapsed}"
     );
 
-    // `/expand all` is the slash-command path for users who want the
-    // expanded view inline (works in alt-screen; in inline mode the
-    // most recent turn's entries flip but already-flushed ones stay
-    // in scrollback — a limitation the overlay sidesteps entirely).
-    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
+    // Force the expanded inline variant directly so this test still
+    // covers the card body rendering. The user-facing full view is Ctrl-T.
+    set_all_transcript_collapsed(&mut app, false);
 
     assert!(!app.transcript[0].collapsed);
     let expanded = render_to_string(&app, 100, 40);
@@ -3497,19 +3745,6 @@ fn failed_tool_result_starts_expanded_so_error_is_visible() {
     );
 }
 
-#[test]
-fn parse_transcript_category_accepts_reasoning_and_thinking_aliases() {
-    assert!(matches!(
-        parse_transcript_category("reasoning"),
-        Some(TranscriptCategory::Reasoning)
-    ));
-    assert!(matches!(
-        parse_transcript_category("thinking"),
-        Some(TranscriptCategory::Reasoning)
-    ));
-    assert!(parse_transcript_category("rambling").is_none());
-}
-
 #[tokio::test]
 async fn typing_after_selection_returns_focus_to_prompt_editing() {
     let mut agent = test_agent(SessionMode::Build);
@@ -3531,33 +3766,16 @@ async fn typing_after_selection_returns_focus_to_prompt_editing() {
 }
 
 #[tokio::test]
-async fn slash_collapse_and_expand_apply_to_tool_entries() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-
-    assert!(handle_slash_command(&mut app, &mut agent, "/expand tools").await);
-    assert!(!app.transcript[0].collapsed);
-
-    assert!(handle_slash_command(&mut app, &mut agent, "/collapse tools").await);
-    assert!(app.transcript[0].collapsed);
-}
-
-#[tokio::test]
-async fn bare_slash_expand_opens_full_transcript_overlay() {
+async fn removed_slash_expand_no_longer_opens_full_transcript_overlay() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     app.push_tool_result(sample_tool_result("grep", "needle found"));
     app.transcript[0].collapsed = true;
 
-    assert!(handle_slash_command(&mut app, &mut agent, "/expand").await);
+    assert!(!handle_slash_command(&mut app, &mut agent, "/expand").await);
 
-    assert!(app.transcript_overlay.is_some());
-    assert_eq!(app.status, "full transcript open");
-    assert!(
-        app.transcript[0].collapsed,
-        "bare /expand should not pretend it can rewrite inline scrollback"
-    );
+    assert!(app.transcript_overlay.is_none());
+    assert!(app.transcript[0].collapsed);
 }
 
 #[test]
@@ -3633,7 +3851,7 @@ fn shell_tool_rows_show_command_and_highlight_output() {
         "stderr": "",
     });
     app.push_tool_result_with_call(result, Some(call));
-    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
+    set_all_transcript_collapsed(&mut app, false);
 
     let output = render_to_string(&app, 140, 18);
 
@@ -3971,7 +4189,7 @@ fn edit_tool_row_summarizes_checkpoint_diff_and_expands_patch() {
             arguments: serde_json::json!({}),
         }),
     );
-    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
+    set_all_transcript_collapsed(&mut app, false);
 
     let output = render_to_string(&app, 120, 16);
 
@@ -4010,7 +4228,7 @@ fn expanded_edit_diff_does_not_claim_ctrl_e_can_expand_further() {
             arguments: serde_json::json!({}),
         }),
     );
-    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
+    set_all_transcript_collapsed(&mut app, false);
 
     let lines = format_transcript_entry_with_width(
         &app.transcript[0],
@@ -4388,7 +4606,7 @@ fn plan_mode_question_marks_freeform_answer_when_selected() {
         .iter()
         .find(|span| span.content.as_ref() == "● ")
         .expect("answer marker");
-    assert_eq!(marker.style.fg, Some(AMBER));
+    assert_eq!(marker.style.fg, Some(crate::render::theme::accent()));
     assert!(
         answer
             .spans
@@ -4429,15 +4647,15 @@ fn plan_mode_question_selected_choice_uses_amber_dot_not_yellow_label() {
         .iter()
         .find(|span| span.content.as_ref() == "● ")
         .expect("selected marker");
-    assert_eq!(marker.style.fg, Some(AMBER));
+    assert_eq!(marker.style.fg, Some(crate::render::theme::accent()));
 
     let label = selected
         .spans
         .iter()
         .find(|span| span.content.as_ref() == "Behavior-preserving only")
         .expect("selected label");
-    assert_ne!(label.style.fg, Some(GOLD));
-    assert_ne!(label.style.fg, Some(AMBER));
+    assert_ne!(label.style.fg, Some(crate::render::theme::secondary()));
+    assert_ne!(label.style.fg, Some(crate::render::theme::accent()));
 }
 
 #[test]
@@ -4464,22 +4682,20 @@ fn repeated_invalid_tool_arguments_are_coalesced() {
 #[test]
 fn command_and_output_highlighters_style_key_parts() {
     let command = command_spans("cargo test -p squeezy-tui");
-    assert_eq!(command[0].style.fg, Some(GOLD));
+    assert_eq!(command[0].style.fg, Some(crate::render::theme::secondary()));
     assert!(
-        command
-            .iter()
-            .any(|span| span.content.as_ref() == "-p" && span.style.fg == Some(AMBER)),
+        command.iter().any(|span| span.content.as_ref() == "-p"
+            && span.style.fg == Some(crate::render::theme::accent())),
         "{command:?}"
     );
 
     let ansi = ansi_spans("\u{1b}[32mok\u{1b}[0m error");
-    assert_eq!(ansi[0].style.fg, Some(Color::Green));
+    assert_eq!(ansi[0].style.fg, Some(ratatui::style::Color::Green));
 
     let keyword = keyword_spans("public class Foo { return ok; }");
     assert!(
-        keyword
-            .iter()
-            .any(|span| span.content.as_ref() == "class" && span.style.fg == Some(GOLD)),
+        keyword.iter().any(|span| span.content.as_ref() == "class"
+            && span.style.fg == Some(crate::render::theme::secondary())),
         "{keyword:?}"
     );
 }
@@ -4489,7 +4705,7 @@ fn ansi_passthrough_renders_colors() {
     let line = render::ansi::ansi_to_line("\u{1b}[32mhello\u{1b}[0m world");
 
     assert_eq!(line.spans[0].content.as_ref(), "hello");
-    assert_eq!(line.spans[0].style.fg, Some(Color::Green));
+    assert_eq!(line.spans[0].style.fg, Some(ratatui::style::Color::Green));
 }
 
 #[test]
@@ -4646,12 +4862,12 @@ fn markdown_renders_heading_and_code() {
 #[test]
 fn markdown_colors_confidence_labels_after_em_dash() {
     let cases = [
-        ("exact_syntax", render::palette::SUCCESS_GREEN),
-        ("import_resolved", render::palette::AMBER),
-        ("candidate_set", render::palette::GOLD),
-        ("external", render::palette::QUIET),
-        ("unknown", render::palette::QUIET),
-        ("label_missing", render::palette::ERROR_RED),
+        ("exact_syntax", crate::render::theme::green()),
+        ("import_resolved", crate::render::theme::accent()),
+        ("candidate_set", crate::render::theme::secondary()),
+        ("external", crate::render::theme::quiet()),
+        ("unknown", crate::render::theme::quiet()),
+        ("label_missing", crate::render::theme::red()),
     ];
     for (label, expected) in cases {
         let lines = render::markdown::render_markdown(&format!(
@@ -4675,7 +4891,7 @@ fn markdown_colors_confidence_labels_in_brackets() {
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.as_ref() == "candidate_set")
         .expect("bracketed label should render its own span");
-    assert_eq!(span.style.fg, Some(render::palette::GOLD));
+    assert_eq!(span.style.fg, Some(crate::render::theme::secondary()));
 }
 
 #[test]
@@ -4688,7 +4904,7 @@ fn markdown_leaves_identifier_lookalikes_uncoloured() {
     // identifier inside a code span.
     let any_styled_label = lines.iter().flat_map(|line| line.spans.iter()).any(|span| {
         span.content.as_ref() == "exact_syntax"
-            && span.style.fg == Some(render::palette::SUCCESS_GREEN)
+            && span.style.fg == Some(crate::render::theme::green())
     });
     assert!(
         !any_styled_label,
@@ -5090,17 +5306,18 @@ fn render_uses_two_line_status_footer() {
 
     let output = render_to_string(&app, 140, 18);
     assert!(output.contains("Squeezy v"), "{output}");
-    // model/provider used to ride in the banner; it moved to the live
-    // status line (`provider-and-model` item) so changing models surfaces
-    // without a restart. This test now exercises the footer rows only.
-    assert!(output.contains("dir "), "{output}");
+    // model/provider used to ride in the banner; it now comes from the
+    // default status-line detail row so changing models surfaces without a
+    // restart.
+    assert!(output.contains("openai:gpt-test"), "{output}");
     assert!(output.contains("feature"), "{output}");
     assert!(
         output.contains("Build mode (Shift+Tab to cycle)"),
         "{output}"
     );
     assert!(!output.contains("ready"), "{output}");
-    assert!(output.contains("Up/Down menu/history"), "{output}");
+    assert!(output.contains("Up/Down menu"), "{output}");
+    assert!(output.contains("Alt+Up/Down history"), "{output}");
 }
 
 #[test]
@@ -5115,7 +5332,7 @@ fn status_footer_sits_directly_below_prompt_area() {
         .expect("prompt cursor");
     let status_line = lines
         .iter()
-        .position(|line| line.contains("dir "))
+        .position(|line| line.contains("scripted:gpt-test"))
         .expect("status line");
     let help_line = lines
         .iter()
@@ -5202,13 +5419,13 @@ fn compact_viewport_hides_attachment_panel_before_prompt_footer() {
 }
 
 #[test]
-fn auto_mode_is_default_terminal_model() {
+fn auto_mode_uses_alternate_screen_to_avoid_inline_cursor_probe() {
     let config = test_config(SessionMode::Build);
 
     assert_eq!(config.tui.alternate_screen, TuiAlternateScreen::Auto);
     assert_eq!(
         TerminalMode::from(config.tui.alternate_screen),
-        TerminalMode::Inline
+        TerminalMode::AlternateScreen
     );
     assert_eq!(
         TerminalMode::from(TuiAlternateScreen::Never),
@@ -5253,6 +5470,47 @@ fn transcript_overlay_screen_keeps_native_selection_available() {
     assert!(
         !ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
         "full transcript must leave native terminal text selection available"
+    );
+    assert!(
+        !ansi.contains(ENABLE_MOUSE_DRAG_CAPTURE),
+        "full transcript must not capture drag events by default"
+    );
+}
+
+#[test]
+fn transcript_overlay_mouse_mode_enables_scrollbar_drag_reporting() {
+    let mut bytes = Vec::new();
+    set_transcript_overlay_mouse_mode(&mut bytes, true, false)
+        .expect("enable transcript overlay mouse mode");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    assert!(
+        ansi.starts_with(DISABLE_MOUSE_MODES),
+        "must reset stale mouse modes before enabling drag reporting"
+    );
+    assert!(
+        ansi.contains(ENABLE_MOUSE_DRAG_CAPTURE),
+        "scrollbar mode must enable button-drag reporting"
+    );
+    assert!(
+        ansi.contains("\x1b[?1002h"),
+        "scrollbar mode must report drag events, not just clicks"
+    );
+}
+
+#[test]
+fn transcript_overlay_mouse_mode_can_restore_main_click_capture() {
+    let mut bytes = Vec::new();
+    set_transcript_overlay_mouse_mode(&mut bytes, false, true).expect("restore main mouse capture");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    assert!(
+        ansi.starts_with(DISABLE_MOUSE_MODES),
+        "must leave overlay drag mode before restoring main mouse capture"
+    );
+    assert!(
+        ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
+        "main click capture should be restored when it was enabled before the overlay"
     );
 }
 
@@ -5354,6 +5612,31 @@ fn render_prompt_uses_rotating_coin_and_cursor() {
 }
 
 #[test]
+fn first_turn_empty_composer_spinner_animates_before_streaming_output() {
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+    app.cancel = Some(CancellationToken::new());
+    app.turn_visual = TurnVisualState::Running;
+    app.animation_tick_rate = Duration::from_millis(100);
+    app.input.clear();
+    app.pending_assistant.clear();
+    app.transcript.clear();
+
+    app.animation_tick = 0;
+    let first = render_to_string(&app, 100, 12);
+    app.animation_tick = 4;
+    let second = render_to_string(&app, 100, 12);
+
+    assert!(first.contains("●  ┃"), "{first}");
+    assert!(second.contains("◕  ┃"), "{second}");
+    assert_ne!(
+        first, second,
+        "first-turn spinner frame should repaint before any assistant delta"
+    );
+}
+
+#[test]
 fn render_prompt_places_cursor_inside_input_text() {
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "abcd".to_string());
@@ -5445,7 +5728,10 @@ fn assistant_marker_uses_answer_color() {
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
 
     assert_eq!(lines[0].spans[1].content.as_ref(), "●");
-    assert_eq!(lines[0].spans[1].style.fg, Some(SUCCESS_GREEN));
+    assert_eq!(
+        lines[0].spans[1].style.fg,
+        Some(crate::render::theme::green())
+    );
     assert_eq!(lines[0].spans[3].content.as_ref(), "done");
     assert_eq!(
         lines.last().expect("trailing blank").spans.len(),
@@ -5467,7 +5753,10 @@ fn failed_assistant_marker_uses_error_color() {
     let lines = format_message_entry(&item, false, false, MessageOutcome::Failed);
 
     assert_eq!(lines[0].spans[1].content.as_ref(), "●");
-    assert_eq!(lines[0].spans[1].style.fg, Some(ERROR_RED));
+    assert_eq!(
+        lines[0].spans[1].style.fg,
+        Some(crate::render::theme::red())
+    );
 }
 
 #[test]
@@ -5493,32 +5782,56 @@ accuracy=provider token counters are provider-reported when available.";
     };
 
     // Header still renders the `• Noted` chrome plus the bolded
-    // "Cost accounting" body, in GOLD.
+    // "Cost accounting" body, in crate::render::theme::secondary().
     let header_style = span_for(&lines[0], "Cost accounting");
-    assert_eq!(header_style.fg, Some(GOLD));
+    assert_eq!(header_style.fg, Some(crate::render::theme::secondary()));
     assert!(header_style.add_modifier.contains(Modifier::BOLD));
 
     // `session=` is the dim label, `abc` is the bright value.
     let session_line = &lines[1];
-    assert_eq!(span_for(session_line, "session=").fg, Some(QUIET));
+    assert_eq!(
+        span_for(session_line, "session=").fg,
+        Some(crate::render::theme::quiet())
+    );
     assert_eq!(span_for(session_line, "abc").fg, None);
 
-    // The dollar amount pops in AMBER; the trailing parenthetical fades.
+    // The dollar amount pops in crate::render::theme::accent(); the trailing parenthetical fades.
     let usd_line = &lines[3];
-    assert_eq!(span_for(usd_line, "estimated_usd=").fg, Some(QUIET));
-    assert_eq!(span_for(usd_line, "$0.415300").fg, Some(AMBER));
-    assert_eq!(span_for(usd_line, "(estimated").fg, Some(QUIET));
+    assert_eq!(
+        span_for(usd_line, "estimated_usd=").fg,
+        Some(crate::render::theme::quiet())
+    );
+    assert_eq!(
+        span_for(usd_line, "$0.415300").fg,
+        Some(crate::render::theme::accent())
+    );
+    assert_eq!(
+        span_for(usd_line, "(estimated").fg,
+        Some(crate::render::theme::quiet())
+    );
 
     // Zero / dash values fade so real numbers carry the eye.
     let tokens_line = &lines[4];
-    assert_eq!(span_for(tokens_line, "provider_tokens").fg, Some(GOLD));
+    assert_eq!(
+        span_for(tokens_line, "provider_tokens").fg,
+        Some(crate::render::theme::secondary())
+    );
     assert_eq!(span_for(tokens_line, "1200").fg, None);
-    assert_eq!(span_for(tokens_line, "-").fg, Some(QUIET));
-    assert_eq!(span_for(tokens_line, "0").fg, Some(QUIET));
+    assert_eq!(
+        span_for(tokens_line, "-").fg,
+        Some(crate::render::theme::quiet())
+    );
+    assert_eq!(
+        span_for(tokens_line, "0").fg,
+        Some(crate::render::theme::quiet())
+    );
 
-    // The leading group word on tool rows is GOLD.
+    // The leading group word on tool rows is crate::render::theme::secondary().
     let tools_line = &lines[5];
-    assert_eq!(span_for(tools_line, "tools").fg, Some(GOLD));
+    assert_eq!(
+        span_for(tools_line, "tools").fg,
+        Some(crate::render::theme::secondary())
+    );
     assert_eq!(span_for(tools_line, "4").fg, None);
 
     // The accuracy epilogue is wholly dimmed.
@@ -5528,7 +5841,7 @@ accuracy=provider token counters are provider-reported when available.";
             .spans
             .iter()
             .all(|span| span.style.fg.is_none()
-                || span.style.fg == Some(QUIET)
+                || span.style.fg == Some(crate::render::theme::quiet())
                 || span.content.as_ref().chars().all(char::is_whitespace)),
         "{accuracy_line:?}"
     );
@@ -5664,11 +5977,11 @@ fn working_shimmer_sweeps_left_to_right() {
     let right_foregrounds = right.iter().map(|span| span.style.fg).collect::<Vec<_>>();
 
     assert!(
-        left_foregrounds.contains(&Some(WORKING_SHIMMER_HIGHLIGHT)),
+        left_foregrounds.contains(&Some(crate::render::theme::shimmer())),
         "{left_foregrounds:?}"
     );
     assert!(
-        right_foregrounds.contains(&Some(WORKING_SHIMMER_HIGHLIGHT)),
+        right_foregrounds.contains(&Some(crate::render::theme::shimmer())),
         "{right_foregrounds:?}"
     );
     assert!(left.iter().all(|span| span.style.bg.is_none()));
@@ -5702,13 +6015,13 @@ fn working_shimmer_changes_rendered_cells_across_ticks() {
     assert!(
         first
             .iter()
-            .any(|(fg, bg, _)| *fg != AMBER && *bg == Color::Reset),
+            .any(|(fg, bg, _)| *fg != crate::render::theme::accent() && *bg == Color::Reset),
         "{first:?}"
     );
     assert!(
         second
             .iter()
-            .any(|(fg, bg, _)| *fg != AMBER && *bg == Color::Reset),
+            .any(|(fg, bg, _)| *fg != crate::render::theme::accent() && *bg == Color::Reset),
         "{second:?}"
     );
     assert_ne!(
@@ -6018,14 +6331,20 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         message_outcome(&app.transcript, 0),
     );
     // Open bubble: lines[0] = bullet + content text.
-    assert_eq!(user_lines[0].spans[1].style.fg, Some(AMBER));
+    assert_eq!(
+        user_lines[0].spans[1].style.fg,
+        Some(crate::render::theme::accent())
+    );
     assert!(
         user_lines[0].spans[1].content.ends_with(' '),
         "{:?}",
         user_lines[0].spans[1].content
     );
     assert_eq!(user_lines[0].spans[2].content.as_ref(), "hi");
-    assert_eq!(user_lines[0].spans[2].style.fg, Some(Color::White));
+    assert_eq!(
+        user_lines[0].spans[2].style.fg,
+        Some(crate::render::theme::foreground())
+    );
 
     let log_lines = format_transcript_entry(
         &app.transcript[1],
@@ -6033,8 +6352,14 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         app.tool_output_verbosity,
         message_outcome(&app.transcript, 1),
     );
-    assert_eq!(log_lines[0].spans[1].style.fg, Some(ERROR_RED));
-    assert_eq!(log_lines[0].spans[2].style.fg, Some(QUIET));
+    assert_eq!(
+        log_lines[0].spans[1].style.fg,
+        Some(crate::render::theme::red())
+    );
+    assert_eq!(
+        log_lines[0].spans[2].style.fg,
+        Some(crate::render::theme::muted())
+    );
 }
 
 #[test]
@@ -6049,14 +6374,20 @@ fn user_prompt_text_is_highlighted_in_transcript() {
         .collect::<String>();
 
     // Open bubble: lines[0].spans = [indent "  ", bullet (phase + space), text]
-    assert_eq!(lines[0].spans[1].style.fg, Some(AMBER));
+    assert_eq!(
+        lines[0].spans[1].style.fg,
+        Some(crate::render::theme::accent())
+    );
     assert!(
         lines[0].spans[1].content.ends_with(' '),
         "{:?}",
         lines[0].spans[1].content
     );
     assert_eq!(lines[0].spans[2].content.as_ref(), "find getFoo");
-    assert_eq!(lines[0].spans[2].style.fg, Some(Color::White));
+    assert_eq!(
+        lines[0].spans[2].style.fg,
+        Some(crate::render::theme::foreground())
+    );
 }
 
 #[test]
@@ -6076,8 +6407,8 @@ fn submitted_bang_prompt_marks_first_nonempty_bang_dark_red() {
         .find(|span| span.content.as_ref() == "ls")
         .expect("command body span");
 
-    assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(bang.style.fg, Some(crate::render::theme::red()));
+    assert_eq!(rest.style.fg, Some(crate::render::theme::foreground()));
 }
 
 #[test]
@@ -6097,14 +6428,14 @@ fn live_prompt_marks_first_nonempty_bang_dark_red() {
         .find(|span| span.content.as_ref() == "ls")
         .expect("command body span");
 
-    assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(bang.style.fg, Some(crate::render::theme::red()));
+    assert_eq!(rest.style.fg, Some(crate::render::theme::foreground()));
 }
 
 #[test]
 fn submitted_double_bang_prompt_marks_both_bangs_dark_red() {
     // `!!cmd` runs locally but skips the LLM context (F01). Both bangs
-    // need to glow `BANG_RED` so the user can tell quiet bangs apart from
+    // need to glow `crate::render::theme::red()` so the user can tell quiet bangs apart from
     // the regular single-bang at a glance.
     let item = TranscriptItem::user("  !!git status");
 
@@ -6120,8 +6451,8 @@ fn submitted_double_bang_prompt_marks_both_bangs_dark_red() {
         .find(|span| span.content.as_ref() == "git status")
         .expect("command body span");
 
-    assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(bang.style.fg, Some(crate::render::theme::red()));
+    assert_eq!(rest.style.fg, Some(crate::render::theme::foreground()));
     assert!(
         lines[1]
             .spans
@@ -6148,8 +6479,8 @@ fn live_double_bang_prompt_marks_both_bangs_dark_red() {
         .find(|span| span.content.as_ref() == "git status")
         .expect("command body span");
 
-    assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(bang.style.fg, Some(crate::render::theme::red()));
+    assert_eq!(rest.style.fg, Some(crate::render::theme::foreground()));
 }
 
 #[test]
@@ -8085,6 +8416,21 @@ fn test_agent_with_config(config: AppConfig) -> Agent {
     )
 }
 
+fn test_agent_without_session_log(mode: SessionMode) -> Agent {
+    test_agent_without_session_log_with_config(AppConfig {
+        session_mode: mode,
+        workspace_root: temp_workspace("agent"),
+        ..Default::default()
+    })
+}
+
+fn test_agent_without_session_log_with_config(config: AppConfig) -> Agent {
+    Agent::new_ephemeral(
+        config,
+        Arc::new(UnavailableProvider::new("scripted", "test provider")),
+    )
+}
+
 fn temp_workspace(name: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -8213,7 +8559,7 @@ fn sample_attachment(id: &str) -> ContextAttachment {
 
 #[tokio::test]
 async fn slash_verbosity_with_inline_arg_applies_immediately() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     app.response_verbosity = ResponseVerbosity::Normal;
     let ran = handle_slash_command(&mut app, &mut agent, "/verbosity verbose").await;
@@ -8233,7 +8579,7 @@ async fn slash_verbosity_with_inline_arg_applies_immediately() {
 
 #[tokio::test]
 async fn slash_effort_low_sets_session_reasoning_effort() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     assert!(agent.config_snapshot().reasoning_effort.is_none());
 
@@ -8247,7 +8593,7 @@ async fn slash_effort_low_sets_session_reasoning_effort() {
 
 #[tokio::test]
 async fn slash_effort_auto_clears_session_reasoning_effort() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     // Pre-seed a value so `auto` has something to clear.
     let mut seeded = agent.config_snapshot();
     seeded.reasoning_effort = Some(squeezy_core::ReasoningEffort::High);
@@ -8261,7 +8607,7 @@ async fn slash_effort_auto_clears_session_reasoning_effort() {
 
 #[tokio::test]
 async fn slash_effort_rejects_unknown_value() {
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut seeded = agent.config_snapshot();
     seeded.reasoning_effort = Some(squeezy_core::ReasoningEffort::Medium);
     agent.replace_config(seeded);
@@ -8287,7 +8633,7 @@ async fn slash_verbosity_without_arg_prints_current_value_and_usage_hint() {
     // the config_screen modal. It prints the current value + usage
     // hint into the transcript (matching /effort's surface) so users
     // get consistent shape between bare and arg-form invocations.
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let ran = handle_slash_command(&mut app, &mut agent, "/verbosity").await;
     assert!(ran);
@@ -8313,14 +8659,11 @@ async fn slash_verbosity_without_arg_prints_current_value_and_usage_hint() {
 
 // ---- /theme palette switch ----
 
-/// `/theme dark` and `/theme light` flip the runtime palette override and
-/// mirror the choice into the agent's config so a settings-screen open
-/// reflects the new value.
+/// `/theme dark` is a backwards-compatible alias for the bundled default
+/// theme and mirrors the choice into the agent's config.
 #[tokio::test]
-async fn slash_theme_dark_flips_palette_and_config() {
-    use crate::render::palette;
-
-    let mut agent = test_agent(SessionMode::Build);
+async fn slash_theme_dark_selects_default_theme_and_config() {
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     // Point settings writes at a tempfile so the test never touches HOME.
     let dir = temp_workspace("theme_dark");
@@ -8329,79 +8672,64 @@ async fn slash_theme_dark_flips_palette_and_config() {
 
     let ran = handle_slash_command(&mut app, &mut agent, "/theme dark").await;
     assert!(ran, "/theme dark should dispatch");
-    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
-    assert_eq!(
-        agent.config_snapshot().tui.theme,
-        squeezy_core::TuiTheme::Dark
-    );
+    assert_eq!(crate::render::theme::current_theme_name(), "default");
+    assert_eq!(agent.config_snapshot().tui.theme, "default");
     let saved = std::fs::read_to_string(&settings_path).expect("settings file written");
     assert!(
-        saved.contains("theme = \"dark\""),
+        saved.contains("theme = \"default\""),
         "settings.toml should record the theme; got {saved}"
     );
 }
 
-/// `/theme light` flips the override to the light tone.
+/// `/theme light` is a backwards-compatible alias for the brighter builtin.
 #[tokio::test]
-async fn slash_theme_light_flips_palette() {
-    use crate::render::palette;
-
-    let mut agent = test_agent(SessionMode::Build);
+async fn slash_theme_light_selects_bright_theme() {
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_light");
     let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
 
     let ran = handle_slash_command(&mut app, &mut agent, "/theme light").await;
     assert!(ran);
-    assert_eq!(palette::palette_tone(), palette::PaletteTone::Light);
-    assert_eq!(
-        agent.config_snapshot().tui.theme,
-        squeezy_core::TuiTheme::Light
-    );
+    assert_eq!(crate::render::theme::current_theme_name(), "bright");
+    assert_eq!(agent.config_snapshot().tui.theme, "bright");
 }
 
-/// `/theme system` clears the override so terminal detection wins again.
+/// `/theme system` is a backwards-compatible alias for the bundled default.
 #[tokio::test]
-async fn slash_theme_system_clears_override() {
-    use crate::render::palette;
-
-    let mut agent = test_agent(SessionMode::Build);
+async fn slash_theme_system_selects_default_theme() {
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_system");
     let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
 
-    // Pin to Dark first so the System branch has something visible to clear.
-    palette::set_palette_tone_override(Some(palette::PaletteTone::Dark));
-    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme light").await;
+    assert!(ran);
+    assert_eq!(crate::render::theme::current_theme_name(), "bright");
 
     let ran = handle_slash_command(&mut app, &mut agent, "/theme system").await;
     assert!(ran);
-    // With the override cleared the visible tone is whichever the detector
-    // returns for the current process — we only assert that the override
-    // really was reset back to the detector's value.
-    assert_eq!(palette::palette_tone(), palette::detected_palette_tone());
-    assert_eq!(
-        agent.config_snapshot().tui.theme,
-        squeezy_core::TuiTheme::System
-    );
+    assert_eq!(crate::render::theme::current_theme_name(), "default");
+    assert_eq!(agent.config_snapshot().tui.theme, "default");
 }
 
 /// Unknown sub-arguments don't mutate anything — the user sees a usage hint
 /// instead of a silent tone change.
 #[tokio::test]
 async fn slash_theme_unknown_value_does_not_change_palette() {
-    use crate::render::palette;
-
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_bad");
     let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
 
-    let before_tone = palette::palette_tone();
+    let before_theme_name = crate::render::theme::current_theme_name();
     let before_theme = agent.config_snapshot().tui.theme;
     let ran = handle_slash_command(&mut app, &mut agent, "/theme zebra").await;
     assert!(ran);
-    assert_eq!(palette::palette_tone(), before_tone);
+    assert_eq!(
+        crate::render::theme::current_theme_name(),
+        before_theme_name
+    );
     assert_eq!(agent.config_snapshot().tui.theme, before_theme);
     assert!(
         app.status.contains("unknown theme"),
@@ -8410,86 +8738,59 @@ async fn slash_theme_unknown_value_does_not_change_palette() {
     );
 }
 
-/// Bare `/theme` (no sub-arg) shows usage — used to remind the user of the
-/// allowed values without forcing them to open the config screen.
+/// Bare `/theme` opens the config screen focused on Themes, matching `/model`
+/// and the other no-argument config shortcuts.
 #[tokio::test]
-async fn slash_theme_without_arg_shows_usage() {
-    let mut agent = test_agent(SessionMode::Build);
+async fn slash_theme_without_arg_opens_theme_config_section() {
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    let dir = temp_workspace("theme_usage");
-    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
 
     let ran = handle_slash_command(&mut app, &mut agent, "/theme").await;
     assert!(ran);
-    assert!(
-        app.status.starts_with("usage:") && app.status.contains("/theme"),
-        "expected usage hint, got: {}",
-        app.status
+    let state = app.config_screen.expect("config screen should be open");
+    assert_eq!(
+        state.current_section().id,
+        squeezy_core::config_schema::SectionId::Themes
     );
 }
 
-/// `/theme catppuccin` pins the Dark tone *and* flips the accent variant
-/// so the working-shimmer and prompt cursor render in mauve. Verifies that
-/// each named theme drives both the tone and the accent override — the two
-/// must move together or the result is a mismatched palette.
+/// `/theme catppuccin` selects the bundled mauve palette.
 #[tokio::test]
-async fn slash_theme_catppuccin_pins_dark_tone_and_mauve_accent() {
-    use crate::render::palette;
-
-    let mut agent = test_agent(SessionMode::Build);
+async fn slash_theme_catppuccin_selects_mauve_theme() {
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_catppuccin");
     let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
 
     let ran = handle_slash_command(&mut app, &mut agent, "/theme catppuccin").await;
     assert!(ran, "/theme catppuccin should dispatch");
-    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
-    assert_eq!(
-        palette::accent_variant(),
-        palette::AccentVariant::Catppuccin
-    );
+    assert_eq!(crate::render::theme::current_theme_name(), "catppuccin");
     assert_ne!(
-        palette::accent_primary(),
-        palette::AMBER,
+        crate::render::theme::rgb(crate::render::theme::token::PALETTE_ACCENT),
+        crate::render::theme::resolve_theme(&agent.config_snapshot(), "default")
+            .resolve(crate::render::theme::token::PALETTE_ACCENT)
+            .expect("default accent"),
         "catppuccin must override the amber default to the mauve accent",
     );
-    assert_eq!(
-        agent.config_snapshot().tui.theme,
-        squeezy_core::TuiTheme::Catppuccin
-    );
+    assert_eq!(agent.config_snapshot().tui.theme, "catppuccin");
 }
 
-/// `/theme high-contrast` pins the Light tone with a bright accessibility
-/// accent. Validates the hyphenated-argument path users will type and that
-/// the accent override flips to HighContrast independently of `dark`/
-/// `light` so reverting via `/theme system` restores the default.
+/// `/theme high-contrast` selects the bundled high-contrast palette.
 #[tokio::test]
-async fn slash_theme_high_contrast_pins_light_tone_and_yellow_accent() {
-    use crate::render::palette;
-
-    let mut agent = test_agent(SessionMode::Build);
+async fn slash_theme_high_contrast_selects_builtin_theme() {
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_hc");
     let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
 
     let ran = handle_slash_command(&mut app, &mut agent, "/theme high-contrast").await;
     assert!(ran);
-    assert_eq!(palette::palette_tone(), palette::PaletteTone::Light);
-    assert_eq!(
-        palette::accent_variant(),
-        palette::AccentVariant::HighContrast
-    );
-    assert_eq!(
-        agent.config_snapshot().tui.theme,
-        squeezy_core::TuiTheme::HighContrast,
-    );
+    assert_eq!(crate::render::theme::current_theme_name(), "high-contrast");
+    assert_eq!(agent.config_snapshot().tui.theme, "high-contrast");
 
-    // Reverting clears both overrides so the next session paints the
-    // detector-derived tone with the amber/gold default again.
     let ran = handle_slash_command(&mut app, &mut agent, "/theme system").await;
     assert!(ran);
-    assert_eq!(palette::accent_variant(), palette::AccentVariant::Default);
-    assert_eq!(palette::accent_primary(), palette::AMBER);
+    assert_eq!(crate::render::theme::current_theme_name(), "default");
 }
 
 /// Regression for `squeezy-ramu`: when the eval harness pins a settings
@@ -8500,7 +8801,6 @@ async fn slash_theme_high_contrast_pins_light_tone_and_yellow_accent() {
 /// operator's real config mid-run.
 #[tokio::test]
 async fn tui_harness_settings_override_pins_theme_writes_to_scratch() {
-    use crate::render::palette;
     use crate::testing::TuiHarness;
 
     let dir = temp_workspace("ramu_harness_override");
@@ -8544,13 +8844,13 @@ async fn tui_harness_settings_override_pins_theme_writes_to_scratch() {
         handle_slash_command(app, agent, "/theme dark").await
     };
     assert!(ran, "/theme dark should dispatch");
-    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
+    assert_eq!(crate::render::theme::current_theme_name(), "default");
 
     // Scratch file got the override; the env-pointed "home" file did
     // NOT — that's the whole point of the fix.
     let saved = std::fs::read_to_string(&scratch_settings).expect("scratch settings file written");
     assert!(
-        saved.contains("theme = \"dark\""),
+        saved.contains("theme = \"default\""),
         "scratch should record the theme; got {saved}",
     );
     assert!(
@@ -8726,10 +9026,12 @@ impl ScopedSettingsPath {
         let lock = THEME_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        // Start every theme test from a known palette state — even if a
-        // previous test left an override behind.
-        crate::render::palette::set_palette_tone_override(None);
-        crate::render::palette::set_accent_variant(crate::render::palette::AccentVariant::Default);
+        // Start every theme test from a known runtime theme — even if a
+        // previous test left the process-global theme snapshot behind.
+        let mut default_cfg = squeezy_core::AppConfig::default();
+        default_cfg.tui.theme = "default".to_string();
+        default_cfg.tui.themes.clear();
+        crate::render::theme::set_active_theme(&default_cfg);
         let previous = std::env::var_os("SQUEEZY_SETTINGS_PATH");
         // SAFETY: the global mutex above ensures no other theme test is
         // mutating this env var at the same time.
@@ -8748,8 +9050,10 @@ impl Drop for ScopedSettingsPath {
             Some(value) => unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", value) },
             None => unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") },
         }
-        crate::render::palette::set_palette_tone_override(None);
-        crate::render::palette::set_accent_variant(crate::render::palette::AccentVariant::Default);
+        let mut default_cfg = squeezy_core::AppConfig::default();
+        default_cfg.tui.theme = "default".to_string();
+        default_cfg.tui.themes.clear();
+        crate::render::theme::set_active_theme(&default_cfg);
     }
 }
 
@@ -9138,7 +9442,6 @@ fn slash_commands_have_documented_capability_for_every_entry() {
         "/build",
         "/compact",
         "/attach",
-        "/detach",
         "/pin",
         "/unpin",
         "/resume",
@@ -9176,6 +9479,41 @@ fn slash_compact_unavailable_during_turn_renders_dim_hint() {
     assert!(
         output.contains("unavailable during turn"),
         "expected unavailable hint: {output}"
+    );
+}
+
+#[test]
+fn slash_unavailable_commands_stay_readable_during_turn() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new());
+    set_input(&mut app, "/attach".to_string());
+
+    let lines = slash_suggestion_lines(&app, 120);
+    let attach_line = lines
+        .iter()
+        .find(|line| line.spans.iter().any(|span| span.content == "/attach"))
+        .expect("attach suggestion line");
+    let command_span = attach_line
+        .spans
+        .iter()
+        .find(|span| span.content == "/attach")
+        .expect("attach command span");
+
+    assert_ne!(
+        command_span.style.fg,
+        Some(crate::render::theme::quiet()),
+        "unavailable command names should not use the low-contrast quiet color"
+    );
+    assert!(
+        !command_span.style.add_modifier.contains(Modifier::DIM),
+        "unavailable command names should not use terminal DIM, which can render as black"
+    );
+    assert!(
+        attach_line
+            .spans
+            .iter()
+            .any(|span| span.content.contains("unavailable during turn")),
+        "unavailable hint should remain explicit"
     );
 }
 
@@ -9226,7 +9564,7 @@ fn slash_parameter_hint_uses_status_model_color() {
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/attach".to_string());
 
-    let lines = slash_suggestion_lines(&app);
+    let lines = slash_suggestion_lines(&app, 120);
     let attach_line = lines
         .iter()
         .find(|line| line.spans.iter().any(|span| span.content == "/attach"))
@@ -9234,22 +9572,22 @@ fn slash_parameter_hint_uses_status_model_color() {
     let description_span = attach_line
         .spans
         .iter()
-        .find(|span| span.content.contains("attach a file as prompt context"))
+        .find(|span| span.content.contains("insert a file token in the prompt"))
         .expect("attach description span");
-    let hint_span = attach_line
-        .spans
+    let hint_span = lines
         .iter()
+        .flat_map(|line| line.spans.iter())
         .find(|span| span.content.trim() == "<path>")
         .expect("attach parameter hint span");
 
     assert_eq!(
         description_span.style.fg,
-        Some(QUIET),
+        Some(crate::render::theme::quiet()),
         "description color should stay unchanged"
     );
     assert_eq!(
         hint_span.style.fg,
-        Some(crate::render::palette::ACCENT_CYAN),
+        Some(crate::render::theme::cyan()),
         "parameter hints should render with the status-line model color"
     );
 }
@@ -9546,6 +9884,15 @@ async fn ctrl_t_opens_and_closes_transcript_overlay() {
         app.transcript_overlay.is_some(),
         "Ctrl-T should open the overlay"
     );
+    let overlay = app.transcript_overlay.expect("overlay");
+    assert_eq!(
+        overlay.scroll, TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        "Ctrl-T should open anchored to the bottom/live end"
+    );
+    assert!(
+        !overlay.mode.mouse_capture(),
+        "Ctrl-T should preserve native text selection by default"
+    );
 
     handle_key(
         &mut app,
@@ -9557,6 +9904,557 @@ async fn ctrl_t_opens_and_closes_transcript_overlay() {
     assert!(
         app.transcript_overlay.is_none(),
         "Esc should close the overlay"
+    );
+}
+
+#[tokio::test]
+async fn esc_closes_transcript_overlay_without_interrupting_active_turn() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    app.turn_rx = Some(rx);
+    app.cancel = Some(cancel.clone());
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc closes overlay");
+
+    assert!(!quit);
+    assert!(app.transcript_overlay.is_none());
+    assert!(app.turn_rx.is_some(), "active turn should keep running");
+    assert!(!cancel.is_cancelled(), "Esc should close overlay first");
+}
+
+#[tokio::test]
+async fn transcript_overlay_m_toggles_scrollbar_drag_mode() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("open overlay");
+    let native_hint = format_status_hints(&app);
+    assert!(
+        native_hint.contains("native select/copy"),
+        "overlay should start in native selection mode: {native_hint}"
+    );
+    assert!(
+        native_hint.contains("M scrollbar drag"),
+        "overlay should expose the scrollbar-drag toggle: {native_hint}"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("toggle overlay mouse mode");
+    let overlay = app.transcript_overlay.expect("overlay");
+    assert!(
+        overlay.mode.mouse_capture(),
+        "M should enable app-handled right scrollbar dragging"
+    );
+    let drag_hint = format_status_hints(&app);
+    assert!(
+        drag_hint.contains("drag right gutter scroll"),
+        "drag mode should describe the active scrollbar behavior: {drag_hint}"
+    );
+    assert!(
+        drag_hint.contains("Shift-drag select"),
+        "drag mode should preserve the terminal selection escape hatch: {drag_hint}"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("toggle overlay mouse mode off");
+    assert!(
+        !app.transcript_overlay
+            .expect("overlay")
+            .mode
+            .mouse_capture(),
+        "second M should restore native selection mode"
+    );
+}
+
+#[tokio::test]
+async fn transcript_overlay_ctrl_m_does_not_toggle_scrollbar_drag_mode() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-m while overlay is open");
+
+    assert!(
+        !app.transcript_overlay
+            .expect("overlay")
+            .mode
+            .mouse_capture(),
+        "Ctrl-M must not arm terminal mouse-drag reporting"
+    );
+}
+
+#[test]
+fn transcript_overlay_drag_release_keeps_scrollbar_drag_mode() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+
+    let changed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        !changed,
+        "mouse release alone should not redraw the overlay"
+    );
+    assert!(
+        app.transcript_overlay
+            .expect("overlay")
+            .mode
+            .mouse_capture(),
+        "explicit scrollbar drag mode must remain armed until the user toggles it off"
+    );
+}
+
+#[test]
+fn input_batch_coalesces_transcript_scrollbar_drag_flood_before_key() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+    let events = vec![
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    ];
+
+    let coalesced = coalesce_input_events_for_dispatch(&app, events);
+
+    assert_eq!(
+        coalesced.len(),
+        2,
+        "drag floods should collapse to the latest drag plus the following key"
+    );
+    match coalesced[0] {
+        Event::Mouse(mouse) => {
+            assert_eq!(mouse.row, 12);
+            assert!(matches!(
+                mouse.kind,
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+            ));
+        }
+        ref other => panic!("expected coalesced drag first, got {other:?}"),
+    }
+    assert!(
+        matches!(coalesced[1], Event::Key(key) if key.code == KeyCode::Esc),
+        "keyboard event must remain immediately reachable after the coalesced drag"
+    );
+}
+
+#[test]
+fn input_batch_prioritizes_key_before_transcript_drag_flood() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+    let mut events = vec![
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    ];
+
+    let priority = take_priority_key_event_for_dispatch(&app, &mut events);
+
+    assert!(
+        matches!(priority, Some(Event::Key(key)) if key.code == KeyCode::Esc),
+        "keys must be handled before drag repaint work while scrollbar capture is active"
+    );
+    assert_eq!(
+        events.len(),
+        2,
+        "mouse events stay available for later coalescing after the key"
+    );
+}
+
+#[test]
+fn input_poll_limit_expands_in_transcript_scrollbar_drag_mode() {
+    let mut app = test_app(SessionMode::Build);
+    assert_eq!(input_events_per_poll_limit(&app), MAX_INPUT_EVENTS_PER_POLL);
+
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+
+    assert_eq!(
+        input_events_per_poll_limit(&app),
+        MAX_TRANSCRIPT_DRAG_INPUT_EVENTS_PER_POLL,
+        "scrollbar drag mode should drain deep mouse floods before repainting"
+    );
+}
+
+#[test]
+fn input_batch_does_not_coalesce_drags_outside_scrollbar_drag_mode() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::NativeSelection,
+    });
+    let events = vec![
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        }),
+    ];
+
+    let coalesced = coalesce_input_events_for_dispatch(&app, events);
+
+    assert_eq!(
+        coalesced.len(),
+        2,
+        "native-selection mode should not rewrite mouse event batches"
+    );
+}
+
+#[test]
+fn transcript_overlay_drag_uses_cached_scrollbar_geometry() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+    app.transcript_overlay_scrollbar_cache
+        .set(Some(TranscriptOverlayScrollbarCache {
+            scrollbar_area: Rect {
+                x: 79,
+                y: 1,
+                width: 1,
+                height: 10,
+            },
+            geometry: TranscriptScrollbarGeometry {
+                thumb_top: 0,
+                thumb_height: 2,
+                max_scroll: 100,
+            },
+        }));
+
+    let changed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        changed,
+        "dragging the cached scrollbar should update scroll"
+    );
+    assert_eq!(
+        app.transcript_overlay.expect("overlay").scroll,
+        TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        "drag mapping should use cached max-scroll without relayouting transcript lines"
+    );
+}
+
+#[tokio::test]
+async fn transcript_overlay_end_boundary_keeps_escape_and_ctrl_c_responsive() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::NativeSelection,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    )
+    .await
+    .expect("scroll back in overlay");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+    )
+    .await
+    .expect("jump to overlay end");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc after end");
+
+    assert!(
+        app.transcript_overlay.is_none(),
+        "Esc should still close Ctrl-T after scrolling back to the end"
+    );
+
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        mode: TranscriptOverlayMode::NativeSelection,
+    });
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-c after end");
+
+    assert!(!quit, "first Ctrl-C should arm exit confirm, not exit");
+    assert!(
+        app.exit_confirm_armed,
+        "Ctrl-C should still reach the exit-confirm path after overlay end"
+    );
+}
+
+#[tokio::test]
+async fn transcript_overlay_owns_page_keys_before_global_keymap() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..80 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    app.transcript_scroll_from_bottom = 12;
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::NativeSelection,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+    )
+    .await
+    .expect("page down while overlay is open");
+
+    assert_eq!(
+        app.transcript_overlay.expect("overlay").scroll,
+        10,
+        "PageDown should scroll the Ctrl-T transcript overlay"
+    );
+    assert_eq!(
+        app.transcript_scroll_from_bottom, 12,
+        "PageDown must not scroll the underlying transcript while Ctrl-T is open"
+    );
+}
+
+#[tokio::test]
+async fn transcript_overlay_swallows_ctrl_x_queue_chord() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.prompt_queue.push_back("queued".to_string());
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-x while overlay is open");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("q while overlay is open");
+
+    assert!(
+        app.prompt_queue_overlay.is_none(),
+        "Ctrl-X Q must not open the queue overlay behind Ctrl-T"
+    );
+    assert!(
+        app.transcript_overlay.is_some(),
+        "Ctrl-T overlay should keep owning the key path"
+    );
+}
+
+#[tokio::test]
+async fn turn_completion_preserves_transcript_overlay_scrollbar_drag_mode() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+
+    drain_agent_events(&mut app).await;
+
+    assert!(app.turn_rx.is_none(), "turn should finish");
+    let overlay = app.transcript_overlay.expect("overlay should remain open");
+    assert!(
+        overlay.mode.mouse_capture(),
+        "turn completion must preserve explicit scrollbar drag mode"
+    );
+}
+
+#[tokio::test]
+async fn esc_still_closes_overlay_after_turn_completes_from_scrollbar_drag_mode() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc should be handled");
+
+    assert!(
+        app.transcript_overlay.is_none(),
+        "Esc should close Ctrl-T after turn completion"
+    );
+}
+
+#[tokio::test]
+async fn ctrl_c_still_reaches_exit_confirm_after_turn_completes_from_scrollbar_drag_mode() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-c should be handled");
+
+    assert!(!quit, "first Ctrl-C should arm exit confirm, not exit");
+    assert!(
+        app.exit_confirm_armed,
+        "Ctrl-C should still reach the global exit-confirm path"
     );
 }
 
@@ -9602,6 +10500,101 @@ fn transcript_overlay_renders_entries_uncollapsed() {
 }
 
 #[test]
+fn transcript_overlay_includes_pending_assistant_mid_turn() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("tell me a story"));
+    app.pending_reasoning = "planning the next line".to_string();
+    app.pending_assistant.push_delta("Once the lantern woke,");
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let lines = transcript_lines_for_overlay(&app, Some(100));
+    let rendered = lines_to_plain_text(&lines);
+
+    assert!(
+        rendered.contains("planning the next line"),
+        "overlay should show live reasoning while the turn streams: {rendered}"
+    );
+    assert!(
+        rendered.contains("Once the lantern woke,"),
+        "overlay should show live assistant text while the turn streams: {rendered}"
+    );
+}
+
+#[test]
+fn transcript_overlay_cache_invalidates_for_pending_stream_changes() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("tell me a story"));
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+    app.pending_assistant.push_delta("first live tail");
+
+    let first = lines_to_plain_text(&transcript_overlay_rows_for_render(&app, 80));
+    assert!(first.contains("first live tail"), "{first}");
+
+    app.pending_assistant.clear();
+    app.pending_assistant.push_delta("second live tail");
+
+    let second = lines_to_plain_text(&transcript_overlay_rows_for_render(&app, 80));
+    assert!(second.contains("second live tail"), "{second}");
+    assert!(
+        !second.contains("first live tail"),
+        "cached overlay rows must not hold stale live output: {second}"
+    );
+}
+
+#[test]
+fn transcript_overlay_cache_invalidates_for_width_changes() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant(
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa",
+    ));
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let narrow = transcript_overlay_rows_for_render(&app, 12).len();
+    let wide = transcript_overlay_rows_for_render(&app, 80).len();
+
+    assert!(
+        narrow > wide,
+        "narrow overlay rows should wrap into more visible rows: narrow={narrow}, wide={wide}"
+    );
+}
+
+#[test]
+fn transcript_overlay_repaint_clears_stale_characters() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+    app.push_transcript_item(TranscriptItem::assistant(
+        "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+    ));
+
+    let backend = TestBackend::new(64, 12);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render(frame, &app))
+        .expect("first draw");
+
+    app.transcript.clear();
+    app.push_transcript_item(TranscriptItem::assistant("ok"));
+    terminal
+        .draw(|frame| render(frame, &app))
+        .expect("second draw");
+
+    let buffer = terminal.backend().buffer();
+    let mut output = String::new();
+    for y in 0..12 {
+        for x in 0..64 {
+            output.push_str(buffer[(x, y)].symbol());
+        }
+        output.push('\n');
+    }
+
+    assert!(output.contains("ok"), "{output}");
+    assert!(
+        !output.contains("ZZZZ"),
+        "shorter overlay rows must clear stale characters from the prior frame: {output}"
+    );
+}
+
+#[test]
 fn transcript_overlay_renders_right_scrollbar_for_overflow() {
     let mut app = test_app(SessionMode::Build);
     for index in 0..40 {
@@ -9618,6 +10611,38 @@ fn transcript_overlay_renders_right_scrollbar_for_overflow() {
     assert!(
         output.contains('░'),
         "overflowing transcript overlay should render a scrollbar track: {output}"
+    );
+}
+
+#[test]
+fn transcript_overlay_keeps_status_footer_visible() {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..20 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let output = render_to_string(&app, 120, 18);
+
+    assert!(
+        output.contains("Transcript"),
+        "overlay frame missing: {output}"
+    );
+    assert!(
+        output.contains("Build mode (Shift+Tab to cycle)"),
+        "overlay should keep the mode/status row visible: {output}"
+    );
+    assert!(
+        output.contains("PgUp/PgDn/Wheel scroll"),
+        "overlay should keep the transcript hint row visible: {output}"
+    );
+    assert!(
+        output.contains("M scrollbar drag"),
+        "overlay should expose the scrollbar-drag toggle: {output}"
+    );
+    assert!(
+        output.contains("native select/copy"),
+        "overlay should default to native text selection: {output}"
     );
 }
 
@@ -9641,6 +10666,61 @@ fn transcript_overlay_scrollbar_click_maps_to_scroll_offset() {
     assert!(
         transcript_overlay_scroll_for_scrollbar_row(6, scrollbar_area, 100).expect("middle row")
             > 0
+    );
+}
+
+#[test]
+fn transcript_overlay_tool_cards_are_expanded_and_plain() {
+    let mut app = test_app(SessionMode::Build);
+    let body = (0..30)
+        .map(|i| format!("line-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body_len = body.len();
+    let call = ToolCall {
+        call_id: "read-1".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({"path": "src/lib.rs"}),
+    };
+    let result = ToolResult {
+        call_id: "read-1".to_string(),
+        tool_name: "read_file".to_string(),
+        status: ToolStatus::Success,
+        content: serde_json::json!({
+            "path": "src/lib.rs",
+            "bytes_returned": body_len,
+            "total_bytes": body_len,
+            "ranges": [{"start": 1, "end": 30}],
+            "content": body,
+        }),
+        cost_hint: ToolCostHint {
+            output_bytes: body_len as u64,
+            ..ToolCostHint::default()
+        },
+        receipt: ToolReceipt {
+            output_sha256: "abcdef1234567890".to_string(),
+            content_sha256: Some("0123456789abcdef".to_string()),
+        },
+        spill_model_output: None,
+    };
+    app.push_tool_result_with_call(result, Some(call));
+
+    let lines = transcript_lines_for_overlay(&app, Some(100));
+    let rendered = lines_to_plain_text(&lines);
+
+    assert!(
+        rendered.contains("line-14"),
+        "overlay transcript must include uncapped output: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Ctrl-T for full transcript"),
+        "{rendered}"
+    );
+    assert!(
+        lines.iter().all(|line| {
+            line.style.bg.is_none() && line.spans.iter().all(|span| span.style.bg.is_none())
+        }),
+        "overlay transcript should not carry card background tints: {lines:?}"
     );
 }
 
@@ -9872,14 +10952,14 @@ fn note_turn_started_marks_dirty_and_animation_active() {
 }
 
 #[test]
-fn focus_lost_freezes_animation_tick_and_active_animation_predicate() {
-    // The main loop drives `animation_tick` from a focused/unfocused
-    // gate (`if app.focused { app.animation_tick = … }`) and
-    // short-circuits `has_active_animation()` while the host terminal
-    // is unfocused. This test pins both halves of the contract.
+fn focus_lost_keeps_active_turn_spinner_animating_but_freezes_idle_motion() {
+    // The main loop freezes idle background motion while unfocused, but an
+    // in-flight turn must keep ticking so the first-prompt spinner does not
+    // park on one frame if the terminal reports a transient focus loss.
     let mut app = test_app(SessionMode::Build);
-    // Simulate a turn in flight: spinner + working title would
-    // normally keep the loop redrawing every iteration.
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+    app.cancel = Some(CancellationToken::new());
     app.turn_visual = TurnVisualState::Running;
     app.terminal_title_state = TerminalTitleState::Working;
     assert!(
@@ -9887,42 +10967,43 @@ fn focus_lost_freezes_animation_tick_and_active_animation_predicate() {
         "focused running turn must advertise an active animation"
     );
 
-    // FocusLost arrived. The animation gate clamps every motion
-    // signal so the main loop stops repainting and stops ticking
-    // the spinner driver until focus returns.
+    // FocusLost arrived during an active turn. The turn remains the driver, so
+    // the spinner and title animation keep advancing.
     app.focused = false;
     assert!(
-        !app.has_active_animation(),
-        "unfocused TUI must not advertise any active animation, even mid-turn"
+        app.has_active_animation(),
+        "unfocused active turn must still advertise an active animation"
     );
 
-    // Drive the loop body's animation-tick gate directly: the
-    // counter MUST NOT advance while unfocused, even across many
-    // iterations.
     let baseline = app.animation_tick;
     for _ in 0..32 {
-        if app.focused {
+        if should_advance_animation_tick(&app) {
             app.animation_tick = app.animation_tick.wrapping_add(1);
         }
     }
     assert_eq!(
-        app.animation_tick, baseline,
-        "no animation tick may fire while focus is lost"
+        app.animation_tick,
+        baseline + 32,
+        "active turn should keep the animation tick alive while unfocused"
     );
 
-    // FocusGained restores both signals.
-    app.focused = true;
+    let mut idle = test_app(SessionMode::Build);
+    idle.focused = false;
+    idle.turn_visual = TurnVisualState::Running;
+    idle.terminal_title_state = TerminalTitleState::Working;
     assert!(
-        app.has_active_animation(),
-        "refocus must re-arm the active-animation predicate"
+        !idle.has_active_animation(),
+        "unfocused idle UI should not keep background animation alive"
     );
-    if app.focused {
-        app.animation_tick = app.animation_tick.wrapping_add(1);
+    let idle_baseline = idle.animation_tick;
+    for _ in 0..32 {
+        if should_advance_animation_tick(&idle) {
+            idle.animation_tick = idle.animation_tick.wrapping_add(1);
+        }
     }
     assert_eq!(
-        app.animation_tick,
-        baseline + 1,
-        "tick driver must resume incrementing once focus returns"
+        idle.animation_tick, idle_baseline,
+        "idle animation tick should stay frozen while unfocused"
     );
 }
 
@@ -9942,22 +11023,77 @@ fn idle_prompt_coin_is_frozen_regardless_of_animation_tick() {
         );
         let span = prompt_coin_span(&app);
         assert_eq!(span.content.as_ref(), "●");
-        assert_eq!(span.style.fg, Some(crate::render::palette::AMBER));
+        assert_eq!(span.style.fg, Some(crate::render::theme::accent()));
     }
 }
 
 #[test]
-fn status_line_unset_keeps_legacy_two_row_layout() {
+fn status_line_unset_uses_builtin_colored_detail_items() {
     let app = test_app(SessionMode::Build);
-    // No /statusline configured ⇒ row 2 is the hints line, not a detail
-    // line. Existing users see no visible change until they opt in.
+    // No /statusline configured means "use the built-in detail list" with
+    // colors enabled by default. Row 2 remains the hints line.
     let lines = format_status_lines(&app, 120);
     assert_eq!(lines.len(), 2);
+    let row1: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        row1.contains("scripted:gpt-test"),
+        "default detail row should include provider:model: {row1}"
+    );
     assert!(row2.contains("Enter send"), "row 2 should be hints: {row2}");
     assert!(
-        !row2.contains("openai:"),
-        "row 2 should not include the detail line: {row2}"
+        !row1.contains("dir "),
+        "default detail row should replace the legacy dir/git prefix: {row1}"
+    );
+    assert!(row2.contains("Enter send"), "row 2 should be hints: {row2}");
+}
+
+#[test]
+fn status_line_empty_list_disables_detail_items() {
+    let mut app = test_app(SessionMode::Build);
+    app.status_line_items = Some(Vec::new());
+
+    let lines = format_status_lines(&app, 120);
+    assert_eq!(lines.len(), 2);
+    let row1: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        row1.contains("dir "),
+        "row 1 should fall back to legacy overview: {row1}"
+    );
+    assert!(
+        !row1.contains("scripted:gpt-test"),
+        "empty list should disable detail items: {row1}"
+    );
+    assert!(row2.contains("Enter send"), "row 2 should be hints: {row2}");
+}
+
+#[test]
+fn status_line_default_detail_truncates_before_mode_label() {
+    let mut app = test_app(SessionMode::Build);
+    app.directory =
+        "/very/long/workspace/path/that/should/not/push/the/mode/label/off/screen".to_string();
+
+    let lines = format_status_lines(&app, 80);
+    let row1: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+
+    assert!(
+        row1.contains("..."),
+        "long default detail row should be truncated: {row1}"
+    );
+    assert!(
+        row1.contains("Build mode (Shift+Tab to cycle)"),
+        "mode label must remain visible: {row1}"
+    );
+    let provider_span = lines[0]
+        .spans
+        .iter()
+        .find(|s| s.content.contains("scripted:gpt-test"))
+        .expect("provider span");
+    assert_eq!(
+        provider_span.style.fg,
+        Some(crate::render::theme::cyan()),
+        "unset status_line should still use the default colored detail row"
     );
 }
 
@@ -9996,7 +11132,7 @@ fn status_line_configured_replaces_overview_dir_and_branch() {
         .expect("provider span");
     assert_eq!(
         provider_span.style.fg,
-        Some(crate::render::palette::ACCENT_CYAN),
+        Some(crate::render::theme::cyan()),
         "provider-and-model should paint with the Model accent (cyan)"
     );
 }
@@ -10024,12 +11160,12 @@ fn status_line_languages_use_squeezy_amber() {
 
     assert_eq!(
         language_span.style.fg,
-        Some(AMBER),
+        Some(crate::render::theme::accent()),
         "languages should use Squeezy's darker brand accent"
     );
     assert_eq!(
         dir_span.style.fg,
-        Some(crate::render::palette::ACCENT_GREEN),
+        Some(crate::render::theme::green()),
         "other path-family status items should keep their existing color"
     );
 }

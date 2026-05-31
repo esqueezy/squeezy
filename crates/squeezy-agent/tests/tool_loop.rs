@@ -799,85 +799,81 @@ async fn mixed_subagent_kinds_track_cost_per_kind() {
 // subagent that emitted 5+ parallel tool calls in a single round would fill
 // the buffer and block forever on `send().await`. The drained-channel fix
 // must keep this case progressing.
-#[tokio::test]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "Windows default thread stack is 1MB; F10's buffer_unordered subagent dispatch \
-              exceeds it on win-x86_64 only. Real fix is to spawn the subagent fan-out on a \
-              dedicated tokio task with explicit Builder::new_multi_thread + thread_stack_size, \
-              tracked as a follow-up to F10-pi-parallel-and-chain-modes."
-)]
-async fn explore_subagent_with_many_parallel_tool_calls_does_not_deadlock() {
-    let root = temp_workspace("explore_subagent_high_fanout");
-    for index in 0..12 {
-        fs::write(root.join(format!("file{index}.rs")), b"// content\n").expect("write source");
-    }
-    let mut sub_round = vec![Ok(LlmEvent::Started)];
-    for index in 0..12 {
-        sub_round.push(Ok(LlmEvent::ToolCall(LlmToolCall {
-            call_id: format!("sub_read_{index}"),
-            name: "read_file".to_string(),
-            arguments: serde_json::json!({"path": format!("file{index}.rs")}),
-        })));
-    }
-    sub_round.push(Ok(LlmEvent::Completed {
-        response_id: Some("sub_tools".to_string()),
-        cost: CostSnapshot::default(),
-        stop_reason: None,
-        reasoning_only_stop: false,
-    }));
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "explore_call".to_string(),
-                name: "explore".to_string(),
-                arguments: serde_json::json!({"prompt": "Inspect all files"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("parent_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        sub_round,
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("brief".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("sub_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("done".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("parent_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
+#[test]
+fn explore_subagent_with_many_parallel_tool_calls_does_not_deadlock() {
+    run_high_stack_test(async {
+        let root = temp_workspace("explore_subagent_high_fanout");
+        const TOOL_CALLS: usize = 12;
+        for index in 0..TOOL_CALLS {
+            fs::write(root.join(format!("file{index}.rs")), b"// content\n").expect("write source");
+        }
+        let mut sub_round = vec![Ok(LlmEvent::Started)];
+        for index in 0..TOOL_CALLS {
+            sub_round.push(Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: format!("sub_read_{index}"),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": format!("file{index}.rs")}),
+            })));
+        }
+        sub_round.push(Ok(LlmEvent::Completed {
+            response_id: Some("sub_tools".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "explore_call".to_string(),
+                    name: "explore".to_string(),
+                    arguments: serde_json::json!({"prompt": "Inspect all files"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            sub_round,
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("brief".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("sub_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
 
-    let drain = drain_turn(agent.start_turn("research".to_string(), CancellationToken::new()));
-    // Give the subagent a generous wall-clock budget; before the fix the
-    // send().await inside the tool dispatcher blocked indefinitely.
-    tokio::time::timeout(std::time::Duration::from_secs(30), drain)
-        .await
-        .expect("subagent must not deadlock under high fan-out");
+        let drain = drain_turn(agent.start_turn("research".to_string(), CancellationToken::new()));
+        // Give the subagent a generous wall-clock budget; before the fix the
+        // send().await inside the tool dispatcher blocked indefinitely.
+        tokio::time::timeout(std::time::Duration::from_secs(30), drain)
+            .await
+            .expect("subagent must not deadlock under high fan-out");
 
-    let snapshot = agent.session_accounting_snapshot().await;
-    assert_eq!(snapshot.metrics.subagent_calls, 1);
-    assert_eq!(snapshot.metrics.subagent_failures, 0);
-    assert_eq!(snapshot.metrics.subagent_tool_calls, 12);
+        let snapshot = agent.session_accounting_snapshot().await;
+        assert_eq!(snapshot.metrics.subagent_calls, 1);
+        assert_eq!(snapshot.metrics.subagent_failures, 0);
+        assert_eq!(snapshot.metrics.subagent_tool_calls, TOOL_CALLS as u64);
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]

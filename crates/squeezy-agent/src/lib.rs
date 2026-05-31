@@ -126,7 +126,7 @@ const DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER: &str = "{previous}";
 /// budget. Eight steps is enough to thread a non-trivial multi-stage
 /// research workflow without letting the model commit the entire turn
 /// budget to one chain.
-const DELEGATE_CHAIN_MAX_STEPS: usize = 8;
+const DELEGATE_CHAIN_MAX_STEPS: usize = 16;
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
@@ -142,7 +142,8 @@ const SUBAGENT_JSON_TAIL_INSTRUCTION: &str = "Output contract: end your final as
 /// parent Agent. The registry rejects further `start()` calls until an
 /// in-flight subagent finishes (lease drops). Keeps fanout flat and
 /// predictable rather than letting a model spawn an unbounded swarm.
-const SUBAGENT_MAX_CONCURRENT: usize = 4;
+#[allow(dead_code)]
+const SUBAGENT_MAX_CONCURRENT: usize = squeezy_core::DEFAULT_SUBAGENT_MAX_CONCURRENT;
 // Compaction summary truncation budget — survivor policy chunk for the
 // SUMMARY_BLOCK family. Sister budgets live in `context_compaction.rs`;
 // this one stays here because it is *also* used by
@@ -1221,6 +1222,22 @@ pub struct PendingConfigSwap {
 impl Agent {
     pub fn new(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Self {
         let session_log = start_session_log(&config, provider.name());
+        Self::new_with_session_log(config, provider, session_log)
+    }
+
+    /// Build an agent without opening a durable session log.
+    ///
+    /// This is for local harnesses that need agent state transitions but do
+    /// not need a resumable session or session metadata on disk.
+    pub fn new_ephemeral(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Self {
+        Self::new_with_session_log(config, provider, None)
+    }
+
+    fn new_with_session_log(
+        config: AppConfig,
+        provider: Arc<dyn LlmProvider>,
+        session_log: Option<SessionHandle>,
+    ) -> Self {
         // Fresh sessions inherit the most-recent cross-session calibration so
         // the first round's estimator isn't stuck on per-provider defaults.
         // Missing or malformed files fall back to `TokenCalibration::default()`,
@@ -2821,8 +2838,6 @@ impl Agent {
             | DispatchCommand::Model
             | DispatchCommand::Plans { .. }
             | DispatchCommand::Copy { .. }
-            | DispatchCommand::Collapse { .. }
-            | DispatchCommand::Expand { .. }
             | DispatchCommand::Feedback { .. }
             | DispatchCommand::Report { .. }
             | DispatchCommand::Effort { .. }
@@ -3291,6 +3306,23 @@ impl Agent {
         cancel: CancellationToken,
         response_verbosity: ResponseVerbosity,
     ) -> mpsc::Receiver<AgentEvent> {
+        self.start_turn_with_display_input(
+            input.clone(),
+            input,
+            Vec::new(),
+            cancel,
+            response_verbosity,
+        )
+    }
+
+    pub fn start_turn_with_display_input(
+        &self,
+        display_input: String,
+        input: String,
+        transient_input_items: Vec<LlmInputItem>,
+        cancel: CancellationToken,
+        response_verbosity: ResponseVerbosity,
+    ) -> mpsc::Receiver<AgentEvent> {
         let (tx, rx) = mpsc::channel(128);
         let provider = self.provider.clone();
         let mut config = self.config.clone();
@@ -3333,6 +3365,11 @@ impl Agent {
             panic_telemetry,
             async move {
                 let redacted_input = redactor.redact(&input);
+                let redacted_display_input = if display_input == input {
+                    redacted_input.text.clone()
+                } else {
+                    redactor.redact(&display_input).text
+                };
                 let task_title = redacted_input.text.clone();
                 let failure_session_log = session_log.clone();
                 // Echo the user message into the TUI before kicking MCP
@@ -3341,7 +3378,7 @@ impl Agent {
                 if tx
                     .send(AgentEvent::UserMessage {
                         turn_id,
-                        message: TranscriptItem::user(redacted_input.text.clone()),
+                        message: TranscriptItem::user(redacted_display_input.clone()),
                     })
                     .await
                     .is_err()
@@ -3461,6 +3498,8 @@ impl Agent {
                     replay,
                     subagents,
                     hooks,
+                    display_input: redacted_display_input,
+                    transient_input_items,
                 }
                 .run(task_title.clone())
                 .await;
@@ -4350,6 +4389,8 @@ struct TurnRuntime {
     /// installed — the per-round LLM call site checks this before
     /// building a `HookContext`.
     hooks: Option<Arc<HookRegistry>>,
+    display_input: String,
+    transient_input_items: Vec<LlmInputItem>,
 }
 
 impl TurnRuntime {
@@ -4780,12 +4821,18 @@ impl TurnRuntime {
             self.dispatch_setup();
             self.dispatch_session_start();
         }
+        let original_input = input.clone();
+        let display_tracks_input = self.display_input == original_input;
+        let mut display_input = std::mem::take(&mut self.display_input);
         // UserPromptSubmit gives handlers a chance to rewrite the
         // user's input before any skill activation or routing. The
         // `mutate.prompt` field of any handler's reply replaces the
         // in-flight prompt; the chain runs in registration order so
         // later handlers see earlier rewrites.
         let input = self.dispatch_user_prompt_submit(input);
+        if display_tracks_input {
+            display_input = input.clone();
+        }
         let task_title = input.clone();
         let activation = self.tools.activate_skills_for_input(&input)?;
         let base_instructions = match self.tools.format_active_skills(&activation.skills) {
@@ -4825,8 +4872,10 @@ impl TurnRuntime {
             .filter(|attachment| attachment.is_active())
             .cloned()
             .collect::<Vec<_>>();
-        let user_transcript =
-            TranscriptItem::user(format_user_text_with_context(&input, &active_attachments));
+        let user_transcript = TranscriptItem::user(format_user_text_with_context(
+            &display_input,
+            &active_attachments,
+        ));
         // Redact at insertion time so the conversation upholds the
         // "already redacted" invariant. The per-round LLM request build
         // then sends `next_input` straight through without rebuilding
@@ -4846,7 +4895,8 @@ impl TurnRuntime {
         // `input_image`, Bedrock `ImageBlock`, …). The provider's
         // `ensure_vision_support` call then surfaces a structured
         // `ProviderRequest` error if the active model lacks vision.
-        let image_items = image_input_items_for_attachments(&active_attachments);
+        let mut image_items = image_input_items_for_attachments(&active_attachments);
+        image_items.extend(std::mem::take(&mut self.transient_input_items));
         // Upgrade any legacy conversation items resumed from disk so the
         // invariant holds for the rest of this turn. Idempotent and
         // cheap for items already in redacted form.
@@ -7278,7 +7328,7 @@ async fn run_subagent_dispatch(
     let lease = match context.subagents.start(
         kind.role().unwrap_or(SubagentRole::Explorer),
         child_cancel.clone(),
-        SUBAGENT_MAX_CONCURRENT,
+        context.config.subagents.max_concurrent.max(1),
         format!("{} starting", kind.as_str()),
     ) {
         Ok(lease) => lease,
@@ -9534,7 +9584,7 @@ async fn flush_delegate_batch(
             .await;
     }
 
-    let cap = SUBAGENT_MAX_CONCURRENT.max(1);
+    let cap = context.config.subagents.max_concurrent.max(1);
     let completions = futures_util::stream::iter(calls.into_iter().map(|(index, call, kind)| {
         let context = context.clone();
         async move {
@@ -11890,10 +11940,12 @@ fn attachment_shape(attachments: &[ContextAttachment]) -> AttachmentShape {
         ..AttachmentShape::default()
     };
     for attachment in attachments {
-        shape.stored_bytes += attachment.stored_bytes;
         shape.redactions += attachment.redactions;
         match attachment.status {
-            ContextAttachmentStatus::Attached => shape.active += 1,
+            ContextAttachmentStatus::Attached => {
+                shape.active += 1;
+                shape.stored_bytes += attachment.stored_bytes;
+            }
             ContextAttachmentStatus::Removed => shape.removed += 1,
             ContextAttachmentStatus::Unsupported => shape.unsupported += 1,
         }

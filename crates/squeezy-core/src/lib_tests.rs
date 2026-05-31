@@ -139,7 +139,7 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert!(config.hardening.deny_debug_attach);
     assert!(!config.store_responses);
     assert!(config.exploration_compiler);
-    assert_eq!(config.max_parallel_tools, 8);
+    assert_eq!(config.max_parallel_tools, DEFAULT_MAX_PARALLEL_TOOLS);
     assert_eq!(config.exa_mcp_url, DEFAULT_EXA_MCP_URL);
     assert_eq!(config.exa_api_key_env, DEFAULT_EXA_API_KEY_ENV);
     assert_eq!(
@@ -2861,7 +2861,7 @@ default_model = "project-default"
     )
     .expect("write project file");
 
-    let (settings, sources) = load_settings_from_paths(
+    let (settings, sources, warnings) = load_settings_from_paths(
         Some(user_path.as_path()),
         Some(project_path.as_path()),
         None,
@@ -2873,6 +2873,7 @@ default_model = "project-default"
     assert!(sources[1].contains("user.toml"));
     assert!(sources[2].starts_with("project:"));
     assert!(sources[2].contains("squeezy.toml"));
+    assert!(warnings.is_empty());
 
     let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
     assert_eq!(config.model, "project-model");
@@ -2918,7 +2919,7 @@ model = "repo-model"
     )
     .expect("write repo file");
 
-    let (settings, sources) = load_settings_from_paths(
+    let (settings, sources, warnings) = load_settings_from_paths(
         None,
         Some(project_path.as_path()),
         Some(repo_path.as_path()),
@@ -2928,6 +2929,7 @@ model = "repo-model"
     assert_eq!(sources[0], "defaults");
     assert!(sources[1].starts_with("project:"));
     assert!(sources[2].starts_with("repo:"));
+    assert!(warnings.is_empty());
     let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
     assert_eq!(config.model, "repo-model");
 
@@ -2949,7 +2951,7 @@ fn load_settings_from_paths_skips_missing_files() {
     let user_path = dir.join("does_not_exist.toml");
     let project_path = dir.join("also_missing.toml");
 
-    let (settings, sources) = load_settings_from_paths(
+    let (settings, sources, warnings) = load_settings_from_paths(
         Some(user_path.as_path()),
         Some(project_path.as_path()),
         Some(dir.join("repo_missing.toml").as_path()),
@@ -2957,6 +2959,7 @@ fn load_settings_from_paths_skips_missing_files() {
     .expect("merge sources");
 
     assert_eq!(sources, vec!["defaults".to_string()]);
+    assert!(warnings.is_empty());
     assert!(settings.providers.is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -3158,31 +3161,49 @@ fn resolve_field_source_returns_env_when_env_var_set() {
 }
 
 #[test]
-fn tui_theme_parses_lowercase_and_aliases_auto_to_system() {
-    assert_eq!(TuiTheme::parse("system"), Some(TuiTheme::System));
-    assert_eq!(TuiTheme::parse("dark"), Some(TuiTheme::Dark));
-    assert_eq!(TuiTheme::parse("light"), Some(TuiTheme::Light));
-    // `auto` is the historical / config-screen equivalent of "system".
-    assert_eq!(TuiTheme::parse("auto"), Some(TuiTheme::System));
-    // Named themes with distinct accent identities; aliases keep the slash
-    // command forgiving when users guess hyphen / underscore variants.
-    assert_eq!(TuiTheme::parse("catppuccin"), Some(TuiTheme::Catppuccin));
-    assert_eq!(TuiTheme::parse("mauve"), Some(TuiTheme::Catppuccin));
+fn tui_theme_names_normalize_aliases_and_custom_slugs() {
     assert_eq!(
-        TuiTheme::parse("high-contrast"),
-        Some(TuiTheme::HighContrast),
+        normalize_tui_theme_name("system").as_deref(),
+        Some("default")
+    );
+    assert_eq!(normalize_tui_theme_name("dark").as_deref(), Some("default"));
+    assert_eq!(normalize_tui_theme_name("light").as_deref(), Some("bright"));
+    assert_eq!(normalize_tui_theme_name("auto").as_deref(), Some("default"));
+    assert_eq!(
+        normalize_tui_theme_name("catppuccin").as_deref(),
+        Some("catppuccin")
     );
     assert_eq!(
-        TuiTheme::parse("high_contrast"),
-        Some(TuiTheme::HighContrast),
+        normalize_tui_theme_name("mauve").as_deref(),
+        Some("catppuccin")
     );
-    assert_eq!(TuiTheme::parse("hc"), Some(TuiTheme::HighContrast));
-    // Whitespace and uppercase are tolerated so users typing `/theme Dark`
-    // hit the same branch as the canonical `/theme dark` form.
-    assert_eq!(TuiTheme::parse("  Dark  "), Some(TuiTheme::Dark));
-    assert_eq!(TuiTheme::parse("LIGHT"), Some(TuiTheme::Light));
-    assert_eq!(TuiTheme::parse("solarized"), None);
-    assert_eq!(TuiTheme::parse(""), None);
+    assert_eq!(
+        normalize_tui_theme_name("high-contrast").as_deref(),
+        Some("high-contrast"),
+    );
+    assert_eq!(
+        normalize_tui_theme_name("high_contrast").as_deref(),
+        Some("high-contrast"),
+    );
+    assert_eq!(
+        normalize_tui_theme_name("hc").as_deref(),
+        Some("high-contrast")
+    );
+    assert_eq!(
+        normalize_tui_theme_name("  Dark  ").as_deref(),
+        Some("default")
+    );
+    assert_eq!(normalize_tui_theme_name("LIGHT").as_deref(), Some("bright"));
+    assert_eq!(
+        normalize_tui_theme_name("solarized").as_deref(),
+        Some("solarized")
+    );
+    assert_eq!(
+        normalize_tui_theme_name("my_theme").as_deref(),
+        Some("my-theme")
+    );
+    assert_eq!(normalize_tui_theme_name(""), None);
+    assert_eq!(normalize_tui_theme_name("bad theme!"), None);
 }
 
 #[test]
@@ -3190,70 +3211,87 @@ fn tui_theme_round_trips_through_settings_toml() {
     let parsed = SettingsFile::from_toml_str(
         r#"
 [tui]
-theme = "dark"
+theme = "solarized"
+
+[tui.themes.solarized.colors]
+palette.accent = [1, 2, 3]
+ui.foreground = [250, 251, 252]
 "#,
         "test",
     )
     .expect("settings parse");
     let config = AppConfig::from_settings_and_env_vars(parsed, |_| None);
-    assert_eq!(config.tui.theme, TuiTheme::Dark);
+    assert_eq!(config.tui.theme, "solarized");
+    assert_eq!(
+        config
+            .tui
+            .themes
+            .get("solarized")
+            .and_then(|theme| theme.colors.get("palette.accent"))
+            .copied(),
+        Some([1, 2, 3])
+    );
+    assert_eq!(
+        config
+            .tui
+            .themes
+            .get("solarized")
+            .and_then(|theme| theme.colors.get("ui.foreground"))
+            .copied(),
+        Some([250, 251, 252])
+    );
 
     // Emit and re-parse to confirm the writer persists the field.
     let emitted = config.inspect_redacted();
     assert!(
-        emitted.contains("theme = \"dark\""),
+        emitted.contains("theme = \"solarized\""),
         "inspect should emit the theme leaf, got: {emitted}"
+    );
+    assert!(
+        emitted.contains("\"palette.accent\" = [1, 2, 3]"),
+        "inspect should emit theme color overrides, got: {emitted}"
     );
     let reparsed = SettingsFile::from_toml_str(&emitted, "round trip").expect("inspect re-parse");
     let reloaded = AppConfig::from_settings_and_env_vars(reparsed, |_| None);
-    assert_eq!(reloaded.tui.theme, TuiTheme::Dark);
+    assert_eq!(reloaded.tui.theme, "solarized");
+    assert_eq!(
+        reloaded
+            .tui
+            .themes
+            .get("solarized")
+            .and_then(|theme| theme.colors.get("palette.accent"))
+            .copied(),
+        Some([1, 2, 3])
+    );
 }
 
 #[test]
-fn tui_theme_as_str_round_trips_through_parse_for_every_variant() {
-    for theme in [
-        TuiTheme::System,
-        TuiTheme::Dark,
-        TuiTheme::Light,
-        TuiTheme::Catppuccin,
-        TuiTheme::HighContrast,
-    ] {
-        let s = theme.as_str();
-        assert_eq!(
-            TuiTheme::parse(s),
-            Some(theme),
-            "as_str→parse must round-trip for {theme:?} (got {s:?})",
-        );
-    }
-}
-
-#[test]
-fn tui_theme_defaults_to_system_when_unset() {
+fn tui_theme_defaults_to_default_when_unset() {
     let parsed =
         SettingsFile::from_toml_str("[tui]\ntick_rate_ms = 50\n", "test").expect("settings parse");
     let config = AppConfig::from_settings_and_env_vars(parsed, |_| None);
-    assert_eq!(config.tui.theme, TuiTheme::System);
+    assert_eq!(config.tui.theme, DEFAULT_TUI_THEME_NAME);
 }
 
 #[test]
-fn tui_theme_rejects_unknown_string() {
+fn tui_theme_rejects_invalid_name() {
     let result = SettingsFile::from_toml_str(
         r#"
 [tui]
-theme = "solarized"
+theme = "bad theme!"
 "#,
         "test",
     );
     let err = result.expect_err("invalid theme should be rejected");
     let msg = err.to_string();
     assert!(
-        msg.contains("invalid TUI theme") || msg.contains("solarized"),
+        msg.contains("invalid TUI theme") || msg.contains("bad theme"),
         "expected invalid-theme diagnostic, got: {msg}"
     );
 }
 
 #[test]
-fn unknown_fields_are_warned_and_removed_from_settings_file() {
+fn unknown_fields_are_ignored_warned_and_preserved_in_settings_file() {
     let dir = std::env::temp_dir().join(format!(
         "squeezy-unknown-fields-{}-{}",
         std::process::id(),
@@ -3272,18 +3310,44 @@ fn unknown_fields_are_warned_and_removed_from_settings_file() {
     )
     .expect("write seed settings");
 
-    let (_settings, _sources) =
+    let (settings, sources, warnings) =
         SettingsFile::load_optional_source(&path, "test").expect("load_optional_source");
 
-    let cleaned = std::fs::read_to_string(&path).expect("read cleaned settings");
+    assert_eq!(
+        settings.tui.as_ref().and_then(|tui| tui.tick_rate_ms),
+        Some(100)
+    );
+    assert_eq!(
+        sources,
+        vec!["defaults".to_string(), format!("test:{}", path.display())]
+    );
+    assert_eq!(
+        warnings,
+        vec![ConfigWarning {
+            source: format!("test:{}", path.display()),
+            field: "tui.legacy_widget_padding".to_string(),
+        }]
+    );
+
+    let cleaned = std::fs::read_to_string(&path).expect("read settings");
     assert!(
-        !cleaned.contains("legacy_widget_padding"),
-        "unknown key should be stripped, got: {cleaned}"
+        cleaned.contains("legacy_widget_padding"),
+        "unknown key should be preserved while ignored, got: {cleaned}"
     );
     assert!(
         cleaned.contains("tick_rate_ms = 100"),
         "known key should be preserved, got: {cleaned}"
     );
+
+    let config = AppConfig::try_from_settings_and_env_vars_with_sources_and_warnings(
+        settings,
+        sources,
+        warnings.clone(),
+        None,
+        |_| None,
+    )
+    .expect("config loads with unknown field warnings");
+    assert_eq!(config.config_warnings, warnings);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

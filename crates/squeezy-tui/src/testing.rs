@@ -60,7 +60,7 @@ impl TuiHarness {
         height: u16,
         settings_path_override: Option<PathBuf>,
     ) -> Result<Self> {
-        apply_theme_overrides(config.tui.theme);
+        apply_theme_overrides(&config);
         // Mirror production (`crates/squeezy-tui/src/lib.rs:525`): the
         // banner / status-line provider label comes from the live
         // provider, not a harness literal. `Agent::provider_name()` is
@@ -264,8 +264,8 @@ impl TuiHarness {
     /// composer would take. This is the only way to exercise
     /// `DispatchOutcome::TuiOnly` commands (`/config`, `/model`,
     /// `/permissions`, `/effort`, `/verbosity`, `/tool-verbosity`,
-    /// `/theme`, `/statusline`, `/keymap`, `/collapse`, `/expand`,
-    /// `/copy`, `/help`, etc.) from an eval driver — those commands
+    /// `/theme`, `/statusline`, `/keymap`, `/copy`, `/help`, etc.)
+    /// from an eval driver — those commands
     /// short-circuit `Agent::dispatch_command_raw` and never reach the
     /// TUI.
     ///
