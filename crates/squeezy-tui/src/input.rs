@@ -115,8 +115,8 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         &[PermissionCapability::Network],
     ),
     slash_args_caps(
-        "/options",
-        "open options (or pass a section name)",
+        "/config",
+        "open config (or pass a section name)",
         true,
         "[section]",
         &[PermissionCapability::Edit],
@@ -180,7 +180,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     ),
     slash_args(
         "/expand",
-        "expand transcript entries (default: all)",
+        "open full transcript; args expand entries inline",
         true,
         "[all|tools|logs|diffs|receipts|assistant|reasoning]",
     ),
@@ -198,7 +198,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     slash_args("/unpin", "remove pinned context", false, "<id>"),
     slash_caps(
         "/feedback",
-        "preview or send product feedback",
+        "preview feedback and ask to send",
         true,
         &[PermissionCapability::Network],
     ),
@@ -929,24 +929,32 @@ pub(crate) fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> 
     };
     let choice_count = pending.request.choices.len();
     let allow_freeform = pending.request.allow_freeform;
+    let max_selection = if allow_freeform {
+        choice_count
+    } else {
+        choice_count.saturating_sub(1)
+    };
     match key.code {
         KeyCode::Up => {
-            if choice_count > 0 {
+            if choice_count > 0 || allow_freeform {
                 pending.selection_index = pending.selection_index.saturating_sub(1);
             }
             app.pending_request_user_input = Some(pending);
             true
         }
         KeyCode::Down => {
-            if choice_count > 0 {
-                pending.selection_index =
-                    (pending.selection_index + 1).min(choice_count.saturating_sub(1));
+            if choice_count > 0 || allow_freeform {
+                pending.selection_index = (pending.selection_index + 1).min(max_selection);
             }
             app.pending_request_user_input = Some(pending);
             true
         }
         KeyCode::Enter => {
-            if allow_freeform && !pending.answer.trim().is_empty() {
+            if allow_freeform && pending.selection_index >= choice_count {
+                if pending.answer.trim().is_empty() {
+                    app.pending_request_user_input = Some(pending);
+                    return true;
+                }
                 let text = std::mem::take(&mut pending.answer);
                 pending.answer_cursor = 0;
                 let _ = pending
@@ -975,21 +983,25 @@ pub(crate) fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> 
             true
         }
         KeyCode::Backspace if allow_freeform => {
+            pending.selection_index = choice_count;
             delete_answer_before_cursor(&mut pending);
             app.pending_request_user_input = Some(pending);
             true
         }
         KeyCode::Delete if allow_freeform => {
+            pending.selection_index = choice_count;
             delete_answer_at_cursor(&mut pending);
             app.pending_request_user_input = Some(pending);
             true
         }
         KeyCode::Left if allow_freeform => {
+            pending.selection_index = choice_count;
             move_answer_cursor_left(&mut pending);
             app.pending_request_user_input = Some(pending);
             true
         }
         KeyCode::Right if allow_freeform => {
+            pending.selection_index = choice_count;
             move_answer_cursor_right(&mut pending);
             app.pending_request_user_input = Some(pending);
             true
@@ -998,6 +1010,7 @@ pub(crate) fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> 
             if allow_freeform
                 && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
         {
+            pending.selection_index = choice_count;
             insert_answer_char(&mut pending, ch);
             app.pending_request_user_input = Some(pending);
             true

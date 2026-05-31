@@ -11,7 +11,7 @@ use squeezy_core::{
     ContextAttachmentStatus, ContextEstimate, CostSnapshot, PermissionCapability, PermissionMode,
     PermissionPolicy, PermissionRequest, PermissionRisk, PermissionScope, SessionMode,
     StatusVerbosity, TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus,
-    TaskVerificationState, ToolOutputVerbosity, TuiAlternateScreen, TuiConfig,
+    TaskVerificationState, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen, TuiConfig,
     TuiSynchronizedOutput, TurnId, TurnMetrics,
 };
 use squeezy_llm::UnavailableProvider;
@@ -213,7 +213,7 @@ async fn freeform_modal_keeps_typing_out_of_main_composer() {
 }
 
 #[tokio::test]
-async fn freeform_modal_enter_submits_typed_answer_before_selected_choice() {
+async fn freeform_modal_enter_submits_dotted_choice_even_with_typed_answer() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Plan);
     let request = RequestUserInputRequest {
@@ -242,9 +242,147 @@ async fn freeform_modal_enter_submits_typed_answer_before_selected_choice() {
     .expect("handle enter");
 
     let response = response_rx.await.expect("response");
+    assert_eq!(response.choice_value.as_deref(), Some("default"));
+    assert_eq!(response.freeform, None);
+    assert!(app.pending_request_user_input.is_none());
+}
+
+#[tokio::test]
+async fn freeform_modal_typing_moves_dot_to_answer_row() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Plan);
+    let request = RequestUserInputRequest {
+        question: "Where to next?".to_string(),
+        choices: vec![squeezy_agent::RequestUserInputChoice {
+            label: "Default".to_string(),
+            value: "default".to_string(),
+        }],
+        allow_freeform: true,
+    };
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 0,
+        answer: String::new(),
+        answer_cursor: 0,
+    });
+
+    for ch in "typed answer".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("handle char");
+    }
+    assert_eq!(
+        app.pending_request_user_input
+            .as_ref()
+            .expect("pending")
+            .selection_index,
+        1,
+        "typing should move the dot to the freeform Answer row",
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle enter");
+
+    let response = response_rx.await.expect("response");
     assert_eq!(response.choice_value, None);
     assert_eq!(response.freeform.as_deref(), Some("typed answer"));
-    assert!(app.pending_request_user_input.is_none());
+}
+
+#[tokio::test]
+async fn freeform_modal_up_from_answer_ignores_typed_text_on_enter() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Plan);
+    let request = RequestUserInputRequest {
+        question: "Where to next?".to_string(),
+        choices: vec![squeezy_agent::RequestUserInputChoice {
+            label: "Default".to_string(),
+            value: "default".to_string(),
+        }],
+        allow_freeform: true,
+    };
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 1,
+        answer: "typed answer".to_string(),
+        answer_cursor: "typed answer".len(),
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle up");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle enter");
+
+    let response = response_rx.await.expect("response");
+    assert_eq!(response.choice_value.as_deref(), Some("default"));
+    assert_eq!(response.freeform, None);
+}
+
+#[tokio::test]
+async fn freeform_modal_down_reaches_answer_row_after_last_choice() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Plan);
+    let request = RequestUserInputRequest {
+        question: "Where to next?".to_string(),
+        choices: vec![
+            squeezy_agent::RequestUserInputChoice {
+                label: "First".to_string(),
+                value: "first".to_string(),
+            },
+            squeezy_agent::RequestUserInputChoice {
+                label: "Second".to_string(),
+                value: "second".to_string(),
+            },
+        ],
+        allow_freeform: true,
+    };
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 1,
+        answer: String::new(),
+        answer_cursor: 0,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle down");
+
+    assert_eq!(
+        app.pending_request_user_input
+            .as_ref()
+            .expect("pending")
+            .selection_index,
+        2,
+        "Down from the last choice should select the freeform Answer row",
+    );
 }
 
 #[tokio::test]
@@ -633,6 +771,75 @@ async fn wheel_scroll_works_in_inline_mode() {
         },
     );
     assert_eq!(app.transcript_scroll_from_bottom, 0);
+}
+
+#[tokio::test]
+async fn wheel_scroll_targets_transcript_overlay_when_open() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(
+        app.transcript_overlay.expect("overlay").scroll,
+        3,
+        "wheel down must scroll the full transcript overlay"
+    );
+    assert_eq!(
+        app.transcript_scroll_from_bottom, 0,
+        "overlay wheel events must not scroll the underlying transcript"
+    );
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(app.transcript_overlay.expect("overlay").scroll, 0);
+}
+
+#[tokio::test]
+async fn transcript_overlay_mouse_is_modal() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+    app.register_click(
+        Rect {
+            x: 0,
+            y: 4,
+            width: 80,
+            height: 1,
+        },
+        ClickAction::ToggleQueueOverlay,
+    );
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 5,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        app.prompt_queue_overlay.is_none(),
+        "overlay mouse events must not click through to the underlying UI"
+    );
 }
 
 #[tokio::test]
@@ -1447,10 +1654,10 @@ async fn slash_plan_with_trailing_space_still_switches_mode() {
 }
 
 #[tokio::test]
-async fn slash_options_opens_screen() {
+async fn slash_config_opens_screen() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/options".to_string());
+    set_input(&mut app, "/config".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -1462,10 +1669,10 @@ async fn slash_options_opens_screen() {
 }
 
 #[tokio::test]
-async fn slash_config_legacy_alias_opens_screen() {
+async fn slash_options_legacy_alias_opens_screen() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/config".to_string());
+    set_input(&mut app, "/options".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -3336,6 +3543,23 @@ async fn slash_collapse_and_expand_apply_to_tool_entries() {
     assert!(app.transcript[0].collapsed);
 }
 
+#[tokio::test]
+async fn bare_slash_expand_opens_full_transcript_overlay() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    app.transcript[0].collapsed = true;
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/expand").await);
+
+    assert!(app.transcript_overlay.is_some());
+    assert_eq!(app.status, "full transcript open");
+    assert!(
+        app.transcript[0].collapsed,
+        "bare /expand should not pretend it can rewrite inline scrollback"
+    );
+}
+
 #[test]
 fn tool_output_verbosity_changes_preview_length() {
     let result = sample_tool_result("grep", &"x".repeat(1_000));
@@ -3427,6 +3651,74 @@ fn shell_tool_rows_show_command_and_highlight_output() {
     );
     assert!(output.contains("ok"), "{output}");
     assert!(!output.contains("\\u001b"), "{output}");
+}
+
+#[test]
+fn failed_rustfmt_output_uses_diff_background_not_colored_text() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("shell", "");
+    result.status = ToolStatus::Error;
+    result.content = serde_json::json!({
+        "command": "cargo fmt --check",
+        "workdir": ".",
+        "exit_code": 1,
+        "stdout": concat!(
+            "Diff in /tmp/project/src/lib.rs:1:\n",
+            "fn demo() {\n",
+            "\u{1b}[31m-    old_call();\u{1b}(B\u{1b}[m\n",
+            "\u{1b}[32m+    new_call();\u{1b}(B\u{1b}[m\n",
+        ),
+        "stderr": "",
+    });
+    app.push_tool_result(result);
+
+    let lines = format_transcript_entry_with_width(
+        &app.transcript[0],
+        false,
+        ToolOutputVerbosity::Normal,
+        MessageOutcome::Normal,
+        Some(140),
+        true,
+    );
+    let rendered = lines_to_plain_text(&lines);
+    assert!(
+        rendered.contains("Diff in /tmp/project/src/lib.rs:1:"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("(B+"), "{rendered}");
+    assert!(!rendered.contains("(B-"), "{rendered}");
+
+    let add_line = lines
+        .iter()
+        .find(|line| rendered_line_text(line).contains("+    new_call();"))
+        .expect("add line");
+    assert!(
+        add_line.style.bg.is_some(),
+        "add line should carry a row background: {add_line:?}"
+    );
+    let add_sign = add_line
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "+")
+        .expect("add sign");
+    assert_eq!(add_sign.style.fg, None);
+    assert!(add_sign.style.bg.is_some());
+
+    let del_line = lines
+        .iter()
+        .find(|line| rendered_line_text(line).contains("-    old_call();"))
+        .expect("delete line");
+    assert!(
+        del_line.style.bg.is_some(),
+        "delete line should carry a row background: {del_line:?}"
+    );
+    let del_sign = del_line
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "-")
+        .expect("delete sign");
+    assert_eq!(del_sign.style.fg, None);
+    assert!(del_sign.style.bg.is_some());
 }
 
 #[test]
@@ -3580,6 +3872,82 @@ fn tool_rows_summarize_diff_glob_read_and_plan_outputs() {
 }
 
 #[test]
+fn read_tool_output_summary_names_saved_tool_without_raw_json() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("read_tool_output", "");
+    result.content = serde_json::json!({
+        "handle": "abc123",
+        "bytes_returned": 128,
+        "total_bytes": 4096,
+        "truncated": true,
+        "content": "{\"call_id\":\"call-1\",\"tool_name\":\"diff_context\",\"status\":\"Success\",\"content\":{\"files\":[{\"path\":\"src/lib.rs\""
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 140, 12);
+
+    assert!(
+        output.contains("✔ Explored expand saved diff context · 128B · partial result"),
+        "{output}"
+    );
+    assert!(output.contains("saved diff context"), "{output}");
+    assert!(
+        output.contains("content saved tool-result JSON (partial; hidden in normal mode)"),
+        "{output}"
+    );
+    assert!(!output.contains("\"tool_name\""), "{output}");
+    assert!(!output.contains("\"files\""), "{output}");
+}
+
+#[test]
+fn read_tool_output_hides_cargo_json_artifacts_in_normal_mode() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("read_tool_output", "");
+    result.content = serde_json::json!({
+        "handle": "cargo-json",
+        "bytes_returned": 256,
+        "total_bytes": 1024,
+        "truncated": true,
+        "content": concat!(
+            "{\"reason\":\"compiler-artifact\",\"package_id\":\"registry+https://github.com/rust-lang/crates.io-index#libc@0.2.184\"}\n",
+            "{\"reason\":\"build-script-executed\",\"package_id\":\"registry+https://github.com/rust-lang/crates.io-index#libc@0.2.184\"}\n",
+            "{\"reason\":\"compiler-message\",\"message\":{\"rendered\":\"error[E0308]: mismatched types\\n  --> src/lib.rs:1:1\\n\"}}\n",
+            "===== stderr =====\n",
+            "   Compiling demo v0.1.0 (/tmp/demo)\n",
+            "error: could not compile `demo` due to 1 previous error\n",
+        )
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 140, 18);
+
+    assert!(
+        output.contains("✔ Explored expand saved compiler output · 256B · partial result"),
+        "{output}"
+    );
+    assert!(output.contains("saved compiler output"), "{output}");
+    assert!(output.contains("compiler messages"), "{output}");
+    assert!(
+        output.contains("error[E0308]: mismatched types"),
+        "{output}"
+    );
+    assert!(output.contains("stderr"), "{output}");
+    assert!(
+        output.contains("error: could not compile `demo` due to 1 previous error"),
+        "{output}"
+    );
+    assert!(
+        output.contains("compiler JSON hidden in normal mode"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("\"reason\":\"compiler-artifact\""),
+        "{output}"
+    );
+    assert!(!output.contains("\"package_id\""), "{output}");
+}
+
+#[test]
 fn edit_tool_row_summarizes_checkpoint_diff_and_expands_patch() {
     let mut app = test_app(SessionMode::Build);
     let mut result = sample_tool_result("apply_patch", "");
@@ -3696,6 +4064,124 @@ fn collapsed_edit_row_shows_diff_preview() {
 }
 
 #[test]
+fn edit_row_uses_apply_patch_unified_diff_when_checkpoint_is_absent() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("apply_patch", "");
+    result.content = serde_json::json!({
+        "files": [{
+            "after_sha256": "after",
+            "before_sha256": "before",
+            "bytes_after": 20,
+            "bytes_before": 10,
+            "changed": true,
+            "path": "src/cli/paths.rs"
+        }],
+        "unified_diff": "--- a/src/cli/paths.rs\n+++ b/src/cli/paths.rs\n@@ -1,3 +1,4 @@\n unchanged\n-old\n+new\n+added\n"
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 140, 16);
+
+    assert!(
+        output.contains("✔ Edited src/cli/paths.rs · +2 -1"),
+        "{output}"
+    );
+    assert!(output.contains("file src/cli/paths.rs +2 -1"), "{output}");
+    assert!(output.contains("-old"), "{output}");
+    assert!(output.contains("+new"), "{output}");
+    assert!(
+        !output.contains("\"unified_diff\""),
+        "renderer should show the diff, not raw JSON: {output}"
+    );
+}
+
+#[test]
+fn write_file_new_file_preview_uses_call_content() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("write_file", "");
+    result.call_id = "write-1".to_string();
+    result.content = serde_json::json!({
+        "path": "src/process_info.rs",
+        "before_sha256": null,
+        "after_sha256": "after",
+        "bytes_written": 25,
+        "noop": false
+    });
+    app.push_tool_result_with_call(
+        result,
+        Some(ToolCall {
+            call_id: "write-1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "src/process_info.rs",
+                "content": "fn new_process_info() {}\n"
+            }),
+        }),
+    );
+
+    let output = render_to_string(&app, 140, 16);
+
+    assert!(
+        output.contains("✔ Edited src/process_info.rs · +1 -0"),
+        "{output}"
+    );
+    assert!(
+        output.contains("file src/process_info.rs +1 -0"),
+        "{output}"
+    );
+    assert!(output.contains("+fn new_process_info() {}"), "{output}");
+    assert!(
+        !output.contains("\"bytes_written\""),
+        "renderer should show the write preview, not raw JSON: {output}"
+    );
+}
+
+#[test]
+fn write_file_existing_file_without_diff_does_not_show_fake_all_add() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("write_file", "");
+    result.call_id = "write-1".to_string();
+    result.content = serde_json::json!({
+        "path": "src/cli/commands/init.rs",
+        "before_sha256": "before",
+        "after_sha256": "after",
+        "bytes_written": 2048,
+        "noop": false
+    });
+    app.push_tool_result_with_call(
+        result,
+        Some(ToolCall {
+            call_id: "write-1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "src/cli/commands/init.rs",
+                "content": "line\n".repeat(200)
+            }),
+        }),
+    );
+
+    let output = render_to_string(&app, 140, 16);
+
+    assert!(
+        output.contains("✔ Edited src/cli/commands/init.rs"),
+        "{output}"
+    );
+    assert!(output.contains("file src/cli/commands/init.rs"), "{output}");
+    assert!(
+        !output.contains("+200 -0"),
+        "existing-file write_file without an actual diff must not look like a full-file add: {output}"
+    );
+    assert!(
+        !output.contains("+line"),
+        "existing-file write_file without an actual diff must not render the replacement body as a fake add diff: {output}"
+    );
+    assert!(
+        !output.contains("\"bytes_written\""),
+        "renderer should not fall back to raw JSON: {output}"
+    );
+}
+
+#[test]
 fn edit_diff_preview_uses_dedicated_diff_colors() {
     let mut app = test_app(SessionMode::Build);
     let mut result = sample_tool_result("apply_patch", "");
@@ -3725,34 +4211,33 @@ fn edit_diff_preview_uses_dedicated_diff_colors() {
     assert!(!rendered.contains("index 123"), "{rendered}");
 
     // Patch content is "old" / "new" — short strings that the highlighter
-    // labels as plain identifiers, so the sign + body fall back to the
-    // diff-foreground color. The bg tint, however, is always applied on
-    // +/- rows.
+    // labels as plain identifiers, so the sign + body keep the default
+    // foreground. The row background is what carries the diff state.
     let add_sign = lines
         .iter()
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.as_ref() == "+")
         .expect("add sign span");
-    assert_eq!(
-        add_sign.style.fg,
-        Some(render::palette::best_color(
-            render::palette::rgb_components(DIFF_ADD_FG,)
-        ))
-    );
+    assert_eq!(add_sign.style.fg, None);
     assert_eq!(add_sign.style.bg, Some(render::diff::diff_add_bg()));
+    let add_line = lines
+        .iter()
+        .find(|line| line.spans.iter().any(|span| span.content.as_ref() == "+"))
+        .expect("add line");
+    assert_eq!(add_line.style.bg, Some(render::diff::diff_add_bg()));
 
     let del_sign = lines
         .iter()
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.as_ref() == "-")
         .expect("delete sign span");
-    assert_eq!(
-        del_sign.style.fg,
-        Some(render::palette::best_color(
-            render::palette::rgb_components(DIFF_DEL_FG,)
-        ))
-    );
+    assert_eq!(del_sign.style.fg, None);
     assert_eq!(del_sign.style.bg, Some(render::diff::diff_del_bg()));
+    let del_line = lines
+        .iter()
+        .find(|line| line.spans.iter().any(|span| span.content.as_ref() == "-"))
+        .expect("delete line");
+    assert_eq!(del_line.style.bg, Some(render::diff::diff_del_bg()));
 }
 
 #[test]
@@ -3859,13 +4344,100 @@ fn plan_mode_question_renders_with_choices_and_freeform_hint() {
         "first choice missing: {output}"
     );
     assert!(
-        output.contains("› Keep the current layout"),
+        output.contains("● Keep the current layout"),
         "selected marker missing on second choice: {output}"
     );
     assert!(
         output.contains("freeform"),
         "freeform hint missing: {output}"
     );
+}
+
+#[test]
+fn plan_mode_question_marks_freeform_answer_when_selected() {
+    let request = RequestUserInputRequest {
+        question: "Which path?".to_string(),
+        choices: vec![
+            RequestUserInputChoice {
+                label: "Use src/main.rs as the representative file".to_string(),
+                value: "src/main.rs".to_string(),
+            },
+            RequestUserInputChoice {
+                label: "Pick a different Rust file for me".to_string(),
+                value: "other".to_string(),
+            },
+            RequestUserInputChoice {
+                label: "I want a broader modernization pass, not one file".to_string(),
+                value: "broader".to_string(),
+            },
+        ],
+        allow_freeform: true,
+    };
+
+    let lines = format_request_user_input_menu_lines(&request, request.choices.len(), "lm");
+    let answer = lines
+        .iter()
+        .find(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref() == "Answer › ")
+        })
+        .expect("answer row");
+    let marker = answer
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "● ")
+        .expect("answer marker");
+    assert_eq!(marker.style.fg, Some(AMBER));
+    assert!(
+        answer
+            .spans
+            .iter()
+            .any(|span| span.content.as_ref() == "lm"),
+        "typed answer should remain visible on the selected answer row",
+    );
+}
+
+#[test]
+fn plan_mode_question_selected_choice_uses_amber_dot_not_yellow_label() {
+    let request = RequestUserInputRequest {
+        question: "For the modernization pass, should I keep it strict?".to_string(),
+        choices: vec![
+            RequestUserInputChoice {
+                label: "Behavior-preserving only".to_string(),
+                value: "behavior_preserving".to_string(),
+            },
+            RequestUserInputChoice {
+                label: "Allow small internal cleanup".to_string(),
+                value: "small_cleanup".to_string(),
+            },
+        ],
+        allow_freeform: false,
+    };
+
+    let lines = format_request_user_input_menu_lines(&request, 0, "");
+    let selected = lines
+        .iter()
+        .find(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref() == "Behavior-preserving only")
+        })
+        .expect("selected choice line");
+    let marker = selected
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "● ")
+        .expect("selected marker");
+    assert_eq!(marker.style.fg, Some(AMBER));
+
+    let label = selected
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "Behavior-preserving only")
+        .expect("selected label");
+    assert_ne!(label.style.fg, Some(GOLD));
+    assert_ne!(label.style.fg, Some(AMBER));
 }
 
 #[test]
@@ -3942,9 +4514,8 @@ fn diff_render_colorizes_gutter() {
     };
 
     let lines = render::diff::render_diff_file(&file);
-    // The sign character carries the line's foreground colour; gutter,
-    // sign and content are split into separate spans so per-token syntax
-    // highlighting can attach colours to the body.
+    // The sign character is split from the body so the diff background can
+    // cover the whole row without coloring text red/green.
     let add_sign = lines
         .iter()
         .flat_map(|line| line.spans.iter())
@@ -3956,18 +4527,8 @@ fn diff_render_colorizes_gutter() {
         .find(|span| span.content.as_ref() == "-")
         .expect("delete sign span");
 
-    assert_eq!(
-        add_sign.style.fg,
-        Some(render::palette::best_color(
-            render::palette::rgb_components(DIFF_ADD_FG,)
-        ))
-    );
-    assert_eq!(
-        del_sign.style.fg,
-        Some(render::palette::best_color(
-            render::palette::rgb_components(DIFF_DEL_FG,)
-        ))
-    );
+    assert_eq!(add_sign.style.fg, None);
+    assert_eq!(del_sign.style.fg, None);
     assert!(
         lines
             .iter()
@@ -4675,6 +5236,54 @@ fn alternate_scroll_commands_use_xterm_private_mode() {
 }
 
 #[test]
+fn transcript_overlay_screen_keeps_native_selection_available() {
+    let mut bytes = Vec::new();
+    enter_transcript_overlay_screen(&mut bytes).expect("enter transcript overlay screen");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    assert!(ansi.contains("\x1b[?1049h"), "must enter alt screen");
+    assert!(
+        ansi.contains("\x1b[?1007h"),
+        "must enable alternate-scroll mode for wheel-to-key fallback"
+    );
+    assert!(
+        ansi.contains(DISABLE_MOUSE_MODES),
+        "must clear inline mouse capture before opening the transcript"
+    );
+    assert!(
+        !ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
+        "full transcript must leave native terminal text selection available"
+    );
+}
+
+#[test]
+fn transcript_overlay_screen_exit_restores_inline_mouse_setting() {
+    let mut without_restore = Vec::new();
+    leave_transcript_overlay_screen(&mut without_restore, false)
+        .expect("leave transcript overlay screen");
+    let without_restore = String::from_utf8(without_restore).expect("ansi");
+    assert!(
+        !without_restore.contains(ENABLE_MOUSE_CLICK_CAPTURE),
+        "default inline mode should not keep mouse capture enabled"
+    );
+
+    let mut with_restore = Vec::new();
+    leave_transcript_overlay_screen(&mut with_restore, true)
+        .expect("leave transcript overlay screen");
+    let with_restore = String::from_utf8(with_restore).expect("ansi");
+    let leave_pos = with_restore
+        .find("\x1b[?1049l")
+        .expect("must leave alt screen");
+    let restore_pos = with_restore
+        .find(ENABLE_MOUSE_CLICK_CAPTURE)
+        .expect("must restore opt-in mouse capture");
+    assert!(
+        restore_pos > leave_pos,
+        "opt-in inline mouse capture should be restored after returning to the main buffer"
+    );
+}
+
+#[test]
 fn modify_other_keys_reset_uses_xterm_sequence() {
     let mut disable = String::new();
     DisableModifyOtherKeys
@@ -4761,12 +5370,9 @@ fn active_prompt_keeps_one_blank_line_after_header() {
 
     let output = render_to_string(&app, 100, 16);
     let lines = output.lines().collect::<Vec<_>>();
-    // `directory` is now the last row of the startup card (model and
-    // languages moved to the live status line so they stay in sync
-    // with config edits).
     let header_bottom = lines
         .iter()
-        .rposition(|line| line.contains("directory"))
+        .rposition(|line| line.contains("Squeezy v"))
         .expect("header bottom");
 
     assert!(
@@ -4782,6 +5388,25 @@ fn active_prompt_keeps_one_blank_line_after_header() {
             .take(6)
             .any(|line| line.contains('┃')),
         "{output}"
+    );
+}
+
+#[test]
+fn startup_banner_is_centered_in_viewport() {
+    let app = test_app(SessionMode::Build);
+
+    let output = render_to_string(&app, 120, 16);
+    let banner = output
+        .lines()
+        .find(|line| line.contains("Squeezy v"))
+        .expect("startup banner");
+    let leading = banner.chars().take_while(|ch| *ch == ' ').count();
+    let content_width = banner.trim().chars().count();
+    let expected = (120usize.saturating_sub(content_width)) / 2;
+
+    assert!(
+        leading.abs_diff(expected) <= 1,
+        "banner should be centered: leading={leading} expected={expected}\n{output}"
     );
 }
 
@@ -4804,14 +5429,13 @@ fn active_prompt_cursor_is_vertically_centered() {
 
     let lines = prompt_input_lines(&app, PROMPT_MIN_HEIGHT, 80);
 
-    // Composer at min height: top rule + top pad + content + bot pad + bottom rule = 5 rows
-    assert_eq!(lines.len(), 5);
+    // Composer at min height: top rule + top pad + content + bottom pad = 4 rows.
+    assert_eq!(lines.len(), 4);
     let has_coin = |line: &Line<'_>| line.spans.iter().any(|s| s.content.contains('●'));
     assert!(!has_coin(&lines[0]), "{lines:?}");
     assert!(!has_coin(&lines[1]), "{lines:?}");
     assert!(has_coin(&lines[2]), "{lines:?}");
     assert!(!has_coin(&lines[3]), "{lines:?}");
-    assert!(!has_coin(&lines[4]), "{lines:?}");
 }
 
 #[test]
@@ -4923,6 +5547,27 @@ fn accounting_block_dispatch_skips_unrelated_system_messages() {
         .iter()
         .any(|span| span.content.as_ref() == "Noted");
     assert!(header_has_noted, "{lines:?}");
+}
+
+#[test]
+fn context_snapshot_stays_expanded_in_compact_transcript() {
+    let mut config = test_config(SessionMode::Build);
+    config.tui.transcript_default = TranscriptDefault::Compact;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let body = std::iter::once("Context window".to_string())
+        .chain((0..30).map(|index| format!("source_{index}=tokens")))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    app.push_transcript_item(TranscriptItem::system(body));
+    let output = render_to_string(&app, 120, 40);
+
+    assert!(output.contains("Context window"), "{output}");
+    assert!(output.contains("source_25=tokens"), "{output}");
+    assert!(
+        !output.contains("Context window …"),
+        "explicit /context output should not collapse to a summary: {output}"
+    );
 }
 
 #[test]
@@ -5138,24 +5783,18 @@ fn submitted_prompt_renders_bubble_around_text() {
         true,
     );
 
-    let top = lines[0]
+    let content = lines[0]
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    let content = lines[1]
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    let bottom = lines[2]
+    let bottom = lines[1]
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert!(top.starts_with("  ╭"), "{top}");
-    assert!(top.ends_with('╮'), "{top}");
+    assert_eq!(lines.len(), 3, "{lines:?}");
     assert!(content.starts_with("  "), "{content}");
     assert!(content.ends_with("find getFoo"), "{content}");
     assert!(bottom.starts_with("  ╰─◖"), "{bottom}");
@@ -5185,15 +5824,14 @@ fn submitted_prompt_preserves_empty_lines() {
         })
         .collect::<Vec<_>>();
 
-    // Open bubble: top corners + 4 content rows ("one", "", "three", "") + bottom corners + separator
-    assert_eq!(lines.len(), 7);
-    assert!(rendered[0].starts_with("  ╭"), "{rendered:?}");
-    assert!(rendered[1].contains("one"), "{rendered:?}");
-    assert_eq!(rendered[2].trim(), "");
-    assert!(rendered[3].contains("three"), "{rendered:?}");
-    assert_eq!(rendered[4].trim(), "");
-    assert!(rendered[5].starts_with("  ╰─◖"), "{rendered:?}");
-    assert_eq!(rendered[6], "");
+    // Open bubble: 4 content rows ("one", "", "three", "") + bottom edge + separator.
+    assert_eq!(lines.len(), 6);
+    assert!(rendered[0].contains("one"), "{rendered:?}");
+    assert_eq!(rendered[1].trim(), "");
+    assert!(rendered[2].contains("three"), "{rendered:?}");
+    assert_eq!(rendered[3].trim(), "");
+    assert!(rendered[4].starts_with("  ╰─◖"), "{rendered:?}");
+    assert_eq!(rendered[5], "");
 }
 
 #[test]
@@ -5379,15 +6017,15 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         app.tool_output_verbosity,
         message_outcome(&app.transcript, 0),
     );
-    // Open bubble: lines[0] = top corners, lines[1] = bullet + content text
-    assert_eq!(user_lines[1].spans[1].style.fg, Some(AMBER));
+    // Open bubble: lines[0] = bullet + content text.
+    assert_eq!(user_lines[0].spans[1].style.fg, Some(AMBER));
     assert!(
-        user_lines[1].spans[1].content.ends_with(' '),
+        user_lines[0].spans[1].content.ends_with(' '),
         "{:?}",
-        user_lines[1].spans[1].content
+        user_lines[0].spans[1].content
     );
-    assert_eq!(user_lines[1].spans[2].content.as_ref(), "hi");
-    assert_eq!(user_lines[1].spans[2].style.fg, Some(Color::White));
+    assert_eq!(user_lines[0].spans[2].content.as_ref(), "hi");
+    assert_eq!(user_lines[0].spans[2].style.fg, Some(Color::White));
 
     let log_lines = format_transcript_entry(
         &app.transcript[1],
@@ -5404,21 +6042,21 @@ fn user_prompt_text_is_highlighted_in_transcript() {
     let item = TranscriptItem::user("find getFoo");
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
-    let _text = lines[1]
+    let _text = lines[0]
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    // Open bubble: lines[1].spans = [indent "  ", bullet (phase + space), text]
-    assert_eq!(lines[1].spans[1].style.fg, Some(AMBER));
+    // Open bubble: lines[0].spans = [indent "  ", bullet (phase + space), text]
+    assert_eq!(lines[0].spans[1].style.fg, Some(AMBER));
     assert!(
-        lines[1].spans[1].content.ends_with(' '),
+        lines[0].spans[1].content.ends_with(' '),
         "{:?}",
-        lines[1].spans[1].content
+        lines[0].spans[1].content
     );
-    assert_eq!(lines[1].spans[2].content.as_ref(), "find getFoo");
-    assert_eq!(lines[1].spans[2].style.fg, Some(Color::White));
+    assert_eq!(lines[0].spans[2].content.as_ref(), "find getFoo");
+    assert_eq!(lines[0].spans[2].style.fg, Some(Color::White));
 }
 
 #[test]
@@ -5426,13 +6064,13 @@ fn submitted_bang_prompt_marks_first_nonempty_bang_dark_red() {
     let item = TranscriptItem::user("  !ls");
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
-    // Content row is lines[1] (lines[0] is the bubble top border).
-    let bang = lines[1]
+    // Content row is lines[0].
+    let bang = lines[0]
         .spans
         .iter()
         .find(|span| span.content.as_ref() == "!")
         .expect("bang marker span");
-    let rest = lines[1]
+    let rest = lines[0]
         .spans
         .iter()
         .find(|span| span.content.as_ref() == "ls")
@@ -5471,12 +6109,12 @@ fn submitted_double_bang_prompt_marks_both_bangs_dark_red() {
     let item = TranscriptItem::user("  !!git status");
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
-    let bang = lines[1]
+    let bang = lines[0]
         .spans
         .iter()
         .find(|span| span.content.as_ref() == "!!")
         .expect("double-bang marker span");
-    let rest = lines[1]
+    let rest = lines[0]
         .spans
         .iter()
         .find(|span| span.content.as_ref() == "git status")
@@ -5520,7 +6158,7 @@ fn prompt_height_grows_for_multiline_input() {
     assert_eq!(input_panel_height(&app, 100), PROMPT_MIN_HEIGHT);
 
     set_input(&mut app, "one\ntwo\nthree".to_string());
-    assert_eq!(input_panel_height(&app, 100), 7);
+    assert_eq!(input_panel_height(&app, 100), 6);
 
     set_input(
         &mut app,
@@ -5869,7 +6507,7 @@ async fn slash_pin_pins_and_unpins_transcript_context() {
 }
 
 #[tokio::test]
-async fn slash_feedback_previews_redacted_message_before_send() {
+async fn slash_feedback_previews_redacted_message_and_prompts_for_decision() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
 
@@ -5882,7 +6520,7 @@ async fn slash_feedback_previews_redacted_message_before_send() {
         .await
     );
 
-    assert_eq!(app.status, "feedback preview ready");
+    assert_eq!(app.status, "feedback ready: Enter send · Esc discard");
     assert!(app.pending_feedback.is_some());
     let TranscriptEntryKind::Message(item) = &app.transcript.last().expect("preview").kind else {
         panic!("feedback preview should be a message entry");
@@ -5891,7 +6529,35 @@ async fn slash_feedback_previews_redacted_message_before_send() {
     assert!(preview.contains("feedback preview"), "{preview}");
     assert!(preview.contains("<redacted:"), "{preview}");
     assert!(!preview.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
-    assert!(preview.contains("/feedback send"));
+    assert!(
+        preview.contains("Press Enter to send or Esc to discard."),
+        "{preview}"
+    );
+
+    let output = render_to_string(&app, 100, 24);
+    assert!(output.contains("Send feedback?"), "{output}");
+    assert!(output.contains("Enter/Y Send"), "{output}");
+    assert!(output.contains("Esc/N Discard"), "{output}");
+}
+
+#[tokio::test]
+async fn slash_feedback_escape_discards_pending_preview() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/feedback too much ceremony").await);
+    assert!(app.pending_feedback.is_some());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+    )
+    .await
+    .expect("handle feedback discard");
+
+    assert!(app.pending_feedback.is_none());
+    assert_eq!(app.status, "feedback discarded");
 }
 
 #[tokio::test]
@@ -7339,12 +8005,17 @@ fn render_inline_to_string(app: &TuiApp, width: u16, height: u16) -> String {
 fn lines_to_plain_text(lines: &[Line<'_>]) -> String {
     let mut output = String::new();
     for line in lines {
-        for span in &line.spans {
-            output.push_str(&span.content);
-        }
+        output.push_str(&rendered_line_text(line));
         output.push('\n');
     }
     output
+}
+
+fn rendered_line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
 }
 
 fn rendered_word_styles(app: &TuiApp, word: &str) -> Vec<(Color, Color, Modifier)> {
@@ -7536,7 +8207,7 @@ fn sample_attachment(id: &str) -> ContextAttachment {
 // ---- /verbosity inline back-compat ----
 //
 // `/model`, `/permissions`, `/verbosity`, and `/tool-verbosity` open the
-// `/options` screen focused on the matching section; the original overlay
+// `/config` screen focused on the matching section; the original overlay
 // flow was replaced by the full editor. Section-routing coverage lives in
 // `slash_model_opens_config_at_models_section` and friends below.
 
@@ -8551,6 +9222,39 @@ fn slash_parameter_hint_appears_in_render() {
 }
 
 #[test]
+fn slash_parameter_hint_uses_status_model_color() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/attach".to_string());
+
+    let lines = slash_suggestion_lines(&app);
+    let attach_line = lines
+        .iter()
+        .find(|line| line.spans.iter().any(|span| span.content == "/attach"))
+        .expect("attach suggestion line");
+    let description_span = attach_line
+        .spans
+        .iter()
+        .find(|span| span.content.contains("attach a file as prompt context"))
+        .expect("attach description span");
+    let hint_span = attach_line
+        .spans
+        .iter()
+        .find(|span| span.content.trim() == "<path>")
+        .expect("attach parameter hint span");
+
+    assert_eq!(
+        description_span.style.fg,
+        Some(QUIET),
+        "description color should stay unchanged"
+    );
+    assert_eq!(
+        hint_span.style.fg,
+        Some(crate::render::palette::ACCENT_CYAN),
+        "parameter hints should render with the status-line model color"
+    );
+}
+
+#[test]
 fn json_patch_preview_parser_emits_events_per_patch() {
     use super::streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
 
@@ -8894,6 +9598,49 @@ fn transcript_overlay_renders_entries_uncollapsed() {
     assert!(
         !output.contains("Ctrl-O to expand"),
         "overlay should not show truncation ellipsis: {output}"
+    );
+}
+
+#[test]
+fn transcript_overlay_renders_right_scrollbar_for_overflow() {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..40 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let output = render_to_string(&app, 80, 12);
+
+    assert!(
+        output.contains('█'),
+        "overflowing transcript overlay should render a scrollbar thumb: {output}"
+    );
+    assert!(
+        output.contains('░'),
+        "overflowing transcript overlay should render a scrollbar track: {output}"
+    );
+}
+
+#[test]
+fn transcript_overlay_scrollbar_click_maps_to_scroll_offset() {
+    let scrollbar_area = Rect {
+        x: 79,
+        y: 1,
+        width: 1,
+        height: 10,
+    };
+
+    assert_eq!(
+        transcript_overlay_scroll_for_scrollbar_row(1, scrollbar_area, 100),
+        Some(0)
+    );
+    assert_eq!(
+        transcript_overlay_scroll_for_scrollbar_row(10, scrollbar_area, 100),
+        Some(90)
+    );
+    assert!(
+        transcript_overlay_scroll_for_scrollbar_row(6, scrollbar_area, 100).expect("middle row")
+            > 0
     );
 }
 
@@ -9255,6 +10002,39 @@ fn status_line_configured_replaces_overview_dir_and_branch() {
 }
 
 #[test]
+fn status_line_languages_use_squeezy_amber() {
+    use crate::status::StatusLineItem;
+    let mut app = test_app(SessionMode::Build);
+    app.directory = "~/project".to_string();
+    app.language_summary = "Python 10, Rust 247".to_string();
+    app.status_line_items = Some(vec![StatusLineItem::CurrentDir, StatusLineItem::Languages]);
+    app.status_line_use_colors = true;
+
+    let lines = format_status_lines(&app, 200);
+    let dir_span = lines[0]
+        .spans
+        .iter()
+        .find(|s| s.content == "~/project")
+        .expect("directory span");
+    let language_span = lines[0]
+        .spans
+        .iter()
+        .find(|s| s.content.contains("Python 10, Rust 247"))
+        .expect("languages span");
+
+    assert_eq!(
+        language_span.style.fg,
+        Some(AMBER),
+        "languages should use Squeezy's darker brand accent"
+    );
+    assert_eq!(
+        dir_span.style.fg,
+        Some(crate::render::palette::ACCENT_GREEN),
+        "other path-family status items should keep their existing color"
+    );
+}
+
+#[test]
 fn status_line_items_stay_compact_for_paths_tokens_and_session_ids() {
     use crate::status::StatusLineItem;
     let mut app = test_app(SessionMode::Build);
@@ -9592,7 +10372,7 @@ async fn alt_one_skips_when_an_approval_is_pending() {
     let _ = fs::remove_dir_all(root);
 }
 
-// ─── /options dispatch routing — TuiApp-level eval tests ─────────────────
+// ─── /config dispatch routing — TuiApp-level eval tests ─────────────────
 //
 // Companion fixture: crates/squeezy-eval/fixtures/scenarios/options-screen-routing.toml.
 // These tests exercise the slash-router by driving `handle_key` against a
@@ -9600,10 +10380,10 @@ async fn alt_one_skips_when_an_approval_is_pending() {
 // save dispatch) lives in `config_screen_tests.rs` instead.
 
 #[tokio::test]
-async fn unknown_options_slug_emits_warning_then_opens_default() {
+async fn unknown_config_slug_emits_warning_then_opens_default() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/options nosuchsection".to_string());
+    set_input(&mut app, "/config nosuchsection".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -9623,10 +10403,10 @@ async fn unknown_options_slug_emits_warning_then_opens_default() {
 }
 
 #[tokio::test]
-async fn options_slug_for_unregistered_meta_warns() {
+async fn config_slug_for_unregistered_meta_warns() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/options skills".to_string());
+    set_input(&mut app, "/config skills".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -9643,10 +10423,10 @@ async fn options_slug_for_unregistered_meta_warns() {
 }
 
 #[tokio::test]
-async fn options_with_no_arg_does_not_emit_unknown_slug_warning() {
+async fn config_with_no_arg_does_not_emit_unknown_slug_warning() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/options".to_string());
+    set_input(&mut app, "/config".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -9658,30 +10438,14 @@ async fn options_with_no_arg_does_not_emit_unknown_slug_warning() {
     let message = note.map(|n| n.message.clone()).unwrap_or_default();
     assert!(
         !message.contains("not a navigable section"),
-        "no-arg /options must not warn about a missing slug, got: {message}"
+        "no-arg /config must not warn about a missing slug, got: {message}"
     );
 }
 
 #[tokio::test]
-async fn options_and_config_alias_open_the_same_screen() {
+async fn config_and_options_alias_open_the_same_screen() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/options".to_string());
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    )
-    .await
-    .expect("handle key");
-    let after_options = app.config_screen.as_ref().map(|s| s.current_section().id);
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-    )
-    .await
-    .expect("handle key");
     set_input(&mut app, "/config".to_string());
     handle_key(
         &mut app,
@@ -9691,8 +10455,24 @@ async fn options_and_config_alias_open_the_same_screen() {
     .await
     .expect("handle key");
     let after_config = app.config_screen.as_ref().map(|s| s.current_section().id);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    set_input(&mut app, "/options".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    let after_options = app.config_screen.as_ref().map(|s| s.current_section().id);
     assert_eq!(
-        after_options, after_config,
-        "/options and /config must land on the same starting section"
+        after_config, after_options,
+        "/config and /options must land on the same starting section"
     );
 }
