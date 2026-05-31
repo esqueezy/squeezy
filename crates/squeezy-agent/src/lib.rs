@@ -1222,6 +1222,22 @@ pub struct PendingConfigSwap {
 impl Agent {
     pub fn new(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Self {
         let session_log = start_session_log(&config, provider.name());
+        Self::new_with_session_log(config, provider, session_log)
+    }
+
+    /// Build an agent without opening a durable session log.
+    ///
+    /// This is for local harnesses that need agent state transitions but do
+    /// not need a resumable session or session metadata on disk.
+    pub fn new_ephemeral(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Self {
+        Self::new_with_session_log(config, provider, None)
+    }
+
+    fn new_with_session_log(
+        config: AppConfig,
+        provider: Arc<dyn LlmProvider>,
+        session_log: Option<SessionHandle>,
+    ) -> Self {
         // Fresh sessions inherit the most-recent cross-session calibration so
         // the first round's estimator isn't stuck on per-provider defaults.
         // Missing or malformed files fall back to `TokenCalibration::default()`,

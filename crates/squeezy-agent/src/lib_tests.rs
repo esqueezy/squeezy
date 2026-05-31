@@ -7862,7 +7862,7 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
         ),
         (
             DispatchCommand::Theme {
-                theme: "dark".to_string(),
+                theme: Some("dark".to_string()),
             },
             "theme",
         ),
