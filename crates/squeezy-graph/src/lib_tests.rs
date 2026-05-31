@@ -3157,6 +3157,99 @@ fn graph_records_only_real_maven_dependencies() {
 }
 
 #[test]
+fn graph_records_kotlin_project_facts_from_gradle_kts() {
+    let _ = LanguageParser::new().unwrap();
+    let mut build = record(
+        "build.gradle.kts",
+        r#"plugins {
+    kotlin("jvm") version "1.9.24"
+}
+
+dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1")
+}
+"#,
+    );
+    build.language = LanguageKind::Unsupported;
+    let source = kotlin_record(
+        "src/main/kotlin/com/example/Foo.kt",
+        "package com.example\n\nclass Foo\n",
+    );
+    let parsed = vec![
+        ParsedFile::unsupported(build, "gradle metadata"),
+        ParsedFile {
+            file: source,
+            package: Some("com.example".to_string()),
+            symbols: Vec::new(),
+            imports: Vec::new(),
+            calls: Vec::new(),
+            references: Vec::new(),
+            body_hits: Vec::new(),
+            unsupported: None,
+            diagnostics: Vec::new(),
+            changed_ranges: Vec::new(),
+        },
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let facts = graph
+        .kotlin_project_facts()
+        .iter()
+        .map(|fact| format!("{}:{}:{}", fact.provider, fact.kind, fact.value))
+        .collect::<Vec<_>>();
+    assert!(
+        facts.contains(&"gradle:source_root:main:src/main/kotlin".to_string()),
+        "expected Kotlin source-root fact; got {facts:?}",
+    );
+    assert!(
+        facts.contains(
+            &"gradle:dependency:implementation:org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1"
+                .to_string()
+        ),
+        "expected Kotlin gradle dependency fact; got {facts:?}",
+    );
+    // Java's source-root extractor only recognises `src/<set>/java`, so the
+    // Kotlin source root must not appear in java_project_facts even though
+    // build.gradle.kts is shared between the two pipelines.
+    let java_source_roots = graph
+        .java_project_facts()
+        .iter()
+        .filter(|fact| fact.kind == "source_root")
+        .map(|fact| fact.value.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !java_source_roots
+            .iter()
+            .any(|value| value.contains("kotlin")),
+        "java_project_facts source_root should not pick up Kotlin layout; got {java_source_roots:?}",
+    );
+}
+
+#[test]
+fn kotlin_project_facts_dedup_across_rebuilds() {
+    // Trigger a second rebuild via remove_file; the cache should not
+    // accumulate duplicates of the same coordinate.
+    let _ = LanguageParser::new().unwrap();
+    let mut build = record(
+        "build.gradle.kts",
+        r#"dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1")
+}
+"#,
+    );
+    build.language = LanguageKind::Unsupported;
+    let parsed = vec![ParsedFile::unsupported(build, "gradle metadata")];
+    let mut graph = SemanticGraph::from_parsed(parsed);
+    graph.remove_file(&FileId::new("missing/no-op.kt"));
+    let deps = graph
+        .kotlin_project_facts()
+        .iter()
+        .filter(|fact| fact.kind == "dependency")
+        .count();
+    assert_eq!(deps, 1, "expected a single dedup'd dependency entry");
+}
+
+#[test]
 fn candidate_set_call_edge_emits_ids() {
     let mut parser = LanguageParser::new().unwrap();
     let source = python_record(

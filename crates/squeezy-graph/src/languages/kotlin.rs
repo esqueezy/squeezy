@@ -299,9 +299,8 @@ fn kotlin_symbol_is_top_level(symbol: &GraphSymbol) -> bool {
 /// Source-root facts for a Kotlin Gradle layout (`src/<set>/kotlin/...`).
 ///
 /// Wired into the bench harness via the `kotlin_project_facts` query kind in
-/// `benchmarks/specs/kotlin-smoke-queries.json`; not yet consumed by the
-/// in-process resolver, so the rebuild path stays Java-only until phase 2.
-#[allow(dead_code)]
+/// `benchmarks/specs/kotlin-smoke-queries.json` and consumed by
+/// `SemanticGraph::rebuild_kotlin_project_facts`.
 pub(crate) fn kotlin_source_root_facts(
     provider: &str,
     kotlin_paths: &[&str],
@@ -341,7 +340,6 @@ pub(crate) fn kotlin_source_root_facts(
 /// `generated_exclusion`. The Kotlin set is a superset of Java's because
 /// `src/generated/kotlin/...` is the conventional Kotlin layout, in
 /// addition to the Gradle / Maven build paths shared with Java.
-#[allow(dead_code)]
 pub(crate) fn kotlin_generated_source_root(path: &str) -> Option<String> {
     for marker in [
         "target/generated-sources/",
@@ -360,7 +358,6 @@ pub(crate) fn kotlin_generated_source_root(path: &str) -> Option<String> {
 /// Build-system provider detection mirrors Java's set since Kotlin shares
 /// Gradle and Maven tooling. Wrapped under a Kotlin-named alias to keep the
 /// family self-contained.
-#[allow(dead_code)]
 pub(crate) fn kotlin_build_metadata_provider(file: &FileRecord) -> Option<&'static str> {
     match file.relative_path.as_str() {
         "pom.xml" => Some("maven"),
@@ -368,6 +365,50 @@ pub(crate) fn kotlin_build_metadata_provider(file: &FileRecord) -> Option<&'stat
             Some("gradle")
         }
         _ => None,
+    }
+}
+
+/// FNV-1a fingerprint over the Kotlin source path set; mirrors
+/// `java_paths_signature` so the rebuild cache invalidates whenever Kotlin
+/// source layout changes.
+pub(crate) fn kotlin_paths_signature(paths: &[String]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+    let mut hash = FNV_OFFSET;
+    for path in paths {
+        for byte in path.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash ^= 0x00;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Configured-source extraction from the build script. Gradle's
+/// `srcDir(...)` lines parse the same way whether the DSL is Groovy or
+/// Kotlin, and Maven's `<sourceDirectory>` tags are XML-only, so both
+/// providers reuse the existing Java helpers.
+pub(crate) fn kotlin_configured_source_facts(
+    provider: &str,
+    source: &str,
+) -> Vec<(&'static str, String, &'static str)> {
+    match provider {
+        "maven" => super::java::maven_configured_source_facts(source),
+        "gradle" => super::java::gradle_configured_source_facts(source),
+        _ => Vec::new(),
+    }
+}
+
+/// Dependency-coordinate extraction. Gradle and Maven coordinate shapes are
+/// language-agnostic at the build-metadata layer, so reuse the existing Java
+/// extractors verbatim.
+pub(crate) fn kotlin_dependency_facts(provider: &str, source: &str) -> Vec<String> {
+    match provider {
+        "maven" => super::java::maven_dependency_facts(source),
+        "gradle" => super::java::gradle_dependency_facts(source),
+        _ => Vec::new(),
     }
 }
 

@@ -36,6 +36,10 @@ use crate::languages::{
         java_paths_signature, java_source_root_facts,
     },
     js_ts::{JsTsResolver, is_js_ts_language},
+    kotlin::{
+        kotlin_build_metadata_provider, kotlin_configured_source_facts, kotlin_dependency_facts,
+        kotlin_paths_signature, kotlin_source_root_facts,
+    },
     python::{python_module_path_for_file, python_path_segments},
 };
 
@@ -316,10 +320,20 @@ pub struct DotnetProjectFact {
     pub provenance: Provenance,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KotlinProjectFact {
+    pub provider: String,
+    pub kind: String,
+    pub value: String,
+    pub source_file: FileId,
+    pub provenance: Provenance,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LanguageFact {
     Java(JavaProjectFact),
     Dotnet(DotnetProjectFact),
+    Kotlin(KotlinProjectFact),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -352,9 +366,12 @@ pub struct SemanticGraph {
     body_hits: Vec<BodyHit>,
     java_project_facts: Vec<JavaProjectFact>,
     dotnet_project_facts: Vec<DotnetProjectFact>,
+    kotlin_project_facts: Vec<KotlinProjectFact>,
     cargo_facts: Option<CargoCompilerFacts>,
     java_project_facts_cache: HashMap<FileId, CachedJavaProjectFacts>,
     java_project_facts_cache_java_paths_signature: u64,
+    kotlin_project_facts_cache: HashMap<FileId, CachedKotlinProjectFacts>,
+    kotlin_project_facts_cache_kotlin_paths_signature: u64,
     symbols_by_name: HashMap<String, Vec<SymbolId>>,
     symbol_signature_lower: HashMap<SymbolId, String>,
     signature_trigram_index: HashMap<[u8; 3], Vec<SymbolId>>,
@@ -411,6 +428,15 @@ struct CachedJavaProjectFacts {
     source_root_facts: Vec<(&'static str, String, &'static str)>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedKotlinProjectFacts {
+    hash: ContentHash,
+    kotlin_paths_signature: u64,
+    dependency_values: Vec<String>,
+    configured_source_facts: Vec<(&'static str, String, &'static str)>,
+    source_root_facts: Vec<(&'static str, String, &'static str)>,
+}
+
 impl SemanticGraph {
     #[allow(dead_code)]
     fn lang_ext(&self, family: LanguageFamily) -> &'static dyn backend::LanguageGraphExt {
@@ -438,9 +464,12 @@ impl SemanticGraph {
             body_hits: Vec::new(),
             java_project_facts: Vec::new(),
             dotnet_project_facts: Vec::new(),
+            kotlin_project_facts: Vec::new(),
             cargo_facts: None,
             java_project_facts_cache: HashMap::new(),
             java_project_facts_cache_java_paths_signature: 0,
+            kotlin_project_facts_cache: HashMap::new(),
+            kotlin_project_facts_cache_kotlin_paths_signature: 0,
             symbols_by_name: HashMap::new(),
             symbol_signature_lower: HashMap::new(),
             signature_trigram_index: HashMap::new(),
@@ -471,6 +500,7 @@ impl SemanticGraph {
         }
         graph.rebuild_java_project_facts();
         graph.rebuild_dotnet_project_facts();
+        graph.rebuild_kotlin_project_facts();
         graph.rebuild_semantic_edges();
         graph.rebuild_indexes();
         graph
@@ -487,6 +517,7 @@ impl SemanticGraph {
         }
         self.rebuild_java_project_facts();
         self.rebuild_dotnet_project_facts();
+        self.rebuild_kotlin_project_facts();
         self.rebuild_semantic_edges();
         self.rebuild_indexes();
     }
@@ -495,6 +526,7 @@ impl SemanticGraph {
         self.remove_file_data(file_id);
         self.rebuild_java_project_facts();
         self.rebuild_dotnet_project_facts();
+        self.rebuild_kotlin_project_facts();
         self.rebuild_semantic_edges();
         self.rebuild_indexes();
     }
@@ -511,6 +543,8 @@ impl SemanticGraph {
         self.java_project_facts
             .retain(|fact| &fact.source_file != file_id);
         self.dotnet_project_facts
+            .retain(|fact| &fact.source_file != file_id);
+        self.kotlin_project_facts
             .retain(|fact| &fact.source_file != file_id);
         self.edges.retain(|edge| {
             self.symbols.contains_key(&edge.from)
@@ -552,6 +586,10 @@ impl SemanticGraph {
 
     pub fn dotnet_project_facts(&self) -> &[DotnetProjectFact] {
         &self.dotnet_project_facts
+    }
+
+    pub fn kotlin_project_facts(&self) -> &[KotlinProjectFact] {
+        &self.kotlin_project_facts
     }
 
     pub fn cargo_facts(&self) -> Option<&CargoCompilerFacts> {
@@ -651,6 +689,12 @@ impl SemanticGraph {
                     .iter()
                     .cloned()
                     .map(LanguageFact::Dotnet),
+            )
+            .chain(
+                self.kotlin_project_facts
+                    .iter()
+                    .cloned()
+                    .map(LanguageFact::Kotlin),
             )
             .collect()
     }
@@ -1184,6 +1228,131 @@ impl SemanticGraph {
             return;
         }
         self.dotnet_project_facts.push(DotnetProjectFact {
+            provider: provider.to_string(),
+            kind: kind.to_string(),
+            value,
+            source_file: file.id.clone(),
+            provenance: Provenance::new(provider, reason),
+        });
+    }
+
+    fn rebuild_kotlin_project_facts(&mut self) {
+        self.kotlin_project_facts.clear();
+        let metadata_files = self
+            .files
+            .values()
+            .filter_map(|file| {
+                kotlin_build_metadata_provider(file).map(|provider| (provider, file.clone()))
+            })
+            .collect::<Vec<_>>();
+        if metadata_files.is_empty() {
+            self.kotlin_project_facts_cache.clear();
+            self.kotlin_project_facts_cache_kotlin_paths_signature = 0;
+            return;
+        }
+
+        let mut kotlin_paths = self
+            .files
+            .values()
+            .filter(|file| file.language == LanguageKind::Kotlin)
+            .map(|file| file.relative_path.clone())
+            .collect::<Vec<_>>();
+        kotlin_paths.sort();
+        let kotlin_paths_sig = kotlin_paths_signature(&kotlin_paths);
+        self.kotlin_project_facts_cache_kotlin_paths_signature = kotlin_paths_sig;
+
+        let metadata_ids = metadata_files
+            .iter()
+            .map(|(_, file)| file.id.clone())
+            .collect::<HashSet<_>>();
+        self.kotlin_project_facts_cache
+            .retain(|file_id, _| metadata_ids.contains(file_id));
+
+        let mut dedup = BTreeSet::new();
+        for (provider, file) in metadata_files {
+            let cache_hit = self
+                .kotlin_project_facts_cache
+                .get(&file.id)
+                .map(|entry| {
+                    entry.hash == file.hash && entry.kotlin_paths_signature == kotlin_paths_sig
+                })
+                .unwrap_or(false);
+
+            if !cache_hit {
+                let kotlin_path_refs = kotlin_paths.iter().map(String::as_str).collect::<Vec<_>>();
+                let source_root_facts = kotlin_source_root_facts(provider, &kotlin_path_refs);
+                let (dependency_values, configured_source_facts) =
+                    if let Ok(source) = std::fs::read_to_string(&file.path) {
+                        (
+                            kotlin_dependency_facts(provider, &source),
+                            kotlin_configured_source_facts(provider, &source),
+                        )
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                self.kotlin_project_facts_cache.insert(
+                    file.id.clone(),
+                    CachedKotlinProjectFacts {
+                        hash: file.hash.clone(),
+                        kotlin_paths_signature: kotlin_paths_sig,
+                        dependency_values,
+                        configured_source_facts,
+                        source_root_facts,
+                    },
+                );
+            }
+
+            let entry = self
+                .kotlin_project_facts_cache
+                .get(&file.id)
+                .expect("just inserted")
+                .clone();
+            for (kind, value, reason) in entry.source_root_facts {
+                self.push_kotlin_project_fact(&mut dedup, provider, kind, value, &file, reason);
+            }
+            for value in entry.dependency_values {
+                self.push_kotlin_project_fact(
+                    &mut dedup,
+                    provider,
+                    "dependency",
+                    value,
+                    &file,
+                    "build dependency coordinate",
+                );
+            }
+            for (kind, value, reason) in entry.configured_source_facts {
+                self.push_kotlin_project_fact(&mut dedup, provider, kind, value, &file, reason);
+            }
+        }
+
+        self.kotlin_project_facts.sort_by(|left, right| {
+            left.provider
+                .cmp(&right.provider)
+                .then(left.kind.cmp(&right.kind))
+                .then(left.value.cmp(&right.value))
+        });
+    }
+
+    fn push_kotlin_project_fact(
+        &mut self,
+        dedup: &mut BTreeSet<(String, String, String, String)>,
+        provider: &str,
+        kind: &str,
+        value: String,
+        file: &FileRecord,
+        reason: &str,
+    ) {
+        if value.is_empty()
+            || !dedup.insert((
+                provider.to_string(),
+                kind.to_string(),
+                value.clone(),
+                file.id.0.clone(),
+            ))
+        {
+            return;
+        }
+        self.kotlin_project_facts.push(KotlinProjectFact {
             provider: provider.to_string(),
             kind: kind.to_string(),
             value,
@@ -2153,6 +2322,7 @@ impl GraphManager {
         } else if metadata_refresh_needed {
             self.graph.rebuild_java_project_facts();
             self.graph.rebuild_dotnet_project_facts();
+            self.graph.rebuild_kotlin_project_facts();
             self.graph.rebuild_semantic_edges();
             self.graph.rebuild_indexes();
         }
