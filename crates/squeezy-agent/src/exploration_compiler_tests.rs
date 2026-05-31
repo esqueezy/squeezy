@@ -168,6 +168,62 @@ fn source_file_extension_token_does_not_trigger_planner_preflight() {
     assert!(compile_exploration_plan("Which file defines main.go?").is_none());
 }
 #[test]
+fn prompt_noise_words_are_rejected_by_is_useful_query() {
+    // Capitalized English prompt scaffolding (`ONLY`, `OUTPUT`, `EXPECTED`,
+    // ...) was being treated as a Rust-y symbol by `looks_like_rust_symbol`
+    // (uppercase first char), so the planner fired `symbol_context "ONLY"`
+    // and the like. The `is_useful_query` gate must reject these before they
+    // ever reach query extraction.
+    for noise in [
+        "ONLY", "TODO", "NOTE", "OUTPUT", "RETURN", "ERROR", "WARNING", "STOP", "EXACTLY", "MUST",
+        "EXPECT", "EXPECTED", "ACTUAL", "INPUT", "testing", "Only", "output",
+    ] {
+        assert!(
+            !is_useful_query(noise),
+            "is_useful_query({noise:?}) must be false but was true"
+        );
+    }
+
+    // Sanity: a real identifier still passes.
+    assert!(is_useful_query("Runner"));
+    assert!(is_useful_query("make_widget"));
+}
+
+#[test]
+fn capitalized_noise_word_does_not_drive_planner_query() {
+    // Real-world Python prompts include phrases like "Output ONLY the file
+    // path". Before the noise-word reject, the planner extracted `ONLY` (or
+    // `Output`) as a Rust-y symbol and emitted `symbol_context "ONLY"`. With
+    // the reject in place there is no symbolic token left, so the planner
+    // either falls through entirely or finds a real identifier elsewhere.
+    let plan =
+        compile_exploration_plan("Which file defines the helper? Output ONLY the file path.");
+    if let Some(plan) = plan {
+        assert_ne!(
+            plan.query.as_deref(),
+            Some("ONLY"),
+            "planner picked the noise word `ONLY` as a query"
+        );
+        assert_ne!(
+            plan.query.as_deref(),
+            Some("Output"),
+            "planner picked the noise word `Output` as a query"
+        );
+    }
+}
+
+#[test]
+fn quoted_noise_word_is_also_rejected() {
+    // The quoted-literal path also runs through `is_useful_query`, so a
+    // prompt that literally quotes a noise word must not compile to a plan
+    // that drives a graph query on it.
+    let plan = compile_exploration_plan("Where is `ONLY` defined?");
+    if let Some(plan) = plan {
+        assert_ne!(plan.query.as_deref(), Some("ONLY"));
+    }
+}
+
+#[test]
 fn planner_graph_max_results_caps_above_realistic_subclass_fanout() {
     // Real-world hierarchies (e.g. all `WidgetsBindingObserver` subclasses
     // in a Flutter app) reliably produce 15+ siblings. The cap must clear

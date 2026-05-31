@@ -404,7 +404,49 @@ fn is_useful_query(token: &str) -> bool {
     if token.len() < 3 || !token.chars().any(|ch| ch.is_ascii_alphabetic()) {
         return false;
     }
-    !looks_like_path(token)
+    if looks_like_path(token) {
+        return false;
+    }
+    !is_prompt_noise_word(token)
+}
+
+/// English prompt scaffolding words (`ONLY`, `OUTPUT`, `EXPECTED`, ...) that
+/// the surrounding instructions routinely capitalize for emphasis. Without
+/// this rejection, `looks_like_rust_symbol` accepts them as identifier-shaped
+/// (uppercase first char) and the planner fires nonsense graph queries like
+/// `symbol_context "ONLY"` that drag whole runs into degraded paths.
+fn is_prompt_noise_word(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "only"
+            | "todo"
+            | "note"
+            | "notes"
+            | "output"
+            | "outputs"
+            | "return"
+            | "returns"
+            | "error"
+            | "errors"
+            | "warning"
+            | "warnings"
+            | "stop"
+            | "exactly"
+            | "must"
+            | "expect"
+            | "expects"
+            | "expected"
+            | "actual"
+            | "input"
+            | "inputs"
+            | "testing"
+            | "please"
+            | "answer"
+            | "explain"
+            | "describe"
+            | "summary"
+            | "summarize"
+    )
 }
 
 fn looks_like_path(token: &str) -> bool {
