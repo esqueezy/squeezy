@@ -1,43 +1,242 @@
-# Graph vs. no-graph eval — three-task A/B with cost and recall
+# Graph vs. no-graph eval — realworld multi-step audits
 
-A controlled A/B comparison of squeezy with its semantic-graph tool
-family available against the same agent loop with that family hidden.
-Three task shapes, three runs per side per task, eighteen runs total,
-plus baseline-vs-fix replays for the bugs the experiment surfaced.
+A controlled A/B of squeezy with its semantic-graph tool family
+available against the same agent loop with that family hidden, exercised
+against twelve real-world multi-step refactor / audit prompts (one per
+language) rooted in upstream OSS repos. Each scenario asks for a
+structured per-row classification (override strategy, mixin set,
+diagnostic mode, setter scope), not just an enumeration of call sites —
+the model has to walk a hierarchy, read each candidate body, and tag it.
 
 Full per-run data in [`graph-vs-nograph-data.csv`](graph-vs-nograph-data.csv).
 
 ## Setup
 
-- **Model**: `gpt-5.4-mini` via the `openai` provider preset (same model
-  on both sides of every comparison).
-- **Workspace**: the squeezy repo itself (Rust workspace under
-  `crates/`).
-- **System prompt**: a deliberately neutral instructions block on both
-  sides ("answer concisely with whatever tools are available"). The
-  default `DEFAULT_INSTRUCTIONS` in `squeezy-core` leans toward
-  graph-first; using it would have biased the no-graph half toward
-  tools it cannot call.
-- **Permissions**: `permission_mode = "allow"` on both sides, widened
-  by this PR so `read` / `ignored_search` are covered (without that
-  the no-graph half was getting `grep` / `read_file` auto-denied).
+- **Model**: `gpt-5.4-mini` via the `openai` provider preset (both
+  sides of every A/B).
+- **Workspaces**: per-language upstream repos pinned by SHA — for
+  example `JamesNK/Newtonsoft.Json @4f73e7`, `felangel/bloc @ff675f7`,
+  `spf13/cobra @ad460ea`, `google/gson`, `akka/akka @d65463d`. Each
+  scenario `.toml` records its repo and SHA under `[workspace.github]`.
 - **No-graph variant**: the twelve graph tools (`repo_map`,
   `decl_search`, `definition_search`, `reference_search`,
   `symbol_context`, `hierarchy`, `read_slice`, `upstream_flow`,
   `downstream_flow`, `diff_context`, `plan_patch`,
-  `refresh_compiler_facts`) are filtered out of the advertised tool
-  list via the new `excluded_tools` overlay, and the graph-first
-  exploration planner is disabled via
+  `refresh_compiler_facts`) are filtered out via the `excluded_tools`
+  overlay and the graph-first exploration planner is disabled via
   `SQUEEZY_EXPLORATION_COMPILER=0`. Both halves of every A/B are
   otherwise identical.
+- **System prompt**: a neutral instructions block ("answer concisely
+  with whatever tools are available").
 
 Scenarios live under
-[`crates/squeezy-eval/fixtures/scenarios/graph-vs-nograph-*.toml`](../../../crates/squeezy-eval/fixtures/scenarios).
-The harness already ships with `squeezy-eval diff <A> <B>` for
-per-pair comparison; this doc rolls the six scenarios up into a single
-table.
+[`crates/squeezy-eval/fixtures/scenarios/graph-vs-nograph-{lang}-realworld-{with,no}-graph.toml`](../../../crates/squeezy-eval/fixtures/scenarios).
 
-## Tasks
+## Smoke results (n=1 per variant)
+
+Cost is the total turn cost from `run.json` totals; tool_calls is the
+count of `tool_call_completed` events in `trace.jsonl`. Recall is the
+fraction of expected rows present in the final assistant answer,
+hand-graded against the ground truth captured in each scenario's
+`description` block.
+
+| lang  | scenario                                      | variant     | tool_calls | cost     | recall   | trace |
+|-------|-----------------------------------------------|-------------|-----------:|---------:|---------:|-------|
+| csharp | Newtonsoft sync `Read*` override audit       | with_graph  | 23 | $0.0579 | 20/29 (69%)  | `target/eval/graph-vs-nograph-csharp-realworld-with-graph-1780218467813` |
+| csharp | Newtonsoft sync `Read*` override audit       | no_graph    | 27 | $0.0724 | 29/29 (100%) | `target/eval/graph-vs-nograph-csharp-realworld-no-graph-1780218585042` |
+| dart   | bloc_lint `_Listener` override classification | with_graph  | 12 | $0.0206 | 14/15 (93%)  | `target/eval/graph-vs-nograph-dart-realworld-with-graph-1780219490722` |
+| dart   | bloc_lint `_Listener` override classification | no_graph    |  6 | $0.0192 | 14/15 (93%)  | `target/eval/graph-vs-nograph-dart-realworld-no-graph-1780219693878` |
+| go     | spf13/cobra `*Command` setter scope audit    | with_graph  |  7 | $0.0257 | 17/17 (100%) | `target/eval/graph-vs-nograph-go-realworld-with-graph-1780218535992` |
+| go     | spf13/cobra `*Command` setter scope audit    | no_graph    |  5 | $0.0175 | 17/17 (100%) | `target/eval/graph-vs-nograph-go-realworld-no-graph-1780219184410` |
+| java   | gson `TypeAdapter` override audit            | with_graph  | 17 | n/a*    | 0/N (failed) | `target/eval/graph-vs-nograph-java-realworld-with-graph-1780219165874` |
+| java   | gson `TypeAdapter` override audit            | no_graph    |  0 | n/a*    | 0/N (failed) | `target/eval/graph-vs-nograph-java-realworld-no-graph-1780219172380` |
+| scala  | akka `RequiresMessageQueue` mailbox audit     | with_graph  | 30 | $0.0552 | 12/12 (100%) | `target/eval/smoke-scala-realworld/graph-vs-nograph-scala-realworld-with-graph-1780219137011` |
+| scala  | akka `RequiresMessageQueue` mailbox audit     | no_graph    | 49 | $0.0911 | 12/12 (100%) | `target/eval/smoke-scala-realworld/graph-vs-nograph-scala-realworld-no-graph-1780219769654` |
+| cpp    | spdlog `sink_it_` override audit             | both        | — | — | not yet run at n=1 | — |
+| rust   | LlmProvider `name()` body classification     | both        | — | — | not yet run at n=1 | — |
+| python | requests `Session` intra-class call graph    | both        | — | — | not yet run at n=1 | — |
+| js     | lodash fp wrapper alias resolution           | both        | — | — | not yet run at n=1 | — |
+| ruby   | sidekiq `Component` consumer audit           | both        | — | — | not yet run at n=1 | — |
+| kotlin | detekt-rules-complexity Rule subclass audit  | both        | — | — | not yet run at n=1 | — |
+| swift  | RoutesBuilder HTTP-method extension audit    | both        | — | — | not yet run at n=1 | — |
+| php    | laravel Eloquent Relation concern audit      | both        | — | — | PHP scenario in flight | — |
+
+\* Java turns failed mid-run. The with-graph turn issued 17 tool calls
+then emitted a `turn_failed` event without a cost record; the no-graph
+turn delegated to the `explore` subagent and never returned. Both
+`run.json` totals show `$0.0000`.
+
+## Headline finding
+
+At n=1 on the five languages that smoke-ran successfully:
+
+- **scala** is the cleanest win for the graph half: 30 vs 49 tool calls
+  (-39%) and $0.0552 vs $0.0911 (-39%) at identical 12/12 recall. The
+  no-graph half blew through `max_tool_calls_per_turn = 48` and still
+  got the right answer, but at nearly double the cost.
+- **dart** and **go** are roughly even on recall, with cost within
+  noise. Dart with-graph spent 12 tool calls vs 6 for no-graph but came
+  out only $0.0014 more expensive ($0.0206 vs $0.0192). Go with-graph
+  was actually slightly more expensive ($0.0257 vs $0.0175) because
+  `repo_map` ran on the cobra workspace as the first action.
+- **csharp** is a regression at n=1: with-graph cost less ($0.0579 vs
+  $0.0724) but missed the entire `TraceJsonReader` subclass (9 of the
+  29 expected rows). The no-graph half hit 29/29. See "Bugs surfaced"
+  below — the graph indexer reported `graph_available = false` for
+  this Newtonsoft workspace, so the with-graph half effectively ran on
+  grep + read_slice with the cost overhead of attempting graph tools
+  first.
+- **java** failed on both sides. The with-graph half over-fanned-out
+  on `read_slice` after `repo_map` and crashed the turn; the no-graph
+  half delegated to a subagent that produced no answer.
+
+Per-variant aggregates (sum across the four langs where both sides
+completed — scala, dart, go, csharp):
+
+| variant     | total tool_calls | total cost | wins (recall) |
+|-------------|-----------------:|-----------:|---------------|
+| with_graph  | 72  | $0.1594 | 3/4 ties or wins (scala, dart, go); csharp regression |
+| no_graph    | 87  | $0.2002 | 4/4 ties or perfect (29/29 on csharp) |
+
+Graph wins on aggregate cost (-20%) and matches or beats no-graph on
+recall everywhere except csharp.
+
+## Bugs surfaced
+
+### 1. csharp `internal class` left out of subclass enumeration (with-graph)
+
+`Src/Newtonsoft.Json/Serialization/TraceJsonReader.cs` declares
+`internal class TraceJsonReader : JsonReader` and overrides all nine
+sync `Read*` slots, all of them `delegate`-strategy
+(`_innerReader.Read*()`). The with-graph run enumerated `BsonReader` (1
+public), `JsonTextReader` (9), `JsonValidatingReader` (9), `JTokenReader`
+(1) — but never opened `TraceJsonReader.cs`, missing 9 of 29 rows. The
+no-graph run, running the same prompt, did find it (its grep sweep
+over `public override.*Read` returned the `TraceJsonReader.cs`
+matches alongside the others, and the model read each body).
+
+Root cause is that this workspace's graph index came back unavailable
+for the .NET tree, so the with-graph half fell back to grep — but
+unlike the no-graph variant it spent its first 8 tool calls in
+`definition_search` / `repo_map` /  `glob` exploration that returned
+`graph_unavailable`, narrowing the remaining budget for the grep
+sweep. The model never widened its grep pattern past `public override
+.*Read` qualified by `JsonReader`-side filenames and so dropped the
+one `internal class` member.
+
+Cite: `target/eval/graph-vs-nograph-csharp-realworld-with-graph-1780218467813/run.json`
+totals 23 tool calls / $0.0579 with the missing rows visible in the
+final assistant_delta text;
+`target/eval/graph-vs-nograph-csharp-realworld-no-graph-1780218585042/run.json`
+totals 27 tool calls / $0.0724 and the final answer includes the nine
+`TraceJsonReader.cs` rows.
+
+Action: surface graph availability up-front in the agent preamble so
+the model doesn't burn budget on graph tools that will return
+`graph_unavailable`. Today the model only learns the graph is dead
+after each individual tool call fails.
+
+### 2. ruby nested-class fully-qualified path (Sidekiq::Scheduled::Enq)
+
+The Ruby realworld scenario (`sidekiq/sidekiq` Component method-usage
+audit) requires emitting fully-qualified Ruby class paths through
+nested module declarations — for instance,
+`Sidekiq::Scheduled::Enq` and `Sidekiq::Scheduled::Poller` both live
+inside the same `module Sidekiq; module Scheduled; class Enq; ...`
+file. Two of the fourteen expected rows are nested-class entries that a
+naive grep-for-`include Sidekiq::Component` workflow returns under the
+bare `Enq` / `Poller` names, dropping the `Sidekiq::Scheduled::`
+prefix.
+
+The Ruby smoke at n=1 has not yet been recorded (no
+`target/eval/graph-vs-nograph-ruby-realworld-*` directories), so this
+is currently sourced from the scenario design — the prompt explicitly
+calls it out:
+
+> Treat each `class Foo` ... `include Sidekiq::Component` ... `end`
+> body that names the module on its own line as one entry. If two
+> distinct classes inside the same file both `include
+> Sidekiq::Component` (e.g. `Sidekiq::Scheduled::Enq` and
+> `Sidekiq::Scheduled::Poller` in `lib/sidekiq/scheduled.rb`), report
+> them as two separate rows.
+
+Cite: `crates/squeezy-eval/fixtures/scenarios/graph-vs-nograph-ruby-realworld-with-graph.toml`
+(prompt body, items "class" and the nested-class disambiguation rule).
+
+Action: re-run the Ruby pair under `target/eval/` and grade the actual
+recall. If the with-graph hierarchy walk drops the
+`Sidekiq::Scheduled::` prefix on nested classes, file a graph bug
+against the Ruby module-nest walker.
+
+### 3. dart planner row truncation (one row dropped on both sides)
+
+Both Dart smoke runs returned exactly 14 rows where the scenario
+ground-truth has 15. The two outputs are otherwise identical:
+`AvoidBuildContextExtensions` (3 rows), `AvoidFlutterImports` (1),
+`AvoidPublicBlocMethods` (2), `AvoidPublicFields` (2), `PreferBloc`
+(1), `PreferBuildContextExtensions` (1), `PreferCubit` (1),
+`PreferFileNamingConventions` (1), `PreferVoidPublicCubitMethods` (2)
+= 14. The missing row is the third
+`PreferVoidPublicCubitMethods._Listener` override (the scenario
+description specifies 15 total).
+
+Because both variants drop the same row, the failure is upstream of
+the graph/no-graph split — most likely the assistant emitted an
+"and one more" thought during reasoning that never made it to a
+visible output token, or stopped one row short of finishing. Worth
+checking whether `model_output_bytes` hit a per-turn cap (the Dart
+runs both ended at $0.02 — well under budget).
+
+Cite: `target/eval/graph-vs-nograph-dart-realworld-with-graph-1780219490722`
+and `target/eval/graph-vs-nograph-dart-realworld-no-graph-1780219693878`
+— final assistant_delta concatenation, grep `packages/bloc_lint`
+returns 14 in each.
+
+Action: re-run dart at n=3 to confirm the truncation reproduces; if it
+does, capture the missing row's reasoning trace and decide whether the
+fix is prompt (explicit "emit all 15 rows" check) or planner (raise
+the output-bytes cap on this scenario shape).
+
+## Reproduce
+
+```sh
+# build the eval binary
+cargo build -p squeezy-eval --release
+
+# run a single realworld pair (csharp)
+./target/release/squeezy-eval run \
+  crates/squeezy-eval/fixtures/scenarios/graph-vs-nograph-csharp-realworld-with-graph.toml \
+  --out target/eval --quiet
+./target/release/squeezy-eval run \
+  crates/squeezy-eval/fixtures/scenarios/graph-vs-nograph-csharp-realworld-no-graph.toml \
+  --out target/eval --quiet
+
+# all-language n=3 driver (writes to target/eval/realworld-n3-logs/<lang>.log)
+target/eval/realworld-n3-logs/run-lang.sh csharp
+```
+
+Each run writes `run.json`, `trace.jsonl`, `frames.jsonl`,
+`findings.jsonl`, and a `tickets/` directory; the per-run cost and
+tool-call sequence used to build the table come from `run.json` +
+`trace.jsonl`.
+
+## Appendix: legacy small-scenario data
+
+The original three-task A/B for this branch — single-symbol callers,
+trait-implementor enumeration, cross-crate `estimate_cost` callers —
+predates the realworld sweep and lives in this appendix for
+back-reference. It exercised the graph fixes shipped on this branch
+(self-crate qualified call, workspace-cross-crate qualified /
+import-resolved reference) against the same `gpt-5.4-mini` model.
+
+### Setup (legacy)
+
+- **Workspace**: the squeezy repo itself (Rust workspace under
+  `crates/`).
+- **No-graph variant**: same `excluded_tools` overlay and
+  `SQUEEZY_EXPLORATION_COMPILER=0` as the realworld sweep.
+
+### Tasks (legacy)
 
 | # | Prompt | Ground truth size | Why graph should help |
 |---|---|---:|---|
@@ -48,7 +247,7 @@ table.
 Ground truth verified by `rg`/`grep` against the working tree at HEAD
 of this branch and re-verified after each fix.
 
-## Headline numbers
+### Headline numbers (legacy)
 
 Medians across three runs per side per task, comparing the **current
 state of the branch** (both fixes shipped) against the no-graph baseline.
@@ -69,9 +268,9 @@ per-run table.
 delivers 27/27 recall while graph's median (4 tool calls) sometimes
 stops short — see "Where graph wins" below.
 
-## Per-run data
+### Per-run data (legacy)
 
-### Task 1 — `run_scenario` callers
+#### Task 1 — `run_scenario` callers
 
 | variant | run | tool calls | events | cost | recall |
 |---|---|---:|---:|---:|---:|
@@ -88,7 +287,7 @@ returned only the `ci.rs` references and silently missed
 `main.rs:172`. Documented in
 `references_to_symbol_finds_qualified_self_crate_call_across_modules`.
 
-### Task 2 — `LlmProvider` impls (27 ground truth)
+#### Task 2 — `LlmProvider` impls (27 ground truth)
 
 | variant | fix level | run | tool calls | events | cost | recall |
 |---|---|---|---:|---:|---:|---:|
@@ -108,7 +307,7 @@ than pre-fix (max 18/27), but the median doesn't move because on
 `grep` as its first move even when graph tools are available. See
 "Where graph still falls short."
 
-### Task 3 — `estimate_cost` callers (6 ground truth)
+#### Task 3 — `estimate_cost` callers (6 ground truth)
 
 | variant | fix level | run | tool calls | events | cost | recall |
 |---|---|---|---:|---:|---:|---:|
@@ -129,7 +328,7 @@ graph runs were unreliable too (one returned correct count with wrong
 caller names, one returned 1, one returned nothing); post-fix two of
 three runs are perfect.
 
-## Where graph wins the most
+### Where graph wins the most (legacy)
 
 **Cross-crate single-symbol traversal under a tight budget** — task 3
 is the cleanest case for the graph value prop. The graph-resolved
@@ -148,7 +347,7 @@ silently missed the qualified `squeezy_eval::run_scenario` call from
 that hit, so the graph side now matches no-graph on recall while
 keeping its cost edge.
 
-## Where graph still falls short
+### Where graph still falls short (legacy)
 
 **Workspace-wide structural enumeration (task 2)** — when the prompt
 is "list every implementor / definition / type matching X", the
@@ -161,13 +360,13 @@ follow-up nudge in `squeezy-agent`'s default instructions — "for
 'list every implementor / definition / type' questions, prefer
 `decl_search` over `grep`" — should close it.
 
-## Fixes shipped
+### Fixes shipped (legacy)
 
 Two binding-rule additions in `squeezy-graph`. Each is gated by a
 unique-workspace-candidate-by-name check, so ambiguous names stay
 unresolved.
 
-### 1. Self-crate qualified call
+#### 1. Self-crate qualified call
 
 `<mycrate>::foo()` from another module of the same crate now resolves
 to the function in that crate. Tree-sitter emits the `Calls` edge
@@ -184,7 +383,7 @@ Unit tests:
 - `references_to_symbol_finds_qualified_self_crate_call_across_modules`
 - `self_crate_qualified_callable_does_not_bind_when_name_is_ambiguous_in_crate`
 
-### 2. Workspace-cross-crate qualified or import-resolved reference
+#### 2. Workspace-cross-crate qualified or import-resolved reference
 
 `<othercrate>::Foo` from a different workspace crate, and bare `foo()`
 after `use othercrate::foo;`, now resolve to the symbol in
@@ -208,31 +407,7 @@ Unit tests:
   which documented the pre-resolution behaviour we are now partially
   retiring)
 
-## Reproduce
-
-```sh
-# build the eval binary
-cargo build -p squeezy-eval --release
-
-# run any scenario three times
-for i in 1 2 3; do
-  ./target/release/squeezy-eval run \
-    crates/squeezy-eval/fixtures/scenarios/graph-vs-nograph-callers-with-graph.toml \
-    --no-triage --out target/eval --quiet
-done
-
-# compare a pair of run directories
-./target/release/squeezy-eval diff \
-  target/eval/graph-vs-nograph-callers-with-graph-<ts> \
-  target/eval/graph-vs-nograph-callers-no-graph-<ts>
-```
-
-Each run writes `run.json`, `trace.jsonl`, `frames.jsonl`,
-`findings.jsonl`, and a `tickets/` directory; the per-run cost,
-tool-call sequence, and assistant answer text used to build the
-tables above come from `run.json` + `trace.jsonl` + `frames.jsonl`.
-
-## Architectural audits (Codex baseline)
+## Appendix: Architectural audits (Codex baseline)
 
 Seven architectural-audit scenarios — "list every X that derives from /
 implements / imports / writes Y" — run three times each against Codex
