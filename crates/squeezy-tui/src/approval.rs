@@ -125,7 +125,7 @@ fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
             .copied()
             .and_then(crate::render::diff::language_hint_from_path)
             .map(str::to_string);
-        let body = crate::render::diff::render_patch_full_lines(diff, hint.as_deref());
+        let body = crate::render::diff::render_patch_full_lines_cached(diff, hint.as_deref());
         let total = body.len();
         let shown = total.min(APPROVAL_DIFF_BODY_CAP);
         for mut line in body.into_iter().take(shown) {
