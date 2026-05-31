@@ -37,13 +37,20 @@ fi
 # automatically when invoked directly, so we resolve it from the kotlinc
 # install (one level up from the kotlinc launcher) and pass it explicitly.
 KOTLINC_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v kotlinc)")")")"
-EMBEDDABLE_JAR="$KOTLINC_HOME/lib/kotlin-compiler-embeddable.jar"
-if [ ! -f "$EMBEDDABLE_JAR" ]; then
-    echo "kotlin-compiler-embeddable.jar not found at $EMBEDDABLE_JAR" >&2
+# The standalone kotlinc distribution ships `kotlin-compiler.jar`; the
+# `*-embeddable` variant is published as a separate Maven artifact for tools
+# that need the intellij-shaded classes. Either jar exposes the
+# `org.jetbrains.kotlin.cli.*` and `.psi.*` symbols KotlinOracle.kt imports,
+# so accept whichever is present in the install.
+COMPILER_JAR=$(ls "$KOTLINC_HOME"/lib/kotlin-compiler-embeddable.jar \
+                  "$KOTLINC_HOME"/lib/kotlin-compiler.jar 2>/dev/null | head -1)
+if [ -z "$COMPILER_JAR" ]; then
+    echo "kotlin-compiler[-embeddable].jar not found under $KOTLINC_HOME/lib" >&2
+    ls "$KOTLINC_HOME"/lib 2>/dev/null | head -20 >&2 || true
     exit 2
 fi
 
 echo "Building Kotlin oracle jar with $(kotlinc -version 2>&1)..."
-kotlinc -include-runtime -cp "$EMBEDDABLE_JAR" -d kotlin-oracle.jar KotlinOracle.kt
+kotlinc -include-runtime -cp "$COMPILER_JAR" -d kotlin-oracle.jar KotlinOracle.kt
 
 echo "Wrote $(pwd)/kotlin-oracle.jar"
