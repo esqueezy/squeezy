@@ -309,6 +309,11 @@ fn dart_top_level_symbol_from_node(
     {
         dart_collect_async_attribute(node, &signature, &mut attributes);
     }
+    if matches!(kind, SymbolKind::Function)
+        && let Some(body_node) = body
+    {
+        dart_collect_local_type_attributes(body_node, ctx.source, &mut attributes);
+    }
     attributes.sort();
     attributes.dedup();
 
@@ -487,14 +492,18 @@ fn dart_symbol_from_signature(
     if has_body {
         dart_collect_async_attribute(decl_node, &signature_node, &mut attributes);
     }
-    attributes.sort();
-    attributes.dedup();
 
     let body = if has_body {
         decl_node.child_by_field_name("body")
     } else {
         None
     };
+    if let Some(body_node) = body {
+        dart_collect_local_type_attributes(body_node, ctx.source, &mut attributes);
+    }
+    attributes.sort();
+    attributes.dedup();
+
     let span = span_from_node(decl_node);
     let body_span = body.map(span_from_node);
     let signature_text_value = signature_text(decl_node, body, ctx.source);
@@ -934,6 +943,170 @@ fn dart_extension_type_representation_type(node: Node<'_>, source: &str) -> Opti
         return None;
     }
     Some(dart_strip_type_args(&raw).to_string())
+}
+
+/// Walk a Dart function/method body and emit `dart-local:<name>:<type>`
+/// attributes for typed-or-inferable local variables. The graph resolver
+/// reads these to dispatch `receiver.method(...)` calls when the receiver
+/// is a body-local whose static type is known (typed declaration, or a
+/// `final/var name = Constructor()` shape).
+fn dart_collect_local_type_attributes(body: Node<'_>, source: &str, attributes: &mut Vec<String>) {
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "local_variable_declaration" {
+            dart_collect_locals_from_declaration(node, source, attributes);
+            // Don't descend: variable RHS expressions can't introduce new
+            // locals on the enclosing function in a way that affects
+            // dispatch.
+            continue;
+        }
+        // Skip descending into nested closures / nested function
+        // declarations so their locals don't leak onto the enclosing
+        // symbol's attribute set.
+        if matches!(
+            node.kind(),
+            "function_expression"
+                | "function_declaration"
+                | "method_declaration"
+                | "local_function_declaration"
+        ) && node.id() != body.id()
+        {
+            continue;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
+fn dart_collect_locals_from_declaration(
+    decl: Node<'_>,
+    source: &str,
+    attributes: &mut Vec<String>,
+) {
+    let mut decl_cursor = decl.walk();
+    let Some(init) = decl
+        .named_children(&mut decl_cursor)
+        .find(|child| child.kind() == "initialized_variable_definition")
+    else {
+        return;
+    };
+    let mut explicit_type: Option<String> = None;
+    let mut current_name: Option<String> = None;
+    let mut current_has_rhs = false;
+    let mut cursor = init.walk();
+    let children: Vec<Node<'_>> = init.named_children(&mut cursor).collect();
+    for child in children {
+        match child.kind() {
+            "type" => {
+                explicit_type = node_text(child, source)
+                    .ok()
+                    .map(|text| dart_strip_type_args(text.trim()).to_string())
+                    .map(|text| text.trim_end_matches('?').to_string())
+                    .filter(|text| !text.is_empty() && text != "?");
+            }
+            "identifier" => {
+                if let Some(prev_name) = current_name.take()
+                    && !current_has_rhs
+                    && let Some(ty) = explicit_type.as_deref()
+                {
+                    attributes.push(format!("dart-local:{prev_name}:{ty}"));
+                }
+                current_name = node_text(child, source)
+                    .ok()
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty());
+                current_has_rhs = false;
+            }
+            "initialized_identifier" => {
+                if let Some(prev_name) = current_name.take()
+                    && !current_has_rhs
+                    && let Some(ty) = explicit_type.as_deref()
+                {
+                    attributes.push(format!("dart-local:{prev_name}:{ty}"));
+                }
+                let mut inner_cursor = child.walk();
+                let mut ident: Option<Node<'_>> = None;
+                let mut rhs: Option<Node<'_>> = None;
+                for ic in child.named_children(&mut inner_cursor) {
+                    if ic.kind() == "identifier" && ident.is_none() {
+                        ident = Some(ic);
+                    } else if !matches!(ic.kind(), "metadata" | "comment" | "block_comment") {
+                        rhs = Some(ic);
+                    }
+                }
+                let name = ident
+                    .and_then(|n| node_text(n, source).ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let inferred = rhs.and_then(|n| dart_infer_expression_type(n, source));
+                let ty = explicit_type.clone().or(inferred);
+                if let (Some(name), Some(ty)) = (name, ty) {
+                    attributes.push(format!("dart-local:{name}:{ty}"));
+                }
+                current_name = None;
+                current_has_rhs = false;
+            }
+            other if !matches!(other, "metadata" | "comment" | "block_comment") => {
+                if let Some(name) = current_name.take() {
+                    current_has_rhs = true;
+                    let ty = explicit_type
+                        .clone()
+                        .or_else(|| dart_infer_expression_type(child, source));
+                    if let Some(ty) = ty {
+                        attributes.push(format!("dart-local:{name}:{ty}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(name) = current_name
+        && !current_has_rhs
+        && let Some(ty) = explicit_type
+    {
+        attributes.push(format!("dart-local:{name}:{ty}"));
+    }
+}
+
+/// Best-effort static type for a simple Dart RHS expression on a
+/// local-variable declaration. Recognises constructor calls
+/// (`Foo()`, `prefix.Foo()`) and literal forms.
+fn dart_infer_expression_type(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "call_expression" => {
+            let func = node.child_by_field_name("function")?;
+            match func.kind() {
+                "identifier" => node_text(func, source)
+                    .ok()
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| dart_looks_like_type_name(text)),
+                "member_expression" => {
+                    let property = func.child_by_field_name("property")?;
+                    node_text(property, source)
+                        .ok()
+                        .map(|text| text.trim().to_string())
+                        .filter(|text| dart_looks_like_type_name(text))
+                }
+                _ => None,
+            }
+        }
+        "string_literal" => Some("String".to_string()),
+        "decimal_integer_literal" | "hex_integer_literal" => Some("int".to_string()),
+        "decimal_floating_point_literal" => Some("double".to_string()),
+        "true" | "false" => Some("bool".to_string()),
+        "list_literal" => Some("List".to_string()),
+        "set_or_map_literal" => Some("Map".to_string()),
+        _ => None,
+    }
+}
+
+fn dart_looks_like_type_name(text: &str) -> bool {
+    let bare = dart_strip_type_args(text);
+    let first = bare.chars().next();
+    first.map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+        && bare.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 fn dart_superclass_names(node: Node<'_>, source: &str) -> Vec<String> {

@@ -464,6 +464,14 @@ impl SemanticGraph {
                     Vec::new(),
                 );
             }
+            if let Some(id) = self.dart_typed_local_method_call(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "dart typed local receiver",
+                    Vec::new(),
+                );
+            }
             if let Some(id) = self.arity_unique_candidate(&candidates, call) {
                 return (Some(id), Confidence::Heuristic, "arity match", Vec::new());
             }

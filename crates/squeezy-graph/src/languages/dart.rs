@@ -296,11 +296,43 @@ impl SemanticGraph {
             .map(|(id, _)| id.clone())
     }
 
+    /// Dart receiver-typed dispatch for `local.method(...)`: when the
+    /// receiver is a body-local whose static type was recorded as a
+    /// `dart-local:<name>:<type>` attribute, look up `method` on that
+    /// class (and its `part` siblings via `dart_method_on_class`).
+    pub(crate) fn dart_typed_local_method_call(
+        &self,
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        if !self.caller_is_dart(caller_id) {
+            return None;
+        }
+        let receiver_text = call.receiver.as_deref()?;
+        if matches!(receiver_text, "this" | "super" | "self") {
+            return None;
+        }
+        let receiver_type = self.dart_receiver_static_type(caller_id, receiver_text)?;
+        let class_id = self
+            .dart_class_symbols_by_name(&receiver_type)
+            .into_iter()
+            .next()?;
+        if let Some(method) = self.dart_method_on_class(&class_id, &call.name) {
+            return Some(method);
+        }
+        self.dart_method_in_ancestors(&class_id, &call.name, 0)
+    }
+
     /// Best-effort static type of a receiver identifier inside a Dart caller.
-    /// Currently handles parameters whose declared type appears verbatim in the
-    /// signature text (good enough for typed parameters), and `final X` locals
-    /// where the rhs is a constructor call (handles `final s = Service();`).
-    fn dart_receiver_static_type(&self, caller_id: &SymbolId, receiver: &str) -> Option<String> {
+    /// Resolution order: caller signature (typed parameters), recorded
+    /// `dart-local:<name>:<type>` attributes (from typed-or-inferable body
+    /// locals), receiver-class fields with a `type:` attribute, then a
+    /// literal-receiver heuristic (`'...'.method()` -> String, etc.).
+    pub(crate) fn dart_receiver_static_type(
+        &self,
+        caller_id: &SymbolId,
+        receiver: &str,
+    ) -> Option<String> {
         let caller = self.symbols.get(caller_id)?;
         // Look for `<Type> <receiver>` or `<Type>? <receiver>` in the signature.
         let signature = &caller.signature;
@@ -320,6 +352,22 @@ impl SemanticGraph {
                 return Some(token.to_string());
             }
         }
+        // Look for a `dart-local:<receiver>:<type>` attribute recorded by
+        // the parser for typed/inferable body locals.
+        let local_prefix = format!("dart-local:{receiver}:");
+        if let Some(ty) = caller
+            .attributes
+            .iter()
+            .find_map(|attr| attr.strip_prefix(&local_prefix))
+        {
+            return Some(ty.trim().to_string());
+        }
+        // Literal-receiver heuristic: `'foo'.method()` has String receiver
+        // type, `42.method()` has int, etc. The parser keeps the raw
+        // literal text in `call.receiver`, so detect on first char.
+        if let Some(ty) = dart_literal_receiver_type(receiver) {
+            return Some(ty.to_string());
+        }
         // Look for a Field on the receiver's class whose name matches.
         let class_id = self.dart_class_for_caller(caller_id)?;
         let field = self
@@ -335,6 +383,27 @@ impl SemanticGraph {
             }
         }
         None
+    }
+}
+
+/// Map a Dart literal-form receiver text (e.g. `'hi'`, `42`, `3.14`, `true`)
+/// onto its built-in static type so extension dispatch can match
+/// `extension X on T { ... }` against a literal call site.
+fn dart_literal_receiver_type(receiver: &str) -> Option<&'static str> {
+    let trimmed = receiver.trim();
+    let first = trimmed.chars().next()?;
+    match first {
+        '\'' | '"' => Some("String"),
+        't' if trimmed == "true" => Some("bool"),
+        'f' if trimmed == "false" => Some("bool"),
+        '0'..='9' => {
+            if trimmed.contains('.') || trimmed.contains('e') || trimmed.contains('E') {
+                Some("double")
+            } else {
+                Some("int")
+            }
+        }
+        _ => None,
     }
 }
 
