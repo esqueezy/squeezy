@@ -31,6 +31,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap},
 };
+use serde::Deserialize;
 #[cfg(test)]
 use squeezy_agent::RequestUserInputChoice;
 use squeezy_agent::{
@@ -213,7 +214,6 @@ fn enter_transcript_overlay_screen<W: Write>(writer: &mut W) -> io::Result<()> {
         EnterAlternateScreen,
         Print(DISABLE_MOUSE_MODES),
         EnableAlternateScroll,
-        Print(ENABLE_MOUSE_CLICK_CAPTURE),
         Clear(ClearType::All),
         MoveTo(0, 0)
     )
@@ -4406,7 +4406,7 @@ fn format_request_user_input_menu_lines(
         ),
     ]));
     for (index, choice) in request.choices.iter().enumerate() {
-        let is_selected = index == selected.min(request.choices.len().saturating_sub(1));
+        let is_selected = index == selected && selected < request.choices.len();
         let marker = if is_selected { "● " } else { "  " };
         let label_style = if is_selected {
             Style::default()
@@ -4440,15 +4440,21 @@ fn format_request_user_input_menu_lines(
         // whole modal reads as one semantic surface; the typed body uses
         // a dim+bold tone-aware foreground for legibility without
         // overpowering the question line.
+        let is_selected = selected >= request.choices.len();
+        let marker = if is_selected { "● " } else { "  " };
+        let marker_style = Style::default().fg(if is_selected { AMBER } else { QUIET });
         let entry_style = Style::default()
             .fg(palette::footer_fg())
             .add_modifier(Modifier::BOLD);
         let label_style = Style::default().fg(MODE_PURPLE);
         let cursor_style = Style::default().fg(Color::Black).bg(MODE_PURPLE);
-        let mut spans = vec![Span::raw("  "), Span::styled("Answer › ", label_style)];
+        let mut spans = vec![
+            Span::styled(marker, marker_style),
+            Span::styled("Answer › ", label_style),
+        ];
         if input.is_empty() {
             spans.push(Span::styled(
-                "(type your answer · Enter sends · Esc cancels)",
+                "(type your answer · Enter sends when selected)",
                 Style::default().fg(QUIET),
             ));
         } else {
@@ -7615,8 +7621,14 @@ fn read_file_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 }
 
 fn read_tool_output_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let label = saved_tool_output_meta(tool)
+        .map(|meta| format!("expand saved {}", saved_tool_output_label(&meta.tool_name)))
+        .or_else(|| {
+            saved_compiler_output_summary(tool).map(|_| "expand saved compiler output".to_string())
+        })
+        .unwrap_or_else(|| "expand saved tool output".to_string());
     let mut spans = vec![Span::styled(
-        "expand saved tool output",
+        label,
         Style::default().fg(palette::muted_fg()),
     )];
     if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
@@ -7666,6 +7678,8 @@ struct EditChangedFile {
     patch: Option<String>,
     patch_truncated: bool,
 }
+
+const WRITE_FILE_DIFF_PREVIEW_LINES: usize = 200;
 
 /// Extract the file paths an apply_patch / write_file invocation targets,
 /// used to dedupe transient failure/success pairs in [`TuiApp::recent_edit_failures`].
@@ -7734,6 +7748,11 @@ fn edit_changed_files(tool: &ToolTranscript) -> Vec<EditChangedFile> {
             edit_file_paths(&tool.result.content),
         ));
     }
+    if files.is_empty()
+        && let Some(file) = edit_file_from_write_call(tool)
+    {
+        files.push(file);
+    }
     if files.is_empty() {
         if let Some(items) = tool.result.content["files"].as_array() {
             files.extend(items.iter().filter_map(|item| {
@@ -7756,6 +7775,43 @@ fn edit_changed_files(tool: &ToolTranscript) -> Vec<EditChangedFile> {
         }
     }
     files
+}
+
+fn edit_file_from_write_call(tool: &ToolTranscript) -> Option<EditChangedFile> {
+    if tool.result.tool_name != "write_file" {
+        return None;
+    }
+    let call = tool.call.as_ref()?;
+    let path =
+        string_arg(&tool.result.content, "path").or_else(|| string_arg(&call.arguments, "path"))?;
+    let content = call.arguments.get("content")?.as_str()?;
+    let patch = render_write_file_preview_diff(&path, content)?;
+    let additions = patch
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .count() as u64;
+    let total_lines = content.lines().count();
+
+    Some(EditChangedFile {
+        path,
+        additions,
+        deletions: 0,
+        patch: Some(patch),
+        patch_truncated: total_lines > WRITE_FILE_DIFF_PREVIEW_LINES,
+    })
+}
+
+fn render_write_file_preview_diff(path: &str, content: &str) -> Option<String> {
+    if content.is_empty() {
+        return None;
+    }
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n@@ -0,0 +1 @@\n");
+    for line in content.lines().take(WRITE_FILE_DIFF_PREVIEW_LINES) {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
 }
 
 fn edit_file_paths(content: &serde_json::Value) -> Vec<String> {
@@ -8725,17 +8781,78 @@ fn expanded_read_tool_output_detail_lines(
             format!("bytes {} of {}", format_bytes(bytes), format_bytes(total)),
         ));
     }
+    if let Some(saved) = saved_tool_output_meta(tool) {
+        lines.push(detail_line(
+            false,
+            QUIET,
+            format!("saved {}", saved_tool_output_label(&saved.tool_name)),
+        ));
+        if let Some(result) = saved.parsed {
+            let nested = ToolTranscript {
+                call: None,
+                result,
+                repeat_count: 1,
+            };
+            lines.extend(expanded_tool_detail_lines(&nested, verbosity));
+            return lines;
+        }
+        if !matches!(verbosity, ToolOutputVerbosity::Verbose) {
+            let detail = if saved.partial {
+                "content saved tool-result JSON (partial; hidden in normal mode)"
+            } else {
+                "content saved tool-result JSON (hidden in normal mode)"
+            };
+            lines.push(detail_line(false, QUIET, detail));
+            return lines;
+        }
+    }
+    if let Some(summary) = saved_compiler_output_summary(tool) {
+        lines.push(detail_line(false, QUIET, "saved compiler output"));
+        if !summary.messages.is_empty() {
+            lines.push(detail_line(false, QUIET, "compiler messages"));
+            for line in head_tail_lines(
+                &summary.messages.join("\n"),
+                saved_output_preview_limit(verbosity),
+            ) {
+                if line.truncated_marker {
+                    lines.push(detail_line(false, QUIET, line.text));
+                } else {
+                    lines.push(detail_spans_line(styled_output_spans(&line.text)));
+                }
+            }
+        }
+        if !summary.stderr.is_empty() {
+            lines.push(detail_line(false, QUIET, "stderr"));
+            for line in head_tail_lines(
+                &summary.stderr.join("\n"),
+                saved_output_preview_limit(verbosity),
+            ) {
+                if line.truncated_marker {
+                    lines.push(detail_line(false, QUIET, line.text));
+                } else {
+                    lines.push(detail_spans_line(styled_output_spans(&line.text)));
+                }
+            }
+        }
+        if !matches!(verbosity, ToolOutputVerbosity::Verbose) {
+            let mut detail = format!(
+                "compiler JSON hidden in normal mode ({} message lines)",
+                summary.hidden_json_lines
+            );
+            if summary.partial {
+                detail.push_str(" · partial result");
+            }
+            lines.push(detail_line(false, QUIET, detail));
+            return lines;
+        }
+    }
     if let Some(content) = string_arg(&tool.result.content, "content") {
         // Spilled tool payloads are routinely hundreds of lines of raw JSON,
         // so fold inline even on the expanded card — the overlay (which
         // pins Verbose) still hands the full content to anyone hitting
         // Ctrl-T. Generic `output_block_lines` stays unbounded so the
         // existing "expand grep → see every match" behaviour is preserved.
-        let limit = match verbosity {
-            ToolOutputVerbosity::Compact => 12,
-            ToolOutputVerbosity::Normal => 40,
-            ToolOutputVerbosity::Verbose => usize::MAX,
-        };
+        let limit = saved_output_preview_limit(verbosity);
         if !content.trim().is_empty() {
             lines.push(detail_line(false, QUIET, "content"));
             for line in head_tail_lines(&content, limit) {
@@ -8748,6 +8865,163 @@ fn expanded_read_tool_output_detail_lines(
         }
     }
     lines
+}
+
+fn saved_output_preview_limit(verbosity: ToolOutputVerbosity) -> usize {
+    match verbosity {
+        ToolOutputVerbosity::Compact => 12,
+        ToolOutputVerbosity::Normal => 40,
+        ToolOutputVerbosity::Verbose => usize::MAX,
+    }
+}
+
+#[derive(Debug)]
+struct SavedToolOutputMeta {
+    tool_name: String,
+    parsed: Option<ToolResult>,
+    partial: bool,
+}
+
+fn saved_tool_output_meta(tool: &ToolTranscript) -> Option<SavedToolOutputMeta> {
+    if tool.result.tool_name != "read_tool_output" {
+        return None;
+    }
+    let content = string_arg(&tool.result.content, "content")?;
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let parsed = serde_json::from_str::<ToolResult>(trimmed).ok();
+    let tool_name = parsed
+        .as_ref()
+        .map(|result| result.tool_name.clone())
+        .or_else(|| json_string_field_prefix(trimmed, "tool_name"))?;
+    let partial = tool.result.content["truncated"].as_bool().unwrap_or(false) || parsed.is_none();
+    Some(SavedToolOutputMeta {
+        tool_name,
+        parsed,
+        partial,
+    })
+}
+
+fn json_string_field_prefix(source: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let start = source.find(&needle)? + needle.len();
+    let mut rest = source[start..].trim_start();
+    rest = rest.strip_prefix(':')?.trim_start();
+    let mut deserializer = serde_json::Deserializer::from_str(rest);
+    String::deserialize(&mut deserializer).ok()
+}
+
+fn saved_tool_output_label(tool_name: &str) -> String {
+    match tool_name {
+        "diff_context" => "diff context".to_string(),
+        "repo_map" => "repo map".to_string(),
+        "decl_search" => "declarations".to_string(),
+        "symbol_context" => "symbol context".to_string(),
+        "read_file" | "read_slice" => "read".to_string(),
+        "apply_patch" => "patch".to_string(),
+        "write_file" => "write".to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
+#[derive(Debug)]
+struct SavedCompilerOutputSummary {
+    messages: Vec<String>,
+    stderr: Vec<String>,
+    hidden_json_lines: usize,
+    partial: bool,
+}
+
+fn saved_compiler_output_summary(tool: &ToolTranscript) -> Option<SavedCompilerOutputSummary> {
+    if tool.result.tool_name != "read_tool_output" {
+        return None;
+    }
+    let content = string_arg(&tool.result.content, "content")?;
+    let partial = tool.result.content["truncated"].as_bool().unwrap_or(false);
+    compiler_output_summary(&content, partial)
+}
+
+fn compiler_output_summary(content: &str, partial: bool) -> Option<SavedCompilerOutputSummary> {
+    let mut messages = Vec::new();
+    let mut stderr = Vec::new();
+    let mut hidden_json_lines = 0usize;
+    let mut saw_compiler_stream = false;
+    let mut in_stderr = false;
+
+    for raw in content.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed == "===== stderr =====" {
+            in_stderr = true;
+            continue;
+        }
+        if trimmed.starts_with("=====") {
+            in_stderr = false;
+            continue;
+        }
+        if in_stderr {
+            if !line.trim().is_empty() {
+                stderr.push(line.to_string());
+            }
+            continue;
+        }
+        if let Some(message) = cargo_json_message_line(trimmed) {
+            saw_compiler_stream = true;
+            if !message.is_empty() {
+                messages.extend(message.lines().map(ToOwned::to_owned));
+            }
+            hidden_json_lines += 1;
+        } else if looks_like_cargo_json_line(trimmed) {
+            saw_compiler_stream = true;
+            hidden_json_lines += 1;
+        }
+    }
+
+    if saw_compiler_stream || !stderr.is_empty() {
+        Some(SavedCompilerOutputSummary {
+            messages,
+            stderr,
+            hidden_json_lines,
+            partial,
+        })
+    } else {
+        None
+    }
+}
+
+fn cargo_json_message_line(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    match value["reason"].as_str()? {
+        "compiler-message" => value["message"]["rendered"]
+            .as_str()
+            .or_else(|| value["message"]["message"].as_str())
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn looks_like_cargo_json_line(line: &str) -> bool {
+    if line.is_empty() {
+        return false;
+    }
+    if line.contains("\"reason\":\"compiler-artifact\"")
+        || line.contains("\"reason\":\"build-script-executed\"")
+        || line.contains("\"reason\":\"build-finished\"")
+        || line.contains("\"package_id\":\"registry+https://github.com/rust-lang/crates.io-index#")
+    {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| value["reason"].as_str().map(str::to_owned))
+        .is_some_and(|reason| {
+            matches!(
+                reason.as_str(),
+                "compiler-artifact" | "build-script-executed" | "build-finished"
+            )
+        })
 }
 
 fn expanded_generic_tool_detail_lines(
@@ -10262,7 +10536,8 @@ fn format_status_hint_base(app: &TuiApp) -> String {
             return "type your answer · Enter send · Esc cancel".to_string();
         }
         if pending.request.allow_freeform {
-            return "Up/Down choose · type for free-form · Enter send · Esc cancel".to_string();
+            return "Up/Down choose · type selects Answer · Enter sends dotted row · Esc cancel"
+                .to_string();
         }
         return "Up/Down choose · Enter select · Esc cancel".to_string();
     }

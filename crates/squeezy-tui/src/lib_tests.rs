@@ -213,7 +213,7 @@ async fn freeform_modal_keeps_typing_out_of_main_composer() {
 }
 
 #[tokio::test]
-async fn freeform_modal_enter_submits_typed_answer_before_selected_choice() {
+async fn freeform_modal_enter_submits_dotted_choice_even_with_typed_answer() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Plan);
     let request = RequestUserInputRequest {
@@ -242,9 +242,147 @@ async fn freeform_modal_enter_submits_typed_answer_before_selected_choice() {
     .expect("handle enter");
 
     let response = response_rx.await.expect("response");
+    assert_eq!(response.choice_value.as_deref(), Some("default"));
+    assert_eq!(response.freeform, None);
+    assert!(app.pending_request_user_input.is_none());
+}
+
+#[tokio::test]
+async fn freeform_modal_typing_moves_dot_to_answer_row() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Plan);
+    let request = RequestUserInputRequest {
+        question: "Where to next?".to_string(),
+        choices: vec![squeezy_agent::RequestUserInputChoice {
+            label: "Default".to_string(),
+            value: "default".to_string(),
+        }],
+        allow_freeform: true,
+    };
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 0,
+        answer: String::new(),
+        answer_cursor: 0,
+    });
+
+    for ch in "typed answer".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("handle char");
+    }
+    assert_eq!(
+        app.pending_request_user_input
+            .as_ref()
+            .expect("pending")
+            .selection_index,
+        1,
+        "typing should move the dot to the freeform Answer row",
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle enter");
+
+    let response = response_rx.await.expect("response");
     assert_eq!(response.choice_value, None);
     assert_eq!(response.freeform.as_deref(), Some("typed answer"));
-    assert!(app.pending_request_user_input.is_none());
+}
+
+#[tokio::test]
+async fn freeform_modal_up_from_answer_ignores_typed_text_on_enter() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Plan);
+    let request = RequestUserInputRequest {
+        question: "Where to next?".to_string(),
+        choices: vec![squeezy_agent::RequestUserInputChoice {
+            label: "Default".to_string(),
+            value: "default".to_string(),
+        }],
+        allow_freeform: true,
+    };
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 1,
+        answer: "typed answer".to_string(),
+        answer_cursor: "typed answer".len(),
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle up");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle enter");
+
+    let response = response_rx.await.expect("response");
+    assert_eq!(response.choice_value.as_deref(), Some("default"));
+    assert_eq!(response.freeform, None);
+}
+
+#[tokio::test]
+async fn freeform_modal_down_reaches_answer_row_after_last_choice() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Plan);
+    let request = RequestUserInputRequest {
+        question: "Where to next?".to_string(),
+        choices: vec![
+            squeezy_agent::RequestUserInputChoice {
+                label: "First".to_string(),
+                value: "first".to_string(),
+            },
+            squeezy_agent::RequestUserInputChoice {
+                label: "Second".to_string(),
+                value: "second".to_string(),
+            },
+        ],
+        allow_freeform: true,
+    };
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 1,
+        answer: String::new(),
+        answer_cursor: 0,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle down");
+
+    assert_eq!(
+        app.pending_request_user_input
+            .as_ref()
+            .expect("pending")
+            .selection_index,
+        2,
+        "Down from the last choice should select the freeform Answer row",
+    );
 }
 
 #[tokio::test]
@@ -3666,6 +3804,82 @@ fn tool_rows_summarize_diff_glob_read_and_plan_outputs() {
 }
 
 #[test]
+fn read_tool_output_summary_names_saved_tool_without_raw_json() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("read_tool_output", "");
+    result.content = serde_json::json!({
+        "handle": "abc123",
+        "bytes_returned": 128,
+        "total_bytes": 4096,
+        "truncated": true,
+        "content": "{\"call_id\":\"call-1\",\"tool_name\":\"diff_context\",\"status\":\"Success\",\"content\":{\"files\":[{\"path\":\"src/lib.rs\""
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 140, 12);
+
+    assert!(
+        output.contains("✔ Explored expand saved diff context · 128B · partial result"),
+        "{output}"
+    );
+    assert!(output.contains("saved diff context"), "{output}");
+    assert!(
+        output.contains("content saved tool-result JSON (partial; hidden in normal mode)"),
+        "{output}"
+    );
+    assert!(!output.contains("\"tool_name\""), "{output}");
+    assert!(!output.contains("\"files\""), "{output}");
+}
+
+#[test]
+fn read_tool_output_hides_cargo_json_artifacts_in_normal_mode() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("read_tool_output", "");
+    result.content = serde_json::json!({
+        "handle": "cargo-json",
+        "bytes_returned": 256,
+        "total_bytes": 1024,
+        "truncated": true,
+        "content": concat!(
+            "{\"reason\":\"compiler-artifact\",\"package_id\":\"registry+https://github.com/rust-lang/crates.io-index#libc@0.2.184\"}\n",
+            "{\"reason\":\"build-script-executed\",\"package_id\":\"registry+https://github.com/rust-lang/crates.io-index#libc@0.2.184\"}\n",
+            "{\"reason\":\"compiler-message\",\"message\":{\"rendered\":\"error[E0308]: mismatched types\\n  --> src/lib.rs:1:1\\n\"}}\n",
+            "===== stderr =====\n",
+            "   Compiling demo v0.1.0 (/tmp/demo)\n",
+            "error: could not compile `demo` due to 1 previous error\n",
+        )
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 140, 18);
+
+    assert!(
+        output.contains("✔ Explored expand saved compiler output · 256B · partial result"),
+        "{output}"
+    );
+    assert!(output.contains("saved compiler output"), "{output}");
+    assert!(output.contains("compiler messages"), "{output}");
+    assert!(
+        output.contains("error[E0308]: mismatched types"),
+        "{output}"
+    );
+    assert!(output.contains("stderr"), "{output}");
+    assert!(
+        output.contains("error: could not compile `demo` due to 1 previous error"),
+        "{output}"
+    );
+    assert!(
+        output.contains("compiler JSON hidden in normal mode"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("\"reason\":\"compiler-artifact\""),
+        "{output}"
+    );
+    assert!(!output.contains("\"package_id\""), "{output}");
+}
+
+#[test]
 fn edit_tool_row_summarizes_checkpoint_diff_and_expands_patch() {
     let mut app = test_app(SessionMode::Build);
     let mut result = sample_tool_result("apply_patch", "");
@@ -3810,6 +4024,47 @@ fn edit_row_uses_apply_patch_unified_diff_when_checkpoint_is_absent() {
     assert!(
         !output.contains("\"unified_diff\""),
         "renderer should show the diff, not raw JSON: {output}"
+    );
+}
+
+#[test]
+fn write_file_edit_row_uses_call_content_when_result_has_only_path() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("write_file", "");
+    result.call_id = "write-1".to_string();
+    result.content = serde_json::json!({
+        "path": "src/process_info.rs",
+        "before_sha256": "before",
+        "after_sha256": "after",
+        "bytes_written": 25,
+        "noop": false
+    });
+    app.push_tool_result_with_call(
+        result,
+        Some(ToolCall {
+            call_id: "write-1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "src/process_info.rs",
+                "content": "fn new_process_info() {}\n"
+            }),
+        }),
+    );
+
+    let output = render_to_string(&app, 140, 16);
+
+    assert!(
+        output.contains("✔ Edited src/process_info.rs · +1 -0"),
+        "{output}"
+    );
+    assert!(
+        output.contains("file src/process_info.rs +1 -0"),
+        "{output}"
+    );
+    assert!(output.contains("+fn new_process_info() {}"), "{output}");
+    assert!(
+        !output.contains("\"bytes_written\""),
+        "renderer should show the write preview, not raw JSON: {output}"
     );
 }
 
@@ -3982,6 +4237,51 @@ fn plan_mode_question_renders_with_choices_and_freeform_hint() {
     assert!(
         output.contains("freeform"),
         "freeform hint missing: {output}"
+    );
+}
+
+#[test]
+fn plan_mode_question_marks_freeform_answer_when_selected() {
+    let request = RequestUserInputRequest {
+        question: "Which path?".to_string(),
+        choices: vec![
+            RequestUserInputChoice {
+                label: "Use src/main.rs as the representative file".to_string(),
+                value: "src/main.rs".to_string(),
+            },
+            RequestUserInputChoice {
+                label: "Pick a different Rust file for me".to_string(),
+                value: "other".to_string(),
+            },
+            RequestUserInputChoice {
+                label: "I want a broader modernization pass, not one file".to_string(),
+                value: "broader".to_string(),
+            },
+        ],
+        allow_freeform: true,
+    };
+
+    let lines = format_request_user_input_menu_lines(&request, request.choices.len(), "lm");
+    let answer = lines
+        .iter()
+        .find(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref() == "Answer › ")
+        })
+        .expect("answer row");
+    let marker = answer
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "● ")
+        .expect("answer marker");
+    assert_eq!(marker.style.fg, Some(AMBER));
+    assert!(
+        answer
+            .spans
+            .iter()
+            .any(|span| span.content.as_ref() == "lm"),
+        "typed answer should remain visible on the selected answer row",
     );
 }
 
@@ -4823,7 +5123,7 @@ fn alternate_scroll_commands_use_xterm_private_mode() {
 }
 
 #[test]
-fn transcript_overlay_screen_enables_scroll_capture() {
+fn transcript_overlay_screen_keeps_native_selection_available() {
     let mut bytes = Vec::new();
     enter_transcript_overlay_screen(&mut bytes).expect("enter transcript overlay screen");
     let ansi = String::from_utf8(bytes).expect("ansi");
@@ -4834,8 +5134,12 @@ fn transcript_overlay_screen_enables_scroll_capture() {
         "must enable alternate-scroll mode for wheel-to-key fallback"
     );
     assert!(
-        ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
-        "must capture wheel events while the overlay is modal"
+        ansi.contains(DISABLE_MOUSE_MODES),
+        "must clear inline mouse capture before opening the transcript"
+    );
+    assert!(
+        !ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
+        "full transcript must leave native terminal text selection available"
     );
 }
 

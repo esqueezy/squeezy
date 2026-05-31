@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -88,6 +88,23 @@ async fn wait_for_agent_graph(agent: &Agent) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("agent graph did not become ready");
+}
+
+async fn wait_for_persisted_graph_partition(root: &Path, file_id: &str) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_error = "partition not checked yet".to_string();
+    while Instant::now() < deadline {
+        match SqueezyStore::open(root, None) {
+            Ok(store) => match store.graph_partition(&squeezy_core::FileId::new(file_id)) {
+                Ok(Some(partition)) => return partition,
+                Ok(None) => last_error = "partition absent".to_string(),
+                Err(err) => last_error = format!("graph_partition failed: {err}"),
+            },
+            Err(err) => last_error = format!("store open failed: {err}"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("graph partition {file_id} was not persisted: {last_error}");
 }
 
 #[tokio::test]
@@ -1697,12 +1714,9 @@ async fn agent_shares_state_store_with_tool_registry_for_graph_persistence() {
     agent.shutdown().await;
     drop(agent);
 
-    let store = SqueezyStore::open(&root, None).expect("reopen state store");
-    let partition: Option<serde_json::Value> = store
-        .graph_partition(&squeezy_core::FileId::new("src/lib.rs"))
-        .expect("graph_partition");
+    let partition = wait_for_persisted_graph_partition(&root, "src/lib.rs").await;
     assert!(
-        partition.is_some(),
+        !partition.is_null(),
         "agent must persist graph partitions through the shared state store",
     );
 
