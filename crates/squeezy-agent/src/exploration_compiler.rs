@@ -35,6 +35,13 @@ pub(crate) struct ExplorationPlan {
 }
 
 pub(crate) const RAW_READ_DENIAL_REASON: &str = "exploration compiler refused raw read before graph context; call repo_map, definition_search, symbol_context, or another graph navigation tool first";
+/// Cap on `max_results` for graph-tool calls the planner emits before the
+/// model has run. A real-world subclass/hierarchy fan-out (e.g. all
+/// `WidgetsBindingObserver` subclasses in a Flutter app) routinely exceeds
+/// the previous value of 8 and silently truncated the tail. Keeping headroom
+/// at 32 covers the realistic-but-not-pathological cases the planner sees;
+/// the model can paginate or widen further from there.
+pub(crate) const PLANNER_GRAPH_MAX_RESULTS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExplorationTurnState {
@@ -111,7 +118,7 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
                 tool_call(
                     "planner_symbol_context",
                     "symbol_context",
-                    json!({"query": query.clone(), "max_results": 8, "max_references": 12}),
+                    json!({"query": query.clone(), "max_results": PLANNER_GRAPH_MAX_RESULTS, "max_references": 12}),
                 ),
                 tool_call(
                     "planner_test_glob",
@@ -133,7 +140,7 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
                 tool_call(
                     "planner_symbol_context",
                     "symbol_context",
-                    json!({"query": query.clone(), "max_results": 8, "max_references": 20}),
+                    json!({"query": query.clone(), "max_results": PLANNER_GRAPH_MAX_RESULTS, "max_references": 20}),
                 ),
                 tool_call(
                     "planner_upstream_flow",
@@ -160,7 +167,7 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
                 tool_call(
                     "planner_definition_search",
                     "definition_search",
-                    json!({"query": query.clone(), "max_results": 8}),
+                    json!({"query": query.clone(), "max_results": PLANNER_GRAPH_MAX_RESULTS}),
                 ),
                 tool_call(
                     "planner_upstream_flow",
@@ -204,7 +211,7 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
             calls: vec![tool_call(
                 "planner_symbol_context",
                 "symbol_context",
-                json!({"query": query, "max_results": 8, "max_references": 4}),
+                json!({"query": query, "max_results": PLANNER_GRAPH_MAX_RESULTS, "max_references": 4}),
             )],
             guard_raw_reads: true,
         });
@@ -224,7 +231,7 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
             calls: vec![tool_call(
                 "planner_definition_search",
                 "definition_search",
-                json!({"query": query.clone(), "max_results": 8}),
+                json!({"query": query.clone(), "max_results": PLANNER_GRAPH_MAX_RESULTS}),
             )],
             guard_raw_reads: true,
         });

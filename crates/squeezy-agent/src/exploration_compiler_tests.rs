@@ -167,3 +167,58 @@ fn source_file_extension_token_does_not_trigger_planner_preflight() {
     // rejected by the same gate.
     assert!(compile_exploration_plan("Which file defines main.go?").is_none());
 }
+#[test]
+fn planner_graph_max_results_caps_above_realistic_subclass_fanout() {
+    // Real-world hierarchies (e.g. all `WidgetsBindingObserver` subclasses
+    // in a Flutter app) reliably produce 15+ siblings. The cap must clear
+    // that headroom by a wide margin so the planner doesn't silently
+    // truncate the tail before the model ever sees it.
+    assert!(
+        PLANNER_GRAPH_MAX_RESULTS >= 32,
+        "planner cap regressed below 32: was {PLANNER_GRAPH_MAX_RESULTS}",
+    );
+}
+
+#[test]
+fn planner_calls_use_the_shared_graph_max_results_constant() {
+    // Pin every planner-emitted graph call to the shared cap. If a future
+    // edit hard-codes a smaller integer (the original bug was a literal
+    // `8`), this assertion fires before recall regresses.
+    let cap = PLANNER_GRAPH_MAX_RESULTS as u64;
+    let prompts = [
+        "Which file defines make_widget?",
+        "list methods on Widget",
+        "Who calls Runner::run?",
+        "What is the change impact of Runner::run?",
+        "Find tests for Runner::run coverage",
+    ];
+    for prompt in prompts {
+        let plan = compile_exploration_plan(prompt)
+            .unwrap_or_else(|| panic!("expected plan for prompt: {prompt}"));
+        for call in &plan.calls {
+            // Only assert on tools whose `max_results` the planner is
+            // responsible for sizing; flow tools intentionally cap at 25.
+            if !matches!(
+                call.name.as_str(),
+                "definition_search" | "decl_search" | "symbol_context" | "hierarchy"
+            ) {
+                continue;
+            }
+            let observed = call
+                .arguments
+                .get("max_results")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "planner call `{}` for prompt `{prompt}` missing max_results",
+                        call.name
+                    )
+                });
+            assert_eq!(
+                observed, cap,
+                "planner call `{}` for prompt `{prompt}` used max_results={observed}, expected the shared cap {cap}",
+                call.name,
+            );
+        }
+    }
+}
