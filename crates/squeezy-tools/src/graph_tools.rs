@@ -470,13 +470,33 @@ fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> boo
     let Some(filter) = filter else {
         return true;
     };
-    let path = symbol.file_id.0.as_str();
+    path_matches_filter(symbol.file_id.0.as_str(), filter)
+}
+
+/// Match `path` against a model-supplied `filter`.
+///
+/// Filters that look like a directory path (contain `/`) match by strict
+/// prefix with a directory boundary — `gson/src/main/java` matches files
+/// under that tree but not siblings like `gson/src/test/java/...`. This is
+/// what the model intuitively means when it writes a multi-segment path.
+///
+/// Single-token filters (no `/`, e.g. `squeezy_graph`) keep the loose
+/// trailing-segment + fuzzy fallback so casual "find a crate" queries
+/// still resolve. The fuzzy path was the source of cross-tree noise only
+/// when the model already wrote a real prefix; gating on `/` removes that
+/// noise without regressing the bareword UX.
+fn path_matches_filter(path: &str, filter: &str) -> bool {
+    if filter.contains('/') {
+        let filter = filter.trim_end_matches('/');
+        if filter.is_empty() {
+            return true;
+        }
+        return path == filter
+            || (path.starts_with(filter) && path.as_bytes().get(filter.len()) == Some(&b'/'));
+    }
     if path == filter || path.ends_with(&format!("/{filter}")) {
         return true;
     }
-    // Append fuzzy path matching as a fallback so casual queries like
-    // `path: "graph_mgr"` resolve to `crates/squeezy-graph/src/lib.rs`.
-    // Suffix matching above keeps precedence; fuzzy only rescues misses.
     squeezy_rank::fuzzy::fuzzy_path_score(path, filter).is_some()
 }
 
@@ -1652,27 +1672,44 @@ fn hierarchy_node_packet(
 }
 
 pub(crate) fn symbol_json(graph: &squeezy_graph::SemanticGraph, symbol: &GraphSymbol) -> Value {
-    json!({
-        "id": symbol.id.0,
-        "name": symbol.name,
-        "kind": format!("{:?}", symbol.kind),
-        "path": symbol.file_id.0,
-        "language": graph.files.get(&symbol.file_id).map(|file| file.language.display_name()),
-        "signature": symbol.signature,
-        "visibility": symbol.visibility,
-        "span": span_json(symbol.span),
-        "body_span": symbol.body_span.map(span_json),
-        "attributes": symbol.attributes,
-        "dirty": symbol.dirty.as_ref().map(|dirty| json!({
-            "status": dirty.status,
-            "ranges": dirty.ranges.iter().map(|range| json!({
-                "start_line": range.start_line,
-                "end_line": range.end_line,
-            })).collect::<Vec<_>>(),
-        })),
-        "confidence": symbol.confidence.id(),
-        "freshness": format!("{:?}", symbol.freshness),
-    })
+    // Lean shape for first-emit symbol packets. Every dropped field paid for
+    // itself in measured trace bytes without changing the model's next-call
+    // routing:
+    //   * `body_span` near-duplicated `span`; the model only needs it when
+    //     it already decided to read the body, and at that point it calls
+    //     `read_slice` with `symbol_id + span_kind=body` and the graph
+    //     resolves the body span internally.
+    //   * `attributes` is a search-time filter (`decl_search` accepts
+    //     `attribute`), not a downstream decision input.
+    //   * `language` and `freshness` were decorations the agent never
+    //     branched on. Telemetry still carries both via typed graph events.
+    //   * `visibility` and `dirty` are emitted only when set so the common
+    //     case (unannotated symbols) sheds two keys per packet.
+    let _ = graph;
+    let mut object = serde_json::Map::with_capacity(8);
+    object.insert("id".to_string(), json!(symbol.id.0));
+    object.insert("name".to_string(), json!(symbol.name));
+    object.insert("kind".to_string(), json!(format!("{:?}", symbol.kind)));
+    object.insert("path".to_string(), json!(symbol.file_id.0));
+    object.insert("signature".to_string(), json!(symbol.signature));
+    object.insert("span".to_string(), span_json(symbol.span));
+    if let Some(visibility) = symbol.visibility.as_deref() {
+        object.insert("visibility".to_string(), json!(visibility));
+    }
+    if let Some(dirty) = symbol.dirty.as_ref() {
+        object.insert(
+            "dirty".to_string(),
+            json!({
+                "status": dirty.status,
+                "ranges": dirty.ranges.iter().map(|range| json!({
+                    "start_line": range.start_line,
+                    "end_line": range.end_line,
+                })).collect::<Vec<_>>(),
+            }),
+        );
+    }
+    object.insert("confidence".to_string(), json!(symbol.confidence.id()));
+    Value::Object(object)
 }
 
 pub(crate) fn symbol_summary_json(symbol: &GraphSymbol) -> Value {
@@ -1686,6 +1723,11 @@ pub(crate) fn symbol_summary_json(symbol: &GraphSymbol) -> Value {
 }
 
 fn edge_json(edge: &GraphEdge) -> Value {
+    // `freshness` and `provenance` were per-edge decorations the model never
+    // branched on: freshness is "Fresh" in steady state and provenance is
+    // the squeezy-graph stub. Telemetry still emits both via the typed
+    // graph events; dropping them from the wire payload cuts ~40-60B per
+    // edge and every call_graph/downstream_flow packet carries several.
     let mut value = json!({
         "from": edge.from.0,
         "to": edge.to.as_ref().map(|id| id.0.clone()),
@@ -1693,8 +1735,6 @@ fn edge_json(edge: &GraphEdge) -> Value {
         "kind": format!("{:?}", edge.kind),
         "span": edge.span.map(span_json),
         "confidence": edge.confidence.id(),
-        "freshness": format!("{:?}", edge.freshness),
-        "provenance": provenance_json(edge.provenance.clone()),
     });
     if !edge.candidates.is_empty()
         && let Some(object) = value.as_object_mut()
@@ -2110,13 +2150,16 @@ pub(crate) fn reference_json(hit: ReferenceHit) -> Value {
 }
 
 fn span_json(span: squeezy_core::SourceSpan) -> Value {
-    // `end.column` is dropped from the wire payload — the start column plus the
-    // line range is enough for the model to locate the span, and the byte
-    // window already pins the exact end. Saves ~24B per span across every
-    // packet, repo_map node, symbol, edge, and reference hit.
+    // The wire payload addresses spans by 1-based line numbers only. The
+    // model routes every follow-up by line range (`read_slice` accepts
+    // `start_line`/`end_line`, and the agent compaction pipeline derives
+    // the byte window from `offset` + `content.len()` rather than reading
+    // a span's byte offsets), so the raw byte coordinates were doubling
+    // each span's footprint without changing decisions. `end.column` is
+    // dropped for the same reason — start column plus the line range pins
+    // the span. Saves ~40-60B per span across every packet, repo_map node,
+    // symbol, edge, and reference hit.
     json!({
-        "start_byte": span.start_byte,
-        "end_byte": span.end_byte,
         "start": {"line": span.start.line, "column": span.start.column},
         "end": {"line": span.end.line},
     })
@@ -3427,6 +3470,73 @@ impl ToolRegistry {
     }
 }
 
+/// Strip decoration fields from a graph tool packet on REPLAY — i.e.
+/// when the model is being shown a tool result it already absorbed on a
+/// prior turn. `confidence`, `freshness`, `dirty`, `body_span`, and
+/// `attributes` exist to inform the model's INITIAL decision after the
+/// packet first lands; on cached re-reads they are dead weight. `symbol`
+/// is shrunk to its identifying fields (`name`, `kind`, `path`, `span`)
+/// — the symbol `id`, `signature`, `visibility`, `language`, and the
+/// same decoration fields the outer packet drops are not load-bearing
+/// on replay either. Containers (`spans`, `references`, `callers`,
+/// `callees`, `diagnostics`, `hierarchy`, `children`, `packets`,
+/// `nested`) recurse so deep packets shrink uniformly.
+///
+/// Returns a fresh `Value`; the input is left untouched so the caller
+/// can decide whether replacing the cached output is worth a JSON
+/// round-trip. Non-object inputs pass through unchanged.
+pub fn compact_replay_packet(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut out = serde_json::Map::with_capacity(object.len());
+            for (key, child) in object {
+                if PACKET_REPLAY_DROP_FIELDS.contains(&key.as_str()) {
+                    continue;
+                }
+                if key == "symbol" {
+                    out.insert(key.clone(), compact_replay_symbol(child));
+                    continue;
+                }
+                out.insert(key.clone(), compact_replay_packet(child));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(compact_replay_packet).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Field set dropped from a packet object on replay. Listed inline (vs
+/// constructed from `&[&str]` at runtime) so the lookup is a small const
+/// slice scan — packets are recursive and this runs once per node.
+const PACKET_REPLAY_DROP_FIELDS: &[&str] = &[
+    "confidence",
+    "freshness",
+    "dirty",
+    "body_span",
+    "attributes",
+    "provenance",
+];
+
+/// `symbol` substructure inside a packet keeps only the identifying
+/// fields the model needs to locate the symbol — `name`, `kind`,
+/// `path`, and `span`. The `id` matters on the first emit (the model
+/// can hand it back to `symbol_context` or `read_slice`), but on replay
+/// the model already chose its next call from the first packet; the id
+/// only re-bloats the cached payload.
+fn compact_replay_symbol(value: &Value) -> Value {
+    let Value::Object(object) = value else {
+        return value.clone();
+    };
+    let mut out = serde_json::Map::with_capacity(4);
+    for key in ["name", "kind", "path", "span"] {
+        if let Some(child) = object.get(key) {
+            out.insert(key.to_string(), child.clone());
+        }
+    }
+    Value::Object(out)
+}
+
 #[cfg(test)]
 mod line_window_auto_widen_tests {
     use super::{
@@ -3513,5 +3623,74 @@ mod line_window_auto_widen_tests {
             "end_line clamped to file length, got {}",
             span.end.line + 1
         );
+    }
+}
+
+#[cfg(test)]
+mod path_filter_tests {
+    use super::path_matches_filter;
+
+    #[test]
+    fn multi_segment_filter_requires_directory_boundary() {
+        // The Java realworld bug: `gson/src/main/java` was returning 27
+        // matches because suffix/fuzzy matching admitted `src/test/java`
+        // siblings. Strict prefix semantics keep only the real children.
+        assert!(path_matches_filter(
+            "gson/src/main/java/com/google/gson/TypeAdapter.java",
+            "gson/src/main/java",
+        ));
+        assert!(!path_matches_filter(
+            "gson/src/test/java/com/google/gson/TypeAdapterTest.java",
+            "gson/src/main/java",
+        ));
+    }
+
+    #[test]
+    fn multi_segment_filter_rejects_substring_neighbour() {
+        // `src/main` must not bleed into `experimental_src/main` — a
+        // substring/fuzzy match would incorrectly let it through.
+        assert!(path_matches_filter("src/main/foo.rs", "src/main"));
+        assert!(!path_matches_filter(
+            "experimental_src/main/foo.rs",
+            "src/main",
+        ));
+    }
+
+    #[test]
+    fn multi_segment_filter_allows_exact_directory_match() {
+        // `path == filter` (the directory itself) is a legitimate match
+        // when a symbol's file_id happens to equal the filter.
+        assert!(path_matches_filter(
+            "gson/src/main/java",
+            "gson/src/main/java"
+        ));
+        // Trailing slashes are tolerated; the model occasionally types them.
+        assert!(path_matches_filter(
+            "gson/src/main/java/Foo.java",
+            "gson/src/main/java/",
+        ));
+    }
+
+    #[test]
+    fn single_token_filter_retains_fuzzy_segment_match() {
+        // The casual `path: "squeezy_graph"` UX still resolves to
+        // `crates/squeezy-graph/src/lib.rs` via fuzzy/separator-insensitive
+        // matching. Strict prefix only kicks in when the filter has a `/`.
+        assert!(path_matches_filter(
+            "crates/squeezy-graph/src/lib.rs",
+            "squeezy_graph",
+        ));
+        assert!(path_matches_filter(
+            "gson/src/main/java/com/google/gson/Foo.java",
+            "Foo.java",
+        ));
+    }
+
+    #[test]
+    fn single_token_filter_still_rejects_unrelated_paths() {
+        assert!(!path_matches_filter(
+            "crates/squeezy-graph/src/lib.rs",
+            "zzzznope",
+        ));
     }
 }
