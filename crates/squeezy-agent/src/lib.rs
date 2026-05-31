@@ -187,6 +187,12 @@ struct ConversationState {
     metrics: SessionMetrics,
     redactions: u64,
     token_calibration: squeezy_llm::TokenCalibration,
+    /// Mirror of the per-turn router's sticky-window counter, kept
+    /// in sync with `Agent::routing_state.sticky.remaining_turns` so
+    /// that every existing `to_resume_state()` call site persists the
+    /// router's cross-turn state without a parallel plumbing change.
+    /// Read back into the live router on `Agent::resume`.
+    routing_sticky_remaining_turns: u8,
 }
 
 impl ConversationState {
@@ -205,7 +211,16 @@ impl ConversationState {
             metrics: metadata.metrics.clone(),
             redactions: metadata.redactions,
             token_calibration: metadata.token_calibration.clone(),
+            routing_sticky_remaining_turns: state.routing_sticky_remaining_turns,
         }
+    }
+
+    fn routing_sticky_remaining_turns(&self) -> u8 {
+        self.routing_sticky_remaining_turns
+    }
+
+    fn set_routing_sticky_remaining_turns(&mut self, value: u8) {
+        self.routing_sticky_remaining_turns = value;
     }
 
     fn to_resume_state(&self) -> SessionResumeState {
@@ -229,6 +244,7 @@ impl ConversationState {
             hydrated_transcript: Vec::new(),
             context_attachments: self.context_attachments.clone(),
             context_compaction: self.context_compaction.clone(),
+            routing_sticky_remaining_turns: self.routing_sticky_remaining_turns,
         }
     }
 }
@@ -1318,6 +1334,7 @@ impl Agent {
             Vec::new()
         };
         let conversation_state = ConversationState::from_resume(resume_state, &metadata);
+        let routing_sticky_remaining = conversation_state.routing_sticky_remaining_turns();
         let agent = Self::build(
             config,
             provider,
@@ -1325,6 +1342,13 @@ impl Agent {
             conversation_state,
             None,
         );
+        if routing_sticky_remaining > 0 {
+            // Honour the persisted sticky window so a follow-up
+            // prompt on a resumed mid-hard-task session continues to
+            // skip the per-turn router until the window expires.
+            let mut state = agent.routing_state.lock().expect("routing state lock");
+            state.sticky.remaining_turns = routing_sticky_remaining;
+        }
         let _ = handle.update_metadata(|metadata| {
             metadata.status = SessionStatus::Running;
             metadata.ended_at_ms = None;
@@ -5254,12 +5278,19 @@ impl TurnRuntime {
             state.pending_override.force_parent = false;
             snapshot
         };
-        let sticky_active = self
-            .routing_state
+        let (sticky_active, sticky_remaining_after_tick) = {
+            let mut state = self.routing_state.lock().expect("routing state lock");
+            let was_sticky = state.sticky.tick();
+            (was_sticky, state.sticky.remaining_turns)
+        };
+        // Mirror the post-tick value into `ConversationState` so a
+        // resume snapshot taken after this turn reflects the
+        // decremented sticky window (not the value the previous turn
+        // engaged).
+        self.conversation_state
             .lock()
-            .expect("routing state lock")
-            .sticky
-            .tick();
+            .await
+            .set_routing_sticky_remaining_turns(sticky_remaining_after_tick);
         let classify_result = turn_router::classify_turn(
             turn_router::ClassifyTurnInputs {
                 user_input: &task_title,
@@ -5304,6 +5335,8 @@ impl TurnRuntime {
         if on_cheap_turn {
             broker.metrics.routed_to_cheap = true;
             if let Some(reason_label) = decision.reason_label() {
+                self.telemetry
+                    .spawn(TelemetryEvent::routing_routed(reason_label));
                 let _ = self
                     .tx
                     .send(AgentEvent::TurnRouted {
@@ -5416,12 +5449,24 @@ impl TurnRuntime {
                     current_model = parent_model.clone();
                     on_cheap_turn = false;
                     broker.metrics.escalated_to_parent = true;
-                    {
+                    let sticky_remaining = {
                         let mut state = self.routing_state.lock().expect("routing state lock");
                         state
                             .sticky
                             .engage(self.config.routing.escalation_sticky_turns);
-                    }
+                        state.sticky.remaining_turns
+                    };
+                    // Mirror the engaged window into `ConversationState`
+                    // so the next `to_resume_state()` call — which
+                    // happens at every turn boundary via
+                    // `persist_turn_accounting` — persists it without
+                    // any extra plumbing.
+                    self.conversation_state
+                        .lock()
+                        .await
+                        .set_routing_sticky_remaining_turns(sticky_remaining);
+                    self.telemetry
+                        .spawn(TelemetryEvent::routing_escalated(reason.as_str()));
                     let _ = self
                         .tx
                         .send(AgentEvent::TurnRouted {

@@ -1567,6 +1567,7 @@ impl SessionHandle {
                     hydrated_transcript: hydrated,
                     context_attachments: self.context_attachments().unwrap_or_default(),
                     context_compaction: ContextCompactionState::default(),
+                    routing_sticky_remaining_turns: 0,
                 });
             }
         }
@@ -1587,6 +1588,7 @@ impl SessionHandle {
             hydrated_transcript: hydrated,
             context_attachments: self.context_attachments().unwrap_or_default(),
             context_compaction: ContextCompactionState::default(),
+            routing_sticky_remaining_turns: 0,
         })
     }
 
@@ -2425,6 +2427,18 @@ pub struct SessionResumeState {
     pub context_attachments: Vec<ContextAttachment>,
     #[serde(default)]
     pub context_compaction: ContextCompactionState,
+    /// Remaining turns in the per-turn router's escalation-sticky
+    /// window at session-save time. After an escalation hands a
+    /// cheap-routed turn back to the parent model, the next few user
+    /// prompts skip the router so a follow-up clarification stays on
+    /// parent. Persisting it across `/resume` keeps that behaviour
+    /// intact when the user reopens a session mid-hard-task. Older
+    /// `resume_state.json` files have no field; the
+    /// `#[serde(default)]` keeps reads backward-compatible (the
+    /// router starts each session with a zeroed sticky window
+    /// anyway).
+    #[serde(default)]
+    pub routing_sticky_remaining_turns: u8,
 }
 
 /// One entry the TUI knows how to push into its transcript on
