@@ -494,7 +494,11 @@ pub(crate) fn hierarchy_spec() -> ToolSpec {
 pub(crate) fn read_slice_spec() -> ToolSpec {
     ToolSpec {
         name: "read_slice".to_string(),
-        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Set read_mode=diff to return only changed ranges against a baseline. Prefer spans returned by graph evidence packets.".to_string(),
+        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Set read_mode=diff to return only changed ranges against a baseline. \
+            When a graph packet returns a symbol_id (definition_search, symbol_context, hierarchy, reference_search), prefer `symbol_id=<id>` with `span_kind=body` over a hand-picked line range \
+            — the tool returns the exact body in one call without padding guesswork. \
+            For line-range mode, the window auto-expands so callers don't need to micro-pad: ranges under ~60 lines are widened symmetrically toward ~80 lines so the enclosing function/impl block is usually included. \
+            If you need more, ask for it explicitly via wider `start_line`/`end_line` or `context_lines`.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -502,16 +506,16 @@ pub(crate) fn read_slice_spec() -> ToolSpec {
             "additionalProperties": false,
             "properties": {
                 "path": {"type": "string"},
-                "symbol_id": {"type": "string"},
-                "span_kind": {"type": "string", "enum": ["signature", "body"]},
+                "symbol_id": {"type": "string", "description": "Symbol id from a graph packet. With span_kind=body returns the full body span — preferred over guessing start_line/end_line."},
+                "span_kind": {"type": "string", "enum": ["signature", "body"], "description": "With symbol_id: `signature` returns the declaration line(s); `body` returns the full body span. Default signature."},
                 "read_mode": {"type": "string", "enum": ["slice", "diff"], "description": "slice returns the requested exact range; diff returns only changed ranges for the same path or symbol. Default slice."},
                 "diff_baseline": {"type": "string", "enum": ["worktree", "branch_base", "index", "last_receipt"], "description": "Baseline for read_mode=diff. worktree compares against HEAD including staged, unstaged, and untracked changes; branch_base compares against the default-branch merge base; index compares staged changes; last_receipt compares against the most recent model-visible read snapshot for this path and falls back to worktree if unavailable."},
                 "max_ranges": {"type": "integer", "minimum": 1, "maximum": 100},
                 "start_byte": {"type": "integer", "minimum": 0},
                 "end_byte": {"type": "integer", "minimum": 0},
-                "start_line": {"type": "integer", "minimum": 1},
-                "end_line": {"type": "integer", "minimum": 1},
-                "context_lines": {"type": "integer", "minimum": 0},
+                "start_line": {"type": "integer", "minimum": 1, "description": "1-based start line. When the requested window is narrower than ~60 lines it auto-widens symmetrically toward ~80 lines so the enclosing block fits in one fetch."},
+                "end_line": {"type": "integer", "minimum": 1, "description": "1-based end line, inclusive. Pair with start_line; the window auto-widens when too tight."},
+                "context_lines": {"type": "integer", "minimum": 0, "description": "Extra context to add on each side of the line range. Adds on top of the auto-widening default."},
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LIMIT},
                 "diff_only": {"type": "boolean"}
