@@ -30,7 +30,7 @@ Full per-run data in [`graph-vs-nograph-data.csv`](graph-vs-nograph-data.csv).
   with whatever tools are available").
 
 Scenarios live under
-[`crates/squeezy-eval/fixtures/scenarios/graph-vs-nograph-{lang}-realworld-{with,no}-graph.toml`](../../../crates/squeezy-eval/fixtures/scenarios).
+[`crates/squeezy-eval/fixtures/scenarios/benchmarks/natural/graph-vs-nograph-{lang}-realworld-{with,no}-graph.toml`](../../../crates/squeezy-eval/fixtures/scenarios/benchmarks/natural).
 
 ## Smoke results (n=1 per variant)
 
@@ -165,7 +165,7 @@ calls it out:
 > `Sidekiq::Scheduled::Poller` in `lib/sidekiq/scheduled.rb`), report
 > them as two separate rows.
 
-Cite: `crates/squeezy-eval/fixtures/scenarios/graph-vs-nograph-ruby-realworld-with-graph.toml`
+Cite: `crates/squeezy-eval/fixtures/scenarios/benchmarks/natural/graph-vs-nograph-ruby-realworld-with-graph.toml`
 (prompt body, items "class" and the nested-class disambiguation rule).
 
 Action: re-run the Ruby pair under `target/eval/` and grade the actual
@@ -210,10 +210,10 @@ cargo build -p squeezy-eval --release
 
 # run a single realworld pair (csharp)
 ./target/release/squeezy-eval run \
-  crates/squeezy-eval/fixtures/scenarios/graph-vs-nograph-csharp-realworld-with-graph.toml \
+  crates/squeezy-eval/fixtures/scenarios/benchmarks/natural/graph-vs-nograph-csharp-realworld-with-graph.toml \
   --out target/eval --quiet
 ./target/release/squeezy-eval run \
-  crates/squeezy-eval/fixtures/scenarios/graph-vs-nograph-csharp-realworld-no-graph.toml \
+  crates/squeezy-eval/fixtures/scenarios/benchmarks/natural/graph-vs-nograph-csharp-realworld-no-graph.toml \
   --out target/eval --quiet
 
 # all-language n=3 driver (writes to target/eval/realworld-n3-logs/<lang>.log)
@@ -424,7 +424,7 @@ metrics are appended to
 [`graph-vs-nograph-data.csv`](graph-vs-nograph-data.csv) as
 `{lang}_architectural` rows with variant `codex_baseline`. Costs are
 medians of three runs; squeezy figures come from the same scenarios
-under `crates/squeezy-eval/fixtures/scenarios/graph-vs-nograph-{lang}-architectural-{with,no}-graph.toml`
+under `crates/squeezy-eval/fixtures/scenarios/benchmarks/targeted/graph-vs-nograph-{lang}-architectural-{with,no}-graph.toml`
 (Go was not in the squeezy validation sweep).
 
 | scenario | codex $ | squeezy with-graph $ | squeezy no-graph $ | codex recall | cost winner |

@@ -203,21 +203,9 @@ async fn run_cmd(
 
 fn list_cmd(dir: Option<PathBuf>) -> Result<(), squeezy_eval::driver::EvalError> {
     let dir = dir.unwrap_or_else(|| PathBuf::from("crates/squeezy-eval/fixtures/scenarios"));
-    let mut entries = std::fs::read_dir(&dir)
-        .map_err(|err| squeezy_eval::driver::EvalError::Io(format!("read_dir {dir:?}: {err}")))?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("toml"))
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let path = entry.path();
+    let mut paths = squeezy_eval::ci::collect_scenario_paths(&dir)?;
+    paths.sort();
+    for path in paths {
         match squeezy_eval::scenario::load(&path) {
             Ok(scenario) => {
                 println!("{:<40} {}", scenario.id, scenario.title);
