@@ -1697,6 +1697,31 @@ async fn slash_plan_with_trailing_space_still_switches_mode() {
 }
 
 #[tokio::test]
+async fn inline_slash_plan_uses_surrounding_prompt_text() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    set_input(&mut app, "please /plan rethink attachment UX".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.mode, SessionMode::Plan);
+    assert!(app.input.is_empty());
+    wait_for_turn_completion(&mut app).await;
+    assert!(
+        transcript_message_contents(&app)
+            .iter()
+            .any(|content| content.contains("please rethink attachment UX")),
+        "inline /plan should preserve the surrounding prompt text"
+    );
+}
+
+#[tokio::test]
 async fn slash_config_opens_screen() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -2661,7 +2686,7 @@ async fn prompt_history_uses_plain_up_down_when_prompt_is_empty() {
 }
 
 #[tokio::test]
-async fn alternate_screen_arrows_recall_history_when_prompt_is_empty() {
+async fn alternate_screen_arrows_scroll_transcript_when_prompt_is_empty() {
     let mut agent = test_agent(SessionMode::Build);
     let mut config = test_config(SessionMode::Build);
     config.tui.alternate_screen = TuiAlternateScreen::Always;
@@ -2674,6 +2699,29 @@ async fn alternate_screen_arrows_recall_history_when_prompt_is_empty() {
         &mut app,
         &mut agent,
         KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("scroll up");
+
+    assert!(app.input.is_empty());
+    assert_eq!(app.transcript_scroll_from_bottom, 3);
+    assert!(app.input_history_index.is_none());
+}
+
+#[tokio::test]
+async fn alternate_screen_alt_arrows_recall_history_when_prompt_is_empty() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    config.tui.alternate_screen = TuiAlternateScreen::Always;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
+    push_input_history(&mut app, "first prompt".to_string());
+    push_input_history(&mut app, "second prompt".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
     )
     .await
     .expect("history up");
@@ -2841,12 +2889,37 @@ async fn slash_menu_renders_and_completes_selected_command() {
 }
 
 #[tokio::test]
+async fn slash_menu_completes_inline_command_token() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "please /att".to_string());
+
+    let output = render_to_string(&app, 100, 36);
+    assert!(output.contains("/attach"), "{output}");
+    assert!(
+        !output.contains("/cost"),
+        "prefix-only commands should stay out of inline slash completion: {output}"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("complete inline command");
+
+    assert_eq!(app.input, "please /attach ");
+    assert_eq!(app.status, "selected /attach");
+}
+
+#[tokio::test]
 async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/".to_string());
 
-    let suggestions = slash_suggestions(&app.input);
+    let suggestions = input::slash_suggestions(&app.input);
     let names = suggestions
         .iter()
         .map(|command| command.name)
@@ -3041,7 +3114,7 @@ fn slash_suggestion_lines_keep_short_hints_inline_when_width_allows() {
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
         })
-        .find(|line| line.contains("/attach ") && line.contains("attach a file"))
+        .find(|line| line.contains("/attach ") && line.contains("insert a file token"))
         .expect("attach suggestion line");
 
     assert!(
@@ -3260,62 +3333,97 @@ async fn slash_context_uses_registry_fallback_for_unknown_models() {
 }
 
 #[tokio::test]
-async fn multiline_paste_becomes_attached_context() {
-    let root = temp_workspace("tui_paste");
-    let config = test_config_with_root(SessionMode::Build, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-
-    handle_paste(
-        &mut app,
-        &mut agent,
-        "2026-05-24 ERROR failed\r\nOPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\r".to_string(),
-    )
-    .await
-    .expect("handle paste");
-
-    assert_eq!(app.attachments.len(), 1);
-    assert!(app.status.contains("attached paste"), "{}", app.status);
-    assert!(
-        !app.attachments[0]
-            .preview
-            .contains("sk-abcdefghijklmnopqrstuvwxyz")
-    );
-    assert!(
-        app.attachments[0]
-            .preview
-            .contains("2026-05-24 ERROR failed"),
-        "{}",
-        app.attachments[0].preview
-    );
-    let rendered = render_to_string(&app, 100, 20);
-    assert!(
-        rendered.contains(&app.attachments[0].id),
-        "attachment should render: {rendered}"
-    );
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn small_single_line_paste_stays_in_prompt() {
+async fn small_paste_stays_in_prompt() {
     let root = temp_workspace("tui_inline_paste");
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let mut agent = test_agent_without_session_log_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
 
-    handle_paste(&mut app, &mut agent, "small paste".to_string())
+    handle_paste(&mut app, &mut agent, "small\r\npaste".to_string())
         .await
         .expect("handle paste");
 
-    assert_eq!(app.input, "small paste");
+    assert_eq!(app.input, "small\npaste");
     assert!(app.attachments.is_empty());
+    assert!(app.prompt_attachments.is_empty());
 
     let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn slash_attach_and_detach_update_active_context() {
+async fn large_paste_uses_visible_prompt_token() {
+    let root = temp_workspace("tui_large_paste");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let pasted = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 7);
+
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("handle paste");
+
+    let placeholder = format!("[Pasted Content {} chars]", pasted.chars().count());
+    assert_eq!(app.input, placeholder);
+    assert_eq!(app.prompt_attachments.len(), 1);
+    assert!(app.attachments.is_empty());
+    let input = app.input.clone();
+    let prepared = prepare_prompt_turn_input(&mut app, input);
+    assert_eq!(prepared.display_input, placeholder);
+    assert_eq!(prepared.model_input, pasted);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn deleting_large_paste_token_drops_payload_before_submit() {
+    let root = temp_workspace("tui_large_paste_delete");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    handle_paste(
+        &mut app,
+        &mut agent,
+        "y".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1),
+    )
+    .await
+    .expect("handle paste");
+    app.input.clear();
+    app.input_cursor = 0;
+    app.prune_prompt_attachments();
+
+    assert!(app.prompt_attachments.is_empty());
+    let prepared = prepare_prompt_turn_input(&mut app, "summarize".to_string());
+    assert_eq!(prepared.model_input, "summarize");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn duplicate_large_pastes_get_unique_prompt_tokens() {
+    let root = temp_workspace("tui_large_paste_dupe");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let pasted = "z".repeat(LARGE_PASTE_CHAR_THRESHOLD + 2);
+
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("first paste");
+    insert_input_char(&mut app, ' ');
+    handle_paste(&mut app, &mut agent, pasted)
+        .await
+        .expect("second paste");
+
+    assert!(app.input.contains("[Pasted Content 1002 chars]"));
+    assert!(app.input.contains("[Pasted Content 1002 chars #2]"));
+    assert_eq!(app.prompt_attachments.len(), 2);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn slash_attach_inserts_visible_file_token() {
     let root = temp_workspace("tui_attach");
     fs::write(
         root.join("error.log"),
@@ -3327,35 +3435,70 @@ async fn slash_attach_and_detach_update_active_context() {
     let mut app = test_app_with_config(&config, SessionMode::Build);
 
     assert!(handle_slash_command(&mut app, &mut agent, "/attach error.log").await);
-    assert_eq!(app.attachments.len(), 1);
-    assert!(app.status.contains("attached file"), "{}", app.status);
-
-    let id = app.attachments[0].id.clone();
-    let command = format!("/detach {id}");
-    assert!(handle_slash_command(&mut app, &mut agent, &command).await);
     assert!(app.attachments.is_empty());
-    assert_eq!(app.status, format!("detached {id}"));
+    assert_eq!(app.input, "[Attached file error.log]");
+    assert_eq!(app.prompt_attachments.len(), 1);
+    assert!(app.status.contains("inserted [Attached file error.log]"));
+    let input = app.input.clone();
+    let prepared = prepare_prompt_turn_input(&mut app, input);
+    assert!(prepared.model_input.contains("Attached file error.log:"));
+    assert!(prepared.model_input.contains("2026-05-24 ERROR failed"));
 
     let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn slash_attach_routes_canonical_images_to_vision_kind() {
-    // F18 wires PNG/JPEG/GIF/WEBP magic-byte hits through to a
-    // routable `Image` attachment that fans into `LlmInputItem::Image`
-    // on the next turn. The TUI status surfaces the active attach
-    // instead of the legacy "unsupported file" rejection.
-    let root = temp_workspace("tui_attach_image_png");
-    fs::write(root.join("shot.png"), b"\x89PNG\r\n\x1a\nimage").expect("write image");
+async fn inline_slash_attach_inserts_token_without_dropping_prompt_text() {
+    let root = temp_workspace("tui_inline_attach");
+    fs::write(root.join("error.log"), "inline attach fixture\n").expect("write log");
     let config = test_config_with_root(SessionMode::Build, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    set_input(
+        &mut app,
+        "please review /attach error.log before replying".to_string(),
+    );
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(
+        app.input,
+        "please review [Attached file error.log] before replying"
+    );
+    assert_eq!(app.prompt_attachments.len(), 1);
+    assert!(app.status.contains("inserted [Attached file error.log]"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn slash_attach_routes_canonical_images_to_prompt_token() {
+    let root = temp_workspace("tui_attach_image_png");
+    let image_bytes = b"\x89PNG\r\n\x1a\nimage".to_vec();
+    fs::write(root.join("shot.png"), &image_bytes).expect("write image");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
 
     assert!(handle_slash_command(&mut app, &mut agent, "/attach shot.png").await);
-    assert_eq!(app.attachments.len(), 1);
-    assert_eq!(app.attachments[0].kind, ContextAttachmentKind::Image);
-    assert!(app.status.contains("attached file"), "{}", app.status);
-    assert!(app.status.contains("kind=image"), "{}", app.status);
+    assert!(app.attachments.is_empty());
+    assert_eq!(app.input, "[Image shot.png]");
+    let input = app.input.clone();
+    let prepared = prepare_prompt_turn_input(&mut app, input);
+    assert_eq!(prepared.display_input, "[Image shot.png]");
+    assert_eq!(prepared.model_input, "[Image shot.png]");
+    assert_eq!(prepared.transient_input_items.len(), 1);
+    let LlmInputItem::Image { media_type, bytes } = &prepared.transient_input_items[0] else {
+        panic!("expected image item");
+    };
+    assert_eq!(media_type, "image/png");
+    assert_eq!(bytes.as_ref(), image_bytes.as_slice());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -3374,7 +3517,12 @@ async fn slash_attach_surfaces_unsupported_label_only_images() {
 
     assert!(handle_slash_command(&mut app, &mut agent, "/attach snap.heic").await);
     assert!(app.attachments.is_empty());
-    assert!(app.status.contains("unsupported file"), "{}", app.status);
+    assert!(
+        app.status
+            .contains("unsupported file kind=unsupported_image"),
+        "{}",
+        app.status
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -3412,6 +3560,30 @@ async fn slash_help_config_renders_citations_and_config() {
     assert!(content.contains("docs/external/PROVIDERS.md"), "{content}");
     assert!(content.contains("[model]"), "{content}");
     assert!(!content.contains("--api-key"), "{content}");
+}
+
+#[tokio::test]
+async fn inline_slash_help_dispatches_from_prompt_body() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    set_input(&mut app, "please /help providers".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    wait_for_turn_completion(&mut app).await;
+    assert!(app.input.is_empty());
+    assert!(
+        transcript_message_contents(&app).contains(&"/help providers"),
+        "inline /help should dispatch the command from its inline position"
+    );
+    let content = last_message_content(&app).expect("help transcript");
+    assert!(content.contains("docs/external/PROVIDERS.md"), "{content}");
 }
 
 #[tokio::test]
@@ -9270,7 +9442,6 @@ fn slash_commands_have_documented_capability_for_every_entry() {
         "/build",
         "/compact",
         "/attach",
-        "/detach",
         "/pin",
         "/unpin",
         "/resume",
@@ -9308,6 +9479,41 @@ fn slash_compact_unavailable_during_turn_renders_dim_hint() {
     assert!(
         output.contains("unavailable during turn"),
         "expected unavailable hint: {output}"
+    );
+}
+
+#[test]
+fn slash_unavailable_commands_stay_readable_during_turn() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new());
+    set_input(&mut app, "/attach".to_string());
+
+    let lines = slash_suggestion_lines(&app, 120);
+    let attach_line = lines
+        .iter()
+        .find(|line| line.spans.iter().any(|span| span.content == "/attach"))
+        .expect("attach suggestion line");
+    let command_span = attach_line
+        .spans
+        .iter()
+        .find(|span| span.content == "/attach")
+        .expect("attach command span");
+
+    assert_ne!(
+        command_span.style.fg,
+        Some(crate::render::theme::quiet()),
+        "unavailable command names should not use the low-contrast quiet color"
+    );
+    assert!(
+        !command_span.style.add_modifier.contains(Modifier::DIM),
+        "unavailable command names should not use terminal DIM, which can render as black"
+    );
+    assert!(
+        attach_line
+            .spans
+            .iter()
+            .any(|span| span.content.contains("unavailable during turn")),
+        "unavailable hint should remain explicit"
     );
 }
 
@@ -9366,7 +9572,7 @@ fn slash_parameter_hint_uses_status_model_color() {
     let description_span = attach_line
         .spans
         .iter()
-        .find(|span| span.content.contains("attach a file as prompt context"))
+        .find(|span| span.content.contains("insert a file token in the prompt"))
         .expect("attach description span");
     let hint_span = lines
         .iter()

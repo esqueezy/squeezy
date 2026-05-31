@@ -3305,6 +3305,23 @@ impl Agent {
         cancel: CancellationToken,
         response_verbosity: ResponseVerbosity,
     ) -> mpsc::Receiver<AgentEvent> {
+        self.start_turn_with_display_input(
+            input.clone(),
+            input,
+            Vec::new(),
+            cancel,
+            response_verbosity,
+        )
+    }
+
+    pub fn start_turn_with_display_input(
+        &self,
+        display_input: String,
+        input: String,
+        transient_input_items: Vec<LlmInputItem>,
+        cancel: CancellationToken,
+        response_verbosity: ResponseVerbosity,
+    ) -> mpsc::Receiver<AgentEvent> {
         let (tx, rx) = mpsc::channel(128);
         let provider = self.provider.clone();
         let mut config = self.config.clone();
@@ -3347,6 +3364,11 @@ impl Agent {
             panic_telemetry,
             async move {
                 let redacted_input = redactor.redact(&input);
+                let redacted_display_input = if display_input == input {
+                    redacted_input.text.clone()
+                } else {
+                    redactor.redact(&display_input).text
+                };
                 let task_title = redacted_input.text.clone();
                 let failure_session_log = session_log.clone();
                 // Echo the user message into the TUI before kicking MCP
@@ -3355,7 +3377,7 @@ impl Agent {
                 if tx
                     .send(AgentEvent::UserMessage {
                         turn_id,
-                        message: TranscriptItem::user(redacted_input.text.clone()),
+                        message: TranscriptItem::user(redacted_display_input.clone()),
                     })
                     .await
                     .is_err()
@@ -3474,6 +3496,8 @@ impl Agent {
                     replay,
                     subagents,
                     hooks,
+                    display_input: redacted_display_input,
+                    transient_input_items,
                 }
                 .run(task_title.clone())
                 .await;
@@ -4362,6 +4386,8 @@ struct TurnRuntime {
     /// installed — the per-round LLM call site checks this before
     /// building a `HookContext`.
     hooks: Option<Arc<HookRegistry>>,
+    display_input: String,
+    transient_input_items: Vec<LlmInputItem>,
 }
 
 impl TurnRuntime {
@@ -4792,12 +4818,18 @@ impl TurnRuntime {
             self.dispatch_setup();
             self.dispatch_session_start();
         }
+        let original_input = input.clone();
+        let display_tracks_input = self.display_input == original_input;
+        let mut display_input = std::mem::take(&mut self.display_input);
         // UserPromptSubmit gives handlers a chance to rewrite the
         // user's input before any skill activation or routing. The
         // `mutate.prompt` field of any handler's reply replaces the
         // in-flight prompt; the chain runs in registration order so
         // later handlers see earlier rewrites.
         let input = self.dispatch_user_prompt_submit(input);
+        if display_tracks_input {
+            display_input = input.clone();
+        }
         let task_title = input.clone();
         let activation = self.tools.activate_skills_for_input(&input)?;
         let base_instructions = match self.tools.format_active_skills(&activation.skills) {
@@ -4837,8 +4869,10 @@ impl TurnRuntime {
             .filter(|attachment| attachment.is_active())
             .cloned()
             .collect::<Vec<_>>();
-        let user_transcript =
-            TranscriptItem::user(format_user_text_with_context(&input, &active_attachments));
+        let user_transcript = TranscriptItem::user(format_user_text_with_context(
+            &display_input,
+            &active_attachments,
+        ));
         // Redact at insertion time so the conversation upholds the
         // "already redacted" invariant. The per-round LLM request build
         // then sends `next_input` straight through without rebuilding
@@ -4858,7 +4892,8 @@ impl TurnRuntime {
         // `input_image`, Bedrock `ImageBlock`, …). The provider's
         // `ensure_vision_support` call then surfaces a structured
         // `ProviderRequest` error if the active model lacks vision.
-        let image_items = image_input_items_for_attachments(&active_attachments);
+        let mut image_items = image_input_items_for_attachments(&active_attachments);
+        image_items.extend(std::mem::take(&mut self.transient_input_items));
         // Upgrade any legacy conversation items resumed from disk so the
         // invariant holds for the rest of this turn. Idempotent and
         // cheap for items already in redacted form.

@@ -21,6 +21,20 @@ pub(crate) struct SlashCommand {
     pub(crate) capabilities: &'static [PermissionCapability],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlashCommandOccurrence {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) command: SlashCommand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlashCompletionContext {
+    start: usize,
+    end: usize,
+    at_prompt_start: bool,
+}
+
 const fn slash(name: &'static str, description: &'static str) -> SlashCommand {
     SlashCommand {
         name,
@@ -82,6 +96,7 @@ const fn slash_args_caps(
 /// to highlight recognised commands in amber both in the live input widget
 /// and in the transcript view of a sent prompt. Returns the longest match so
 /// `/job-cancel foo` resolves to `/job-cancel`, not `/job`.
+#[cfg(test)]
 pub(crate) fn match_slash_command_prefix(text: &str) -> Option<usize> {
     if !text.starts_with('/') {
         return None;
@@ -157,12 +172,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     slash("/reviewer", "show recent AI reviewer auto-decisions"),
     slash_args_caps(
         "/attach",
-        "attach a file as prompt context",
+        "insert a file token in the prompt",
         false,
         "<path>",
         &[PermissionCapability::Read],
     ),
-    slash("/attachments", "list attached context"),
     slash("/copy", "copy last answer or transcript"),
     // `/compact` triggers a summarisation turn against the model.
     SlashCommand {
@@ -298,7 +312,6 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "[compact|normal|verbose]",
         &[PermissionCapability::Edit],
     ),
-    slash_args("/detach", "remove attached context", false, "<id>"),
     slash_caps(
         "/statusline",
         "configure which items appear in the status bar",
@@ -318,6 +331,10 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
 impl SlashCommand {
     pub(crate) fn is_dimmed(&self, task_in_progress: bool) -> bool {
         task_in_progress && !self.available_during_task
+    }
+
+    pub(crate) fn supports_inline_use(&self) -> bool {
+        matches!(self.name, "/attach" | "/help" | "/plan" | "/build")
     }
 
     /// Short label used in the slash menu badge, e.g. `net`, `read`, `edit`.
@@ -361,6 +378,7 @@ pub(crate) fn note_input_edited(app: &mut TuiApp) {
     app.input_history_index = None;
     app.input_history_draft.clear();
     app.selected_entry = None;
+    app.prune_prompt_attachments();
     clamp_slash_menu_index(app);
     refresh_mention_popup(app);
 }
@@ -489,12 +507,14 @@ pub(crate) fn apply_mention_popup(app: &mut TuiApp) -> bool {
 pub(crate) fn clear_input(app: &mut TuiApp) {
     app.input.clear();
     app.input_cursor = 0;
+    app.clear_prompt_attachments();
     clamp_slash_menu_index(app);
 }
 
 pub(crate) fn set_input(app: &mut TuiApp, input: String) {
     app.input = input;
     app.input_cursor = app.input.len();
+    app.clear_prompt_attachments();
     clamp_input_cursor(app);
     clamp_slash_menu_index(app);
 }
@@ -513,6 +533,7 @@ pub(crate) fn restore_prompt_after_cancel(app: &mut TuiApp) -> bool {
     };
     app.input = text;
     app.input_cursor = app.input.len();
+    app.clear_prompt_attachments();
     true
 }
 
@@ -838,19 +859,31 @@ pub(crate) fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirectio
     }
 }
 
+#[cfg(test)]
 pub(crate) fn slash_suggestions(input: &str) -> Vec<SlashCommand> {
-    if !is_slash_completion_input(input) {
+    slash_suggestions_at(input, input.len())
+}
+
+pub(crate) fn slash_suggestions_at(input: &str, cursor: usize) -> Vec<SlashCommand> {
+    let Some(context) = slash_completion_context(input, cursor) else {
         return Vec::new();
-    }
-    let needle = input.trim();
+    };
+    let needle = &input[context.start..context.end];
+    let include =
+        |command: &&SlashCommand| context.at_prompt_start || command.supports_inline_use();
     // Bare `/` lists every command, ordered alphabetically by name.
     if needle == "/" {
-        let mut suggestions = SLASH_COMMANDS.to_vec();
+        let mut suggestions = SLASH_COMMANDS
+            .iter()
+            .filter(include)
+            .copied()
+            .collect::<Vec<_>>();
         suggestions.sort_by(|left, right| left.name.cmp(right.name));
         return suggestions;
     }
     let mut scored: Vec<(SlashCommand, i32)> = SLASH_COMMANDS
         .iter()
+        .filter(include)
         .copied()
         .filter_map(|command| {
             crate::fuzzy::score(command.name, needle).map(|score| (command, score))
@@ -862,15 +895,88 @@ pub(crate) fn slash_suggestions(input: &str) -> Vec<SlashCommand> {
     scored.into_iter().map(|(cmd, _)| cmd).collect()
 }
 
-pub(crate) fn is_slash_completion_input(input: &str) -> bool {
-    let trimmed = input.trim();
-    trimmed.starts_with('/')
-        && !trimmed[1..].contains(char::is_whitespace)
-        && !trimmed.contains('\n')
+fn slash_completion_context(input: &str, cursor: usize) -> Option<SlashCompletionContext> {
+    let cursor = text_cursor(input, cursor);
+    let (start, end) = token_bounds_at_cursor(input, cursor);
+    let token = &input[start..end];
+    if !token.starts_with('/') || token[1..].contains('/') {
+        return None;
+    }
+    Some(SlashCompletionContext {
+        start,
+        end,
+        at_prompt_start: input[..start].trim().is_empty(),
+    })
+}
+
+fn token_bounds_at_cursor(input: &str, cursor: usize) -> (usize, usize) {
+    let start = input[..cursor]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    let end = input[cursor..]
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(index, _)| cursor + index)
+        .unwrap_or(input.len());
+    (start, end)
+}
+
+pub(crate) fn find_inline_slash_dispatch_command(input: &str) -> Option<SlashCommandOccurrence> {
+    slash_command_occurrences(input)
+        .into_iter()
+        .find(|occurrence| {
+            !input[..occurrence.start].trim().is_empty() && occurrence.command.supports_inline_use()
+        })
+}
+
+pub(crate) fn slash_command_ranges(input: &str) -> Vec<(usize, usize)> {
+    slash_command_occurrences(input)
+        .into_iter()
+        .filter(|occurrence| {
+            input[..occurrence.start].trim().is_empty() || occurrence.command.supports_inline_use()
+        })
+        .map(|occurrence| (occurrence.start, occurrence.end))
+        .collect()
+}
+
+fn slash_command_occurrences(input: &str) -> Vec<SlashCommandOccurrence> {
+    let mut occurrences = Vec::new();
+    let mut cursor = 0;
+    while cursor < input.len() {
+        let Some((relative_start, _)) = input[cursor..]
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+        else {
+            break;
+        };
+        let start = cursor + relative_start;
+        let end = input[start..]
+            .char_indices()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(index, _)| start + index)
+            .unwrap_or(input.len());
+        let token = &input[start..end];
+        if let Some(command) = SLASH_COMMANDS
+            .iter()
+            .copied()
+            .find(|command| command.name == token)
+        {
+            occurrences.push(SlashCommandOccurrence {
+                start,
+                end,
+                command,
+            });
+        }
+        cursor = end;
+    }
+    occurrences
 }
 
 pub(crate) fn clamp_slash_menu_index(app: &mut TuiApp) {
-    let count = slash_suggestions(&app.input).len();
+    let count = slash_suggestions_at(&app.input, app.input_cursor).len();
     if count == 0 {
         app.slash_menu_index = 0;
     } else if app.slash_menu_index >= count {
@@ -879,7 +985,7 @@ pub(crate) fn clamp_slash_menu_index(app: &mut TuiApp) {
 }
 
 pub(crate) fn move_slash_menu_selection(app: &mut TuiApp, direction: SelectionDirection) -> bool {
-    let count = slash_suggestions(&app.input).len();
+    let count = slash_suggestions_at(&app.input, app.input_cursor).len();
     if count == 0 {
         return false;
     }
@@ -897,15 +1003,22 @@ pub(crate) fn move_slash_menu_selection(app: &mut TuiApp, direction: SelectionDi
 }
 
 pub(crate) fn complete_selected_slash_command(app: &mut TuiApp) -> bool {
-    let suggestions = slash_suggestions(&app.input);
+    let Some(context) = slash_completion_context(&app.input, app.input_cursor) else {
+        return false;
+    };
+    let suggestions = slash_suggestions_at(&app.input, app.input_cursor);
     if suggestions.is_empty() {
         return false;
     }
     let selected = suggestions[app.slash_menu_index.min(suggestions.len() - 1)];
-    if app.input.trim() == selected.name {
+    if &app.input[context.start..context.end] == selected.name {
         return false;
     }
-    set_input(app, format!("{} ", selected.name));
+    let replacement = format!("{} ", selected.name);
+    app.input
+        .replace_range(context.start..context.end, &replacement);
+    app.input_cursor = context.start + replacement.len();
+    note_input_edited(app);
     app.slash_menu_index = 0;
     app.status = format!("selected {}", selected.name);
     true
