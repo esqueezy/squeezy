@@ -370,7 +370,9 @@ fn anthropic_messages(
                     "input": arguments,
                 })],
             ),
-            LlmInputItem::FunctionCallOutput { call_id, output } => push_anthropic_message(
+            LlmInputItem::FunctionCallOutput {
+                call_id, output, ..
+            } => push_anthropic_message(
                 &mut messages,
                 "user",
                 vec![json!({

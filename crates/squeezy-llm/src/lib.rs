@@ -254,9 +254,34 @@ pub enum LlmInputItem {
         name: String,
         arguments: Value,
     },
+    /// Tool result returned to the model after a `FunctionCall`.
+    ///
+    /// `output` carries the canonical string form callers have always
+    /// used (JSON-stringified output, terminal text, etc.) so existing
+    /// providers and persistence stay byte-compatible. Two optional
+    /// extensions land structured tool results without breaking the
+    /// string contract:
+    ///
+    /// - `content_parts`: when `Some`, providers that support
+    ///   structured tool results (Anthropic `tool_result.content`
+    ///   arrays, Bedrock Converse `toolResult.content`, OpenAI
+    ///   Responses image blocks) ship the part list directly instead
+    ///   of round-tripping a base64-stringified image through
+    ///   `output`. Each `ToolResultPart::Image` carries the raw bytes
+    ///   as an `Arc<[u8]>` so a 110k-token base64 PNG never lands in
+    ///   the wire body. Providers that don't support arrays fall back
+    ///   to `output`.
+    /// - `is_error`: Gemini's `functionResponse.response` switches its
+    ///   shape between `{output}` and `{error}` based on whether the
+    ///   tool failed; the flag carries that signal without forcing the
+    ///   agent to embed a sentinel in `output`.
     FunctionCallOutput {
         call_id: String,
         output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_parts: Option<Vec<ToolResultPart>>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_error: bool,
     },
     Reasoning(ReasoningPayload),
     /// Inline image attached to a user turn. `media_type` is an
@@ -273,6 +298,31 @@ pub enum LlmInputItem {
     },
 }
 
+/// Structured content block carried inside
+/// [`LlmInputItem::FunctionCallOutput::content_parts`].
+///
+/// Providers that accept array-shaped tool results (Anthropic, Bedrock
+/// Converse, OpenAI Responses for image returns) lower this list
+/// directly; providers that only accept a string `output` skip the
+/// array and fall back to the `output` field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolResultPart {
+    Text {
+        text: String,
+    },
+    Image {
+        media_type: String,
+        #[serde(serialize_with = "serialize_image_bytes_b64")]
+        #[serde(deserialize_with = "deserialize_image_bytes_b64")]
+        bytes: Arc<[u8]>,
+    },
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 impl LlmInputItem {
     /// Construct an `Image` item from a media-type string and raw bytes.
     /// Convenience to keep call sites short.
@@ -280,6 +330,20 @@ impl LlmInputItem {
         Self::Image {
             media_type: media_type.into(),
             bytes: bytes.into(),
+        }
+    }
+
+    /// Construct a `FunctionCallOutput` from a call id and string
+    /// output, leaving `content_parts` empty and `is_error` false.
+    /// Most callers want this shape — agents that stringify tool
+    /// output into the legacy `output` slot, replay paths, and tests
+    /// that only care about the call-id/output pair.
+    pub fn function_output(call_id: impl Into<String>, output: impl Into<String>) -> Self {
+        Self::FunctionCallOutput {
+            call_id: call_id.into(),
+            output: output.into(),
+            content_parts: None,
+            is_error: false,
         }
     }
 
@@ -413,7 +477,12 @@ pub(crate) fn normalize_tool_ids_for_replay(items: &[LlmInputItem]) -> Vec<LlmIn
                     arguments: arguments.clone(),
                 });
             }
-            LlmInputItem::FunctionCallOutput { call_id, output } => {
+            LlmInputItem::FunctionCallOutput {
+                call_id,
+                output,
+                content_parts,
+                is_error,
+            } => {
                 let already_seen = id_map.contains_key(call_id);
                 let canonical = canonicalize_call_id(call_id, &mut id_map, &mut next_index);
                 if !already_seen {
@@ -433,6 +502,8 @@ pub(crate) fn normalize_tool_ids_for_replay(items: &[LlmInputItem]) -> Vec<LlmIn
                 out.push(LlmInputItem::FunctionCallOutput {
                     call_id: canonical,
                     output: output.clone(),
+                    content_parts: content_parts.clone(),
+                    is_error: *is_error,
                 });
             }
             other => out.push(other.clone()),

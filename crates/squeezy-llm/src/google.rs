@@ -253,7 +253,9 @@ fn google_contents(input: &[LlmInputItem]) -> Value {
                     "parts": [{"functionCall": {"name": name, "args": arguments}}],
                 }));
             }
-            LlmInputItem::FunctionCallOutput { call_id, output } => {
+            LlmInputItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
                 let name = tool_names_by_call_id
                     .get(call_id.as_str())
                     .copied()

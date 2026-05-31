@@ -286,7 +286,9 @@ fn ollama_messages(instructions: &str, input: &[LlmInputItem]) -> Value {
                     }]
                 }));
             }
-            LlmInputItem::FunctionCallOutput { call_id: _, output } => {
+            LlmInputItem::FunctionCallOutput {
+                call_id: _, output, ..
+            } => {
                 messages.push(json!({ "role": "tool", "content": output }));
             }
             // Ollama's native chat API puts images on the message itself

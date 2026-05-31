@@ -5620,10 +5620,14 @@ fn compaction_drops_orphan_function_call_outputs_from_interleaved_parallel_calls
         LlmInputItem::FunctionCallOutput {
             call_id: "call_A".to_string(),
             output: "foo result".to_string(),
+            content_parts: None,
+            is_error: false,
         },
         LlmInputItem::FunctionCallOutput {
             call_id: "call_B".to_string(),
             output: "bar result".to_string(),
+            content_parts: None,
+            is_error: false,
         },
         LlmInputItem::AssistantText("post-tools reply".to_string()),
     ];
@@ -5747,10 +5751,14 @@ fn redact_llm_input_items_drops_orphan_function_call_outputs_defensively() {
         LlmInputItem::FunctionCallOutput {
             call_id: "call_keep".to_string(),
             output: "ok".to_string(),
+            content_parts: None,
+            is_error: false,
         },
         LlmInputItem::FunctionCallOutput {
             call_id: "call_orphan".to_string(),
             output: "lingering output from a dropped call".to_string(),
+            content_parts: None,
+            is_error: false,
         },
     ];
 
@@ -5802,7 +5810,9 @@ fn tool_call_without_output_gets_synthetic_error_repair() {
         LlmInputItem::FunctionCall { call_id, .. } if call_id == "call_orphan"
     ));
     match &prepared[2] {
-        LlmInputItem::FunctionCallOutput { call_id, output } => {
+        LlmInputItem::FunctionCallOutput {
+            call_id, output, ..
+        } => {
             assert_eq!(call_id, "call_orphan");
             assert!(
                 output.contains("interrupted"),
@@ -5835,6 +5845,8 @@ fn mixed_orphan_call_and_orphan_output_both_repaired() {
         LlmInputItem::FunctionCallOutput {
             call_id: "output_orphan".to_string(),
             output: "lingering output from a dropped call".to_string(),
+            content_parts: None,
+            is_error: false,
         },
         LlmInputItem::UserText("continue".to_string()),
     ];
@@ -7636,6 +7648,8 @@ fn subagent_transcript_serializes_conversation_items() {
         LlmInputItem::FunctionCallOutput {
             call_id: "c1".to_string(),
             output: "ok".to_string(),
+            content_parts: None,
+            is_error: false,
         },
     ];
     let transcript = subagent_transcript(&conversation);

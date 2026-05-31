@@ -636,7 +636,9 @@ fn openai_input_item(item: &LlmInputItem) -> Option<Value> {
             "name": name,
             "arguments": serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string()),
         }),
-        LlmInputItem::FunctionCallOutput { call_id, output } => json!({
+        LlmInputItem::FunctionCallOutput {
+            call_id, output, ..
+        } => json!({
             "type": "function_call_output",
             "call_id": call_id,
             "output": output,

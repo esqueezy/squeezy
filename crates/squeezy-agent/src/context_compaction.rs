@@ -418,6 +418,8 @@ pub(crate) fn repair_orphan_function_calls(items: Vec<LlmInputItem>) -> Vec<LlmI
             repaired.push(LlmInputItem::FunctionCallOutput {
                 call_id: call_id.clone(),
                 output: "{\"error\":\"tool call interrupted\",\"is_error\":true}".to_string(),
+                content_parts: None,
+                is_error: true,
             });
         }
     }
@@ -454,13 +456,20 @@ pub(crate) fn strip_media_for_compaction(items: &[LlmInputItem]) -> Vec<LlmInput
     items
         .iter()
         .map(|item| match item {
-            LlmInputItem::FunctionCallOutput { call_id, output } => {
+            LlmInputItem::FunctionCallOutput {
+                call_id,
+                output,
+                content_parts,
+                is_error,
+            } => {
                 if output.len() < STRIP_MEDIA_MIN_LEN {
                     item.clone()
                 } else {
                     LlmInputItem::FunctionCallOutput {
                         call_id: call_id.clone(),
                         output: strip_media_data_uris(output),
+                        content_parts: content_parts.clone(),
+                        is_error: *is_error,
                     }
                 }
             }
@@ -577,7 +586,9 @@ fn llm_item_estimated_bytes(item: &LlmInputItem) -> usize {
             name,
             arguments,
         } => call_id.len() + name.len() + arguments.to_string().len(),
-        LlmInputItem::FunctionCallOutput { call_id, output } => call_id.len() + output.len(),
+        LlmInputItem::FunctionCallOutput {
+            call_id, output, ..
+        } => call_id.len() + output.len(),
         LlmInputItem::Reasoning(payload) => payload.display_text().len(),
         // Image bytes don't consume model context tokens directly (the
         // provider's vision encoder charges its own per-image token
@@ -1201,7 +1212,9 @@ fn durable_context_lines(items: &[LlmInputItem]) -> Vec<String> {
                 "- tool call {name} args={}",
                 compact_text(&arguments.to_string(), COMPACTION_TOOL_ARGS_MAX_CHARS)
             )),
-            LlmInputItem::FunctionCallOutput { call_id, output } => Some(format!(
+            LlmInputItem::FunctionCallOutput {
+                call_id, output, ..
+            } => Some(format!(
                 "- tool output {call_id}: {}",
                 compact_text(output, COMPACTION_TOOL_OUTPUT_MAX_CHARS)
             )),

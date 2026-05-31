@@ -516,7 +516,9 @@ pub(crate) fn conversation_messages(
                     ContentBlock::ToolUse(tool_use),
                 )?;
             }
-            LlmInputItem::FunctionCallOutput { call_id, output } => {
+            LlmInputItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
                 let tool_result = ToolResultBlock::builder()
                     .tool_use_id(call_id)
                     .content(ToolResultContentBlock::Text(output.clone()))

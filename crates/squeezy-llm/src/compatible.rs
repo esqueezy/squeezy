@@ -656,7 +656,9 @@ fn chat_message(item: &LlmInputItem, cache_control: Option<&Value>) -> Option<Va
                 }
             }],
         }),
-        LlmInputItem::FunctionCallOutput { call_id, output } => json!({
+        LlmInputItem::FunctionCallOutput {
+            call_id, output, ..
+        } => json!({
             "role": "tool",
             "tool_call_id": call_id,
             "content": output,

@@ -81,6 +81,8 @@ fn conversation_messages_round_trip_tool_call_and_result() {
             LlmInputItem::FunctionCallOutput {
                 call_id: "call_1".to_string(),
                 output: "ok".to_string(),
+                content_parts: None,
+                is_error: false,
             },
         ],
         false,

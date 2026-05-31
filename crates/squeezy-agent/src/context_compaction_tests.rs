@@ -27,6 +27,8 @@ fn function_call_output(call_id: &str, output: &str) -> LlmInputItem {
     LlmInputItem::FunctionCallOutput {
         call_id: call_id.to_string(),
         output: output.to_string(),
+        content_parts: None,
+        is_error: false,
     }
 }
 

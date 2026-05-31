@@ -5210,6 +5210,8 @@ impl TurnRuntime {
                     LlmInputItem::FunctionCallOutput {
                         call_id: pending.result.call_id,
                         output,
+                        content_parts: None,
+                        is_error: false,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -6222,6 +6224,8 @@ impl TurnRuntime {
                     let item = LlmInputItem::FunctionCallOutput {
                         call_id: pending.result.call_id,
                         output,
+                        content_parts: None,
+                        is_error: false,
                     };
                     (item, tool_name, status)
                 })
@@ -8064,7 +8068,9 @@ fn subagent_transcript(conversation: &[LlmInputItem]) -> Vec<Value> {
                 "name": name,
                 "arguments": arguments,
             }),
-            LlmInputItem::FunctionCallOutput { call_id, output } => json!({
+            LlmInputItem::FunctionCallOutput {
+                call_id, output, ..
+            } => json!({
                 "role": "tool_result",
                 "call_id": call_id,
                 "output": output,
@@ -8396,6 +8402,8 @@ async fn run_subagent_rounds(
             LlmInputItem::FunctionCallOutput {
                 call_id: pending.result.call_id,
                 output,
+                content_parts: None,
+                is_error: false,
             }
         }));
     }
@@ -12254,9 +12262,16 @@ fn redact_input_item(item: LlmInputItem, redactor: &Redactor) -> LlmInputItem {
             name,
             arguments: redact_json_value(arguments, redactor),
         },
-        LlmInputItem::FunctionCallOutput { call_id, output } => LlmInputItem::FunctionCallOutput {
+        LlmInputItem::FunctionCallOutput {
+            call_id,
+            output,
+            content_parts,
+            is_error,
+        } => LlmInputItem::FunctionCallOutput {
             call_id,
             output: redactor.redact(&output).text,
+            content_parts,
+            is_error,
         },
         // Reasoning payloads are model-signed blobs. Redacting the opaque
         // bytes would break replay; redact only the human-readable summary
@@ -12833,9 +12848,15 @@ pub(crate) fn llm_input_to_resume_item(item: LlmInputItem) -> ResumeItem {
             name,
             arguments,
         },
-        LlmInputItem::FunctionCallOutput { call_id, output } => {
-            ResumeItem::FunctionCallOutput { call_id, output }
-        }
+        // `content_parts` / `is_error` from the structured-tool-result
+        // extension are dropped on persistence — the resume schema
+        // hasn't been bumped yet, so a checkpoint round-trip materializes
+        // a plain string output. Phase 4 lowers structured arrays at the
+        // provider boundary directly from the live `LlmInputItem`, so
+        // the loss only affects the resume edge case.
+        LlmInputItem::FunctionCallOutput {
+            call_id, output, ..
+        } => ResumeItem::FunctionCallOutput { call_id, output },
         LlmInputItem::Reasoning(payload) => ResumeItem::Reasoning { payload },
         LlmInputItem::Image { media_type, bytes } => ResumeItem::Image {
             media_type,
@@ -12871,7 +12892,7 @@ fn resume_item_to_llm_input(item: ResumeItem) -> LlmInputItem {
             arguments,
         },
         ResumeItem::FunctionCallOutput { call_id, output } => {
-            LlmInputItem::FunctionCallOutput { call_id, output }
+            LlmInputItem::function_output(call_id, output)
         }
         ResumeItem::Reasoning { payload } => LlmInputItem::Reasoning(payload),
         ResumeItem::Image {

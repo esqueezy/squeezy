@@ -113,7 +113,9 @@ pub(crate) fn maybe_micro_compact_mid_turn(
     let mut cleared_call_ids = Vec::new();
     let mut bytes_saved: usize = 0;
     for item in conversation.iter_mut() {
-        if let LlmInputItem::FunctionCallOutput { call_id, output } = item
+        if let LlmInputItem::FunctionCallOutput {
+            call_id, output, ..
+        } = item
             && clear_set.contains(call_id.as_str())
             && !is_already_cleared(output)
         {

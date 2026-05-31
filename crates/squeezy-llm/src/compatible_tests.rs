@@ -26,6 +26,8 @@ fn sample_request() -> LlmRequest {
             LlmInputItem::FunctionCallOutput {
                 call_id: "call_42".to_string(),
                 output: r#"{"result":"ok"}"#.to_string(),
+                content_parts: None,
+                is_error: false,
             },
         ]),
         max_output_tokens: Some(128),

@@ -118,6 +118,8 @@ fn request_body_preserves_function_response_name() {
             LlmInputItem::FunctionCallOutput {
                 call_id: "call-1".to_string(),
                 output: "match".to_string(),
+                content_parts: None,
+                is_error: false,
             },
         ]),
         max_output_tokens: None,

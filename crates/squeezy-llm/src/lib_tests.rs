@@ -270,6 +270,8 @@ fn normalize_tool_ids_rewrites_paired_call_and_output_to_canonical_form() {
         LlmInputItem::FunctionCallOutput {
             call_id: openai_responses_id.to_string(),
             output: "match".to_string(),
+            content_parts: None,
+            is_error: false,
         },
     ]);
 
@@ -287,7 +289,9 @@ fn normalize_tool_ids_rewrites_paired_call_and_output_to_canonical_form() {
         other => panic!("expected FunctionCall, got {other:?}"),
     }
     match &normalized[1] {
-        LlmInputItem::FunctionCallOutput { call_id, output } => {
+        LlmInputItem::FunctionCallOutput {
+            call_id, output, ..
+        } => {
             assert_eq!(call_id, "call_1");
             assert_eq!(output, "match");
         }
@@ -308,6 +312,8 @@ fn normalize_tool_ids_assigns_distinct_canonical_ids_per_call() {
         LlmInputItem::FunctionCallOutput {
             call_id: "toolu_abc".to_string(),
             output: "ok".to_string(),
+            content_parts: None,
+            is_error: false,
         },
         LlmInputItem::FunctionCall {
             call_id: "google_call_2".to_string(),
@@ -317,6 +323,8 @@ fn normalize_tool_ids_assigns_distinct_canonical_ids_per_call() {
         LlmInputItem::FunctionCallOutput {
             call_id: "google_call_2".to_string(),
             output: "ok".to_string(),
+            content_parts: None,
+            is_error: false,
         },
     ]);
 
@@ -342,6 +350,8 @@ fn normalize_tool_ids_synthesizes_placeholder_for_orphan_tool_result() {
         LlmInputItem::FunctionCallOutput {
             call_id: "lost_after_model_swap".to_string(),
             output: "result".to_string(),
+            content_parts: None,
+            is_error: false,
         },
         LlmInputItem::UserText("now what?".to_string()),
     ]);
@@ -365,7 +375,9 @@ fn normalize_tool_ids_synthesizes_placeholder_for_orphan_tool_result() {
         other => panic!("expected synthesized FunctionCall, got {other:?}"),
     }
     match &normalized[2] {
-        LlmInputItem::FunctionCallOutput { call_id, output } => {
+        LlmInputItem::FunctionCallOutput {
+            call_id, output, ..
+        } => {
             assert_eq!(call_id, "call_1");
             assert_eq!(output, "result");
         }
@@ -386,6 +398,8 @@ fn normalize_tool_ids_pairs_orphan_synthesis_with_subsequent_real_calls() {
         LlmInputItem::FunctionCallOutput {
             call_id: "fc_orphan".to_string(),
             output: "stale".to_string(),
+            content_parts: None,
+            is_error: false,
         },
         LlmInputItem::FunctionCall {
             call_id: "toolu_new".to_string(),
@@ -395,6 +409,8 @@ fn normalize_tool_ids_pairs_orphan_synthesis_with_subsequent_real_calls() {
         LlmInputItem::FunctionCallOutput {
             call_id: "toolu_new".to_string(),
             output: "match".to_string(),
+            content_parts: None,
+            is_error: false,
         },
     ]);
 
@@ -461,6 +477,8 @@ fn normalize_tool_ids_is_idempotent_on_already_canonical_input() {
         LlmInputItem::FunctionCallOutput {
             call_id: "call_1".to_string(),
             output: "hit".to_string(),
+            content_parts: None,
+            is_error: false,
         },
         LlmInputItem::FunctionCall {
             call_id: "call_2".to_string(),
@@ -470,6 +488,8 @@ fn normalize_tool_ids_is_idempotent_on_already_canonical_input() {
         LlmInputItem::FunctionCallOutput {
             call_id: "call_2".to_string(),
             output: "data".to_string(),
+            content_parts: None,
+            is_error: false,
         },
     ];
     let once = normalize_tool_ids_for_replay(&canonical);
@@ -498,6 +518,8 @@ fn normalize_tool_ids_simulates_anthropic_to_openai_cross_model_replay() {
         LlmInputItem::FunctionCallOutput {
             call_id: "toolu_aaa".to_string(),
             output: "(stale)".to_string(),
+            content_parts: None,
+            is_error: false,
         },
         // Subsequent OpenAI Responses turn with its native id shape.
         LlmInputItem::FunctionCall {
@@ -508,6 +530,8 @@ fn normalize_tool_ids_simulates_anthropic_to_openai_cross_model_replay() {
         LlmInputItem::FunctionCallOutput {
             call_id: openai_id.to_string(),
             output: "found".to_string(),
+            content_parts: None,
+            is_error: false,
         },
     ]);
 

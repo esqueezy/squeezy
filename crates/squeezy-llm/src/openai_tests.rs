@@ -75,6 +75,8 @@ fn request_body_serializes_tool_outputs_as_input_items() {
             LlmInputItem::FunctionCallOutput {
                 call_id: "call_1".to_string(),
                 output: "{\"status\":\"success\"}".to_string(),
+                content_parts: None,
+                is_error: false,
             },
         ]),
         max_output_tokens: None,

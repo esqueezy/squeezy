@@ -134,6 +134,8 @@ fn request_body_maps_tool_roundtrip_messages() {
             LlmInputItem::FunctionCallOutput {
                 call_id: "toolu_1".to_string(),
                 output: "model = 'haiku'".to_string(),
+                content_parts: None,
+                is_error: false,
             },
         ]),
         max_output_tokens: Some(32),
