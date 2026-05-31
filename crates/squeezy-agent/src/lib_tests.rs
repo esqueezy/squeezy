@@ -14,8 +14,8 @@ use squeezy_core::{
     AppConfig, CompactionStrategy, ContextAttachmentKind, ContextCompactionConfig,
     ContextCompactionState, ContextCompactionTrigger, CostSnapshot, PermissionAction,
     PermissionCapability, PermissionMode, PermissionPolicy, PermissionRequest, PermissionRisk,
-    PermissionRuleSource, Result, SessionLogConfig, SessionMode, ShellSandboxMode, SkillsConfig,
-    SubagentConfig, TaskStateStatus,
+    PermissionRuleSource, ResponseVerbosity, Result, SessionLogConfig, SessionMode,
+    ShellSandboxMode, SkillsConfig, SubagentConfig, TaskStateStatus,
 };
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
@@ -909,6 +909,49 @@ async fn pasted_png_bytes_route_into_llm_image_input_item() {
     };
     assert_eq!(media_type, "image/png");
     assert_eq!(bytes.as_ref(), png.as_slice());
+}
+
+#[tokio::test]
+async fn transient_turn_image_items_do_not_persist_as_context_attachments() {
+    let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
+        response_id: Some("resp_1".to_string()),
+        cost: CostSnapshot::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })]]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+    let mut png = Vec::new();
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    png.extend_from_slice(b"inline-turn-image");
+
+    let mut rx = agent.start_turn_with_display_input(
+        "describe [Image shot.png]".to_string(),
+        "describe [Image shot.png]".to_string(),
+        vec![LlmInputItem::Image {
+            media_type: "image/png".to_string(),
+            bytes: Arc::from(png.clone().into_boxed_slice()),
+        }],
+        CancellationToken::new(),
+        ResponseVerbosity::Normal,
+    );
+    let mut displayed_user = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::UserMessage { message, .. } = event {
+            displayed_user = Some(message.content);
+        }
+    }
+
+    assert_eq!(displayed_user.as_deref(), Some("describe [Image shot.png]"));
+    assert!(agent.context_attachments_snapshot().await.is_empty());
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .input
+            .iter()
+            .any(|item| matches!(item, LlmInputItem::Image { .. })),
+        "request should include transient image input"
+    );
 }
 
 #[tokio::test]

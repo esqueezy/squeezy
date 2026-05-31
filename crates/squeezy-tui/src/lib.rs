@@ -41,13 +41,15 @@ use squeezy_agent::{
     RequestUserInputRequest, RequestUserInputResponse, ToolApprovalDecision, ToolApprovalRequest,
 };
 use squeezy_core::{
-    AppConfig, ConfigWarning, ContextAttachment, ContextCompactionRecord, ContextCompactionState,
-    ContextEstimate, PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role,
-    SessionMode, ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot,
-    TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
-    TuiSynchronizedOutput,
+    AppConfig, ConfigWarning, ContextAttachment, ContextAttachmentKind, ContextCompactionRecord,
+    ContextCompactionState, ContextEstimate, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES,
+    PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
+    ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig,
+    ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
+    TuiSynchronizedOutput, context_attachment_storage_text, detect_context_attachment_kind,
+    detect_image_mime,
 };
-use squeezy_llm::LlmProvider;
+use squeezy_llm::{LlmInputItem, LlmProvider};
 use squeezy_skills::PromptTemplateCatalog;
 use squeezy_store::{BugReportBundle, BugReportOptions, CleanupMode, SessionQuery};
 use squeezy_telemetry::PreparedFeedback;
@@ -111,7 +113,7 @@ use input::{
     move_input_cursor_line_end, move_input_cursor_line_start, move_input_cursor_right,
     move_input_cursor_up, move_input_cursor_word_left, move_input_cursor_word_right,
     move_slash_menu_selection, push_input_history, recall_prompt_history,
-    reject_unknown_slash_command, slash_suggestions,
+    reject_unknown_slash_command,
 };
 
 use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
@@ -119,7 +121,7 @@ use render::palette::{self, blend_color};
 use terminal_writer::TerminalWriter;
 use toast::ToastQueue;
 
-const INLINE_PASTE_MAX_BYTES: usize = 512;
+const LARGE_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const LONG_ASSISTANT_CHARS: usize = 1_200;
 const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
@@ -1953,7 +1955,8 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 insert_input_char(app, '\n');
                 return Ok(false);
             }
-            let input = app.input.trim().to_string();
+            let raw_input = app.input.clone();
+            let input = raw_input.trim().to_string();
             if input.is_empty() {
                 app.status = "enter a prompt first".to_string();
                 return Ok(false);
@@ -1961,17 +1964,36 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             // Slash commands always execute immediately — they're UI
             // actions, not turn-equivalent prompts, so they shouldn't
             // queue behind a running turn.
+            let before_command_input = app.input.clone();
             if handle_slash_command(app, agent, &input).await {
-                clear_input(app);
+                let preserve_input =
+                    app.preserve_input_after_slash_command || app.input != before_command_input;
+                app.preserve_input_after_slash_command = false;
+                if !preserve_input {
+                    clear_input(app);
+                }
                 app.input_history_index = None;
                 app.input_history_draft.clear();
                 app.slash_menu_index = 0;
+                return Ok(false);
+            }
+            if handle_inline_slash_command(app, agent, &raw_input).await {
                 return Ok(false);
             }
             if reject_unknown_slash_command(app, &input) {
                 return Ok(false);
             }
             if app.turn_rx.is_some() {
+                app.prune_prompt_attachments();
+                if app
+                    .prompt_attachments
+                    .iter()
+                    .any(|attachment| input.contains(&attachment.placeholder))
+                {
+                    app.status = "prompt attachments cannot be queued; wait for the current turn"
+                        .to_string();
+                    return Ok(false);
+                }
                 app.prompt_queue.push_back(input.clone());
                 clear_input(app);
                 push_input_history(app, input);
@@ -1982,9 +2004,9 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             // during the turn can restore it via Ctrl-R. Completion clears
             // this field; only Cancelled/Failed leave it set.
             app.cancelled_prompt = Some(input.clone());
-            clear_input(app);
             push_input_history(app, input.clone());
             start_user_turn(app, agent, input);
+            clear_input(app);
             Ok(false)
         }
         KeyCode::Backspace => {
@@ -2029,7 +2051,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     }
 }
 
-async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Result<()> {
+async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Result<()> {
     let normalized = normalize_pasted_text(&text);
     // The config screen owns its own set of focusable text inputs (secret
     // entry, search, picker filter, field editor). Route paste there
@@ -2046,34 +2068,168 @@ async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Resu
         insert_input_text(app, &normalized);
         return Ok(());
     }
-    if is_inline_paste(&normalized) {
+    if app.pending_approval.is_some() || app.pending_mcp_elicitation.is_some() {
+        app.status = "paste unavailable while a modal prompt is open".to_string();
+        return Ok(());
+    }
+
+    if let Some(status) = insert_pasted_image_path_token(app, &normalized) {
+        app.status = status;
+        return Ok(());
+    }
+
+    if is_large_prompt_paste(&normalized) {
+        let chars = normalized.chars().count();
+        let placeholder =
+            insert_prompt_text_token(app, format!("[Pasted Content {chars} chars]"), normalized);
+        app.status = format!("inserted {placeholder}");
+    } else {
         insert_input_text(app, &normalized);
-        return Ok(());
-    }
-    if app.turn_rx.is_some()
-        || app.pending_approval.is_some()
-        || app.pending_mcp_elicitation.is_some()
-    {
-        app.status = "paste-as-attachment unavailable mid-turn; queue the prompt and retry after"
-            .to_string();
-        return Ok(());
-    }
-    match agent.attach_pasted_context(normalized).await {
-        Ok(update) => {
-            app.attachments = agent.context_attachments_snapshot().await;
-            app.status = attachment_update_status("paste", &update);
-        }
-        Err(error) => app.status = format!("paste attach failed: {error}"),
     }
     Ok(())
+}
+
+fn insert_pasted_image_path_token(app: &mut TuiApp, text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+    let candidate = trimmed.trim_matches('"');
+    let resolved = resolve_workspace_path(&app.workspace_root, candidate);
+    if !resolved.is_file() {
+        return None;
+    }
+    let bytes = match std::fs::read(&resolved) {
+        Ok(bytes) => bytes,
+        Err(error) => return Some(format!("image paste failed: {error}")),
+    };
+    let media_type = detect_image_mime(&bytes)?;
+    let label = file_label(&resolved);
+    let placeholder = insert_prompt_image_token(
+        app,
+        format!("[Image {label}]"),
+        media_type.to_string(),
+        bytes,
+    );
+    Some(format!("inserted {placeholder}"))
+}
+
+fn insert_file_prompt_attachment(app: &mut TuiApp, path: &str) -> Result<String> {
+    let resolved = resolve_workspace_path(&app.workspace_root, path);
+    let bytes = std::fs::read(&resolved)?;
+    let label = file_label(&resolved);
+    let display_path = display_workspace_path(&app.workspace_root, &resolved);
+    let text = std::str::from_utf8(&bytes).ok();
+    let kind = detect_context_attachment_kind(Some(&label), &bytes, text);
+    if kind == ContextAttachmentKind::Image {
+        let media_type = detect_image_mime(&bytes)
+            .map(str::to_string)
+            .unwrap_or_else(|| "image/png".to_string());
+        let placeholder =
+            insert_prompt_image_token(app, format!("[Image {label}]"), media_type, bytes);
+        return Ok(format!("inserted {placeholder}"));
+    }
+    if !kind.is_supported_text() {
+        return Err(SqueezyError::Agent(format!(
+            "unsupported file kind={}",
+            kind.as_str()
+        )));
+    }
+    let text = text.unwrap_or_default();
+    let (bounded_text, truncated) =
+        context_attachment_storage_text(text, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES);
+    let mut replacement = format!("Attached file {display_path}:\n{bounded_text}");
+    if truncated {
+        replacement.push_str("\n[truncated]");
+    }
+    let placeholder =
+        insert_prompt_text_token(app, format!("[Attached file {label}]"), replacement);
+    Ok(format!("inserted {placeholder}"))
+}
+
+fn resolve_workspace_path(root: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file")
+        .to_string()
+}
+
+fn display_workspace_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn insert_prompt_text_token(
+    app: &mut TuiApp,
+    base_placeholder: String,
+    replacement: String,
+) -> String {
+    let placeholder = unique_prompt_placeholder(app, &base_placeholder);
+    insert_input_text(app, &placeholder);
+    app.prompt_attachments.push(PromptAttachment {
+        placeholder: placeholder.clone(),
+        payload: PromptAttachmentPayload::Text { replacement },
+    });
+    placeholder
+}
+
+fn insert_prompt_image_token(
+    app: &mut TuiApp,
+    base_placeholder: String,
+    media_type: String,
+    bytes: Vec<u8>,
+) -> String {
+    let placeholder = unique_prompt_placeholder(app, &base_placeholder);
+    insert_input_text(app, &placeholder);
+    app.prompt_attachments.push(PromptAttachment {
+        placeholder: placeholder.clone(),
+        payload: PromptAttachmentPayload::Image {
+            media_type,
+            bytes: Arc::from(bytes.into_boxed_slice()),
+        },
+    });
+    placeholder
+}
+
+fn unique_prompt_placeholder(app: &TuiApp, base: &str) -> String {
+    if !prompt_placeholder_in_use(app, base) {
+        return base.to_string();
+    }
+    let stem = base.strip_suffix(']').unwrap_or(base);
+    for index in 2.. {
+        let candidate = format!("{stem} #{index}]");
+        if !prompt_placeholder_in_use(app, &candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded placeholder suffix search must return")
+}
+
+fn prompt_placeholder_in_use(app: &TuiApp, placeholder: &str) -> bool {
+    app.input.contains(placeholder)
+        || app
+            .prompt_attachments
+            .iter()
+            .any(|attachment| attachment.placeholder == placeholder)
 }
 
 fn normalize_pasted_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn is_inline_paste(text: &str) -> bool {
-    text.len() <= INLINE_PASTE_MAX_BYTES && !text.contains('\n')
+fn is_large_prompt_paste(text: &str) -> bool {
+    text.chars().count() > LARGE_PASTE_CHAR_THRESHOLD
 }
 
 /// Resolve `key` against the user-configurable keymap and execute the
@@ -2225,10 +2381,7 @@ fn scroll_transcript_down(app: &mut TuiApp, lines: u16) {
 }
 
 fn should_route_plain_arrow_to_scroll(app: &TuiApp) -> bool {
-    app.alternate_scroll_enabled
-        && app.input_history_index.is_none()
-        && !app.transcript.is_empty()
-        && (app.transcript_scroll_from_bottom > 0 || !app.input.trim().is_empty())
+    app.alternate_scroll_enabled && app.input_history_index.is_none() && !app.transcript.is_empty()
 }
 
 fn request_turn_interrupt(app: &mut TuiApp) -> bool {
@@ -2455,6 +2608,108 @@ pub(crate) async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, in
     true
 }
 
+async fn handle_inline_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
+    let Some(occurrence) = input::find_inline_slash_dispatch_command(input) else {
+        return false;
+    };
+    let slash = occurrence.command.name;
+    if !occurrence.command.available_during_task && turn_in_progress(app) {
+        app.status = format!("{slash} unavailable during turn");
+        return true;
+    }
+    match slash {
+        "/attach" => handle_inline_attach_command(app, input, occurrence.start, occurrence.end),
+        "/help" | "/plan" | "/build" => {
+            let command_input =
+                inline_prompt_command_input(input, occurrence.start, occurrence.end, slash);
+            let before_command_input = app.input.clone();
+            if handle_slash_command(app, agent, &command_input).await {
+                let preserve_input =
+                    app.preserve_input_after_slash_command || app.input != before_command_input;
+                app.preserve_input_after_slash_command = false;
+                if !preserve_input {
+                    clear_input(app);
+                }
+                app.input_history_index = None;
+                app.input_history_draft.clear();
+                app.slash_menu_index = 0;
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn inline_prompt_command_input(input: &str, start: usize, end: usize, slash: &str) -> String {
+    let before = input[..start].trim();
+    let after = input[end..].trim();
+    let prompt = if slash == "/help" {
+        after.to_string()
+    } else {
+        [before, after]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if prompt.is_empty() {
+        slash.to_string()
+    } else {
+        format!("{slash} {prompt}")
+    }
+}
+
+fn handle_inline_attach_command(
+    app: &mut TuiApp,
+    input: &str,
+    command_start: usize,
+    command_end: usize,
+) -> bool {
+    let Some((path, path_end)) = inline_attach_path(input, command_end) else {
+        app.status = "usage: /attach <path>".to_string();
+        return true;
+    };
+    let original_input = app.input.clone();
+    let original_cursor = app.input_cursor;
+    app.input.replace_range(command_start..path_end, "");
+    app.input_cursor = command_start;
+    match insert_file_prompt_attachment(app, &path) {
+        Ok(status) => app.status = status,
+        Err(error) => {
+            app.input = original_input;
+            app.input_cursor = original_cursor;
+            app.preserve_input_after_slash_command = true;
+            app.status = format!("attach failed: {error}");
+        }
+    }
+    true
+}
+
+fn inline_attach_path(input: &str, command_end: usize) -> Option<(String, usize)> {
+    let (relative_start, first) = input[command_end..]
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())?;
+    let path_start = command_end + relative_start;
+    if first == '"' || first == '\'' {
+        let value_start = path_start + first.len_utf8();
+        let close = input[value_start..]
+            .char_indices()
+            .find(|(_, ch)| *ch == first)
+            .map(|(index, _)| value_start + index)?;
+        let path = input[value_start..close].to_string();
+        let path_end = close + first.len_utf8();
+        return (!path.is_empty()).then_some((path, path_end));
+    }
+    let path_end = input[path_start..]
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(index, _)| path_start + index)
+        .unwrap_or(input.len());
+    let path = input[path_start..path_end].to_string();
+    (!path.is_empty()).then_some((path, path_end))
+}
+
 /// Attempt to resolve an unknown `/foo …` head against the user-
 /// authored prompt-template catalog. On a hit the rendered body is
 /// routed through the normal user-turn flow (echo + history + queue
@@ -2581,12 +2836,17 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             handle_report_command(app, agent, &args).await;
         }
         DispatchCommand::Attach { path } => {
-            match agent.attach_file_context(PathBuf::from(&path)).await {
-                Ok(update) => {
-                    app.attachments = agent.context_attachments_snapshot().await;
-                    app.status = attachment_update_status("file", &update);
+            let original_input = app.input.clone();
+            let original_cursor = app.input_cursor;
+            clear_input(app);
+            match insert_file_prompt_attachment(app, &path) {
+                Ok(status) => app.status = status,
+                Err(error) => {
+                    app.input = original_input;
+                    app.input_cursor = original_cursor;
+                    app.preserve_input_after_slash_command = true;
+                    app.status = format!("attach failed: {error}");
                 }
-                Err(error) => app.status = format!("attach failed: {error}"),
             }
         }
         DispatchCommand::Attachments => {
@@ -3329,31 +3589,6 @@ async fn handle_report_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
     }
 }
 
-fn attachment_update_status(
-    source: &str,
-    update: &squeezy_agent::ContextAttachmentUpdate,
-) -> String {
-    let attachment = &update.attachment;
-    if update.duplicate {
-        return format!("deduped {source} as {}", attachment.id);
-    }
-    if !update.active {
-        return format!(
-            "unsupported {source}: {} ({})",
-            attachment.kind.as_str(),
-            attachment.original_bytes
-        );
-    }
-    format!(
-        "attached {source} {} kind={} bytes={} preview={} redactions={}",
-        attachment.id,
-        attachment.kind.as_str(),
-        attachment.original_bytes,
-        attachment.preview_bytes,
-        attachment.redactions,
-    )
-}
-
 fn format_attachment_list(attachments: &[ContextAttachment]) -> String {
     if attachments.is_empty() {
         return "No attached context.".to_string();
@@ -3820,6 +4055,42 @@ fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
 /// by the post-plan Execute action so both paths share the same plan
 /// prefix and turn-state bookkeeping.
 pub(crate) fn start_user_turn(app: &mut TuiApp, agent: &mut Agent, input: String) {
+    let prompt = prepare_prompt_turn_input(app, input);
+    start_user_turn_prepared(app, agent, prompt);
+}
+
+#[derive(Debug, Clone)]
+struct PreparedPromptTurn {
+    display_input: String,
+    model_input: String,
+    transient_input_items: Vec<LlmInputItem>,
+}
+
+fn prepare_prompt_turn_input(app: &mut TuiApp, input: String) -> PreparedPromptTurn {
+    app.prune_prompt_attachments();
+    let mut model_input = input.clone();
+    let mut transient_input_items = Vec::new();
+    for attachment in app.prompt_attachments.clone() {
+        if !input.contains(&attachment.placeholder) {
+            continue;
+        }
+        match attachment.payload {
+            PromptAttachmentPayload::Text { replacement } => {
+                model_input = model_input.replace(&attachment.placeholder, &replacement);
+            }
+            PromptAttachmentPayload::Image { media_type, bytes } => {
+                transient_input_items.push(LlmInputItem::Image { media_type, bytes });
+            }
+        }
+    }
+    PreparedPromptTurn {
+        display_input: input,
+        model_input,
+        transient_input_items,
+    }
+}
+
+fn start_user_turn_prepared(app: &mut TuiApp, agent: &mut Agent, prompt: PreparedPromptTurn) {
     if let Some(swap) = agent.drain_pending_swap() {
         let note = swap
             .display_note
@@ -3832,12 +4103,17 @@ pub(crate) fn start_user_turn(app: &mut TuiApp, agent: &mut Agent, input: String
     app.task_state = None;
     app.task_panel_collapsed = false;
     app.note_turn_started();
-    let prefixed_input = match take_pending_plan_prefix(app) {
-        Some(prefix) => format!("{prefix}{input}"),
-        None => input,
+    let (display_input, model_input) = match take_pending_plan_prefix(app) {
+        Some(prefix) => (
+            format!("{prefix}{}", prompt.display_input),
+            format!("{prefix}{}", prompt.model_input),
+        ),
+        None => (prompt.display_input, prompt.model_input),
     };
-    app.turn_rx = Some(agent.start_turn_with_response_verbosity(
-        prefixed_input,
+    app.turn_rx = Some(agent.start_turn_with_display_input(
+        display_input,
+        model_input,
+        prompt.transient_input_items,
         cancel.clone(),
         app.response_verbosity,
     ));
@@ -6310,7 +6586,7 @@ fn render_attachments(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let hidden = app.attachments.len() - max_rows;
         if let Some(last) = lines.last_mut() {
             last.spans.push(Span::styled(
-                format!(" · +{hidden} more (/attachments)"),
+                format!(" · +{hidden} more"),
                 Style::default().fg(crate::render::theme::quiet()),
             ));
         }
@@ -7206,23 +7482,18 @@ fn format_user_prompt_entry(
 
     let mut lines = Vec::with_capacity(content.len() + 2);
 
+    let slash_ranges = input::slash_command_ranges(&item.content);
     let mut line_start = 0usize;
     for (index, line_text) in content.iter().enumerate() {
-        let slash_len = if index == 0 {
-            input::match_slash_command_prefix(line_text)
-        } else {
-            None
-        };
         let bang_ref = bang_range.as_ref();
         let style_text_at = |abs_offset: usize| -> Style {
             if bang_ref.is_some_and(|range| range.contains(&abs_offset)) {
                 Style::default().fg(crate::render::theme::red())
-            } else if let Some(len) = slash_len {
-                if abs_offset < len {
-                    Style::default().fg(crate::render::theme::accent())
-                } else {
-                    Style::default().fg(crate::render::theme::foreground())
-                }
+            } else if slash_ranges
+                .iter()
+                .any(|(start, end)| *start <= abs_offset && abs_offset < *end)
+            {
+                Style::default().fg(crate::render::theme::accent())
             } else {
                 Style::default().fg(crate::render::theme::foreground())
             }
@@ -10917,11 +11188,7 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     }
     let cursor = input_cursor(app);
     let parts = app.input.split('\n').collect::<Vec<_>>();
-    // Slash highlight only applies to the first line of input — slash
-    // commands are always at the start of a prompt, never embedded later.
-    let slash_len = parts
-        .first()
-        .and_then(|first| input::match_slash_command_prefix(first));
+    let slash_ranges = input::slash_command_ranges(&app.input);
     let bang_range = bang_command_marker_range(&app.input);
     let mut line_start = 0usize;
     parts
@@ -10935,20 +11202,21 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
             };
             let mut spans = prefix;
             let line_end = line_start + line.len();
-            let slash_split = if index == 0 { slash_len } else { None };
             let style_text_at = |abs_offset: usize| -> Style {
                 if bang_range
                     .as_ref()
                     .is_some_and(|range| range.contains(&abs_offset))
                 {
                     Style::default().fg(crate::render::theme::red())
+                } else if let Some(style) = prompt_attachment_style_at(app, abs_offset) {
+                    style
+                } else if slash_ranges
+                    .iter()
+                    .any(|(start, end)| *start <= abs_offset && abs_offset < *end)
+                {
+                    Style::default().fg(crate::render::theme::accent())
                 } else {
-                    match slash_split {
-                        Some(len) if abs_offset < len => {
-                            Style::default().fg(crate::render::theme::accent())
-                        }
-                        _ => Style::default().fg(crate::render::theme::foreground()),
-                    }
+                    Style::default().fg(crate::render::theme::foreground())
                 }
             };
             if cursor >= line_start && cursor <= line_end {
@@ -10969,6 +11237,22 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
             Line::from(spans)
         })
         .collect()
+}
+
+fn prompt_attachment_style_at(app: &TuiApp, abs_offset: usize) -> Option<Style> {
+    for attachment in &app.prompt_attachments {
+        for (start, _) in app.input.match_indices(&attachment.placeholder) {
+            let end = start + attachment.placeholder.len();
+            if (start..end).contains(&abs_offset) {
+                return Some(
+                    Style::default()
+                        .fg(crate::render::theme::cyan())
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+        }
+    }
+    None
 }
 
 /// Push styled spans for `chunk`, splitting anywhere the computed style
@@ -11063,7 +11347,7 @@ fn composer_bubble_lines(
 }
 
 fn slash_suggestion_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
-    let suggestions = slash_suggestions(&app.input);
+    let suggestions = input::slash_suggestions_at(&app.input, app.input_cursor);
     let visible = visible_slash_suggestions(&suggestions, app.slash_menu_index);
     let command_width = visible
         .iter()
@@ -11084,27 +11368,24 @@ fn slash_suggestion_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
         let marker = if selected { "› " } else { "  " };
         let command_padding =
             " ".repeat(command_width.saturating_sub(command.name.chars().count()) + 2);
-        let name_color = if dimmed {
-            crate::render::theme::quiet()
-        } else if selected {
+        let name_color = if selected {
             crate::render::theme::secondary()
+        } else if dimmed {
+            crate::render::theme::foreground()
         } else {
             crate::render::theme::accent()
         };
         let mut name_style = Style::default().fg(name_color);
         if dimmed {
-            name_style = name_style.add_modifier(Modifier::DIM);
+            name_style = name_style.add_modifier(Modifier::ITALIC);
         }
         let mut description_style = Style::default().fg(crate::render::theme::quiet());
         if dimmed {
-            description_style = description_style.add_modifier(Modifier::DIM);
+            description_style = description_style.fg(crate::render::theme::foreground());
         }
-        let mut hint_style = Style::default()
+        let hint_style = Style::default()
             .fg(crate::render::theme::cyan())
             .add_modifier(Modifier::ITALIC);
-        if dimmed {
-            hint_style = hint_style.add_modifier(Modifier::DIM);
-        }
         let mut spans = vec![
             Span::styled(
                 marker,
@@ -11132,15 +11413,11 @@ fn slash_suggestion_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
                 format!("  [{}]", badges.join("|")),
                 Style::default()
                     .fg(if dimmed {
-                        crate::render::theme::quiet()
+                        crate::render::theme::foreground()
                     } else {
                         crate::render::theme::accent()
                     })
-                    .add_modifier(if dimmed {
-                        Modifier::DIM | Modifier::ITALIC
-                    } else {
-                        Modifier::ITALIC
-                    }),
+                    .add_modifier(Modifier::ITALIC),
             ))
         };
         let dimmed_span = if dimmed {
@@ -11148,7 +11425,7 @@ fn slash_suggestion_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
                 "  (unavailable during turn)",
                 Style::default()
                     .fg(crate::render::theme::quiet())
-                    .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                    .add_modifier(Modifier::ITALIC),
             ))
         } else {
             None
@@ -12195,6 +12472,23 @@ impl TelemetryStatus {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptAttachment {
+    placeholder: String,
+    payload: PromptAttachmentPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptAttachmentPayload {
+    Text {
+        replacement: String,
+    },
+    Image {
+        media_type: String,
+        bytes: Arc<[u8]>,
+    },
+}
+
 pub(crate) struct TuiApp {
     pub(crate) provider_name: &'static str,
     pub(crate) version: &'static str,
@@ -12230,6 +12524,7 @@ pub(crate) struct TuiApp {
     pub(crate) telemetry: TelemetryStatus,
     pub(crate) input: String,
     pub(crate) input_cursor: usize,
+    pub(crate) prompt_attachments: Vec<PromptAttachment>,
     pub(crate) input_history: prompt_history::PromptHistory,
     pub(crate) input_history_index: Option<usize>,
     pub(crate) input_history_draft: String,
@@ -12471,6 +12766,9 @@ pub(crate) struct TuiApp {
     /// `DispatchCommand`; a match expands the template body and routes
     /// it through [`start_user_turn`] like any other typed prompt.
     pub(crate) prompt_templates: PromptTemplateCatalog,
+    /// One-shot slash-command escape hatch for commands that intentionally
+    /// leave editable text in the composer after they run.
+    pub(crate) preserve_input_after_slash_command: bool,
     /// Override for the user-scope settings file that slash commands
     /// (`/theme`, `/statusline`, …) persist into. `None` ⇒ production
     /// path: `squeezy_core::default_settings_path()` (which itself
@@ -12538,6 +12836,15 @@ fn format_config_warning(warning: &ConfigWarning) -> String {
 }
 
 impl TuiApp {
+    pub(crate) fn prune_prompt_attachments(&mut self) {
+        self.prompt_attachments
+            .retain(|attachment| self.input.contains(&attachment.placeholder));
+    }
+
+    pub(crate) fn clear_prompt_attachments(&mut self) {
+        self.prompt_attachments.clear();
+    }
+
     /// Clear the click-target registry at the start of each frame.
     /// Called from `render` / `render_inline` before any widget draws.
     pub(crate) fn begin_frame_clickables(&self) {
@@ -12658,6 +12965,7 @@ impl TuiApp {
             telemetry: TelemetryStatus::from_config(&config.telemetry),
             input: String::new(),
             input_cursor: 0,
+            prompt_attachments: Vec::new(),
             input_history: if config.tui.persist_prompt_history {
                 prompt_history::PromptHistory::with_persistence(
                     prompt_history::DEFAULT_PROMPT_HISTORY_CAPACITY,
@@ -12766,6 +13074,7 @@ impl TuiApp {
             pending_chord: None,
             clickables: std::cell::RefCell::new(Vec::new()),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
+            preserve_input_after_slash_command: false,
             settings_path_override: None,
         };
         for warning in &config.config_warnings {

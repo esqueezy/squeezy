@@ -131,8 +131,6 @@ fn purely_informational_slash_commands_declare_no_capabilities() {
         "/pin",
         "/unpin",
         "/copy",
-        "/attachments",
-        "/detach",
         "/plan",
         "/build",
     ] {
@@ -142,6 +140,12 @@ fn purely_informational_slash_commands_declare_no_capabilities() {
             find_command(name).capabilities,
         );
     }
+}
+
+#[test]
+fn legacy_attachment_commands_are_hidden_from_slash_menu() {
+    assert!(!SLASH_COMMANDS.iter().any(|cmd| cmd.name == "/attachments"));
+    assert!(!SLASH_COMMANDS.iter().any(|cmd| cmd.name == "/detach"));
 }
 
 #[test]
@@ -221,4 +225,48 @@ fn slash_suggestions_orders_prefix_matches_before_fuzzy_matches() {
 #[test]
 fn slash_suggestions_returns_no_matches_for_unrelated_input() {
     assert!(slash_suggestions("/zzz").is_empty());
+}
+
+#[test]
+fn slash_suggestions_mid_prompt_only_show_inline_commands() {
+    let names = slash_suggestions("please /")
+        .into_iter()
+        .map(|cmd| cmd.name)
+        .collect::<Vec<_>>();
+
+    for expected in ["/attach", "/build", "/help", "/plan"] {
+        assert!(
+            names.contains(&expected),
+            "expected inline command {expected} in {names:?}"
+        );
+    }
+    for prefix_only in ["/config", "/cost", "/model", "/theme"] {
+        assert!(
+            !names.contains(&prefix_only),
+            "prefix-only command {prefix_only} should not appear mid-prompt: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn inline_dispatch_ignores_prefix_only_commands() {
+    assert_eq!(
+        find_inline_slash_dispatch_command("please /plan the refactor")
+            .map(|occurrence| occurrence.command.name),
+        Some("/plan")
+    );
+    assert!(
+        find_inline_slash_dispatch_command("please /cost").is_none(),
+        "/cost remains a start-only command"
+    );
+}
+
+#[test]
+fn slash_command_ranges_highlight_inline_commands_only() {
+    assert_eq!(
+        slash_command_ranges("please /attach Cargo.toml"),
+        vec![(7, 14)]
+    );
+    assert!(slash_command_ranges("please /cost").is_empty());
+    assert_eq!(slash_command_ranges("/cost"), vec![(0, 5)]);
 }
