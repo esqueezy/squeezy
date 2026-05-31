@@ -41,12 +41,21 @@ KOTLINC_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v kotlinc)")")")"
 # `*-embeddable` variant is published as a separate Maven artifact for tools
 # that need the intellij-shaded classes. Either jar exposes the
 # `org.jetbrains.kotlin.cli.*` and `.psi.*` symbols KotlinOracle.kt imports,
-# so accept whichever is present in the install.
-COMPILER_JAR=$(ls "$KOTLINC_HOME"/lib/kotlin-compiler-embeddable.jar \
-                  "$KOTLINC_HOME"/lib/kotlin-compiler.jar 2>/dev/null | head -1)
+# so accept whichever is present. Avoid `ls A B | head -1` because under
+# `set -euo pipefail`, `ls` exits non-zero when any argument is missing and
+# the pipefail propagation aborts the script even though one match exists.
+COMPILER_JAR=""
+for candidate in \
+    "$KOTLINC_HOME/lib/kotlin-compiler-embeddable.jar" \
+    "$KOTLINC_HOME/lib/kotlin-compiler.jar"; do
+    if [ -f "$candidate" ]; then
+        COMPILER_JAR="$candidate"
+        break
+    fi
+done
 if [ -z "$COMPILER_JAR" ]; then
     echo "kotlin-compiler[-embeddable].jar not found under $KOTLINC_HOME/lib" >&2
-    ls "$KOTLINC_HOME"/lib 2>/dev/null | head -20 >&2 || true
+    ls "$KOTLINC_HOME/lib" 2>/dev/null | head -20 >&2 || true
     exit 2
 fi
 
