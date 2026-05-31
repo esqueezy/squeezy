@@ -1,0 +1,74 @@
+id = "graph-vs-nograph-go-realworld-with-graph"
+title = "spf13/cobra *Command setter audit — with graph (openai mini)"
+description = """
+Realistic Go A/B half. Audits every method on `*Command` in
+`spf13/cobra` whose name starts with `Set` (the setter surface a
+config-builder migration would have to cover). Ground truth is 17
+methods, all defined in `command.go`. The task is multi-step:
+  1. enumerate every `Set*` method on `*Command`
+  2. read each body
+  3. classify whether the body mutates ONLY fields of the receiver
+     `c`, or whether it also touches another `*Command` instance
+     (via `c.Root()`, `c.helpCommand`, child commands in a loop, etc.)
+Graph tooling can resolve the receiver type and batch the bodies;
+grep alone has to filter out non-`*Command` `Set*` methods on
+helpers like `FlagSet` and read each body manually.
+"""
+
+[workspace.github]
+repo = "spf13/cobra"
+sha = "ad460ea8f249db69c943a365fb84f3a59042d54e"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 48
+
+[[steps]]
+kind = "prompt"
+text = """
+Audit every method defined on the receiver type `*Command` in the
+`spf13/cobra` repo whose name starts with `Set` (capital S followed
+by an uppercase letter). Include every such method, including the
+one marked Deprecated.
+
+Exclude:
+  - Methods on any other receiver type (e.g. `*FlagSet`,
+    `*Group`, etc.).
+  - Files ending in `_test.go`.
+  - Doc comments and `//` lines.
+
+For each method give exactly four fields, one per line per method,
+separated by a blank line between methods:
+  - `name`: method name (e.g. `SetContext`)
+  - `file`: path relative to repo root
+  - `line`: 1-based line number of the `func` keyword in the
+    declaration
+  - `scope`: one of
+      * `self`   — body writes ONLY to fields of the receiver `c`
+      * `other`  — body writes to a field of a different `*Command`
+                   instance reached via `c.Root()`, `c.helpCommand`,
+                   iteration over `c.commands`, or any other
+                   non-self path. A recursive call to the same
+                   setter on a different `*Command` also counts as
+                   `other`.
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 480
+max_input_tokens = 200000
+
+[triage]
+enabled = false
