@@ -147,3 +147,39 @@ js_architectural,js,codex_baseline,baseline,3,/tmp/codex-runs/architectural/js-r
 python_architectural,python,codex_baseline,baseline,1,/tmp/codex-runs/architectural/python-r1,12,34,106128,87808,4417,2086,40202,0.0402,21,21,100.0,21,"PERFECT 21/21 RequestException subclasses with exact raise counts"
 python_architectural,python,codex_baseline,baseline,2,/tmp/codex-runs/architectural/python-r2,7,21,86321,75648,5065,2777,36471,0.0365,21,21,100.0,21,"PERFECT 21/21 RequestException subclasses with exact raise counts"
 python_architectural,python,codex_baseline,baseline,3,/tmp/codex-runs/architectural/python-r3,6,20,75799,71424,3658,1761,25099,0.0251,21,21,100.0,21,"PERFECT 21/21 RequestException subclasses with exact raise counts"
+ruby_callers,ruby,codex_baseline,baseline,1,/tmp/codex-runs/newlangs/ruby-callers-r1,9,26,72397,54272,2072,996,26988,0.0270,7,7,100.0,7,PERFECT 7/7 fire_event call sites
+ruby_callers,ruby,codex_baseline,baseline,2,/tmp/codex-runs/newlangs/ruby-callers-r2,8,23,56140,46592,1929,970,19336,0.0193,7,7,100.0,7,PERFECT 7/7 fire_event call sites
+ruby_callers,ruby,codex_baseline,baseline,3,/tmp/codex-runs/newlangs/ruby-callers-r3,8,23,56552,38016,1631,759,24093,0.0241,7,7,100.0,7,PERFECT 7/7 fire_event call sites
+ruby_architectural,ruby,codex_baseline,baseline,1,/tmp/codex-runs/newlangs/ruby-architectural-r1,17,41,112064,71040,2491,744,47306,0.0473,14,14,100.0,14,"PERFECT 14/14 + 1 false positive (Metrics::Middleware:129 — includes ServerMiddleware, not Component)"
+ruby_architectural,ruby,codex_baseline,baseline,2,/tmp/codex-runs/newlangs/ruby-architectural-r2,25,57,81758,60928,3251,919,34822,0.0348,14,14,100.0,14,PERFECT 14/14 + 0 false positives
+ruby_architectural,ruby,codex_baseline,baseline,3,/tmp/codex-runs/newlangs/ruby-architectural-r3,30,68,131943,83200,3826,1020,60014,0.0600,14,14,100.0,14,PERFECT 14/14 + 0 false positives
+php_callers,php,codex_baseline,baseline,1,/tmp/codex-runs/newlangs/php-callers-r1,13,34,70139,41984,2403,806,35079,0.0351,9,10,90.0,9,9/10; missed HasTimestamps.php:54 (intra-trait call)
+php_callers,php,codex_baseline,baseline,2,/tmp/codex-runs/newlangs/php-callers-r2,9,25,56957,37504,2104,923,26871,0.0269,10,10,100.0,10,PERFECT 10/10 usesTimestamps callers
+php_callers,php,codex_baseline,baseline,3,/tmp/codex-runs/newlangs/php-callers-r3,7,20,35828,20736,1691,708,20484,0.0205,10,10,100.0,10,PERFECT 10/10 usesTimestamps callers
+php_architectural,php,codex_baseline,baseline,1,/tmp/codex-runs/newlangs/php-architectural-r1,14,35,51867,45056,2418,878,19368,0.0194,10,11,90.9,10,10/11; typo in MemcachedStore.php path emitted as MandcachedStore.php
+php_architectural,php,codex_baseline,baseline,2,/tmp/codex-runs/newlangs/php-architectural-r2,18,45,135113,113920,3565,1396,40481,0.0405,11,11,100.0,11,PERFECT 11/11 Store implementers
+php_architectural,php,codex_baseline,baseline,3,/tmp/codex-runs/newlangs/php-architectural-r3,14,34,55626,47104,2558,1298,21435,0.0214,11,11,100.0,11,PERFECT 11/11 Store implementers
+kotlin_callers,kotlin,codex_baseline,baseline,1,/tmp/codex-runs/newlangs/kotlin-callers-r1,12,31,58476,40064,4062,2747,35093,0.0351,6,6,100.0,6,PERFECT 6/6 isInternal extension callers
+kotlin_callers,kotlin,codex_baseline,baseline,2,/tmp/codex-runs/newlangs/kotlin-callers-r2,12,31,54323,39040,2308,955,24776,0.0248,6,6,100.0,6,PERFECT 6/6 isInternal extension callers
+kotlin_callers,kotlin,codex_baseline,baseline,3,/tmp/codex-runs/newlangs/kotlin-callers-r3,12,31,54377,50176,2185,787,16746,0.0167,5,6,83.3,5,5/6; missed AbstractClassCanBeInterface.kt:127
+kotlin_architectural,kotlin,codex_baseline,baseline,1,/tmp/codex-runs/newlangs/kotlin-architectural-r1,5,17,62916,55296,2929,1069,23043,0.0230,28,28,100.0,28,PERFECT 28/28 CliArgument subclasses (incl. BoolCliArgument intermediate + 8 via-BoolCliArgument)
+kotlin_architectural,kotlin,codex_baseline,baseline,2,/tmp/codex-runs/newlangs/kotlin-architectural-r2,4,15,61295,52224,2613,857,22479,0.0225,27,28,96.4,27,27/28; missed BoolCliArgument:147 intermediate sealed class
+kotlin_architectural,kotlin,codex_baseline,baseline,3,/tmp/codex-runs/newlangs/kotlin-architectural-r3,3,12,45702,39040,2664,1028,19912,0.0199,28,28,100.0,28,PERFECT 28/28 CliArgument subclasses
+swift_callers,swift,codex_baseline,baseline,1,/tmp/codex-runs/newlangs/swift-callers-r1,20,49,173186,153216,9184,7038,67797,0.0678,22,22,100.0,22,PERFECT 22/22 Response init callers
+swift_callers,swift,codex_baseline,baseline,2,/tmp/codex-runs/newlangs/swift-callers-r2,17,41,78582,58368,7190,5299,51893,0.0519,20,22,90.9,20,20/22; missed ResponseCodable.swift:75 and :83 (StaticString/String encodeResponse)
+swift_callers,swift,codex_baseline,baseline,3,/tmp/codex-runs/newlangs/swift-callers-r3,28,63,79893,57344,7645,4803,55615,0.0556,22,22,100.0,22,22/22 + 3 hallucinated rows mislabelled as ResponseCodable.swift but matching +Concurrency.swift content
+swift_architectural,swift,codex_baseline,baseline,1,/tmp/codex-runs/newlangs/swift-architectural-r1,12,32,79307,67968,3219,1511,28087,0.0281,9,9,100.0,9,PERFECT 9/9 ContentEncoder/Decoder conformers
+swift_architectural,swift,codex_baseline,baseline,2,/tmp/codex-runs/newlangs/swift-architectural-r2,10,26,48173,33920,2126,1076,22801,0.0228,9,9,100.0,9,PERFECT 9/9 ContentEncoder/Decoder conformers
+swift_architectural,swift,codex_baseline,baseline,3,/tmp/codex-runs/newlangs/swift-architectural-r3,15,38,82888,65408,3182,1702,32335,0.0323,9,9,100.0,9,PERFECT 9/9 ContentEncoder/Decoder conformers (single-line format)
+scala_callers,scala,codex_baseline,baseline,1,/tmp/codex-runs/newlangs/scala-callers-r1,6,18,37032,30336,1917,1131,15924,0.0159,7,7,100.0,7,PERFECT 7/7 registerForExecution call sites
+scala_callers,scala,codex_baseline,baseline,2,/tmp/codex-runs/newlangs/scala-callers-r2,6,18,37210,20736,1744,981,21759,0.0218,7,7,100.0,7,PERFECT 7/7 registerForExecution call sites
+scala_callers,scala,codex_baseline,baseline,3,/tmp/codex-runs/newlangs/scala-callers-r3,12,31,74515,55808,2768,1475,30672,0.0307,7,7,100.0,7,PERFECT 7/7 registerForExecution call sites
+scala_architectural,scala,codex_baseline,baseline,1,/tmp/codex-runs/newlangs/scala-architectural-r1,10,28,142493,117504,3293,1453,42373,0.0424,13,13,100.0,13,PERFECT 13/13 MailboxType direct subclasses
+scala_architectural,scala,codex_baseline,baseline,2,/tmp/codex-runs/newlangs/scala-architectural-r2,4,14,37329,30336,2691,1721,19629,0.0196,13,13,100.0,13,PERFECT 13/13 MailboxType direct subclasses
+scala_architectural,scala,codex_baseline,baseline,3,/tmp/codex-runs/newlangs/scala-architectural-r3,5,17,84801,67072,2370,1231,28992,0.0290,13,13,100.0,13,PERFECT 13/13 MailboxType direct subclasses
+dart_callers,dart,codex_baseline,baseline,1,/tmp/codex-runs/newlangs/dart-callers-r1,15,37,52331,45568,2162,845,18219,0.0182,6,6,100.0,6,PERFECT 6/6 reportToken callers
+dart_callers,dart,codex_baseline,baseline,2,/tmp/codex-runs/newlangs/dart-callers-r2,10,27,53585,46080,1722,716,16834,0.0168,6,6,100.0,6,PERFECT 6/6 reportToken callers
+dart_callers,dart,codex_baseline,baseline,3,/tmp/codex-runs/newlangs/dart-callers-r3,8,24,69500,60800,2214,878,21048,0.0210,6,6,100.0,6,PERFECT 6/6 reportToken callers
+dart_architectural,dart,codex_baseline,baseline,1,/tmp/codex-runs/newlangs/dart-architectural-r1,24,57,93792,81664,2756,459,27623,0.0276,9,9,100.0,9,PERFECT 9/9 LintRule subclasses
+dart_architectural,dart,codex_baseline,baseline,2,/tmp/codex-runs/newlangs/dart-architectural-r2,21,49,55567,45568,2500,504,22167,0.0222,9,9,100.0,9,PERFECT 9/9 LintRule subclasses
+dart_architectural,dart,codex_baseline,baseline,3,/tmp/codex-runs/newlangs/dart-architectural-r3,22,52,68724,59776,2683,467,23268,0.0233,9,9,100.0,9,PERFECT 9/9 LintRule subclasses
