@@ -1399,7 +1399,9 @@ impl ToolRegistry {
             .acquire_owned()
             .await
             .map_err(|_| std::io::Error::other("shell execution limiter is closed"))?;
-        let key = fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+        // `resolve_shell_workdir` canonicalizes before this guard is acquired;
+        // keep the hot path from recanonicalizing the same directory.
+        let key = workdir.to_path_buf();
         let lock = {
             let mut locks = self
                 .shell_workdir_locks
