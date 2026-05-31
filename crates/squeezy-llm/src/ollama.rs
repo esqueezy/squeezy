@@ -320,14 +320,21 @@ impl JsonLineDecoder {
     fn push(&mut self, bytes: &[u8]) -> Vec<String> {
         self.buffer.extend_from_slice(bytes);
         let mut lines = Vec::new();
-        while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let line = self.buffer.drain(..=index).collect::<Vec<_>>();
-            if let Ok(text) = String::from_utf8(line) {
-                let text = text.trim();
-                if !text.is_empty() {
-                    lines.push(text.to_string());
-                }
-            }
+        let mut consumed = 0usize;
+
+        while let Some(index) = self.buffer[consumed..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let line_end = consumed + index;
+            push_json_line(&self.buffer[consumed..line_end], &mut lines);
+            consumed = line_end + 1;
+        }
+
+        if consumed != 0 {
+            let remaining = self.buffer.len() - consumed;
+            self.buffer.copy_within(consumed.., 0);
+            self.buffer.truncate(remaining);
         }
         lines
     }
@@ -337,12 +344,18 @@ impl JsonLineDecoder {
             return Vec::new();
         }
         let line = std::mem::take(&mut self.buffer);
-        String::from_utf8(line)
-            .ok()
-            .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty())
-            .into_iter()
-            .collect()
+        let mut lines = Vec::new();
+        push_json_line(&line, &mut lines);
+        lines
+    }
+}
+
+fn push_json_line(bytes: &[u8], lines: &mut Vec<String>) {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        let text = text.trim();
+        if !text.is_empty() {
+            lines.push(text.to_string());
+        }
     }
 }
 

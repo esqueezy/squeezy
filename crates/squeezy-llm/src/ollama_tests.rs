@@ -127,6 +127,30 @@ fn parser_extracts_text_tool_calls_and_usage() {
 }
 
 #[test]
+fn json_line_decoder_splits_lines_without_dropping_tail() {
+    let mut decoder = JsonLineDecoder::default();
+    let lines = decoder.push(b" {\"a\":1}\n\n{\"b\"");
+    assert_eq!(lines, vec![r#"{"a":1}"#.to_string()]);
+    let lines = decoder.push(
+        br#":2}
+{"c":3}
+"#,
+    );
+    assert_eq!(
+        lines,
+        vec![r#"{"b":2}"#.to_string(), r#"{"c":3}"#.to_string()],
+    );
+    assert!(decoder.finish().is_empty());
+}
+
+#[test]
+fn json_line_decoder_finish_flushes_unterminated_line() {
+    let mut decoder = JsonLineDecoder::default();
+    assert!(decoder.push(b"{\"a\"").is_empty());
+    assert_eq!(decoder.finish(), vec![r#"{"a""#.to_string()]);
+}
+
+#[test]
 fn show_metadata_extracts_context_window_from_model_info() {
     let value = json!({
         "model_info": {

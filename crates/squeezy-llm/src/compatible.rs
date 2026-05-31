@@ -7,8 +7,7 @@
 //! native OpenAI provider stays on the `/responses` endpoint and is not
 //! routed through here.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use async_stream::try_stream;
 use base64::Engine as _;
@@ -882,18 +881,18 @@ impl StreamState {
                 );
                 continue;
             };
-            let arguments_text = if partial.arguments.is_empty() {
-                "{}".to_string()
+            let arguments = if partial.arguments.is_empty() {
+                Value::Object(Default::default())
             } else {
-                partial.arguments
+                match serde_json::from_str::<Value>(&partial.arguments) {
+                    Ok(arguments) => arguments,
+                    Err(err) => json!({
+                        INVALID_TOOL_ARGUMENTS_KEY: true,
+                        INVALID_TOOL_ARGUMENTS_ERROR_KEY: err.to_string(),
+                        INVALID_TOOL_ARGUMENTS_RAW_KEY: partial.arguments,
+                    }),
+                }
             };
-            let arguments = serde_json::from_str::<Value>(&arguments_text).unwrap_or_else(|err| {
-                json!({
-                    INVALID_TOOL_ARGUMENTS_KEY: true,
-                    INVALID_TOOL_ARGUMENTS_ERROR_KEY: err.to_string(),
-                    INVALID_TOOL_ARGUMENTS_RAW_KEY: arguments_text,
-                })
-            });
             events.push(LlmEvent::ToolCall(LlmToolCall {
                 call_id,
                 name,
@@ -949,9 +948,9 @@ fn drain_reasoning(state: &mut StreamState) -> Option<LlmEvent> {
 /// an array whose elements expose either a `text` or `delta` string field
 /// (regardless of `type`, which varies — `text`, `output_text`,
 /// `output_text_delta`, `text_delta`, `reasoning`, etc).
-fn collect_delta_text(value: Option<&Value>) -> String {
+fn collect_delta_text(value: Option<&Value>) -> Option<Cow<'_, str>> {
     match value {
-        Some(Value::String(text)) => text.clone(),
+        Some(Value::String(text)) if !text.is_empty() => Some(Cow::Borrowed(text)),
         Some(Value::Array(parts)) => {
             let mut out = String::new();
             for part in parts {
@@ -961,9 +960,29 @@ fn collect_delta_text(value: Option<&Value>) -> String {
                     out.push_str(delta);
                 }
             }
-            out
+            if out.is_empty() {
+                None
+            } else {
+                Some(Cow::Owned(out))
+            }
         }
-        _ => String::new(),
+        _ => None,
+    }
+}
+
+fn collect_reasoning_delta(delta: &Value) -> Option<Cow<'_, str>> {
+    match (
+        collect_delta_text(delta.get("reasoning_content")),
+        collect_delta_text(delta.get("reasoning")),
+    ) {
+        (Some(left), Some(right)) => {
+            let mut text = String::with_capacity(left.len() + right.len());
+            text.push_str(&left);
+            text.push_str(&right);
+            Some(Cow::Owned(text))
+        }
+        (Some(text), None) | (None, Some(text)) => Some(text),
+        (None, None) => None,
     }
 }
 
@@ -1050,19 +1069,16 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
     if let Some(choices) = choices {
         for choice in choices {
             if let Some(delta) = choice.get("delta") {
-                let reasoning = collect_delta_text(delta.get("reasoning_content"))
-                    + &collect_delta_text(delta.get("reasoning"));
-                if !reasoning.is_empty() {
+                if let Some(reasoning) = collect_reasoning_delta(delta) {
                     state.reasoning_buf.push_str(&reasoning);
                     events.push(LlmEvent::ReasoningDelta {
-                        text: reasoning,
+                        text: reasoning.into_owned(),
                         kind: ReasoningKind::Summary,
                     });
                 }
-                let content = collect_delta_text(delta.get("content"));
-                if !content.is_empty() {
+                if let Some(content) = collect_delta_text(delta.get("content")) {
                     state.saw_visible_output = true;
-                    events.push(LlmEvent::TextDelta(content));
+                    events.push(LlmEvent::TextDelta(content.into_owned()));
                 }
                 if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for tool_call in tool_calls {
