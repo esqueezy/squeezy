@@ -178,7 +178,16 @@ pub(crate) fn enforce_gates(report: &BenchmarkReport, no_speed_gate: bool) -> Re
                 nav.definitions.false_negative,
             )));
         }
-        if nav.references.symbols_sampled > 0 && nav.references.precision < 0.80 {
+        // Precision = tp / (tp + fp); when (tp + fp) < 5 each emission
+        // shifts the ratio by ≥20% and the gate is statistical noise. This
+        // matters in practice because SourceKit-LSP without a SwiftPM build
+        // index frequently returns zero references for sampled
+        // declarations, so legitimate type-position emissions (return
+        // types, protocol-conformance clauses) end up the only signal — a
+        // denominator too thin to gate on.
+        const SWIFT_REF_GATE_MIN_EMISSIONS: usize = 5;
+        let ref_emissions = nav.references.true_positive + nav.references.false_positive;
+        if ref_emissions >= SWIFT_REF_GATE_MIN_EMISSIONS && nav.references.precision < 0.80 {
             return Err(SqueezyError::Graph(format!(
                 "Swift reference precision {:.3} below 0.80 gate (symbols={} tp={} fp={} fn={})",
                 nav.references.precision,
