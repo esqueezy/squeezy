@@ -54,6 +54,12 @@ const DIFF_CAPACITY: usize = 64;
 const ENTRY_CAPACITY: usize = 1024;
 
 type LineVec = Arc<Vec<Line<'static>>>;
+type MarkdownKey = (u64, u64);
+type HighlightKey = (u64, &'static str, u64);
+type DiffKey = (PathBuf, u64, u64);
+type MarkdownCache = Mutex<LruCache<MarkdownKey, LineVec>>;
+type HighlightCache = Mutex<LruCache<HighlightKey, LineVec>>;
+type DiffCache = Mutex<LruCache<DiffKey, LineVec>>;
 
 /// Validity tag for one cached entry render. Held alongside the rendered
 /// lines so a lookup can verify that none of the inputs that drove the
@@ -80,8 +86,8 @@ struct CachedEntryRender {
     lines: LineVec,
 }
 
-fn markdown_cache() -> &'static Mutex<LruCache<(u64, u64), LineVec>> {
-    static CACHE: OnceLock<Mutex<LruCache<(u64, u64), LineVec>>> = OnceLock::new();
+fn markdown_cache() -> &'static MarkdownCache {
+    static CACHE: OnceLock<MarkdownCache> = OnceLock::new();
     CACHE.get_or_init(|| {
         Mutex::new(LruCache::new(
             NonZeroUsize::new(MARKDOWN_CAPACITY).expect("non-zero capacity"),
@@ -89,8 +95,8 @@ fn markdown_cache() -> &'static Mutex<LruCache<(u64, u64), LineVec>> {
     })
 }
 
-fn highlight_cache() -> &'static Mutex<LruCache<(u64, &'static str, u64), LineVec>> {
-    static CACHE: OnceLock<Mutex<LruCache<(u64, &'static str, u64), LineVec>>> = OnceLock::new();
+fn highlight_cache() -> &'static HighlightCache {
+    static CACHE: OnceLock<HighlightCache> = OnceLock::new();
     CACHE.get_or_init(|| {
         Mutex::new(LruCache::new(
             NonZeroUsize::new(HIGHLIGHT_CAPACITY).expect("non-zero capacity"),
@@ -98,8 +104,8 @@ fn highlight_cache() -> &'static Mutex<LruCache<(u64, &'static str, u64), LineVe
     })
 }
 
-fn diff_cache() -> &'static Mutex<LruCache<(PathBuf, u64, u64), LineVec>> {
-    static CACHE: OnceLock<Mutex<LruCache<(PathBuf, u64, u64), LineVec>>> = OnceLock::new();
+fn diff_cache() -> &'static DiffCache {
+    static CACHE: OnceLock<DiffCache> = OnceLock::new();
     CACHE.get_or_init(|| {
         Mutex::new(LruCache::new(
             NonZeroUsize::new(DIFF_CAPACITY).expect("non-zero capacity"),

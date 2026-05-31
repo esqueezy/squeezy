@@ -904,14 +904,12 @@ fn edit_theme_text(
             *draft = chars.into_iter().collect();
             *cursor = idx + 1;
         }
-        KeyCode::Backspace => {
-            if *cursor > 0 {
-                let mut chars: Vec<char> = draft.chars().collect();
-                let idx = (*cursor - 1).min(chars.len().saturating_sub(1));
-                chars.remove(idx);
-                *draft = chars.into_iter().collect();
-                *cursor -= 1;
-            }
+        KeyCode::Backspace if *cursor > 0 => {
+            let mut chars: Vec<char> = draft.chars().collect();
+            let idx = (*cursor - 1).min(chars.len().saturating_sub(1));
+            chars.remove(idx);
+            *draft = chars.into_iter().collect();
+            *cursor -= 1;
         }
         KeyCode::Left => *cursor = cursor.saturating_sub(1),
         KeyCode::Right => *cursor = (*cursor + 1).min(draft.chars().count()),
