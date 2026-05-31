@@ -1,0 +1,109 @@
+id = "graph-vs-nograph-dart-realworld-no-graph"
+title = "felangel/bloc bloc_lint _Listener override + report classification — no graph (openai mini)"
+description = """
+No-graph half of the realistic Dart audit A/B. Same prompt as the
+with-graph counterpart but the semantic graph tool family is excluded
+— the model has to grep + read_file across nine sibling rule files
+under `packages/bloc_lint/lib/src/rules/` to enumerate fifteen
+`_Listener` overrides and classify each by whether its body calls
+`context.reportToken`, `context.reportTokenRange`, delegates to a
+private helper that does, or neither.
+"""
+
+[workspace.github]
+repo = "felangel/bloc"
+sha = "ff675f7078aa90470b222a8ae07673522ef32233"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 48
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+For every concrete `class _Listener extends Listener` declared under
+`packages/bloc_lint/lib/src/rules/` in this repository, list each
+method the `_Listener` overrides and classify how its body reports a
+diagnostic.
+
+Inclusion rules:
+- One row per `@override` method declared inside a `class _Listener
+  extends Listener` body. Skip the rule class's own
+  `Listener create(LintContext context)` / `Listener? create(...)` —
+  that override lives on the `LintRule` subclass, not on `_Listener`.
+- Skip any private helper method declared on the same `_Listener`
+  that is not marked `@override` (e.g.
+  `avoid_build_context_extensions._Listener._report`).
+- Exclude anything outside `packages/bloc_lint/lib/src/rules/` (tests,
+  examples, other packages).
+- For files that declare multiple `_Listener` overrides, emit one row
+  per override.
+
+For each override give exactly five fields, tab-separated, one row
+per override, no header row:
+- `file`: path relative to the repo root containing the `_Listener`
+  declaration.
+- `line`: 1-based line number of the `void <method>(` declaration
+  inside the `_Listener` body (the line where the method name appears,
+  not the `@override` line above it).
+- `rule`: the rule class name owning the listener (the `class XxxYyy
+  extends LintRule` declared earlier in the same file — e.g.
+  `AvoidFlutterImports`, `PreferBuildContextExtensions`).
+- `method`: the unqualified overridden method name (e.g.
+  `beginImport`, `endFields`, `handleIdentifier`).
+- `reports`: classification of how this override calls a `context.report*`
+  method. Use exactly one of:
+    - `token`        — the override body textually calls
+                       `context.reportToken(...)` directly.
+    - `range`        — the override body textually calls
+                       `context.reportTokenRange(...)` directly.
+    - `delegated`    — the override body calls a private helper
+                       declared on the same `_Listener` (e.g. `_report(...)`)
+                       and that helper calls a `context.report*` method.
+                       Classify by the helper's own call (`token` or
+                       `range` does not apply here — use `delegated`).
+    - `none`         — the override body neither calls a `context.report*`
+                       method nor delegates to a helper that does. Pure
+                       state-tracking overrides (e.g. `beginMetadata`
+                       in `avoid_public_bloc_methods._Listener`) belong
+                       here, as do overrides whose body only chains to
+                       `super.<method>(...)`.
+
+Output the rows sorted in ascending order by `file`, then by `line`.
+No prose, no header line, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 480
+max_input_tokens = 200000
+
+[triage]
+enabled = false
