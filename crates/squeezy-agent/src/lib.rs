@@ -74,6 +74,7 @@ mod permission_persist;
 mod plan_mode;
 mod roles;
 pub mod subagent_catalog;
+mod turn_router;
 
 pub use dispatch::{
     DispatchCommand, DispatchCommandKind, DispatchCommandParseError, DispatchOutcome,
@@ -186,6 +187,12 @@ struct ConversationState {
     metrics: SessionMetrics,
     redactions: u64,
     token_calibration: squeezy_llm::TokenCalibration,
+    /// Mirror of the per-turn router's sticky-window counter, kept
+    /// in sync with `Agent::routing_state.sticky.remaining_turns` so
+    /// that every existing `to_resume_state()` call site persists the
+    /// router's cross-turn state without a parallel plumbing change.
+    /// Read back into the live router on `Agent::resume`.
+    routing_sticky_remaining_turns: u8,
 }
 
 impl ConversationState {
@@ -204,7 +211,16 @@ impl ConversationState {
             metrics: metadata.metrics.clone(),
             redactions: metadata.redactions,
             token_calibration: metadata.token_calibration.clone(),
+            routing_sticky_remaining_turns: state.routing_sticky_remaining_turns,
         }
+    }
+
+    fn routing_sticky_remaining_turns(&self) -> u8 {
+        self.routing_sticky_remaining_turns
+    }
+
+    fn set_routing_sticky_remaining_turns(&mut self, value: u8) {
+        self.routing_sticky_remaining_turns = value;
     }
 
     fn to_resume_state(&self) -> SessionResumeState {
@@ -228,6 +244,7 @@ impl ConversationState {
             hydrated_transcript: Vec::new(),
             context_attachments: self.context_attachments.clone(),
             context_compaction: self.context_compaction.clone(),
+            routing_sticky_remaining_turns: self.routing_sticky_remaining_turns,
         }
     }
 }
@@ -1206,6 +1223,12 @@ pub struct Agent {
     /// fire-and-forget lifetime of these tasks. New tasks may still be
     /// registered after a shutdown completes; the JoinSet is reusable.
     background_tasks: Arc<StdMutex<tokio::task::JoinSet<()>>>,
+    /// Cross-turn state for the per-turn model router. Tracks the
+    /// escalation-sticky window and any pending `/cheap` / `/parent` /
+    /// `/router` user override. Shared with each `TurnRuntime` via
+    /// `Arc<StdMutex<_>>` so the streaming loop can engage the sticky
+    /// window after an escalation and the next `start_turn` picks it up.
+    routing_state: Arc<StdMutex<turn_router::RoutingPersistentState>>,
 }
 
 /// A configuration change that has been written to disk but is waiting for
@@ -1311,6 +1334,7 @@ impl Agent {
             Vec::new()
         };
         let conversation_state = ConversationState::from_resume(resume_state, &metadata);
+        let routing_sticky_remaining = conversation_state.routing_sticky_remaining_turns();
         let agent = Self::build(
             config,
             provider,
@@ -1318,6 +1342,13 @@ impl Agent {
             conversation_state,
             None,
         );
+        if routing_sticky_remaining > 0 {
+            // Honour the persisted sticky window so a follow-up
+            // prompt on a resumed mid-hard-task session continues to
+            // skip the per-turn router until the window expires.
+            let mut state = agent.routing_state.lock().expect("routing state lock");
+            state.sticky.remaining_turns = routing_sticky_remaining;
+        }
         let _ = handle.update_metadata(|metadata| {
             metadata.status = SessionStatus::Running;
             metadata.ended_at_ms = None;
@@ -1618,12 +1649,41 @@ impl Agent {
             pending_swap: None,
             event_broadcast,
             background_tasks: Arc::new(StdMutex::new(tokio::task::JoinSet::new())),
+            routing_state: Arc::new(StdMutex::new(turn_router::RoutingPersistentState::default())),
         }
     }
 
     /// Borrow the current effective config.
     pub fn config(&self) -> &AppConfig {
         &self.config
+    }
+
+    /// Force the next turn onto the provider's small-fast cheap tier
+    /// even when the heuristic would not have fired and the LLM judge
+    /// would have voted parent. Used by the `/cheap` slash command.
+    /// One-shot — consumed by the next `start_turn`.
+    pub fn request_routing_force_cheap(&self) {
+        let mut state = self.routing_state.lock().expect("routing state lock");
+        state.pending_override.force_cheap = true;
+        state.pending_override.force_parent = false;
+    }
+
+    /// Force the next turn onto the user's configured parent model,
+    /// bypassing the router entirely. Used by the `/parent` slash
+    /// command. One-shot — consumed by the next `start_turn`.
+    pub fn request_routing_force_parent(&self) {
+        let mut state = self.routing_state.lock().expect("routing state lock");
+        state.pending_override.force_parent = true;
+        state.pending_override.force_cheap = false;
+    }
+
+    /// Toggle the master routing switch for the rest of the session.
+    /// When `disabled` is `true`, the per-turn router never picks the
+    /// cheap tier implicitly; explicit `/cheap` still works. Used by
+    /// `/router off|on`.
+    pub fn set_routing_session_disabled(&self, disabled: bool) {
+        let mut state = self.routing_state.lock().expect("routing state lock");
+        state.pending_override.session_disabled = disabled;
     }
 
     /// Test-only handle to the subagent registry so callers can
@@ -2845,7 +2905,10 @@ impl Agent {
             | DispatchCommand::ToolVerbosity { .. }
             | DispatchCommand::Statusline
             | DispatchCommand::Theme { .. }
-            | DispatchCommand::Keymap) => DispatchOutcome::TuiOnly {
+            | DispatchCommand::Keymap
+            | DispatchCommand::Cheap
+            | DispatchCommand::Parent
+            | DispatchCommand::Router { .. }) => DispatchOutcome::TuiOnly {
                 command: cmd.slash_name().trim_start_matches('/').to_string(),
             },
         }
@@ -3346,6 +3409,7 @@ impl Agent {
         let subagents = self.subagents.clone();
         let hooks = self.hooks.clone();
         let background_tasks = self.background_tasks.clone();
+        let routing_state = self.routing_state.clone();
 
         let turn_done = Arc::new(Notify::new());
         let panic_tx = tx.clone();
@@ -3500,6 +3564,7 @@ impl Agent {
                     hooks,
                     display_input: redacted_display_input,
                     transient_input_items,
+                    routing_state,
                 }
                 .run(task_title.clone())
                 .await;
@@ -4391,6 +4456,7 @@ struct TurnRuntime {
     hooks: Option<Arc<HookRegistry>>,
     display_input: String,
     transient_input_items: Vec<LlmInputItem>,
+    routing_state: Arc<StdMutex<turn_router::RoutingPersistentState>>,
 }
 
 impl TurnRuntime {
@@ -5198,6 +5264,94 @@ impl TurnRuntime {
         // one retry per turn to prevent infinite loops if the model
         // ignores the nudge.
         let mut replan_retry_used = false;
+        // Per-turn model routing decision. The classifier runs once at
+        // the top of the turn; `current_model` is what each round
+        // dispatches on. On mid-turn escalation it is overwritten with
+        // the parent model for the rest of the turn — the conversation
+        // state survives because `replace_provider` is not needed for
+        // a within-provider swap on the wire.
+        let parent_model_str = self.config.model.clone();
+        let parent_model: Arc<str> = Arc::from(parent_model_str.clone());
+        let routing_override = {
+            let mut state = self.routing_state.lock().expect("routing state lock");
+            let snapshot = state.pending_override;
+            // Force-cheap / force-parent are one-shot per turn; clear them
+            // so the next prompt routes on its own merits.
+            state.pending_override.force_cheap = false;
+            state.pending_override.force_parent = false;
+            snapshot
+        };
+        let (sticky_active, sticky_remaining_after_tick) = {
+            let mut state = self.routing_state.lock().expect("routing state lock");
+            let was_sticky = state.sticky.tick();
+            (was_sticky, state.sticky.remaining_turns)
+        };
+        // Mirror the post-tick value into `ConversationState` so a
+        // resume snapshot taken after this turn reflects the
+        // decremented sticky window (not the value the previous turn
+        // engaged).
+        self.conversation_state
+            .lock()
+            .await
+            .set_routing_sticky_remaining_turns(sticky_remaining_after_tick);
+        let classify_result = turn_router::classify_turn(
+            turn_router::ClassifyTurnInputs {
+                user_input: &task_title,
+                provider: &self.provider,
+                provider_name: self.provider.name(),
+                parent_model: &parent_model_str,
+                config: &self.config,
+                has_image_input: !image_items.is_empty(),
+                overrides: routing_override,
+                sticky: sticky_active,
+            },
+            self.cancel.clone(),
+        )
+        .await;
+        let decision = classify_result.decision;
+        let judge_cost = classify_result.judge_cost;
+        // Fold the judge call's spend into the broker so its tokens
+        // count against `max_session_cost_usd_micros` and surface in
+        // the turn's provider cost — that's the bill the provider
+        // already sent over the wire. Stamp the same number into
+        // `routing_judge_usd_micros` so the audit field shows the
+        // judge's share separately from the main turn's request.
+        // `record_provider_cost` may return a warning status; we
+        // discard it here so the routing layer never emits the
+        // session-cap warning event itself — the main turn's later
+        // `record_provider_cost` will fire the warning if applicable.
+        if judge_cost.estimated_usd_micros.is_some()
+            || judge_cost.input_tokens.is_some()
+            || judge_cost.output_tokens.is_some()
+        {
+            let _ = broker.record_provider_cost(&judge_cost);
+            broker.metrics.routing_judge_usd_micros = judge_cost
+                .estimated_usd_micros
+                .unwrap_or(0)
+                .saturating_add(broker.metrics.routing_judge_usd_micros);
+        }
+        let mut current_model: Arc<str> = match &decision {
+            turn_router::TurnRoutingDecision::Cheap { model, .. } => model.clone(),
+            turn_router::TurnRoutingDecision::Parent => parent_model.clone(),
+        };
+        let mut on_cheap_turn = decision.is_cheap();
+        if on_cheap_turn {
+            broker.metrics.routed_to_cheap = true;
+            if let Some(reason_label) = decision.reason_label() {
+                self.telemetry
+                    .spawn(TelemetryEvent::routing_routed(&reason_label));
+                let _ = self
+                    .tx
+                    .send(AgentEvent::TurnRouted {
+                        turn_id: self.turn_id,
+                        from: parent_model_str.clone(),
+                        to: current_model.to_string(),
+                        reason: reason_label,
+                    })
+                    .await;
+            }
+        }
+        let mut escalation_state = turn_router::EscalationState::default();
         for round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
                 self.finish_cancelled_turn(
@@ -5233,6 +5387,7 @@ impl TurnRuntime {
                 )
             });
             if let Some(status) = cap_status {
+                self.stamp_routing_savings(&mut broker.metrics);
                 self.publish_terminal_task_state(
                     TaskStateStatus::Failed,
                     Some(format_cap_reached_reason(status)),
@@ -5277,8 +5432,57 @@ impl TurnRuntime {
                 .as_ref()
                 .expect("instructions cache populated above")
                 .clone();
+            // Mid-turn escalation: if the cheap-routed turn has tripped
+            // any signal we tracked over the previous round, swap to
+            // the parent model from this round onward and let the
+            // sticky window suppress routing on the next user prompt.
+            // The decision is one-way — once the turn escalates it
+            // never falls back to the cheap tier within this turn.
+            if on_cheap_turn
+                && let Some(reason) = escalation_state.maybe_trigger(
+                    broker.metrics.tool_calls,
+                    broker.metrics.tool_errors,
+                    broker.metrics.budget_denials,
+                    &assistant_message,
+                    on_cheap_turn,
+                    &self.config.routing,
+                    self.config.max_tool_calls_per_turn,
+                )
+            {
+                let from_model = current_model.to_string();
+                current_model = parent_model.clone();
+                on_cheap_turn = false;
+                broker.metrics.escalated_to_parent = true;
+                let sticky_remaining = {
+                    let mut state = self.routing_state.lock().expect("routing state lock");
+                    state
+                        .sticky
+                        .engage(self.config.routing.escalation_sticky_turns);
+                    state.sticky.remaining_turns
+                };
+                // Mirror the engaged window into `ConversationState`
+                // so the next `to_resume_state()` call — which
+                // happens at every turn boundary via
+                // `persist_turn_accounting` — persists it without
+                // any extra plumbing.
+                self.conversation_state
+                    .lock()
+                    .await
+                    .set_routing_sticky_remaining_turns(sticky_remaining);
+                self.telemetry
+                    .spawn(TelemetryEvent::routing_escalated(reason.as_str()));
+                let _ = self
+                    .tx
+                    .send(AgentEvent::TurnRouted {
+                        turn_id: self.turn_id,
+                        from: from_model,
+                        to: parent_model_str.clone(),
+                        reason: format!("escalated_{}", reason.as_str()),
+                    })
+                    .await;
+            }
             let request = LlmRequest {
-                model: Arc::from(self.config.model.as_str()),
+                model: current_model.clone(),
                 instructions: Arc::from(cached_instructions),
                 input: Arc::from(next_input.as_slice()),
                 max_output_tokens: self.config.max_output_tokens,
@@ -5359,6 +5563,7 @@ impl TurnRuntime {
                         round_output_bytes,
                     )
                     .await;
+                    self.stamp_routing_savings(&mut broker.metrics);
                     self.finish_cancelled_turn(
                         &task_title,
                         &total_cost,
@@ -5440,6 +5645,59 @@ impl TurnRuntime {
                             .is_err()
                         {
                             return Ok(());
+                        }
+                        // Mid-stream escalation: a refusal phrase in
+                        // the assistant text flips the router to the
+                        // parent model *immediately* instead of
+                        // waiting for the next round's preflight
+                        // check. The detector latches on first
+                        // trigger so polling every delta cannot
+                        // double-emit, and the input is the full
+                        // accumulated `assistant_message` so a
+                        // phrase straddling two deltas still
+                        // matches. Tool-call ceiling and error
+                        // threshold are also re-evaluated here for
+                        // free; they only flip when the round-end
+                        // accounting would have caught them anyway,
+                        // but the early swap shaves wasted output.
+                        if on_cheap_turn
+                            && let Some(reason) = escalation_state.maybe_trigger(
+                                broker.metrics.tool_calls,
+                                broker.metrics.tool_errors,
+                                broker.metrics.budget_denials,
+                                &assistant_message,
+                                on_cheap_turn,
+                                &self.config.routing,
+                                self.config.max_tool_calls_per_turn,
+                            )
+                        {
+                            let from_model = current_model.to_string();
+                            current_model = parent_model.clone();
+                            on_cheap_turn = false;
+                            broker.metrics.escalated_to_parent = true;
+                            let sticky_remaining = {
+                                let mut state =
+                                    self.routing_state.lock().expect("routing state lock");
+                                state
+                                    .sticky
+                                    .engage(self.config.routing.escalation_sticky_turns);
+                                state.sticky.remaining_turns
+                            };
+                            self.conversation_state
+                                .lock()
+                                .await
+                                .set_routing_sticky_remaining_turns(sticky_remaining);
+                            self.telemetry
+                                .spawn(TelemetryEvent::routing_escalated(reason.as_str()));
+                            let _ = self
+                                .tx
+                                .send(AgentEvent::TurnRouted {
+                                    turn_id: self.turn_id,
+                                    from: from_model,
+                                    to: parent_model_str.clone(),
+                                    reason: format!("escalated_{}", reason.as_str()),
+                                })
+                                .await;
                         }
                     }
                     LlmEvent::ReasoningDelta { text, .. } => {
@@ -5566,6 +5824,7 @@ impl TurnRuntime {
                             round_output_bytes,
                         )
                         .await;
+                        self.stamp_routing_savings(&mut broker.metrics);
                         self.finish_cancelled_turn(
                             &task_title,
                             &total_cost,
@@ -5604,6 +5863,7 @@ impl TurnRuntime {
                 let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
                     &raw_assistant_text,
                 ));
+                self.stamp_routing_savings(&mut broker.metrics);
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
                 self.persist_turn_state(TurnPersistInput {
@@ -5653,6 +5913,7 @@ impl TurnRuntime {
                     {
                         self.record_replay_model_text_delta(&tail);
                     }
+                    self.stamp_routing_savings(&mut broker.metrics);
                     self.publish_terminal_task_state(
                         TaskStateStatus::Failed,
                         Some("response truncated by max_tokens".to_string()),
@@ -5678,6 +5939,7 @@ impl TurnRuntime {
                     {
                         self.record_replay_model_text_delta(&tail);
                     }
+                    self.stamp_routing_savings(&mut broker.metrics);
                     self.publish_terminal_task_state(
                         TaskStateStatus::Failed,
                         Some("context window exceeded".to_string()),
@@ -5703,6 +5965,7 @@ impl TurnRuntime {
                     {
                         self.record_replay_model_text_delta(&tail);
                     }
+                    self.stamp_routing_savings(&mut broker.metrics);
                     self.publish_terminal_task_state(
                         TaskStateStatus::Failed,
                         Some("model refused the request".to_string()),
@@ -5839,6 +6102,7 @@ impl TurnRuntime {
                 let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
                     &raw_assistant_text,
                 ));
+                self.stamp_routing_savings(&mut broker.metrics);
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
                 self.persist_turn_state(TurnPersistInput {
@@ -5913,6 +6177,7 @@ impl TurnRuntime {
                 .await
             };
             if self.cancel.is_cancelled() || results.iter().any(cancelled_tool_result) {
+                self.stamp_routing_savings(&mut broker.metrics);
                 self.finish_cancelled_turn(
                     &task_title,
                     &total_cost,
@@ -6187,6 +6452,24 @@ impl TurnRuntime {
         // Stop fires after telemetry persistence so audit handlers
         // see the final TurnMetrics already on disk.
         self.dispatch_stop();
+    }
+
+    /// Stamp `routing_estimated_savings_usd_micros` on a turn's
+    /// metrics just before they are emitted to the TUI / telemetry /
+    /// session metrics. No-op for non-routed turns or when either
+    /// model lacks a pricing entry in the registry. Called at every
+    /// terminal-state site in the main turn loop so the event the
+    /// user sees, the cumulative session counter, and the telemetry
+    /// stream agree on the savings figure.
+    fn stamp_routing_savings(&self, metrics: &mut TurnMetrics) {
+        if !metrics.routed_to_cheap {
+            return;
+        }
+        metrics.routing_estimated_savings_usd_micros = turn_router::estimate_routing_savings(
+            self.provider.name(),
+            &self.config.model,
+            &metrics.provider,
+        );
     }
 
     async fn persist_turn_state(&self, input: TurnPersistInput<'_>) {
@@ -8685,7 +8968,7 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
 /// (`qwen3-coder`) is the only model a local Ollama install is guaranteed
 /// to have, so it is returned verbatim rather than pretending a separate
 /// cheap tier exists.
-fn cheap_model_for(provider: &str, config: &AppConfig) -> Option<String> {
+pub(crate) fn cheap_model_for(provider: &str, config: &AppConfig) -> Option<String> {
     if let Some(model) = config.small_fast_model.clone() {
         return Some(model);
     }
@@ -13173,6 +13456,21 @@ pub enum AgentEvent {
     Failed {
         turn_id: TurnId,
         error: SqueezyError,
+    },
+    /// Emitted whenever the per-turn router swaps the model on the wire
+    /// away from the user's configured parent model. Fires twice on an
+    /// escalated turn: once at the start when the cheap tier is
+    /// selected, and once mid-turn when the cheap model handed back to
+    /// the parent. `from` is the model the agent would otherwise have
+    /// used; `to` is the model the next round will dispatch on; `reason`
+    /// is a short stable token (`heuristic_slam_dunk_<rule>`,
+    /// `llm_judge`, `user_explicit`, `escalated_<signal>`) so TUI and
+    /// eval consumers can match on it without parsing prose.
+    TurnRouted {
+        turn_id: TurnId,
+        from: String,
+        to: String,
+        reason: String,
     },
 }
 

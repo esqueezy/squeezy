@@ -675,6 +675,47 @@ impl TelemetryEvent {
             },
         }
     }
+
+    /// `routing.routed{reason}` counter event. Fires once per turn
+    /// when the per-turn model router dispatches on the provider's
+    /// cheap tier instead of the user's configured parent model. The
+    /// `reason` payload is the same short token surfaced on
+    /// `AgentEvent::TurnRouted` — the matched heuristic verb (e.g.
+    /// `"run"`, `"checkout"`), `"llm_judge"`, or `"user_explicit"`.
+    /// Aggregated over time this lets us tune the heuristic whitelist:
+    /// rare verbs can be pruned, judge-only routes can be promoted to
+    /// the whitelist once their false-positive rate is known.
+    pub fn routing_routed(reason: &str) -> Self {
+        Self {
+            event: TelemetryEventName::RoutingRouted,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                routing_reason: Some(reason.to_string()),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    /// `routing.escalated{reason}` counter event. Fires when a
+    /// cheap-routed turn hits an escalation signal and the agent
+    /// swaps back to the parent model. `reason` is one of the
+    /// `EscalationReason` short tokens: `"tool_call_ceiling"`,
+    /// `"error_threshold"`, or `"refusal_phrase"`. Escalation rate is
+    /// the central reliability metric for the router — high rates on
+    /// a single reason point to a threshold that needs tuning;
+    /// uniform low rates mean the heuristic + judge are calibrated.
+    pub fn routing_escalated(reason: &str) -> Self {
+        Self {
+            event: TelemetryEventName::RoutingEscalated,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                routing_reason: Some(reason.to_string()),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -707,6 +748,18 @@ pub enum TelemetryEventName {
     /// allowlist would have spared an interruption.
     #[serde(rename = "ai_reviewer_allow_downgrade")]
     AiReviewerAllowDowngrade,
+    /// `routing.routed{reason}` — emitted once per turn that the
+    /// per-turn model router dispatched on the cheap tier. `reason`
+    /// distinguishes the heuristic verb, the LLM-judge vote, and the
+    /// explicit user override. Aggregated counts drive heuristic
+    /// tuning.
+    #[serde(rename = "squeezy_routing_routed")]
+    RoutingRouted,
+    /// `routing.escalated{reason}` — emitted when a cheap-routed
+    /// turn hands back to the parent model mid-flight. The dominant
+    /// reason at a high rate signals a threshold to tune.
+    #[serde(rename = "squeezy_routing_escalated")]
+    RoutingEscalated,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -815,6 +868,13 @@ pub struct TelemetryProperties {
     /// `allow_capabilities` allowlist.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_capability: Option<String>,
+    /// Tagged on routing events (`RoutingRouted`, `RoutingEscalated`)
+    /// so dashboards can break down per-reason rates: which heuristic
+    /// rule fired, which escalation signal tripped, whether the LLM
+    /// judge overrode it, whether the user explicitly forced a route.
+    /// `None` on every other event type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_reason: Option<String>,
     /// Per-session trace id stamped by [`TelemetryClient`] on every event
     /// it accepts. W3C-trace-context-shaped 32-hex-char string. Equal
     /// across every event emitted by a single Squeezy session so an
