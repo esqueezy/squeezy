@@ -11417,11 +11417,7 @@ fn slash_suggestion_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
                     } else {
                         crate::render::theme::accent()
                     })
-                    .add_modifier(if dimmed {
-                        Modifier::ITALIC
-                    } else {
-                        Modifier::ITALIC
-                    }),
+                    .add_modifier(Modifier::ITALIC),
             ))
         };
         let dimmed_span = if dimmed {
