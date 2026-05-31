@@ -2696,8 +2696,8 @@ async fn shell_approval_event_surfaces_new_sandbox_metadata() {
             call_id: "call_meta".to_string(),
             name: "shell".to_string(),
             arguments: json!({
-                "command": "cargo test --workspace",
-                "description": "run tests",
+                "command": "node build.js --release",
+                "description": "run build script",
                 "timeout_ms": 45_000,
                 "output_byte_cap": 16_000,
             }),
@@ -7618,7 +7618,7 @@ async fn dispatch_command_mode_switches() {
         .await;
     assert!(matches!(
         outcome,
-        DispatchOutcome::ModeChanged { ref mode, changed: true } if mode == "plan"
+        DispatchOutcome::ModeChanged { ref mode, changed: true, .. } if mode == "plan"
     ));
     // Repeating the call is a no-op: changed=false.
     let outcome = agent
@@ -7626,15 +7626,39 @@ async fn dispatch_command_mode_switches() {
         .await;
     assert!(matches!(
         outcome,
-        DispatchOutcome::ModeChanged { ref mode, changed: false } if mode == "plan"
+        DispatchOutcome::ModeChanged { ref mode, changed: false, .. } if mode == "plan"
     ));
     let outcome = agent
         .dispatch_command(DispatchCommand::Build { prompt: None })
         .await;
     assert!(matches!(
         outcome,
-        DispatchOutcome::ModeChanged { ref mode, changed: true } if mode == "build"
+        DispatchOutcome::ModeChanged { ref mode, changed: true, .. } if mode == "build"
     ));
+}
+
+#[tokio::test]
+async fn dispatch_command_plan_with_prompt_surfaces_prompt_in_outcome() {
+    // squeezy-9n9w (audit B3): the agent dispatch path used to discard
+    // the trailing prompt on `/plan <prompt>` / `/build <prompt>`, so
+    // non-TUI callers (RPC, squeezy-eval) silently lost the user's
+    // intent. The outcome now carries the prompt through.
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Plan {
+            prompt: Some("analyze the changes since main".into()),
+        })
+        .await;
+    let DispatchOutcome::ModeChanged {
+        ref mode,
+        changed: true,
+        ref prompt,
+    } = outcome
+    else {
+        panic!("expected ModeChanged, got {outcome:?}");
+    };
+    assert_eq!(mode, "plan");
+    assert_eq!(prompt.as_deref(), Some("analyze the changes since main"));
 }
 
 #[tokio::test]
@@ -7651,8 +7675,6 @@ async fn dispatch_command_jobs_permissions_reviewer_snapshots_are_empty_by_defau
     let agent = mock_agent_for_dispatch();
     let jobs = agent.dispatch_command(DispatchCommand::Tasks).await;
     assert!(matches!(jobs, DispatchOutcome::JobsList { count: 0 }));
-    let jobs_alias = agent.dispatch_command(DispatchCommand::Jobs).await;
-    assert!(matches!(jobs_alias, DispatchOutcome::JobsList { count: 0 }));
     let perms = agent.dispatch_command(DispatchCommand::Permissions).await;
     assert!(matches!(
         perms,
@@ -7748,7 +7770,7 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
         (DispatchCommand::Keymap, "keymap"),
         (DispatchCommand::Statusline, "statusline"),
         (DispatchCommand::Help { topic: None }, "help"),
-        (DispatchCommand::Config { section: None }, "options"),
+        (DispatchCommand::Config { section: None }, "config"),
         (DispatchCommand::Model, "model"),
         (
             DispatchCommand::Plans {
@@ -7919,7 +7941,7 @@ async fn dispatch_command_raw_routes_through_parser() {
     let plan = agent.dispatch_command_raw("/plan").await;
     assert!(matches!(
         plan,
-        DispatchOutcome::ModeChanged { ref mode, changed: true } if mode == "plan"
+        DispatchOutcome::ModeChanged { ref mode, changed: true, .. } if mode == "plan"
     ));
     let unknown = agent.dispatch_command_raw("/no-such-command").await;
     assert!(matches!(

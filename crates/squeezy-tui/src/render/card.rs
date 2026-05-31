@@ -28,18 +28,27 @@ pub(crate) fn apply_background(line: Line<'static>, bg: Option<Style>) -> Line<'
     let Some(bg) = bg else {
         return line;
     };
-    let spans: Vec<Span<'static>> = line
-        .spans
-        .into_iter()
-        .map(|span| {
-            let style = span.style.patch(bg);
-            Span::styled(span.content, style)
-        })
-        .collect();
-    Line::from(spans)
+    let mut line = line;
+    let line_has_bg = line.style.bg.is_some();
+    if !line_has_bg {
+        line.style = line.style.patch(bg);
+    }
+    if line_has_bg {
+        return line;
+    }
+    for span in &mut line.spans {
+        if span.style.bg.is_none() {
+            span.style = span.style.patch(bg);
+        }
+    }
+    line
 }
 
 /// Blank line styled with the card background, used as top/bottom padding.
 pub(crate) fn blank_card_line(bg: Option<Style>) -> Option<Line<'static>> {
     bg.map(|bg| Line::from(vec![Span::styled(String::new(), bg)]))
 }
+
+#[cfg(test)]
+#[path = "card_tests.rs"]
+mod tests;

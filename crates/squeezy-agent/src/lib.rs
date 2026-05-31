@@ -19,12 +19,12 @@ use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentSource, ContextAttachmentStatus,
     ContextCompactionRecord, ContextCompactionState, ContextCompactionTrigger, ContextEstimate,
     ContextPin, CostSnapshot, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_OLLAMA_MODEL,
-    PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability, PermissionRequest,
-    PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict, ProviderConfig,
-    Redactor, ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError, StreamRedactor,
-    SubagentConfig, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig, TranscriptItem, TurnId,
-    TurnMetrics, context_attachment_preview, context_attachment_storage_text,
-    default_settings_path, detect_context_attachment_kind,
+    PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability, PermissionPolicyMode,
+    PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict,
+    ProviderConfig, Redactor, ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError,
+    StreamRedactor, SubagentConfig, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig,
+    TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
+    context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
 };
 use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
@@ -1479,6 +1479,7 @@ impl Agent {
                 shell_sandbox: config.permissions.shell_sandbox.clone(),
                 mcp_servers: config.mcp_servers.clone(),
                 checkpoints_enabled: config.checkpoints_enabled,
+                full_access: config.permissions.mode == PermissionPolicyMode::FullAccess,
             },
             config.skills.clone(),
             &config.graph,
@@ -1497,6 +1498,7 @@ impl Agent {
                     shell_sandbox: config.permissions.shell_sandbox.clone(),
                     mcp_servers: config.mcp_servers.clone(),
                     checkpoints_enabled: config.checkpoints_enabled,
+                    full_access: config.permissions.mode == PermissionPolicyMode::FullAccess,
                 },
                 config.skills.clone(),
                 &config.graph,
@@ -2483,12 +2485,14 @@ impl Agent {
         estimate_context(&state.conversation)
     }
 
-    pub async fn compact_context_manual(&self) -> squeezy_core::Result<ContextCompactionReport> {
+    pub async fn compact_context_manual(
+        &self,
+    ) -> squeezy_core::Result<Option<ContextCompactionReport>> {
         let mut state = self.conversation_state.lock().await;
         let mut conversation = state.conversation.clone();
         let mut context_compaction = state.context_compaction.clone();
         let attachments = state.context_attachments.clone();
-        let report = compact_conversation_with_strategy(
+        let Some(report) = compact_conversation_with_strategy(
             &mut conversation,
             &mut context_compaction,
             &attachments,
@@ -2501,7 +2505,14 @@ impl Agent {
             true,
         )
         .await
-        .ok_or_else(|| SqueezyError::Agent("not enough context to compact".to_string()))?;
+        else {
+            // squeezy-kkdb (audit B4): the conversation has no
+            // compaction-eligible items yet (empty session, only the
+            // synthetic head, or already maximally compacted). Treat
+            // this as a clean no-op rather than an error so callers
+            // surface a graceful "nothing to compact" message.
+            return Ok(None);
+        };
         state.conversation = conversation;
         state.context_compaction = context_compaction;
         state.previous_response_id = None;
@@ -2525,7 +2536,7 @@ impl Agent {
                 turn_id: TurnId::INVALID,
                 report: report.clone(),
             }));
-        Ok(report)
+        Ok(Some(report))
     }
 
     /// Dispatch a typed slash command. Every entry in
@@ -2549,7 +2560,8 @@ impl Agent {
                     }
                 } else {
                     match self.compact_context_manual().await {
-                        Ok(_) => DispatchOutcome::Compacted,
+                        Ok(Some(_)) => DispatchOutcome::Compacted { skipped: false },
+                        Ok(None) => DispatchOutcome::Compacted { skipped: true },
                         Err(err) => DispatchOutcome::Error {
                             command: "/compact".into(),
                             message: format!("{err}"),
@@ -2557,18 +2569,20 @@ impl Agent {
                     }
                 }
             }
-            DispatchCommand::Plan { .. } => {
+            DispatchCommand::Plan { prompt } => {
                 let changed = self.set_session_mode(SessionMode::Plan, "dispatch_command");
                 DispatchOutcome::ModeChanged {
                     mode: "plan".into(),
                     changed,
+                    prompt,
                 }
             }
-            DispatchCommand::Build { .. } => {
+            DispatchCommand::Build { prompt } => {
                 let changed = self.set_session_mode(SessionMode::Build, "dispatch_command");
                 DispatchOutcome::ModeChanged {
                     mode: "build".into(),
                     changed,
+                    prompt,
                 }
             }
             DispatchCommand::Cost => {
@@ -2589,16 +2603,16 @@ impl Agent {
                     count: entries.len(),
                 }
             }
-            DispatchCommand::Tasks | DispatchCommand::Jobs => {
+            DispatchCommand::Tasks => {
                 let jobs = self.jobs_snapshot();
                 DispatchOutcome::JobsList { count: jobs.len() }
             }
-            DispatchCommand::Task { id } | DispatchCommand::Job { id } => {
+            DispatchCommand::Task { id } => {
                 let job_id = id.parse::<JobId>().ok();
                 let found = job_id.and_then(|id| self.job_snapshot(id)).is_some();
                 DispatchOutcome::TaskDetail { id, found }
             }
-            DispatchCommand::TaskCancel { id } | DispatchCommand::JobCancel { id } => {
+            DispatchCommand::TaskCancel { id } => {
                 let cancelled = id
                     .parse::<JobId>()
                     .ok()
@@ -10528,7 +10542,7 @@ async fn permission_decision_for_request(
     }
     log_permission_verdict(&request, &verdict);
     match verdict.action {
-        PermissionAction::Allow => ApprovalDecision::Approved,
+        PermissionAction::Allow => approved_decision(context, &request),
         PermissionAction::Deny => {
             if verdict.silent {
                 log_silent_deny(context, &request, &verdict);
@@ -10604,7 +10618,7 @@ async fn permission_decision_for_request(
             );
             let outcome = match decision {
                 Ok(ToolApprovalDecision::Approved | ToolApprovalDecision::AllowOnce) => {
-                    ApprovalDecision::Approved
+                    approved_decision(context, &request)
                 }
                 Ok(ToolApprovalDecision::AllowSession) => {
                     install_persistent_rule(
@@ -10626,7 +10640,7 @@ async fn permission_decision_for_request(
                             "action": "allow",
                         }),
                     );
-                    ApprovalDecision::Approved
+                    approved_decision(context, &request)
                 }
                 Ok(ToolApprovalDecision::AllowRuleUser) => {
                     install_persistent_rule(
@@ -10636,7 +10650,7 @@ async fn permission_decision_for_request(
                         PermissionAction::Allow,
                     )
                     .await;
-                    ApprovalDecision::Approved
+                    approved_decision(context, &request)
                 }
                 Ok(ToolApprovalDecision::AllowRuleProject) => {
                     install_persistent_rule(
@@ -10646,7 +10660,7 @@ async fn permission_decision_for_request(
                         PermissionAction::Allow,
                     )
                     .await;
-                    ApprovalDecision::Approved
+                    approved_decision(context, &request)
                 }
                 Ok(ToolApprovalDecision::AskRuleUser) => {
                     install_persistent_rule(
@@ -10746,6 +10760,14 @@ async fn permission_decision_for_request(
             outcome
         }
     }
+}
+
+fn approved_decision(
+    context: &PermissionDecisionContext,
+    request: &PermissionRequest,
+) -> ApprovalDecision {
+    context.tools.record_permission_grant(request);
+    ApprovalDecision::Approved
 }
 
 fn shell_ask_approver_for_context(context: &ToolExecutionContext<'_>) -> ShellAskApprover {

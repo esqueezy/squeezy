@@ -19,7 +19,7 @@ use crossterm::{
     style::Print,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode,
+        enable_raw_mode, size as terminal_size,
     },
 };
 use ratatui::{
@@ -31,6 +31,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap},
 };
+use serde::Deserialize;
 #[cfg(test)]
 use squeezy_agent::RequestUserInputChoice;
 use squeezy_agent::{
@@ -112,8 +113,8 @@ use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverit
 #[cfg(test)]
 use render::palette::WORKING_SHIMMER_HIGHLIGHT;
 use render::palette::{
-    self, AMBER, BANG_RED, DIFF_ADD_FG, DIFF_DEL_FG, ERROR_RED, GOLD, MODE_BUILD_GREEN,
-    MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN, blend_color,
+    self, AMBER, BANG_RED, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET,
+    SUCCESS_GREEN, blend_color,
 };
 use terminal_writer::TerminalWriter;
 use toast::ToastQueue;
@@ -133,13 +134,13 @@ const TOOL_CALL_MAX_LINES: usize = 5;
 /// `local_shell_command_call` in the agent). 50 lines fits a typical
 /// command's full output without truncation.
 const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
-const PROMPT_MIN_HEIGHT: u16 = 5;
+const PROMPT_MIN_HEIGHT: u16 = 4;
 const PROMPT_MAX_HEIGHT: u16 = 30;
 const INLINE_VIEWPORT_HEIGHT: u16 = 18;
 // The slash-command roster grew well past 30 entries, so a 5-row
 // window forced users to scroll for almost any non-top-5 command.
 // 10 fits comfortably in a standard 24-row terminal alongside the
-// prompt + status row and matches the picker height used by /options
+// prompt + status row and matches the picker height used by /config
 // search and the model picker.
 const SLASH_MENU_MAX_ITEMS: usize = 10;
 
@@ -175,9 +176,7 @@ fn shell_output_is_unified_diff(tool: &ToolTranscript) -> bool {
         return false;
     }
     let stdout = tool.result.content["stdout"].as_str().unwrap_or("");
-    stdout
-        .lines()
-        .any(|line| line.starts_with("@@ -") && line.contains(" @@"))
+    shell_text_looks_like_diff(stdout)
 }
 
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
@@ -206,6 +205,33 @@ const END_SYNCHRONIZED_UPDATE: &str = "\x1b[?2026l";
 const TITLE_SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TITLE_SPINNER_INTERVAL_MS: u64 = 100;
 const TITLE_NOTIFICATION_GLYPH: &str = "●";
+
+fn enter_transcript_overlay_screen<W: Write>(writer: &mut W) -> io::Result<()> {
+    execute!(
+        writer,
+        EnterAlternateScreen,
+        Print(DISABLE_MOUSE_MODES),
+        EnableAlternateScroll,
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    )
+}
+
+fn leave_transcript_overlay_screen<W: Write>(
+    writer: &mut W,
+    restore_mouse_capture: bool,
+) -> io::Result<()> {
+    execute!(
+        writer,
+        DisableAlternateScroll,
+        Print(DISABLE_MOUSE_MODES),
+        LeaveAlternateScreen
+    )?;
+    if restore_mouse_capture {
+        execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))?;
+    }
+    Ok(())
+}
 
 /// Tracks what we want the terminal window/tab title to convey. Most
 /// terminal emulators surface their own "activity" indicator that
@@ -818,6 +844,37 @@ async fn handle_plan_choice_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
     true
 }
 
+async fn handle_feedback_prompt_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> bool {
+    if app.pending_feedback.is_none() {
+        return false;
+    }
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return true;
+    }
+    match key.code {
+        KeyCode::Enter
+        | KeyCode::Char('y')
+        | KeyCode::Char('Y')
+        | KeyCode::Char('s')
+        | KeyCode::Char('S') => {
+            submit_pending_feedback(app, agent).await;
+            true
+        }
+        KeyCode::Esc
+        | KeyCode::Char('n')
+        | KeyCode::Char('N')
+        | KeyCode::Char('d')
+        | KeyCode::Char('D') => {
+            discard_pending_feedback(app);
+            true
+        }
+        _ => true,
+    }
+}
+
 async fn apply_plan_choice(
     app: &mut TuiApp,
     agent: &mut Agent,
@@ -846,7 +903,7 @@ async fn apply_plan_choice(
             // in via the handoff prefix queued by the mode switch, so the
             // model retains the full plan even with an emptied transcript.
             match agent.compact_context_manual().await {
-                Ok(report) => {
+                Ok(Some(report)) => {
                     app.context_compaction.last = Some(report.record.clone());
                     app.context_compaction.generation = report.record.generation;
                     app.context_compaction.summary = Some(report.summary.clone());
@@ -858,11 +915,16 @@ async fn apply_plan_choice(
                         pending.plan_id
                     ));
                 }
-                Err(err) => {
-                    // "not enough context to compact" is fine — common on a
-                    // fresh session and not a blocker for execution.
+                Ok(None) => {
+                    // Nothing to compact — common on a fresh session.
                     app.push_log(format!(
-                        "execute-clean: skipped compaction ({err}); running plan"
+                        "execute-clean: nothing to compact for plan {}; running",
+                        pending.plan_id
+                    ));
+                }
+                Err(err) => {
+                    app.push_log(format!(
+                        "execute-clean: compaction failed ({err}); running plan"
                     ));
                 }
             }
@@ -994,6 +1056,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.pending_approval.is_some()
         || app.pending_mcp_elicitation.is_some()
         || app.pending_plan_choice.is_some()
+        || app.pending_feedback.is_some()
         || app.config_screen.is_some()
         || app.status_line_setup.is_some()
         || app.overlay.is_some()
@@ -1124,6 +1187,10 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
 }
 
 fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
+    if handle_transcript_overlay_mouse(app, mouse) {
+        return;
+    }
+
     // Left-click is dispatched via the per-frame click registry so any
     // render path can add new buttons by pushing a `Clickable` — no
     // edits to this fn are needed when new buttons land.
@@ -1143,6 +1210,54 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
         MouseEventKind::ScrollDown => scroll_transcript_down(app, 3),
         _ => {}
     }
+}
+
+fn handle_transcript_overlay_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
+    if app.transcript_overlay.is_none() {
+        return false;
+    };
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if let Some(state) = app.transcript_overlay.as_mut() {
+                state.scroll = state.scroll.saturating_sub(3);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some(state) = app.transcript_overlay.as_mut() {
+                state.scroll = state.scroll.saturating_add(3);
+            }
+        }
+        MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        | MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+            if let Some(scroll) = transcript_overlay_scroll_from_mouse(app, mouse.column, mouse.row)
+                && let Some(state) = app.transcript_overlay.as_mut()
+            {
+                state.scroll = scroll;
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn transcript_overlay_scroll_from_mouse(app: &TuiApp, column: u16, row: u16) -> Option<u16> {
+    let (width, height) = terminal_size().ok()?;
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let inner = transcript_overlay_inner(area);
+    let (text_area, scrollbar_area) = transcript_overlay_text_and_scrollbar_areas(inner)?;
+    if column != scrollbar_area.x
+        || row < scrollbar_area.y
+        || row >= scrollbar_area.y.saturating_add(scrollbar_area.height)
+    {
+        return None;
+    }
+    let lines = transcript_lines_for_overlay(app, Some(text_area.width));
+    transcript_overlay_scroll_for_scrollbar_row(row, scrollbar_area, lines.len())
 }
 
 /// Canonicalise a `KeyEvent` so every downstream dispatcher sees a
@@ -1383,6 +1498,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     }
 
     if handle_plan_choice_key(app, agent, key).await {
+        return Ok(false);
+    }
+
+    if handle_feedback_prompt_key(app, agent, key).await {
         return Ok(false);
     }
 
@@ -2032,7 +2151,7 @@ fn save_status_line(
 
 /// Whether the transcript should show a styled banner for this slash
 /// command's invocation. Commands that open their own UI overlay
-/// (`/options`, `/statusline`, …) are silenced — the overlay is the
+/// (`/config`, `/statusline`, …) are silenced — the overlay is the
 /// affordance. Commands that route through `start_user_turn` and
 /// already produce a user-message bubble (`/help`) are also silenced
 /// to avoid duplication. `/verbosity` and `/tool-verbosity` open a UI
@@ -2044,14 +2163,14 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
         return false;
     }
     match command {
-        "/options" | "/statusline" | "/model" | "/permissions" | "/copy" | "/collapse"
-        | "/expand" | "/help" => false,
+        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/copy"
+        | "/collapse" | "/expand" | "/help" => false,
         "/verbosity" | "/tool-verbosity" => !rest.trim().is_empty(),
         _ => true,
     }
 }
 
-async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
+pub(crate) async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
     let cmd = match DispatchCommand::parse(input) {
         Ok(cmd) => cmd,
         // Unknown heads fall through to the user-authored prompt
@@ -2074,6 +2193,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         }
     };
 
+    let raw_head = input.split_whitespace().next().unwrap_or_default();
     let slash = cmd.slash_name();
     if let Some(spec) = SLASH_COMMANDS.iter().find(|spec| spec.name == slash)
         && !spec.available_during_task
@@ -2083,8 +2203,11 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         return true;
     }
 
-    let rest = input.strip_prefix(slash).map(str::trim).unwrap_or_default();
-    if should_echo_slash_command(slash, rest) {
+    let rest = input
+        .strip_prefix(raw_head)
+        .map(str::trim)
+        .unwrap_or_default();
+    if should_echo_slash_command(raw_head, rest) {
         app.push_slash_command_echo(input);
     }
 
@@ -2128,7 +2251,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         DispatchCommand::Config { section } => {
             let slug = section.as_deref();
             let id = slug.and_then(squeezy_core::config_schema::section_from_slug);
-            // `/options <slug>` used to silently fall back to the Models
+            // `/config <slug>` used to silently fall back to the Models
             // section when the slug was a valid `SectionId` variant that
             // had no `ConfigSectionMeta` entry (Skills, Tools, Providers,
             // Context, McpServers, ShellSandbox, PermissionRules) or was
@@ -2140,7 +2263,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             {
                 app.app_notifications.push(
                     format!(
-                        "/options: '{raw}' is not a navigable section — opening the default view. \
+                        "/config: '{raw}' is not a navigable section — opening the default view. \
                          Press / to search field labels."
                     ),
                     NotifySeverity::Warn,
@@ -2266,7 +2389,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 }
             } else {
                 match agent.compact_context_manual().await {
-                    Ok(report) => {
+                    Ok(Some(report)) => {
                         app.context_compaction = agent.context_compaction_snapshot().await;
                         app.context_estimate = report.record.after.clone();
                         app.status = compaction_status_line(&report.record);
@@ -2284,6 +2407,9 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                             before = report.record.before.estimated_tokens,
                             after = report.record.after.estimated_tokens,
                         )));
+                    }
+                    Ok(None) => {
+                        app.status = "nothing to compact yet".to_string();
                     }
                     Err(error) => app.status = format!("compact failed: {error}"),
                 }
@@ -2334,49 +2460,20 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             apply_collapse_expand(app, "/collapse", category.as_deref(), true);
         }
         DispatchCommand::Expand { category } => {
-            apply_collapse_expand(app, "/expand", category.as_deref(), false);
+            if category.is_none() {
+                app.transcript_overlay = Some(TranscriptOverlayState::default());
+                app.status = "full transcript open".to_string();
+            } else {
+                apply_collapse_expand(app, "/expand", category.as_deref(), false);
+            }
         }
         DispatchCommand::Diff => handle_slash_diff(app),
         DispatchCommand::Effort { value } => handle_slash_effort(app, agent, value.as_deref()),
         DispatchCommand::Verbosity { value } => {
-            if let Some(value) = value
-                && let Some(verbosity) = parse_response_verbosity(&value)
-            {
-                app.response_verbosity = verbosity;
-                let mut next = agent.config_snapshot();
-                next.tui.response_verbosity = verbosity;
-                agent.replace_config(next);
-                app.app_notifications.push(
-                    format!("response verbosity → {}", verbosity.as_str()),
-                    NotifySeverity::Success,
-                );
-                return;
-            }
-            toggle_config_screen(
-                app,
-                agent,
-                Some(squeezy_core::config_schema::SectionId::Verbosity),
-            );
+            handle_slash_verbosity(app, agent, value.as_deref());
         }
         DispatchCommand::ToolVerbosity { value } => {
-            if let Some(value) = value
-                && let Some(verbosity) = parse_tool_output_verbosity(&value)
-            {
-                app.tool_output_verbosity = verbosity;
-                let mut next = agent.config_snapshot();
-                next.tui.tool_output_verbosity = verbosity;
-                agent.replace_config(next);
-                app.app_notifications.push(
-                    format!("tool output verbosity → {}", verbosity.as_str()),
-                    NotifySeverity::Success,
-                );
-                return;
-            }
-            toggle_config_screen(
-                app,
-                agent,
-                Some(squeezy_core::config_schema::SectionId::Verbosity),
-            );
+            handle_slash_tool_verbosity(app, agent, value.as_deref());
         }
         DispatchCommand::Theme { theme } => {
             let Some(parsed) = TuiTheme::parse(&theme) else {
@@ -2401,16 +2498,16 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             };
             app.push_transcript_item(TranscriptItem::system(body));
         }
-        DispatchCommand::Tasks | DispatchCommand::Jobs => {
+        DispatchCommand::Tasks => {
             sync_jobs_from_agent(app, agent);
             let body = format_tasks_list(app, agent);
             app.status = format!("{} tasks", app.jobs.len());
             app.push_transcript_item(TranscriptItem::system(body));
         }
-        DispatchCommand::Task { id } | DispatchCommand::Job { id } => {
+        DispatchCommand::Task { id } => {
             apply_task_detail(app, agent, &id);
         }
-        DispatchCommand::TaskCancel { id } | DispatchCommand::JobCancel { id } => {
+        DispatchCommand::TaskCancel { id } => {
             apply_task_cancel(app, agent, &id);
         }
         DispatchCommand::Sessions => match agent.list_sessions(&SessionQuery::default()) {
@@ -2602,7 +2699,8 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
 }
 
 fn apply_collapse_expand(app: &mut TuiApp, command: &str, category: Option<&str>, collapsed: bool) {
-    let category = match category {
+    let category_arg = category;
+    let category = match category_arg {
         Some(value) => match parse_transcript_category(value) {
             Some(category) => category,
             None => {
@@ -2614,12 +2712,24 @@ fn apply_collapse_expand(app: &mut TuiApp, command: &str, category: Option<&str>
         None => TranscriptCategory::All,
     };
     let changed = set_transcript_collapsed(app, category, collapsed);
-    app.status = format!(
-        "{} {} transcript entr{}",
-        if collapsed { "collapsed" } else { "expanded" },
-        changed,
-        if changed == 1 { "y" } else { "ies" }
-    );
+    let verb = if collapsed { "collapse" } else { "expand" };
+    let past = if collapsed { "collapsed" } else { "expanded" };
+    if changed == 0 {
+        // squeezy-o3z0 (audit U3): when nothing matches the requested
+        // category, say so directly instead of leaking a "collapsed 0
+        // transcript entries" line. `category_arg` is the user-typed
+        // slug; falling back to "matching" keeps the bare /collapse
+        // case (TranscriptCategory::All) readable too.
+        let label = category_arg.unwrap_or("matching");
+        app.status = format!("no {label} entries to {verb}");
+    } else {
+        app.status = format!(
+            "{} {} transcript entr{}",
+            past,
+            changed,
+            if changed == 1 { "y" } else { "ies" }
+        );
+    }
 }
 
 fn apply_task_detail(app: &mut TuiApp, agent: &Agent, raw_id: &str) {
@@ -2909,48 +3019,55 @@ fn handle_help_command(app: &mut TuiApp, agent: &mut Agent, rest: &str) {
 async fn handle_feedback_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
     match rest {
         "send" => {
-            let Some(feedback) = app.pending_feedback.take() else {
-                app.status = "no feedback pending".to_string();
-                return;
-            };
-            match agent.submit_feedback(&feedback).await {
-                Ok(result) => {
-                    app.status = format!("feedback sent {}", result.id);
-                    app.push_transcript_item(TranscriptItem::system(format!(
-                        "feedback sent\nfeedback_id={}",
-                        result.id
-                    )));
-                }
-                Err(error) => {
-                    app.pending_feedback = Some(feedback);
-                    app.status = format!("feedback send failed: {error}");
-                }
-            }
+            submit_pending_feedback(app, agent).await;
         }
         "cancel" => {
-            app.pending_feedback = None;
-            app.status = "feedback cancelled".to_string();
+            discard_pending_feedback(app);
         }
         "" => {
-            app.status =
-                "usage: /feedback <what happened> | /feedback send | /feedback cancel".to_string();
+            app.status = "usage: /feedback <what happened>".to_string();
         }
         message => match agent.prepare_feedback(message) {
             Ok(feedback) => {
                 let preview = format!(
-                    "feedback preview\nfeedback_id={}\nbytes={} redactions={}\n\n{}\n\nRun /feedback send to submit or /feedback cancel.",
+                    "feedback preview\nfeedback_id={}\nbytes={} redactions={}\n\n{}\n\nPress Enter to send or Esc to discard.",
                     feedback.feedback_id,
                     feedback.message_bytes,
                     feedback.redactions,
                     feedback.message
                 );
                 app.pending_feedback = Some(feedback);
-                app.status = "feedback preview ready".to_string();
+                app.status = "feedback ready: Enter send · Esc discard".to_string();
                 app.push_transcript_item(TranscriptItem::system(preview));
             }
             Err(error) => app.status = format!("feedback preview failed: {error}"),
         },
     }
+}
+
+async fn submit_pending_feedback(app: &mut TuiApp, agent: &Agent) {
+    let Some(feedback) = app.pending_feedback.take() else {
+        app.status = "no feedback pending".to_string();
+        return;
+    };
+    match agent.submit_feedback(&feedback).await {
+        Ok(result) => {
+            app.status = format!("feedback sent {}", result.id);
+            app.push_transcript_item(TranscriptItem::system(format!(
+                "feedback sent\nfeedback_id={}",
+                result.id
+            )));
+        }
+        Err(error) => {
+            app.pending_feedback = Some(feedback);
+            app.status = format!("feedback send failed: {error}");
+        }
+    }
+}
+
+fn discard_pending_feedback(app: &mut TuiApp) {
+    app.pending_feedback = None;
+    app.status = "feedback discarded".to_string();
 }
 
 async fn handle_report_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
@@ -3281,7 +3398,7 @@ fn parse_tool_output_verbosity(value: &str) -> Option<ToolOutputVerbosity> {
 /// next turn picks it up via `request_reasoning_effort`. `auto` (or `clear`,
 /// `unset`, `none`) drops the override and falls back to the model default. The
 /// command is session-scoped — to persist across runs, edit `model.reasoning_effort`
-/// via `/options`. `SQUEEZY_REASONING_EFFORT` env var still wins on next load, so
+/// via `/config`. `SQUEEZY_REASONING_EFFORT` env var still wins on next load, so
 /// surface that fact when set.
 fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
     let Some(raw) = value else {
@@ -3314,10 +3431,11 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
         || "auto (model default)".to_string(),
         |e| e.as_str().to_string(),
     );
-    app.app_notifications.push(
-        format!("reasoning effort → {label}"),
-        NotifySeverity::Success,
-    );
+    // squeezy-a19z (audit U1): status line only; the previous
+    // app_notification push duplicated feedback and diverged from
+    // /verbosity / /tool-verbosity, which only used notifications.
+    // Unify on the status line — it's the immediate-feedback surface
+    // for these session-scoped switches.
     app.status = format!("reasoning effort → {label}");
     if std::env::var("SQUEEZY_REASONING_EFFORT").is_ok() {
         app.app_notifications.push(
@@ -3325,6 +3443,59 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
             NotifySeverity::Warn,
         );
     }
+}
+
+/// `/verbosity [concise|normal|verbose]`. Bare prints the current
+/// value and usage hint into the transcript (matches `/effort`'s
+/// surface); with an explicit value, sets `tui.response_verbosity`
+/// and reports via the status line. Previously the bare form
+/// short-circuited to the `/config` config_screen — surprising
+/// mode-switch on argument presence (squeezy-3ys0 / audit U2).
+fn handle_slash_verbosity(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
+    let Some(raw) = value else {
+        let current = agent.config_snapshot().tui.response_verbosity;
+        app.status = format!("response verbosity: {}", current.as_str());
+        app.push_transcript_item(TranscriptItem::system(format!(
+            "response verbosity = {}\nusage: /verbosity [concise|normal|verbose]",
+            current.as_str()
+        )));
+        return;
+    };
+    let Some(verbosity) = parse_response_verbosity(raw) else {
+        app.status =
+            format!("unknown response verbosity {raw:?}; expected concise, normal, or verbose");
+        return;
+    };
+    app.response_verbosity = verbosity;
+    let mut next = agent.config_snapshot();
+    next.tui.response_verbosity = verbosity;
+    agent.replace_config(next);
+    app.status = format!("response verbosity → {}", verbosity.as_str());
+}
+
+/// `/tool-verbosity [compact|normal|verbose]`. Same shape as
+/// [`handle_slash_verbosity`] — bare prints + usage hint, with-arg
+/// sets and reports via the status line. squeezy-a19z + squeezy-3ys0.
+fn handle_slash_tool_verbosity(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
+    let Some(raw) = value else {
+        let current = agent.config_snapshot().tui.tool_output_verbosity;
+        app.status = format!("tool output verbosity: {}", current.as_str());
+        app.push_transcript_item(TranscriptItem::system(format!(
+            "tool output verbosity = {}\nusage: /tool-verbosity [compact|normal|verbose]",
+            current.as_str()
+        )));
+        return;
+    };
+    let Some(verbosity) = parse_tool_output_verbosity(raw) else {
+        app.status =
+            format!("unknown tool output verbosity {raw:?}; expected compact, normal, or verbose");
+        return;
+    };
+    app.tool_output_verbosity = verbosity;
+    let mut next = agent.config_snapshot();
+    next.tui.tool_output_verbosity = verbosity;
+    agent.replace_config(next);
+    app.status = format!("tool output verbosity → {}", verbosity.as_str());
 }
 
 fn set_transcript_collapsed(
@@ -3588,7 +3759,8 @@ fn switch_mode(
         && (app.turn_rx.is_some()
             || app.pending_approval.is_some()
             || app.pending_mcp_elicitation.is_some()
-            || app.pending_request_user_input.is_some())
+            || app.pending_request_user_input.is_some()
+            || app.pending_feedback.is_some())
     {
         app.status = "mode switch unavailable during active turn".to_string();
         return;
@@ -3896,10 +4068,8 @@ fn send_approval_decision(
     let _ = pending.decision_tx.send(option.decision);
     app.status = match option.choice {
         ApprovalChoice::Approve => format!("approved {tool_name}"),
-        ApprovalChoice::ApproveSession => format!("saved session approval for {tool_name}"),
         ApprovalChoice::ApproveProject => format!("saved repo approval for {tool_name}"),
         ApprovalChoice::Deny => format!("denied {tool_name}"),
-        ApprovalChoice::DenySession => format!("saved session deny for {tool_name}"),
     };
     true
 }
@@ -3907,10 +4077,8 @@ fn send_approval_decision(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalChoice {
     Approve,
-    ApproveSession,
     ApproveProject,
     Deny,
-    DenySession,
 }
 
 #[derive(Debug, Clone)]
@@ -3955,53 +4123,27 @@ fn approval_deny() -> ApprovalOption {
     )
 }
 
-fn approval_deny_session() -> ApprovalOption {
-    ApprovalOption::new_static(
-        ApprovalChoice::DenySession,
-        "Deny for this session",
-        "save an in-memory deny rule",
-        ToolApprovalDecision::DenySession,
-    )
-}
-
 /// Build the per-capability allow/deny menu for a pending approval. The
-/// option list is shaped to the request (network host vs exec amendment
-/// vs plain accept) so each "Approve" label names the binary, host,
-/// server, or path that the resulting rule will cover — the user can
-/// codify *why* in one keystroke.
+/// menu keeps the obvious one-shot decision first, then offers one
+/// project-scoped allow rule for users who want to persist the decision.
 fn approval_options_for(request: &ToolApprovalRequest) -> Vec<ApprovalOption> {
-    let (session_label, session_hint, project_label, project_hint) =
-        capability_scope_labels(request);
-    let session = ApprovalOption {
-        choice: ApprovalChoice::ApproveSession,
-        label: session_label,
-        hint: session_hint,
-        decision: ToolApprovalDecision::AllowSession,
-    };
+    let (project_label, project_hint) = capability_project_label(request);
     let project = ApprovalOption {
         choice: ApprovalChoice::ApproveProject,
         label: project_label,
         hint: project_hint,
         decision: ToolApprovalDecision::AllowRuleProject,
     };
-    vec![
-        approval_once(),
-        session,
-        project,
-        approval_deny(),
-        approval_deny_session(),
-    ]
+    vec![approval_once(), project, approval_deny()]
 }
 
-/// Returns `(session_label, session_hint, project_label, project_hint)` for
-/// the allow options. Each label names the capability-specific target (binary,
-/// host, MCP server/tool, write root) so the prompt makes the persisted rule
-/// shape visible without forcing the user to read the rule-preview line.
-fn capability_scope_labels(
+/// Returns `(project_label, project_hint)` for the persistent allow option.
+/// Each label names the capability-specific target (binary, host, MCP
+/// server/tool, write root) so the prompt makes the persisted rule shape
+/// visible without forcing the user to read the rule-preview line.
+fn capability_project_label(
     request: &ToolApprovalRequest,
 ) -> (
-    std::borrow::Cow<'static, str>,
-    std::borrow::Cow<'static, str>,
     std::borrow::Cow<'static, str>,
     std::borrow::Cow<'static, str>,
 ) {
@@ -4051,8 +4193,6 @@ fn capability_scope_labels(
         }
     }) else {
         return (
-            Cow::Borrowed("Approve for this session"),
-            Cow::Borrowed("save an in-memory rule"),
             Cow::Borrowed("Always approve this command in this repo"),
             Cow::Borrowed("save a project rule"),
         );
@@ -4069,8 +4209,6 @@ fn capability_scope_labels(
         | PermissionCapability::Destructive => unreachable!(),
     };
     (
-        Cow::Owned(format!("Allow {kind} {scope_display} (session)")),
-        Cow::Owned(format!("save an in-memory {hint_kind} rule")),
         Cow::Owned(format!("Always allow {kind} {scope_display}")),
         Cow::Owned(format!("save a project {hint_kind} rule")),
     )
@@ -4247,6 +4385,33 @@ fn format_plan_choice_menu_lines(pending: &PendingPlanChoice) -> Vec<Line<'stati
     lines
 }
 
+fn format_feedback_prompt_lines(feedback: &PreparedFeedback) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled(
+                "Send feedback?",
+                Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {}", feedback.feedback_id),
+                Style::default().fg(QUIET),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                compact_text(&feedback.message, 160),
+                Style::default().fg(palette::muted_fg()),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("› Enter/Y Send", Style::default().fg(GOLD)),
+            Span::styled(" · ", Style::default().fg(QUIET)),
+            Span::styled("Esc/N Discard", Style::default().fg(palette::muted_fg())),
+        ]),
+    ]
+}
+
 fn format_request_user_input_menu_lines(
     request: &RequestUserInputRequest,
     selected: usize,
@@ -4275,19 +4440,22 @@ fn format_request_user_input_menu_lines(
         ),
     ]));
     for (index, choice) in request.choices.iter().enumerate() {
-        let is_selected = index == selected.min(request.choices.len().saturating_sub(1));
-        let marker = if is_selected { "› " } else { "  " };
+        let is_selected = index == selected && selected < request.choices.len();
+        let marker = if is_selected { "● " } else { "  " };
         let label_style = if is_selected {
-            Style::default().fg(GOLD)
+            Style::default()
+                .fg(palette::footer_fg())
+                .add_modifier(Modifier::BOLD)
         } else {
             // Tone-aware muted grey sits below the luminance budget so
-            // the selected GOLD row wins the eye in the warm-taupe modal.
+            // the amber selection dot carries focus without turning the
+            // label itself yellow.
             Style::default().fg(palette::muted_fg())
         };
         let mut spans = vec![
             Span::styled(
                 marker,
-                Style::default().fg(if is_selected { GOLD } else { QUIET }),
+                Style::default().fg(if is_selected { AMBER } else { QUIET }),
             ),
             Span::styled(compact_text(&choice.label, 180), label_style),
         ];
@@ -4306,15 +4474,21 @@ fn format_request_user_input_menu_lines(
         // whole modal reads as one semantic surface; the typed body uses
         // a dim+bold tone-aware foreground for legibility without
         // overpowering the question line.
+        let is_selected = selected >= request.choices.len();
+        let marker = if is_selected { "● " } else { "  " };
+        let marker_style = Style::default().fg(if is_selected { AMBER } else { QUIET });
         let entry_style = Style::default()
             .fg(palette::footer_fg())
             .add_modifier(Modifier::BOLD);
         let label_style = Style::default().fg(MODE_PURPLE);
         let cursor_style = Style::default().fg(Color::Black).bg(MODE_PURPLE);
-        let mut spans = vec![Span::raw("  "), Span::styled("Answer › ", label_style)];
+        let mut spans = vec![
+            Span::styled(marker, marker_style),
+            Span::styled("Answer › ", label_style),
+        ];
         if input.is_empty() {
             spans.push(Span::styled(
-                "(type your answer · Enter sends · Esc cancels)",
+                "(type your answer · Enter sends when selected)",
                 Style::default().fg(QUIET),
             ));
         } else {
@@ -5019,6 +5193,8 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
         )
     } else if let Some(pending) = app.pending_plan_choice.as_ref() {
         visual_line_count(&format_plan_choice_menu_lines(pending), width)
+    } else if let Some(feedback) = app.pending_feedback.as_ref() {
+        visual_line_count(&format_feedback_prompt_lines(feedback), width)
     } else {
         0
     }
@@ -5048,6 +5224,8 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
         )
     } else if let Some(pending) = app.pending_plan_choice.as_ref() {
         format_plan_choice_menu_lines(pending)
+    } else if let Some(feedback) = app.pending_feedback.as_ref() {
+        format_feedback_prompt_lines(feedback)
     } else {
         Vec::new()
     }
@@ -5078,7 +5256,7 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Some(state) => state,
         None => return,
     };
-    let title = " Transcript — Ctrl-T or Esc to close · PgUp/PgDn scroll ";
+    let title = " Transcript — Ctrl-T or Esc to close · PgUp/PgDn or wheel scroll ";
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -5087,13 +5265,136 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             title,
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
         ));
-    let inner = block.inner(area);
+    let inner = transcript_overlay_inner(area);
     frame.render_widget(block, area);
-    let lines = transcript_lines_for_overlay(app, Some(inner.width));
+    let (text_area, scrollbar_area) =
+        transcript_overlay_text_and_scrollbar_areas(inner).unwrap_or((
+            inner,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
+        ));
+    let lines = transcript_lines_for_overlay(app, Some(text_area.width));
+    let line_count = lines.len();
+    let scroll = transcript_overlay_scrollbar_geometry(line_count, text_area.height, state.scroll)
+        .map(|geometry| state.scroll.min(geometry.max_scroll))
+        .unwrap_or(0);
     let paragraph = Paragraph::new(lines)
-        .scroll((state.scroll, 0))
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, inner);
+    frame.render_widget(paragraph, text_area);
+    if scrollbar_area.width > 0
+        && let Some(geometry) =
+            transcript_overlay_scrollbar_geometry(line_count, scrollbar_area.height, scroll)
+    {
+        render_transcript_overlay_scrollbar(frame, scrollbar_area, geometry);
+    }
+}
+
+fn transcript_overlay_inner(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn transcript_overlay_text_and_scrollbar_areas(inner: Rect) -> Option<(Rect, Rect)> {
+    if inner.width <= 1 || inner.height == 0 {
+        return None;
+    }
+    let text_area = Rect {
+        width: inner.width.saturating_sub(1),
+        ..inner
+    };
+    let scrollbar_area = Rect {
+        x: inner.x + inner.width - 1,
+        y: inner.y,
+        width: 1,
+        height: inner.height,
+    };
+    Some((text_area, scrollbar_area))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscriptScrollbarGeometry {
+    thumb_top: u16,
+    thumb_height: u16,
+    max_scroll: u16,
+}
+
+fn transcript_overlay_scrollbar_geometry(
+    content_len: usize,
+    viewport_height: u16,
+    scroll: u16,
+) -> Option<TranscriptScrollbarGeometry> {
+    let track_height = usize::from(viewport_height);
+    if track_height == 0 || content_len <= track_height {
+        return None;
+    }
+    let max_scroll = content_len
+        .saturating_sub(track_height)
+        .min(usize::from(u16::MAX));
+    if max_scroll == 0 {
+        return None;
+    }
+    let thumb_height = ((track_height * track_height) / content_len).clamp(1, track_height);
+    let travel = track_height.saturating_sub(thumb_height);
+    let scroll = usize::from(scroll).min(max_scroll);
+    let thumb_top = if travel == 0 {
+        0
+    } else {
+        scroll * travel / max_scroll
+    };
+    Some(TranscriptScrollbarGeometry {
+        thumb_top: thumb_top as u16,
+        thumb_height: thumb_height as u16,
+        max_scroll: max_scroll as u16,
+    })
+}
+
+fn transcript_overlay_scroll_for_scrollbar_row(
+    row: u16,
+    scrollbar_area: Rect,
+    content_len: usize,
+) -> Option<u16> {
+    let geometry = transcript_overlay_scrollbar_geometry(content_len, scrollbar_area.height, 0)?;
+    let local_row = row
+        .saturating_sub(scrollbar_area.y)
+        .min(scrollbar_area.height - 1);
+    let track_height = usize::from(scrollbar_area.height);
+    let thumb_height = usize::from(geometry.thumb_height);
+    let travel = track_height.saturating_sub(thumb_height);
+    if travel == 0 {
+        return Some(0);
+    }
+    let centered = usize::from(local_row).saturating_sub(thumb_height / 2);
+    let position = centered.min(travel);
+    Some(((position * usize::from(geometry.max_scroll)) / travel) as u16)
+}
+
+fn render_transcript_overlay_scrollbar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    geometry: TranscriptScrollbarGeometry,
+) {
+    let thumb_end = geometry.thumb_top.saturating_add(geometry.thumb_height);
+    let lines = (0..area.height)
+        .map(|offset| {
+            let in_thumb = offset >= geometry.thumb_top && offset < thumb_end;
+            let (symbol, style) = if in_thumb {
+                ("█", Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
+            } else {
+                ("░", Style::default().fg(QUIET))
+            };
+            Line::from(Span::styled(symbol, style))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Build the per-entry line list for the overlay: every entry is forced
@@ -5407,17 +5708,11 @@ fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
 }
 
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
-    let card_width = width.clamp(36, 64) as usize;
-    // `model` and `languages` are intentionally omitted: in inline mode
-    // the card lives in terminal scrollback and can't be rewritten, so
-    // both would freeze on a model change or filesystem edit. The live
-    // status line (`provider-and-model`, `reasoning-effort`, `languages`)
-    // is the source of truth for those instead.
-    vec![
-        startup_phase_strip(card_width, app.version),
-        Line::from(""),
-        startup_meta_row("directory", app.directory.clone(), card_width),
-    ]
+    // Dynamic metadata belongs in the live status line. In inline mode
+    // the startup card lives in scrollback and cannot be rewritten, so
+    // repeating fields such as directory/model/languages here makes the
+    // first frame stale and visually redundant.
+    vec![startup_phase_strip(width as usize, app.version)]
 }
 
 fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {
@@ -5467,21 +5762,6 @@ fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(version_text, Style::default().fg(AMBER)),
-    ])
-}
-
-fn startup_meta_row(label: &'static str, value: String, card_width: usize) -> Line<'static> {
-    const INDENT: usize = 4;
-    const LABEL_WIDTH: usize = 11;
-    let label_len = label.chars().count();
-    let trailing = LABEL_WIDTH.saturating_sub(label_len);
-    let max_value = card_width.saturating_sub(INDENT + LABEL_WIDTH);
-    let value = fit_chars(&value, max_value);
-    Line::from(vec![
-        Span::raw(" ".repeat(INDENT)),
-        Span::styled(label.to_string(), Style::default().fg(AMBER)),
-        Span::raw(" ".repeat(trailing)),
-        Span::styled(value, Style::default().fg(Color::White)),
     ])
 }
 
@@ -6256,7 +6536,7 @@ fn format_message_entry_with_width(
 fn format_accounting_block_entry(selected: bool, content: &str) -> Option<Vec<Line<'static>>> {
     let mut iter = content.lines();
     let header = iter.next()?;
-    if header != "Cost accounting" && header != "Context accounting" {
+    if header != "Cost accounting" && header != "Context window" {
         return None;
     }
     let header_span = Span::styled(
@@ -6375,13 +6655,7 @@ fn format_user_prompt_entry(
         % BULLETS.len();
     let bullet = BULLETS[bullet_idx];
 
-    let top = Line::from(vec![
-        Span::raw(INDENT.to_string()),
-        Span::styled(format!("╭{}╮", "─".repeat(max_text_width + 2)), amber),
-    ]);
-
-    let mut lines = Vec::with_capacity(content.len() + 3);
-    lines.push(top);
+    let mut lines = Vec::with_capacity(content.len() + 2);
 
     let mut line_start = 0usize;
     for (index, line_text) in content.iter().enumerate() {
@@ -7504,8 +7778,14 @@ fn read_file_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 }
 
 fn read_tool_output_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let label = saved_tool_output_meta(tool)
+        .map(|meta| format!("expand saved {}", saved_tool_output_label(&meta.tool_name)))
+        .or_else(|| {
+            saved_compiler_output_summary(tool).map(|_| "expand saved compiler output".to_string())
+        })
+        .unwrap_or_else(|| "expand saved tool output".to_string());
     let mut spans = vec![Span::styled(
-        "expand saved tool output",
+        label,
         Style::default().fg(palette::muted_fg()),
     )];
     if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
@@ -7555,6 +7835,8 @@ struct EditChangedFile {
     patch: Option<String>,
     patch_truncated: bool,
 }
+
+const WRITE_FILE_DIFF_PREVIEW_LINES: usize = 200;
 
 /// Extract the file paths an apply_patch / write_file invocation targets,
 /// used to dedupe transient failure/success pairs in [`TuiApp::recent_edit_failures`].
@@ -7613,6 +7895,21 @@ fn edit_changed_files(tool: &ToolTranscript) -> Vec<EditChangedFile> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    if files.is_empty()
+        && let Some(patch) = tool.result.content["unified_diff"]
+            .as_str()
+            .filter(|patch| !patch.trim().is_empty())
+    {
+        files.extend(edit_files_from_unified_diff(
+            patch,
+            edit_file_paths(&tool.result.content),
+        ));
+    }
+    if files.is_empty()
+        && let Some(file) = edit_file_from_write_call(tool)
+    {
+        files.push(file);
+    }
     if files.is_empty() {
         if let Some(items) = tool.result.content["files"].as_array() {
             files.extend(items.iter().filter_map(|item| {
@@ -7635,6 +7932,174 @@ fn edit_changed_files(tool: &ToolTranscript) -> Vec<EditChangedFile> {
         }
     }
     files
+}
+
+fn edit_file_from_write_call(tool: &ToolTranscript) -> Option<EditChangedFile> {
+    if tool.result.tool_name != "write_file" {
+        return None;
+    }
+    let call = tool.call.as_ref()?;
+    let path =
+        string_arg(&tool.result.content, "path").or_else(|| string_arg(&call.arguments, "path"))?;
+    if !tool
+        .result
+        .content
+        .get("before_sha256")
+        .is_some_and(|value| value.is_null())
+    {
+        return Some(EditChangedFile {
+            path,
+            additions: 0,
+            deletions: 0,
+            patch: None,
+            patch_truncated: false,
+        });
+    }
+    let content = call.arguments.get("content")?.as_str()?;
+    let patch = render_write_file_preview_diff(&path, content)?;
+    let additions = patch
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .count() as u64;
+    let total_lines = content.lines().count();
+
+    Some(EditChangedFile {
+        path,
+        additions,
+        deletions: 0,
+        patch: Some(patch),
+        patch_truncated: total_lines > WRITE_FILE_DIFF_PREVIEW_LINES,
+    })
+}
+
+fn render_write_file_preview_diff(path: &str, content: &str) -> Option<String> {
+    if content.is_empty() {
+        return None;
+    }
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n@@ -0,0 +1 @@\n");
+    for line in content.lines().take(WRITE_FILE_DIFF_PREVIEW_LINES) {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
+}
+
+fn edit_file_paths(content: &serde_json::Value) -> Vec<String> {
+    content["files"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["path"].as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn edit_files_from_unified_diff(patch: &str, fallback_paths: Vec<String>) -> Vec<EditChangedFile> {
+    let mut files = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+    let mut fallback_index = 0;
+
+    for line in patch.lines() {
+        if line.starts_with("--- ") && !current_lines.is_empty() {
+            push_edit_diff_file(
+                &mut files,
+                current_path.take(),
+                &fallback_paths,
+                &mut fallback_index,
+                std::mem::take(&mut current_lines),
+            );
+        }
+        if line.starts_with("+++ ") {
+            current_path = diff_header_path(line).or_else(|| current_path.take());
+        } else if line.starts_with("--- ") {
+            current_path = diff_header_path(line);
+        }
+        current_lines.push(line.to_string());
+    }
+    push_edit_diff_file(
+        &mut files,
+        current_path,
+        &fallback_paths,
+        &mut fallback_index,
+        current_lines,
+    );
+
+    if files.is_empty() && !patch.trim().is_empty() {
+        let path = fallback_paths
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "patch".to_string());
+        let (additions, deletions) = count_unified_diff_changes(patch);
+        files.push(EditChangedFile {
+            path,
+            additions,
+            deletions,
+            patch: Some(patch.to_string()),
+            patch_truncated: false,
+        });
+    }
+    files
+}
+
+fn push_edit_diff_file(
+    files: &mut Vec<EditChangedFile>,
+    path: Option<String>,
+    fallback_paths: &[String],
+    fallback_index: &mut usize,
+    lines: Vec<String>,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    let patch = lines.join("\n");
+    let path = path.or_else(|| {
+        let value = fallback_paths.get(*fallback_index).cloned();
+        *fallback_index += 1;
+        value
+    });
+    let Some(path) = path else {
+        return;
+    };
+    let (additions, deletions) = count_unified_diff_changes(&patch);
+    files.push(EditChangedFile {
+        path,
+        additions,
+        deletions,
+        patch: Some(patch),
+        patch_truncated: false,
+    });
+}
+
+fn diff_header_path(line: &str) -> Option<String> {
+    let path = line
+        .strip_prefix("+++ ")
+        .or_else(|| line.strip_prefix("--- "))?
+        .trim();
+    if path == "/dev/null" || path.is_empty() {
+        return None;
+    }
+    Some(
+        path.strip_prefix("a/")
+            .or_else(|| path.strip_prefix("b/"))
+            .unwrap_or(path)
+            .to_string(),
+    )
+}
+
+fn count_unified_diff_changes(patch: &str) -> (u64, u64) {
+    let additions = patch
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .count() as u64;
+    let deletions = patch
+        .lines()
+        .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+        .count() as u64;
+    (additions, deletions)
 }
 
 fn diff_context_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
@@ -8072,9 +8537,7 @@ fn shell_output_block_lines(
         .unwrap_or_else(|| tool.result.tool_name.clone());
     let workdir = string_arg(&tool.result.content, "workdir").unwrap_or_else(|| ".".to_string());
     let limit = preview_limit.unwrap_or(usize::MAX);
-    let is_diff = output
-        .lines()
-        .any(|line| line.starts_with("@@ -") && line.contains(" @@"));
+    let is_diff = shell_text_looks_like_diff(&output);
     let mut lines = vec![shell_output_title_line(&command, &workdir)];
     lines.extend(head_tail_lines(&output, limit).into_iter().map(|line| {
         if line.truncated_marker {
@@ -8112,6 +8575,30 @@ fn shell_output_line(content: &str) -> Line<'static> {
     Line::from(spans)
 }
 
+fn shell_text_looks_like_diff(content: &str) -> bool {
+    let mut saw_rustfmt_header = false;
+    let mut saw_change = false;
+    for line in content.lines() {
+        let stripped = strip_ansi_escape_sequences(line);
+        let trimmed = stripped.trim_start();
+        if trimmed.starts_with("@@ -") && trimmed.contains(" @@") {
+            return true;
+        }
+        if trimmed.starts_with("Diff in ") {
+            saw_rustfmt_header = true;
+        }
+        if is_diff_change_line(trimmed) {
+            saw_change = true;
+        }
+    }
+    saw_rustfmt_header && saw_change
+}
+
+fn is_diff_change_line(trimmed: &str) -> bool {
+    (trimmed.starts_with('+') && !trimmed.starts_with("+++"))
+        || (trimmed.starts_with('-') && !trimmed.starts_with("---"))
+}
+
 /// Diff-aware variant of [`shell_output_line`]. Lines that begin with `+`
 /// or `-` (but NOT `+++` / `---` file headers) get a tinted background to
 /// mirror the inline-diff styling reviewers expect from GitHub / Claude
@@ -8119,7 +8606,24 @@ fn shell_output_line(content: &str) -> Line<'static> {
 /// finds the section breaks; everything else falls through to the default
 /// styled output.
 fn shell_output_diff_line(content: &str) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+    diff_output_line(content, vec![Span::raw("  ")])
+}
+
+fn detail_output_diff_line(content: &str) -> Line<'static> {
+    diff_output_line(
+        content,
+        vec![
+            Span::raw("  "),
+            Span::styled(
+                "│ ",
+                Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
+            ),
+        ],
+    )
+}
+
+fn diff_output_line(content: &str, mut spans: Vec<Span<'static>>) -> Line<'static> {
+    let content = strip_ansi_escape_sequences(content);
     let trimmed = content.trim_start_matches(' ');
     let leading_ws = &content[..content.len() - trimmed.len()];
     if !leading_ws.is_empty() {
@@ -8128,21 +8632,21 @@ fn shell_output_diff_line(content: &str) -> Line<'static> {
     let style = if trimmed.starts_with("+++") || trimmed.starts_with("---") {
         Style::default().fg(palette::muted_fg())
     } else if let Some(rest) = trimmed.strip_prefix('+') {
-        let mut style = Style::default().fg(DIFF_ADD_FG);
-        if let Some(bg) = palette::surface_bg(DIFF_ADD_FG) {
-            style = style.bg(bg);
-        }
+        let bg = render::diff::diff_add_bg();
+        let style = Style::default().bg(bg);
         spans.push(Span::styled("+".to_string(), style));
         spans.push(Span::styled(rest.to_string(), style));
-        return Line::from(spans);
+        let mut line = Line::from(spans);
+        line = line.style(Style::default().bg(bg));
+        return line;
     } else if let Some(rest) = trimmed.strip_prefix('-') {
-        let mut style = Style::default().fg(DIFF_DEL_FG);
-        if let Some(bg) = palette::surface_bg(DIFF_DEL_FG) {
-            style = style.bg(bg);
-        }
+        let bg = render::diff::diff_del_bg();
+        let style = Style::default().bg(bg);
         spans.push(Span::styled("-".to_string(), style));
         spans.push(Span::styled(rest.to_string(), style));
-        return Line::from(spans);
+        let mut line = Line::from(spans);
+        line = line.style(Style::default().bg(bg));
+        return line;
     } else if trimmed.starts_with("@@") {
         Style::default()
             .fg(palette::MODE_PURPLE)
@@ -8153,6 +8657,31 @@ fn shell_output_diff_line(content: &str) -> Line<'static> {
     };
     spans.push(Span::styled(trimmed.to_string(), style));
     Line::from(spans)
+}
+
+fn strip_ansi_escape_sequences(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some('(' | ')' | '*' | '+' | '-' | '.' | '/') => {
+                let _ = chars.next();
+            }
+            Some(_) | None => {}
+        }
+    }
+    output
 }
 
 fn expanded_decl_search_detail_lines(
@@ -8477,17 +9006,78 @@ fn expanded_read_tool_output_detail_lines(
             format!("bytes {} of {}", format_bytes(bytes), format_bytes(total)),
         ));
     }
+    if let Some(saved) = saved_tool_output_meta(tool) {
+        lines.push(detail_line(
+            false,
+            QUIET,
+            format!("saved {}", saved_tool_output_label(&saved.tool_name)),
+        ));
+        if let Some(result) = saved.parsed {
+            let nested = ToolTranscript {
+                call: None,
+                result,
+                repeat_count: 1,
+            };
+            lines.extend(expanded_tool_detail_lines(&nested, verbosity));
+            return lines;
+        }
+        if !matches!(verbosity, ToolOutputVerbosity::Verbose) {
+            let detail = if saved.partial {
+                "content saved tool-result JSON (partial; hidden in normal mode)"
+            } else {
+                "content saved tool-result JSON (hidden in normal mode)"
+            };
+            lines.push(detail_line(false, QUIET, detail));
+            return lines;
+        }
+    }
+    if let Some(summary) = saved_compiler_output_summary(tool) {
+        lines.push(detail_line(false, QUIET, "saved compiler output"));
+        if !summary.messages.is_empty() {
+            lines.push(detail_line(false, QUIET, "compiler messages"));
+            for line in head_tail_lines(
+                &summary.messages.join("\n"),
+                saved_output_preview_limit(verbosity),
+            ) {
+                if line.truncated_marker {
+                    lines.push(detail_line(false, QUIET, line.text));
+                } else {
+                    lines.push(detail_spans_line(styled_output_spans(&line.text)));
+                }
+            }
+        }
+        if !summary.stderr.is_empty() {
+            lines.push(detail_line(false, QUIET, "stderr"));
+            for line in head_tail_lines(
+                &summary.stderr.join("\n"),
+                saved_output_preview_limit(verbosity),
+            ) {
+                if line.truncated_marker {
+                    lines.push(detail_line(false, QUIET, line.text));
+                } else {
+                    lines.push(detail_spans_line(styled_output_spans(&line.text)));
+                }
+            }
+        }
+        if !matches!(verbosity, ToolOutputVerbosity::Verbose) {
+            let mut detail = format!(
+                "compiler JSON hidden in normal mode ({} message lines)",
+                summary.hidden_json_lines
+            );
+            if summary.partial {
+                detail.push_str(" · partial result");
+            }
+            lines.push(detail_line(false, QUIET, detail));
+            return lines;
+        }
+    }
     if let Some(content) = string_arg(&tool.result.content, "content") {
         // Spilled tool payloads are routinely hundreds of lines of raw JSON,
         // so fold inline even on the expanded card — the overlay (which
         // pins Verbose) still hands the full content to anyone hitting
         // Ctrl-T. Generic `output_block_lines` stays unbounded so the
         // existing "expand grep → see every match" behaviour is preserved.
-        let limit = match verbosity {
-            ToolOutputVerbosity::Compact => 12,
-            ToolOutputVerbosity::Normal => 40,
-            ToolOutputVerbosity::Verbose => usize::MAX,
-        };
+        let limit = saved_output_preview_limit(verbosity);
         if !content.trim().is_empty() {
             lines.push(detail_line(false, QUIET, "content"));
             for line in head_tail_lines(&content, limit) {
@@ -8500,6 +9090,163 @@ fn expanded_read_tool_output_detail_lines(
         }
     }
     lines
+}
+
+fn saved_output_preview_limit(verbosity: ToolOutputVerbosity) -> usize {
+    match verbosity {
+        ToolOutputVerbosity::Compact => 12,
+        ToolOutputVerbosity::Normal => 40,
+        ToolOutputVerbosity::Verbose => usize::MAX,
+    }
+}
+
+#[derive(Debug)]
+struct SavedToolOutputMeta {
+    tool_name: String,
+    parsed: Option<ToolResult>,
+    partial: bool,
+}
+
+fn saved_tool_output_meta(tool: &ToolTranscript) -> Option<SavedToolOutputMeta> {
+    if tool.result.tool_name != "read_tool_output" {
+        return None;
+    }
+    let content = string_arg(&tool.result.content, "content")?;
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let parsed = serde_json::from_str::<ToolResult>(trimmed).ok();
+    let tool_name = parsed
+        .as_ref()
+        .map(|result| result.tool_name.clone())
+        .or_else(|| json_string_field_prefix(trimmed, "tool_name"))?;
+    let partial = tool.result.content["truncated"].as_bool().unwrap_or(false) || parsed.is_none();
+    Some(SavedToolOutputMeta {
+        tool_name,
+        parsed,
+        partial,
+    })
+}
+
+fn json_string_field_prefix(source: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let start = source.find(&needle)? + needle.len();
+    let mut rest = source[start..].trim_start();
+    rest = rest.strip_prefix(':')?.trim_start();
+    let mut deserializer = serde_json::Deserializer::from_str(rest);
+    String::deserialize(&mut deserializer).ok()
+}
+
+fn saved_tool_output_label(tool_name: &str) -> String {
+    match tool_name {
+        "diff_context" => "diff context".to_string(),
+        "repo_map" => "repo map".to_string(),
+        "decl_search" => "declarations".to_string(),
+        "symbol_context" => "symbol context".to_string(),
+        "read_file" | "read_slice" => "read".to_string(),
+        "apply_patch" => "patch".to_string(),
+        "write_file" => "write".to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
+#[derive(Debug)]
+struct SavedCompilerOutputSummary {
+    messages: Vec<String>,
+    stderr: Vec<String>,
+    hidden_json_lines: usize,
+    partial: bool,
+}
+
+fn saved_compiler_output_summary(tool: &ToolTranscript) -> Option<SavedCompilerOutputSummary> {
+    if tool.result.tool_name != "read_tool_output" {
+        return None;
+    }
+    let content = string_arg(&tool.result.content, "content")?;
+    let partial = tool.result.content["truncated"].as_bool().unwrap_or(false);
+    compiler_output_summary(&content, partial)
+}
+
+fn compiler_output_summary(content: &str, partial: bool) -> Option<SavedCompilerOutputSummary> {
+    let mut messages = Vec::new();
+    let mut stderr = Vec::new();
+    let mut hidden_json_lines = 0usize;
+    let mut saw_compiler_stream = false;
+    let mut in_stderr = false;
+
+    for raw in content.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed == "===== stderr =====" {
+            in_stderr = true;
+            continue;
+        }
+        if trimmed.starts_with("=====") {
+            in_stderr = false;
+            continue;
+        }
+        if in_stderr {
+            if !line.trim().is_empty() {
+                stderr.push(line.to_string());
+            }
+            continue;
+        }
+        if let Some(message) = cargo_json_message_line(trimmed) {
+            saw_compiler_stream = true;
+            if !message.is_empty() {
+                messages.extend(message.lines().map(ToOwned::to_owned));
+            }
+            hidden_json_lines += 1;
+        } else if looks_like_cargo_json_line(trimmed) {
+            saw_compiler_stream = true;
+            hidden_json_lines += 1;
+        }
+    }
+
+    if saw_compiler_stream || !stderr.is_empty() {
+        Some(SavedCompilerOutputSummary {
+            messages,
+            stderr,
+            hidden_json_lines,
+            partial,
+        })
+    } else {
+        None
+    }
+}
+
+fn cargo_json_message_line(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    match value["reason"].as_str()? {
+        "compiler-message" => value["message"]["rendered"]
+            .as_str()
+            .or_else(|| value["message"]["message"].as_str())
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn looks_like_cargo_json_line(line: &str) -> bool {
+    if line.is_empty() {
+        return false;
+    }
+    if line.contains("\"reason\":\"compiler-artifact\"")
+        || line.contains("\"reason\":\"build-script-executed\"")
+        || line.contains("\"reason\":\"build-finished\"")
+        || line.contains("\"package_id\":\"registry+https://github.com/rust-lang/crates.io-index#")
+    {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| value["reason"].as_str().map(str::to_owned))
+        .is_some_and(|reason| {
+            matches!(
+                reason.as_str(),
+                "compiler-artifact" | "build-script-executed" | "build-finished"
+            )
+        })
 }
 
 fn expanded_generic_tool_detail_lines(
@@ -8609,10 +9356,13 @@ fn output_block_lines(
     }
     let limit = usize::MAX;
     let lines = head_tail_lines(content, limit);
+    let is_diff = shell_text_looks_like_diff(content);
     let mut rendered = vec![detail_line(false, QUIET, label)];
     rendered.extend(lines.into_iter().map(|line| {
         if line.truncated_marker {
             detail_line(false, QUIET, line.text)
+        } else if is_diff {
+            detail_output_diff_line(&line.text)
         } else {
             detail_spans_line(styled_output_spans(&line.text))
         }
@@ -8685,6 +9435,7 @@ fn detail_spans_line(content: Vec<Span<'static>>) -> Line<'static> {
 }
 
 fn detail_rendered_line(line: Line<'static>) -> Line<'static> {
+    let style = line.style;
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
@@ -8693,7 +9444,7 @@ fn detail_rendered_line(line: Line<'static>) -> Line<'static> {
         ),
     ];
     spans.extend(line.spans);
-    Line::from(spans)
+    Line::from(spans).style(style)
 }
 
 fn command_spans(command: &str) -> Vec<Span<'static>> {
@@ -9326,7 +10077,7 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
         queue_overlay_lines + overlay_lines + mention_lines + suggestion_lines + indicator_lines;
     let max_height = (PROMPT_MAX_HEIGHT as usize).max(popup_height + PROMPT_MIN_HEIGHT as usize);
     prompt_visual_line_count(&app.input, width)
-        .saturating_add(4)
+        .saturating_add(3)
         .saturating_add(queue_overlay_lines)
         .saturating_add(overlay_lines)
         .saturating_add(mention_lines)
@@ -9453,18 +10204,18 @@ fn composer_bubble_lines(
 ) -> Vec<Line<'static>> {
     let width = width as usize;
     let height = height as usize;
-    if width < 4 || height < 3 {
+    if width < 4 || height < 2 {
         return content;
     }
     let amber = Style::default().fg(AMBER);
 
-    // Open layout: just a top and bottom horizontal rule with the typed
-    // content sandwiched between blank padding rows. No vertical sides —
-    // they read as visual noise when the composer is on the default
-    // terminal background.
+    // Open layout: a single top rule with the typed content floating
+    // underneath. No vertical sides or bottom rule — the latter added a
+    // heavy extra divider below the cursor and made the composer feel boxed
+    // in on the default terminal background.
     let rule = Line::from(Span::styled("─".repeat(width), amber));
 
-    let interior_rows = height.saturating_sub(2);
+    let interior_rows = height.saturating_sub(1);
     let mut content = content;
     if content.len() > interior_rows {
         // Pick the visible window so the cursor's line stays on screen.
@@ -9487,7 +10238,7 @@ fn composer_bubble_lines(
     let bot_pad = spare - top_pad;
 
     let mut lines = Vec::with_capacity(height);
-    lines.push(rule.clone());
+    lines.push(rule);
     for _ in 0..top_pad {
         lines.push(Line::from(""));
     }
@@ -9499,7 +10250,6 @@ fn composer_bubble_lines(
     for _ in 0..bot_pad {
         lines.push(Line::from(""));
     }
-    lines.push(rule);
     lines
 }
 
@@ -9556,8 +10306,8 @@ fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
                 spans.push(Span::styled(
                     hint_text,
                     Style::default()
-                        .fg(QUIET)
-                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                        .fg(palette::ACCENT_CYAN)
+                        .add_modifier(Modifier::ITALIC),
                 ));
             }
             let badges = command.capability_badges();
@@ -10014,7 +10764,8 @@ fn format_status_hint_base(app: &TuiApp) -> String {
             return "type your answer · Enter send · Esc cancel".to_string();
         }
         if pending.request.allow_freeform {
-            return "Up/Down choose · type for free-form · Enter send · Esc cancel".to_string();
+            return "Up/Down choose · type selects Answer · Enter sends dotted row · Esc cancel"
+                .to_string();
         }
         return "Up/Down choose · Enter select · Esc cancel".to_string();
     }
@@ -10030,6 +10781,8 @@ fn format_status_hint_base(app: &TuiApp) -> String {
     } else if app.pending_approval.is_some() {
         return "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Esc cancel"
             .to_string();
+    } else if app.pending_feedback.is_some() {
+        return "Enter/Y send feedback · Esc/N discard".to_string();
     } else if app.cancel.is_some() {
         let mut hint = String::from(
             "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-T full transcript · Ctrl-Y copy · /help",
@@ -10482,20 +11235,16 @@ fn format_language_report(report: &squeezy_tools::LanguageReport) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PermissionStatus {
-    read: String,
-    edit: String,
+    mode: String,
     shell: String,
-    web: String,
     sandbox: String,
 }
 
 impl PermissionStatus {
     fn from_policy(policy: &PermissionPolicy) -> Self {
         Self {
-            read: policy.read.as_str().to_string(),
-            edit: policy.edit.as_str().to_string(),
+            mode: policy.mode.as_str().replace('_', "-"),
             shell: policy.shell.as_str().to_string(),
-            web: policy.web.as_str().to_string(),
             sandbox: format!(
                 "{}/net={}",
                 policy.shell_sandbox.mode.as_str(),
@@ -10505,10 +11254,7 @@ impl PermissionStatus {
     }
 
     fn compact(&self) -> String {
-        format!(
-            "perm=r:{} e:{} sh:{} web:{}",
-            self.read, self.edit, self.shell, self.web
-        )
+        format!("perm={}", self.mode)
     }
 }
 
@@ -10549,7 +11295,7 @@ pub(crate) struct TuiApp {
     pub(crate) show_reasoning_usage: bool,
     /// Render-time grouping of adjacent same-tool same-status calls into
     /// one card. Mirrors `config.tui.coalesce_tool_runs` at startup;
-    /// flipped at runtime via `/options coalesce_tool_runs = …`. Default
+    /// flipped at runtime via `/config coalesce_tool_runs = …`. Default
     /// `true`. Independent of the push-time retry coalescer
     /// ([`coalesce_tool_transcript_entry`]).
     pub(crate) coalesce_tool_runs: bool,
@@ -11460,6 +12206,7 @@ impl TranscriptEntry {
     fn message(id: u64, item: TranscriptItem, transcript_default: TranscriptDefault) -> Self {
         let collapsed = transcript_default == TranscriptDefault::Compact
             && item.role != Role::Assistant
+            && system_message_can_collapse(&item)
             && item.content.chars().count() > LONG_ASSISTANT_CHARS;
         Self {
             id,
@@ -11708,6 +12455,15 @@ impl TranscriptEntry {
             }
         }
     }
+}
+
+fn system_message_can_collapse(item: &TranscriptItem) -> bool {
+    item.role != Role::System
+        || item
+            .content
+            .lines()
+            .next()
+            .is_none_or(|header| header != "Context window")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11988,6 +12744,11 @@ struct TerminalGuard {
     /// `mode == AlternateScreen` (that mode is already fullscreen —
     /// no swap needed).
     overlay_screen_active: bool,
+    /// Whether the user opted into mouse capture. The transcript overlay
+    /// keeps this off by default so ordinary text selection still works;
+    /// when capture is enabled, its right-side scrollbar also receives
+    /// click/drag events.
+    mouse_capture: bool,
     exit_hint: Option<String>,
     startup_flushed: bool,
     transcript_flushed_len: usize,
@@ -12094,6 +12855,7 @@ impl TerminalGuard {
             overlay_terminal: None,
             mode,
             overlay_screen_active: false,
+            mouse_capture,
             exit_hint: None,
             startup_flushed: false,
             transcript_flushed_len: 0,
@@ -12251,13 +13013,8 @@ impl TerminalGuard {
                 .terminal
                 .as_mut()
                 .expect("primary inline terminal lost — unreachable after `enter`");
-            execute!(
-                inline.backend_mut(),
-                EnterAlternateScreen,
-                Clear(ClearType::All),
-                MoveTo(0, 0)
-            )
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+            enter_transcript_overlay_screen(inline.backend_mut())
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         }
         // Force the overlay terminal to paint from scratch — its
         // internal "previously drawn" buffer is stale (from the
@@ -12282,7 +13039,7 @@ impl TerminalGuard {
                 .overlay_terminal
                 .as_mut()
                 .expect("overlay terminal must be built when overlay-screen is active");
-            execute!(overlay.backend_mut(), LeaveAlternateScreen)
+            leave_transcript_overlay_screen(overlay.backend_mut(), self.mouse_capture)
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         }
         // The terminal emulator has restored the main buffer. The
@@ -12388,7 +13145,7 @@ impl Drop for TerminalGuard {
         if self.overlay_screen_active
             && let Some(overlay) = self.overlay_terminal.as_mut()
         {
-            let _ = execute!(overlay.backend_mut(), LeaveAlternateScreen);
+            let _ = leave_transcript_overlay_screen(overlay.backend_mut(), false);
             self.overlay_screen_active = false;
         }
         // Drop the overlay terminal explicitly so its writer
