@@ -90,6 +90,9 @@ async fn ollama_local_streaming_smoke() -> Result<()> {
             | LlmEvent::ReasoningDone(_)
             | LlmEvent::ContextOverflow { .. }
             | LlmEvent::ServerModel(_) => {}
+            // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
+            // are ignored by the smoke harness.
+            _ => { /* future variant */ }
         }
     }
 

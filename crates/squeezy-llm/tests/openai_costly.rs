@@ -72,6 +72,9 @@ async fn openai_responses_streaming_costly() -> Result<()> {
             | LlmEvent::ReasoningDone(_)
             | LlmEvent::ContextOverflow { .. }
             | LlmEvent::ServerModel(_) => {}
+            // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
+            // are ignored by the costly smoke test.
+            _ => { /* future variant */ }
         }
     }
 

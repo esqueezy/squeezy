@@ -5831,6 +5831,11 @@ impl TurnRuntime {
                         return Ok(());
                     }
                     LlmEvent::ContextOverflow { .. } | LlmEvent::ServerModel(_) => {}
+                    // `LlmEvent` is `#[non_exhaustive]`; unknown future
+                    // variants flow past without disturbing the turn — they
+                    // get a dedicated arm once consumers are taught about
+                    // them.
+                    _ => { /* future variant */ }
                 }
             }
 
@@ -8279,6 +8284,10 @@ async fn run_subagent_rounds(
                     };
                 }
                 LlmEvent::ContextOverflow { .. } | LlmEvent::ServerModel(_) => {}
+                // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
+                // are silently passed over in the subagent loop until a
+                // dedicated arm exists.
+                _ => { /* future variant */ }
             }
         }
 
@@ -11377,6 +11386,9 @@ Working target: {:?}",
             | LlmEvent::ReasoningDone(_)
             | LlmEvent::ContextOverflow { .. }
             | LlmEvent::ServerModel(_) => {}
+            // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
+            // contribute nothing to the classifier verdict text.
+            _ => { /* future variant */ }
         }
     }
     Some(parse_classifier_verdict(&text))

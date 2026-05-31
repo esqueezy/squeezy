@@ -329,6 +329,9 @@ async fn collect_reviewer_text(
             | LlmEvent::ReasoningDone(_)
             | LlmEvent::ContextOverflow { .. }
             | LlmEvent::ServerModel(_) => {}
+            // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
+            // contribute nothing to the reviewer's collected text.
+            _ => { /* future variant */ }
         }
     }
     Ok(text)
