@@ -1753,13 +1753,24 @@ fn edge_json(edge: &GraphEdge) -> Value {
 }
 
 fn hierarchy_node_json(graph: &squeezy_graph::SemanticGraph, node: &HierarchyNode) -> Value {
+    // The nested `symbol` mirror (id, name, kind, path, span) duplicated every
+    // field the node itself already carried except `path`, which we now hoist
+    // directly. A real hierarchy result measured at ~24kB before this trim was
+    // carrying ~10kB in nested symbol mirrors alone, and the redundant byte
+    // coordinates inside `span_json` doubled the spend. `freshness` was a
+    // per-node decoration the model never branched on (the file-level signal
+    // still flows via the typed graph event), so dropping it shaves another
+    // ~15B per node.
+    let path = graph
+        .symbols
+        .get(&node.id)
+        .map(|symbol| symbol.file_id.0.clone());
     json!({
         "id": node.id.0,
         "name": node.name,
         "kind": format!("{:?}", node.kind),
+        "path": path,
         "span": span_json(node.span),
-        "freshness": format!("{:?}", node.freshness),
-        "symbol": graph.symbols.get(&node.id).map(symbol_summary_json),
         "children": node.children.iter().map(|child| hierarchy_node_json(graph, child)).collect::<Vec<_>>(),
     })
 }
