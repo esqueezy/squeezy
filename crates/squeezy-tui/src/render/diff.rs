@@ -171,8 +171,7 @@ fn render_line(line: &DiffLine, gutter_width: usize, language_hint: Option<&str>
         DiffLineKind::Hunk => ' ',
     };
     let fg_style = match line.kind {
-        DiffLineKind::Add => add_fg_style(),
-        DiffLineKind::Delete => delete_fg_style(),
+        DiffLineKind::Add | DiffLineKind::Delete => Style::default(),
         DiffLineKind::Context => Style::default().fg(palette::QUIET),
         DiffLineKind::Hunk => Style::default(),
     };
@@ -199,9 +198,13 @@ fn render_line(line: &DiffLine, gutter_width: usize, language_hint: Option<&str>
     }
     spans.push(Span::styled(sign.to_string(), sign_style));
 
-    // Content spans: try syntax highlighting; fall back to a single span
-    // with the diff foreground color. Either way, layer the bg tint.
-    let content_spans = content_spans(&line.content, language_hint, fg_style);
+    // Changed rows intentionally skip syntax highlighting: the only add/delete
+    // cue should be the row background, not red/green or token-colored text.
+    let syntax_hint = match line.kind {
+        DiffLineKind::Add | DiffLineKind::Delete => None,
+        DiffLineKind::Context | DiffLineKind::Hunk => language_hint,
+    };
+    let content_spans = content_spans(&line.content, syntax_hint, fg_style);
     for mut span in content_spans {
         if let Some(bg) = bg {
             span.style = span.style.bg(bg);
@@ -209,7 +212,11 @@ fn render_line(line: &DiffLine, gutter_width: usize, language_hint: Option<&str>
         spans.push(span);
     }
 
-    Line::from(spans)
+    let mut rendered = Line::from(spans);
+    if let Some(bg) = bg {
+        rendered = rendered.style(Style::default().bg(bg));
+    }
+    rendered
 }
 
 fn content_spans(
@@ -228,22 +235,6 @@ fn content_spans(
         }
     }
     vec![Span::styled(content.to_string(), fallback_style)]
-}
-
-fn add_fg_style() -> Style {
-    Style::default()
-        .fg(palette::best_color(palette::rgb_components(
-            palette::DIFF_ADD_FG,
-        )))
-        .add_modifier(Modifier::BOLD)
-}
-
-fn delete_fg_style() -> Style {
-    Style::default()
-        .fg(palette::best_color(palette::rgb_components(
-            palette::DIFF_DEL_FG,
-        )))
-        .add_modifier(Modifier::BOLD)
 }
 
 /// Soft green tint behind added lines. The `#213A2B` dark / `#dafbe1`

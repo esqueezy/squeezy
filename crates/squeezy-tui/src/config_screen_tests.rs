@@ -566,13 +566,13 @@ fn path_editor_commits_pathbuf() {
     assert_eq!(p, std::path::PathBuf::from("/tmp/c"));
 }
 
-// ─── /options UX/UI eval fixture ──────────────────────────────────────────
+// ─── /config UX/UI eval fixture ───────────────────────────────────────────
 //
 // Companion to `crates/squeezy-eval/fixtures/scenarios/options-screen-routing.toml`
-// (slash-router level) and to the `unknown_options_slug_…` tests in
+// (slash-router level) and to the `unknown_config_slug_…` tests in
 // `lib_tests.rs` (TuiApp dispatch). The tests in this block drive
 // `ConfigScreenState` directly to cover the rendering, key handling,
-// and runtime-efficacy invariants identified by the /options UX audit.
+// and runtime-efficacy invariants identified by the /config UX audit.
 
 fn render_screen_to_text(state: &ConfigScreenState, width: u16, height: u16) -> String {
     use ratatui::Terminal;
@@ -1005,6 +1005,38 @@ fn sidebar_shows_more_below_marker_when_clipped() {
     );
 }
 
+#[test]
+fn sidebar_keeps_late_sections_visible_before_reset() {
+    for (section, label) in [
+        (SectionId::Feedback, "Feedback"),
+        (SectionId::Redaction, "Redaction"),
+        (SectionId::Web, "Web"),
+    ] {
+        let state = ConfigScreenState::new(AppConfig::default(), Some(section));
+        let rendered = render_screen_to_text(&state, 80, 14);
+        assert!(
+            rendered.contains(&format!("› {label}")),
+            "sidebar should scroll before Reset so {label} is visibly selected, got:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn field_pane_keeps_active_row_visible_when_clipped() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    state.field_index = state.row_count() - 2;
+    let active_label = state.current_field().label;
+    let rendered = render_screen_to_text(&state, 120, 14);
+    assert!(
+        rendered.contains(&format!("› {active_label}")),
+        "short field pane should scroll to the active row, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("▲"),
+        "scrolled field pane should show rows hidden above, got:\n{rendered}"
+    );
+}
+
 #[tokio::test]
 async fn tab_from_default_user_scope_advances_to_repo() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
@@ -1079,12 +1111,13 @@ async fn immediate_tier_enum_save_propagates_to_agent() {
 
 #[tokio::test]
 async fn immediate_tier_permission_save_propagates_to_agent() {
-    use squeezy_core::PermissionMode;
+    use squeezy_core::{PermissionMode, PermissionPolicyMode};
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Permissions));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.scope = ConfigScope::User;
-    state.field_index = 0;
+    state.effective.permissions.mode = PermissionPolicyMode::Custom;
+    state.field_index = 1;
     state.effective.permissions.read = PermissionMode::Allow;
     agent.replace_config(state.effective.clone());
     handle_key(
