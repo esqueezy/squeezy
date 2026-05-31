@@ -496,7 +496,7 @@ fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> boo
         return true;
     };
     let path = symbol.file_id.0.as_str();
-    if path == filter || path.ends_with(&format!("/{filter}")) {
+    if path_matches_exact_or_suffix(path, filter) {
         return true;
     }
     // Append fuzzy path matching as a fallback so casual queries like
@@ -1114,9 +1114,10 @@ fn graph_zero_hit_fallback(
     }
     let (path_value, language_value, reason) = match path {
         Some(path) => {
-            let file = graph.files.values().find(|file| {
-                file.relative_path == path || file.relative_path.ends_with(&format!("/{path}"))
-            });
+            let file = graph
+                .files
+                .values()
+                .find(|file| path_matches_exact_or_suffix(&file.relative_path, path));
             match file {
                 Some(file) => {
                     let reason = match file.language {
@@ -1334,7 +1335,14 @@ fn reference_packet(hit: &ReferenceHit) -> Value {
 
 fn reference_matches_path(hit: &ReferenceHit, filter: &str) -> bool {
     let path = hit.reference.file_id.0.as_str();
-    path == filter || path.ends_with(&format!("/{filter}"))
+    path_matches_exact_or_suffix(path, filter)
+}
+
+fn path_matches_exact_or_suffix(path: &str, filter: &str) -> bool {
+    path == filter
+        || path
+            .strip_suffix(filter)
+            .is_some_and(|prefix| prefix.ends_with('/'))
 }
 
 fn call_edge_packet(
@@ -1984,9 +1992,10 @@ fn read_slice_target(
         .ok_or_else(|| "read_slice requires path or symbol_id".to_string())?;
     let status = graph
         .and_then(|graph| {
-            graph.files.values().find(|file| {
-                file.relative_path == path || file.relative_path.ends_with(&format!("/{path}"))
-            })
+            graph
+                .files
+                .values()
+                .find(|file| path_matches_exact_or_suffix(&file.relative_path, &path))
         })
         .map(|file| graph_status_for_language(file.language))
         .unwrap_or("not_indexed");
