@@ -1,0 +1,652 @@
+//! Per-turn model routing — the "cheap-model fast path".
+//!
+//! A turn that starts on the user's headline model (Opus, Sonnet,
+//! GPT-5.5, …) is silently dispatched to the provider's small-fast tier
+//! (Haiku, GPT-mini, Gemini Flash Lite, Bedrock cheap variant, …) when
+//! the user prompt is "obviously simple" — a single well-specified
+//! operation such as "checkout the foo branch and run cargo test".
+//!
+//! Two-layer classifier:
+//!   1. **Heuristic prefilter** — pure-Rust pattern match on imperative
+//!      verbs, prompt length, multi-paragraph / ambiguity smells.
+//!   2. **Cheap-tier LLM judge** — single short JSON-constrained
+//!      classification call dispatched to the same cheap model that
+//!      would run the routed turn. Only fires when the heuristic
+//!      abstains and the prompt is shorter than `judge_max_chars`.
+//!
+//! Fallback is handled by [`EscalationState`], which the agent's
+//! streaming loop polls after every tool result and assistant-text
+//! delta. On signal (tool-call ceiling, error threshold, refusal
+//! phrase, parse error) the agent calls `replace_provider` on its own
+//! provider with the parent model and continues the same turn — no
+//! replay required.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use serde::Deserialize;
+use squeezy_core::{AppConfig, CostSnapshot, ReasoningEffort, RoutingConfig};
+use squeezy_llm::{CacheRetention, CacheSpec, LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
+use tokio_util::sync::CancellationToken;
+
+use crate::cheap_model_for;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheapReason {
+    HeuristicSlamDunk(&'static str),
+    /// Matched an entry from the user's `[routing].extra_heuristic_verbs`
+    /// allowlist rather than the built-in whitelist. Telemetry and the
+    /// `AgentEvent::TurnRouted` reason string carry the literal verb
+    /// (prefixed `extra_verb:`) so operators can audit which extension
+    /// fires how often.
+    ExtraVerb(Arc<str>),
+    LlmJudge,
+    UserExplicit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EscalationReason {
+    ToolCallCeiling,
+    ErrorThreshold,
+    RefusalPhrase,
+}
+
+impl EscalationReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolCallCeiling => "tool_call_ceiling",
+            Self::ErrorThreshold => "error_threshold",
+            Self::RefusalPhrase => "refusal_phrase",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum TurnRoutingDecision {
+    Parent,
+    Cheap {
+        reason: CheapReason,
+        model: Arc<str>,
+    },
+}
+
+impl TurnRoutingDecision {
+    pub(crate) fn is_cheap(&self) -> bool {
+        matches!(self, Self::Cheap { .. })
+    }
+
+    pub(crate) fn reason_label(&self) -> Option<String> {
+        match self {
+            Self::Cheap { reason, .. } => Some(match reason {
+                CheapReason::HeuristicSlamDunk(rule) => (*rule).to_string(),
+                CheapReason::ExtraVerb(verb) => format!("extra_verb:{verb}"),
+                CheapReason::LlmJudge => "llm_judge".to_string(),
+                CheapReason::UserExplicit => "user_explicit".to_string(),
+            }),
+            Self::Parent => None,
+        }
+    }
+}
+
+/// One-turn user overrides set by the `/cheap`, `/parent`, and `/router`
+/// slash commands. The dispatcher reads these once per turn; the
+/// transient `force_*` flags are cleared after consumption while
+/// `session_disabled` persists for the rest of the session.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct RoutingOverride {
+    pub force_cheap: bool,
+    pub force_parent: bool,
+    pub session_disabled: bool,
+}
+
+/// Sticky-window state. After an escalation, the next
+/// `escalation_sticky_turns` user prompts are dispatched on the parent
+/// model even if the classifier would route cheap — avoids flapping in
+/// the middle of a hard task. Decremented at the top of each
+/// `classify_turn` call.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct StickyEscalation {
+    pub remaining_turns: u8,
+}
+
+impl StickyEscalation {
+    pub fn engage(&mut self, sticky_turns: u8) {
+        self.remaining_turns = self.remaining_turns.max(sticky_turns);
+    }
+
+    /// Returns `true` if the current turn must use the parent model
+    /// because a recent escalation is still in its sticky window;
+    /// decrements the counter as a side effect so the window expires
+    /// naturally as the user continues to send prompts.
+    pub fn tick(&mut self) -> bool {
+        if self.remaining_turns == 0 {
+            return false;
+        }
+        self.remaining_turns -= 1;
+        true
+    }
+}
+
+/// Cross-turn router state owned by `Agent`. Reset between turns where
+/// appropriate (`pending_override.force_*` is one-shot); the sticky
+/// window persists until it expires naturally.
+#[derive(Debug, Default)]
+pub(crate) struct RoutingPersistentState {
+    pub sticky: StickyEscalation,
+    pub pending_override: RoutingOverride,
+}
+
+const HEURISTIC_VERBS: &[&str] = &[
+    "checkout", "rename", "run", "ls", "cat", "grep", "format", "fmt", "lint", "fetch", "stash",
+    "tag",
+];
+
+const AMBIGUITY_MARKERS: &[&str] = &[
+    "maybe",
+    "figure out",
+    "decide",
+    "design",
+    "refactor across",
+    "should i",
+    "should we",
+    "what if",
+    "think about",
+    "let me know",
+    "investigate",
+    "explore",
+    "research",
+    "legacy",
+    "across the",
+    "any test",
+    "any tests",
+    "any file",
+    "any files",
+    "the one that",
+];
+
+const LEADING_FILLER: &[&str] = &[
+    "please", "can", "could", "would", "you", "kindly", "now", "just", "quick", "quickly", "hey",
+    "hi", "hello",
+];
+
+/// Conjunctions and connector phrases that signal a compound, multi-step
+/// request when they sit between two verb-shaped clauses. We reject if
+/// any appear after the imperative verb because the cheap tier handles
+/// single mechanical asks much more reliably than compound ones (e.g.
+/// "rename foo to bar, then check if any test fails, then update README"
+/// is a classic borderline case the cheap model gets wrong).
+const COMPOUND_CONNECTORS: &[&str] = &[
+    ", then",
+    " then ",
+    "; then",
+    "; and",
+    "and check",
+    "and update",
+    "and verify",
+    "and confirm",
+    "and ensure",
+    "and make sure",
+];
+
+/// Strict prompt-shape limits for the heuristic prefilter. Anything
+/// outside these bounds falls through to the LLM judge (or `Parent`
+/// when the judge is disabled), never directly to "cheap" — the goal
+/// is to admit only the most obvious slam-dunks and let the judge
+/// handle everything else.
+const HEURISTIC_MAX_WORDS: usize = 15;
+const HEURISTIC_MAX_SENTENCES: usize = 1;
+
+const REFUSAL_PHRASES: &[&str] = &[
+    "i'm not sure",
+    "i am not sure",
+    "this is complex",
+    "need more context",
+    "i can't",
+    "i cannot",
+    "unable to",
+    "let me think",
+];
+
+/// Heuristic prefilter — pure function. Returns the matched rule name
+/// when the prompt is a slam-dunk for cheap routing, otherwise `None`.
+///
+/// Returning `None` does **not** mean "use the parent model"; it means
+/// "let the next layer decide" — for borderline prompts within the
+/// judge's char budget that translates to the LLM-judge call, and for
+/// everything else to `Parent`. The bar here is deliberately strict so
+/// the heuristic only fires on inputs the cheap tier handles
+/// unambiguously: short, single-clause, single-imperative requests
+/// naming the mechanical operation and its target. Anything longer,
+/// compound, or vague gets the second-opinion judge.
+pub(crate) fn heuristic_slam_dunk(user_input: &str, cfg: &RoutingConfig) -> Option<CheapReason> {
+    let trimmed = user_input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if (trimmed.len() as u32) > cfg.heuristic_max_chars {
+        return None;
+    }
+    if trimmed.contains("\n\n") {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if AMBIGUITY_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return None;
+    }
+    if COMPOUND_CONNECTORS
+        .iter()
+        .any(|connector| lower.contains(connector))
+    {
+        return None;
+    }
+    if count_words(&lower) > HEURISTIC_MAX_WORDS {
+        return None;
+    }
+    if count_sentences(trimmed) > HEURISTIC_MAX_SENTENCES {
+        return None;
+    }
+    let mut words = lower
+        .split(|c: char| !c.is_ascii_alphabetic() && c != '-')
+        .filter(|word| !word.is_empty());
+    let first = loop {
+        let word = words.next()?;
+        if !LEADING_FILLER.contains(&word) {
+            break word;
+        }
+    };
+    if let Some(verb) = HEURISTIC_VERBS.iter().copied().find(|verb| *verb == first) {
+        return Some(CheapReason::HeuristicSlamDunk(verb));
+    }
+    // User-extended whitelist runs AFTER the builtin so adding a verb
+    // can never override a hardcoded ambiguity marker (e.g. adding
+    // "investigate" to the extra list still falls through to `None`
+    // because the marker check earlier already rejected the prompt).
+    for extra in &cfg.extra_heuristic_verbs {
+        if extra.eq_ignore_ascii_case(first) {
+            return Some(CheapReason::ExtraVerb(Arc::from(first.to_string())));
+        }
+    }
+    None
+}
+
+fn count_words(lower: &str) -> usize {
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+        .filter(|word| !word.is_empty())
+        .count()
+}
+
+fn count_sentences(text: &str) -> usize {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    // Count terminators followed by whitespace OR end-of-string; treat
+    // bare-comma compound asks as already filtered by COMPOUND_CONNECTORS
+    // above so we don't have to teach this function about clause shape.
+    let mut sentences = 0usize;
+    let mut iter = trimmed.chars().peekable();
+    while let Some(ch) = iter.next() {
+        if matches!(ch, '.' | '!' | '?') {
+            match iter.peek() {
+                Some(next) if next.is_whitespace() => sentences += 1,
+                None => sentences += 1,
+                _ => {}
+            }
+        }
+    }
+    if sentences == 0 {
+        // Single declarative without a terminator counts as one sentence.
+        return 1;
+    }
+    // A trailing terminator means we have N sentences; if the last
+    // sentence has no terminator we still want to count it.
+    let last = trimmed.chars().last();
+    match last {
+        Some('.') | Some('!') | Some('?') => sentences,
+        _ => sentences + 1,
+    }
+}
+
+/// True iff `text` contains any low-confidence phrase from the
+/// assistant stream — used by the escalation detector.
+pub(crate) fn contains_refusal_phrase(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    REFUSAL_PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
+#[derive(Debug, Deserialize)]
+struct JudgeReply {
+    route: String,
+    #[serde(default, rename = "reason")]
+    _reason: String,
+}
+
+pub(crate) struct ClassifyTurnInputs<'a> {
+    pub user_input: &'a str,
+    pub provider: &'a Arc<dyn LlmProvider>,
+    pub provider_name: &'a str,
+    pub parent_model: &'a str,
+    pub config: &'a AppConfig,
+    pub has_image_input: bool,
+    pub overrides: RoutingOverride,
+    pub sticky: bool,
+}
+
+/// Result of classifying a single turn. Carries the routing decision
+/// plus any cost the LLM judge actually billed — zero `CostSnapshot`
+/// when the heuristic fired, the judge was disabled, the prompt fell
+/// outside `judge_max_chars`, or the judge call errored before
+/// emitting a `Completed` event.
+pub(crate) struct ClassifyResult {
+    pub decision: TurnRoutingDecision,
+    pub judge_cost: CostSnapshot,
+}
+
+impl ClassifyResult {
+    fn parent() -> Self {
+        Self {
+            decision: TurnRoutingDecision::Parent,
+            judge_cost: CostSnapshot::default(),
+        }
+    }
+
+    fn cheap(reason: CheapReason, model: Arc<str>) -> Self {
+        Self {
+            decision: TurnRoutingDecision::Cheap { reason, model },
+            judge_cost: CostSnapshot::default(),
+        }
+    }
+}
+
+pub(crate) async fn classify_turn(
+    inputs: ClassifyTurnInputs<'_>,
+    cancel: CancellationToken,
+) -> ClassifyResult {
+    let cfg = &inputs.config.routing;
+
+    if inputs.overrides.force_parent {
+        return ClassifyResult::parent();
+    }
+    // The master switch (config or `/router off`) gates implicit
+    // routing but never blocks an explicit `/cheap` request.
+    let auto_disabled = inputs.overrides.session_disabled || !cfg.auto_cheap;
+    if auto_disabled && !inputs.overrides.force_cheap {
+        return ClassifyResult::parent();
+    }
+    if inputs.sticky {
+        return ClassifyResult::parent();
+    }
+    if inputs.has_image_input && cfg.bypass_for_images {
+        return ClassifyResult::parent();
+    }
+
+    let Some(cheap) = cheap_model_for(inputs.provider_name, inputs.config) else {
+        return ClassifyResult::parent();
+    };
+    if cheap == inputs.parent_model {
+        // Routing to the same model would be a no-op — skip the
+        // classifier and the judge call entirely.
+        return ClassifyResult::parent();
+    }
+    let cheap: Arc<str> = Arc::from(cheap);
+
+    if inputs.overrides.force_cheap {
+        return ClassifyResult::cheap(CheapReason::UserExplicit, cheap);
+    }
+
+    if let Some(reason) = heuristic_slam_dunk(inputs.user_input, cfg) {
+        return ClassifyResult::cheap(reason, cheap);
+    }
+
+    if !cfg.auto_cheap_llm_judge {
+        return ClassifyResult::parent();
+    }
+    let prompt_chars = inputs.user_input.chars().count() as u32;
+    if prompt_chars == 0 || prompt_chars > cfg.judge_max_chars {
+        return ClassifyResult::parent();
+    }
+    let (verdict, judge_cost) = run_judge(
+        inputs.provider,
+        inputs.provider_name,
+        &cheap,
+        inputs.user_input,
+        cancel,
+    )
+    .await;
+    match verdict {
+        Some(true) => ClassifyResult {
+            decision: TurnRoutingDecision::Cheap {
+                reason: CheapReason::LlmJudge,
+                model: cheap,
+            },
+            judge_cost,
+        },
+        _ => ClassifyResult {
+            decision: TurnRoutingDecision::Parent,
+            judge_cost,
+        },
+    }
+}
+
+/// Estimate the savings of running this turn on the cheap tier
+/// instead of the parent model. Re-prices the actual provider-reported
+/// `cost` (token counts) at the parent's per-Mtok rate via the same
+/// `squeezy_llm::estimate_cost` helper the cap pre-flight uses, then
+/// subtracts the cheap-tier bill. Returns `0` when either side has no
+/// pricing entry in the registry — the field is best-effort.
+pub(crate) fn estimate_routing_savings(
+    provider: &str,
+    parent_model: &str,
+    actual_cheap_cost: &CostSnapshot,
+) -> u64 {
+    let Some(parent_estimate) =
+        squeezy_llm::estimate_cost(provider, parent_model, actual_cheap_cost)
+    else {
+        return 0;
+    };
+    let actual = actual_cheap_cost.estimated_usd_micros.unwrap_or(0);
+    parent_estimate.saturating_sub(actual)
+}
+
+// Per-provider judge prompts. All three carry the same routing
+// guidance — short, well-specified mechanical asks go cheap;
+// architectural / exploratory / debugging asks go parent — but the
+// formatting cues differ to match what each provider's small-fast
+// tier responds best to. The default (Anthropic, Bedrock, OpenAI-
+// compatible aggregators that proxy Anthropic) emphasises the
+// single-line JSON object; the OpenAI variant adds extra weight to
+// the "no prose" constraint because OpenAI nanos otherwise lead with
+// a brief preamble; the Google variant adds explicit "no markdown"
+// because Gemini Flash Lite likes to wrap JSON in ```json fences
+// even when told not to.
+const JUDGE_INSTRUCTIONS_DEFAULT: &str = concat!(
+    "You are a routing classifier deciding which LLM should handle a coding-agent turn. ",
+    "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast and ",
+    "inexpensive but weaker at ambiguous instructions and architectural judgement. ",
+    "Reply with a SINGLE JSON object on one line, no markdown, no prose: ",
+    "{\"route\":\"cheap\"|\"parent\",\"reason\":\"<short explanation>\"}.\n\n",
+    "Choose 'cheap' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
+    "operation plus its targets (e.g. \"checkout branch X and run cargo test\", \"rename foo() to bar() in src/lib.rs\"). ",
+    "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
+    "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
+);
+
+const JUDGE_INSTRUCTIONS_OPENAI: &str = concat!(
+    "You are a routing classifier. Output ONLY a single JSON object on one line. ",
+    "Do NOT include any prose, preamble, explanation, or trailing text. ",
+    "Schema: {\"route\":\"cheap\"|\"parent\",\"reason\":\"<short explanation>\"}.\n\n",
+    "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast but ",
+    "weaker at ambiguous instructions and architectural judgement. ",
+    "Choose 'cheap' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
+    "operation plus its targets (e.g. \"checkout branch X and run cargo test\", \"rename foo() to bar() in src/lib.rs\"). ",
+    "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
+    "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
+);
+
+const JUDGE_INSTRUCTIONS_GOOGLE: &str = concat!(
+    "You are a routing classifier. Reply with ONLY a single JSON object on one line — NO markdown fences, ",
+    "NO code blocks, NO prose, NO commentary. ",
+    "Schema: {\"route\":\"cheap\"|\"parent\",\"reason\":\"<short explanation>\"}.\n\n",
+    "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast but ",
+    "weaker at ambiguous instructions and architectural judgement. ",
+    "Choose 'cheap' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
+    "operation plus its targets (e.g. \"checkout branch X and run cargo test\", \"rename foo() to bar() in src/lib.rs\"). ",
+    "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
+    "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
+);
+
+fn judge_instructions_for(provider_name: &str) -> &'static str {
+    match provider_name {
+        "openai" | "openai_codex" | "azure_openai" => JUDGE_INSTRUCTIONS_OPENAI,
+        "google" => JUDGE_INSTRUCTIONS_GOOGLE,
+        _ => JUDGE_INSTRUCTIONS_DEFAULT,
+    }
+}
+
+const JUDGE_TIMEOUT_MS: u64 = 10_000;
+const JUDGE_MAX_OUTPUT_TOKENS: u32 = 80;
+
+async fn run_judge(
+    provider: &Arc<dyn LlmProvider>,
+    provider_name: &str,
+    cheap_model: &Arc<str>,
+    user_input: &str,
+    cancel: CancellationToken,
+) -> (Option<bool>, CostSnapshot) {
+    // The judge's system prompt is static, so we mark the request for
+    // long-retention provider prompt caching keyed by the provider's
+    // short name. Anthropic plants a `cache_control` block on the
+    // system prompt, OpenAI Responses forwards `prompt_cache_key` +
+    // `prompt_cache_retention: 24h`, Bedrock plants a typed
+    // `CachePoint` block — the routing-judge prefix becomes a cache
+    // hit on every subsequent borderline turn within the retention
+    // window, which is the bulk of the judge's cost.
+    let cache = CacheSpec {
+        key: Some(format!("routing-judge-v1:{provider_name}")),
+        retention: CacheRetention::Long,
+    };
+    let request = LlmRequest {
+        model: cheap_model.clone(),
+        instructions: Arc::from(judge_instructions_for(provider_name).to_string()),
+        input: Arc::from(vec![LlmInputItem::UserText(user_input.to_string())]),
+        max_output_tokens: Some(JUDGE_MAX_OUTPUT_TOKENS),
+        response_verbosity: None,
+        reasoning_effort: Some(ReasoningEffort::Low),
+        previous_response_id: None,
+        cache_key: None,
+        cache,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: Arc::from(Vec::new()),
+    };
+    let mut stream = provider.stream_response(request, cancel.clone());
+    let fetch = async {
+        let mut text = String::new();
+        let mut cost = CostSnapshot::default();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(LlmEvent::TextDelta(delta)) => text.push_str(&delta),
+                Ok(LlmEvent::Completed {
+                    cost: completed_cost,
+                    ..
+                }) => {
+                    cost = completed_cost;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => return (None, CostSnapshot::default()),
+            }
+        }
+        (Some(text), cost)
+    };
+    let (raw, cost) = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return (None, CostSnapshot::default()),
+        _ = tokio::time::sleep(Duration::from_millis(JUDGE_TIMEOUT_MS)) => {
+            return (None, CostSnapshot::default());
+        }
+        result = fetch => result,
+    };
+    let verdict = raw.and_then(|text| parse_judge_reply(&text));
+    (verdict, cost)
+}
+
+fn parse_judge_reply(raw: &str) -> Option<bool> {
+    let trimmed = raw.trim();
+    let body = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(|stripped| stripped.trim().trim_end_matches("```").trim())
+        .unwrap_or(trimmed);
+    let reply: JudgeReply = serde_json::from_str(body).ok()?;
+    match reply.route.trim().to_ascii_lowercase().as_str() {
+        "cheap" => Some(true),
+        "parent" => Some(false),
+        _ => None,
+    }
+}
+
+/// Per-turn escalation state. The streaming loop calls
+/// [`Self::maybe_trigger`] after each tool result and each assistant
+/// text flush; on `Some(reason)` the agent swaps to the parent model
+/// for the rest of the turn and engages the sticky window.
+#[derive(Debug, Default)]
+pub(crate) struct EscalationState {
+    pub triggered: Option<EscalationReason>,
+}
+
+impl EscalationState {
+    /// The detector intentionally takes seven orthogonal signals
+    /// (three counters, the latest assistant text, the on-cheap-turn
+    /// gate, the routing config, and the parent's tool budget) so the
+    /// caller does not have to construct a transient struct just to
+    /// poll for escalation on every round and every text delta. The
+    /// clippy `too_many_arguments` lint flags the 8 args; we allow it
+    /// here rather than introduce a wrapper type that would obscure
+    /// the call-site contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn maybe_trigger(
+        &mut self,
+        tool_calls: u64,
+        tool_errors: u64,
+        budget_denials: u64,
+        recent_assistant_text: &str,
+        on_cheap_turn: bool,
+        cfg: &RoutingConfig,
+        max_tool_calls_per_turn: u64,
+    ) -> Option<EscalationReason> {
+        if !on_cheap_turn || self.triggered.is_some() {
+            return None;
+        }
+        let ceiling = cfg.resolved_cheap_escalation_tool_calls(max_tool_calls_per_turn);
+        if tool_calls > ceiling {
+            self.triggered = Some(EscalationReason::ToolCallCeiling);
+            return self.triggered;
+        }
+        let error_threshold = cfg.cheap_escalation_error_threshold as u64;
+        if tool_errors.saturating_add(budget_denials) >= error_threshold && error_threshold > 0 {
+            self.triggered = Some(EscalationReason::ErrorThreshold);
+            return self.triggered;
+        }
+        if contains_refusal_phrase(recent_assistant_text) {
+            self.triggered = Some(EscalationReason::RefusalPhrase);
+            return self.triggered;
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+#[path = "turn_router_tests.rs"]
+mod tests;

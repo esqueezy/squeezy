@@ -3106,6 +3106,21 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             Err(error) => app.status = format!("unpin failed: {error}"),
         },
         DispatchCommand::Diff => handle_slash_diff(app),
+        DispatchCommand::Cheap => {
+            agent.request_routing_force_cheap();
+            app.push_transcript_item(TranscriptItem::system(
+                "next turn forced to the cheap model (one-shot)".to_string(),
+            ));
+            app.status = "routing: forced cheap next turn".to_string();
+        }
+        DispatchCommand::Parent => {
+            agent.request_routing_force_parent();
+            app.push_transcript_item(TranscriptItem::system(
+                "next turn forced to the parent model (one-shot)".to_string(),
+            ));
+            app.status = "routing: forced parent next turn".to_string();
+        }
+        DispatchCommand::Router { value } => handle_slash_router(app, agent, value.as_deref()),
         DispatchCommand::Effort { value } => handle_slash_effort(app, agent, value.as_deref()),
         DispatchCommand::Verbosity { value } => {
             handle_slash_verbosity(app, agent, value.as_deref());
@@ -4021,6 +4036,41 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
             NotifySeverity::Warn,
         );
     }
+}
+
+/// `/router [on|off]`. Bare prints the current state and usage hint.
+/// `on` re-enables session-wide auto-routing to the cheap tier; `off`
+/// disables it (explicit `/cheap` still works). The toggle is one-shot
+/// at the override level — the user's persisted `[routing].auto_cheap`
+/// config is not touched.
+fn handle_slash_router(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
+    let snapshot = agent.config_snapshot();
+    let config_default_on = snapshot.routing.auto_cheap;
+    let Some(raw) = value else {
+        let state = if config_default_on {
+            "enabled"
+        } else {
+            "disabled (config default)"
+        };
+        app.status = format!("routing: {state}");
+        app.push_transcript_item(TranscriptItem::system(format!(
+            "routing = {state}\nusage: /router [on|off]"
+        )));
+        return;
+    };
+    let disabled = match raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "enable" | "enabled" | "true" | "1" => false,
+        "off" | "disable" | "disabled" | "false" | "0" => true,
+        _ => {
+            app.status = format!("unknown router state {raw:?}; expected on or off");
+            return;
+        }
+    };
+    agent.set_routing_session_disabled(disabled);
+    app.status = format!(
+        "routing → {}",
+        if disabled { "disabled" } else { "enabled" }
+    );
 }
 
 /// `/verbosity [concise|normal|verbose]`. Bare prints the current

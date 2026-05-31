@@ -7941,6 +7941,9 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
             "session-cleanup",
         ),
         (DispatchCommand::Pin { target: None }, "pin"),
+        (DispatchCommand::Cheap, "cheap"),
+        (DispatchCommand::Parent, "parent"),
+        (DispatchCommand::Router { value: None }, "router"),
     ];
     for (cmd, expected_kind) in cases {
         let outcome = agent.dispatch_command(cmd.clone()).await;
