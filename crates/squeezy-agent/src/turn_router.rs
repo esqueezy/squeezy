@@ -35,6 +35,12 @@ use crate::cheap_model_for;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CheapReason {
     HeuristicSlamDunk(&'static str),
+    /// Matched an entry from the user's `[routing].extra_heuristic_verbs`
+    /// allowlist rather than the built-in whitelist. Telemetry and the
+    /// `AgentEvent::TurnRouted` reason string carry the literal verb
+    /// (prefixed `extra_verb:`) so operators can audit which extension
+    /// fires how often.
+    ExtraVerb(Arc<str>),
     LlmJudge,
     UserExplicit,
 }
@@ -70,12 +76,13 @@ impl TurnRoutingDecision {
         matches!(self, Self::Cheap { .. })
     }
 
-    pub(crate) fn reason_label(&self) -> Option<&'static str> {
+    pub(crate) fn reason_label(&self) -> Option<String> {
         match self {
             Self::Cheap { reason, .. } => Some(match reason {
-                CheapReason::HeuristicSlamDunk(rule) => rule,
-                CheapReason::LlmJudge => "llm_judge",
-                CheapReason::UserExplicit => "user_explicit",
+                CheapReason::HeuristicSlamDunk(rule) => (*rule).to_string(),
+                CheapReason::ExtraVerb(verb) => format!("extra_verb:{verb}"),
+                CheapReason::LlmJudge => "llm_judge".to_string(),
+                CheapReason::UserExplicit => "user_explicit".to_string(),
             }),
             Self::Parent => None,
         }
@@ -212,7 +219,7 @@ const REFUSAL_PHRASES: &[&str] = &[
 /// unambiguously: short, single-clause, single-imperative requests
 /// naming the mechanical operation and its target. Anything longer,
 /// compound, or vague gets the second-opinion judge.
-pub(crate) fn heuristic_slam_dunk(user_input: &str, cfg: &RoutingConfig) -> Option<&'static str> {
+pub(crate) fn heuristic_slam_dunk(user_input: &str, cfg: &RoutingConfig) -> Option<CheapReason> {
     let trimmed = user_input.trim();
     if trimmed.is_empty() {
         return None;
@@ -251,7 +258,19 @@ pub(crate) fn heuristic_slam_dunk(user_input: &str, cfg: &RoutingConfig) -> Opti
             break word;
         }
     };
-    HEURISTIC_VERBS.iter().copied().find(|verb| *verb == first)
+    if let Some(verb) = HEURISTIC_VERBS.iter().copied().find(|verb| *verb == first) {
+        return Some(CheapReason::HeuristicSlamDunk(verb));
+    }
+    // User-extended whitelist runs AFTER the builtin so adding a verb
+    // can never override a hardcoded ambiguity marker (e.g. adding
+    // "investigate" to the extra list still falls through to `None`
+    // because the marker check earlier already rejected the prompt).
+    for extra in &cfg.extra_heuristic_verbs {
+        if extra.eq_ignore_ascii_case(first) {
+            return Some(CheapReason::ExtraVerb(Arc::from(first.to_string())));
+        }
+    }
+    None
 }
 
 fn count_words(lower: &str) -> usize {
@@ -383,8 +402,8 @@ pub(crate) async fn classify_turn(
         return ClassifyResult::cheap(CheapReason::UserExplicit, cheap);
     }
 
-    if let Some(rule) = heuristic_slam_dunk(inputs.user_input, cfg) {
-        return ClassifyResult::cheap(CheapReason::HeuristicSlamDunk(rule), cheap);
+    if let Some(reason) = heuristic_slam_dunk(inputs.user_input, cfg) {
+        return ClassifyResult::cheap(reason, cheap);
     }
 
     if !cfg.auto_cheap_llm_judge {
@@ -437,7 +456,18 @@ pub(crate) fn estimate_routing_savings(
     parent_estimate.saturating_sub(actual)
 }
 
-const JUDGE_INSTRUCTIONS: &str = concat!(
+// Per-provider judge prompts. All three carry the same routing
+// guidance — short, well-specified mechanical asks go cheap;
+// architectural / exploratory / debugging asks go parent — but the
+// formatting cues differ to match what each provider's small-fast
+// tier responds best to. The default (Anthropic, Bedrock, OpenAI-
+// compatible aggregators that proxy Anthropic) emphasises the
+// single-line JSON object; the OpenAI variant adds extra weight to
+// the "no prose" constraint because OpenAI nanos otherwise lead with
+// a brief preamble; the Google variant adds explicit "no markdown"
+// because Gemini Flash Lite likes to wrap JSON in ```json fences
+// even when told not to.
+const JUDGE_INSTRUCTIONS_DEFAULT: &str = concat!(
     "You are a routing classifier deciding which LLM should handle a coding-agent turn. ",
     "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast and ",
     "inexpensive but weaker at ambiguous instructions and architectural judgement. ",
@@ -448,6 +478,38 @@ const JUDGE_INSTRUCTIONS: &str = concat!(
     "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
     "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
 );
+
+const JUDGE_INSTRUCTIONS_OPENAI: &str = concat!(
+    "You are a routing classifier. Output ONLY a single JSON object on one line. ",
+    "Do NOT include any prose, preamble, explanation, or trailing text. ",
+    "Schema: {\"route\":\"cheap\"|\"parent\",\"reason\":\"<short explanation>\"}.\n\n",
+    "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast but ",
+    "weaker at ambiguous instructions and architectural judgement. ",
+    "Choose 'cheap' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
+    "operation plus its targets (e.g. \"checkout branch X and run cargo test\", \"rename foo() to bar() in src/lib.rs\"). ",
+    "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
+    "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
+);
+
+const JUDGE_INSTRUCTIONS_GOOGLE: &str = concat!(
+    "You are a routing classifier. Reply with ONLY a single JSON object on one line — NO markdown fences, ",
+    "NO code blocks, NO prose, NO commentary. ",
+    "Schema: {\"route\":\"cheap\"|\"parent\",\"reason\":\"<short explanation>\"}.\n\n",
+    "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast but ",
+    "weaker at ambiguous instructions and architectural judgement. ",
+    "Choose 'cheap' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
+    "operation plus its targets (e.g. \"checkout branch X and run cargo test\", \"rename foo() to bar() in src/lib.rs\"). ",
+    "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
+    "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
+);
+
+fn judge_instructions_for(provider_name: &str) -> &'static str {
+    match provider_name {
+        "openai" | "openai_codex" | "azure_openai" => JUDGE_INSTRUCTIONS_OPENAI,
+        "google" => JUDGE_INSTRUCTIONS_GOOGLE,
+        _ => JUDGE_INSTRUCTIONS_DEFAULT,
+    }
+}
 
 const JUDGE_TIMEOUT_MS: u64 = 10_000;
 const JUDGE_MAX_OUTPUT_TOKENS: u32 = 80;
@@ -473,7 +535,7 @@ async fn run_judge(
     };
     let request = LlmRequest {
         model: cheap_model.clone(),
-        instructions: Arc::from(JUDGE_INSTRUCTIONS.to_string()),
+        instructions: Arc::from(judge_instructions_for(provider_name).to_string()),
         input: Arc::from(vec![LlmInputItem::UserText(user_input.to_string())]),
         max_output_tokens: Some(JUDGE_MAX_OUTPUT_TOKENS),
         response_verbosity: None,

@@ -1327,9 +1327,17 @@ impl AppConfig {
             self.routing.heuristic_max_chars
         ));
         output.push_str(&format!(
-            "judge_max_chars = {}\n\n",
+            "judge_max_chars = {}\n",
             self.routing.judge_max_chars
         ));
+        if self.routing.extra_heuristic_verbs.is_empty() {
+            output.push_str("# extra_heuristic_verbs = []  # user-extended verb whitelist\n\n");
+        } else {
+            output.push_str(&format!(
+                "extra_heuristic_verbs = {}\n\n",
+                toml_string_array(&self.routing.extra_heuristic_verbs)
+            ));
+        }
 
         output.push_str("[permissions]\n");
         output.push_str(&format!(
@@ -3280,6 +3288,15 @@ pub struct RoutingConfig {
     pub bypass_for_images: bool,
     pub heuristic_max_chars: u32,
     pub judge_max_chars: u32,
+    /// User-extended heuristic verb whitelist. The built-in whitelist
+    /// is deliberately narrow because false positives bypass the LLM
+    /// judge — adding an entry here widens the heuristic surface but
+    /// the matched prompt still has to clear the same ambiguity-marker,
+    /// compound-connector, word-count, and sentence-count guards as a
+    /// built-in match. Empty by default. Configured via
+    /// `[routing].extra_heuristic_verbs = ["deploy", "tail"]` in TOML
+    /// or `SQUEEZY_ROUTING_EXTRA_HEURISTIC_VERBS=deploy,tail` env.
+    pub extra_heuristic_verbs: Vec<String>,
 }
 
 impl RoutingConfig {
@@ -3334,6 +3351,15 @@ impl RoutingConfig {
                 .and_then(|raw| raw.parse::<u32>().ok())
                 .or(settings.judge_max_chars)
                 .unwrap_or(DEFAULT_ROUTING_JUDGE_MAX_CHARS),
+            extra_heuristic_verbs: get_var("SQUEEZY_ROUTING_EXTRA_HEURISTIC_VERBS")
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|verb| verb.trim().to_string())
+                        .filter(|verb| !verb.is_empty())
+                        .collect()
+                })
+                .or(settings.extra_heuristic_verbs)
+                .unwrap_or_default(),
         }
     }
 
@@ -3361,6 +3387,7 @@ pub struct RoutingSettings {
     pub bypass_for_images: Option<bool>,
     pub heuristic_max_chars: Option<u32>,
     pub judge_max_chars: Option<u32>,
+    pub extra_heuristic_verbs: Option<Vec<String>>,
 }
 
 impl RoutingSettings {
@@ -3376,6 +3403,7 @@ impl RoutingSettings {
                 "bypass_for_images",
                 "heuristic_max_chars",
                 "judge_max_chars",
+                "extra_heuristic_verbs",
             ],
             source,
             path,
@@ -3424,6 +3452,12 @@ impl RoutingSettings {
                 source,
                 &field(path, "judge_max_chars"),
             )?,
+            extra_heuristic_verbs: string_array_value(
+                table,
+                "extra_heuristic_verbs",
+                source,
+                &field(path, "extra_heuristic_verbs"),
+            )?,
         })
     }
 
@@ -3445,6 +3479,7 @@ impl RoutingSettings {
         replace_if_some(&mut self.bypass_for_images, next.bypass_for_images);
         replace_if_some(&mut self.heuristic_max_chars, next.heuristic_max_chars);
         replace_if_some(&mut self.judge_max_chars, next.judge_max_chars);
+        merge_string_lists(&mut self.extra_heuristic_verbs, next.extra_heuristic_verbs);
     }
 }
 

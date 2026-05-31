@@ -4,9 +4,21 @@ use squeezy_core::{
 };
 
 use super::{
-    EscalationReason, EscalationState, contains_refusal_phrase, estimate_routing_savings,
-    heuristic_slam_dunk,
+    CheapReason, EscalationReason, EscalationState, contains_refusal_phrase,
+    estimate_routing_savings,
 };
+
+/// Test-only wrapper that keeps the previous `Option<&'static str>`
+/// shape so existing assertions continue to read as
+/// `Some("verb") | None`. Built-in matches surface their static verb;
+/// extra-verb matches surface `None` here (covered by dedicated tests
+/// below that target the `ExtraVerb` variant explicitly).
+fn heuristic_slam_dunk(input: &str, cfg: &RoutingConfig) -> Option<&'static str> {
+    match super::heuristic_slam_dunk(input, cfg) {
+        Some(CheapReason::HeuristicSlamDunk(verb)) => Some(verb),
+        _ => None,
+    }
+}
 
 fn default_routing_config() -> RoutingConfig {
     RoutingConfig {
@@ -18,6 +30,7 @@ fn default_routing_config() -> RoutingConfig {
         bypass_for_images: true,
         heuristic_max_chars: DEFAULT_ROUTING_HEURISTIC_MAX_CHARS,
         judge_max_chars: DEFAULT_ROUTING_JUDGE_MAX_CHARS,
+        extra_heuristic_verbs: Vec::new(),
     }
 }
 
@@ -391,6 +404,115 @@ fn count_sentences_handles_terminators() {
     assert_eq!(super::count_sentences("run cargo test. then commit."), 2);
     assert_eq!(super::count_sentences("first. second. third."), 3);
     assert_eq!(super::count_sentences("first? then second!"), 2);
+}
+
+// -- Per-provider judge prompts --------------------------------------------
+
+#[test]
+fn judge_instructions_default_used_for_anthropic_bedrock_etc() {
+    let default = super::judge_instructions_for("anthropic");
+    assert_eq!(default, super::judge_instructions_for("bedrock"));
+    assert_eq!(default, super::judge_instructions_for("openrouter"));
+    assert_eq!(default, super::judge_instructions_for("vercel"));
+    assert_eq!(default, super::judge_instructions_for("portkey"));
+    assert_eq!(default, super::judge_instructions_for("unknown-provider"));
+}
+
+#[test]
+fn judge_instructions_openai_emphasises_no_prose() {
+    let openai = super::judge_instructions_for("openai");
+    assert_eq!(openai, super::judge_instructions_for("openai_codex"));
+    assert_eq!(openai, super::judge_instructions_for("azure_openai"));
+    assert!(
+        openai.contains("ONLY"),
+        "openai variant must emphasise no-prose: {openai}"
+    );
+    assert_ne!(openai, super::judge_instructions_for("anthropic"));
+}
+
+#[test]
+fn judge_instructions_google_forbids_markdown_fences() {
+    let google = super::judge_instructions_for("google");
+    assert!(
+        google.contains("NO markdown") || google.contains("NO code blocks"),
+        "google variant must forbid markdown fences: {google}"
+    );
+    assert_ne!(google, super::judge_instructions_for("anthropic"));
+}
+
+#[test]
+fn judge_instructions_all_variants_keep_routing_guidance() {
+    for provider in ["anthropic", "openai", "google"] {
+        let prompt = super::judge_instructions_for(provider);
+        assert!(
+            prompt.contains("'cheap'") && prompt.contains("'parent'"),
+            "{provider} variant must carry the cheap/parent guidance: {prompt}"
+        );
+        assert!(
+            prompt.contains("JSON"),
+            "{provider} variant must instruct JSON output: {prompt}"
+        );
+    }
+}
+
+// -- User-extended heuristic whitelist -------------------------------------
+
+fn cfg_with_extras(extras: &[&str]) -> RoutingConfig {
+    let mut cfg = default_routing_config();
+    cfg.extra_heuristic_verbs = extras.iter().map(|s| s.to_string()).collect();
+    cfg
+}
+
+#[test]
+fn extra_verb_fires_when_first_word_matches_user_list() {
+    let cfg = cfg_with_extras(&["deploy"]);
+    match super::heuristic_slam_dunk("deploy to staging", &cfg) {
+        Some(CheapReason::ExtraVerb(verb)) => assert_eq!(&*verb, "deploy"),
+        other => panic!("expected ExtraVerb match, got {other:?}"),
+    }
+}
+
+#[test]
+fn extra_verb_match_is_case_insensitive() {
+    let cfg = cfg_with_extras(&["Deploy"]);
+    match super::heuristic_slam_dunk("DEPLOY to staging", &cfg) {
+        Some(CheapReason::ExtraVerb(verb)) => assert_eq!(&*verb, "deploy"),
+        other => panic!("expected ExtraVerb match, got {other:?}"),
+    }
+}
+
+#[test]
+fn extra_verb_still_subject_to_ambiguity_marker_guard() {
+    // Adding "investigate" to the user list cannot override the
+    // hardcoded ambiguity marker — the prompt is rejected before the
+    // verb check fires.
+    let cfg = cfg_with_extras(&["investigate"]);
+    assert!(
+        super::heuristic_slam_dunk("investigate the failing test", &cfg).is_none(),
+        "extra verb must not override the ambiguity marker guard"
+    );
+}
+
+#[test]
+fn extra_verb_still_subject_to_compound_connector_guard() {
+    let cfg = cfg_with_extras(&["deploy"]);
+    assert!(
+        super::heuristic_slam_dunk("deploy to staging and verify the rollout", &cfg).is_none(),
+        "extra verb must not override the compound connector guard"
+    );
+}
+
+#[test]
+fn extra_verb_does_not_shadow_builtin_match() {
+    // Built-ins check first; adding "run" to the extra list is fine
+    // but the matched reason should be the built-in `HeuristicSlamDunk`
+    // (with `&'static str` payload) rather than the dynamic
+    // `ExtraVerb` variant.
+    let cfg = cfg_with_extras(&["run"]);
+    match super::heuristic_slam_dunk("run cargo test", &cfg) {
+        Some(CheapReason::HeuristicSlamDunk(verb)) => assert_eq!(verb, "run"),
+        other => panic!("expected built-in match, got {other:?}"),
+    }
 }
 
 // -- Routing savings math --------------------------------------------------

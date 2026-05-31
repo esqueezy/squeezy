@@ -5336,14 +5336,14 @@ impl TurnRuntime {
             broker.metrics.routed_to_cheap = true;
             if let Some(reason_label) = decision.reason_label() {
                 self.telemetry
-                    .spawn(TelemetryEvent::routing_routed(reason_label));
+                    .spawn(TelemetryEvent::routing_routed(&reason_label));
                 let _ = self
                     .tx
                     .send(AgentEvent::TurnRouted {
                         turn_id: self.turn_id,
                         from: parent_model_str.clone(),
                         to: current_model.to_string(),
-                        reason: reason_label.to_string(),
+                        reason: reason_label,
                     })
                     .await;
             }
@@ -5642,6 +5642,59 @@ impl TurnRuntime {
                             .is_err()
                         {
                             return Ok(());
+                        }
+                        // Mid-stream escalation: a refusal phrase in
+                        // the assistant text flips the router to the
+                        // parent model *immediately* instead of
+                        // waiting for the next round's preflight
+                        // check. The detector latches on first
+                        // trigger so polling every delta cannot
+                        // double-emit, and the input is the full
+                        // accumulated `assistant_message` so a
+                        // phrase straddling two deltas still
+                        // matches. Tool-call ceiling and error
+                        // threshold are also re-evaluated here for
+                        // free; they only flip when the round-end
+                        // accounting would have caught them anyway,
+                        // but the early swap shaves wasted output.
+                        if on_cheap_turn
+                            && let Some(reason) = escalation_state.maybe_trigger(
+                                broker.metrics.tool_calls,
+                                broker.metrics.tool_errors,
+                                broker.metrics.budget_denials,
+                                &assistant_message,
+                                on_cheap_turn,
+                                &self.config.routing,
+                                self.config.max_tool_calls_per_turn,
+                            )
+                        {
+                            let from_model = current_model.to_string();
+                            current_model = parent_model.clone();
+                            on_cheap_turn = false;
+                            broker.metrics.escalated_to_parent = true;
+                            let sticky_remaining = {
+                                let mut state =
+                                    self.routing_state.lock().expect("routing state lock");
+                                state
+                                    .sticky
+                                    .engage(self.config.routing.escalation_sticky_turns);
+                                state.sticky.remaining_turns
+                            };
+                            self.conversation_state
+                                .lock()
+                                .await
+                                .set_routing_sticky_remaining_turns(sticky_remaining);
+                            self.telemetry
+                                .spawn(TelemetryEvent::routing_escalated(reason.as_str()));
+                            let _ = self
+                                .tx
+                                .send(AgentEvent::TurnRouted {
+                                    turn_id: self.turn_id,
+                                    from: from_model,
+                                    to: parent_model_str.clone(),
+                                    reason: format!("escalated_{}", reason.as_str()),
+                                })
+                                .await;
                         }
                     }
                     LlmEvent::ReasoningDelta { text, .. } => {
