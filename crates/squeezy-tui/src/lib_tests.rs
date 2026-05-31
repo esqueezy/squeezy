@@ -9484,6 +9484,49 @@ fn transcript_overlay_renders_entries_uncollapsed() {
 }
 
 #[test]
+fn transcript_overlay_renders_right_scrollbar_for_overflow() {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..40 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let output = render_to_string(&app, 80, 12);
+
+    assert!(
+        output.contains('█'),
+        "overflowing transcript overlay should render a scrollbar thumb: {output}"
+    );
+    assert!(
+        output.contains('░'),
+        "overflowing transcript overlay should render a scrollbar track: {output}"
+    );
+}
+
+#[test]
+fn transcript_overlay_scrollbar_click_maps_to_scroll_offset() {
+    let scrollbar_area = Rect {
+        x: 79,
+        y: 1,
+        width: 1,
+        height: 10,
+    };
+
+    assert_eq!(
+        transcript_overlay_scroll_for_scrollbar_row(1, scrollbar_area, 100),
+        Some(0)
+    );
+    assert_eq!(
+        transcript_overlay_scroll_for_scrollbar_row(10, scrollbar_area, 100),
+        Some(90)
+    );
+    assert!(
+        transcript_overlay_scroll_for_scrollbar_row(6, scrollbar_area, 100).expect("middle row")
+            > 0
+    );
+}
+
+#[test]
 fn diff_card_pushed_via_helper_renders_summary_and_lines() {
     let mut app = test_app(SessionMode::Build);
     let lines: Vec<ratatui::text::Line<'static>> = vec![

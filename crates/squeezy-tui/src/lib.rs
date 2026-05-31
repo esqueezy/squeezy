@@ -19,7 +19,7 @@ use crossterm::{
     style::Print,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode,
+        enable_raw_mode, size as terminal_size,
     },
 };
 use ratatui::{
@@ -1215,15 +1215,51 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
 }
 
 fn handle_transcript_overlay_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
-    let Some(state) = app.transcript_overlay.as_mut() else {
+    if app.transcript_overlay.is_none() {
         return false;
     };
     match mouse.kind {
-        MouseEventKind::ScrollUp => state.scroll = state.scroll.saturating_sub(3),
-        MouseEventKind::ScrollDown => state.scroll = state.scroll.saturating_add(3),
+        MouseEventKind::ScrollUp => {
+            if let Some(state) = app.transcript_overlay.as_mut() {
+                state.scroll = state.scroll.saturating_sub(3);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some(state) = app.transcript_overlay.as_mut() {
+                state.scroll = state.scroll.saturating_add(3);
+            }
+        }
+        MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        | MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+            if let Some(scroll) = transcript_overlay_scroll_from_mouse(app, mouse.column, mouse.row)
+                && let Some(state) = app.transcript_overlay.as_mut()
+            {
+                state.scroll = scroll;
+            }
+        }
         _ => {}
     }
     true
+}
+
+fn transcript_overlay_scroll_from_mouse(app: &TuiApp, column: u16, row: u16) -> Option<u16> {
+    let (width, height) = terminal_size().ok()?;
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let inner = transcript_overlay_inner(area);
+    let (text_area, scrollbar_area) = transcript_overlay_text_and_scrollbar_areas(inner)?;
+    if column != scrollbar_area.x
+        || row < scrollbar_area.y
+        || row >= scrollbar_area.y.saturating_add(scrollbar_area.height)
+    {
+        return None;
+    }
+    let lines = transcript_lines_for_overlay(app, Some(text_area.width));
+    transcript_overlay_scroll_for_scrollbar_row(row, scrollbar_area, lines.len())
 }
 
 /// Canonicalise a `KeyEvent` so every downstream dispatcher sees a
@@ -5231,13 +5267,136 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             title,
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
         ));
-    let inner = block.inner(area);
+    let inner = transcript_overlay_inner(area);
     frame.render_widget(block, area);
-    let lines = transcript_lines_for_overlay(app, Some(inner.width));
+    let (text_area, scrollbar_area) =
+        transcript_overlay_text_and_scrollbar_areas(inner).unwrap_or((
+            inner,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
+        ));
+    let lines = transcript_lines_for_overlay(app, Some(text_area.width));
+    let line_count = lines.len();
+    let scroll = transcript_overlay_scrollbar_geometry(line_count, text_area.height, state.scroll)
+        .map(|geometry| state.scroll.min(geometry.max_scroll))
+        .unwrap_or(0);
     let paragraph = Paragraph::new(lines)
-        .scroll((state.scroll, 0))
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, inner);
+    frame.render_widget(paragraph, text_area);
+    if scrollbar_area.width > 0
+        && let Some(geometry) =
+            transcript_overlay_scrollbar_geometry(line_count, scrollbar_area.height, scroll)
+    {
+        render_transcript_overlay_scrollbar(frame, scrollbar_area, geometry);
+    }
+}
+
+fn transcript_overlay_inner(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn transcript_overlay_text_and_scrollbar_areas(inner: Rect) -> Option<(Rect, Rect)> {
+    if inner.width <= 1 || inner.height == 0 {
+        return None;
+    }
+    let text_area = Rect {
+        width: inner.width.saturating_sub(1),
+        ..inner
+    };
+    let scrollbar_area = Rect {
+        x: inner.x + inner.width - 1,
+        y: inner.y,
+        width: 1,
+        height: inner.height,
+    };
+    Some((text_area, scrollbar_area))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscriptScrollbarGeometry {
+    thumb_top: u16,
+    thumb_height: u16,
+    max_scroll: u16,
+}
+
+fn transcript_overlay_scrollbar_geometry(
+    content_len: usize,
+    viewport_height: u16,
+    scroll: u16,
+) -> Option<TranscriptScrollbarGeometry> {
+    let track_height = usize::from(viewport_height);
+    if track_height == 0 || content_len <= track_height {
+        return None;
+    }
+    let max_scroll = content_len
+        .saturating_sub(track_height)
+        .min(usize::from(u16::MAX));
+    if max_scroll == 0 {
+        return None;
+    }
+    let thumb_height = ((track_height * track_height) / content_len).clamp(1, track_height);
+    let travel = track_height.saturating_sub(thumb_height);
+    let scroll = usize::from(scroll).min(max_scroll);
+    let thumb_top = if travel == 0 {
+        0
+    } else {
+        scroll * travel / max_scroll
+    };
+    Some(TranscriptScrollbarGeometry {
+        thumb_top: thumb_top as u16,
+        thumb_height: thumb_height as u16,
+        max_scroll: max_scroll as u16,
+    })
+}
+
+fn transcript_overlay_scroll_for_scrollbar_row(
+    row: u16,
+    scrollbar_area: Rect,
+    content_len: usize,
+) -> Option<u16> {
+    let geometry = transcript_overlay_scrollbar_geometry(content_len, scrollbar_area.height, 0)?;
+    let local_row = row
+        .saturating_sub(scrollbar_area.y)
+        .min(scrollbar_area.height - 1);
+    let track_height = usize::from(scrollbar_area.height);
+    let thumb_height = usize::from(geometry.thumb_height);
+    let travel = track_height.saturating_sub(thumb_height);
+    if travel == 0 {
+        return Some(0);
+    }
+    let centered = usize::from(local_row).saturating_sub(thumb_height / 2);
+    let position = centered.min(travel);
+    Some(((position * usize::from(geometry.max_scroll)) / travel) as u16)
+}
+
+fn render_transcript_overlay_scrollbar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    geometry: TranscriptScrollbarGeometry,
+) {
+    let thumb_end = geometry.thumb_top.saturating_add(geometry.thumb_height);
+    let lines = (0..area.height)
+        .map(|offset| {
+            let in_thumb = offset >= geometry.thumb_top && offset < thumb_end;
+            let (symbol, style) = if in_thumb {
+                ("█", Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
+            } else {
+                ("░", Style::default().fg(QUIET))
+            };
+            Line::from(Span::styled(symbol, style))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Build the per-entry line list for the overlay: every entry is forced
@@ -12516,9 +12675,10 @@ struct TerminalGuard {
     /// `mode == AlternateScreen` (that mode is already fullscreen —
     /// no swap needed).
     overlay_screen_active: bool,
-    /// Whether the user opted into mouse capture for the ordinary TUI.
-    /// The transcript overlay enables mouse capture temporarily so wheel
-    /// gestures reach the modal panel; on close we restore this setting.
+    /// Whether the user opted into mouse capture. The transcript overlay
+    /// keeps this off by default so ordinary text selection still works;
+    /// when capture is enabled, its right-side scrollbar also receives
+    /// click/drag events.
     mouse_capture: bool,
     exit_hint: Option<String>,
     startup_flushed: bool,
