@@ -445,16 +445,11 @@ impl SseDecoder {
             self.line_buffer.clear();
             return Ok(());
         }
-        let line = std::str::from_utf8(&self.line_buffer)
-            .map_err(|_| {
-                SseTransportError::InvalidLine(
-                    String::from_utf8_lossy(&self.line_buffer).into_owned(),
-                )
-            })?
-            .to_string();
-        self.line_buffer.clear();
+        let line = std::str::from_utf8(&self.line_buffer).map_err(|_| {
+            SseTransportError::InvalidLine(String::from_utf8_lossy(&self.line_buffer).into_owned())
+        })?;
 
-        let (field, value) = split_field(&line);
+        let (field, value) = split_field(line);
         match field {
             "event" => {
                 self.current.event = Some(value.to_string());
@@ -487,6 +482,7 @@ impl SseDecoder {
                 );
             }
         }
+        self.line_buffer.clear();
         Ok(())
     }
 }

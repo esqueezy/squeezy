@@ -425,6 +425,10 @@ impl McpClientRegistry {
         }
 
         let mut next = normalize_palette(raw_tools);
+        let mut cached_tool_counts = BTreeMap::<String, usize>::new();
+        for tool in prior_cache.values() {
+            *cached_tool_counts.entry(tool.server.clone()).or_default() += 1;
+        }
 
         for (model_name, tool) in &prior_cache {
             let server_still_enabled = self
@@ -440,10 +444,10 @@ impl McpClientRegistry {
                 per_server
                     .entry(tool.server.clone())
                     .or_insert(McpServerStatus::Ready {
-                        tools_count: prior_cache
-                            .values()
-                            .filter(|cached| cached.server == tool.server)
-                            .count(),
+                        tools_count: cached_tool_counts
+                            .get(&tool.server)
+                            .copied()
+                            .unwrap_or_default(),
                         cached: true,
                     });
             }
