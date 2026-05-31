@@ -483,6 +483,7 @@ pub struct LlmToolCall {
 /// provider error; `StopSequence` and `Refusal` carry the remaining
 /// semantically distinct cases; `Other` keeps provider-specific strings
 /// reachable without forcing the registry to enumerate every value.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum StopReason {

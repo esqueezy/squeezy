@@ -1286,6 +1286,10 @@ impl Driver {
                     squeezy_llm::StopReason::StopSequence => "stop_sequence".to_string(),
                     squeezy_llm::StopReason::Refusal => "refusal".to_string(),
                     squeezy_llm::StopReason::Other(other) => other.clone(),
+                    // `StopReason` is `#[non_exhaustive]`; unknown future
+                    // variants collapse to the canonical "other" label so
+                    // the assertion still has a string to compare against.
+                    _ => "other".to_string(),
                 });
                 if let Some(expected) = equals
                     && actual_label.as_deref() != Some(expected.as_str())
