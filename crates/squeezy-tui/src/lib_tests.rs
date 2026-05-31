@@ -2143,6 +2143,59 @@ async fn slash_plans_list_renders_persisted_plans() {
 }
 
 #[tokio::test]
+async fn slash_plans_list_empty_renders_guidance() {
+    let root = temp_workspace("slash_plans_list_empty");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+
+    set_input(&mut app, "/plans list".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.status, "no plans persisted in this session");
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(
+        rendered.contains("No plans saved in this session yet"),
+        "empty /plans list should explain itself: {rendered}"
+    );
+    assert!(
+        rendered.contains("Plan mode"),
+        "empty /plans list should tell users how plans are created: {rendered}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn slash_plans_show_without_id_renders_usage_guidance() {
+    let root = temp_workspace("slash_plans_show_no_id");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+
+    set_input(&mut app, "/plans show".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.status, "usage: /plans <subcommand> <id-or-prefix>");
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(rendered.contains("Missing plan id"), "{rendered}");
+    assert!(rendered.contains("/plans show <id>"), "{rendered}");
+    assert!(rendered.contains("Run `/plans`"), "{rendered}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn slash_plans_delete_requires_explicit_yes() {
     let root = temp_workspace("slash_plans_delete_confirm");
     let config = test_config_with_root(SessionMode::Plan, root.clone());
@@ -2392,6 +2445,15 @@ async fn slash_plans_show_unknown_id_sets_status() {
         app.status.starts_with("no plan matches"),
         "got status: {}",
         app.status
+    );
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(
+        rendered.contains("No plan matches `plan-does-not-exist`"),
+        "missing plan should be transcript-visible: {rendered}"
+    );
+    assert!(
+        rendered.contains("no saved plans"),
+        "missing plan in an empty session should explain why: {rendered}"
     );
     let _ = fs::remove_dir_all(&root);
 }
@@ -2966,7 +3028,7 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/".to_string());
 
-    let suggestions = input::slash_suggestions(&app.input);
+    let suggestions = input::slash_suggestions_for_app(&app);
     let names = suggestions
         .iter()
         .map(|command| command.name)
@@ -3054,6 +3116,37 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
         suggestions.len() - 1,
         "Up from 0 should wrap to last"
     );
+}
+
+#[test]
+fn slash_menu_filters_checkpoint_commands_from_disabled_config() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/".to_string());
+    let names = input::slash_suggestions_for_app(&app)
+        .into_iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
+    for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
+        assert!(
+            !names.contains(&checkpoint_command),
+            "{checkpoint_command} should not be suggested while checkpointing is disabled"
+        );
+    }
+
+    let mut config = test_config(SessionMode::Build);
+    config.checkpoints_enabled = true;
+    let mut enabled_app = test_app_with_config(&config, SessionMode::Build);
+    set_input(&mut enabled_app, "/".to_string());
+    let names = input::slash_suggestions_for_app(&enabled_app)
+        .into_iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
+    for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
+        assert!(
+            names.contains(&checkpoint_command),
+            "{checkpoint_command} should be suggested while checkpointing is enabled"
+        );
+    }
 }
 
 #[test]
@@ -3504,6 +3597,19 @@ async fn slash_attach_inserts_visible_file_token() {
     assert!(prepared.model_input.contains("2026-05-24 ERROR failed"));
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn slash_attachments_empty_renders_guidance() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/attachments").await);
+
+    assert_eq!(app.status, "no attached context");
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(rendered.contains("No attached context yet"), "{rendered}");
+    assert!(rendered.contains("/attach <path>"), "{rendered}");
 }
 
 #[tokio::test]
@@ -6814,28 +6920,6 @@ async fn ctrl_y_copies_last_assistant_message() {
 }
 
 #[tokio::test]
-async fn slash_copy_transcript_copies_plain_text_transcript() {
-    let mut agent = test_agent(SessionMode::Build);
-    let writes = Arc::new(StdMutex::new(Vec::new()));
-    let mut app = test_app_with_clipboard(
-        SessionMode::Build,
-        Box::new(RecordingClipboard {
-            writes: writes.clone(),
-            error: None,
-        }),
-    );
-    app.push_transcript_item(TranscriptItem::user("hello"));
-    app.push_transcript_item(TranscriptItem::assistant("answer"));
-
-    assert!(handle_slash_command(&mut app, &mut agent, "/copy transcript").await);
-    assert_eq!(
-        writes.lock().unwrap().as_slice(),
-        ["user: hello\nassistant: answer"]
-    );
-    assert!(app.status.contains("copied transcript"), "{}", app.status);
-}
-
-#[tokio::test]
 async fn slash_pin_pins_and_unpins_transcript_context() {
     let root = temp_workspace("pin_context");
     let config = test_config_with_root(SessionMode::Build, root.clone());
@@ -6860,6 +6944,19 @@ async fn slash_pin_pins_and_unpins_transcript_context() {
     assert_eq!(app.status, format!("unpinned {pin_id}"));
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn slash_pins_empty_renders_guidance() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/pins").await);
+
+    assert_eq!(app.status, "no pinned context");
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(rendered.contains("No pinned context yet"), "{rendered}");
+    assert!(rendered.contains("/pin selected"), "{rendered}");
 }
 
 #[tokio::test]
@@ -7178,7 +7275,9 @@ fn base64_encoder_supports_osc52_payloads() {
 
 #[tokio::test]
 async fn successful_edit_turn_pushes_diff_undo_hint() {
-    let mut app = test_app(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    config.checkpoints_enabled = true;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
     let (tx, rx) = mpsc::channel(8);
     app.turn_rx = Some(rx);
 
@@ -7220,6 +7319,47 @@ async fn successful_edit_turn_pushes_diff_undo_hint() {
     assert!(
         !app.last_turn_had_edits,
         "flag must reset after the hint fires"
+    );
+}
+
+#[tokio::test]
+async fn successful_edit_turn_hides_undo_hint_when_checkpointing_disabled() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let edit_result = sample_tool_result("apply_patch", "patched ok");
+    tx.send(AgentEvent::ToolCallCompleted {
+        turn_id: TurnId::new(1),
+        result: edit_result,
+    })
+    .await
+    .expect("send tool result");
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let hint = app.transcript.iter().find_map(|entry| match &entry.kind {
+        TranscriptEntryKind::Log(LogEntry { message, .. }) if message.contains("/diff") => {
+            Some(message.clone())
+        }
+        _ => None,
+    });
+    let hint = hint.expect("successful edit turn must push a /diff hint");
+    assert!(
+        !hint.contains("/undo"),
+        "checkpointing disabled should hide /undo hint: {hint}"
     );
 }
 
@@ -7321,7 +7461,9 @@ async fn repeated_raw_shell_output_is_not_rendered_as_assistant_reply() {
 
 #[tokio::test]
 async fn failed_edit_turn_error_status_mentions_undo() {
-    let mut app = test_app(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    config.checkpoints_enabled = true;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
     let (tx, rx) = mpsc::channel(8);
     app.turn_rx = Some(rx);
 
