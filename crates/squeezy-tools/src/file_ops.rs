@@ -64,6 +64,7 @@ pub(crate) struct GrepArgs {
     pub(crate) pattern: String,
     pub(crate) path: Option<String>,
     include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
     include_ignored: Option<bool>,
     diff_only: Option<bool>,
     output_mode: Option<GrepOutputMode>,
@@ -283,6 +284,11 @@ impl ToolRegistry {
             Err(err) => return tool_error(call, err),
         };
 
+        let exclude = match build_include_set(args.exclude.as_deref()) {
+            Ok(exclude) => exclude,
+            Err(err) => return tool_error(call, err),
+        };
+
         let include_ignored = args.include_ignored.unwrap_or(false);
         let diff_only = args.diff_only.unwrap_or(false);
         let diff_paths = if diff_only {
@@ -358,6 +364,12 @@ impl ToolRegistry {
             if include
                 .as_ref()
                 .is_some_and(|include| !include.is_match(rel.as_path()))
+            {
+                continue;
+            }
+            if exclude
+                .as_ref()
+                .is_some_and(|exclude| exclude.is_match(rel.as_path()))
             {
                 continue;
             }
@@ -476,6 +488,9 @@ impl ToolRegistry {
         );
         if let Some(include) = args.include.as_ref() {
             metadata.insert("include".to_string(), json!(include));
+        }
+        if let Some(exclude) = args.exclude.as_ref() {
+            metadata.insert("exclude".to_string(), json!(exclude));
         }
         metadata.insert("include_ignored".to_string(), json!(include_ignored));
         metadata.insert("diff_only".to_string(), json!(diff_only));

@@ -233,6 +233,7 @@ pub(crate) fn grep_spec() -> ToolSpec {
                 "pattern": {"type": "string", "description": "Rust regex pattern to search for."},
                 "path": {"type": "string", "description": "Workspace-relative file or directory to search.", "default": "."},
                 "include": {"type": "array", "items": {"type": "string"}, "description": "Optional glob patterns such as *.rs or crates/**/lib.rs."},
+                "exclude": {"type": "array", "items": {"type": "string"}, "description": "Optional glob patterns whose matches are skipped. Mirrors `include` but in reverse."},
                 "include_ignored": {"type": "boolean", "description": "When true, include files ignored by .gitignore and other ignore files. Default false."},
                 "diff_only": {"type": "boolean", "description": "When true, search only files changed in the current Git worktree diff. Default false."},
                 "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Return matching lines, only files containing matches, or only a count. Default content."},

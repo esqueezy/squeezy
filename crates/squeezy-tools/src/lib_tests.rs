@@ -894,6 +894,41 @@ async fn grep_rejects_unknown_field() {
 }
 
 #[tokio::test]
+async fn grep_exclude_filter_drops_matching_paths() {
+    let root = temp_workspace("grep_exclude");
+    fs::write(root.join("a.rs"), "needle\n").expect("write a");
+    fs::write(root.join("b.rs"), "needle\n").expect("write b");
+    fs::write(root.join("c.rs"), "needle\n").expect("write c");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_exclude".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({
+                    "pattern": "needle",
+                    "exclude": ["**/b.rs"],
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let mut paths = match_paths(&result);
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec!["a.rs".to_string(), "c.rs".to_string()],
+        "exclude=**/b.rs must skip b.rs while keeping a.rs and c.rs"
+    );
+    assert_eq!(result.content["metadata"]["exclude"], json!(["**/b.rs"]));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn glob_lists_paths_without_reading_content_and_respects_ignore() {
     let root = temp_workspace("glob_ignore");
     fs::write(root.join(".gitignore"), "ignored.rs\n").expect("write gitignore");
