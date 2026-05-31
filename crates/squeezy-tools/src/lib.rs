@@ -4405,17 +4405,21 @@ impl ToolOutputStore {
         if !is_valid_handle(handle) {
             return Err("invalid tool output handle".to_string());
         }
-        let bytes = fs::read(self.path_for(handle))
+        let path = self.path_for(handle);
+        let total_bytes = fs::metadata(&path)
+            .map_err(|err| format!("tool output handle not found or unreadable: {err}"))?
+            .len() as usize;
+        let offset = offset.min(total_bytes);
+        let bytes = read_range(&path, offset as u64, limit)
             .map_err(|err| format!("tool output handle not found or unreadable: {err}"))?;
-        let offset = offset.min(bytes.len());
-        let end = offset.saturating_add(limit).min(bytes.len());
-        let content = String::from_utf8_lossy(&bytes[offset..end]).to_string();
+        let end = offset.saturating_add(bytes.len()).min(total_bytes);
+        let content = String::from_utf8_lossy(&bytes).to_string();
         Ok(StoredToolOutputSlice {
             offset,
-            bytes_returned: end - offset,
-            total_bytes: bytes.len(),
-            sha256: sha256_hex(&bytes),
-            truncated: end < bytes.len(),
+            bytes_returned: bytes.len(),
+            total_bytes,
+            sha256: handle.to_string(),
+            truncated: end < total_bytes,
             content,
         })
     }
