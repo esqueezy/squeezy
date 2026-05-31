@@ -79,6 +79,14 @@
       ]
     },
     {
+      "id": "kotlin-project-facts",
+      "kind": "kotlin_project_facts",
+      "expected_contains": [
+        "gradle:source_root:main:src/main/kotlin",
+        "gradle:dependency:implementation:org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1"
+      ]
+    },
+    {
       "id": "kotlin-fallback-quality",
       "kind": "fallback_quality",
       "expected_contains": [
