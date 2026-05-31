@@ -379,16 +379,28 @@ pub(crate) fn collect_csharp_squeezy_symbol_scan_excluding_files(
     scan
 }
 
-fn normalize_php_squeezy_kind(kind: SymbolKind) -> Option<String> {
+/// Normalises a squeezy PHP symbol to the kind label nikic/PHP-Parser
+/// emits. The extractor models PHP namespaces as `SymbolKind::Module` and
+/// both class properties and class constants as `SymbolKind::Field`; the
+/// nikic helper distinguishes `Namespace`, `Property`, and `Constant`. The
+/// `php:field` / `php:const` attributes set by the extractor disambiguate
+/// the two `Field` flavours so the symbol scan can compare like-with-like.
+fn normalize_php_squeezy_kind(kind: SymbolKind, attributes: &[String]) -> Option<String> {
     match kind {
         SymbolKind::Class => Some("Class".to_string()),
         SymbolKind::Interface => Some("Interface".to_string()),
         SymbolKind::Trait => Some("Trait".to_string()),
         SymbolKind::Enum => Some("Enum".to_string()),
-        SymbolKind::Module => Some("Module".to_string()),
+        SymbolKind::Module => Some("Namespace".to_string()),
         SymbolKind::Function | SymbolKind::Test => Some("Function".to_string()),
         SymbolKind::Method => Some("Method".to_string()),
-        SymbolKind::Field => Some("Field".to_string()),
+        SymbolKind::Field => {
+            if attributes.iter().any(|attr| attr == "php:const") {
+                Some("Constant".to_string())
+            } else {
+                Some("Property".to_string())
+            }
+        }
         SymbolKind::Variant => Some("Variant".to_string()),
         SymbolKind::Struct
         | SymbolKind::Crate
@@ -436,7 +448,7 @@ pub(crate) fn collect_php_squeezy_symbol_scan_excluding_files(
             increment(&mut scan.excluded_by_kind, "PhpEvalArgument");
             continue;
         }
-        match normalize_php_squeezy_kind(symbol.kind) {
+        match normalize_php_squeezy_kind(symbol.kind, &symbol.attributes) {
             Some(kind) => {
                 increment_symbol(
                     &mut scan.counts,

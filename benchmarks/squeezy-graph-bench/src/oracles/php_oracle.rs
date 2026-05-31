@@ -147,10 +147,11 @@ fn php_compared_symbol_kinds() -> Vec<String> {
         "Interface".to_string(),
         "Trait".to_string(),
         "Enum".to_string(),
-        "Module".to_string(),
+        "Namespace".to_string(),
         "Function".to_string(),
         "Method".to_string(),
-        "Field".to_string(),
+        "Property".to_string(),
+        "Constant".to_string(),
         "Variant".to_string(),
     ]
 }
