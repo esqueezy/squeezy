@@ -2143,6 +2143,59 @@ async fn slash_plans_list_renders_persisted_plans() {
 }
 
 #[tokio::test]
+async fn slash_plans_list_empty_renders_guidance() {
+    let root = temp_workspace("slash_plans_list_empty");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+
+    set_input(&mut app, "/plans list".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.status, "no plans persisted in this session");
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(
+        rendered.contains("No plans saved in this session yet"),
+        "empty /plans list should explain itself: {rendered}"
+    );
+    assert!(
+        rendered.contains("Plan mode"),
+        "empty /plans list should tell users how plans are created: {rendered}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn slash_plans_show_without_id_renders_usage_guidance() {
+    let root = temp_workspace("slash_plans_show_no_id");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+
+    set_input(&mut app, "/plans show".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.status, "usage: /plans <subcommand> <id-or-prefix>");
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(rendered.contains("Missing plan id"), "{rendered}");
+    assert!(rendered.contains("/plans show <id>"), "{rendered}");
+    assert!(rendered.contains("Run `/plans`"), "{rendered}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn slash_plans_delete_requires_explicit_yes() {
     let root = temp_workspace("slash_plans_delete_confirm");
     let config = test_config_with_root(SessionMode::Plan, root.clone());
@@ -2392,6 +2445,15 @@ async fn slash_plans_show_unknown_id_sets_status() {
         app.status.starts_with("no plan matches"),
         "got status: {}",
         app.status
+    );
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(
+        rendered.contains("No plan matches `plan-does-not-exist`"),
+        "missing plan should be transcript-visible: {rendered}"
+    );
+    assert!(
+        rendered.contains("no saved plans"),
+        "missing plan in an empty session should explain why: {rendered}"
     );
     let _ = fs::remove_dir_all(&root);
 }
@@ -3535,6 +3597,19 @@ async fn slash_attach_inserts_visible_file_token() {
     assert!(prepared.model_input.contains("2026-05-24 ERROR failed"));
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn slash_attachments_empty_renders_guidance() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/attachments").await);
+
+    assert_eq!(app.status, "no attached context");
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(rendered.contains("No attached context yet"), "{rendered}");
+    assert!(rendered.contains("/attach <path>"), "{rendered}");
 }
 
 #[tokio::test]
@@ -6869,6 +6944,19 @@ async fn slash_pin_pins_and_unpins_transcript_context() {
     assert_eq!(app.status, format!("unpinned {pin_id}"));
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn slash_pins_empty_renders_guidance() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/pins").await);
+
+    assert_eq!(app.status, "no pinned context");
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(rendered.contains("No pinned context yet"), "{rendered}");
+    assert!(rendered.contains("/pin selected"), "{rendered}");
 }
 
 #[tokio::test]
