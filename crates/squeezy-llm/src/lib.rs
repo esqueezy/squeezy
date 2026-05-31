@@ -243,6 +243,7 @@ pub struct LlmOutputSchema {
     pub strict: bool,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LlmInputItem {

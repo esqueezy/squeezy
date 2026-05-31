@@ -11981,6 +11981,9 @@ fn conversation_shape(conversation: &[LlmInputItem]) -> ConversationShape {
                 shape.image_items += 1;
                 shape.image_bytes += bytes.len();
             }
+            // `LlmInputItem` is `#[non_exhaustive]`; unknown future variants
+            // increment no counters until a dedicated arm exists.
+            _ => {}
         }
     }
     shape
@@ -12255,6 +12258,9 @@ fn redact_input_item(item: LlmInputItem, redactor: &Redactor) -> LlmInputItem {
         // unchanged so the provider's vision pipeline still receives the
         // original image.
         LlmInputItem::Image { media_type, bytes } => LlmInputItem::Image { media_type, bytes },
+        // `LlmInputItem` is `#[non_exhaustive]`; pass unknown future
+        // variants through unchanged so they survive the redaction pass.
+        other => other,
     }
 }
 
@@ -12822,6 +12828,12 @@ pub(crate) fn llm_input_to_resume_item(item: LlmInputItem) -> ResumeItem {
         LlmInputItem::Image { media_type, bytes } => ResumeItem::Image {
             media_type,
             data_base64: BASE64_STANDARD.encode(bytes.as_ref()),
+        },
+        // `LlmInputItem` is `#[non_exhaustive]`; unknown future variants
+        // round-trip through an empty user text marker until the resume
+        // schema gains a dedicated representation for them.
+        _ => ResumeItem::UserText {
+            text: String::new(),
         },
     }
 }

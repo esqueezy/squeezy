@@ -315,6 +315,10 @@ pub(crate) fn llm_request_input_bytes(request: &LlmRequest) -> u64 {
                 .map(|v| v.len() as u64)
                 .unwrap_or(0),
             LlmInputItem::Reasoning(payload) => payload.display_text().len() as u64,
+            // `LlmInputItem` is `#[non_exhaustive]`; unknown future variants
+            // contribute zero bytes to the calibration EMA until a
+            // dedicated arm exists.
+            _ => 0,
         });
     }
     for spec in request.tools.iter() {
