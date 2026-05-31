@@ -180,8 +180,6 @@ impl ToolRegistry {
         } else {
             None
         };
-        let coverage_warnings = shell_coverage_warnings(&args.command);
-
         if let Some(pattern) = shell_command_references_sensitive_path(
             &args.command,
             &self.shell_sandbox.sensitive_path_patterns,
@@ -525,6 +523,7 @@ impl ToolRegistry {
             );
         }
         if let Some(checkpoint_before) = checkpoint_before.as_ref() {
+            let coverage_warnings = shell_coverage_warnings(&args.command);
             self.append_checkpoint_to_content(
                 &mut raw_content,
                 Some(checkpoint_before),
