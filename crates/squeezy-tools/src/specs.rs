@@ -212,7 +212,7 @@ fn supported_language_list() -> String {
 /// `LanguageFamily::all()` at runtime.
 fn graph_first_preamble(fallback_tool: &str) -> String {
     format!(
-        "Prefer `decl_search`, `reference_search`, or `symbol_context` for symbol-shaped queries in {languages} files when the query is a bare name and the languages have nominal type systems (Rust, Go, C#, C++, Java) — they follow imports, qualified paths, and re-exports that regex misses. For Python and JS/TS aliased-import resolution, or any multi-symbol tabulation (count usages across N symbols, aggregate fields per class), `{fallback_tool}` with a focused query or script is usually one shot. Use `{fallback_tool}` for literal text (strings, comments, config keys) or files outside {languages}.",
+        "Prefer `decl_search`, `reference_search`, or `symbol_context` for symbol-shaped queries in {languages} files when the query is a bare name and the languages have nominal type systems (Rust, Go, C#, C++, Java, Kotlin, Swift, Scala, Dart) — they follow imports, qualified paths, and re-exports that regex misses. For Python, JS/TS, Ruby, or PHP aliased-import resolution, or any multi-symbol tabulation (count usages across N symbols, aggregate fields per class), `{fallback_tool}` with a focused query or script is usually one shot. Use `{fallback_tool}` for literal text (strings, comments, config keys) or files outside {languages}.",
         languages = supported_language_list(),
     )
 }
