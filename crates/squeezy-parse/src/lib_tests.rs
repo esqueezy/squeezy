@@ -2571,6 +2571,109 @@ end
 }
 
 #[test]
+fn parser_attributes_method_to_correct_ruby_sibling_class() {
+    // Two sibling classes inside one module. Each calls `fire_event` from
+    // its own method body. The parser must attribute each method (and the
+    // calls inside it) to its declaring sibling, not bleed the second
+    // class's methods into the first. Mirrors the sidekiq
+    // `Sidekiq::Scheduled::Enq` + `Sidekiq::Scheduled::Poller` shape.
+    let source = "module Sidekiq\n\
+                  module Scheduled\n\
+                  class Enq\n\
+                  include Sidekiq::Component\n\
+                  def enqueue_jobs\n\
+                  fire_event(:enq)\n\
+                  end\n\
+                  end\n\
+                  \n\
+                  class Poller\n\
+                  include Sidekiq::Component\n\
+                  def start\n\
+                  fire_event(:poller)\n\
+                  safe_thread(\"poller\") { run }\n\
+                  end\n\
+                  end\n\
+                  end\n\
+                  end\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ruby_record("lib/sidekiq/scheduled.rb", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let enq = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "Enq" && s.kind == SymbolKind::Class)
+        .expect("Enq class");
+    let poller = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "Poller" && s.kind == SymbolKind::Class)
+        .expect("Poller class");
+    assert_ne!(enq.id, poller.id, "sibling classes must have distinct ids");
+    // Sibling classes must not nest under each other.
+    assert_eq!(enq.parent_id, poller.parent_id);
+    assert_ne!(enq.parent_id.as_ref(), Some(&poller.id));
+
+    // Enq spans only its own declaration; Poller starts AFTER Enq ends.
+    assert!(enq.span.end_byte <= poller.span.start_byte);
+    assert!(enq.span.end.line < poller.span.start.line);
+
+    let enqueue_jobs = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "enqueue_jobs" && s.kind == SymbolKind::Method)
+        .expect("enqueue_jobs method");
+    let start = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "start" && s.kind == SymbolKind::Method)
+        .expect("start method");
+    assert_eq!(enqueue_jobs.parent_id.as_ref(), Some(&enq.id));
+    assert_eq!(start.parent_id.as_ref(), Some(&poller.id));
+
+    // Each fire_event call site must be attributed to the correct method.
+    let enq_fire_event = parsed
+        .calls
+        .iter()
+        .filter(|c| c.name == "fire_event")
+        .filter(|c| c.caller_id.as_ref() == Some(&enqueue_jobs.id))
+        .count();
+    let poller_fire_event = parsed
+        .calls
+        .iter()
+        .filter(|c| c.name == "fire_event")
+        .filter(|c| c.caller_id.as_ref() == Some(&start.id))
+        .count();
+    assert_eq!(enq_fire_event, 1, "Enq method must own one fire_event call");
+    assert_eq!(
+        poller_fire_event, 1,
+        "Poller method must own one fire_event call"
+    );
+
+    // Belt-and-suspenders: every call site must live within its owning
+    // method's body span.
+    for call in &parsed.calls {
+        let Some(owner_id) = call.caller_id.as_ref() else {
+            continue;
+        };
+        let Some(owner) = parsed.symbols.iter().find(|s| &s.id == owner_id) else {
+            continue;
+        };
+        let Some(body) = owner.body_span else {
+            continue;
+        };
+        assert!(
+            body.start_byte <= call.span.start_byte && call.span.end_byte <= body.end_byte,
+            "call to `{}` at {:?} is attributed to `{}` but sits outside its body span {:?}",
+            call.name,
+            call.span,
+            owner.name,
+            body
+        );
+    }
+}
+
+#[test]
 fn parser_extracts_swift_symbols_imports_calls_and_references() {
     let source = r#"
 import Foundation

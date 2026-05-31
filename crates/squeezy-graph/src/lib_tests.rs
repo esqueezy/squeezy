@@ -7170,6 +7170,136 @@ end
     assert!(graph.call_chain(&search.id, &find_by_email.id, 3).is_some());
 }
 
+#[test]
+fn ruby_sibling_classes_attribute_method_calls_to_correct_enclosing_class() {
+    // Sidekiq's `lib/sidekiq/scheduled.rb` ships two sibling classes —
+    // `Sidekiq::Scheduled::Enq` and `Sidekiq::Scheduled::Poller` — under
+    // the same module. Each calls a `Sidekiq::Component`-provided
+    // helper (`fire_event`) from its own method body. `reference_search`
+    // for `fire_event` must produce hits whose owner chain leads back
+    // to the correct sibling, not bleed Poller's count into Enq.
+    let component = ruby_record(
+        "lib/sidekiq/component.rb",
+        "module Sidekiq\n\
+         module Component\n\
+         def fire_event(event); end\n\
+         def safe_thread(name); yield; end\n\
+         end\n\
+         end\n",
+    );
+    let scheduled = ruby_record(
+        "lib/sidekiq/scheduled.rb",
+        "module Sidekiq\n\
+         module Scheduled\n\
+         class Enq\n\
+         include Sidekiq::Component\n\
+         def enqueue_jobs\n\
+         fire_event(:enq)\n\
+         end\n\
+         end\n\
+         \n\
+         class Poller\n\
+         include Sidekiq::Component\n\
+         def start\n\
+         fire_event(:poller_start)\n\
+         safe_thread(\"poller\") { run }\n\
+         end\n\
+         end\n\
+         end\n\
+         end\n",
+    );
+    let mut parser = LanguageParser::new().unwrap();
+    let parsed = [component, scheduled]
+        .into_iter()
+        .map(|r| parser.parse_record(&r).unwrap())
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let enq = graph
+        .find_symbol_by_name("Enq")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Class)
+        .expect("Enq class");
+    let poller = graph
+        .find_symbol_by_name("Poller")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Class)
+        .expect("Poller class");
+    // Sanity: sibling classes share a parent module and have disjoint spans.
+    assert_eq!(enq.parent_id, poller.parent_id);
+    assert!(enq.span.end_byte <= poller.span.start_byte);
+
+    let enqueue_jobs = graph
+        .find_symbol_by_name("enqueue_jobs")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Method)
+        .expect("enqueue_jobs");
+    let start = graph
+        .find_symbol_by_name("start")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Method)
+        .expect("start");
+    assert_eq!(
+        enqueue_jobs.parent_id.as_ref(),
+        Some(&enq.id),
+        "enqueue_jobs must be hosted by Enq, got parent_id={:?}",
+        enqueue_jobs.parent_id
+    );
+    assert_eq!(
+        start.parent_id.as_ref(),
+        Some(&poller.id),
+        "start must be hosted by Poller, got parent_id={:?}",
+        start.parent_id
+    );
+
+    // `reference_search("fire_event")` must return a hit owned by
+    // enqueue_jobs and a hit owned by start, each binding back to its
+    // own sibling class through `parent_id`.
+    let hits = graph.reference_search("fire_event");
+    let owner_class_ids = hits
+        .iter()
+        .filter_map(|hit| hit.owner.as_ref())
+        .filter(|owner| owner.kind == SymbolKind::Method)
+        .filter_map(|owner| owner.parent_id.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        owner_class_ids.contains(&enq.id),
+        "expected fire_event reference owned by an Enq method, got {owner_class_ids:?}"
+    );
+    assert!(
+        owner_class_ids.contains(&poller.id),
+        "expected fire_event reference owned by a Poller method, got {owner_class_ids:?}"
+    );
+
+    // `references_to_symbol` against the Component#fire_event declaration
+    // must surface both call sites, each correctly owner-attributed to
+    // the sibling's method (and therefore to the sibling class via
+    // parent_id).
+    let fire_event_decl = graph
+        .find_symbol_by_name("fire_event")
+        .into_iter()
+        .find(|s| {
+            s.kind == SymbolKind::Method
+                && s.file_id.0 == "lib/sidekiq/component.rb"
+                && !s.attributes.iter().any(|a| a == "ruby:synthesized")
+        })
+        .expect("fire_event method declaration");
+    let resolved = graph.references_to_symbol(&fire_event_decl.id);
+    let resolved_class_ids = resolved
+        .iter()
+        .filter_map(|hit| hit.owner.as_ref())
+        .filter_map(|owner| owner.parent_id.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        resolved_class_ids.contains(&enq.id),
+        "references_to_symbol must surface Enq-owned call site, got {resolved_class_ids:?}"
+    );
+    assert!(
+        resolved_class_ids.contains(&poller.id),
+        "references_to_symbol must surface Poller-owned call site, got {resolved_class_ids:?}"
+    );
+}
+
 fn parsed_imports(graph: &SemanticGraph) -> impl Iterator<Item = &ParsedImport> {
     graph.imports.iter()
 }
