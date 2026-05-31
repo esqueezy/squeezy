@@ -45,14 +45,20 @@ runs:
       if: inputs.language == 'kotlin'
       shell: bash
       run: |
-        # Kotlin oracle (`benchmarks/oracle/kotlin/KotlinOracle.kt`) depends
-        # on PSI types shipped with kotlin-compiler-embeddable, bundled with
-        # the standalone kotlinc distribution. Pin in lockstep with the
-        # tree-sitter-kotlin-ng grammar release tracked in Cargo.toml.
+        # KotlinOracle.kt imports `org.jetbrains.kotlin.com.intellij.*`, the
+        # shaded IntelliJ namespace that only ships in the kotlin-compiler-
+        # embeddable Maven artifact. The standalone kotlinc distribution
+        # only carries the unshaded `com.intellij.*` classes, so we install
+        # both: the standalone tarball provides the `kotlinc` launcher and
+        # stdlib jars; the embeddable jar is dropped next to them so
+        # build.sh can find it via the lib/ directory.
+        # Pin in lockstep with the tree-sitter-kotlin-ng grammar release.
         KOTLIN_VERSION="1.9.24"
         curl -sLo /tmp/kotlin.zip \
           "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip"
         sudo unzip -q /tmp/kotlin.zip -d /opt
+        sudo curl -fL -o /opt/kotlinc/lib/kotlin-compiler-embeddable.jar \
+          "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-compiler-embeddable/${KOTLIN_VERSION}/kotlin-compiler-embeddable-${KOTLIN_VERSION}.jar"
         echo "/opt/kotlinc/bin" >> "$GITHUB_PATH"
 
     - name: Install C/C++ validation tools
