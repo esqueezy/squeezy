@@ -16,10 +16,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     DEFAULT_MAX_BYTES_PER_FILE, DEFAULT_MAX_FILES, DEFAULT_READ_LIMIT, MAX_READ_LIMIT,
-    POLICY_PREFIX_BYTES, ToolCall, ToolCostHint, ToolRegistry, ToolResult, ToolStatus,
-    build_include_set, build_required_glob, diff_path_set, file_len, is_secret_path, make_result,
-    read_prefix, read_range, sha256_file, tool_arg_error, tool_error, truncate_text,
-    workspace_path,
+    POLICY_PREFIX_BYTES, ToolCall, ToolCostHint, ToolOutputReplayKey, ToolOutputReplayServed,
+    ToolOutputReplaySource, ToolRegistry, ToolResult, ToolStatus, build_include_set,
+    build_required_glob, diff_path_set, file_len, is_secret_path, make_result, read_prefix,
+    read_range, sha256_file, tool_arg_error, tool_error, truncate_text, workspace_path,
 };
 
 pub(crate) const DEFAULT_MAX_MATCHES: usize = 100;
@@ -736,6 +736,14 @@ impl ToolRegistry {
         offset: usize,
         limit: usize,
     ) -> ToolResult {
+        let key = ToolOutputReplayKey {
+            source: ToolOutputReplaySource::Handle(handle.to_string()),
+            offset,
+            limit,
+        };
+        if let Some(stub) = self.read_tool_output_replay_stub(call, &key) {
+            return stub;
+        }
         let output = match self.output_store.read(handle, offset, limit) {
             Ok(output) => output,
             Err(err) => return tool_error(call, err),
@@ -746,7 +754,12 @@ impl ToolRegistry {
             truncated: output.truncated,
             ..ToolCostHint::default()
         };
-
+        self.remember_read_tool_output(
+            key,
+            call.call_id.as_str(),
+            output.bytes_returned,
+            output.sha256.as_str(),
+        );
         make_result(
             call,
             ToolStatus::Success,
@@ -771,6 +784,14 @@ impl ToolRegistry {
         offset: usize,
         limit: usize,
     ) -> ToolResult {
+        let key = ToolOutputReplayKey {
+            source: ToolOutputReplaySource::Path(path.to_string()),
+            offset,
+            limit,
+        };
+        if let Some(stub) = self.read_tool_output_replay_stub(call, &key) {
+            return stub;
+        }
         let output = match self.shell_spillover.read_range(path, offset, limit) {
             Ok(output) => output,
             Err(err) => return tool_error(call, err),
@@ -781,6 +802,12 @@ impl ToolRegistry {
             truncated: output.truncated,
             ..ToolCostHint::default()
         };
+        self.remember_read_tool_output(
+            key,
+            call.call_id.as_str(),
+            output.bytes_returned,
+            output.sha256.as_str(),
+        );
         make_result(
             call,
             ToolStatus::Success,
@@ -796,5 +823,74 @@ impl ToolRegistry {
             cost,
             None,
         )
+    }
+
+    /// On a repeat fetch of the same `(handle_or_path, offset, limit)`,
+    /// emit a brief receipt stub instead of re-serializing the bytes.
+    fn read_tool_output_replay_stub(
+        &self,
+        call: &ToolCall,
+        key: &ToolOutputReplayKey,
+    ) -> Option<ToolResult> {
+        let served = self
+            .tool_output_replay_seen
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(key).cloned())?;
+        let mut content = serde_json::Map::new();
+        content.insert("receipt_stub".to_string(), Value::Bool(true));
+        content.insert(
+            "same_as_call_id".to_string(),
+            Value::String(served.call_id.clone()),
+        );
+        content.insert("unchanged".to_string(), Value::Bool(true));
+        content.insert(
+            "size_bytes".to_string(),
+            Value::Number(serde_json::Number::from(served.size_bytes)),
+        );
+        content.insert(
+            "sha256_short".to_string(),
+            Value::String(served.sha256_short.clone()),
+        );
+        match &key.source {
+            ToolOutputReplaySource::Handle(handle) => {
+                content.insert("handle".to_string(), Value::String(handle.clone()));
+            }
+            ToolOutputReplaySource::Path(path) => {
+                content.insert("path".to_string(), Value::String(path.clone()));
+            }
+        }
+        content.insert(
+            "offset".to_string(),
+            Value::Number(serde_json::Number::from(key.offset)),
+        );
+        content.insert(
+            "limit".to_string(),
+            Value::Number(serde_json::Number::from(key.limit)),
+        );
+        Some(make_result(
+            call,
+            ToolStatus::Success,
+            Value::Object(content),
+            ToolCostHint::default(),
+            None,
+        ))
+    }
+
+    fn remember_read_tool_output(
+        &self,
+        key: ToolOutputReplayKey,
+        call_id: &str,
+        size_bytes: usize,
+        sha256: &str,
+    ) {
+        let Ok(mut guard) = self.tool_output_replay_seen.lock() else {
+            return;
+        };
+        guard.entry(key).or_insert(ToolOutputReplayServed {
+            call_id: call_id.to_string(),
+            size_bytes,
+            sha256_short: sha256.chars().take(12).collect(),
+        });
     }
 }

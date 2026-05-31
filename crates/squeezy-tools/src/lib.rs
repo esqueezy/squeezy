@@ -830,6 +830,32 @@ pub struct ToolRegistry {
     /// the model's stated semantic neighborhood. Keyed by `plan_id`; entries
     /// expire after [`PATCH_PLAN_TTL`].
     pub(crate) patch_plans: Arc<StdMutex<HashMap<String, PatchPlan>>>,
+    /// Tool-level dedup for `read_tool_output`. Spilled bodies are
+    /// immutable for the session; a second fetch of the same
+    /// `(handle_or_path, offset, limit)` window emits a brief receipt
+    /// stub instead of re-serializing the bytes.
+    pub(crate) tool_output_replay_seen:
+        Arc<StdMutex<HashMap<ToolOutputReplayKey, ToolOutputReplayServed>>>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub(crate) struct ToolOutputReplayKey {
+    pub(crate) source: ToolOutputReplaySource,
+    pub(crate) offset: usize,
+    pub(crate) limit: usize,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub(crate) enum ToolOutputReplaySource {
+    Handle(String),
+    Path(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolOutputReplayServed {
+    pub(crate) call_id: String,
+    pub(crate) size_bytes: usize,
+    pub(crate) sha256_short: String,
 }
 
 #[derive(Debug, Default)]
@@ -1176,6 +1202,7 @@ impl ToolRegistry {
             )),
             cached_specs: Arc::new(StdMutex::new(None)),
             patch_plans: Arc::new(StdMutex::new(HashMap::new())),
+            tool_output_replay_seen: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -1224,6 +1251,7 @@ impl ToolRegistry {
             mcp: Arc::new(McpClientRegistry::new(BTreeMap::new())),
             cached_specs: Arc::new(StdMutex::new(None)),
             patch_plans: Arc::new(StdMutex::new(HashMap::new())),
+            tool_output_replay_seen: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 

@@ -2902,24 +2902,31 @@ impl ToolRegistry {
             ..ToolCostHint::default()
         };
         // Slice-mode wire payload carries only the fields the agent cannot
-        // already derive from its call site: the resolved window
-        // (path/offset/bytes_returned), a `truncated` flag, and the bytes
-        // themselves. The full sha256 stays on
-        // `ToolResult.receipt.content_sha256` for cost-broker / receipt
-        // consumers; graph status, span coordinates, and a single-element
-        // `packets` array would just restate fields the model already sees,
-        // so they live on diff-mode reads (where the span describes a hunk
-        // the model has not seen) and are omitted here.
+        // derive from its call site: the resolved window (`path` + `offset`)
+        // and the bytes themselves. The model reads the length straight from
+        // `content`, so `bytes_returned` is only emitted in the truncation
+        // case where the body it sees is smaller than the window it
+        // requested. `truncated` is only set when the read actually clipped
+        // — its value was unconditionally `false` on the >99% of slice
+        // reads that returned the full requested window, so emitting it on
+        // every result was pure decoration. The full sha256 still rides on
+        // `ToolResult.receipt.content_sha256` for cost-broker consumers;
+        // graph status, span coordinates, and a single-element `packets`
+        // array would just restate fields the model already sees, so they
+        // live on diff-mode reads (where the span describes a hunk the
+        // model has not seen) and are omitted here. The agent's compaction
+        // snapshot derives the window from `offset + content.len()` when
+        // `bytes_returned` is absent.
         let mut payload = serde_json::Map::new();
         payload.insert("tool".to_string(), json!("read_slice"));
         payload.insert("path".to_string(), json!(&rel_str));
         payload.insert("offset".to_string(), json!(offset));
-        payload.insert("bytes_returned".to_string(), json!(bytes.len()));
-        payload.insert("truncated".to_string(), json!(truncated));
         if truncated {
+            payload.insert("truncated".to_string(), json!(true));
+            payload.insert("bytes_returned".to_string(), json!(bytes.len()));
             // total_bytes only informs the agent of further bytes to fetch
             // when we actually clipped the read; otherwise it duplicates
-            // `offset + bytes_returned`.
+            // `offset + content.len()`.
             payload.insert("total_bytes".to_string(), json!(total_bytes));
         }
         if let Some(reason) = ignored_reason {
