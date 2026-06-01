@@ -33,6 +33,25 @@ use crate::{
     retry::idle_timeout,
 };
 
+/// Anthropic's hard floor for `thinking.budget_tokens` on Bedrock —
+/// the API rejects any request below this with
+/// `invalid_request_error`. Matches the Anthropic-native floor
+/// (`anthropic.rs:34`).
+const BEDROCK_MIN_THINKING_BUDGET_TOKENS: u64 = 1024;
+
+/// Tokens reserved for the assistant's reply on top of the thinking
+/// budget. Anthropic-on-Bedrock requires `max_tokens > budget_tokens`;
+/// a 1024-token reply headroom keeps the assistant from being
+/// truncated immediately after thinking completes while still leaving
+/// thinking the bulk of the budget. Matches `anthropic.rs:41`.
+const BEDROCK_THINKING_REPLY_HEADROOM_TOKENS: u64 = 1024;
+
+/// Fallback `max_tokens` when the request leaves it unset AND the
+/// model registry does not carry an explicit `max_output_tokens`
+/// limit. Mirrors the Anthropic-native default
+/// (`anthropic.rs:30`).
+const BEDROCK_DEFAULT_MAX_OUTPUT_TOKENS: u64 = 64_000;
+
 #[derive(Debug, Clone)]
 pub struct BedrockProvider {
     region: String,
@@ -192,27 +211,7 @@ impl LlmProvider for BedrockProvider {
             }
             let mut extra_fields: std::collections::HashMap<String, Document> =
                 std::collections::HashMap::new();
-            if let Some(effort) = request.reasoning_effort
-                && crate::capabilities_for("bedrock", &model)
-                    .is_some_and(|caps| caps.reasoning_effort)
-            {
-                let budget = i128::from(effort.thinking_budget_tokens());
-                let thinking = Document::Object(
-                    [
-                        (
-                            "type".to_string(),
-                            Document::String("enabled".to_string()),
-                        ),
-                        (
-                            "budget_tokens".to_string(),
-                            Document::Number(Number::PosInt(budget as u64)),
-                        ),
-                    ]
-                    .into_iter()
-                    .collect(),
-                );
-                extra_fields.insert("thinking".to_string(), thinking);
-            }
+            apply_thinking_extra_fields(&mut extra_fields, &request, &model);
             let body_betas = bedrock_extra_body_betas(&request.beta_headers);
             if !body_betas.is_empty() {
                 let beta_array = body_betas
@@ -471,6 +470,135 @@ fn handle_bedrock_event(
             Ok(Vec::new())
         }
         _ => Ok(Vec::new()),
+    }
+}
+
+/// Populate the Bedrock `additional_model_request_fields` map with the
+/// `thinking` / `output_config` blocks the configured model expects.
+///
+/// Routes by family:
+/// * Adaptive-thinking Claude 4.6+ (opus / sonnet) — emits
+///   `thinking={type:adaptive}` + `output_config={effort:...}`. The bare
+///   `enabled+budget_tokens` form earns a hard 400 on these models.
+/// * Pre-4.6 Claude (3.7 sonnet, opus 4.0/4.5, haiku 4.5) — emits
+///   `thinking={type:enabled, budget_tokens:N}` after enforcing the
+///   `max_tokens > budget_tokens + 1024` invariant the upstream
+///   requires. If the configured `max_output_tokens` is too small the
+///   block is skipped with a `tracing::warn!` so the operator can react
+///   instead of seeing every turn 400.
+///
+/// Skips emission entirely when `reasoning_effort` is unset or when the
+/// model registry says the model does not support reasoning. Caller
+/// owns the map so it can lower additional fields (anthropic_beta, …)
+/// onto the same object.
+pub(crate) fn apply_thinking_extra_fields(
+    extra_fields: &mut HashMap<String, Document>,
+    request: &LlmRequest,
+    model: &str,
+) {
+    let Some(effort) = request.reasoning_effort else {
+        return;
+    };
+    if !crate::capabilities_for("bedrock", model).is_some_and(|caps| caps.reasoning_effort) {
+        return;
+    }
+    let max_tokens = request
+        .max_output_tokens
+        .map(u64::from)
+        .or_else(|| {
+            crate::model_info_for("bedrock", model)
+                .and_then(|info| info.limits)
+                .map(|limits| limits.max_output_tokens)
+        })
+        .unwrap_or(BEDROCK_DEFAULT_MAX_OUTPUT_TOKENS);
+    compute_thinking_extra_fields(extra_fields, model, effort, max_tokens);
+}
+
+/// Inner core of [`apply_thinking_extra_fields`] without the
+/// reasoning-effort or capabilities gates. Pure function of `model`,
+/// `effort`, and `max_tokens` so test fixtures can assert wire shapes
+/// for both branches (adaptive vs enabled+budget) without registering
+/// every candidate model in `models.json`.
+pub(crate) fn compute_thinking_extra_fields(
+    extra_fields: &mut HashMap<String, Document>,
+    model: &str,
+    effort: squeezy_core::ReasoningEffort,
+    max_tokens: u64,
+) {
+    if crate::anthropic::model_uses_adaptive_thinking(model) {
+        // Claude 4.6+ opus/sonnet on Bedrock reject
+        // `thinking.type=enabled` and want the budget conveyed through
+        // `output_config.effort` instead. Mirrors `anthropic.rs:186-193`.
+        extra_fields.insert(
+            "thinking".to_string(),
+            Document::Object(
+                [("type".to_string(), Document::String("adaptive".to_string()))]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        extra_fields.insert(
+            "output_config".to_string(),
+            Document::Object(
+                [(
+                    "effort".to_string(),
+                    Document::String(bedrock_effort_label(effort).to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        );
+        return;
+    }
+    // Anthropic requires `budget_tokens >= 1024` AND
+    // `max_tokens > budget_tokens`. When `max_output_tokens` is too
+    // small to satisfy both at once, emitting `thinking` earns a hard
+    // 400 on every turn. Skip the block in that case and warn so the
+    // operator can raise `max_output_tokens` or unset
+    // `reasoning_effort`.
+    let ceiling = max_tokens.saturating_sub(BEDROCK_THINKING_REPLY_HEADROOM_TOKENS);
+    if ceiling >= BEDROCK_MIN_THINKING_BUDGET_TOKENS {
+        let budget = u64::from(effort.thinking_budget_tokens())
+            .min(ceiling)
+            .max(BEDROCK_MIN_THINKING_BUDGET_TOKENS);
+        extra_fields.insert(
+            "thinking".to_string(),
+            Document::Object(
+                [
+                    ("type".to_string(), Document::String("enabled".to_string())),
+                    (
+                        "budget_tokens".to_string(),
+                        Document::Number(Number::PosInt(budget)),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        );
+    } else {
+        tracing::warn!(
+            provider = "bedrock",
+            model = %model,
+            max_output_tokens = max_tokens,
+            min_required =
+                BEDROCK_MIN_THINKING_BUDGET_TOKENS + BEDROCK_THINKING_REPLY_HEADROOM_TOKENS,
+            "bedrock thinking disabled: max_output_tokens too small to satisfy \
+             thinking.budget_tokens >= 1024 with a reply headroom; raise \
+             max_output_tokens or clear reasoning_effort to silence this warning"
+        );
+    }
+}
+
+/// Map cross-provider [`ReasoningEffort`](squeezy_core::ReasoningEffort) to
+/// the lowercase string Anthropic's adaptive-thinking surface expects on
+/// Bedrock (`output_config.effort`). Mirrors `anthropic.rs:70-77` so the
+/// Bedrock and Anthropic-native paths agree on the wire shape.
+pub(crate) fn bedrock_effort_label(effort: squeezy_core::ReasoningEffort) -> &'static str {
+    match effort {
+        squeezy_core::ReasoningEffort::Low => "low",
+        squeezy_core::ReasoningEffort::Medium => "medium",
+        squeezy_core::ReasoningEffort::High => "high",
+        squeezy_core::ReasoningEffort::XHigh => "max",
     }
 }
 

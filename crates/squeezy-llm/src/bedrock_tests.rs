@@ -17,7 +17,8 @@ use squeezy_core::{BedrockConfig, ProviderTransportConfig};
 
 use super::{
     BedrockProvider, BedrockStreamState, apply_inference_profile_prefix,
-    bedrock_request_metadata_map, build_bedrock_client, conversation_messages,
+    apply_thinking_extra_fields, bedrock_effort_label, bedrock_request_metadata_map,
+    build_bedrock_client, compute_thinking_extra_fields, conversation_messages,
     handle_bedrock_event, inference_configuration, json_to_document, region_prefix, system_blocks,
     tool_configuration,
 };
@@ -854,5 +855,162 @@ fn apply_inference_profile_prefix_falls_back_on_unmapped_region() {
             "us-gov-west-1",
         ),
         "anthropic.claude-sonnet-4-6-20251001-v1:0",
+    );
+}
+
+#[test]
+fn bedrock_effort_label_maps_each_variant() {
+    use squeezy_core::ReasoningEffort;
+    // The label set must match Anthropic's adaptive-thinking surface
+    // exactly so the Bedrock and Anthropic-native paths agree on
+    // `output_config.effort`.
+    assert_eq!(bedrock_effort_label(ReasoningEffort::Low), "low");
+    assert_eq!(bedrock_effort_label(ReasoningEffort::Medium), "medium");
+    assert_eq!(bedrock_effort_label(ReasoningEffort::High), "high");
+    assert_eq!(bedrock_effort_label(ReasoningEffort::XHigh), "max");
+}
+
+#[test]
+fn compute_thinking_extra_fields_emits_adaptive_for_claude_4_6_plus() {
+    // Adaptive-thinking opus/sonnet 4.6+ reject the bare
+    // `enabled+budget_tokens` form on Bedrock; the helper must emit
+    // `thinking={type:adaptive}` + `output_config={effort:...}` so the
+    // request reaches the model in the schema it expects.
+    use squeezy_core::ReasoningEffort;
+    let mut fields = std::collections::HashMap::new();
+    compute_thinking_extra_fields(
+        &mut fields,
+        "anthropic.claude-opus-4-6-20251101-v1:0",
+        ReasoningEffort::High,
+        32_768,
+    );
+    let Document::Object(thinking) = fields.get("thinking").expect("thinking emitted") else {
+        panic!("expected Document::Object for thinking");
+    };
+    assert!(matches!(
+        thinking.get("type"),
+        Some(Document::String(s)) if s == "adaptive"
+    ));
+    assert!(
+        !thinking.contains_key("budget_tokens"),
+        "adaptive shape must not carry budget_tokens; got {:?}",
+        thinking,
+    );
+    let Document::Object(output_config) =
+        fields.get("output_config").expect("output_config emitted")
+    else {
+        panic!("expected Document::Object for output_config");
+    };
+    assert!(matches!(
+        output_config.get("effort"),
+        Some(Document::String(s)) if s == "high"
+    ));
+
+    // Sonnet 4.6 follows the same family rule.
+    let mut sonnet_fields = std::collections::HashMap::new();
+    compute_thinking_extra_fields(
+        &mut sonnet_fields,
+        "us.anthropic.claude-sonnet-4-6-20251001-v1:0",
+        ReasoningEffort::Low,
+        32_768,
+    );
+    assert!(sonnet_fields.contains_key("output_config"));
+    let Document::Object(thinking) = sonnet_fields.get("thinking").unwrap() else {
+        panic!("expected Document::Object");
+    };
+    assert!(matches!(
+        thinking.get("type"),
+        Some(Document::String(s)) if s == "adaptive"
+    ));
+}
+
+#[test]
+fn compute_thinking_extra_fields_emits_enabled_budget_for_pre_4_6_claude() {
+    // Pre-4.6 Claude (3.7 sonnet, opus 4.0/4.5, haiku 4.5) must keep
+    // the `enabled+budget_tokens` shape and must not carry the
+    // `output_config` block.
+    use squeezy_core::ReasoningEffort;
+    let mut fields = std::collections::HashMap::new();
+    compute_thinking_extra_fields(
+        &mut fields,
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+        ReasoningEffort::Medium,
+        32_768,
+    );
+    let Document::Object(thinking) = fields.get("thinking").expect("thinking emitted") else {
+        panic!("expected Document::Object for thinking");
+    };
+    assert!(matches!(
+        thinking.get("type"),
+        Some(Document::String(s)) if s == "enabled"
+    ));
+    assert!(
+        matches!(thinking.get("budget_tokens"), Some(Document::Number(_))),
+        "non-adaptive shape must carry budget_tokens; got {:?}",
+        thinking,
+    );
+    assert!(
+        !fields.contains_key("output_config"),
+        "non-adaptive shape must not carry output_config",
+    );
+}
+
+#[test]
+fn compute_thinking_extra_fields_skips_when_max_tokens_too_small() {
+    // The pre-4.6 path enforces `max_tokens > budget_tokens + 1024`.
+    // When the configured `max_output_tokens` cannot satisfy both the
+    // 1024 budget floor and the 1024 reply headroom, skip emission so
+    // every turn doesn't 400.
+    use squeezy_core::ReasoningEffort;
+    let mut fields = std::collections::HashMap::new();
+    compute_thinking_extra_fields(
+        &mut fields,
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+        ReasoningEffort::Low,
+        1024, // 1024 - 1024 headroom = 0 < 1024 min budget
+    );
+    assert!(
+        fields.is_empty(),
+        "thinking must be skipped when max_tokens is too small; got {:?}",
+        fields,
+    );
+}
+
+#[test]
+fn apply_thinking_extra_fields_no_emit_without_reasoning_effort() {
+    // The outer helper is gated by `request.reasoning_effort.is_some()`
+    // so legacy callers that never opt in keep the historical
+    // no-thinking behavior.
+    let mut fields = std::collections::HashMap::new();
+    let request = LlmRequest::default();
+    apply_thinking_extra_fields(
+        &mut fields,
+        &request,
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+    assert!(
+        fields.is_empty(),
+        "no reasoning_effort means no thinking emission; got {:?}",
+        fields,
+    );
+}
+
+#[test]
+fn apply_thinking_extra_fields_no_emit_when_capabilities_missing() {
+    // A model id not in the registry returns `None` from
+    // `capabilities_for`, so the helper short-circuits without
+    // emitting thinking. Protects non-Anthropic vendors (mistral,
+    // titan) from getting Anthropic-shaped thinking blocks.
+    use squeezy_core::ReasoningEffort;
+    let mut fields = std::collections::HashMap::new();
+    let request = LlmRequest {
+        reasoning_effort: Some(ReasoningEffort::High),
+        ..LlmRequest::default()
+    };
+    apply_thinking_extra_fields(&mut fields, &request, "amazon.titan-text-express-v1");
+    assert!(
+        fields.is_empty(),
+        "unregistered model must not get thinking; got {:?}",
+        fields,
     );
 }
