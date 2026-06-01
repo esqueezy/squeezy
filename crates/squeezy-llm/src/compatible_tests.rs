@@ -274,14 +274,17 @@ fn parse_chat_event_emits_reasoning_delta_for_array_shape() {
 }
 
 #[test]
-fn reasoning_only_stop_emits_done_and_visible_notice() {
-    // Qwen3/DeepSeek-R1-via-aggregator failure mode: the model emits only
-    // `reasoning_content` deltas and finishes with `stop` — no `content`,
-    // no `tool_calls`. Without the fallback the agent loop builds an empty
-    // assistant message and the user sees the spinner stop with nothing
-    // new in the transcript. The parser must (1) drain the streamed
-    // reasoning into a `ReasoningDone` so it persists, and (2) inject a
-    // visible `TextDelta` so the empty completion is *seen*.
+fn reasoning_only_stop_drains_reasoning_without_notice_when_thinking_surfaced() {
+    // H-31: DeepSeek `deepseek-reasoner` (and other reasoning-only
+    // modes) ship a *legitimate* completion where the turn ends
+    // with `stop` after a thinking burst with no content. The
+    // earlier behavior injected a noisy "model finished without
+    // emitting any content" notice mid-transcript that read like
+    // an error and recommended `reasoning_effort` (which DeepSeek
+    // V4 ignores). Suppress the notice when reasoning_buf is
+    // non-empty; the `reasoning_only_stop` flag still latches so
+    // the agent loop can decide what to do next (re-prompt for
+    // visible output).
     let mut state = StreamState::default();
     parse_chat_event(
         r#"{"choices":[{"delta":{"reasoning_content":"thinking hard..."}}]}"#,
@@ -300,17 +303,39 @@ fn reasoning_only_stop_emits_done_and_visible_notice() {
             .any(|e| matches!(e, LlmEvent::ReasoningDone(_))),
         "expected ReasoningDone to flush the streamed thinking: {events:?}"
     );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, LlmEvent::TextDelta(text) if text.contains("[squeezy]"))),
+        "H-31: notice must be suppressed when reasoning surfaced: {events:?}"
+    );
+    assert!(
+        state.reasoning_only_stop,
+        "reasoning_only_stop flag must still latch so the agent loop can act"
+    );
+}
+
+#[test]
+fn reasoning_only_stop_emits_notice_when_no_reasoning_surfaced() {
+    // Counterpoint to H-31: a genuinely-empty completion (no
+    // reasoning, no content, no tool calls) keeps the notice
+    // because the user has zero breadcrumbs about why nothing
+    // happened. Distinguishing this case from the DeepSeek path
+    // is the point of gating on `reasoning_buf` non-empty.
+    let mut state = StreamState::default();
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        &mut state,
+    )
+    .expect("stop");
     let notice = events
         .iter()
         .find_map(|e| match e {
             LlmEvent::TextDelta(text) => Some(text.clone()),
             _ => None,
         })
-        .expect("synthetic notice TextDelta");
-    assert!(
-        notice.contains("finish_reason=stop"),
-        "notice must call out the reason: {notice}"
-    );
+        .expect("genuinely-empty stop must still inject the notice");
+    assert!(notice.contains("finish_reason=stop"), "notice: {notice}");
 }
 
 #[test]

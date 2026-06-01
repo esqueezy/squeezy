@@ -1588,15 +1588,35 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                             // Otherwise this is "model said nothing at
                             // all", which is a different (and rarer)
                             // failure mode.
-                            if !state.reasoning_buf.trim().is_empty() {
+                            let has_reasoning = !state.reasoning_buf.trim().is_empty();
+                            if has_reasoning {
                                 state.reasoning_only_stop = true;
                             }
                             if let Some(reasoning_done) = drain_reasoning(state) {
                                 events.push(reasoning_done);
                             }
-                            events.push(LlmEvent::TextDelta(
-                                "\n[squeezy] model finished without emitting any content or tool call (finish_reason=stop). Reasoning-mode models can burn their output budget on thinking; try a more concrete prompt, lower reasoning_effort, or set [model].tool_choice = \"required\" to force a tool call.\n".to_string(),
-                            ));
+                            // H-31: DeepSeek `deepseek-reasoner` (and other
+                            // reasoning-only modes that finish a thinking
+                            // turn with `stop` and no content) ship a
+                            // legitimate completion in this shape. The
+                            // notice text references `reasoning_effort` (V4
+                            // ignores it; see DS-4) and
+                            // `tool_choice = "required"` (nonsensical on a
+                            // text-only reasoning turn), so the user reads
+                            // a confused apology mid-transcript instead of
+                            // the model's normal end-of-thinking signal.
+                            // Suppress when reasoning surfaced — the
+                            // `reasoning_only_stop` flag latched above
+                            // still lets the agent loop decide what to do
+                            // (re-prompt for a visible response).
+                            // Genuinely-empty stops (no reasoning, no
+                            // content, no tool call) keep the notice so
+                            // the user gets *some* breadcrumb.
+                            if !has_reasoning {
+                                events.push(LlmEvent::TextDelta(
+                                    "\n[squeezy] model finished without emitting any content or tool call (finish_reason=stop). Reasoning-mode models can burn their output budget on thinking; try a more concrete prompt, lower reasoning_effort, or set [model].tool_choice = \"required\" to force a tool call.\n".to_string(),
+                                ));
+                            }
                         }
                     }
                     "length" => {
