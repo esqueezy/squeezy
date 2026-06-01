@@ -154,7 +154,7 @@ async fn parallel_read_and_search_outputs_return_to_model_by_call_id() {
     assert_eq!(outputs[0].0, "grep_call");
     assert_eq!(outputs[1].0, "read_call");
     assert!(outputs[0].1["content"]["matches"][0]["path"] == "src.rs");
-    assert!(outputs[1].1["content"]["content"] == "fn needle() {}\n");
+    assert!(outputs[1].1["content"]["content"] == "     1\tfn needle() {}\n");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1525,7 +1525,7 @@ async fn repeated_read_result_returns_receipt_stub_to_model() {
     let outputs = function_outputs(&requests[2]);
     assert_eq!(outputs.len(), 2);
     assert_eq!(outputs[0].0, "first_read");
-    assert_eq!(outputs[0].1["content"]["content"], "same content\n");
+    assert_eq!(outputs[0].1["content"]["content"], "     1\tsame content\n");
     assert_eq!(outputs[1].0, "second_read");
     assert_eq!(outputs[1].1["content"]["receipt_stub"], true);
     assert_eq!(outputs[1].1["content"]["same_as_call_id"], "first_read");
@@ -1584,7 +1584,7 @@ async fn successful_read_result_persists_model_visible_snapshot() {
         .expect("read snapshot")
         .expect("snapshot exists");
     assert_eq!(snapshot.call_id, "read_once");
-    assert_eq!(snapshot.content, "visible content\n");
+    assert_eq!(snapshot.content, "     1\tvisible content\n");
     let expected_hash = sha256_hex("visible content\n".as_bytes());
     assert_eq!(
         snapshot.content_sha256.as_deref(),
@@ -1766,7 +1766,7 @@ async fn repeated_read_result_in_same_round_returns_receipt_stub_to_model() {
     let outputs = function_outputs(&requests[1]);
     assert_eq!(outputs.len(), 2);
     assert_eq!(outputs[0].0, "first_read");
-    assert_eq!(outputs[0].1["content"]["content"], "same round\n");
+    assert_eq!(outputs[0].1["content"]["content"], "     1\tsame round\n");
     assert_eq!(outputs[1].0, "second_read");
     assert_eq!(outputs[1].1["content"]["receipt_stub"], true);
     assert_eq!(outputs[1].1["content"]["same_as_call_id"], "first_read");
@@ -1914,7 +1914,7 @@ async fn changed_read_result_is_not_receipt_stubbed() {
     let outputs = function_outputs(&requests[3]);
     assert_eq!(outputs.len(), 3);
     assert_eq!(outputs[2].0, "second_read");
-    assert_eq!(outputs[2].1["content"]["content"], "after");
+    assert_eq!(outputs[2].1["content"]["content"], "     1\tafter");
     assert_ne!(outputs[2].1["content"]["receipt_stub"], true);
 
     let _ = fs::remove_dir_all(root);
@@ -2052,7 +2052,10 @@ async fn aggregate_budget_omission_is_not_remembered_as_seen_output() {
     let retry_outputs = function_outputs(&requests[2]);
     assert_eq!(retry_outputs[2].0, "second_retry");
     assert_eq!(retry_outputs[2].1["status"], "Success");
-    assert_eq!(retry_outputs[2].1["content"]["content"], "b".repeat(900));
+    assert_eq!(
+        retry_outputs[2].1["content"]["content"],
+        format!("     1\t{}", "b".repeat(900))
+    );
     assert_ne!(retry_outputs[2].1["content"]["receipt_stub"], true);
 
     let _ = fs::remove_dir_all(root);
