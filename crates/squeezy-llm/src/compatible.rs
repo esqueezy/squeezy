@@ -239,7 +239,23 @@ impl OpenAiCompatibleProvider {
         &self.extra_headers
     }
 
+    #[cfg(test)]
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
+        Self::request_body_for_preset(request, OpenAiCompatiblePreset::Custom)
+    }
+
+    /// Variant of [`request_body`] that takes a [`OpenAiCompatiblePreset`]
+    /// so per-preset wire-shape branches (reasoning emission, body
+    /// gates) can fork without spreading another substring test
+    /// across the codebase. Production code (`stream_response`)
+    /// always calls this overload with the constructed provider's
+    /// preset; the legacy `request_body` is retained for tests that
+    /// don't care about preset-specific quirks and for the
+    /// non-Cloudflare path that historically did not branch.
+    pub(crate) fn request_body_for_preset(
+        request: &LlmRequest,
+        preset: OpenAiCompatiblePreset,
+    ) -> Value {
         // Anthropic-via-aggregator routes accept the same ephemeral
         // cache_control markers as the native Anthropic API. We attach them
         // when the caller has supplied a cache_key and the destination model
@@ -328,14 +344,7 @@ impl OpenAiCompatibleProvider {
             body["max_tokens"] = json!(max_tokens);
         }
         if let Some(effort) = request.reasoning_effort {
-            // OpenRouter, xAI, and most OpenAI-compatible endpoints accept the
-            // top-level legacy form. OpenRouter's docs now recommend the
-            // nested `reasoning: { effort: ... }` form; send both so we
-            // cover both shapes without per-preset branching. Aggregators
-            // ignore unknown fields; non-reasoning models ignore the hint.
-            let effort_str = effort.as_str();
-            body["reasoning_effort"] = json!(effort_str);
-            body["reasoning"] = json!({ "effort": effort_str });
+            emit_reasoning_hints(&mut body, preset, &request.model, effort);
         }
         if let Some(key) = cache_spec.key.as_deref() {
             // OpenAI's Chat Completions / Responses APIs honor a top-level
@@ -360,13 +369,18 @@ impl OpenAiCompatibleProvider {
             // readable identifiers.
             body["prompt_cache_key"] = json!(stable_prompt_cache_key(key));
         }
-        if cache_retention == CacheRetention::Long {
+        if cache_retention == CacheRetention::Long && !preset_rejects_prompt_cache_retention(preset)
+        {
             // Mirror the OpenAI native provider's extended-retention opt-in
             // so OpenAI-hosted models proxied via an aggregator (OpenRouter
             // `openai/*`, Vercel AI Gateway, etc.) still get the 24h
             // window. Anthropic-hosted aggregator routes have already
             // emitted the `ttl: "1h"` marker above; OpenAI ignores
             // `prompt_cache_retention` from non-OpenAI flavors.
+            //
+            // H-56: Mistral 422s on any unknown body field, so
+            // `prompt_cache_retention` would break every request that
+            // flips the Long-retention knob on a Mistral preset.
             body["prompt_cache_retention"] = json!("24h");
         }
         if !request.tools.is_empty() {
@@ -604,7 +618,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         // where a deployment really does want a config/virtual-key
         // header.
         let portkey_routing_configured = portkey_routing_header_present(&extra_headers);
-        let body = Self::request_body(&request);
+        let body = Self::request_body_for_preset(&request, preset);
         let provider_label = self.preset.display_name();
 
         Box::pin(try_stream! {
@@ -1355,6 +1369,152 @@ fn local_jit_load_hint(
         }
         _ => "",
     }
+}
+
+/// H-39 / H-49 / H-52 / H-55 / H-62 / H-65: per-preset reasoning-
+/// hint emission. The vendors diverge on how to enable thinking
+/// mode and on the field names; one centralized branch keeps the
+/// matrix reviewable.
+///
+/// The legacy default emits both `reasoning_effort` and
+/// `reasoning: { effort }` because the historical comment was that
+/// aggregators ignore unknown fields. May 2026 verification shows
+/// that's true for OpenRouter / xAI / generic upstreams, but
+/// Mistral, Vercel, Vertex, DeepSeek-V4, Baseten/vLLM/llamacpp,
+/// and Groq all want different shapes; emitting the OpenAI legacy
+/// form on those breaks the request (Mistral 422) or silently
+/// drops the hint (Vercel/Vertex/DeepSeek/Baseten/vLLM/llamacpp).
+fn emit_reasoning_hints(
+    body: &mut Value,
+    preset: OpenAiCompatiblePreset,
+    model: &str,
+    effort: squeezy_core::ReasoningEffort,
+) {
+    let effort_str = effort.as_str();
+    match preset {
+        OpenAiCompatiblePreset::Mistral => {
+            // H-55: Mistral 422s on the nested `reasoning` form and
+            // only honors a top-level `reasoning_effort` clamped to
+            // its enum `none | high`. Map intermediate effort values
+            // to `high` so a `Low`/`Medium` setting still flips
+            // thinking on (the only other option is to drop the
+            // hint, which is worse — silently disables thinking).
+            body["reasoning_effort"] = json!("high");
+        }
+        OpenAiCompatiblePreset::Vercel => {
+            // H-62: Vercel rejects squeezy's top-level
+            // `reasoning_effort` outright; the hint must ride under
+            // `providerOptions.{anthropic|openai}` keyed off the
+            // upstream the gateway is dialing. Pick the shape from
+            // the model id's namespace prefix; fall back to the
+            // OpenAI shape for unrecognized prefixes.
+            let provider_opts = body
+                .as_object_mut()
+                .expect("body is a JSON object")
+                .entry("providerOptions".to_string())
+                .or_insert_with(|| json!({}));
+            let lower = model.to_ascii_lowercase();
+            if lower.starts_with("anthropic/") {
+                let budget = match effort {
+                    squeezy_core::ReasoningEffort::Low => 4096,
+                    squeezy_core::ReasoningEffort::Medium => 8192,
+                    squeezy_core::ReasoningEffort::High => 16384,
+                    squeezy_core::ReasoningEffort::XHigh => 32768,
+                };
+                provider_opts["anthropic"] = json!({ "thinkingBudget": budget });
+            } else {
+                // OpenAI-on-Vercel shape — both Camel-case fields
+                // match Vercel's documented Responses API surface.
+                provider_opts["openai"] = json!({
+                    "reasoningEffort": effort_str,
+                    "reasoningSummary": "auto",
+                });
+            }
+        }
+        OpenAiCompatiblePreset::Vertex => {
+            // H-65: Vertex's OpenAI-compat layer translates
+            // Gemini-thinking via `extra_body.google.thinking_config.thinking_budget`.
+            // The top-level OpenAI `reasoning_effort` is silently
+            // dropped today. Map effort to the documented budget
+            // tokens.
+            let budget = match effort {
+                squeezy_core::ReasoningEffort::Low => 4096,
+                squeezy_core::ReasoningEffort::Medium => 8192,
+                squeezy_core::ReasoningEffort::High => 16384,
+                squeezy_core::ReasoningEffort::XHigh => 32768,
+            };
+            let extra = body
+                .as_object_mut()
+                .expect("body is a JSON object")
+                .entry("extra_body".to_string())
+                .or_insert_with(|| json!({}));
+            extra["google"] = json!({
+                "thinking_config": {
+                    "thinking_budget": budget,
+                }
+            });
+        }
+        OpenAiCompatiblePreset::DeepSeek => {
+            // H-49: DeepSeek V4 controls thinking via the
+            // `thinking` body field, not via `reasoning_effort`.
+            // Map effort to the documented budget modes.
+            let budget = match effort {
+                squeezy_core::ReasoningEffort::Low => 2048,
+                squeezy_core::ReasoningEffort::Medium => 8192,
+                squeezy_core::ReasoningEffort::High => 16384,
+                squeezy_core::ReasoningEffort::XHigh => 32768,
+            };
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        }
+        OpenAiCompatiblePreset::Groq => {
+            // H-52: Groq controls reasoning per model family. The
+            // gpt-oss-* family wants `include_reasoning: true`; Qwen
+            // and DeepSeek-R1 derivatives want a string
+            // `reasoning_format` enum. The two are mutually
+            // exclusive (Groq rejects both together).
+            let lower = model.to_ascii_lowercase();
+            if lower.contains("gpt-oss") {
+                body["include_reasoning"] = json!(true);
+            } else if lower.contains("qwen") || lower.contains("deepseek") {
+                body["reasoning_format"] = json!("parsed");
+            } else {
+                // Fall back to the OpenAI legacy shape for unknown
+                // Groq models (e.g. Llama-3.x).
+                body["reasoning_effort"] = json!(effort_str);
+            }
+        }
+        OpenAiCompatiblePreset::Baseten
+        | OpenAiCompatiblePreset::VLlm
+        | OpenAiCompatiblePreset::LlamaCpp => {
+            // H-39: Baseten + vLLM + llamacpp enable thinking via
+            // a `chat_template_args.enable_thinking` flag the
+            // jinja template consumes. The OpenAI-style
+            // `reasoning_effort` does nothing on these servers
+            // unless the template branches on it explicitly.
+            let chat_template_args = body
+                .as_object_mut()
+                .expect("body is a JSON object")
+                .entry("chat_template_args".to_string())
+                .or_insert_with(|| json!({}));
+            chat_template_args["enable_thinking"] = json!(true);
+        }
+        _ => {
+            // OpenRouter / xAI / generic: emit both shapes — the
+            // legacy top-level + the newer nested form. Aggregators
+            // ignore unknown fields.
+            body["reasoning_effort"] = json!(effort_str);
+            body["reasoning"] = json!({ "effort": effort_str });
+        }
+    }
+}
+
+/// H-56: Mistral 422s on any unknown body field, including
+/// `prompt_cache_retention`. The retention knob has no Mistral
+/// equivalent today (Mistral cache TTL is server-managed), so the
+/// safest path is to suppress the field on the Mistral preset
+/// entirely. Other presets keep the OpenAI-compat opt-in.
+fn preset_rejects_prompt_cache_retention(preset: OpenAiCompatiblePreset) -> bool {
+    matches!(preset, OpenAiCompatiblePreset::Mistral)
 }
 
 /// H-33: derive a stable, collision-safe `prompt_cache_key` that

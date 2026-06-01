@@ -1085,6 +1085,38 @@ fn request_body_passes_reasoning_effort_in_both_legacy_and_unified_shapes() {
 }
 
 #[test]
+fn request_body_emits_chat_template_args_enable_thinking_for_local_presets() {
+    // H-39: Baseten + vLLM + llamacpp speak the
+    // `chat_template_args.enable_thinking` flag the jinja
+    // template consumes. The OpenAI-style `reasoning_effort` is a
+    // silent no-op on these servers.
+    use squeezy_core::ReasoningEffort;
+    for preset in [
+        OpenAiCompatiblePreset::Baseten,
+        OpenAiCompatiblePreset::VLlm,
+        OpenAiCompatiblePreset::LlamaCpp,
+    ] {
+        let mut request = sample_request();
+        request.reasoning_effort = Some(ReasoningEffort::Medium);
+        let body = OpenAiCompatibleProvider::request_body_for_preset(&request, preset);
+        assert_eq!(
+            body["chat_template_args"]["enable_thinking"], true,
+            "preset={preset:?} must emit chat_template_args.enable_thinking when reasoning_effort is set"
+        );
+        // The default OpenAI shape must NOT also be emitted, or
+        // some templates reject the request as ambiguous.
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "preset={preset:?} must not also emit the OpenAI-style reasoning_effort"
+        );
+        assert!(
+            body.get("reasoning").is_none(),
+            "preset={preset:?} must not also emit the nested reasoning.effort"
+        );
+    }
+}
+
+#[test]
 fn request_body_omits_reasoning_when_caller_did_not_request_it() {
     let body = OpenAiCompatibleProvider::request_body(&sample_request());
     assert!(body.get("reasoning_effort").is_none());
