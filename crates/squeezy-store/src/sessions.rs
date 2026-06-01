@@ -3146,9 +3146,15 @@ fn parse_replay_jsonl_line(line: &str) -> Option<SessionReplayEvent> {
 }
 
 fn replay_payload_sha256(payload: &Value) -> String {
+    use std::fmt::Write as _;
+
     let bytes = serde_json::to_vec(payload).unwrap_or_default();
     let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 fn now_ms() -> u64 {
