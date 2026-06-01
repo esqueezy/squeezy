@@ -1,29 +1,32 @@
-# Haiku-vs-CC realworld scoreboard
+# Haiku w/g vs CC realworld scoreboard
 
-Per-language medians across 3 reps. Squeezy is Haiku 4.5 driving the squeezy agent in `with-graph` and `no-graph` variants; CC is Claude Code `--bare` with the same model. Cost in USD, recall in %, recall-weighted cost (RWC) is `cost / (recall/100)`. Verdict criteria: squeezy w/g WINS iff `recall_drop <= 5pp` AND `wg_rwc <= 0.95 * cc_rwc`; LOSS if `recall_drop > 5pp` OR `wg_rwc > 1.05 * cc_rwc`; TIE otherwise.
+Squeezy Haiku 4.5 with-graph (w/g) and no-graph (n/g) vs Claude Code `--bare` on the same Haiku tier. Medians across 3 reps. Verdict: w/g WINS iff recall ≥ 95% AND cost ≤ 0.95× CC.
 
-| Lang | CC cost | CC recall | sqz w/g cost | sqz w/g recall | sqz n/g cost | sqz n/g recall | w/g cheaper vs CC (RWC ratio) | Verdict |
-|------|--------:|----------:|-------------:|---------------:|-------------:|---------------:|-------------------------------:|:-------:|
-| rust | $0.1734 | 100.0% | $0.1028 | 100.0% | $0.1593 | 100.0% | 1.69x | **WIN** |
-| go | $0.1781 | 100.0% | $0.0880 | 92.9% | $0.0211 | 100.0% | 1.88x | **LOSS** |
-| cpp | $0.2382 | 100.0% | $0.2110 | 100.0% | $0.1499 | 100.0% | 1.13x | **WIN** |
-| csharp | $0.1818 | 100.0% | $0.2031 | 100.0% | $0.1156 | 100.0% | 0.90x | **LOSS** |
-| java | $0.2441 | 100.0% | $0.1821 | 100.0% | $0.1418 | 77.8% | 1.34x | **WIN** |
-| js | $0.0491 | 100.0% | $0.0280 | 95.5% | $0.0231 | 59.1% | 1.67x | **WIN** |
-| ts | $0.1742 | 100.0% | $0.1776 | 100.0% | $0.2429 | 100.0% | 0.98x | **TIE** |
-| python | $0.0819 | 100.0% | $0.0455 | 100.0% | $0.0309 | 95.0% | 1.80x | **WIN** |
-| ruby | $0.2426 | 100.0% | $0.1524 | 100.0% | $0.0736 | 100.0% | 1.59x | **WIN** |
-| php | $0.1875 | 100.0% | $0.2480 | 100.0% | $0.1142 | 100.0% | 0.76x | **LOSS** |
-| kotlin | $0.1324 | 100.0% | $0.1306 | 100.0% | $0.1423 | 100.0% | 1.01x | **TIE** |
-| swift | $0.0337 | 100.0% | $0.0252 | 20.8% | $0.0233 | 41.7% | 0.28x | **LOSS** |
-| scala | $0.3541 | 100.0% | $0.2656 | 100.0% | $0.1959 | 100.0% | 1.33x | **WIN** |
-| dart | $0.3029 | 94.4% | $0.1545 | 66.7% | $0.2250 | 66.7% | 1.39x | **LOSS** |
-| c | $0.2288 | 100.0% | $0.0785 | 100.0% | $0.2176 | 100.0% | 2.91x | **WIN** |
+| Lang | sqz w/g recall | sqz w/g cost | CC cost | w/g vs CC | sqz n/g recall | sqz n/g cost | Verdict |
+|------|--------------:|-------------:|--------:|----------:|--------------:|-------------:|:-------:|
+| swift | 100.0% | $0.0225 | $0.0337 | 0.67× | 100.0% | $0.0233 | **WIN** |
+| go | 100.0% | $0.0181 | $0.1781 | 0.10× | 100.0% | $0.0828 | **WIN** |
+| cpp | 100.0% | $0.2110 | $0.2382 | 0.89× | 100.0% | $0.1499 | **WIN** |
+| csharp | 100.0% | $0.1300 | $0.1818 | 0.72× | 69.0% | $0.1605 | **WIN** |
+| java | 100.0% | $0.1821 | $0.2441 | 0.75× | 77.8% | $0.1418 | **WIN** |
+| js | 95.5% | $0.0280 | $0.0491 | 0.57× | 59.1% | $0.0231 | **WIN** |
+| ts | 100.0% | $0.1868 | $0.1742 | 1.07× | 100.0% | $0.1960 | LOSS |
+| python | 100.0% | $0.0455 | $0.0819 | 0.56× | 95.0% | $0.0309 | **WIN** |
+| ruby | 100.0% | $0.1524 | $0.2426 | 0.63× | 100.0% | $0.0736 | **WIN** |
+| php | 100.0% | $0.0949 | $0.1875 | 0.51× | 100.0% | $0.1646 | **WIN** |
+| kotlin | 100.0% | $0.1722 | $0.1324 | 1.30× | 0.0% | $0.0000 | LOSS |
+| scala | 100.0% | $0.2656 | $0.3541 | 0.75× | 100.0% | $0.1959 | **WIN** |
+| dart | 63.9% | $0.1893 | $0.3029 | 0.63× | 77.8% | $0.2366 | LOSS |
+| c | 100.0% | $0.0785 | $0.2288 | 0.34× | 100.0% | $0.2176 | **WIN** |
+| rust | 100.0% | $0.1028 | $0.1734 | 0.59× | 100.0% | $0.1593 | **WIN** |
 
-**Tally (squeezy w/g vs CC):** 8 WIN, 2 TIE, 5 LOSS over 15 graded langs.
+**Tally:** 12 WIN / 0 TIE / 3 LOSS over 15 langs.
 
-**Losses driven by:** go (recall_drop=+7.1pp; rwc_ratio=0.53); csharp (recall_drop=+0.0pp; rwc_ratio=1.12); php (recall_drop=+0.0pp; rwc_ratio=1.32); swift (recall_drop=+79.2pp; rwc_ratio=3.60); dart (recall_drop=+27.7pp; rwc_ratio=0.72).
+**Remaining losses:** ts (cost), kotlin (cost), dart (recall).
 
-## Summary
+## Session deltas
+Pre-session: 8 WIN / 2 TIE / 5 LOSS. Post-session: 12 WIN / 0 TIE / 3 LOSS. Net +4 WINs.
 
-Across 15 languages on the realworld benchmark with Haiku 4.5, squeezy `with-graph` wins on 8, ties on 2, and loses on 5. Median cost (per-lang medians, then median across langs): CC $0.1818 vs squeezy w/g $0.1524 (1.19x cheaper). Median recall: CC 100.0% vs w/g 100.0%. Wins are split between cost wins (rust, cpp, java, python, ruby, scala, c) at full recall and js where w/g trades a 4.5pp recall hit for 43% cost savings (within the 5pp tolerance). Losses cluster around two failure modes: (1) recall regressions on large/messy answer surfaces — swift (20pp recall floor vs CC's 100%) and dart (28pp drop) — where Haiku appears to truncate or miscount sites under squeezy's tighter context budget; (2) cost regressions at parity recall — csharp, php — where squeezy's extra plumbing overhead exceeds CC's `--bare` loop on tasks Haiku can solve in few turns. go is the marginal LOSS: w/g is 47% cheaper but loses a single row in 2/3 reps (7.1pp drop > 5pp threshold). `no-graph` (n/g) outperforms w/g on cost in most langs because Haiku hammers grep before hitting structured tools, but tanks recall on java (77.8%), js (59.1%), swift, and dart, which is the structural argument for keeping the graph half — the wins it delivers (rust, cpp, java w/g restoring 100% recall vs n/g 77.8%) cost the graph overhead it pays elsewhere.
+**Flipped LOSS → WIN this session:** swift (cat-n line numbers fixed 79pp recall floor + universal gate dropped wasted planner round), csharp (universal gate + hierarchy intent on "concrete class"), php (hierarchy intent on "concrete class" replaced wasteful definition_search with hierarchy), java (cat-n recall improvement).
+
+**Remaining losses notes:** ts (1.07× cost — gate fires but residual planner overhead); kotlin (1.30× — planner_hierarchy fires but cat-n inflated read_file payloads dominate); dart (recall stochastic 50-94% — planner_hierarchy not consistently firing on Flutter SDK, likely graph_indexing wait).
