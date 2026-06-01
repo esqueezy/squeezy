@@ -73,10 +73,12 @@ impl PermissionPreview for CatalogPreview {
 fn push_diff(out: &mut Vec<PreviewLine>, body: &str, added: bool) {
     let prefix = if added { '+' } else { '-' };
     for line in body.lines().take(MAX_HUNK_LINES) {
-        out.push(PreviewLine::Diff {
-            added,
-            line: format!("{prefix} {}", truncate_text(line, LINE_BUDGET)),
-        });
+        let truncated = truncate_text(line, LINE_BUDGET);
+        let mut line = String::with_capacity(truncated.len() + 2);
+        line.push(prefix);
+        line.push(' ');
+        line.push_str(&truncated);
+        out.push(PreviewLine::Diff { added, line });
     }
 }
 

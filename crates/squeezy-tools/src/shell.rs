@@ -998,12 +998,10 @@ fn shell_command_writes_protected_metadata(
     protected_names: &[String],
 ) -> Option<String> {
     let name = shell_command_references_protected_metadata(command, protected_names)?;
-    let parsed = parse_shell_command(command);
-    let raw_segments = parsed
-        .as_ref()
-        .map(|parsed| parsed.segments.clone())
-        .filter(|segments| !segments.is_empty())
-        .unwrap_or_else(|| shell_segments(command));
+    let raw_segments = match parse_shell_command(command) {
+        Some(parsed) if !parsed.segments.is_empty() => parsed.segments,
+        _ => shell_segments(command),
+    };
     let segments = expand_wrapper_segments(raw_segments);
     if segments
         .iter()

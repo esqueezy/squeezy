@@ -391,7 +391,8 @@ impl ToolRegistry {
             }
 
             let text = String::from_utf8_lossy(&bytes);
-            if context == 0 {
+            let needs_context = context > 0 && matches!(output_mode, GrepOutputMode::Content);
+            if !needs_context {
                 for (line_index, line) in text.lines().enumerate() {
                     if !regex.is_match(line) {
                         continue;
