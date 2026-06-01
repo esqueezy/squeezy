@@ -474,10 +474,74 @@ async fn recv_event(
         aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError,
     >,
 ) -> Result<Option<ConverseStreamOutput>> {
-    stream
-        .recv()
-        .await
-        .map_err(|err| SqueezyError::ProviderStream(format!("Bedrock event stream error: {err}")))
+    stream.recv().await.map_err(classify_stream_sdk_error)
+}
+
+/// Classify a `SdkError<ConverseStreamOutputError, _>` into the
+/// cross-provider `SqueezyError` envelope so the retry harness and
+/// downstream observers can react to terminal-vs-retryable failure
+/// modes distinctly.
+///
+/// AWS documents `ModelStreamErrorException` /
+/// `ThrottlingException` / `InternalServerException` /
+/// `ServiceUnavailableException` as retryable and
+/// `ValidationException` as terminal. The Smithy stream surface
+/// collapses both into the same `recv()` error type; without the
+/// downcast a `ValidationException` (bad tool schema, malformed
+/// image) would be retried pointlessly. We don't add new
+/// `SqueezyError` variants — terminal failures land on
+/// `ProviderRequest` (the existing 4xx envelope) and retryable
+/// failures land on `ProviderStream` so `is_retryable_stream_error`
+/// in retry.rs continues to drive reconnection.
+fn classify_stream_sdk_error(
+    err: SdkError<
+        aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError,
+        aws_smithy_types::event_stream::RawMessage,
+    >,
+) -> SqueezyError {
+    use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
+    // Non-service errors (transport, timeout, dispatch) are always
+    // retryable. Surface them on `ProviderStream` with a context
+    // hint about the SDK-side cause.
+    if !matches!(err, SdkError::ServiceError(_)) {
+        let kind = match &err {
+            SdkError::ConstructionFailure(_) => "construction-failure",
+            SdkError::TimeoutError(_) => "timeout",
+            SdkError::DispatchFailure(_) => "dispatch-failure",
+            SdkError::ResponseError(_) => "response-error",
+            SdkError::ServiceError(_) => "service-error",
+            _ => "unknown",
+        };
+        return SqueezyError::ProviderStream(format!("Bedrock event stream {kind}: {err}"));
+    }
+    // Service error: downcast into the Smithy discriminant and emit
+    // distinct envelopes by retryability class. `ValidationException`
+    // is the only deterministic-failure variant — everything else is
+    // a transient class the retry harness should retry.
+    let inner = err.into_service_error();
+    match inner {
+        ConverseStreamOutputError::ValidationException(e) => {
+            SqueezyError::ProviderRequest(format!("Bedrock event stream ValidationException: {e}"))
+        }
+        ConverseStreamOutputError::ThrottlingException(e) => {
+            SqueezyError::ProviderStream(format!("Bedrock event stream ThrottlingException: {e}"))
+        }
+        ConverseStreamOutputError::ModelStreamErrorException(e) => SqueezyError::ProviderStream(
+            format!("Bedrock event stream ModelStreamErrorException: {e}"),
+        ),
+        ConverseStreamOutputError::InternalServerException(e) => SqueezyError::ProviderStream(
+            format!("Bedrock event stream InternalServerException: {e}"),
+        ),
+        ConverseStreamOutputError::ServiceUnavailableException(e) => SqueezyError::ProviderStream(
+            format!("Bedrock event stream ServiceUnavailableException: {e}"),
+        ),
+        // `Unhandled` covers unknown error codes the SDK couldn't
+        // model. Treat as retryable since callers shouldn't burn the
+        // budget on a deterministic re-shape of a transient.
+        other => {
+            SqueezyError::ProviderStream(format!("Bedrock event stream unhandled error: {other}"))
+        }
+    }
 }
 
 #[derive(Debug, Default)]

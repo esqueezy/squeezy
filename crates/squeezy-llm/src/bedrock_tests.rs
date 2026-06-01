@@ -19,9 +19,10 @@ use super::{
     BedrockProvider, BedrockStreamState, BreakpointBudget, apply_inference_profile_prefix,
     apply_thinking_extra_fields, bedrock_document_block, bedrock_effort_label,
     bedrock_request_metadata_map, bedrock_tool_choice, build_bedrock_client,
-    compute_thinking_extra_fields, conversation_messages, current_bearer_token,
-    extract_echoed_model, handle_bedrock_event, inference_configuration, json_to_document,
-    region_prefix, sanitize_bedrock_document_name, system_blocks, tool_configuration,
+    classify_stream_sdk_error, compute_thinking_extra_fields, conversation_messages,
+    current_bearer_token, extract_echoed_model, handle_bedrock_event, inference_configuration,
+    json_to_document, region_prefix, sanitize_bedrock_document_name, system_blocks,
+    tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{CacheRetention, LlmInputItem, LlmRequest, LlmToolSpec};
@@ -1599,4 +1600,85 @@ fn auto_caching_emits_three_breakpoints_within_budget() {
         tool_cache_points, 1,
         "tools tail must carry exactly one cachePoint when retention is enabled",
     );
+}
+
+/// LOW: Smithy stream errors used to collapse into a single
+/// `ProviderStream` envelope with an opaque string, so a
+/// `ValidationException` (bad tool schema, malformed image) looked
+/// indistinguishable from a `ThrottlingException` and the retry
+/// harness retried both. Downcast to `ConverseStreamOutputError`
+/// so deterministic failures land on `ProviderRequest` (terminal)
+/// and transient classes land on `ProviderStream` (retryable).
+#[test]
+fn classify_stream_sdk_error_routes_validation_to_provider_request() {
+    use aws_sdk_bedrockruntime::error::SdkError;
+    use aws_sdk_bedrockruntime::types::error::{ConverseStreamOutputError, ValidationException};
+    use aws_smithy_types::event_stream::RawMessage;
+
+    let inner = ConverseStreamOutputError::ValidationException(
+        ValidationException::builder()
+            .message("bad tool schema")
+            .build(),
+    );
+    let err = classify_stream_sdk_error(SdkError::service_error(inner, RawMessage::invalid(None)));
+    let SqueezyError::ProviderRequest(message) = &err else {
+        panic!("expected ProviderRequest for ValidationException, got {err:?}");
+    };
+    assert!(
+        message.contains("ValidationException"),
+        "error must mention the SDK variant: {message}",
+    );
+}
+
+#[test]
+fn classify_stream_sdk_error_routes_transient_classes_to_provider_stream() {
+    use aws_sdk_bedrockruntime::error::SdkError;
+    use aws_sdk_bedrockruntime::types::error::{
+        ConverseStreamOutputError, InternalServerException, ModelStreamErrorException,
+        ServiceUnavailableException, ThrottlingException,
+    };
+    use aws_smithy_types::event_stream::RawMessage;
+
+    for (label, inner) in [
+        (
+            "ThrottlingException",
+            ConverseStreamOutputError::ThrottlingException(
+                ThrottlingException::builder().message("slow down").build(),
+            ),
+        ),
+        (
+            "ModelStreamErrorException",
+            ConverseStreamOutputError::ModelStreamErrorException(
+                ModelStreamErrorException::builder()
+                    .message("mid-stream blip")
+                    .build(),
+            ),
+        ),
+        (
+            "InternalServerException",
+            ConverseStreamOutputError::InternalServerException(
+                InternalServerException::builder()
+                    .message("upstream borked")
+                    .build(),
+            ),
+        ),
+        (
+            "ServiceUnavailableException",
+            ConverseStreamOutputError::ServiceUnavailableException(
+                ServiceUnavailableException::builder()
+                    .message("come back later")
+                    .build(),
+            ),
+        ),
+    ] {
+        let err =
+            classify_stream_sdk_error(SdkError::service_error(inner, RawMessage::invalid(None)));
+        let SqueezyError::ProviderStream(message) = &err else {
+            panic!("expected ProviderStream for {label}, got {err:?}");
+        };
+        assert!(
+            message.contains(label),
+            "error must mention the SDK variant {label}: {message}",
+        );
+    }
 }
