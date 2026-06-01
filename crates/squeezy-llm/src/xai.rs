@@ -12,10 +12,10 @@
 //! requested model id.
 //!
 //! The provider holds one client per route and dispatches per-request based
-//! on [`is_responses_capable`]; per-startup dispatch would lock a session
-//! to a single wire even when the user switches Grok generations mid-run.
+//! on [`classify_route`]; per-startup dispatch would lock a session to a
+//! single wire even when the user switches Grok generations mid-run.
 
-use squeezy_core::{OpenAiCompatibleConfig, OpenAiCompatiblePreset, Result};
+use squeezy_core::{OpenAiCompatibleConfig, OpenAiCompatiblePreset, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
 
 use crate::{LlmProvider, LlmRequest, LlmStream, OpenAiCompatibleProvider, OpenAiProvider};
@@ -42,39 +42,97 @@ impl LlmProvider for XaiProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
-        if is_responses_capable(&request.model) {
-            self.responses.stream_response(request, cancel)
-        } else {
-            self.chat.stream_response(request, cancel)
+        match classify_route(&request.model) {
+            XaiRoute::Responses => self.responses.stream_response(request, cancel),
+            XaiRoute::Chat => self.chat.stream_response(request, cancel),
+            XaiRoute::ImageNotRouted => {
+                // `grok-imagine-*` lives on `/v1/images/generations` which
+                // neither sub-provider knows about. Surface a structured
+                // error so callers see a useful message instead of a 404
+                // returned by the chat parser. M-33 tracks wiring the
+                // actual image endpoint.
+                let model = request.model.clone();
+                let err = SqueezyError::ProviderNotConfigured(format!(
+                    "xAI image generation model `{model}` requires the `/v1/images/generations` endpoint, which squeezy does not yet route. See `.audit/providers/xai.md` (M-33)."
+                ));
+                Box::pin(async_stream::stream! { yield Err(err); })
+            }
         }
     }
 }
 
-/// `true` when the Grok generation supports xAI's Responses endpoint. The
-/// Responses route launched alongside Grok 3 and stays available for every
-/// later release; Grok 2 / grok-beta / grok-1 still only answer Chat
-/// Completions. Match the major version prefix rather than enumerating
-/// every dated SKU so new `grok-4-fast-*`, `grok-5-*`, etc. variants pick
-/// up the richer wire automatically.
-pub(crate) fn is_responses_capable(model: &str) -> bool {
+/// Routing outcome for the xAI dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum XaiRoute {
+    /// Forward to the OpenAI-Responses sub-provider (`/v1/responses`).
+    Responses,
+    /// Forward to the OpenAI-compatible Chat Completions sub-provider
+    /// (`/v1/chat/completions`).
+    Chat,
+    /// Image-only family (`grok-imagine-*`). The dispatcher rejects the
+    /// request with a structured error because the dedicated image
+    /// endpoint is not wired through either sub-provider.
+    ImageNotRouted,
+}
+
+/// Pick the wire route for a given xAI model id.
+///
+/// The matcher walks an explicit allow-list of Grok families that xAI
+/// ships on Responses as of the May 2026 catalog refresh:
+///
+///   * `grok-4` — flagship Grok 4 and dated SKUs.
+///   * `grok-4.3` — Grok 4.3 (target of the May 15 retirement redirect
+///     from `grok-4`).
+///   * `grok-4.20` — Grok 4.20 family (multi-agent and
+///     reasoning/non-reasoning splits).
+///   * `grok-build` — Grok Build long-context (256k) coder.
+///   * `grok-code` — Grok Code (code-tuned, Grok-4-era).
+///
+/// xAI now treats Responses as the canonical surface, so any
+/// *unrecognised* Grok generation defaults to Responses too —
+/// future `grok-5-*`, `grok-omega-*`, etc. SKUs route correctly
+/// without a code change. Legacy `grok-2`, `grok-1`, and `grok-beta`
+/// ids stay on Chat Completions where they have always lived; any
+/// non-grok id falls through to Chat as a defensive default because
+/// the chat endpoint accepts arbitrary model strings the user might
+/// have routed through a base_url override.
+///
+/// `grok-imagine-*` is image-only and lives on
+/// `/v1/images/generations`. Neither sub-provider knows that
+/// endpoint, so the dispatcher returns [`XaiRoute::ImageNotRouted`]
+/// and the caller surfaces a structured error.
+pub(crate) fn classify_route(model: &str) -> XaiRoute {
     let lower = model.to_ascii_lowercase();
-    // Strip an optional `xai/` aggregator namespace prefix so models served
-    // through, e.g., OpenRouter routed back into the xAI dedicated provider
-    // (rare but possible via base_url override) still resolve correctly.
+    // Strip an optional `xai/` aggregator namespace prefix so models
+    // served through an aggregator and routed back into the xAI
+    // dedicated provider (rare but possible via base_url override)
+    // still resolve correctly.
     let id = lower.split_once('/').map(|(_, id)| id).unwrap_or(&lower);
-    // grok-code-* is a Grok 4-era code-tuned family that ships on Responses
-    // (see `https://docs.x.ai/docs/models`). It does not carry a numeric
-    // generation in the id, so opt it in explicitly.
-    if id.starts_with("grok-code") {
-        return true;
+    if id.starts_with("grok-imagine") {
+        return XaiRoute::ImageNotRouted;
     }
-    let Some(rest) = id.strip_prefix("grok-") else {
-        return false;
-    };
-    let Some(generation_char) = rest.chars().next() else {
-        return false;
-    };
-    matches!(generation_char, '3'..='9')
+    if id.starts_with("grok-4") || id.starts_with("grok-build") || id.starts_with("grok-code") {
+        return XaiRoute::Responses;
+    }
+    if id.starts_with("grok-2") || id.starts_with("grok-1") || id.starts_with("grok-beta") {
+        return XaiRoute::Chat;
+    }
+    if id.starts_with("grok-") {
+        // Unknown Grok generation: default to Responses because xAI's
+        // docs treat Responses as the canonical surface as of May
+        // 2026. Falling back to Chat would 404 every future grok-5
+        // reasoning request.
+        return XaiRoute::Responses;
+    }
+    XaiRoute::Chat
+}
+
+/// `true` when the model id should be dispatched against xAI's Responses
+/// endpoint. Thin shim over [`classify_route`] retained for tests that
+/// only care about the binary chat-vs-responses outcome.
+#[cfg(test)]
+pub(crate) fn is_responses_capable(model: &str) -> bool {
+    matches!(classify_route(model), XaiRoute::Responses)
 }
 
 #[cfg(test)]
