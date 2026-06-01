@@ -533,17 +533,33 @@ pub(crate) fn parse_openai_event(
     data: &str,
     reasoning_acc: &mut ReasoningAccumulator,
 ) -> Result<Option<LlmEvent>> {
-    if data == "[DONE]" {
-        return Ok(None);
-    }
+    // Q11 removed the `[DONE]` sentinel — Responses API never emits it
+    // (only Chat Completions does). If a malformed proxy ever injects
+    // it the empty-data parse error path below surfaces it.
 
     let value: Value = serde_json::from_str(data)
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid SSE JSON: {err}")))?;
-    let event_type = value
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    tracing::trace!(target: "squeezy_llm::openai", event_type, "sse event");
+    // LOW: validate `event.type` is actually a string. A malformed proxy
+    // that ships `{"type": null, ...}` would otherwise silently land in
+    // the `_ =>` "unhandled" arm. Track via a tracing warn so the
+    // protocol violation is observable in a debug build.
+    let event_type = match value.get("type") {
+        Some(Value::String(s)) => s.as_str(),
+        Some(other) => {
+            tracing::warn!(
+                target: "squeezy_llm::openai",
+                ?other,
+                "OpenAI SSE event carried a non-string `type` field",
+            );
+            ""
+        }
+        None => "",
+    };
+    // Q10: skip the trace line when the event has no type — useful for
+    // hand-rolled debug fixtures but adds noise in production.
+    if !event_type.is_empty() {
+        tracing::trace!(target: "squeezy_llm::openai", event_type, "sse event");
+    }
 
     // OpenAI Responses events embed the server-chosen model on the
     // `response` object that ships with `response.created`,

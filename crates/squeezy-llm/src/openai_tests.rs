@@ -119,6 +119,22 @@ fn request_body_omits_empty_instructions() {
 }
 
 #[test]
+fn parser_treats_non_string_event_type_as_unhandled() {
+    // LOW: a malformed proxy could ship `{"type": null}`; the parser
+    // must not error, must not match a real branch, just log + skip.
+    let mut acc = ReasoningAccumulator::default();
+    let event = parse_openai_event(r#"{"type":null,"delta":"hello"}"#, &mut acc).expect("ok");
+    assert!(event.is_none());
+}
+
+#[test]
+fn parser_treats_missing_event_type_as_unhandled() {
+    let mut acc = ReasoningAccumulator::default();
+    let event = parse_openai_event(r#"{"delta":"hello"}"#, &mut acc).expect("ok");
+    assert!(event.is_none());
+}
+
+#[test]
 fn parser_extracts_text_delta() {
     let mut acc = ReasoningAccumulator::default();
     let event = parse_openai_event(
