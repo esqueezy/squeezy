@@ -315,6 +315,9 @@ pub const CONSERVATIVE_FALLBACK_CAPABILITIES: ModelCapabilities = ModelCapabilit
     reasoning_effort: false,
     text_verbosity: false,
     prompt_caching: false,
+    default_reasoning_effort: None,
+    thinking_budget_min: None,
+    thinking_budget_max: None,
 };
 
 /// Where the resolved `ModelCapabilities` came from.

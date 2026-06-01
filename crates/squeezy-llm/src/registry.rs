@@ -2,7 +2,9 @@ use std::sync::{Arc, LazyLock};
 
 use serde::Deserialize;
 use serde_json::Value;
-use squeezy_core::{CostSnapshot, ModelProfile, OpenAiCompatiblePreset, ProviderConfig, Result};
+use squeezy_core::{
+    CostSnapshot, ModelProfile, OpenAiCompatiblePreset, ProviderConfig, ReasoningEffort, Result,
+};
 
 use crate::{
     AnthropicProvider, BedrockProvider, FauxProvider, GoogleProvider, LlmInputItem, LlmProvider,
@@ -22,6 +24,24 @@ pub struct ModelCapabilities {
     pub text_verbosity: bool,
     #[serde(default)]
     pub prompt_caching: bool,
+    /// Default `reasoning_effort` the provider should apply when the
+    /// caller leaves [`LlmRequest::reasoning_effort`] unset. `None`
+    /// preserves the historical behavior of "let the provider pick";
+    /// `Some(...)` lets the Phase 3 catalog encode model-recommended
+    /// defaults (e.g. GPT-5 high vs medium baseline). Per-provider
+    /// consumption lands in Phase 4.
+    #[serde(default)]
+    pub default_reasoning_effort: Option<ReasoningEffort>,
+    /// Minimum thinking budget the provider supports for the model.
+    /// `None` leaves the provider default in place. Per-provider
+    /// consumption lands in Phase 4.
+    #[serde(default)]
+    pub thinking_budget_min: Option<u32>,
+    /// Maximum thinking budget the provider supports for the model.
+    /// `None` leaves the provider default in place. Per-provider
+    /// consumption lands in Phase 4.
+    #[serde(default)]
+    pub thinking_budget_max: Option<u32>,
 }
 
 impl ModelCapabilities {
@@ -35,6 +55,9 @@ impl ModelCapabilities {
         reasoning_effort: false,
         text_verbosity: false,
         prompt_caching: false,
+        default_reasoning_effort: None,
+        thinking_budget_min: None,
+        thinking_budget_max: None,
     };
 }
 
