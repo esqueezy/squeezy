@@ -579,6 +579,62 @@ fn dispatcher_xai_config_with_extra_headers(
     }
 }
 
+/// xAI Chat-Completions SSE that reports prompt cache hits at the
+/// top-level `usage.cached_tokens` field (per xAI's chat docs
+/// examples). The squeezy chat parser today only looks at
+/// `prompt_tokens_details.cached_tokens` and
+/// `prompt_cache_hit_tokens`, so this shape silently zeros out the
+/// cached-tokens column. The fixture lives here so M-31's
+/// `compatible.rs` fix can flip the assertion from `None` to
+/// `Some(42)` in lockstep.
+const CHAT_TOPLEVEL_CACHED_TOKENS_SSE_BODY: &str = concat!(
+    "data: {\"id\":\"chatcmpl_xai_m31\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}\n\n",
+    "data: {\"id\":\"chatcmpl_xai_m31\",\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":1,\"cached_tokens\":42}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+#[tokio::test]
+async fn xai_chat_top_level_cached_tokens_gap_marker_m31() {
+    // M-31: regression marker for xAI's top-level
+    // `usage.cached_tokens` shape. The chat parser in `compatible.rs`
+    // currently only consults `prompt_tokens_details.cached_tokens`
+    // and `prompt_cache_hit_tokens`, so this fixture surfaces
+    // `cached_input_tokens = None`. The asymmetry is documented at
+    // `.audit/providers/xai.md` (M-31); once `compatible.rs` learns
+    // the third fallback, flip this expectation to `Some(42)` to
+    // guard against losing the fix.
+    let recorder = DispatcherRecorder::new();
+    let bodies = RouteBodies {
+        responses: RESPONSES_SSE_BODY,
+        chat: CHAT_TOPLEVEL_CACHED_TOKENS_SSE_BODY,
+    };
+    let addr = spawn_xai_dispatcher_server(recorder.clone(), bodies).await;
+    let provider = XaiProvider::from_config(&dispatcher_xai_config(addr))
+        .expect("XaiProvider builds against mock server");
+
+    let stream = provider.stream_response(dispatcher_request("grok-2"), CancellationToken::new());
+    let events: Vec<LlmEvent> =
+        tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+            .await
+            .expect("Chat M-31 SSE must complete within timeout")
+            .into_iter()
+            .map(|res| res.expect("Chat M-31 SSE must not error"))
+            .collect();
+
+    let Some(LlmEvent::Completed { cost, .. }) = events
+        .iter()
+        .find(|event| matches!(event, LlmEvent::Completed { .. }))
+    else {
+        panic!("expected LlmEvent::Completed in M-31 replay");
+    };
+    assert_eq!(cost.input_tokens, Some(20));
+    assert_eq!(cost.output_tokens, Some(1));
+    assert_eq!(
+        cost.cached_input_tokens, None,
+        "M-31 gap marker: xAI's top-level `usage.cached_tokens` is not yet picked up by `parse_chat_usage` in compatible.rs. Flip to `Some(42)` once that fix lands."
+    );
+}
+
 #[test]
 fn xai_classify_route_rejects_imagine_family_c09() {
     // C-09: `grok-imagine-*` is image-only and lives on

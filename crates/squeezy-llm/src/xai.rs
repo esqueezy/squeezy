@@ -20,10 +20,23 @@
 //! while the Chat route honours them. Fixing the asymmetry lives in
 //! `openai.rs` (Phase 4B owns that file) and is intentionally not patched
 //! here. Coordinate with that phase before declaring the audit closed.
+//!
+//! M-31 (xAI `usage.cached_tokens` fallback): the chat-completions cost
+//! parser in `compatible.rs` only consults
+//! `prompt_tokens_details.cached_tokens` and `prompt_cache_hit_tokens`,
+//! but xAI documents a top-level `usage.cached_tokens` shape in some
+//! responses. The fix lives in `parse_chat_usage` (compatible.rs, NOT
+//! owned by this phase). The regression marker `xai_chat_top_level_cached_tokens_gap_marker_m31`
+//! locks in the *current* `None` so a Phase 4-cross fix flips one
+//! assertion when it lands.
+
+use std::collections::BTreeMap;
 
 use squeezy_core::{OpenAiCompatibleConfig, OpenAiCompatiblePreset, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
 
+use crate::compatible::substitute_url_placeholders;
+use crate::credentials::{resolve_api_key_with_inline, static_api_key_source};
 use crate::{LlmProvider, LlmRequest, LlmStream, OpenAiCompatibleProvider, OpenAiProvider};
 
 #[derive(Debug, Clone)]
@@ -34,11 +47,66 @@ pub struct XaiProvider {
 
 impl XaiProvider {
     pub fn from_config(config: &OpenAiCompatibleConfig) -> Result<Self> {
-        debug_assert_eq!(config.preset, OpenAiCompatiblePreset::XAi);
-        Ok(Self {
-            responses: OpenAiProvider::from_xai_config(config)?,
-            chat: OpenAiCompatibleProvider::from_config(config)?,
-        })
+        // M-32: resolve the xAI credential exactly once and share a
+        // single `Arc<dyn ApiKeySource>` between the Responses and
+        // Chat sub-providers. The previous shape called
+        // `OpenAiProvider::from_xai_config` and
+        // `OpenAiCompatibleProvider::from_config` back-to-back, each of
+        // which re-read credentials.json and the env var. The duplicate
+        // I/O is harmless for static keys today but races for any
+        // future OAuth credential (cf. opencode's `XaiAuthPlugin` for
+        // SuperGrok), so funnel both sub-providers through the same
+        // source up front.
+        if config.preset != OpenAiCompatiblePreset::XAi {
+            return Err(SqueezyError::ProviderNotConfigured(format!(
+                "XaiProvider::from_config requires preset=XAi, got {:?}",
+                config.preset,
+            )));
+        }
+        if config.base_url.trim().is_empty() {
+            return Err(SqueezyError::ProviderNotConfigured(
+                "providers.xai.base_url is required for the xAI preset".to_string(),
+            ));
+        }
+        let resolved_base_url = substitute_url_placeholders(
+            config.base_url.trim_end_matches('/'),
+            config.preset,
+            config.account_id.as_deref(),
+            config.gateway_id.as_deref(),
+        )?;
+        let api_key =
+            resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
+        let api_key_source = static_api_key_source(api_key, "xai");
+
+        let responses = OpenAiProvider::with_api_key_source(
+            "xai",
+            api_key_source.clone(),
+            resolved_base_url.clone(),
+            // The Responses route ignores `extra_headers` by design
+            // (see H-22 TODO at module head); no api_version applies to
+            // xAI's `/v1/responses` endpoint.
+            None,
+            config.transport,
+        );
+
+        // The chat route still merges any user-supplied headers on top
+        // of the (empty) preset defaults so xAI requests routed through
+        // PortKey/Helicone-style proxies keep their attribution tags.
+        // xAI itself does not stamp preset_default_headers; mirror that
+        // by starting from an empty map.
+        let mut chat_headers: BTreeMap<String, String> = BTreeMap::new();
+        for (key, value) in &config.extra_headers {
+            chat_headers.insert(key.clone(), value.clone());
+        }
+        let chat = OpenAiCompatibleProvider::with_api_key_source(
+            config.preset,
+            api_key_source,
+            resolved_base_url,
+            chat_headers,
+            config.transport,
+        );
+
+        Ok(Self { responses, chat })
     }
 }
 
