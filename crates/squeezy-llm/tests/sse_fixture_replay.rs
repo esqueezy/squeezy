@@ -192,6 +192,9 @@ fn provider_for(addr: SocketAddr, port_label: u16) -> OpenAiProvider {
             stream_idle_timeout_ms: 5_000,
             ..ProviderTransportConfig::default()
         },
+        organization: None,
+        project: None,
+        service_tier: None,
     };
     OpenAiProvider::from_config(&config).expect("provider")
 }
