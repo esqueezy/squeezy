@@ -2035,6 +2035,26 @@ fn read_slice_target(
     ))
 }
 
+/// Prefix each line of `content` with its 1-based absolute line number in
+/// cat -n format (right-aligned 6-char number, tab, line text). The
+/// in-line `\n` separators are preserved so the model sees one prefixed
+/// row per source line. The first line of the returned string maps to
+/// `start_line`, the second to `start_line + 1`, and so on. Trailing
+/// content without a final `\n` is emitted as a final unterminated row.
+fn prefix_lines_with_numbers(content: &str, start_line: u32) -> String {
+    if content.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(content.len() + content.len() / 8);
+    let mut line_no = start_line;
+    for piece in content.split_inclusive('\n') {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{line_no:>6}\t{piece}");
+        line_no = line_no.saturating_add(1);
+    }
+    out
+}
+
 fn read_slice_byte_window(
     path: &Path,
     total_bytes: u64,
@@ -2894,11 +2914,21 @@ impl ToolRegistry {
             Err(err) => return tool_error(call, err),
         };
         let end = offset.saturating_add(bytes.len());
-        let content = String::from_utf8_lossy(&bytes).to_string();
+        let raw_content = String::from_utf8_lossy(&bytes).to_string();
         let content_sha256 = match sha256_file(&path) {
             Ok(hash) => hash,
             Err(err) => return tool_error(call, err),
         };
+        let start_line_1based: u32 = if let Some(span) = resolved_span {
+            span.start.line.saturating_add(1)
+        } else if offset == 0 {
+            1
+        } else {
+            window_line_offset(&path, offset)
+                .unwrap_or(0)
+                .saturating_add(1)
+        };
+        let content = prefix_lines_with_numbers(&raw_content, start_line_1based);
         let truncated = end < total_bytes as usize
             && args
                 .end_byte
@@ -2911,32 +2941,22 @@ impl ToolRegistry {
             truncated,
             ..ToolCostHint::default()
         };
-        // Slice-mode wire payload carries only the fields the agent cannot
-        // derive from its call site: the resolved window (`path` + `offset`)
-        // and the bytes themselves. The model reads the length straight from
-        // `content`, so `bytes_returned` is only emitted in the truncation
-        // case where the body it sees is smaller than the window it
-        // requested. `truncated` is only set when the read actually clipped
-        // — its value was unconditionally `false` on the >99% of slice
-        // reads that returned the full requested window, so emitting it on
-        // every result was pure decoration. The full sha256 still rides on
-        // `ToolResult.receipt.content_sha256` for cost-broker consumers;
-        // graph status, span coordinates, and a single-element `packets`
-        // array would just restate fields the model already sees, so they
-        // live on diff-mode reads (where the span describes a hunk the
-        // model has not seen) and are omitted here. The agent's compaction
-        // snapshot derives the window from `offset + content.len()` when
-        // `bytes_returned` is absent.
+        // Slice-mode wire payload now prefixes each line in `content` with
+        // its 1-based absolute line number (cat -n format) so the model can
+        // report line numbers without counting newlines. `start_line` is
+        // included explicitly so the model can build line-relative offsets
+        // without parsing the prefix. `bytes_returned` is always emitted —
+        // when content is line-numbered, `content.len()` no longer matches
+        // raw bytes read, so the compaction snapshot needs the explicit
+        // byte count to size the window correctly.
         let mut payload = serde_json::Map::new();
         payload.insert("tool".to_string(), json!("read_slice"));
         payload.insert("path".to_string(), json!(&rel_str));
         payload.insert("offset".to_string(), json!(offset));
+        payload.insert("start_line".to_string(), json!(start_line_1based));
+        payload.insert("bytes_returned".to_string(), json!(bytes.len()));
         if truncated {
             payload.insert("truncated".to_string(), json!(true));
-            payload.insert("bytes_returned".to_string(), json!(bytes.len()));
-            // total_bytes only informs the agent of further bytes to fetch
-            // when we actually clipped the read; otherwise it duplicates
-            // `offset + content.len()`.
             payload.insert("total_bytes".to_string(), json!(total_bytes));
         }
         if let Some(reason) = ignored_reason {

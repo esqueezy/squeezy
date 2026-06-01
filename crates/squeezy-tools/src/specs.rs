@@ -494,7 +494,7 @@ pub(crate) fn hierarchy_spec() -> ToolSpec {
 pub(crate) fn read_slice_spec() -> ToolSpec {
     ToolSpec {
         name: "read_slice".to_string(),
-        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Set read_mode=diff to return only changed ranges against a baseline. When a graph packet returns a symbol_id (definition_search, symbol_context, hierarchy, reference_search), `symbol_id=<id>` with `span_kind=body` returns the body span directly.".to_string(),
+        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Each line in the returned `content` is prefixed with its 1-based absolute line number followed by a tab (cat -n format); the result also carries `start_line` so the model never has to count newlines. Set read_mode=diff to return only changed ranges against a baseline. When a graph packet returns a symbol_id (definition_search, symbol_context, hierarchy, reference_search), `symbol_id=<id>` with `span_kind=body` returns the body span directly.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
