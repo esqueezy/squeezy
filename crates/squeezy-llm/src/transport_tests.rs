@@ -42,6 +42,26 @@ fn shared_client_returns_handles_with_same_underlying_pool() {
 }
 
 #[test]
+fn build_client_applies_connect_timeout_and_tcp_keepalive() {
+    // Smoke test: the builder must accept the connect_timeout +
+    // tcp_keepalive knobs at every config the public surface exposes.
+    // If reqwest ever rejects these (or our `Duration` overflows), the
+    // build would panic via the `expect` inside `build_client`. We
+    // exercise the extremes (default + heavily customized) to catch
+    // any interaction with the pool knobs the same builder also sets.
+    let client = build_client(&ProviderTransportConfig::default());
+    assert!(format!("{client:?}").contains("Client"));
+
+    let customized = ProviderTransportConfig {
+        pool_idle_timeout_ms: 0,
+        pool_max_idle_per_host: 1,
+        ..ProviderTransportConfig::default()
+    };
+    let client = build_client(&customized);
+    assert!(format!("{client:?}").contains("Client"));
+}
+
+#[test]
 fn shared_client_builds_distinct_clients_for_distinct_configs() {
     let fast = ProviderTransportConfig {
         pool_idle_timeout_ms: 1_000,

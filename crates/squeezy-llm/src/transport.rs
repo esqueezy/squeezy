@@ -94,8 +94,19 @@ pub fn shared_client(config: &ProviderTransportConfig) -> reqwest::Client {
 /// (and so the fallback path on a poisoned lock has a single code
 /// path to maintain).
 pub(crate) fn build_client(config: &ProviderTransportConfig) -> reqwest::Client {
-    let mut builder =
-        reqwest::Client::builder().pool_max_idle_per_host(config.pool_max_idle_per_host as usize);
+    let mut builder = reqwest::Client::builder()
+        .pool_max_idle_per_host(config.pool_max_idle_per_host as usize)
+        // Bounds the *connect* (DNS + TCP + TLS) handshake only. A
+        // hung remote during connection would otherwise block the
+        // request indefinitely; reqwest's overall `timeout` is
+        // intentionally unset for streaming bodies, so this is the
+        // only defense against a black-hole connect.
+        .connect_timeout(Duration::from_secs(30))
+        // Probes idle sockets so a pool entry silently killed by a
+        // NAT/firewall is detected on the next reuse instead of
+        // surfacing as a stalled request. Independent of
+        // `pool_idle_timeout_ms`, which governs eviction.
+        .tcp_keepalive(Duration::from_secs(60));
     builder = if config.pool_idle_timeout_ms == 0 {
         // `None` keeps idle sockets parked indefinitely — a
         // `pool_idle_timeout_ms = 0` config explicitly disables
