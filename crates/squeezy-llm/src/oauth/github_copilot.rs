@@ -997,6 +997,10 @@ impl ApiKeySource for GitHubCopilotOAuthSource {
     fn provider_label(&self) -> &str {
         &self.label
     }
+
+    fn can_rotate(&self) -> bool {
+        true
+    }
 }
 
 // ─── Provider client ───────────────────────────────────────────────────────

@@ -608,6 +608,10 @@ impl ApiKeySource for AnthropicOAuthSource {
     fn provider_label(&self) -> &str {
         &self.label
     }
+
+    fn can_rotate(&self) -> bool {
+        true
+    }
 }
 
 fn access_token_is_stale(tokens: &PersistedTokens) -> bool {

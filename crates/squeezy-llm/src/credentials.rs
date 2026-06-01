@@ -418,6 +418,18 @@ pub trait ApiKeySource: Send + Sync + std::fmt::Debug {
     /// Short label used in logs and `Debug` output. Mirrors the
     /// `providers.<section>` key (e.g. `"anthropic"`, `"openai"`).
     fn provider_label(&self) -> &str;
+
+    /// Whether the source can rotate the credential without operator
+    /// intervention. OAuth and refreshable-token sources return `true`
+    /// — the auth-retry layer can call [`Self::invalidate`] and expect
+    /// the next [`Self::current_key`] to succeed. Static API keys
+    /// return `false` (the default) because invalidating just clears
+    /// the only available value; retry would loop forever on a
+    /// genuinely-revoked key. Consumed by H-05 (Phase 2C) to gate the
+    /// `send_with_auth_retry` reconnect.
+    fn can_rotate(&self) -> bool {
+        false
+    }
 }
 
 /// A fixed API key that never refreshes. The path every existing
@@ -565,6 +577,10 @@ impl ApiKeySource for RefreshableToken {
 
     fn provider_label(&self) -> &str {
         &self.label
+    }
+
+    fn can_rotate(&self) -> bool {
+        true
     }
 }
 
