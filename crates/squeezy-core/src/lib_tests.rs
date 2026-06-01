@@ -4198,6 +4198,177 @@ fn extra_headers_none_serializes_without_a_headers_table() {
 }
 
 #[test]
+fn custom_preset_emits_allow_list_warning_at_config_load() {
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Level, Metadata, Subscriber};
+
+    // M-64 contract: when the `Custom` OpenAI-compatible preset is
+    // configured we emit exactly one `WARN` on
+    // `squeezy_core::config` carrying the resolved `base_url`. The
+    // warning is intentionally non-blocking — an operator who imports
+    // a project-local `./squeezy.toml` from an untrusted source needs
+    // to *see* the destination of every Bearer-token-carrying request
+    // before traffic flows. Curated presets (OpenAI proper, Anthropic,
+    // Cloudflare AI Gateway, …) all run against published default
+    // base_urls so the same warning would be noise; only Custom takes
+    // a fully user-controlled URL and bypasses every other check.
+    #[derive(Default, Clone)]
+    struct Capturing {
+        events: Arc<Mutex<Vec<(String, String)>>>,
+    }
+    struct MsgVisitor<'a>(&'a mut String);
+    impl Visit for MsgVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.push_str(&format!("{value:?}"));
+            }
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.0.push_str(value);
+            }
+        }
+    }
+    impl Subscriber for Capturing {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.level() <= &Level::WARN
+        }
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let target = event.metadata().target().to_string();
+            let mut message = String::new();
+            event.record(&mut MsgVisitor(&mut message));
+            self.events
+                .lock()
+                .expect("events lock poisoned")
+                .push((target, message));
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    let subscriber = Capturing::default();
+    let toml = r#"
+[model]
+provider = "openai_compatible"
+
+[providers.openai_compatible]
+base_url = "https://internal.example.com/v1"
+api_key_env = "FAKE_KEY"
+"#;
+    let settings = SettingsFile::from_toml_str(toml, "test").expect("settings parse");
+    let _config = tracing::subscriber::with_default(subscriber.clone(), || {
+        AppConfig::try_from_settings_and_env_vars(settings, None, |name| {
+            (name == "FAKE_KEY").then(|| "k".to_string())
+        })
+    })
+    .expect("Custom preset must build with explicit base_url + api_key_env");
+
+    let captured: Vec<(String, String)> =
+        std::mem::take(&mut *subscriber.events.lock().expect("events lock poisoned"));
+    let matches: Vec<_> = captured
+        .iter()
+        .filter(|(target, message)| {
+            target == "squeezy_core::config" && message.contains("Custom preset bypasses")
+        })
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one Custom-preset allow-list warning on \
+         squeezy_core::config; captured: {captured:?}"
+    );
+    let (_, message) = matches[0];
+    assert!(
+        message.contains("https://internal.example.com/v1"),
+        "warning must name the resolved base_url; got: {message}"
+    );
+}
+
+#[test]
+fn non_custom_preset_does_not_emit_allow_list_warning() {
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Level, Metadata, Subscriber};
+
+    // Counterpart to `custom_preset_emits_allow_list_warning_at_config_load`:
+    // a curated preset (OpenRouter here — it has a published default
+    // base_url) must NOT emit the Custom-preset bypass warning. Without
+    // this control a future regression that fired the warning for
+    // every OpenAI-compatible preset would slip past the positive
+    // assertion above.
+    #[derive(Default, Clone)]
+    struct Capturing {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+    struct MsgVisitor<'a>(&'a mut String);
+    impl Visit for MsgVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.push_str(&format!("{value:?}"));
+            }
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.0.push_str(value);
+            }
+        }
+    }
+    impl Subscriber for Capturing {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.level() <= &Level::WARN && metadata.target() == "squeezy_core::config"
+        }
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut message = String::new();
+            event.record(&mut MsgVisitor(&mut message));
+            self.events
+                .lock()
+                .expect("events lock poisoned")
+                .push(message);
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    let subscriber = Capturing::default();
+    let toml = r#"
+[model]
+provider = "openrouter"
+
+[providers.openrouter]
+api_key_env = "OPENROUTER_API_KEY"
+"#;
+    let settings = SettingsFile::from_toml_str(toml, "test").expect("settings parse");
+    let _config = tracing::subscriber::with_default(subscriber.clone(), || {
+        AppConfig::try_from_settings_and_env_vars(settings, None, |name| {
+            (name == "OPENROUTER_API_KEY").then(|| "k".to_string())
+        })
+    })
+    .expect("OpenRouter preset must build");
+
+    let captured: Vec<String> =
+        std::mem::take(&mut *subscriber.events.lock().expect("events lock poisoned"));
+    for message in &captured {
+        assert!(
+            !message.contains("Custom preset bypasses"),
+            "non-Custom preset must not emit the allow-list warning; got: {message}",
+        );
+    }
+}
+
+#[test]
 fn local_inline_api_key_overrides_user_inline_api_key() {
     let mut user = ProviderSettings {
         api_key: Some("from-user".to_string()),
