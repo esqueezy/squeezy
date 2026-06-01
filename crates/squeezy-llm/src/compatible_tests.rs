@@ -493,6 +493,38 @@ fn parse_chat_event_ignores_unknown_delta_shapes_without_panic() {
 }
 
 #[test]
+fn request_body_forwards_parallel_tool_calls_when_set() {
+    // H-32: aggregator routes that proxy to OpenAI need
+    // parallel_tool_calls to flow through so users can serialise
+    // tool calls. Today the Responses provider honors the field
+    // but the chat-completions path silently drops it.
+    let mut request = sample_request();
+    request.parallel_tool_calls = Some(false);
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(
+        body["parallel_tool_calls"], false,
+        "parallel_tool_calls=Some(false) must flow into the body"
+    );
+
+    let mut request = sample_request();
+    request.parallel_tool_calls = Some(true);
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["parallel_tool_calls"], true);
+}
+
+#[test]
+fn request_body_omits_parallel_tool_calls_when_unset() {
+    // Default behavior preserves "let the upstream pick" — no
+    // wire field, so providers that don't recognise it keep their
+    // historical parallel-on default.
+    let body = OpenAiCompatibleProvider::request_body(&sample_request());
+    assert!(
+        body.get("parallel_tool_calls").is_none(),
+        "parallel_tool_calls must be absent when caller did not set it: {body}"
+    );
+}
+
+#[test]
 fn request_body_pins_n_to_one() {
     // H-24: pin n: 1 explicitly so an upstream server that
     // defaults to n > 1 (rare but legal under Chat Completions)

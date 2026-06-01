@@ -405,6 +405,16 @@ impl OpenAiCompatibleProvider {
             if let Some(choice) = request.tool_choice.as_deref() {
                 body["tool_choice"] = json!(choice);
             }
+            // H-32: forward `parallel_tool_calls` when the caller
+            // explicitly set it. OpenAI's Responses provider already
+            // honors this; aggregator routes that proxy to OpenAI
+            // (OpenRouter, Vercel, PortKey) accept it and translate;
+            // routes that don't recognize the field ignore it. The
+            // field is `None` by default so we don't pin a per-route
+            // policy.
+            if let Some(parallel) = request.parallel_tool_calls {
+                body["parallel_tool_calls"] = json!(parallel);
+            }
         }
         body
     }
