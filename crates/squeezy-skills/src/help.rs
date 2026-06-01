@@ -864,13 +864,24 @@ fn parse_section_header(line: &str) -> Option<&str> {
 }
 
 fn normalize(input: &str) -> String {
-    input
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['_', '-'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut out = String::with_capacity(input.len());
+    let mut pending_space = false;
+    for ch in input.trim().chars() {
+        let ch = match ch {
+            '_' | '-' => ' ',
+            _ => ch.to_ascii_lowercase(),
+        };
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
