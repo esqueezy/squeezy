@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
@@ -385,6 +385,105 @@ fn retry_after_falls_back_when_ms_header_is_unparseable() {
 #[test]
 fn retry_after_returns_none_when_no_headers_present() {
     let headers = reqwest::header::HeaderMap::new();
+    assert_eq!(parse_retry_after(&headers), None);
+}
+
+#[test]
+fn parse_retry_after_handles_float_seconds() {
+    // OpenAI's Responses endpoint occasionally returns sub-second
+    // throttles as `Retry-After: 0.5`. The parser must keep the
+    // fractional precision (rounded to milliseconds) instead of
+    // returning `None` and collapsing to the zero-jitter exponential
+    // backoff.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        "0.5".parse().expect("header value"),
+    );
+    assert_eq!(
+        parse_retry_after(&headers),
+        Some(Duration::from_millis(500))
+    );
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        "1.25".parse().expect("header value"),
+    );
+    assert_eq!(
+        parse_retry_after(&headers),
+        Some(Duration::from_millis(1_250)),
+    );
+}
+
+#[test]
+fn parse_retry_after_rejects_negative_and_nan_floats() {
+    // A negative or NaN float must fall through to `None` rather than
+    // wrap around to a giant Duration. The outer policy clamp would
+    // still defend us, but failing fast keeps the breadcrumb honest.
+    for input in ["-1", "-0.5", "NaN", "inf"] {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            input.parse().expect("header value"),
+        );
+        assert_eq!(
+            parse_retry_after(&headers),
+            None,
+            "input {input:?} must not parse to a Duration",
+        );
+    }
+}
+
+#[test]
+fn parse_retry_after_handles_http_date() {
+    // RFC 7231 permits an HTTP-date in `Retry-After`. CDN gateways and
+    // some Vertex / Bedrock proxies forward the upstream's date string
+    // verbatim. Construct a target ~5s in the future, format it with
+    // `httpdate::fmt_http_date`, and assert the parser produces a
+    // Duration in the [0s, 6s] window around that target (HTTP-date is
+    // second-granularity so the elapsed-since-construction noise stays
+    // sub-second).
+    let target = SystemTime::now() + Duration::from_secs(5);
+    let formatted = httpdate::fmt_http_date(target);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        formatted.parse().expect("header value"),
+    );
+    let parsed = parse_retry_after(&headers).expect("http-date must parse");
+    assert!(
+        parsed <= Duration::from_secs(6),
+        "expected ~5s remaining, saw {parsed:?}",
+    );
+}
+
+#[test]
+fn parse_retry_after_clamps_past_http_date_to_zero() {
+    // A date already in the past (clock skew, slow request, etc.)
+    // must clamp to zero rather than panic on the negative
+    // `duration_since`. The retry then runs immediately, which is the
+    // intended semantics for "wait until <past>".
+    let target = SystemTime::now() - Duration::from_secs(120);
+    let formatted = httpdate::fmt_http_date(target);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        formatted.parse().expect("header value"),
+    );
+    assert_eq!(parse_retry_after(&headers), Some(Duration::ZERO));
+}
+
+#[test]
+fn parse_retry_after_returns_none_on_unparseable_garbage() {
+    // Junk values must fall through to `None` so `send_with_retry`
+    // picks the exponential backoff schedule instead of treating the
+    // header as a literal zero.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        "soon-ish".parse().expect("header value"),
+    );
     assert_eq!(parse_retry_after(&headers), None);
 }
 
