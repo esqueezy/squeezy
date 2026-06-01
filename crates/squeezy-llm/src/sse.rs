@@ -6,6 +6,12 @@
 #[derive(Debug, Default)]
 pub(crate) struct SseDecoder {
     buffer: Vec<u8>,
+    /// Byte offset into `buffer` where the next boundary scan should
+    /// resume. Without this, every push re-scans the entire buffer with
+    /// `.windows(2)` — O(n²) on multi-MB reasoning streams where a
+    /// single event can span many push calls before the `\n\n`
+    /// terminator arrives.
+    scan_pos: usize,
 }
 
 impl SseDecoder {
@@ -13,10 +19,26 @@ impl SseDecoder {
         self.buffer.extend_from_slice(bytes);
         let mut events = Vec::new();
 
-        while let Some((index, len)) = find_event_boundary(&self.buffer) {
-            let event = self.buffer.drain(..index + len).collect::<Vec<_>>();
-            if let Some(data) = decode_sse_event(&event) {
-                events.push(data);
+        loop {
+            match find_event_boundary(&self.buffer, self.scan_pos) {
+                Some((index, len)) => {
+                    let event = self.buffer.drain(..index + len).collect::<Vec<_>>();
+                    // Drained the entire prefix the scanner had walked
+                    // (the boundary itself is part of that prefix), so
+                    // resume from byte 0 of the now-shorter buffer.
+                    self.scan_pos = 0;
+                    if let Some(data) = decode_sse_event(&event) {
+                        events.push(data);
+                    }
+                }
+                None => {
+                    // No boundary yet. Park the cursor near the tail so
+                    // the next push only scans newly-appended bytes.
+                    // Keep a 3-byte overlap so a `\r\n\r\n` boundary
+                    // straddling the push gap is still caught.
+                    self.scan_pos = self.buffer.len().saturating_sub(3);
+                    break;
+                }
             }
         }
 
@@ -24,6 +46,7 @@ impl SseDecoder {
     }
 
     pub(crate) fn finish(&mut self) -> Vec<String> {
+        self.scan_pos = 0;
         if self.buffer.is_empty() {
             return Vec::new();
         }
@@ -33,15 +56,17 @@ impl SseDecoder {
     }
 }
 
-fn find_event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
-    let lf = bytes
+fn find_event_boundary(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let start = start.min(bytes.len());
+    let tail = &bytes[start..];
+    let lf = tail
         .windows(2)
         .position(|window| window == b"\n\n")
-        .map(|index| (index, 2));
-    let crlf = bytes
+        .map(|index| (start + index, 2));
+    let crlf = tail
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .map(|index| (index, 4));
+        .map(|index| (start + index, 4));
 
     [lf, crlf].into_iter().flatten().min_by_key(|b| b.0)
 }
