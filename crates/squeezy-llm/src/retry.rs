@@ -90,6 +90,24 @@ where
     if !is_auth_failure(response.status()) {
         return Ok(response);
     }
+    // Only sources that can actually rotate the credential without
+    // operator intervention (OAuth, refreshable tokens) benefit from
+    // the retry-on-401 dance. A `StaticApiKey` has nothing to rotate
+    // to: `invalidate` just clears the only known value and the next
+    // `current_key` call hands back the same already-rejected string
+    // (or worse, an empty placeholder). Surface the original 401/403
+    // response so the provider's existing error formatter renders an
+    // honest "your key is bad" message instead of looping us into a
+    // second guaranteed rejection.
+    if !source.can_rotate() {
+        tracing::debug!(
+            target: "squeezy_llm::auth_retry",
+            provider = source.provider_label(),
+            status = response.status().as_u16(),
+            "skipping auth retry: source cannot rotate credentials",
+        );
+        return Ok(response);
+    }
     tracing::warn!(
         target: "squeezy_llm::auth_retry",
         provider = source.provider_label(),
@@ -329,9 +347,23 @@ fn seed() -> u64 {
 
 /// Honors `Retry-After-Ms` (preferred, millisecond precision used by Anthropic
 /// and some OpenAI Responses endpoints under sub-second throttling) before
-/// falling back to the seconds-granularity `Retry-After`. Without the
-/// preference we'd sleep a full second when the server is telling us 250 ms
-/// is enough.
+/// falling back to the three shapes RFC 7231 allows for `Retry-After`:
+///
+/// 1. Integer seconds (`Retry-After: 30`) — the historical case.
+/// 2. Fractional seconds (`Retry-After: 0.5`) — OpenAI sometimes returns
+///    sub-second hints; without an f64 branch we'd round to zero and
+///    hammer the upstream.
+/// 3. An HTTP-date (`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`) —
+///    proxy gateways and CDNs emit this when the upstream returns one.
+///    Parsed via [`httpdate::parse_http_date`] against the current
+///    wall clock; a date already in the past clamps to `Duration::ZERO`
+///    so the caller still retries immediately. Wall-clock skew between
+///    client and server can therefore mis-time the cooldown — that's
+///    why the outer policy still clamps to `policy.max_retry_delay`.
+///
+/// Without the preference ladder we'd sleep a full second when the
+/// server is telling us 250 ms is enough, or skip the cooldown entirely
+/// on float / date headers and retry into the same throttle.
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     if let Some(value) = headers.get("retry-after-ms")
         && let Some(millis) = value.to_str().ok().and_then(|s| s.parse::<u64>().ok())
@@ -339,8 +371,22 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         return Some(Duration::from_millis(millis));
     }
     let value = headers.get(reqwest::header::RETRY_AFTER)?;
-    let seconds = value.to_str().ok()?.parse::<u64>().ok()?;
-    Some(Duration::from_secs(seconds))
+    let text = value.to_str().ok()?.trim();
+    if let Ok(seconds) = text.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    if let Ok(seconds) = text.parse::<f64>()
+        && seconds.is_finite()
+        && seconds >= 0.0
+    {
+        // Clamp to ms precision and saturate on absurd values so a buggy
+        // header cannot overflow `Duration::from_millis`. The outer
+        // `policy.max_retry_delay` cap still applies.
+        let millis = (seconds * 1_000.0).clamp(0.0, u64::MAX as f64) as u64;
+        return Some(Duration::from_millis(millis));
+    }
+    let target = httpdate::parse_http_date(text).ok()?;
+    Some(target.duration_since(SystemTime::now()).unwrap_or_default())
 }
 
 async fn sleep_or_cancel(cancel: &CancellationToken, duration: Duration) -> Result<()> {
@@ -591,11 +637,25 @@ where
     Box::pin(stream)
 }
 
+/// Decides whether `with_stream_retry` should reconnect on `err`.
+///
+/// Provider stream/request errors are the only transport-level shapes
+/// the harness knows how to replay, but Anthropic's error normaliser
+/// (and any future provider that opts into the same contract) prefixes
+/// terminal errors with [`crate::anthropic_error::NON_RETRYABLE_MARKER`]
+/// — typically `invalid_request_error`, `authentication_error`, or
+/// `permission_error` responses where retrying the identical request
+/// just burns the rest of the attempt budget on a guaranteed failure.
+///
+/// Strip-and-check the marker before classifying so a marked
+/// `ProviderRequest`/`ProviderStream` returns `false` and short-circuits
+/// the reconnect loop straight to the caller.
 fn is_retryable_stream_error(err: &SqueezyError) -> bool {
-    matches!(
-        err,
-        SqueezyError::ProviderStream(_) | SqueezyError::ProviderRequest(_)
-    )
+    let message = match err {
+        SqueezyError::ProviderStream(msg) | SqueezyError::ProviderRequest(msg) => msg.as_str(),
+        _ => return false,
+    };
+    !message.starts_with(crate::anthropic_error::NON_RETRYABLE_MARKER)
 }
 
 #[cfg(test)]
