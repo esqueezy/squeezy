@@ -403,6 +403,83 @@ fn parallel_tool_calls_across_chunks_get_distinct_ids() {
 }
 
 #[test]
+fn tool_choice_required_maps_to_any_mode() {
+    let request = LlmRequest {
+        model: "gemini-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        tool_choice: Some("required".to_string()),
+        tools: Arc::from(vec![
+            LlmToolSpec {
+                name: "grep".to_string(),
+                description: "search".to_string(),
+                parameters: json!({"type": "object"}),
+                strict: true,
+            }
+            .into(),
+        ]),
+        ..LlmRequest::default()
+    };
+    let body = GoogleProvider::request_body(&request);
+    assert_eq!(
+        body["toolConfig"]["functionCallingConfig"]["mode"], "ANY",
+        "tool_choice=required must map to mode=ANY, got body={body}"
+    );
+}
+
+#[test]
+fn tool_choice_auto_and_none_map_to_modes() {
+    for (choice, want) in [("auto", "AUTO"), ("none", "NONE")] {
+        let request = LlmRequest {
+            model: "gemini-test".to_string().into(),
+            instructions: "be brief".to_string().into(),
+            input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+            tool_choice: Some(choice.to_string()),
+            tools: Arc::from(vec![
+                LlmToolSpec {
+                    name: "grep".to_string(),
+                    description: "search".to_string(),
+                    parameters: json!({"type": "object"}),
+                    strict: true,
+                }
+                .into(),
+            ]),
+            ..LlmRequest::default()
+        };
+        let body = GoogleProvider::request_body(&request);
+        assert_eq!(
+            body["toolConfig"]["functionCallingConfig"]["mode"], want,
+            "tool_choice={choice} must map to mode={want}"
+        );
+    }
+}
+
+#[test]
+fn tool_choice_unset_omits_tool_config() {
+    let request = LlmRequest {
+        model: "gemini-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        tool_choice: None,
+        tools: Arc::from(vec![
+            LlmToolSpec {
+                name: "grep".to_string(),
+                description: "search".to_string(),
+                parameters: json!({"type": "object"}),
+                strict: true,
+            }
+            .into(),
+        ]),
+        ..LlmRequest::default()
+    };
+    let body = GoogleProvider::request_body(&request);
+    assert!(
+        body.get("toolConfig").is_none(),
+        "tool_choice=None must omit toolConfig, got {body}"
+    );
+}
+
+#[test]
 fn clamp_thinking_budget_uses_registry_max_and_min() {
     use crate::ModelCapabilities;
     let caps = ModelCapabilities {

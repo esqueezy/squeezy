@@ -118,8 +118,28 @@ impl GoogleProvider {
                     }))
                     .collect::<Vec<_>>()
             }]);
+            // Forward `tool_choice` as `toolConfig.functionCallingConfig.mode`.
+            // Without this, tool-shy small models (Qwen via aggregators et al.)
+            // ignore the tools list because Gemini's default mode is AUTO.
+            // Map auto/none → AUTO/NONE, required → ANY (Gemini's "must call
+            // some tool" mode). Unrecognized values fall through to Gemini's
+            // default. opencode gemini.ts:173-179 is the reference.
+            if let Some(mode) = tool_choice_to_gemini_mode(request.tool_choice.as_deref()) {
+                body["toolConfig"] = json!({
+                    "functionCallingConfig": { "mode": mode }
+                });
+            }
         }
         body
+    }
+}
+
+fn tool_choice_to_gemini_mode(choice: Option<&str>) -> Option<&'static str> {
+    match choice? {
+        "auto" => Some("AUTO"),
+        "none" => Some("NONE"),
+        "required" => Some("ANY"),
+        _ => None,
     }
 }
 
