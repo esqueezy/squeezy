@@ -2494,6 +2494,66 @@ fn azure_openai_carries_extra_headers_from_settings() {
 }
 
 #[test]
+fn azure_openai_opts_into_entra_id_when_bearer_token_present() {
+    // Operators that pre-populate `AZURE_OPENAI_BEARER_TOKEN` (via
+    // `az account get-access-token`, IMDS, or a sidecar) don't need to
+    // separately flip `use_entra_id`: presence of the token is enough
+    // signal that the api-key path is the wrong default. The provider
+    // surface then swaps `api-key` for `Authorization: Bearer …`.
+    let azure = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("azure_openai".to_string()),
+        "AZURE_OPENAI_BASE_URL" => Some("https://resource.openai.azure.com/openai/v1".to_string()),
+        "AZURE_OPENAI_BEARER_TOKEN" => Some("entra-jwt".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::AzureOpenAi(config) = &azure.provider else {
+        panic!("expected azure");
+    };
+    assert!(config.use_entra_id, "bearer token must imply Entra ID");
+    assert_eq!(
+        config.entra_bearer_token.as_deref(),
+        Some("entra-jwt"),
+        "bearer token must flow through the config so the provider can emit it",
+    );
+}
+
+#[test]
+fn azure_openai_use_entra_id_setting_persists_without_bearer_token() {
+    // The TOML flag stays sticky even when the bearer token has not yet
+    // been issued — the LLM provider's `from_azure_config` is responsible
+    // for surfacing an explicit error rather than silently degrading to
+    // the api-key path, so config-build cannot lose that signal.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "azure_openai".to_string(),
+        ProviderSettings {
+            use_entra_id: Some(true),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("azure_openai"),
+        |name| match name {
+            "AZURE_OPENAI_BASE_URL" => {
+                Some("https://resource.openai.azure.com/openai/v1".to_string())
+            }
+            _ => None,
+        },
+    )
+    .expect("azure config builds");
+    let ProviderConfig::AzureOpenAi(azure) = &config.provider else {
+        panic!("expected azure");
+    };
+    assert!(azure.use_entra_id);
+    assert!(azure.entra_bearer_token.is_none());
+}
+
+#[test]
 fn azure_openai_extra_headers_default_to_empty_map() {
     let azure = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_PROVIDER" => Some("azure_openai".to_string()),

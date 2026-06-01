@@ -609,6 +609,22 @@ impl AppConfig {
                 transport: provider_transport_settings(&providers, &["google"]),
             }),
             "azure" | "azure-openai" | "azure_openai" => {
+                // Entra ID opt-in is layered: either an explicit
+                // `use_entra_id = true` in TOML, or the operator pre-populated
+                // `AZURE_OPENAI_BEARER_TOKEN` and wants squeezy to honor it
+                // without separately flipping the bool. The presence of a
+                // bearer in the env is sufficient signal: callers that
+                // truly want the api-key path leave that env var unset.
+                let entra_bearer_token = get_var("AZURE_OPENAI_BEARER_TOKEN")
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                let use_entra_id = provider_setting_bool_any(
+                    &providers,
+                    &["azure_openai", "azure"],
+                    "use_entra_id",
+                )
+                .unwrap_or(false)
+                    || entra_bearer_token.is_some();
                 ProviderConfig::AzureOpenAi(AzureOpenAiConfig {
                     api_key_env: get_var("AZURE_OPENAI_API_KEY_ENV")
                         .or_else(|| provider_setting(&providers, "azure_openai", "api_key_env"))
@@ -633,6 +649,8 @@ impl AppConfig {
                         &["azure_openai", "azure"],
                     )
                     .unwrap_or_default(),
+                    use_entra_id,
+                    entra_bearer_token,
                     transport: provider_transport_settings(&providers, &["azure_openai", "azure"]),
                 })
             }
@@ -2287,6 +2305,23 @@ pub struct AzureOpenAiConfig {
     /// TOML table, matching the OpenAI-compatible preset shape.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_headers: BTreeMap<String, String>,
+    /// Switches the provider away from the default `api-key: …` header
+    /// to `Authorization: Bearer …` so Microsoft Entra ID / managed
+    /// identity flows can authenticate against Azure OpenAI. The actual
+    /// bearer is sourced from `AZURE_OPENAI_BEARER_TOKEN` (an external
+    /// refresher — `az account get-access-token`, IMDS, or a sidecar —
+    /// keeps the env var current). Defaults to `false`, preserving the
+    /// historical API-key behavior.
+    #[serde(default)]
+    pub use_entra_id: bool,
+    /// Bearer token resolved from the environment when `use_entra_id`
+    /// is set. Snapshot at config build time; treat as short-lived and
+    /// arrange for the supplying process to refresh the env var before
+    /// expiry. `None` means no token was available — the provider
+    /// then surfaces an explicit error rather than silently falling
+    /// back to the api-key path.
+    #[serde(default, serialize_with = "redact_secret_opt")]
+    pub entra_bearer_token: Option<String>,
     pub transport: ProviderTransportConfig,
 }
 
@@ -2840,6 +2875,12 @@ pub struct ProviderSettings {
     /// Faux-only: path to a TOML script file consumed by the in-process
     /// faux provider. Other providers ignore this field.
     pub script: Option<String>,
+    /// Azure-only: opt in to the Entra ID / managed-identity bearer auth
+    /// path. When `Some(true)` the provider emits `Authorization: Bearer`
+    /// sourced from `AZURE_OPENAI_BEARER_TOKEN` instead of the default
+    /// `api-key` header. Tri-state (`None`) so the higher-precedence
+    /// layer can leave the value untouched during settings merge.
+    pub use_entra_id: Option<bool>,
 }
 
 impl ProviderSettings {
@@ -2866,6 +2907,7 @@ impl ProviderSettings {
                 "deployment_name_map",
                 "route_style",
                 "script",
+                "use_entra_id",
             ],
             source,
             path,
@@ -2975,6 +3017,7 @@ impl ProviderSettings {
             deployment_name_map,
             route_style: string_value(table, "route_style", source, &field(path, "route_style"))?,
             script: string_value(table, "script", source, &field(path, "script"))?,
+            use_entra_id: bool_value(table, "use_entra_id", source, &field(path, "use_entra_id"))?,
         })
     }
 
@@ -2999,6 +3042,7 @@ impl ProviderSettings {
         replace_if_some(&mut self.headers, next.headers);
         replace_if_some(&mut self.route_style, next.route_style);
         replace_if_some(&mut self.script, next.script);
+        replace_if_some(&mut self.use_entra_id, next.use_entra_id);
     }
 }
 
@@ -8541,6 +8585,30 @@ fn provider_setting_headers_any(
             && !headers.is_empty()
         {
             return Some(headers.clone());
+        }
+    }
+    None
+}
+
+/// Resolve a typed boolean setting (currently `use_entra_id`) from the
+/// first section in `sections` that defines it. Returns the first
+/// non-`None` value so the higher-precedence alias wins when both
+/// sections set the flag.
+fn provider_setting_bool_any(
+    providers: &BTreeMap<String, ProviderSettings>,
+    sections: &[&str],
+    key: &str,
+) -> Option<bool> {
+    for section in sections {
+        let Some(settings) = providers.get(*section) else {
+            continue;
+        };
+        let value = match key {
+            "use_entra_id" => settings.use_entra_id,
+            _ => None,
+        };
+        if value.is_some() {
+            return value;
         }
     }
     None
