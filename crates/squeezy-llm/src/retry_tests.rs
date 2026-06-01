@@ -738,22 +738,34 @@ async fn send_with_retry_uses_exponential_backoff_when_no_retry_after_headers() 
 /// Test ApiKeySource that hands out a deterministic sequence of keys
 /// and counts how many times the retry layer touched it. Drives the
 /// `send_with_auth_retry` assertions below without spinning up the
-/// full OAuth flow.
+/// full OAuth flow. `can_rotate` is parameterised so the same harness
+/// covers both the OAuth-style refresh path (`true`) and the static-key
+/// short-circuit (`false`).
 #[derive(Debug)]
 struct TestKeySource {
     label: String,
     keys: AsyncMutex<Vec<String>>,
     current_key_calls: AtomicUsize,
     invalidate_calls: AtomicUsize,
+    can_rotate: bool,
 }
 
 impl TestKeySource {
-    fn new(label: &str, keys: Vec<String>) -> Arc<Self> {
+    fn rotatable(label: &str, keys: Vec<String>) -> Arc<Self> {
+        Self::with_rotation(label, keys, true)
+    }
+
+    fn static_key(label: &str, keys: Vec<String>) -> Arc<Self> {
+        Self::with_rotation(label, keys, false)
+    }
+
+    fn with_rotation(label: &str, keys: Vec<String>, can_rotate: bool) -> Arc<Self> {
         Arc::new(Self {
             label: label.to_string(),
             keys: AsyncMutex::new(keys.into_iter().rev().collect()),
             current_key_calls: AtomicUsize::new(0),
             invalidate_calls: AtomicUsize::new(0),
+            can_rotate,
         })
     }
 
@@ -784,6 +796,10 @@ impl ApiKeySource for TestKeySource {
 
     fn provider_label(&self) -> &str {
         &self.label
+    }
+
+    fn can_rotate(&self) -> bool {
+        self.can_rotate
     }
 }
 
@@ -851,7 +867,7 @@ fn auth_retry_policy() -> RetryPolicy {
 #[tokio::test]
 async fn send_with_auth_retry_passes_through_on_2xx() {
     let (addr, attempts) = spawn_status_server(vec![200]).await;
-    let source = TestKeySource::new("test", vec!["good-key".to_string()]);
+    let source = TestKeySource::rotatable("test", vec!["good-key".to_string()]);
     let source_dyn: Arc<dyn ApiKeySource> = source.clone();
     let client = reqwest::Client::new();
     let cancel = CancellationToken::new();
@@ -880,7 +896,7 @@ async fn send_with_auth_retry_passes_through_on_2xx() {
 #[tokio::test]
 async fn send_with_auth_retry_refreshes_once_on_401() {
     let (addr, attempts) = spawn_status_server(vec![401, 200]).await;
-    let source = TestKeySource::new(
+    let source = TestKeySource::rotatable(
         "test",
         vec!["stale-key".to_string(), "fresh-key".to_string()],
     );
@@ -912,7 +928,7 @@ async fn send_with_auth_retry_refreshes_once_on_401() {
 #[tokio::test]
 async fn send_with_auth_retry_refreshes_once_on_403() {
     let (addr, attempts) = spawn_status_server(vec![403, 200]).await;
-    let source = TestKeySource::new(
+    let source = TestKeySource::rotatable(
         "test",
         vec!["stale-key".to_string(), "fresh-key".to_string()],
     );
@@ -939,7 +955,7 @@ async fn send_with_auth_retry_bubbles_up_persistent_401() {
     // unchanged so the provider's existing error formatter reports
     // an honest auth failure instead of looping forever.
     let (addr, attempts) = spawn_status_server(vec![401, 401]).await;
-    let source = TestKeySource::new(
+    let source = TestKeySource::rotatable(
         "test",
         vec!["stale-key".to_string(), "still-stale".to_string()],
     );
@@ -969,6 +985,71 @@ async fn send_with_auth_retry_bubbles_up_persistent_401() {
         1,
         "invalidate fires exactly once even when the refresh did not help"
     );
+}
+
+/// H-05: a `StaticApiKey`-backed source (or any source where
+/// `can_rotate()` reports `false`) has no fresh credential to fall back
+/// to. The auth-retry layer must surface the original 401 response
+/// untouched so the provider's existing error formatter renders an
+/// honest "credential rejected" message instead of looping us into a
+/// second guaranteed rejection.
+#[tokio::test]
+async fn auth_retry_skipped_for_static_key() {
+    let (addr, attempts) = spawn_status_server(vec![401, 200]).await;
+    let source = TestKeySource::static_key("test", vec!["only-key".to_string()]);
+    let source_dyn: Arc<dyn ApiKeySource> = source.clone();
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_auth_retry(&source_dyn, auth_retry_policy(), &cancel, |key| {
+        client.post(&url).bearer_auth(key)
+    })
+    .await
+    .expect("send");
+
+    assert_eq!(
+        response.status().as_u16(),
+        401,
+        "static-key source must surface the original 401 without retrying",
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "no second HTTP attempt: there's no fresh credential to rotate to",
+    );
+    assert_eq!(
+        source.current_key_calls(),
+        1,
+        "current_key must run exactly once for the first attempt",
+    );
+    assert_eq!(
+        source.invalidate_calls(),
+        0,
+        "invalidate is meaningless on a static key — skip it entirely",
+    );
+}
+
+/// Same short-circuit on 403: the trait contract says `can_rotate()`
+/// governs both auth-failure status codes, not just 401.
+#[tokio::test]
+async fn auth_retry_skipped_on_403_for_static_key() {
+    let (addr, attempts) = spawn_status_server(vec![403, 200]).await;
+    let source = TestKeySource::static_key("test", vec!["only-key".to_string()]);
+    let source_dyn: Arc<dyn ApiKeySource> = source.clone();
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_auth_retry(&source_dyn, auth_retry_policy(), &cancel, |key| {
+        client.post(&url).bearer_auth(key)
+    })
+    .await
+    .expect("send");
+
+    assert_eq!(response.status().as_u16(), 403);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(source.invalidate_calls(), 0);
 }
 
 // --- terminal quota classifier -------------------------------------------

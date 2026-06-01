@@ -90,6 +90,24 @@ where
     if !is_auth_failure(response.status()) {
         return Ok(response);
     }
+    // Only sources that can actually rotate the credential without
+    // operator intervention (OAuth, refreshable tokens) benefit from
+    // the retry-on-401 dance. A `StaticApiKey` has nothing to rotate
+    // to: `invalidate` just clears the only known value and the next
+    // `current_key` call hands back the same already-rejected string
+    // (or worse, an empty placeholder). Surface the original 401/403
+    // response so the provider's existing error formatter renders an
+    // honest "your key is bad" message instead of looping us into a
+    // second guaranteed rejection.
+    if !source.can_rotate() {
+        tracing::debug!(
+            target: "squeezy_llm::auth_retry",
+            provider = source.provider_label(),
+            status = response.status().as_u16(),
+            "skipping auth retry: source cannot rotate credentials",
+        );
+        return Ok(response);
+    }
     tracing::warn!(
         target: "squeezy_llm::auth_retry",
         provider = source.provider_label(),
