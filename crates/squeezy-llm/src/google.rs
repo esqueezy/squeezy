@@ -130,6 +130,16 @@ impl GoogleProvider {
                 });
             }
         }
+        // Structured-output: when callers ship an output_schema, ask
+        // Gemini to emit JSON and pin the schema via responseMimeType
+        // + responseSchema. Sanitize through the same Gemini pass so
+        // $ref / additionalProperties / nullable-union shapes don't
+        // trip the server-side validator. Reference:
+        // https://ai.google.dev/gemini-api/docs/structured-output.
+        if let Some(schema) = request.output_schema.as_ref() {
+            body["generationConfig"]["responseMimeType"] = json!("application/json");
+            body["generationConfig"]["responseSchema"] = sanitize_for_gemini(&schema.schema);
+        }
         body
     }
 }

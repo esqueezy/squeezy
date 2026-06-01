@@ -403,6 +403,55 @@ fn parallel_tool_calls_across_chunks_get_distinct_ids() {
 }
 
 #[test]
+fn output_schema_forwards_response_mime_type_and_schema() {
+    use crate::LlmOutputSchema;
+    let request = LlmRequest {
+        model: "gemini-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        output_schema: Some(LlmOutputSchema {
+            name: "Answer".to_string(),
+            schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "answer": {"type": "string"}
+                }
+            }),
+            strict: true,
+        }),
+        ..LlmRequest::default()
+    };
+    let body = GoogleProvider::request_body(&request);
+    assert_eq!(
+        body["generationConfig"]["responseMimeType"], "application/json",
+        "output_schema must set responseMimeType"
+    );
+    let schema = &body["generationConfig"]["responseSchema"];
+    assert_eq!(schema["type"], "object");
+    assert!(
+        schema.get("additionalProperties").is_none(),
+        "responseSchema must run sanitize pass, got {schema}"
+    );
+}
+
+#[test]
+fn output_schema_unset_omits_response_fields() {
+    let request = LlmRequest {
+        model: "gemini-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        ..LlmRequest::default()
+    };
+    let body = GoogleProvider::request_body(&request);
+    assert!(
+        body["generationConfig"].get("responseMimeType").is_none(),
+        "no output_schema => no responseMimeType, got {body}"
+    );
+    assert!(body["generationConfig"].get("responseSchema").is_none());
+}
+
+#[test]
 fn tool_choice_required_maps_to_any_mode() {
     let request = LlmRequest {
         model: "gemini-test".to_string().into(),
