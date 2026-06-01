@@ -469,6 +469,36 @@ impl LlmProvider for OpenAiProvider {
             body["model"] = json!(deployment);
         }
         let affinity_headers = Self::affinity_headers(&request);
+        // H-35 (interim Entra-ID Bearer path): Microsoft Entra ID is
+        // the modern auth path for Azure OpenAI (`Authorization: Bearer
+        // <jwt>` with resource `https://cognitiveservices.azure.com/.default`).
+        // `AzureOpenAiConfig::use_entra_id` is the canonical config slot
+        // and lives in squeezy-core (Phase 4I). Until that schema add
+        // ships, callers can opt in via the `AZURE_OPENAI_USE_ENTRA_ID`
+        // env var — when set to a truthy value the provider attaches
+        // the api key as a Bearer token instead of the `api-key` header.
+        // TODO(Phase 4I): replace this env-var read with a typed config
+        //  field on `AzureOpenAiConfig` and a token-provider hook.
+        let use_entra_id_bearer = provider_name == "azure_openai"
+            && std::env::var("AZURE_OPENAI_USE_ENTRA_ID")
+                .ok()
+                .is_some_and(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                });
+        // H-34 + M-04 (org/project/service_tier/extra_headers): the
+        // schema slots live on `AzureOpenAiConfig` / `OpenAiConfig` in
+        // squeezy-core. TODO(Phase 4I):
+        //  - add `OpenAiConfig::organization`, `OpenAiConfig::project`,
+        //    `OpenAiConfig::service_tier` fields and thread through to
+        //    this auth/body section (set `OpenAI-Organization`,
+        //    `OpenAI-Project` headers; emit `service_tier` in body).
+        //  - add `AzureOpenAiConfig::extra_headers` map and apply here
+        //    after `api-key` / Bearer so user-supplied headers (Entra
+        //    Bearer, APIM subscription key, x-ms-correlation-request-id)
+        //    can override the default.
 
         Box::pin(try_stream! {
             let response = send_with_auth_retry(
@@ -477,9 +507,12 @@ impl LlmProvider for OpenAiProvider {
                 &cancel,
                 |key| {
                     let builder = client.post(&url);
-                    let builder = if provider_name == "azure_openai" {
+                    let builder = if provider_name == "azure_openai" && !use_entra_id_bearer {
                         builder.header("api-key", key)
                     } else {
+                        // OpenAI / xAI / Codex use Bearer; Azure with
+                        // `AZURE_OPENAI_USE_ENTRA_ID=1` also rides this
+                        // arm (H-35 interim path).
                         builder.bearer_auth(key)
                     };
                     // Cache-affinity headers (only emitted when the
