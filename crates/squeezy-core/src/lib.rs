@@ -53,7 +53,7 @@ pub const GOOGLE_SMALL_FAST_MODEL: &str = "gemini-2.5-flash-lite";
 pub const BEDROCK_SMALL_FAST_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
 pub const AZURE_OPENAI_SMALL_FAST_MODEL: &str = OPENAI_SMALL_FAST_MODEL;
 pub const OPENROUTER_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
-pub const VERCEL_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
+pub const VERCEL_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4.5";
 pub const PORTKEY_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
 
 /// Returns the built-in small-fast-model id for `provider`. `provider` is the
@@ -79,7 +79,7 @@ pub fn small_fast_model_for_provider(provider: &str) -> Option<&'static str> {
 pub const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-opus-4-7";
 pub const DEFAULT_VERCEL_AI_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
-pub const DEFAULT_VERCEL_AI_MODEL: &str = "anthropic/claude-opus-4-7";
+pub const DEFAULT_VERCEL_AI_MODEL: &str = "anthropic/claude-opus-4.7";
 pub const DEFAULT_PORTKEY_BASE_URL: &str = "https://api.portkey.ai/v1";
 pub const DEFAULT_PORTKEY_MODEL: &str = "anthropic/claude-opus-4-7";
 // OpenAI-compatible single-vendor (full preset tier).

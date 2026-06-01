@@ -517,7 +517,7 @@
   },
   {
     "provider": "vercel",
-    "id": "anthropic/claude-opus-4-7",
+    "id": "anthropic/claude-opus-4.7",
     "profile": "strong",
     "capabilities": {
       "streaming": true,
