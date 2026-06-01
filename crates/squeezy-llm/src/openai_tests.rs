@@ -40,7 +40,11 @@ fn request_body_uses_responses_streaming_shape() {
 
     assert_eq!(body["model"], "gpt-test");
     assert_eq!(body["instructions"], "be brief");
-    assert_eq!(body["input"], "hello");
+    // User text serializes as the typed array form (audit MEDIUM:
+    // `UserText` content shape) so multi-item turns stay uniform.
+    assert_eq!(body["input"][0]["role"], "user");
+    assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    assert_eq!(body["input"][0]["content"][0]["text"], "hello");
     assert_eq!(body["stream"], true);
     assert_eq!(body["store"], true);
     assert_eq!(body["max_output_tokens"], 32);
@@ -1307,9 +1311,10 @@ fn request_body_encodes_image_as_input_image_data_url() {
     let body = OpenAiProvider::request_body(&request, "openai");
     let input = body["input"].as_array().expect("input array (text+image)");
     assert_eq!(input.len(), 2);
-    // First entry: plain user-text message.
+    // First entry: user-text message in the typed-array shape.
     assert_eq!(input[0]["role"], "user");
-    assert_eq!(input[0]["content"], "what is this?");
+    assert_eq!(input[0]["content"][0]["type"], "input_text");
+    assert_eq!(input[0]["content"][0]["text"], "what is this?");
     // Second entry: user message with one `input_image` content part
     // carrying a data URL.
     assert_eq!(input[1]["role"], "user");
@@ -1329,6 +1334,105 @@ fn request_body_encodes_image_as_input_image_data_url() {
         .decode(encoded)
         .expect("valid base64");
     assert_eq!(decoded.as_slice(), bytes.as_ref());
+}
+
+#[test]
+fn request_body_serializes_function_call_output_content_parts_as_array_form() {
+    // M-06: when the caller attaches structured `content_parts`
+    // (e.g. an image return from a browser tool), serialize the array
+    // form of `function_call_output.output` so the model receives the
+    // image directly instead of through a stringified base64 blob.
+    let png: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "describe the screenshot".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::FunctionCall {
+                call_id: "call_1".to_string(),
+                name: "screenshot".to_string(),
+                arguments: json!({}),
+            },
+            LlmInputItem::FunctionCallOutput {
+                call_id: "call_1".to_string(),
+                output: String::new(),
+                content_parts: Some(vec![
+                    crate::ToolResultPart::Text {
+                        text: "see attached".to_string(),
+                    },
+                    crate::ToolResultPart::Image {
+                        media_type: "image/png".to_string(),
+                        bytes: png.clone(),
+                    },
+                ]),
+                is_error: false,
+            },
+        ]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    let output_item = &body["input"][1];
+    assert_eq!(output_item["type"], "function_call_output");
+    assert_eq!(output_item["call_id"], "call_1");
+    let parts = output_item["output"].as_array().expect("array form output");
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0]["type"], "input_text");
+    assert_eq!(parts[0]["text"], "see attached");
+    assert_eq!(parts[1]["type"], "input_image");
+    let url = parts[1]["image_url"].as_str().expect("data URL");
+    assert!(url.starts_with("data:image/png;base64,"));
+}
+
+#[test]
+fn request_body_falls_back_to_string_output_when_content_parts_unset() {
+    // Existing string-form tool result remains byte-compatible.
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::FunctionCall {
+                call_id: "call_1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle"}),
+            },
+            LlmInputItem::FunctionCallOutput {
+                call_id: "call_1".to_string(),
+                output: "{\"status\":\"success\"}".to_string(),
+                content_parts: None,
+                is_error: false,
+            },
+        ]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    let output_item = &body["input"][1];
+    assert_eq!(output_item["type"], "function_call_output");
+    assert_eq!(output_item["output"], "{\"status\":\"success\"}");
 }
 
 #[test]

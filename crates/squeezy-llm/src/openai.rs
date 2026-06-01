@@ -835,10 +835,12 @@ pub(crate) fn parse_openai_event(
 }
 
 fn openai_input(input: &[LlmInputItem]) -> Value {
-    if let [LlmInputItem::UserText(text)] = input {
-        return json!(text);
-    }
-
+    // UserText array shape (audit MEDIUM finding): always emit the
+    // typed array form so multi-item turns mixing `UserText` and
+    // `Image` produce a uniform shape. The string-form fast-path is
+    // removed because (a) OpenAI is phasing it out for Responses, and
+    // (b) it produced a different prompt-cache prefix than the array
+    // form for otherwise-identical bodies.
     Value::Array(input.iter().filter_map(openai_input_item).collect())
 }
 
@@ -846,11 +848,17 @@ fn openai_input_item(item: &LlmInputItem) -> Option<Value> {
     Some(match item {
         LlmInputItem::UserText(text) => json!({
             "role": "user",
-            "content": text,
+            "content": [{
+                "type": "input_text",
+                "text": text,
+            }],
         }),
         LlmInputItem::AssistantText(text) => json!({
             "role": "assistant",
-            "content": text,
+            "content": [{
+                "type": "output_text",
+                "text": text,
+            }],
         }),
         LlmInputItem::FunctionCall {
             call_id,
@@ -863,12 +871,50 @@ fn openai_input_item(item: &LlmInputItem) -> Option<Value> {
             "arguments": serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string()),
         }),
         LlmInputItem::FunctionCallOutput {
-            call_id, output, ..
-        } => json!({
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": output,
-        }),
+            call_id,
+            output,
+            content_parts,
+            ..
+        } => {
+            // M-06: when the caller attached structured tool-result
+            // parts (image returns from browser tools, multi-block
+            // outputs), emit the Responses-API array form so the model
+            // receives the images directly instead of through a
+            // base64-stringified blob inside `output`. Falls back to
+            // the plain string form when `content_parts` is `None`.
+            if let Some(parts) = content_parts
+                && !parts.is_empty()
+            {
+                let serialized: Vec<Value> = parts
+                    .iter()
+                    .map(|part| match part {
+                        crate::ToolResultPart::Text { text } => json!({
+                            "type": "input_text",
+                            "text": text,
+                        }),
+                        crate::ToolResultPart::Image { media_type, bytes } => json!({
+                            "type": "input_image",
+                            "detail": "auto",
+                            "image_url": format!(
+                                "data:{media_type};base64,{}",
+                                BASE64_STANDARD.encode(bytes.as_ref())
+                            ),
+                        }),
+                    })
+                    .collect();
+                json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": Value::Array(serialized),
+                })
+            } else {
+                json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                })
+            }
+        }
         LlmInputItem::Image { media_type, bytes } => json!({
             "role": "user",
             "content": [{
