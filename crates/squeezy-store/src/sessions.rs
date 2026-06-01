@@ -240,14 +240,20 @@ impl SessionStore {
             return Vec::new();
         };
         let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
-        for line in BufReader::new(file).lines() {
-            let Ok(line) = line else {
-                return Vec::new();
-            };
-            if line.trim().is_empty() {
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => return Vec::new(),
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(line.as_str()) else {
+            let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(trimmed) else {
                 continue;
             };
             match by_id.get(&entry.session_id) {
@@ -3078,12 +3084,18 @@ fn read_jsonl(path: &Path) -> Result<(Vec<SessionEvent>, u64)> {
     };
     let mut events = Vec::new();
     let mut warnings = 0;
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        match serde_json::from_str::<SessionEvent>(line.as_str()) {
+        match serde_json::from_str::<SessionEvent>(trimmed) {
             Ok(event) => events.push(event),
             Err(_) => warnings += 1,
         }
@@ -3099,12 +3111,18 @@ fn read_replay_jsonl(path: &Path) -> Result<(Vec<SessionReplayEvent>, u64)> {
     };
     let mut events = Vec::new();
     let mut warnings = 0;
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        match parse_replay_jsonl_line(line.as_str()) {
+        match parse_replay_jsonl_line(trimmed) {
             Some(event) => events.push(event),
             None => warnings += 1,
         }
@@ -3120,12 +3138,18 @@ fn count_replay_jsonl(path: &Path) -> Result<(u64, u64)> {
     };
     let mut events = 0;
     let mut warnings = 0;
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        if parse_replay_jsonl_line(line.as_str()).is_some() {
+        if parse_replay_jsonl_line(trimmed).is_some() {
             events += 1;
         } else {
             warnings += 1;
