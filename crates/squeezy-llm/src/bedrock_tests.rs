@@ -16,12 +16,13 @@ use aws_sdk_bedrockruntime::operation::converse_stream::builders::ConverseStream
 use squeezy_core::{BedrockConfig, ProviderTransportConfig};
 
 use super::{
-    BedrockProvider, BedrockStreamState, apply_inference_profile_prefix,
+    BedrockProvider, BedrockStreamState, BreakpointBudget, apply_inference_profile_prefix,
     apply_thinking_extra_fields, bedrock_document_block, bedrock_effort_label,
-    bedrock_request_metadata_map, bedrock_tool_choice, build_bedrock_client,
-    compute_thinking_extra_fields, conversation_messages, current_bearer_token,
-    handle_bedrock_event, inference_configuration, json_to_document, region_prefix,
-    sanitize_bedrock_document_name, system_blocks, tool_configuration,
+    bedrock_idle_timeout, bedrock_request_metadata_map, bedrock_tool_choice, build_bedrock_client,
+    classify_stream_sdk_error, compute_thinking_extra_fields, conversation_messages,
+    current_bearer_token, extract_echoed_model, handle_bedrock_event, hex_decode, hex_encode,
+    inference_configuration, json_to_document, region_prefix, sanitize_bedrock_document_name,
+    system_blocks, tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{CacheRetention, LlmInputItem, LlmRequest, LlmToolSpec};
@@ -468,6 +469,38 @@ fn metadata_event_records_usage_tokens() {
     assert!(state.saw_metadata);
     assert_eq!(state.input_tokens, Some(123));
     assert_eq!(state.output_tokens, Some(45));
+}
+
+/// NIT: cost() must surface `input_tokens` as the inclusive total
+/// Bedrock reports — not the sum of the total and its `cache_read`
+/// / `cache_write` subsets. A heavy cache-hit workflow previously
+/// saw ~80% inflation when those subsets were added back into the
+/// total; the fix surfaces the upstream value verbatim and keeps
+/// the cache subset breakdown on the dedicated fields.
+#[test]
+fn cost_surfaces_inclusive_input_tokens_without_double_counting_cache() {
+    let mut state = BedrockStreamState::default();
+    let usage = TokenUsage::builder()
+        .input_tokens(1000)
+        .output_tokens(75)
+        .total_tokens(1075)
+        .cache_read_input_tokens(900)
+        .cache_write_input_tokens(50)
+        .build()
+        .expect("build usage");
+    let metadata = ConverseStreamMetadataEvent::builder().usage(usage).build();
+    handle_bedrock_event(ConverseStreamOutput::Metadata(metadata), &mut state)
+        .expect("handle metadata");
+
+    let cost = state.cost();
+    assert_eq!(
+        cost.input_tokens,
+        Some(1000),
+        "input_tokens must equal Bedrock's inclusive total (1000), not 1000+900+50",
+    );
+    assert_eq!(cost.cached_input_tokens, Some(900));
+    assert_eq!(cost.cache_write_input_tokens, Some(50));
+    assert_eq!(cost.output_tokens, Some(75));
 }
 
 #[test]
@@ -1179,7 +1212,7 @@ fn tool_configuration_forwards_tool_choice() {
 
 #[test]
 fn bedrock_document_block_round_trips_pdf_bytes() {
-    use aws_sdk_bedrockruntime::types::{DocumentFormat, DocumentSource};
+    use aws_sdk_bedrockruntime::types::DocumentFormat;
     let bytes: Arc<[u8]> = Arc::from(b"%PDF-1.4 fake".to_vec());
     let block = bedrock_document_block("application/pdf", "report.pdf", &bytes)
         .expect("pdf must round-trip");
@@ -1385,5 +1418,427 @@ fn handle_bedrock_event_replaces_signature_deltas() {
         Some("authoritative-signature"),
         "second Signature delta must replace, not concat: got {:?}",
         block.signature,
+    );
+}
+
+/// M-15: `messageStop.additionalModelResponseFields` carries the
+/// resolved model id when an application-inference-profile routes
+/// the turn to a backing foundation model that differs from the
+/// caller's request. The helper accepts both `model` and
+/// `server_model` keys, trims whitespace, and falls back to `None`
+/// for shapes we don't understand.
+#[test]
+fn extract_echoed_model_reads_model_key_string() {
+    let fields = Document::Object(
+        [(
+            "model".to_string(),
+            Document::String("anthropic.claude-haiku-4-5-20251001-v1:0".to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    assert_eq!(
+        extract_echoed_model(&fields).as_deref(),
+        Some("anthropic.claude-haiku-4-5-20251001-v1:0"),
+    );
+}
+
+#[test]
+fn extract_echoed_model_accepts_server_model_alias() {
+    // Some Bedrock integrations populate `server_model` instead of
+    // `model` (Bedrock's own SDK guides vary). Accept the alias so
+    // the echo isn't silently dropped just because the field name
+    // doesn't match the most common shape.
+    let fields = Document::Object(
+        [(
+            "server_model".to_string(),
+            Document::String("us.anthropic.claude-sonnet-4-6-20251001-v1:0".to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    assert_eq!(
+        extract_echoed_model(&fields).as_deref(),
+        Some("us.anthropic.claude-sonnet-4-6-20251001-v1:0"),
+    );
+}
+
+#[test]
+fn extract_echoed_model_trims_whitespace_and_ignores_blank() {
+    let padded = Document::Object(
+        [(
+            "model".to_string(),
+            Document::String("   us.anthropic.claude-opus-4-6\n".to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    assert_eq!(
+        extract_echoed_model(&padded).as_deref(),
+        Some("us.anthropic.claude-opus-4-6"),
+    );
+
+    let blank = Document::Object(
+        [("model".to_string(), Document::String("   ".to_string()))]
+            .into_iter()
+            .collect(),
+    );
+    assert!(
+        extract_echoed_model(&blank).is_none(),
+        "blank model echo must be ignored so the tracker can fall back to no-emit",
+    );
+}
+
+#[test]
+fn extract_echoed_model_returns_none_for_unknown_shapes() {
+    // No object => no echo.
+    assert!(extract_echoed_model(&Document::Null).is_none());
+    // Object without recognized keys => no echo.
+    let other = Document::Object(
+        [(
+            "guardrail".to_string(),
+            Document::String("blocked".to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    assert!(extract_echoed_model(&other).is_none());
+}
+
+#[test]
+fn handle_message_stop_records_echoed_model_into_state() {
+    let mut state = BedrockStreamState::default();
+    let fields = Document::Object(
+        [(
+            "model".to_string(),
+            Document::String("us.anthropic.claude-haiku-4-5-20251001-v1:0".to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let stop = MessageStopEvent::builder()
+        .stop_reason(StopReason::EndTurn)
+        .additional_model_response_fields(fields)
+        .build()
+        .expect("build stop");
+    let events = handle_bedrock_event(ConverseStreamOutput::MessageStop(stop), &mut state)
+        .expect("handle stop");
+    assert!(
+        events.is_empty(),
+        "MessageStop must not yield TextDelta etc."
+    );
+    assert!(state.saw_message_stop);
+    assert_eq!(
+        state.echoed_model.as_deref(),
+        Some("us.anthropic.claude-haiku-4-5-20251001-v1:0"),
+        "echoed model id must persist for the post-loop ServerModel emit",
+    );
+}
+
+#[test]
+fn handle_message_stop_without_echo_leaves_state_unset() {
+    let mut state = BedrockStreamState::default();
+    let stop = MessageStopEvent::builder()
+        .stop_reason(StopReason::EndTurn)
+        .build()
+        .expect("build stop");
+    handle_bedrock_event(ConverseStreamOutput::MessageStop(stop), &mut state).expect("handle stop");
+    assert!(
+        state.echoed_model.is_none(),
+        "no additionalModelResponseFields means no echo; state must remain None",
+    );
+}
+
+/// M-18: the 4-slot allocator hands out four markers in
+/// invalidation-priority order (tools -> system -> messages) and
+/// then drops+warns on every subsequent consumer. The cap matches
+/// Bedrock's documented limit so a future per-skill policy that
+/// emits a 5th breakpoint degrades to a warning instead of a
+/// `ValidationException` on every turn.
+#[test]
+fn breakpoint_budget_caps_at_four_and_warns_on_overflow() {
+    let mut budget = BreakpointBudget::new();
+    assert!(budget.consume("tools"));
+    assert!(budget.consume("system"));
+    assert!(budget.consume("messages"));
+    // A fourth slot is still available so a future caller marker
+    // (skill layer, per-message breakpoint) lands inside the cap.
+    assert!(budget.consume("future-marker"));
+    // Cap reached; any further consumer is dropped.
+    assert!(!budget.consume("overflow-1"));
+    assert!(!budget.consume("overflow-2"));
+    assert_eq!(budget.dropped, 2);
+}
+
+/// M-18 regression guard: the auto policy emits exactly three
+/// markers today (tools tail / system tail / latest user block).
+/// The combined system_blocks + conversation_messages +
+/// tool_configuration helpers must still stamp all three when the
+/// budget allows.
+#[test]
+fn auto_caching_emits_three_breakpoints_within_budget() {
+    let specs: Vec<Arc<LlmToolSpec>> = vec![
+        LlmToolSpec {
+            name: "search".to_string(),
+            description: "Web search".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: false,
+        }
+        .into(),
+    ];
+    // System breakpoint.
+    let system = system_blocks("be helpful", CacheRetention::Short).expect("system");
+    let system_cache_points = system
+        .iter()
+        .filter(|b| matches!(b, SystemContentBlock::CachePoint(_)))
+        .count();
+    assert_eq!(
+        system_cache_points, 1,
+        "system tail must carry exactly one cachePoint when retention is enabled",
+    );
+    // Last-user breakpoint.
+    let messages = conversation_messages(
+        &[
+            LlmInputItem::UserText("first".to_string()),
+            LlmInputItem::AssistantText("ack".to_string()),
+            LlmInputItem::UserText("second".to_string()),
+        ],
+        CacheRetention::Short,
+    )
+    .expect("messages");
+    let message_cache_points: usize = messages
+        .iter()
+        .map(|m| {
+            m.content()
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::CachePoint(_)))
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        message_cache_points, 1,
+        "exactly one cachePoint must land on the last user message",
+    );
+    // Tools tail breakpoint.
+    let tools = tool_configuration(&specs, CacheRetention::Short, None)
+        .expect("ok")
+        .expect("present");
+    let tool_cache_points = tools
+        .tools()
+        .iter()
+        .filter(|t| matches!(t, aws_sdk_bedrockruntime::types::Tool::CachePoint(_)))
+        .count();
+    assert_eq!(
+        tool_cache_points, 1,
+        "tools tail must carry exactly one cachePoint when retention is enabled",
+    );
+}
+
+/// LOW: Smithy stream errors used to collapse into a single
+/// `ProviderStream` envelope with an opaque string, so a
+/// `ValidationException` (bad tool schema, malformed image) looked
+/// indistinguishable from a `ThrottlingException` and the retry
+/// harness retried both. Downcast to `ConverseStreamOutputError`
+/// so deterministic failures land on `ProviderRequest` (terminal)
+/// and transient classes land on `ProviderStream` (retryable).
+#[test]
+fn classify_stream_sdk_error_routes_validation_to_provider_request() {
+    use aws_sdk_bedrockruntime::error::SdkError;
+    use aws_sdk_bedrockruntime::types::error::{ConverseStreamOutputError, ValidationException};
+    use aws_smithy_types::event_stream::RawMessage;
+
+    let inner = ConverseStreamOutputError::ValidationException(
+        ValidationException::builder()
+            .message("bad tool schema")
+            .build(),
+    );
+    let err = classify_stream_sdk_error(SdkError::service_error(inner, RawMessage::invalid(None)));
+    let SqueezyError::ProviderRequest(message) = &err else {
+        panic!("expected ProviderRequest for ValidationException, got {err:?}");
+    };
+    assert!(
+        message.contains("ValidationException"),
+        "error must mention the SDK variant: {message}",
+    );
+}
+
+#[test]
+fn classify_stream_sdk_error_routes_transient_classes_to_provider_stream() {
+    use aws_sdk_bedrockruntime::error::SdkError;
+    use aws_sdk_bedrockruntime::types::error::{
+        ConverseStreamOutputError, InternalServerException, ModelStreamErrorException,
+        ServiceUnavailableException, ThrottlingException,
+    };
+    use aws_smithy_types::event_stream::RawMessage;
+
+    for (label, inner) in [
+        (
+            "ThrottlingException",
+            ConverseStreamOutputError::ThrottlingException(
+                ThrottlingException::builder().message("slow down").build(),
+            ),
+        ),
+        (
+            "ModelStreamErrorException",
+            ConverseStreamOutputError::ModelStreamErrorException(
+                ModelStreamErrorException::builder()
+                    .message("mid-stream blip")
+                    .build(),
+            ),
+        ),
+        (
+            "InternalServerException",
+            ConverseStreamOutputError::InternalServerException(
+                InternalServerException::builder()
+                    .message("upstream borked")
+                    .build(),
+            ),
+        ),
+        (
+            "ServiceUnavailableException",
+            ConverseStreamOutputError::ServiceUnavailableException(
+                ServiceUnavailableException::builder()
+                    .message("come back later")
+                    .build(),
+            ),
+        ),
+    ] {
+        let err =
+            classify_stream_sdk_error(SdkError::service_error(inner, RawMessage::invalid(None)));
+        let SqueezyError::ProviderStream(message) = &err else {
+            panic!("expected ProviderStream for {label}, got {err:?}");
+        };
+        assert!(
+            message.contains(label),
+            "error must mention the SDK variant {label}: {message}",
+        );
+    }
+}
+
+/// LOW: adaptive-thinking Claude 4.6+ at high effort can spend
+/// several minutes thinking between visible deltas; the steady-
+/// state 300 s idle timeout used to fire a false-positive timeout
+/// in that configuration. Scale 2x when both the effective
+/// reasoning effort is `High`/`XHigh` and the model is in the
+/// adaptive-thinking family. All other configurations keep the
+/// base default so a genuinely stalled non-reasoning turn still
+/// surfaces as a timeout rather than hanging.
+#[test]
+fn bedrock_idle_timeout_scales_for_adaptive_high_effort() {
+    use squeezy_core::ReasoningEffort;
+    let transport = ProviderTransportConfig::default();
+    let base = bedrock_idle_timeout(
+        transport,
+        &LlmRequest::default(),
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+    // Adaptive (claude-sonnet-4-6) + High effort -> 2x base.
+    let adaptive_high = LlmRequest {
+        reasoning_effort: Some(ReasoningEffort::High),
+        ..LlmRequest::default()
+    };
+    let scaled = bedrock_idle_timeout(
+        transport,
+        &adaptive_high,
+        "us.anthropic.claude-sonnet-4-6-20251001-v1:0",
+    );
+    assert_eq!(
+        scaled,
+        base * 2,
+        "adaptive-thinking + High effort must double the base idle timeout",
+    );
+
+    // Adaptive + XHigh effort also scales.
+    let adaptive_xhigh = LlmRequest {
+        reasoning_effort: Some(ReasoningEffort::XHigh),
+        ..LlmRequest::default()
+    };
+    assert_eq!(
+        bedrock_idle_timeout(
+            transport,
+            &adaptive_xhigh,
+            "anthropic.claude-opus-4-6-20251101-v1:0",
+        ),
+        base * 2,
+        "XHigh on adaptive-thinking models also scales",
+    );
+}
+
+#[test]
+fn bedrock_idle_timeout_does_not_scale_for_non_adaptive_or_low_effort() {
+    use squeezy_core::ReasoningEffort;
+    let transport = ProviderTransportConfig::default();
+    let base = bedrock_idle_timeout(
+        transport,
+        &LlmRequest::default(),
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+
+    // High effort on a non-adaptive model (haiku 4.5) keeps base.
+    let pre_4_6_high = LlmRequest {
+        reasoning_effort: Some(ReasoningEffort::High),
+        ..LlmRequest::default()
+    };
+    assert_eq!(
+        bedrock_idle_timeout(
+            transport,
+            &pre_4_6_high,
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+        ),
+        base,
+        "pre-4.6 Claude keeps the steady-state timeout even at High effort",
+    );
+
+    // Low effort on adaptive model also keeps base.
+    let adaptive_low = LlmRequest {
+        reasoning_effort: Some(ReasoningEffort::Low),
+        ..LlmRequest::default()
+    };
+    assert_eq!(
+        bedrock_idle_timeout(
+            transport,
+            &adaptive_low,
+            "us.anthropic.claude-sonnet-4-6-20251001-v1:0",
+        ),
+        base,
+        "Low effort never scales, even on adaptive-thinking models",
+    );
+
+    // Unset reasoning_effort on a model with no `default_reasoning_effort`
+    // registry entry keeps base.
+    assert_eq!(
+        bedrock_idle_timeout(
+            transport,
+            &LlmRequest::default(),
+            "us.anthropic.claude-sonnet-4-6-20251001-v1:0",
+        ),
+        base,
+        "no effort signal at all means no scaling",
+    );
+}
+
+/// LOW: `hex_encode` now uses `write!` into a pre-allocated
+/// `String` rather than per-byte `format!`. The behavior contract
+/// (lowercase, zero-padded, fixed two characters per byte) must
+/// remain unchanged — assert against known fixtures plus a
+/// round-trip through `hex_decode` over the full byte range.
+#[test]
+fn hex_encode_matches_fixed_two_char_lowercase_per_byte() {
+    use aws_smithy_types::Blob;
+    assert_eq!(hex_encode(&Blob::new(Vec::<u8>::new())), "");
+    assert_eq!(hex_encode(&Blob::new(vec![0u8])), "00");
+    assert_eq!(
+        hex_encode(&Blob::new(vec![0x00, 0x0f, 0xff])),
+        "000fff",
+        "leading zeros must be preserved so the round-trip back through hex_decode is lossless",
+    );
+    // Encode the full byte range and verify `hex_decode` round-trips it.
+    let payload: Vec<u8> = (0u8..=255u8).collect();
+    let encoded = hex_encode(&Blob::new(payload.clone()));
+    assert_eq!(encoded.len(), payload.len() * 2);
+    assert_eq!(
+        hex_decode(&encoded),
+        Some(payload),
+        "hex_decode(hex_encode(bytes)) must return the original bytes",
     );
 }

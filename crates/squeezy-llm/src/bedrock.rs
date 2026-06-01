@@ -175,6 +175,60 @@ pub(crate) fn build_bedrock_client(
     Ok(BedrockClient::new(shared))
 }
 
+/// Bedrock accepts at most four `cachePoint` markers per Converse
+/// request across `tools`, `system`, and `messages`. The hard cap is
+/// documented at
+/// <https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html>;
+/// a 5th breakpoint triggers a `ValidationException` that takes the
+/// whole turn down non-retryably.
+///
+/// `BreakpointBudget` mirrors anthropic.rs's `BreakpointBudget`
+/// (mirror of opencode's `Bedrock.Cache.Breakpoints` slot allocator)
+/// so the lowering layer can decide which sections receive a marker
+/// in invalidation-priority order (tools change least frequently,
+/// system next, messages most often — longer-TTL must precede
+/// shorter-TTL on Bedrock). When the budget is exhausted the
+/// allocator drops the next request and emits a single `tracing::warn!`
+/// per dropped marker so a future per-skill policy that overflows
+/// the cap surfaces in logs instead of failing every request.
+#[derive(Debug)]
+struct BreakpointBudget {
+    remaining: usize,
+    dropped: usize,
+}
+
+impl BreakpointBudget {
+    /// Bedrock's hard cap on `cachePoint` markers per Converse request.
+    const CAP: usize = 4;
+
+    fn new() -> Self {
+        Self {
+            remaining: Self::CAP,
+            dropped: 0,
+        }
+    }
+
+    /// Try to consume one slot for the named section. Returns `true`
+    /// when the marker should be emitted, `false` when the budget is
+    /// exhausted (and warns once per dropped marker so operators see
+    /// when a per-skill policy outgrew Bedrock's 4-breakpoint cap).
+    fn consume(&mut self, section: &'static str) -> bool {
+        if self.remaining == 0 {
+            self.dropped = self.dropped.saturating_add(1);
+            tracing::warn!(
+                provider = "bedrock",
+                section,
+                cap = Self::CAP,
+                dropped = self.dropped,
+                "bedrock cachePoint breakpoint dropped: per-request cap exceeded",
+            );
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
+
 impl LlmProvider for BedrockProvider {
     fn name(&self) -> &'static str {
         "bedrock"
@@ -213,7 +267,29 @@ fn bedrock_stream_attempt(
     cancel: CancellationToken,
 ) -> LlmStream {
     let transport = provider.transport;
+    // NIT: scope every tracing call from this attempt under one span
+    // so per-request `model` / `region` fields show up on every
+    // event (rewrite info, cache-budget warns, idle timeout, unhandled
+    // variant debug, etc.) without each call having to re-thread
+    // them. `requested_model` is what the caller asked for; the
+    // post-rewrite resolved id lands on `LlmEvent::ServerModel` so
+    // the span doesn't need to carry it. `Empty` placeholders let
+    // us record the resolved model and prompt-cache retention once
+    // they're known inside the stream body via `Span::record`.
+    let attempt_span = tracing::info_span!(
+        "bedrock.stream",
+        provider = "bedrock",
+        region = %provider.region,
+        model = %request.model,
+        resolved_model = tracing::field::Empty,
+        retention = tracing::field::Empty,
+    );
     Box::pin(try_stream! {
+        // Hold the span as a local so each `tracing::*!` call can wrap
+        // itself in `attempt_span.in_scope(|| ...)`. Cannot use the
+        // `_guard = span.entered()` pattern because the resulting
+        // `Entered<'_>` is `!Send` and breaks crossing `.await`.
+        let attempt_span = attempt_span;
         let client_result = tokio::select! {
             _ = cancel.cancelled() => {
                 yield LlmEvent::Cancelled;
@@ -233,13 +309,15 @@ fn bedrock_stream_attempt(
         // the transcript / cost-attribution layers see the actual
         // model that produced the turn.
         let model = apply_inference_profile_prefix(&requested_model, &provider.region);
+        attempt_span.record("resolved_model", tracing::field::display(&model));
         if model != requested_model {
-            tracing::info!(
-                provider = "bedrock",
-                requested = %requested_model,
-                resolved = %model,
-                "rewrote Bedrock model id to cross-region inference profile"
-            );
+            attempt_span.in_scope(|| {
+                tracing::info!(
+                    requested = %requested_model,
+                    resolved = %model,
+                    "rewrote Bedrock model id to cross-region inference profile"
+                );
+            });
         }
         let prompt_caching = should_apply_caching("bedrock", &request);
         // Honor `CacheRetention::Long` end-to-end so Bedrock cache
@@ -251,8 +329,42 @@ fn bedrock_stream_attempt(
         } else {
             CacheRetention::None
         };
+        attempt_span.record("retention", tracing::field::debug(retention));
+        // Bedrock's hard cap is 4 `cachePoint` blocks per request,
+        // ordered tools -> system -> messages (longer-TTL must
+        // precede shorter-TTL). The auto policy currently emits
+        // 3 markers (tools tail, system tail, latest user block),
+        // so the cap is not exceeded yet — but a future per-skill
+        // policy that adds a 5th breakpoint would hard-fail every
+        // request with a `ValidationException`. Mirror opencode's
+        // `Bedrock.Cache.Breakpoints` allocator: consume in
+        // invalidation-priority order (least-volatile first) and
+        // drop+warn on overflow rather than 4xx-ing the turn.
+        let mut budget = BreakpointBudget::new();
+        let emit_tools_cache = retention != CacheRetention::None
+            && !request.tools.is_empty()
+            && budget.consume("tools");
+        let emit_system_cache = retention != CacheRetention::None
+            && !request.instructions.trim().is_empty()
+            && budget.consume("system");
+        let emit_messages_cache = retention != CacheRetention::None && budget.consume("messages");
+        let tools_retention = if emit_tools_cache {
+            retention
+        } else {
+            CacheRetention::None
+        };
+        let system_retention = if emit_system_cache {
+            retention
+        } else {
+            CacheRetention::None
+        };
+        let messages_retention = if emit_messages_cache {
+            retention
+        } else {
+            CacheRetention::None
+        };
         let mut builder = client.converse_stream().model_id(&model);
-        for block in system_blocks(&request.instructions, retention)? {
+        for block in system_blocks(&request.instructions, system_retention)? {
             builder = builder.system(block);
         }
         // Canonicalize cross-provider tool-call ids and
@@ -265,12 +377,14 @@ fn bedrock_stream_attempt(
         // produce ids Bedrock either rejects on shape or fails
         // to match.
         let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
-        for message in conversation_messages(&normalized_input, retention)? {
+        for message in conversation_messages(&normalized_input, messages_retention)? {
             builder = builder.messages(message);
         }
-        if let Some(config) =
-            tool_configuration(&request.tools, retention, request.tool_choice.as_deref())?
-        {
+        if let Some(config) = tool_configuration(
+            &request.tools,
+            tools_retention,
+            request.tool_choice.as_deref(),
+        )? {
             builder = builder.tool_config(config);
         }
         if let Some(inference) = inference_configuration(&request) {
@@ -308,11 +422,18 @@ fn bedrock_stream_attempt(
 
         // Surface the auto-applied inference-profile prefix so the
         // TUI / transcript / cost-attribution layers see the actual
-        // model that produced the turn. Emitted at most once per
-        // stream — matches the cross-provider [`LlmEvent::ServerModel`]
-        // contract.
+        // model that produced the turn. The tracker also serves the
+        // M-15 follow-up emission from
+        // `messageStop.additionalModelResponseFields` (an application-
+        // inference-profile may backfill from a different foundation
+        // model than the bare prefix). Only consume here when the
+        // prefix actually changed the id — otherwise the pass-through
+        // call would seal the tracker and the messageStop echo would
+        // never fire.
         let mut server_model_echo = crate::ServerModelEcho::default();
-        if let Some(echo) = server_model_echo.observe(&requested_model, &model) {
+        if model != requested_model
+            && let Some(echo) = server_model_echo.observe(&requested_model, &model)
+        {
             yield echo;
         }
 
@@ -324,7 +445,10 @@ fn bedrock_stream_attempt(
                     yield LlmEvent::Cancelled;
                     return;
                 }
-                next = timeout(idle_timeout(transport), recv_event(&mut stream)) => next,
+                next = timeout(
+                    bedrock_idle_timeout(transport, &request, &model),
+                    recv_event(&mut stream),
+                ) => next,
             };
             let event = polled.map_err(|_| {
                 SqueezyError::ProviderStream("Bedrock stream idle timeout".to_string())
@@ -340,11 +464,25 @@ fn bedrock_stream_attempt(
             ))?;
         }
         if !state.saw_metadata {
-            tracing::warn!(
-                provider = "bedrock",
-                model = %model,
-                "Bedrock stream ended without metadata event; usage tokens unavailable for this turn"
-            );
+            attempt_span.in_scope(|| {
+                tracing::warn!(
+                    "Bedrock stream ended without metadata event; usage tokens unavailable for this turn"
+                );
+            });
+        }
+        // M-15: if Bedrock echoed a resolved model id on
+        // `messageStop.additionalModelResponseFields` (typical for
+        // application-inference-profile routing that backfills from a
+        // different foundation model), surface it through the same
+        // `ServerModelEcho` tracker that observed the inference-profile
+        // prefix rewrite at stream start. `observe` is idempotent: when
+        // the prefix rewrite already emitted, this call is a no-op; when
+        // the rewrite was a pass-through (id matched verbatim), the echo
+        // is the first chance the agent sees the resolved id.
+        if let Some(echoed) = state.echoed_model.as_deref()
+            && let Some(echo_event) = server_model_echo.observe(&requested_model, echoed)
+        {
+            yield echo_event;
         }
         if let Some(payload) = state.flush_reasoning() {
             yield LlmEvent::ReasoningDone(payload);
@@ -364,10 +502,74 @@ async fn recv_event(
         aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError,
     >,
 ) -> Result<Option<ConverseStreamOutput>> {
-    stream
-        .recv()
-        .await
-        .map_err(|err| SqueezyError::ProviderStream(format!("Bedrock event stream error: {err}")))
+    stream.recv().await.map_err(classify_stream_sdk_error)
+}
+
+/// Classify a `SdkError<ConverseStreamOutputError, _>` into the
+/// cross-provider `SqueezyError` envelope so the retry harness and
+/// downstream observers can react to terminal-vs-retryable failure
+/// modes distinctly.
+///
+/// AWS documents `ModelStreamErrorException` /
+/// `ThrottlingException` / `InternalServerException` /
+/// `ServiceUnavailableException` as retryable and
+/// `ValidationException` as terminal. The Smithy stream surface
+/// collapses both into the same `recv()` error type; without the
+/// downcast a `ValidationException` (bad tool schema, malformed
+/// image) would be retried pointlessly. We don't add new
+/// `SqueezyError` variants — terminal failures land on
+/// `ProviderRequest` (the existing 4xx envelope) and retryable
+/// failures land on `ProviderStream` so `is_retryable_stream_error`
+/// in retry.rs continues to drive reconnection.
+fn classify_stream_sdk_error(
+    err: SdkError<
+        aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError,
+        aws_smithy_types::event_stream::RawMessage,
+    >,
+) -> SqueezyError {
+    use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
+    // Non-service errors (transport, timeout, dispatch) are always
+    // retryable. Surface them on `ProviderStream` with a context
+    // hint about the SDK-side cause.
+    if !matches!(err, SdkError::ServiceError(_)) {
+        let kind = match &err {
+            SdkError::ConstructionFailure(_) => "construction-failure",
+            SdkError::TimeoutError(_) => "timeout",
+            SdkError::DispatchFailure(_) => "dispatch-failure",
+            SdkError::ResponseError(_) => "response-error",
+            SdkError::ServiceError(_) => "service-error",
+            _ => "unknown",
+        };
+        return SqueezyError::ProviderStream(format!("Bedrock event stream {kind}: {err}"));
+    }
+    // Service error: downcast into the Smithy discriminant and emit
+    // distinct envelopes by retryability class. `ValidationException`
+    // is the only deterministic-failure variant — everything else is
+    // a transient class the retry harness should retry.
+    let inner = err.into_service_error();
+    match inner {
+        ConverseStreamOutputError::ValidationException(e) => {
+            SqueezyError::ProviderRequest(format!("Bedrock event stream ValidationException: {e}"))
+        }
+        ConverseStreamOutputError::ThrottlingException(e) => {
+            SqueezyError::ProviderStream(format!("Bedrock event stream ThrottlingException: {e}"))
+        }
+        ConverseStreamOutputError::ModelStreamErrorException(e) => SqueezyError::ProviderStream(
+            format!("Bedrock event stream ModelStreamErrorException: {e}"),
+        ),
+        ConverseStreamOutputError::InternalServerException(e) => SqueezyError::ProviderStream(
+            format!("Bedrock event stream InternalServerException: {e}"),
+        ),
+        ConverseStreamOutputError::ServiceUnavailableException(e) => SqueezyError::ProviderStream(
+            format!("Bedrock event stream ServiceUnavailableException: {e}"),
+        ),
+        // `Unhandled` covers unknown error codes the SDK couldn't
+        // model. Treat as retryable since callers shouldn't burn the
+        // budget on a deterministic re-shape of a transient.
+        other => {
+            SqueezyError::ProviderStream(format!("Bedrock event stream unhandled error: {other}"))
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -382,23 +584,32 @@ struct BedrockStreamState {
     saw_message_stop: bool,
     stop_reason: Option<crate::StopReason>,
     saw_metadata: bool,
+    /// Model id echoed by Bedrock on `messageStop.additionalModelResponseFields`.
+    /// When an application-inference-profile ARN routes to a different
+    /// backing foundation model, Bedrock surfaces the resolved id here so
+    /// cost attribution / transcript can pin the actually-billed model.
+    /// Routed through [`crate::ServerModelEcho`] after the stream loop
+    /// completes (emits at most one [`LlmEvent::ServerModel`] per turn).
+    echoed_model: Option<String>,
 }
 
 impl BedrockStreamState {
     fn cost(&self) -> CostSnapshot {
-        // Bedrock routes Claude models and inherits Anthropic's
-        // Messages-API convention where `usage.inputTokens` is the
-        // **uncached delta only**. Normalise to the cross-provider
-        // convention shared by OpenAI / Google / Ollama / compatible:
-        // `input_tokens` is the total prompt the model saw, and the
-        // cached share lives in `cached_input_tokens`. See the matching
-        // comment on `AnthropicStreamState::cost()`.
-        let base = self.input_tokens;
-        let cache_read = self.cache_read_input_tokens.unwrap_or(0);
-        let cache_write = self.cache_write_input_tokens.unwrap_or(0);
-        let total_input = base.map(|b| b.saturating_add(cache_read).saturating_add(cache_write));
+        // Bedrock reports inclusive total; we surface as-is.
+        //
+        // The Converse API populates `usage.inputTokens` as the
+        // **total** prompt tokens the model saw, with
+        // `cacheReadInputTokens` and `cacheWriteInputTokens` as
+        // *subsets* of that total (see opencode's
+        // `bedrock-converse.ts:405-418` for the same convention).
+        // The cross-provider `CostSnapshot.input_tokens` field
+        // expects the same inclusive total, so we pass the value
+        // through verbatim. The earlier convention here
+        // double-counted by treating `inputTokens` as Anthropic's
+        // "uncached delta" — for a heavy cache-hit workflow that
+        // inflated reported input-token counts by ~80%.
         CostSnapshot {
-            input_tokens: total_input,
+            input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             reasoning_output_tokens: None,
             cached_input_tokens: self.cache_read_input_tokens,
@@ -538,6 +749,18 @@ fn handle_bedrock_event(
         ConverseStreamOutput::MessageStop(stop) => {
             state.saw_message_stop = true;
             state.stop_reason = Some(crate::StopReason::from_bedrock(stop.stop_reason().as_str()));
+            // Application-inference-profile routing can land the turn
+            // on a different backing foundation model than the caller
+            // requested. Bedrock surfaces the resolved id in
+            // `messageStop.additionalModelResponseFields` (Anthropic-on-
+            // Bedrock typically emits a top-level `model` string).
+            // Persist into state so the stream loop can route it
+            // through `ServerModelEcho` after `MessageStop`.
+            if let Some(fields) = stop.additional_model_response_fields()
+                && let Some(echoed) = extract_echoed_model(fields)
+            {
+                state.echoed_model = Some(echoed);
+            }
             Ok(Vec::new())
         }
         ConverseStreamOutput::Metadata(meta) => {
@@ -699,6 +922,53 @@ pub(crate) fn bedrock_effort_label(effort: squeezy_core::ReasoningEffort) -> &'s
     }
 }
 
+/// Multiplier applied to the base stream idle timeout when the turn
+/// is configured for high-effort reasoning on an adaptive-thinking
+/// Claude family. Adaptive-thinking Claude 4.6+ can spend several
+/// minutes thinking between visible deltas at max effort; the
+/// cross-provider 300-second default is calibrated for steady-state
+/// streaming and trips a false-positive idle timeout on these
+/// configurations. Scale wide enough (2x) to cover documented worst-
+/// case thinking gaps without hiding genuine stalls.
+const BEDROCK_ADAPTIVE_THINKING_IDLE_TIMEOUT_MULTIPLIER: u32 = 2;
+
+/// Compute the per-event idle timeout for a Bedrock stream. Starts
+/// from the cross-provider [`idle_timeout`] base and doubles it when
+/// both:
+/// * the effective reasoning effort (request override OR the model's
+///   `default_reasoning_effort` capability fallback) is `High` or
+///   `XHigh`, and
+/// * the model is in the adaptive-thinking Claude family
+///   ([`crate::anthropic::model_uses_adaptive_thinking`]).
+///
+/// Other configurations keep the steady-state default so a stalled
+/// non-reasoning turn still surfaces as a timeout instead of hanging.
+pub(crate) fn bedrock_idle_timeout(
+    transport: ProviderTransportConfig,
+    request: &LlmRequest,
+    model: &str,
+) -> std::time::Duration {
+    let base = idle_timeout(transport);
+    // `default_reasoning_effort` from the Phase 1 ModelCapabilities
+    // table covers the model-recommended baseline when the caller
+    // left `reasoning_effort` unset. Without that fallback an agent
+    // that always relies on the registry default would never get the
+    // scaled timeout even on adaptive-thinking models that always
+    // think for several minutes at high effort.
+    let effective_effort = request.reasoning_effort.or_else(|| {
+        crate::capabilities_for("bedrock", model).and_then(|caps| caps.default_reasoning_effort)
+    });
+    let is_high_effort = matches!(
+        effective_effort,
+        Some(squeezy_core::ReasoningEffort::High | squeezy_core::ReasoningEffort::XHigh)
+    );
+    if is_high_effort && crate::anthropic::model_uses_adaptive_thinking(model) {
+        base * BEDROCK_ADAPTIVE_THINKING_IDLE_TIMEOUT_MULTIPLIER
+    } else {
+        base
+    }
+}
+
 /// Map an AWS region id (`us-east-1`, `eu-west-1`, `ap-southeast-2`,
 /// `jp-east-1`, etc.) to the cross-region inference profile prefix
 /// Bedrock expects on Claude foundation models.
@@ -768,11 +1038,39 @@ pub(crate) fn apply_inference_profile_prefix(model: &str, region: &str) -> Strin
     format!("{prefix}.{model}")
 }
 
+/// Pull a server-echoed model id out of Bedrock's
+/// `messageStop.additionalModelResponseFields`. Anthropic-on-Bedrock
+/// typically emits a top-level `model` string when the resolved
+/// backing model differs from the requested id; some integrations also
+/// use `server_model`. The helper accepts either key and returns the
+/// first non-empty match. Returns `None` for shapes we don't
+/// understand (array, missing string, blank value) so the stream loop
+/// silently falls back to "no echo" rather than fabricating one.
+pub(crate) fn extract_echoed_model(fields: &Document) -> Option<String> {
+    let Document::Object(map) = fields else {
+        return None;
+    };
+    for key in ["model", "server_model"] {
+        if let Some(Document::String(value)) = map.get(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn hex_encode(blob: &Blob) -> String {
+    use std::fmt::Write as _;
     let bytes = blob.as_ref();
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+        // `write!` into the pre-allocated `String` skips the
+        // per-byte `format!` heap allocation that previously fired
+        // once per byte. `write!` into a `String` is infallible;
+        // `unwrap()` is the documented idiom.
+        write!(&mut out, "{b:02x}").unwrap();
     }
     out
 }
