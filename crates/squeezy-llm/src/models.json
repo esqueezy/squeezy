@@ -440,7 +440,7 @@
       "reasoning_tokens": false,
       "reasoning_effort": false,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": null,
     "limits": {
@@ -465,7 +465,7 @@
       "reasoning_tokens": false,
       "reasoning_effort": false,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": null,
     "limits": {
@@ -490,7 +490,7 @@
       "reasoning_tokens": false,
       "reasoning_effort": false,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": null,
     "limits": {
@@ -540,7 +540,7 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": null,
     "limits": {
@@ -565,7 +565,7 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": null,
     "limits": {
@@ -590,7 +590,7 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": null,
     "limits": {
@@ -615,7 +615,7 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": true,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": null,
     "limits": {
@@ -640,7 +640,7 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": true,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": null,
     "limits": {
