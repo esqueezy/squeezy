@@ -51,6 +51,37 @@ fn request_body_uses_responses_streaming_shape() {
 }
 
 #[test]
+fn request_body_omits_empty_instructions() {
+    // M-02: an empty `instructions` field would overwrite the stored
+    // default on a `previous_response_id` chain. Skip when empty so the
+    // server-stored default survives.
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: Some("resp_123".to_string()),
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    assert!(
+        body.get("instructions").is_none(),
+        "empty instructions must not serialize",
+    );
+}
+
+#[test]
 fn parser_extracts_text_delta() {
     let mut acc = ReasoningAccumulator::default();
     let event = parse_openai_event(

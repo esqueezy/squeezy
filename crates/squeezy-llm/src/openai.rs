@@ -159,11 +159,17 @@ impl OpenAiProvider {
         let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
         let mut body = json!({
             "model": request.model,
-            "instructions": request.instructions,
             "input": openai_input(&normalized_input),
             "stream": true,
             "store": request.store,
         });
+        // M-02: only emit `instructions` when non-empty. An empty string
+        // would shadow the stored conversation default on a
+        // `previous_response_id` chain (codex mirrors this with
+        // `#[serde(skip_serializing_if = "String::is_empty")]`).
+        if !request.instructions.is_empty() {
+            body["instructions"] = json!(request.instructions);
+        }
         if let Some(previous_response_id) = &request.previous_response_id {
             body["previous_response_id"] = json!(previous_response_id);
         }
