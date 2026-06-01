@@ -20,9 +20,9 @@ use super::{
     apply_thinking_extra_fields, bedrock_document_block, bedrock_effort_label,
     bedrock_request_metadata_map, bedrock_tool_choice, build_bedrock_client,
     classify_stream_sdk_error, compute_thinking_extra_fields, conversation_messages,
-    current_bearer_token, extract_echoed_model, handle_bedrock_event, inference_configuration,
-    json_to_document, region_prefix, sanitize_bedrock_document_name, system_blocks,
-    tool_configuration,
+    current_bearer_token, extract_echoed_model, handle_bedrock_event, hex_decode, hex_encode,
+    inference_configuration, json_to_document, region_prefix, sanitize_bedrock_document_name,
+    system_blocks, tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{CacheRetention, LlmInputItem, LlmRequest, LlmToolSpec};
@@ -1681,4 +1681,30 @@ fn classify_stream_sdk_error_routes_transient_classes_to_provider_stream() {
             "error must mention the SDK variant {label}: {message}",
         );
     }
+}
+
+/// LOW: `hex_encode` now uses `write!` into a pre-allocated
+/// `String` rather than per-byte `format!`. The behavior contract
+/// (lowercase, zero-padded, fixed two characters per byte) must
+/// remain unchanged — assert against known fixtures plus a
+/// round-trip through `hex_decode` over the full byte range.
+#[test]
+fn hex_encode_matches_fixed_two_char_lowercase_per_byte() {
+    use aws_smithy_types::Blob;
+    assert_eq!(hex_encode(&Blob::new(Vec::<u8>::new())), "");
+    assert_eq!(hex_encode(&Blob::new(vec![0u8])), "00");
+    assert_eq!(
+        hex_encode(&Blob::new(vec![0x00, 0x0f, 0xff])),
+        "000fff",
+        "leading zeros must be preserved so the round-trip back through hex_decode is lossless",
+    );
+    // Encode the full byte range and verify `hex_decode` round-trips it.
+    let payload: Vec<u8> = (0u8..=255u8).collect();
+    let encoded = hex_encode(&Blob::new(payload.clone()));
+    assert_eq!(encoded.len(), payload.len() * 2);
+    assert_eq!(
+        hex_decode(&encoded),
+        Some(payload),
+        "hex_decode(hex_encode(bytes)) must return the original bytes",
+    );
 }

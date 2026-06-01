@@ -985,10 +985,15 @@ pub(crate) fn extract_echoed_model(fields: &Document) -> Option<String> {
 }
 
 fn hex_encode(blob: &Blob) -> String {
+    use std::fmt::Write as _;
     let bytes = blob.as_ref();
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+        // `write!` into the pre-allocated `String` skips the
+        // per-byte `format!` heap allocation that previously fired
+        // once per byte. `write!` into a `String` is infallible;
+        // `unwrap()` is the documented idiom.
+        write!(&mut out, "{b:02x}").unwrap();
     }
     out
 }
