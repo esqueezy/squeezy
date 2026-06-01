@@ -8639,7 +8639,7 @@ fn is_loopback_host(host: &str) -> bool {
 /// this function only catches the literal-host path so a config file
 /// pointing straight at `https://169.254.169.254/v1` is refused at load
 /// time without any network round-trip.
-pub(crate) fn is_metadata_or_link_local_host(host: &str) -> bool {
+pub fn is_metadata_or_link_local_host(host: &str) -> bool {
     // Cloud-metadata sentinel hostnames. Match case-insensitively so a
     // `Metadata.Google.Internal` literal in a config can't slip past.
     const METADATA_HOSTS: &[&str] = &[
@@ -8664,7 +8664,7 @@ pub(crate) fn is_metadata_or_link_local_host(host: &str) -> bool {
 /// every resolved `IpAddr` and a DNS rebind that swaps a benign A record
 /// for `169.254.169.254` at resolution time is refused before
 /// `reqwest` returns a connected socket.
-pub(crate) fn is_metadata_or_link_local_ip(ip: &std::net::IpAddr) -> bool {
+pub fn is_metadata_or_link_local_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             // 169.254.0.0/16 link-local (covers AWS IMDS 169.254.169.254,
