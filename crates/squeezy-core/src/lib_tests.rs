@@ -4120,6 +4120,84 @@ fn inline_api_key_is_redacted_on_serde_serialize() {
 }
 
 #[test]
+fn extra_headers_values_are_redacted_on_serde_serialize() {
+    // M-63: the Custom-preset workaround for non-Bearer auth is to
+    // smuggle the secret through `[providers.<section>.headers]`
+    // (LiteLLM `x-litellm-key`, PortKey `x-portkey-api-key`, vLLM
+    // bearer, corporate `x-api-key` / `api-key`). Without redaction
+    // those values flow verbatim through any code path that calls
+    // serde Serialize on a `ProviderSettings`, so a panic envelope or
+    // bug-report dump leaks the user's credential. Pin the contract:
+    // the *key* of each header stays visible (so an operator can see
+    // which slots are wired) and the *value* is masked to
+    // `"<redacted>"`. Cover three common shapes — an OpenRouter
+    // attribution header (not actually secret but treated uniformly),
+    // a LiteLLM virtual-key header, and a PortKey virtual-key header.
+    let mut headers = BTreeMap::new();
+    headers.insert(
+        "x-litellm-key".to_string(),
+        "lk-litellm-do-not-leak".to_string(),
+    );
+    headers.insert(
+        "x-portkey-api-key".to_string(),
+        "pk-portkey-do-not-leak".to_string(),
+    );
+    headers.insert(
+        "HTTP-Referer".to_string(),
+        "https://example.com".to_string(),
+    );
+    let settings = ProviderSettings {
+        api_key_env: Some("OPENAI_API_KEY".to_string()),
+        headers: Some(headers),
+        ..ProviderSettings::default()
+    };
+    let emitted = toml::to_string(&settings).expect("serialize");
+    for plaintext in [
+        "lk-litellm-do-not-leak",
+        "pk-portkey-do-not-leak",
+        "https://example.com",
+    ] {
+        assert!(
+            !emitted.contains(plaintext),
+            "serialize must not leak header value {plaintext:?}; got: {emitted}",
+        );
+    }
+    // Header *names* stay visible so operators can audit which slots
+    // are wired. Without this assertion a future regression that
+    // dropped the whole `headers` table on serialize would slip past.
+    for header_name in ["x-litellm-key", "x-portkey-api-key", "HTTP-Referer"] {
+        assert!(
+            emitted.contains(header_name),
+            "serialize must keep header name {header_name:?} visible; got: {emitted}",
+        );
+    }
+    assert!(
+        emitted.contains("<redacted>"),
+        "serialize must emit the redaction marker; got: {emitted}"
+    );
+}
+
+#[test]
+fn extra_headers_none_serializes_without_a_headers_table() {
+    // M-63 must preserve the `None` distinction: a provider with no
+    // `[providers.<section>.headers]` block should serialize without
+    // any `headers` key at all, so the round-trip back through TOML
+    // keeps the unset state. (`toml::to_string` skips `Option::None`
+    // fields by default, and the redactor must not accidentally upgrade
+    // them to `Some(empty_map)`.)
+    let settings = ProviderSettings {
+        api_key_env: Some("OPENAI_API_KEY".to_string()),
+        headers: None,
+        ..ProviderSettings::default()
+    };
+    let emitted = toml::to_string(&settings).expect("serialize");
+    assert!(
+        !emitted.contains("headers"),
+        "None headers must not emit a [headers] table; got: {emitted}"
+    );
+}
+
+#[test]
 fn local_inline_api_key_overrides_user_inline_api_key() {
     let mut user = ProviderSettings {
         api_key: Some("from-user".to_string()),

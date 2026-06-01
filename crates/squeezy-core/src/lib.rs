@@ -3085,6 +3085,17 @@ pub struct ProviderSettings {
     pub request_max_retries: Option<u8>,
     pub stream_max_retries: Option<u8>,
     pub stream_idle_timeout_ms: Option<u64>,
+    /// `[providers.<section>.headers]` carries `extra_headers` that
+    /// reach the upstream verbatim. The Custom-preset workaround for
+    /// non-Bearer auth (LiteLLM `x-litellm-key`, PortKey
+    /// `x-portkey-api-key`, vLLM bearer, corporate proxies that want
+    /// `api-key` / `x-api-key`) routes the actual secret through here,
+    /// so M-63 masks each value as `"<redacted>"` on the Serialize
+    /// side. The *names* of the headers stay visible so operators can
+    /// see which keys are wired without leaking the values; the
+    /// Deserialize side is untouched so loaded TOML still binds to the
+    /// real values at request time.
+    #[serde(serialize_with = "redact_secret_map_opt")]
     pub headers: Option<BTreeMap<String, String>>,
     /// Bedrock only: operator-defined cost-allocation tags threaded into
     /// every ConverseStream request via `set_request_metadata` so AWS
@@ -3428,6 +3439,38 @@ where
 {
     match value {
         Some(_) => serializer.serialize_some("<redacted>"),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Serialize-side redactor for header maps. M-63: a `Custom`-preset
+/// workaround for non-Bearer auth is to smuggle the secret through
+/// `[providers.openai_compatible.headers] x-api-key = "..."`, but
+/// `ProviderSettings::headers` would otherwise serialize verbatim and
+/// leak the value into any serde-Serialize path that touches the
+/// settings struct (bug reports, `--diagnostics`, panic envelopes, the
+/// effective-config dump). Mirror the
+/// [`redact_secret_opt`] contract — preserve the *shape* of the field
+/// (`None` stays `None`, empty map stays empty, populated keys stay
+/// visible so operators can tell which headers are set) but mask every
+/// *value* as `"<redacted>"`. Header names are not secrets on their
+/// own; the actual credential always lives in the value half.
+fn redact_secret_map_opt<S>(
+    value: &Option<BTreeMap<String, String>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    match value {
+        Some(map) => {
+            let mut entries = serializer.serialize_map(Some(map.len()))?;
+            for key in map.keys() {
+                entries.serialize_entry(key, "<redacted>")?;
+            }
+            entries.end()
+        }
         None => serializer.serialize_none(),
     }
 }
