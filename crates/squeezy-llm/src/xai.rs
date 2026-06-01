@@ -57,24 +57,34 @@ impl LlmProvider for XaiProvider {
 /// every dated SKU so new `grok-4-fast-*`, `grok-5-*`, etc. variants pick
 /// up the richer wire automatically.
 pub(crate) fn is_responses_capable(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase();
     // Strip an optional `xai/` aggregator namespace prefix so models served
     // through, e.g., OpenRouter routed back into the xAI dedicated provider
     // (rare but possible via base_url override) still resolve correctly.
-    let id = lower.split_once('/').map(|(_, id)| id).unwrap_or(&lower);
+    let id = model.split_once('/').map(|(_, id)| id).unwrap_or(model);
     // grok-code-* is a Grok 4-era code-tuned family that ships on Responses
     // (see `https://docs.x.ai/docs/models`). It does not carry a numeric
     // generation in the id, so opt it in explicitly.
-    if id.starts_with("grok-code") {
+    if starts_with_ignore_ascii_case(id, "grok-code") {
         return true;
     }
-    let Some(rest) = id.strip_prefix("grok-") else {
+    let Some(rest) = strip_prefix_ignore_ascii_case(id, "grok-") else {
         return false;
     };
     let Some(generation_char) = rest.chars().next() else {
         return false;
     };
     matches!(generation_char, '3'..='9')
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .and_then(|_| value.get(prefix.len()..))
+}
+
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    strip_prefix_ignore_ascii_case(value, prefix).is_some()
 }
 
 #[cfg(test)]

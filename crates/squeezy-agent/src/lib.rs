@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     pin::Pin,
@@ -3859,7 +3861,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
         subagents: deps.subagents.clone(),
         hooks: deps.hooks.clone(),
     };
-    let execution = run_subagent(&parent, SubagentKind::DocHelp, request).await;
+    let execution = run_subagent(&parent, SubagentKind::DocHelp, request, None).await;
 
     let mut metrics = TurnMetrics::default();
     metrics.merge_subagent_tool_metrics(&execution.metrics);
@@ -7532,7 +7534,7 @@ async fn handle_subagent_call(
     broker: &mut CostBroker,
 ) -> ToolResult {
     record_subagent_call(&mut broker.metrics, kind);
-    let outcome = run_subagent_dispatch(context, call, kind).await;
+    let outcome = Box::pin(run_subagent_dispatch(context, call, kind)).await;
     apply_subagent_dispatch(broker, kind, &outcome);
     outcome.result
 }
@@ -7701,6 +7703,7 @@ async fn run_subagent_dispatch(
         .tx
         .send(AgentEvent::SubagentStarted {
             turn_id: context.turn_id,
+            id: subagent_id,
             agent: kind.as_str().to_string(),
             prompt: started_prompt,
         })
@@ -7730,7 +7733,7 @@ async fn run_subagent_dispatch(
     let progress_tool_name = call.name.clone();
     let progress_tx = context.tx.clone();
     let progress_turn_id = context.turn_id;
-    let subagent_future = run_subagent(&child_context, kind, request);
+    let subagent_future = run_subagent(&child_context, kind, request, Some(subagent_id));
     tokio::pin!(subagent_future);
     let mut progress_ticker = tokio::time::interval(TOOL_PROGRESS_INTERVAL);
     // `interval` fires immediately on first poll; skip that tick so the
@@ -7790,6 +7793,7 @@ async fn run_subagent_dispatch(
                 .tx
                 .send(AgentEvent::SubagentCompleted {
                     turn_id: context.turn_id,
+                    id: subagent_id,
                     agent: kind.as_str().to_string(),
                     summary: compact_text(&execution.summary, 320),
                     metrics: execution.metrics.clone(),
@@ -7817,6 +7821,7 @@ async fn run_subagent_dispatch(
                 .tx
                 .send(AgentEvent::SubagentFailed {
                     turn_id: context.turn_id,
+                    id: subagent_id,
                     agent: kind.as_str().to_string(),
                     error: compact_text(&error, 320),
                     metrics: execution.metrics.clone(),
@@ -7917,6 +7922,7 @@ async fn run_subagent(
     parent: &ToolExecutionContext<'_>,
     kind: SubagentKind,
     request: SubagentRequest,
+    activity_id: Option<SubagentId>,
 ) -> SubagentExecution {
     let mut config = parent.config.clone();
     config.session_mode = SessionMode::Plan;
@@ -8000,12 +8006,35 @@ async fn run_subagent(
     // time the subagent reports liveness; everything else is dropped to
     // keep the parent's transcript clean.
     let (hidden_tx, mut hidden_rx) = mpsc::channel::<AgentEvent>(64);
-    let parent_tx_heartbeat = parent.tx.clone();
+    let parent_tx = parent.tx.clone();
+    let parent_turn_id = parent.turn_id;
+    let activity_agent = kind.as_str().to_string();
     let drain_handle = tokio::spawn(async move {
         while let Some(event) = hidden_rx.recv().await {
+            // ToolProgress heartbeats forward as-is so the parent's
+            // per-event timeout window resets each time the subagent
+            // reports liveness (dart hang fix; see also the try_send
+            // heartbeat above and the subagent-side equivalent).
             if matches!(event, AgentEvent::ToolProgress { .. }) {
-                let _ = parent_tx_heartbeat.send(event).await;
+                let _ = parent_tx.try_send(event);
+                continue;
             }
+            // Other interesting events surface to the parent transcript
+            // as a compact SubagentActivity line so a watching user can
+            // see the subagent's tool churn without seeing its raw
+            // events.
+            let Some(id) = activity_id else {
+                continue;
+            };
+            let Some(message) = subagent_activity_message(event) else {
+                continue;
+            };
+            let _ = parent_tx.try_send(AgentEvent::SubagentActivity {
+                turn_id: parent_turn_id,
+                id,
+                agent: activity_agent.clone(),
+                message,
+            });
         }
     });
     let local_jobs = JobRegistry::new();
@@ -8129,6 +8158,22 @@ fn subagent_transcript(conversation: &[LlmInputItem]) -> Vec<Value> {
         .collect()
 }
 
+fn subagent_activity_message(event: AgentEvent) -> Option<String> {
+    match event {
+        AgentEvent::ToolCallStarted { call, .. } => {
+            let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+            let args = compact_text(&args, 140);
+            Some(format!("running {} {}", call.name, args))
+        }
+        AgentEvent::ToolCallCompleted { result, .. } => Some(format!(
+            "completed {} {}",
+            result.tool_name,
+            tool_status_label(result.status)
+        )),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent_loop(
     parent: &ToolExecutionContext<'_>,
@@ -8153,7 +8198,7 @@ async fn run_subagent_loop(
 ) -> SubagentExecution {
     let runtime_budget = config.subagents.max_runtime_secs.map(Duration::from_secs);
     let Some(budget) = runtime_budget else {
-        return run_subagent_rounds(
+        return Box::pin(run_subagent_rounds(
             parent,
             config,
             tool_specs,
@@ -8173,13 +8218,13 @@ async fn run_subagent_loop(
             conversation,
             supporting_receipts,
             model,
-        )
+        ))
         .await;
     };
     let loop_model = model.clone();
     let timed = tokio::time::timeout(
         budget,
-        run_subagent_rounds(
+        Box::pin(run_subagent_rounds(
             parent,
             config,
             tool_specs,
@@ -8199,7 +8244,7 @@ async fn run_subagent_loop(
             conversation,
             supporting_receipts,
             loop_model,
-        ),
+        )),
     )
     .await;
     match timed {
@@ -8385,7 +8430,7 @@ async fn run_subagent_rounds(
         let mut results = rejected;
         if !approved.is_empty() {
             results.extend(
-                execute_tool_calls(
+                Box::pin(execute_tool_calls(
                     approved,
                     ToolExecutionContext {
                         turn_id: parent.turn_id,
@@ -8412,7 +8457,7 @@ async fn run_subagent_rounds(
                         hooks: parent.hooks.clone(),
                     },
                     broker,
-                )
+                ))
                 .await,
             );
         }
@@ -9872,7 +9917,7 @@ async fn flush_delegate_batch(
     let completions = futures_util::stream::iter(calls.into_iter().map(|(index, call, kind)| {
         let context = context.clone();
         async move {
-            let outcome = run_subagent_dispatch(&context, &call, kind).await;
+            let outcome = Box::pin(run_subagent_dispatch(&context, &call, kind)).await;
             (index, kind, outcome)
         }
     }))
@@ -12383,7 +12428,12 @@ fn tool_schema_index(
             + rows.len(),
     );
     index.push_str(TOOLS_INDEX_OPENER);
-    index.push_str(&rows.join("\n"));
+    for (idx, row) in rows.iter().enumerate() {
+        if idx > 0 {
+            index.push('\n');
+        }
+        index.push_str(row);
+    }
     index.push_str(TOOLS_INDEX_CLOSER);
     Some(index)
 }
@@ -12401,13 +12451,8 @@ fn instructions_with_tool_index(
     }
 }
 
-fn first_line_of_description(description: &str) -> String {
-    description
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+fn first_line_of_description(description: &str) -> &str {
+    description.lines().next().unwrap_or_default().trim()
 }
 
 /// Returns `true` when `tool`'s full JSON schema must be sent on every
@@ -12748,8 +12793,9 @@ fn format_user_text_with_context(input: &str, attachments: &[ContextAttachment])
     let mut output = input.to_string();
     output.push_str("\n\nAttached context references:\n");
     for attachment in attachments {
-        output.push_str(&format!(
-            "- {reference} id={id} source={source} kind={kind} label={label:?} bytes={bytes} stored_bytes={stored_bytes} truncated={truncated}\n",
+        let _ = writeln!(
+            output,
+            "- {reference} id={id} source={source} kind={kind} label={label:?} bytes={bytes} stored_bytes={stored_bytes} truncated={truncated}",
             reference = attachment.reference(),
             id = attachment.id,
             source = attachment.source.as_str(),
@@ -12758,9 +12804,9 @@ fn format_user_text_with_context(input: &str, attachments: &[ContextAttachment])
             bytes = attachment.original_bytes,
             stored_bytes = attachment.stored_bytes,
             truncated = attachment.truncated,
-        ));
+        );
         if let Some(path) = &attachment.path {
-            output.push_str(&format!("  path={path:?}\n"));
+            let _ = writeln!(output, "  path={path:?}");
         }
         if !attachment.preview.is_empty() {
             output.push_str("  redacted_preview:\n");
@@ -12947,7 +12993,17 @@ fn tool_result_output_handle(result: &ToolResult) -> Option<String> {
 }
 
 pub(crate) fn collapse_status_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut words = text.split_whitespace();
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    let mut output = String::with_capacity(text.len());
+    output.push_str(first);
+    for word in words {
+        output.push(' ');
+        output.push_str(word);
+    }
+    output
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
@@ -13336,17 +13392,26 @@ pub enum AgentEvent {
     },
     SubagentStarted {
         turn_id: TurnId,
+        id: SubagentId,
         agent: String,
         prompt: String,
     },
+    SubagentActivity {
+        turn_id: TurnId,
+        id: SubagentId,
+        agent: String,
+        message: String,
+    },
     SubagentCompleted {
         turn_id: TurnId,
+        id: SubagentId,
         agent: String,
         summary: String,
         metrics: TurnMetrics,
     },
     SubagentFailed {
         turn_id: TurnId,
+        id: SubagentId,
         agent: String,
         error: String,
         metrics: TurnMetrics,

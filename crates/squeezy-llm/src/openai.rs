@@ -167,8 +167,7 @@ impl OpenAiProvider {
         if let Some(previous_response_id) = &request.previous_response_id {
             body["previous_response_id"] = json!(previous_response_id);
         }
-        let cache_spec = request.effective_cache_spec();
-        if let Some(key) = cache_spec.key.as_deref() {
+        if let Some(key) = request.effective_cache_key() {
             // OpenAI's Responses API silently drops `prompt_cache_key`
             // values longer than 64 codepoints — the request succeeds
             // but the field is ignored server-side, so every turn pays
@@ -176,7 +175,7 @@ impl OpenAiProvider {
             // cache hits. Clamp client-side. See [`clamp_prompt_cache_key`].
             body["prompt_cache_key"] = json!(clamp_prompt_cache_key(key));
         }
-        if cache_spec.retention == crate::CacheRetention::Long {
+        if request.effective_cache_retention() == crate::CacheRetention::Long {
             body["prompt_cache_retention"] = json!("24h");
         }
         if let Some(max_output_tokens) = request.max_output_tokens {
@@ -216,21 +215,17 @@ impl OpenAiProvider {
             }
         }
         if !request.tools.is_empty() {
-            body["tools"] = json!(
-                request
-                    .tools
-                    .iter()
-                    .map(|tool| {
-                        json!({
-                            "type": "function",
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.parameters,
-                            "strict": tool.strict,
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            );
+            let mut tools = Vec::with_capacity(request.tools.len());
+            for tool in request.tools.iter() {
+                tools.push(json!({
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                    "strict": tool.strict,
+                }));
+            }
+            body["tools"] = Value::Array(tools);
             // Forward `tool_choice` when the caller set one. See LlmRequest
             // docs — `None` omits the field and falls back to the
             // provider's `auto` default.
@@ -261,6 +256,7 @@ impl OpenAiProvider {
     /// The header values carry the full (unclamped) cache key — the
     /// 64-codepoint limit is specific to the body field; routing headers
     /// have OpenAI's general (much larger) header length cap.
+    #[cfg(test)]
     pub(crate) fn affinity_headers(request: &LlmRequest) -> Vec<(&'static str, String)> {
         let Some(key) = request.effective_cache_spec().key else {
             return Vec::new();
@@ -330,7 +326,7 @@ impl LlmProvider for OpenAiProvider {
         if deployment != request.model.as_ref() {
             body["model"] = json!(deployment);
         }
-        let affinity_headers = Self::affinity_headers(&request);
+        let affinity_key = request.effective_cache_key().map(str::to_owned);
 
         Box::pin(try_stream! {
             let response = send_with_auth_retry(
@@ -348,9 +344,13 @@ impl LlmProvider for OpenAiProvider {
                     // request carries a cache key) keep multi-turn
                     // sessions pinned to the backend that warmed the
                     // cached prefix.
-                    let builder = affinity_headers
-                        .iter()
-                        .fold(builder, |b, (name, value)| b.header(*name, value.as_str()));
+                    let builder = if let Some(value) = affinity_key.as_deref() {
+                        builder
+                            .header("session_id", value)
+                            .header("x-client-request-id", value)
+                    } else {
+                        builder
+                    };
                     builder.json(&body)
                 },
             ).await?;
@@ -613,7 +613,13 @@ fn openai_input(input: &[LlmInputItem]) -> Value {
         return json!(text);
     }
 
-    Value::Array(input.iter().filter_map(openai_input_item).collect())
+    let mut items = Vec::with_capacity(input.len());
+    for item in input {
+        if let Some(value) = openai_input_item(item) {
+            items.push(value);
+        }
+    }
+    Value::Array(items)
 }
 
 fn openai_input_item(item: &LlmInputItem) -> Option<Value> {

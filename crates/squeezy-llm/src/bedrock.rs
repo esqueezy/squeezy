@@ -436,9 +436,11 @@ fn handle_bedrock_event(
 
 fn hex_encode(blob: &Blob) -> String {
     let bytes = blob.as_ref();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
 }
@@ -480,7 +482,7 @@ pub(crate) fn conversation_messages(
     input: &[LlmInputItem],
     prompt_caching: bool,
 ) -> Result<Vec<Message>> {
-    let mut messages: Vec<Message> = Vec::new();
+    let mut messages = MessageBuilder::default();
     let mut tool_names_by_id: HashMap<String, String> = HashMap::new();
     for item in input {
         match item {
@@ -575,6 +577,7 @@ pub(crate) fn conversation_messages(
             LlmInputItem::Reasoning(_) => {}
         }
     }
+    let mut messages = messages.finish()?;
     if prompt_caching {
         append_cache_point_to_last_user(&mut messages)?;
     }
@@ -604,35 +607,57 @@ fn append_cache_point_to_last_user(messages: &mut [Message]) -> Result<()> {
     Ok(())
 }
 
-fn push_message(
-    messages: &mut Vec<Message>,
-    role: ConversationRole,
-    block: ContentBlock,
-) -> Result<()> {
-    if let Some(last) = messages.last_mut()
-        && *last.role() == role
-    {
-        let mut content = last.content().to_vec();
-        content.push(block);
-        let rebuilt = Message::builder()
+#[derive(Debug, Default)]
+struct MessageBuilder {
+    messages: Vec<Message>,
+    current_role: Option<ConversationRole>,
+    current_content: Vec<ContentBlock>,
+}
+
+impl MessageBuilder {
+    fn push(&mut self, role: ConversationRole, block: ContentBlock) -> Result<()> {
+        if self
+            .current_role
+            .as_ref()
+            .is_some_and(|current| *current == role)
+        {
+            self.current_content.push(block);
+            return Ok(());
+        }
+        self.flush()?;
+        self.current_role = Some(role);
+        self.current_content.push(block);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<Message>> {
+        self.flush()?;
+        Ok(self.messages)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        let Some(role) = self.current_role.take() else {
+            return Ok(());
+        };
+        let content = std::mem::take(&mut self.current_content);
+        let message = Message::builder()
             .role(role)
             .set_content(Some(content))
             .build()
             .map_err(|err| {
-                SqueezyError::ProviderRequest(format!("failed to merge Bedrock message: {err}"))
+                SqueezyError::ProviderRequest(format!("failed to build Bedrock message: {err}"))
             })?;
-        *last = rebuilt;
-        return Ok(());
+        self.messages.push(message);
+        Ok(())
     }
-    let message = Message::builder()
-        .role(role)
-        .content(block)
-        .build()
-        .map_err(|err| {
-            SqueezyError::ProviderRequest(format!("failed to build Bedrock message: {err}"))
-        })?;
-    messages.push(message);
-    Ok(())
+}
+
+fn push_message(
+    messages: &mut MessageBuilder,
+    role: ConversationRole,
+    block: ContentBlock,
+) -> Result<()> {
+    messages.push(role, block)
 }
 
 pub(crate) fn tool_configuration(
