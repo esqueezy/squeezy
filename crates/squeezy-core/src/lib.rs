@@ -578,7 +578,7 @@ impl AppConfig {
     fn try_from_settings_and_env_vars_with_sources_and_warnings(
         settings: SettingsFile,
         mut sources: Vec<String>,
-        config_warnings: Vec<ConfigWarning>,
+        mut config_warnings: Vec<ConfigWarning>,
         cli_provider: Option<&str>,
         mut var: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self> {
@@ -824,6 +824,28 @@ impl AppConfig {
             .filter(|value| *value > 0)
             .or(model_settings.max_output_tokens)
             .or(DEFAULT_MAX_OUTPUT_TOKENS);
+        // M-58: Cerebras chat-completions v1 accepts `max_tokens` as an
+        // alias today, but the v2 default-switchover (2026-07-21)
+        // tightens schema validation to require `max_completion_tokens`.
+        // Surface a soft warning at config-build time so operators
+        // shipping pre-cutoff configs know they need to update before
+        // the date rolls in; squeezy-llm's Cerebras path is responsible
+        // for emitting `max_completion_tokens` on the wire from this
+        // same `max_output_tokens`.
+        if let ProviderConfig::OpenAiCompatible(compatible) = &provider
+            && compatible.preset == OpenAiCompatiblePreset::Cerebras
+            && max_output_tokens.is_some()
+        {
+            config_warnings.push(ConfigWarning {
+                source: "providers.cerebras".to_string(),
+                field: "model.max_output_tokens emits `max_tokens` today; \
+                        Cerebras v2 (default 2026-07-21) requires `max_completion_tokens`. \
+                        squeezy-llm will switch wire keys automatically, but \
+                        reasoning-model budgets count thinking tokens against \
+                        the limit on v2."
+                    .to_string(),
+            });
+        }
         let tool_choice = get_var("SQUEEZY_TOOL_CHOICE")
             .map(|raw| raw.trim().to_string())
             .filter(|value| !value.is_empty())

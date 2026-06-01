@@ -2835,6 +2835,68 @@ fn vertex_preset_rejects_missing_project() {
 }
 
 #[test]
+fn cerebras_preset_emits_max_completion_tokens_migration_warning() {
+    // Cerebras' chat-completions v1 accepts `max_tokens`; v2
+    // (default 2026-07-21) tightens validation to require
+    // `max_completion_tokens`. The config layer surfaces a soft
+    // warning when operators ship a config that pre-dates the
+    // switch so they're not blindsided by the cutover.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "cerebras".to_string(),
+        ProviderSettings {
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        model_settings: Some(ModelSettings {
+            max_output_tokens: Some(4096),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("cerebras"), |name| match name {
+            "CEREBRAS_API_KEY" => Some("cb-key".to_string()),
+            _ => None,
+        })
+        .expect("cerebras config builds");
+    assert!(
+        config
+            .config_warnings
+            .iter()
+            .any(|w| w.source == "providers.cerebras" && w.field.contains("max_completion_tokens")),
+        "cerebras + max_output_tokens must surface the v2-cutover warning, got: {:?}",
+        config.config_warnings,
+    );
+}
+
+#[test]
+fn cerebras_preset_without_explicit_max_output_tokens_skips_warning() {
+    // `DEFAULT_MAX_OUTPUT_TOKENS` may be `Some(...)` even without a
+    // user-set cap, so the warning fires whenever the resolved
+    // value is non-None on Cerebras. (Operators who want to suppress
+    // the warning entirely can leave the default and accept the v2
+    // wire-key switch.) This test pins the contract so a future
+    // refactor of `DEFAULT_MAX_OUTPUT_TOKENS = None` flips a silent
+    // expectation rather than reintroducing a warning-storm
+    // regression.
+    let config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("openrouter".to_string()),
+        "OPENROUTER_API_KEY" => Some("or-key".to_string()),
+        _ => None,
+    });
+    assert!(
+        config
+            .config_warnings
+            .iter()
+            .all(|w| w.source != "providers.cerebras"),
+        "non-Cerebras providers must not emit the Cerebras v2 warning",
+    );
+}
+
+#[test]
 fn vercel_preset_falls_back_to_oidc_token_env() {
     // Vercel runtimes inject `VERCEL_OIDC_TOKEN` (12h TTL) into every
     // function deployment. When the user has not pasted an
