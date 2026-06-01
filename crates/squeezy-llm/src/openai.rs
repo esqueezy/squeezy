@@ -536,6 +536,25 @@ pub(crate) fn parse_openai_event(
             reasoning_acc.text_buffer.push_str(&delta);
             Ok(Some(LlmEvent::TextDelta(delta)))
         }
+        "response.output_text.done" => {
+            // H-08: the `.done` event carries the authoritative final
+            // string for the completed text part. Reconcile against the
+            // cumulative delta buffer — if a delta was dropped during a
+            // mid-stream reconnect-without-skip or arrived out of order,
+            // emit a corrective `TextDelta` for the missing suffix so
+            // the persisted transcript matches what the model actually
+            // produced. Common case: deltas matched, no event emitted.
+            let authoritative = value.get("text").and_then(Value::as_str).unwrap_or("");
+            let already = reasoning_acc.text_buffer.as_str();
+            if let Some(suffix) = authoritative.strip_prefix(already)
+                && !suffix.is_empty()
+            {
+                let suffix = suffix.to_string();
+                reasoning_acc.text_buffer.push_str(&suffix);
+                return Ok(Some(LlmEvent::TextDelta(suffix)));
+            }
+            Ok(None)
+        }
         "response.refusal.delta" => {
             // C-02: safety-refusal text streams through `refusal.delta`
             // chunks ending with `refusal.done`. Surface each delta as a

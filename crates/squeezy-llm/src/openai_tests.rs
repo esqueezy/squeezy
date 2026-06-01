@@ -633,6 +633,53 @@ fn parser_surfaces_error_events() {
 }
 
 #[test]
+fn parser_reconciles_output_text_done_with_no_divergence() {
+    // H-08: the common case — every `output_text.delta` was observed,
+    // the `output_text.done` text matches the cumulative buffer, no
+    // corrective event emitted.
+    let mut acc = ReasoningAccumulator::default();
+    parse_openai_event(
+        r#"{"type":"response.output_text.delta","delta":"hello "}"#,
+        &mut acc,
+    )
+    .expect("delta 1");
+    parse_openai_event(
+        r#"{"type":"response.output_text.delta","delta":"world"}"#,
+        &mut acc,
+    )
+    .expect("delta 2");
+
+    let done = parse_openai_event(
+        r#"{"type":"response.output_text.done","text":"hello world"}"#,
+        &mut acc,
+    )
+    .expect("done");
+    assert!(done.is_none(), "matched done emits nothing");
+}
+
+#[test]
+fn parser_emits_corrective_text_delta_when_output_text_done_diverges() {
+    // H-08: when a delta was dropped mid-stream, the `output_text.done`
+    // event carries the authoritative full text. Emit a corrective
+    // `TextDelta` for the missing suffix so the persisted transcript
+    // matches what the model actually said.
+    let mut acc = ReasoningAccumulator::default();
+    parse_openai_event(
+        r#"{"type":"response.output_text.delta","delta":"hello "}"#,
+        &mut acc,
+    )
+    .expect("delta 1");
+
+    let done = parse_openai_event(
+        r#"{"type":"response.output_text.done","text":"hello world"}"#,
+        &mut acc,
+    )
+    .expect("done")
+    .expect("must emit corrective delta");
+    assert_eq!(done, LlmEvent::TextDelta("world".to_string()));
+}
+
+#[test]
 fn parser_emits_tool_call_delta_for_function_call_arguments_streaming() {
     // H-07: `response.function_call_arguments.delta` MUST surface as
     // `LlmEvent::ToolCallDelta` so the UI shows progress before the
