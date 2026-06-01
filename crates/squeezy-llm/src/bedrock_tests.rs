@@ -20,8 +20,8 @@ use super::{
     apply_thinking_extra_fields, bedrock_document_block, bedrock_effort_label,
     bedrock_request_metadata_map, bedrock_tool_choice, build_bedrock_client,
     compute_thinking_extra_fields, conversation_messages, current_bearer_token,
-    handle_bedrock_event, inference_configuration, json_to_document, region_prefix,
-    sanitize_bedrock_document_name, system_blocks, tool_configuration,
+    extract_echoed_model, handle_bedrock_event, inference_configuration, json_to_document,
+    region_prefix, sanitize_bedrock_document_name, system_blocks, tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{CacheRetention, LlmInputItem, LlmRequest, LlmToolSpec};
@@ -1385,6 +1385,134 @@ fn handle_bedrock_event_replaces_signature_deltas() {
         Some("authoritative-signature"),
         "second Signature delta must replace, not concat: got {:?}",
         block.signature,
+    );
+}
+
+/// M-15: `messageStop.additionalModelResponseFields` carries the
+/// resolved model id when an application-inference-profile routes
+/// the turn to a backing foundation model that differs from the
+/// caller's request. The helper accepts both `model` and
+/// `server_model` keys, trims whitespace, and falls back to `None`
+/// for shapes we don't understand.
+#[test]
+fn extract_echoed_model_reads_model_key_string() {
+    let fields = Document::Object(
+        [(
+            "model".to_string(),
+            Document::String("anthropic.claude-haiku-4-5-20251001-v1:0".to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    assert_eq!(
+        extract_echoed_model(&fields).as_deref(),
+        Some("anthropic.claude-haiku-4-5-20251001-v1:0"),
+    );
+}
+
+#[test]
+fn extract_echoed_model_accepts_server_model_alias() {
+    // Some Bedrock integrations populate `server_model` instead of
+    // `model` (Bedrock's own SDK guides vary). Accept the alias so
+    // the echo isn't silently dropped just because the field name
+    // doesn't match the most common shape.
+    let fields = Document::Object(
+        [(
+            "server_model".to_string(),
+            Document::String("us.anthropic.claude-sonnet-4-6-20251001-v1:0".to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    assert_eq!(
+        extract_echoed_model(&fields).as_deref(),
+        Some("us.anthropic.claude-sonnet-4-6-20251001-v1:0"),
+    );
+}
+
+#[test]
+fn extract_echoed_model_trims_whitespace_and_ignores_blank() {
+    let padded = Document::Object(
+        [(
+            "model".to_string(),
+            Document::String("   us.anthropic.claude-opus-4-6\n".to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    assert_eq!(
+        extract_echoed_model(&padded).as_deref(),
+        Some("us.anthropic.claude-opus-4-6"),
+    );
+
+    let blank = Document::Object(
+        [("model".to_string(), Document::String("   ".to_string()))]
+            .into_iter()
+            .collect(),
+    );
+    assert!(
+        extract_echoed_model(&blank).is_none(),
+        "blank model echo must be ignored so the tracker can fall back to no-emit",
+    );
+}
+
+#[test]
+fn extract_echoed_model_returns_none_for_unknown_shapes() {
+    // No object => no echo.
+    assert!(extract_echoed_model(&Document::Null).is_none());
+    // Object without recognized keys => no echo.
+    let other = Document::Object(
+        [(
+            "guardrail".to_string(),
+            Document::String("blocked".to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    assert!(extract_echoed_model(&other).is_none());
+}
+
+#[test]
+fn handle_message_stop_records_echoed_model_into_state() {
+    let mut state = BedrockStreamState::default();
+    let fields = Document::Object(
+        [(
+            "model".to_string(),
+            Document::String("us.anthropic.claude-haiku-4-5-20251001-v1:0".to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let stop = MessageStopEvent::builder()
+        .stop_reason(StopReason::EndTurn)
+        .additional_model_response_fields(fields)
+        .build()
+        .expect("build stop");
+    let events = handle_bedrock_event(ConverseStreamOutput::MessageStop(stop), &mut state)
+        .expect("handle stop");
+    assert!(
+        events.is_empty(),
+        "MessageStop must not yield TextDelta etc."
+    );
+    assert!(state.saw_message_stop);
+    assert_eq!(
+        state.echoed_model.as_deref(),
+        Some("us.anthropic.claude-haiku-4-5-20251001-v1:0"),
+        "echoed model id must persist for the post-loop ServerModel emit",
+    );
+}
+
+#[test]
+fn handle_message_stop_without_echo_leaves_state_unset() {
+    let mut state = BedrockStreamState::default();
+    let stop = MessageStopEvent::builder()
+        .stop_reason(StopReason::EndTurn)
+        .build()
+        .expect("build stop");
+    handle_bedrock_event(ConverseStreamOutput::MessageStop(stop), &mut state).expect("handle stop");
+    assert!(
+        state.echoed_model.is_none(),
+        "no additionalModelResponseFields means no echo; state must remain None",
     );
 }
 

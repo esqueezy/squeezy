@@ -397,11 +397,18 @@ fn bedrock_stream_attempt(
 
         // Surface the auto-applied inference-profile prefix so the
         // TUI / transcript / cost-attribution layers see the actual
-        // model that produced the turn. Emitted at most once per
-        // stream — matches the cross-provider [`LlmEvent::ServerModel`]
-        // contract.
+        // model that produced the turn. The tracker also serves the
+        // M-15 follow-up emission from
+        // `messageStop.additionalModelResponseFields` (an application-
+        // inference-profile may backfill from a different foundation
+        // model than the bare prefix). Only consume here when the
+        // prefix actually changed the id — otherwise the pass-through
+        // call would seal the tracker and the messageStop echo would
+        // never fire.
         let mut server_model_echo = crate::ServerModelEcho::default();
-        if let Some(echo) = server_model_echo.observe(&requested_model, &model) {
+        if model != requested_model
+            && let Some(echo) = server_model_echo.observe(&requested_model, &model)
+        {
             yield echo;
         }
 
@@ -434,6 +441,20 @@ fn bedrock_stream_attempt(
                 model = %model,
                 "Bedrock stream ended without metadata event; usage tokens unavailable for this turn"
             );
+        }
+        // M-15: if Bedrock echoed a resolved model id on
+        // `messageStop.additionalModelResponseFields` (typical for
+        // application-inference-profile routing that backfills from a
+        // different foundation model), surface it through the same
+        // `ServerModelEcho` tracker that observed the inference-profile
+        // prefix rewrite at stream start. `observe` is idempotent: when
+        // the prefix rewrite already emitted, this call is a no-op; when
+        // the rewrite was a pass-through (id matched verbatim), the echo
+        // is the first chance the agent sees the resolved id.
+        if let Some(echoed) = state.echoed_model.as_deref()
+            && let Some(echo_event) = server_model_echo.observe(&requested_model, echoed)
+        {
+            yield echo_event;
         }
         if let Some(payload) = state.flush_reasoning() {
             yield LlmEvent::ReasoningDone(payload);
@@ -471,6 +492,13 @@ struct BedrockStreamState {
     saw_message_stop: bool,
     stop_reason: Option<crate::StopReason>,
     saw_metadata: bool,
+    /// Model id echoed by Bedrock on `messageStop.additionalModelResponseFields`.
+    /// When an application-inference-profile ARN routes to a different
+    /// backing foundation model, Bedrock surfaces the resolved id here so
+    /// cost attribution / transcript can pin the actually-billed model.
+    /// Routed through [`crate::ServerModelEcho`] after the stream loop
+    /// completes (emits at most one [`LlmEvent::ServerModel`] per turn).
+    echoed_model: Option<String>,
 }
 
 impl BedrockStreamState {
@@ -627,6 +655,18 @@ fn handle_bedrock_event(
         ConverseStreamOutput::MessageStop(stop) => {
             state.saw_message_stop = true;
             state.stop_reason = Some(crate::StopReason::from_bedrock(stop.stop_reason().as_str()));
+            // Application-inference-profile routing can land the turn
+            // on a different backing foundation model than the caller
+            // requested. Bedrock surfaces the resolved id in
+            // `messageStop.additionalModelResponseFields` (Anthropic-on-
+            // Bedrock typically emits a top-level `model` string).
+            // Persist into state so the stream loop can route it
+            // through `ServerModelEcho` after `MessageStop`.
+            if let Some(fields) = stop.additional_model_response_fields()
+                && let Some(echoed) = extract_echoed_model(fields)
+            {
+                state.echoed_model = Some(echoed);
+            }
             Ok(Vec::new())
         }
         ConverseStreamOutput::Metadata(meta) => {
@@ -855,6 +895,29 @@ pub(crate) fn apply_inference_profile_prefix(model: &str, region: &str) -> Strin
         return model.to_string();
     };
     format!("{prefix}.{model}")
+}
+
+/// Pull a server-echoed model id out of Bedrock's
+/// `messageStop.additionalModelResponseFields`. Anthropic-on-Bedrock
+/// typically emits a top-level `model` string when the resolved
+/// backing model differs from the requested id; some integrations also
+/// use `server_model`. The helper accepts either key and returns the
+/// first non-empty match. Returns `None` for shapes we don't
+/// understand (array, missing string, blank value) so the stream loop
+/// silently falls back to "no echo" rather than fabricating one.
+pub(crate) fn extract_echoed_model(fields: &Document) -> Option<String> {
+    let Document::Object(map) = fields else {
+        return None;
+    };
+    for key in ["model", "server_model"] {
+        if let Some(Document::String(value)) = map.get(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn hex_encode(blob: &Blob) -> String {
