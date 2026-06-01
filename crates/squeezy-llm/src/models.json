@@ -1496,6 +1496,96 @@
     "metadata_source": "https://docs.baseten.co/api-reference/openai"
   },
   {
+    "provider": "cloudflare_workers_ai",
+    "id": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 290000,
+      "output_usd_micros_per_mtok": 2250000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.cloudflare.com/workers-ai/models/"
+  },
+  {
+    "provider": "cloudflare_workers_ai",
+    "id": "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 500000,
+      "output_usd_micros_per_mtok": 4880000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.cloudflare.com/workers-ai/models/"
+  },
+  {
+    "provider": "cloudflare_workers_ai",
+    "id": "@cf/moonshotai/kimi-k2.6",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 600000,
+      "output_usd_micros_per_mtok": 2500000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 262144,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.cloudflare.com/workers-ai/models/"
+  },
+  {
     "provider": "vertex",
     "id": "google/gemini-3.1-pro-preview",
     "profile": "strong",
