@@ -455,6 +455,13 @@ struct InnerState {
     /// successful refresh — forces `current_key` to refresh even when
     /// the cached expiry would otherwise pass the lead-time gate.
     dirty: bool,
+    /// Last error surfaced by [`AnthropicOAuthSource::force_refresh`].
+    /// When populated, the next [`ApiKeySource::current_key`] call
+    /// short-circuits and returns the cached error string rather than
+    /// re-firing the same failed network round-trip. `invalidate()`
+    /// clears the flag so an operator-triggered re-login can retry
+    /// the refresh. See `.audit/providers/anthropic.md` HIGH #5.
+    last_refresh_err: Option<String>,
 }
 
 impl AnthropicOAuthSource {
@@ -482,6 +489,7 @@ impl AnthropicOAuthSource {
             state: Arc::new(RwLock::new(InnerState {
                 tokens,
                 dirty: false,
+                last_refresh_err: None,
             })),
             storage_path,
             config,
@@ -543,8 +551,31 @@ impl AnthropicOAuthSource {
         if !guard.dirty && !access_token_is_stale(&guard.tokens) {
             return Ok(guard.tokens.clone());
         }
+        // Short-circuit when a prior refresh failed and `invalidate()`
+        // has not been called since: re-firing the same network
+        // round-trip against a revoked refresh token would just burn
+        // quota and slow the auth error to surface. Operators clear
+        // the cached error by calling `invalidate()` (e.g. after
+        // `squeezy auth anthropic login`).
+        if let Some(cached) = guard.last_refresh_err.as_deref() {
+            return Err(SqueezyError::ProviderRequest(cached.to_string()));
+        }
         let refresh_token = guard.tokens.refresh_token.clone();
-        let response = refresh_anthropic_token(&self.http, &self.config, &refresh_token).await?;
+        let response = match refresh_anthropic_token(&self.http, &self.config, &refresh_token).await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                // Keep `dirty=true` so the next caller still sees the
+                // stale token as needing refresh, and cache the error
+                // string so concurrent / repeat callers don't re-fire
+                // the failed POST until an explicit `invalidate()`
+                // wipes the flag (the operator-triggered re-login
+                // path).
+                let message = err.to_string();
+                guard.last_refresh_err = Some(message);
+                return Err(err);
+            }
+        };
         let now_ms = current_unix_ms();
         let tokens = PersistedTokens::from_token_response(&response, now_ms);
         // Persistence first; if the rename fails we still hold the
@@ -559,6 +590,7 @@ impl AnthropicOAuthSource {
         }
         guard.tokens = tokens.clone();
         guard.dirty = false;
+        guard.last_refresh_err = None;
         Ok(tokens)
     }
 
@@ -601,6 +633,11 @@ impl ApiKeySource for AnthropicOAuthSource {
         Box::pin(async move {
             let mut guard = self.state.write().await;
             guard.dirty = true;
+            // Wipe the cached refresh error so the operator-triggered
+            // re-invalidate path (e.g. after a fresh `squeezy auth
+            // anthropic login`) can fire the refresh again instead of
+            // forever returning the stale error.
+            guard.last_refresh_err = None;
             Ok(())
         })
     }

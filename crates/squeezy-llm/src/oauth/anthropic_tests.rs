@@ -297,6 +297,151 @@ fn challenge_matches_verifier_round_trip() {
     assert_eq!(codes.challenge, challenge_for(&codes.verifier));
 }
 
+/// H-05: when the token endpoint returns an auth error, the source
+/// must (a) propagate the error to the current caller, (b) keep
+/// `dirty=true` so the cached token is still considered stale, and
+/// (c) short-circuit subsequent `current_key`/`force_refresh` calls
+/// with the cached error rather than re-firing the same failed POST
+/// against a revoked refresh token. `invalidate()` then clears the
+/// cached error so an operator-triggered re-login can retry.
+#[tokio::test]
+async fn force_refresh_caches_error_and_short_circuits_subsequent_calls() {
+    let token_url = spawn_token_mock_with_status(vec![
+        (
+            401,
+            json!({"error": "invalid_grant", "description": "refresh token revoked"}),
+        ),
+        // A second body that would only be served if the source
+        // re-fires the request: the test fails if we ever see it.
+        (
+            200,
+            json!({"access_token": "must-not-be-served", "refresh_token": "x", "expires_in": 3600}),
+        ),
+    ])
+    .await;
+
+    let path = temp_token_path("refresh-err");
+    let config = AnthropicLoginConfig {
+        token_url,
+        ..AnthropicLoginConfig::default()
+    };
+    let source = AnthropicOAuthSource::with_parts(
+        expired_persisted_tokens("err"),
+        path,
+        config,
+        reqwest::Client::new(),
+    );
+
+    // First call: the network round-trip fails and surfaces the
+    // platform error to the caller.
+    let err = source
+        .current_key()
+        .await
+        .expect_err("revoked refresh token must surface as an error");
+    let first_msg = err.to_string();
+    assert!(
+        first_msg.contains("invalid_grant"),
+        "first call must surface the platform error, got {first_msg}",
+    );
+    assert!(
+        source.needs_refresh().await,
+        "dirty must stay true on refresh error so a subsequent retry can fire",
+    );
+
+    // Second call: the cached error short-circuits — no new request
+    // hits the mock (we'd see `must-not-be-served` if it did).
+    let again = source
+        .current_key()
+        .await
+        .expect_err("cached error must short-circuit second attempt");
+    assert!(
+        again.to_string().contains("invalid_grant"),
+        "cached error must round-trip the original platform message, got {again}",
+    );
+
+    // invalidate() wipes the cached error so a fresh attempt can be
+    // made — the next call advances the queue and now sees the
+    // 200 response.
+    source.invalidate().await.expect("invalidate");
+    let ok = source
+        .current_key()
+        .await
+        .expect("post-invalidate retry must reach the next queued response");
+    assert_eq!(ok, "must-not-be-served");
+}
+
+/// Tiny HTTP/1.1 mock that returns each `(status, json_body)` in
+/// order. Used by [`force_refresh_caches_error_and_short_circuits_subsequent_calls`]
+/// so the first call sees a 4xx (refresh failure) and the second
+/// would normally see a 200 (success). When the cached-error
+/// short-circuit kicks in, the second response is never served.
+async fn spawn_token_mock_with_status(responses: Vec<(u16, serde_json::Value)>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = listener.local_addr().expect("local_addr");
+    let queue = Arc::new(Mutex::new(responses.into_iter().collect::<Vec<_>>()));
+    let queue_for_loop = queue.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let queue = queue_for_loop.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(&mut socket);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).await.is_err() {
+                    return;
+                }
+                let mut content_length: usize = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.is_err() {
+                        return;
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:")
+                        && let Ok(len) = rest.trim().parse::<usize>()
+                    {
+                        content_length = len;
+                    }
+                }
+                if content_length > 0 {
+                    let mut buf = vec![0u8; content_length];
+                    if tokio::io::AsyncReadExt::read_exact(&mut reader, &mut buf)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let next = {
+                    let mut guard = queue.lock().await;
+                    if guard.is_empty() {
+                        None
+                    } else {
+                        Some(guard.remove(0))
+                    }
+                };
+                let (status, body) = match next {
+                    Some((status, value)) => (status, value.to_string()),
+                    None => (500_u16, json!({"error": "mock exhausted"}).to_string()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+                    status = status,
+                    len = body.len(),
+                    body = body,
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    format!("http://{}/v1/oauth/token", addr)
+}
+
 // ---------- mock token server ---------------------------------------------
 
 /// Tiny HTTP/1.1 mock for the platform OAuth token endpoint. Returns
