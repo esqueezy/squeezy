@@ -167,15 +167,23 @@ impl AnthropicProvider {
         } else {
             CacheRetention::None
         };
-        let max_tokens = request
-            .max_output_tokens
-            .map(u64::from)
-            .or_else(|| {
-                crate::model_info_for("anthropic", &request.model)
-                    .and_then(|info| info.limits)
-                    .map(|limits| limits.max_output_tokens)
-            })
-            .unwrap_or(DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS);
+        // Clamp the caller's `max_output_tokens` against the
+        // registry-known per-model maximum so a user who copied a
+        // `max_output_tokens = 128000` from an OpenAI config doesn't
+        // earn a hard 400 on every Anthropic turn. Falls back to the
+        // registry value when the caller didn't specify; only the
+        // explicit `unwrap_or` default fires when the model is
+        // unknown to the local registry. See
+        // `.audit/providers/anthropic.md` MEDIUM #5.
+        let registry_max = crate::model_info_for("anthropic", &request.model)
+            .and_then(|info| info.limits)
+            .map(|limits| limits.max_output_tokens);
+        let max_tokens = match (request.max_output_tokens.map(u64::from), registry_max) {
+            (Some(caller), Some(reg)) => caller.min(reg),
+            (Some(caller), None) => caller,
+            (None, Some(reg)) => reg,
+            (None, None) => DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS,
+        };
         // Canonicalize cross-provider tool-call ids and synthesize
         // placeholders for orphan tool results BEFORE the
         // Anthropic-specific message rewrite. Anthropic rejects raw
@@ -267,8 +275,46 @@ impl AnthropicProvider {
                 json_markers::mark_last_stable_tool(&mut tool_values, retention);
             }
             body["tools"] = Value::Array(tool_values);
+            // Map the caller's `tool_choice` hint into Anthropic's
+            // shape (`{type: auto|any|tool, name?}`) so tool-shy
+            // models can still be forced to call a tool. The hint
+            // mirrors opencode's `lowerToolChoice`
+            // (`packages/llm/src/protocols/anthropic-messages.ts:264-270`).
+            // `None` and unrecognised values omit the field so the
+            // provider's default (auto) stays in effect.
+            if let Some(tool_choice) = anthropic_tool_choice(request.tool_choice.as_deref()) {
+                body["tool_choice"] = tool_choice;
+            }
         }
         body
+    }
+}
+
+/// Map squeezy's OpenAI-flavoured `tool_choice` hint onto the
+/// Anthropic `{type, name?}` shape. Returns `None` for `None`,
+/// `Some("none")`, or any unrecognised value so the field is omitted
+/// and Anthropic's default (`auto`) applies.
+fn anthropic_tool_choice(hint: Option<&str>) -> Option<Value> {
+    let raw = hint?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let lower = raw.to_ascii_lowercase();
+    match lower.as_str() {
+        "auto" => Some(json!({ "type": "auto" })),
+        "required" | "any" => Some(json!({ "type": "any" })),
+        "none" => None,
+        _ => {
+            // `tool:NAME` form — force a specific tool.
+            if let Some(name) = lower
+                .strip_prefix("tool:")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(json!({ "type": "tool", "name": name }));
+            }
+            None
+        }
     }
 }
 
@@ -359,15 +405,27 @@ fn merge_oauth_beta_header(caller: Option<&str>, auth: AnthropicAuthScheme) -> O
             let oauth = anthropic_oauth_beta_header();
             let merged = match caller {
                 Some(value) if !value.trim().is_empty() => {
-                    let mut seen: Vec<&str> = Vec::new();
+                    // Case-insensitive dedup so a caller that supplies
+                    // `Claude-code-20250219` doesn't double-ship the
+                    // marker with the lowercase `claude-code-20250219`
+                    // baked into `OAUTH_BETA_HEADER` — Anthropic treats
+                    // beta tokens case-insensitively. See
+                    // `.audit/providers/anthropic.md` LOW #3 / Q6.
+                    let mut seen_lower: Vec<String> = Vec::new();
+                    let mut out: Vec<&str> = Vec::new();
                     for token in oauth.split(',').chain(value.split(',')) {
                         let trimmed = token.trim();
-                        if trimmed.is_empty() || seen.contains(&trimmed) {
+                        if trimmed.is_empty() {
                             continue;
                         }
-                        seen.push(trimmed);
+                        let lower = trimmed.to_ascii_lowercase();
+                        if seen_lower.contains(&lower) {
+                            continue;
+                        }
+                        seen_lower.push(lower);
+                        out.push(trimmed);
                     }
-                    seen.join(",")
+                    out.join(",")
                 }
                 _ => oauth.to_string(),
             };
@@ -631,8 +689,26 @@ fn anthropic_stream_attempt(
                     AnthropicAuthScheme::Oauth => builder
                         .header("authorization", format!("Bearer {key}"))
                         .header("user-agent", OAUTH_USER_AGENT)
-                        .header("x-app", "cli"),
-                    AnthropicAuthScheme::ApiKey => builder.header("x-api-key", key),
+                        .header("x-app", "cli")
+                        // Claude Code's OAuth requests carry this
+                        // header for the platform's "I acknowledge
+                        // the direct-browser-access policy" marker.
+                        // Future platform policy changes may reject
+                        // OAuth requests that omit it; stamping it
+                        // matches the Claude Code identity envelope.
+                        // See `.audit/providers/anthropic.md` MEDIUM #7.
+                        .header("anthropic-dangerous-direct-browser-access", "true"),
+                    AnthropicAuthScheme::ApiKey => builder
+                        .header("x-api-key", key)
+                        // Stamp a Squeezy-identifying User-Agent so
+                        // Anthropic's rate-limit attribution and
+                        // analytics can group API-key callers; bare
+                        // reqwest is unattributed. See
+                        // `.audit/providers/anthropic.md` LOW #2 / Q5.
+                        .header(
+                            "user-agent",
+                            concat!("squeezy-cli/", env!("CARGO_PKG_VERSION")),
+                        ),
                 };
                 if let Some(value) = beta_header.as_deref() {
                     builder = builder.header("anthropic-beta", value);
@@ -915,6 +991,15 @@ struct PartialToolCall {
     call_id: String,
     name: String,
     arguments_json: String,
+    /// `true` once the first `input_json_delta` has been observed. Used
+    /// so a future server build that ships the full input upfront on
+    /// `content_block_start` (rather than always streaming `input: {}`
+    /// then deltas) doesn't get its seed corrupted by a trailing delta:
+    /// when a delta arrives, we drop the seed and start fresh. Today's
+    /// Anthropic behaviour is benign (initial `input` is always empty)
+    /// but the audit calls this out as a future-proofing fix. See
+    /// `.audit/providers/anthropic.md` MEDIUM #6.
+    delta_seen: bool,
 }
 
 fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result<Vec<LlmEvent>> {
@@ -992,6 +1077,7 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                             call_id,
                             name,
                             arguments_json,
+                            delta_seen: false,
                         },
                     );
                     none()
@@ -1076,6 +1162,20 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                         && let Some(partial_json) =
                             delta.get("partial_json").and_then(Value::as_str)
                     {
+                        // First delta wins: discard any seed the
+                        // `content_block_start` frame populated so a
+                        // future server build that ships a non-empty
+                        // initial `input` (e.g. for a cached zero-arg
+                        // tool) doesn't end up with `{}{"a":1}` after
+                        // concatenation. Today's Anthropic behaviour
+                        // is benign (`input` is always `{}` then
+                        // streamed), but the guard future-proofs the
+                        // accumulator. See `.audit/providers/anthropic.md`
+                        // MEDIUM #6.
+                        if !tool_call.delta_seen {
+                            tool_call.arguments_json.clear();
+                            tool_call.delta_seen = true;
+                        }
                         tool_call.arguments_json.push_str(partial_json);
                     }
                     none()

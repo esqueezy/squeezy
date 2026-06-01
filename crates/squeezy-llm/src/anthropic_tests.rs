@@ -1621,6 +1621,191 @@ fn merge_oauth_beta_header_returns_none_for_api_key_without_caller() {
     );
 }
 
+/// LOW Q6: beta token dedup must be case-insensitive — Anthropic
+/// treats `Claude-code-20250219` and `claude-code-20250219` as the
+/// same opt-in, so shipping both burns header space and signals
+/// confusion to the platform.
+#[test]
+fn merge_oauth_beta_header_dedups_case_insensitively() {
+    let merged = super::merge_oauth_beta_header(
+        Some("Claude-Code-20250219,Context-1M-2025-08-07"),
+        AnthropicAuthScheme::Oauth,
+    )
+    .expect("oauth scheme produces a header");
+    // The oauth marker (lowercase `claude-code-20250219`) wins
+    // priority since it is processed first; the caller's
+    // case-variant is dropped, so the merged header contains only
+    // one entry for the marker.
+    let pieces: Vec<&str> = merged.split(',').collect();
+    let lower_pieces: Vec<String> = pieces.iter().map(|p| p.to_ascii_lowercase()).collect();
+    let mut dedup = lower_pieces.clone();
+    dedup.sort();
+    dedup.dedup();
+    assert_eq!(
+        lower_pieces.len(),
+        dedup.len(),
+        "merged header must not contain case-variant duplicates: {merged}",
+    );
+    assert!(
+        lower_pieces.contains(&"context-1m-2025-08-07".to_string()),
+        "caller-supplied beta must still ride on the wire: {merged}",
+    );
+}
+
+/// LOW Q4: `tool_choice` must lower into Anthropic's `{type, name?}`
+/// shape so tool-shy models can be forced to call a specific tool.
+#[test]
+fn request_body_lowers_tool_choice_into_anthropic_shape() {
+    use std::sync::Arc as StdArc;
+    let mk = |hint: Option<&str>| -> serde_json::Value {
+        let request = LlmRequest {
+            model: "claude-test".to_string().into(),
+            instructions: "be brief".to_string().into(),
+            input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+            max_output_tokens: Some(32),
+            response_verbosity: None,
+            reasoning_effort: None,
+            previous_response_id: None,
+            cache_key: None,
+            cache: CacheSpec::default(),
+            tools: Arc::from(vec![
+                LlmToolSpec {
+                    name: "read_file".to_string(),
+                    description: "Read".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    strict: false,
+                }
+                .into(),
+            ]),
+            store: false,
+            tool_choice: hint.map(str::to_string),
+            output_schema: None,
+            parallel_tool_calls: None,
+            beta_headers: StdArc::from(Vec::new()),
+            ..LlmRequest::default()
+        };
+        AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey)
+    };
+
+    // `auto` → `{type:auto}`.
+    let body = mk(Some("auto"));
+    assert_eq!(body["tool_choice"]["type"], "auto");
+
+    // `required` → `{type:any}` (Anthropic's name for "must call a tool").
+    let body = mk(Some("required"));
+    assert_eq!(body["tool_choice"]["type"], "any");
+
+    // `tool:NAME` → `{type:tool, name}`.
+    let body = mk(Some("tool:read_file"));
+    assert_eq!(body["tool_choice"]["type"], "tool");
+    assert_eq!(body["tool_choice"]["name"], "read_file");
+
+    // Unrecognised or absent: field omitted so Anthropic's default
+    // (auto) applies.
+    let body = mk(None);
+    assert!(body.get("tool_choice").is_none());
+    let body = mk(Some("nonsense"));
+    assert!(body.get("tool_choice").is_none());
+}
+
+/// MEDIUM #5: `max_tokens` must clamp against the registry-known
+/// per-model maximum so a user who copied an OpenAI value doesn't
+/// 400 on every Anthropic turn.
+#[test]
+fn request_body_clamps_max_tokens_against_registry_max() {
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(128_000),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+    let max_tokens = body["max_tokens"].as_u64().expect("u64");
+    assert!(
+        max_tokens <= 64_000,
+        "registry max_output_tokens for the default Anthropic model is 64k; \
+         caller 128k must clamp to 64k or lower, got {max_tokens}",
+    );
+}
+
+/// MEDIUM #6: when the first `input_json_delta` arrives, the parser
+/// must drop any seed the `content_block_start` frame populated so a
+/// future server build that ships a complete initial input doesn't
+/// produce `{}{"a":1}` after the delta is appended.
+#[test]
+fn parser_drops_initial_tool_use_input_seed_when_delta_arrives() {
+    let mut state = AnthropicStreamState::default();
+    // Simulate a future server build that ships a non-empty initial
+    // `input` (today's Anthropic is benign — always sends `{}`). The
+    // first delta must reset the accumulator so the resulting JSON
+    // parses cleanly.
+    parse_anthropic_event(
+        r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"old"}}}"#,
+        &mut state,
+    )
+    .expect("start");
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"new"}}"#,
+        &mut state,
+    )
+    .expect("delta-1");
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"}"}}"#,
+        &mut state,
+    )
+    .expect("delta-2");
+    let event = parse_anthropic_event(r#"{"type":"content_block_stop","index":1}"#, &mut state)
+        .expect("stop");
+    assert_eq!(
+        event,
+        vec![LlmEvent::ToolCall(LlmToolCall {
+            call_id: "toolu_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({ "path": "new" }),
+        })],
+        "first delta must reset the accumulator so initial seed cannot corrupt the parse"
+    );
+}
+
+/// LOW Q4 negative: when no tools are advertised, `tool_choice` is
+/// not emitted regardless of the caller hint — Anthropic rejects
+/// `tool_choice` without `tools`.
+#[test]
+fn request_body_omits_tool_choice_when_no_tools_are_advertised() {
+    let request = LlmRequest {
+        model: "claude-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: Some("required".to_string()),
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+    assert!(body.get("tool_choice").is_none());
+}
+
 /// H-01: the 4-slot allocator must consume in tools → system →
 /// messages order so a future caller marker only ever displaces the
 /// most-volatile slot. Today's auto-3 policy fits comfortably under

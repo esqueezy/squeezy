@@ -654,11 +654,18 @@ impl ApiKeySource for AnthropicOAuthSource {
 fn access_token_is_stale(tokens: &PersistedTokens) -> bool {
     let expires_at = UNIX_EPOCH + Duration::from_millis(tokens.expires_at_unix_ms);
     let now = SystemTime::now();
-    // Refresh proactively when there's less than 60 s of life left;
-    // a streaming response can run for tens of seconds and we'd
-    // rather pay one extra refresh than die mid-stream.
-    let lead = Duration::from_secs(60);
-    match expires_at.checked_sub(lead) {
+    // Refresh proactively when there's less than 60 s of life left
+    // *relative to the already-shifted expiry stamp*.
+    // `tokens.expires_at_unix_ms` is the issuer-reported absolute
+    // expiry minus [`REFRESH_LEAD_TIME`] (5 minutes) — see
+    // [`PersistedTokens::from_token_response`]. So the effective
+    // refresh fires roughly 6 minutes ahead of the real platform
+    // expiry, which is intentional: a streaming response can run for
+    // tens of seconds and we'd rather pay one extra refresh than die
+    // mid-stream. Total cushion = 5m persisted + 60s runtime gate.
+    // See `.audit/providers/anthropic.md` MEDIUM #8.
+    let runtime_gate = Duration::from_secs(60);
+    match expires_at.checked_sub(runtime_gate) {
         Some(threshold) => threshold <= now,
         None => true,
     }
