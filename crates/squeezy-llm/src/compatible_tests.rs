@@ -216,6 +216,61 @@ fn request_body_serialises_assistant_function_call_history() {
 }
 
 #[test]
+fn parse_chat_event_flushes_reasoning_done_when_content_starts() {
+    // H-50: DeepSeek V4 interleaves `reasoning → content → reasoning
+    // → content`. Flush the accumulated reasoning to a
+    // `ReasoningDone` event the moment the first content delta
+    // arrives so the transcript renders thinking BEFORE the
+    // matching answer segment, not collapsed at end-of-turn.
+    let mut state = StreamState::default();
+    parse_chat_event(
+        r#"{"choices":[{"delta":{"reasoning_content":"first thought"}}]}"#,
+        &mut state,
+    )
+    .expect("reasoning");
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{"content":"answer"}}]}"#,
+        &mut state,
+    )
+    .expect("content");
+    let positions: Vec<&'static str> = events
+        .iter()
+        .map(|e| match e {
+            LlmEvent::ReasoningDone(_) => "done",
+            LlmEvent::TextDelta(_) => "text",
+            _ => "other",
+        })
+        .collect();
+    assert!(
+        positions.contains(&"done"),
+        "ReasoningDone must be flushed when content starts: {events:?}"
+    );
+    // ReasoningDone must arrive BEFORE the matching TextDelta in
+    // the same event batch.
+    let done_idx = positions.iter().position(|p| *p == "done").unwrap();
+    let text_idx = positions.iter().position(|p| *p == "text").unwrap();
+    assert!(done_idx < text_idx, "ReasoningDone must precede TextDelta");
+    // Second reasoning burst restarts the buffer and the next
+    // content delta flushes again.
+    parse_chat_event(
+        r#"{"choices":[{"delta":{"reasoning_content":"second thought"}}]}"#,
+        &mut state,
+    )
+    .expect("more reasoning");
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{"content":"more answer"}}]}"#,
+        &mut state,
+    )
+    .expect("more content");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, LlmEvent::ReasoningDone(_))),
+        "second interleaved reasoning burst must also flush at next content delta: {events:?}"
+    );
+}
+
+#[test]
 fn split_inline_think_routes_think_tag_content_to_reasoning() {
     // H-43: CF Workers AI DeepSeek-R1-distill / Kimi K2.6 / Gemma 4
     // emit reasoning inline as <think>...</think> tags on the

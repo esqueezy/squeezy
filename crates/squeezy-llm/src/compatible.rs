@@ -1862,6 +1862,21 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                         });
                     }
                     if !visible_span.is_empty() {
+                        // H-50: DeepSeek V4 and other interleaved-
+                        // reasoning models stream
+                        // `reasoning → content → reasoning → content`
+                        // segments within a single turn. Flush the
+                        // accumulated reasoning into a
+                        // `ReasoningDone` when the first content
+                        // delta arrives so the transcript renders
+                        // thinking BEFORE its matching answer
+                        // segment (not concatenated at end-of-turn
+                        // and out of position).
+                        if !state.reasoning_buf.trim().is_empty()
+                            && let Some(reasoning_done) = drain_reasoning(state)
+                        {
+                            events.push(reasoning_done);
+                        }
                         state.saw_visible_output = true;
                         events.push(LlmEvent::TextDelta(visible_span));
                     }
