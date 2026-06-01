@@ -216,6 +216,91 @@ fn request_body_serialises_assistant_function_call_history() {
 }
 
 #[test]
+fn split_inline_think_routes_think_tag_content_to_reasoning() {
+    // H-43: CF Workers AI DeepSeek-R1-distill / Kimi K2.6 / Gemma 4
+    // emit reasoning inline as <think>...</think> tags on the
+    // OpenAI-compat path. Render those into ReasoningDelta so the
+    // TUI promotes them to the thinking pane.
+    let mut state = StreamState {
+        extract_inline_think: true,
+        ..StreamState::default()
+    };
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{"content":"<think>I should grep first</think>Here is the answer."}}]}"#,
+        &mut state,
+    )
+    .expect("delta");
+    let reasoning: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            LlmEvent::ReasoningDelta { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    let visible: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            LlmEvent::TextDelta(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning, vec!["I should grep first".to_string()]);
+    assert_eq!(visible, vec!["Here is the answer.".to_string()]);
+}
+
+#[test]
+fn split_inline_think_handles_split_across_chunks() {
+    // The tag tokens may arrive across delta boundaries
+    // (`<thi` then `nk>...</thin` then `k>visible`). Buffer
+    // partial tags so they stitch back together on the next
+    // chunk.
+    let mut state = StreamState {
+        extract_inline_think: true,
+        ..StreamState::default()
+    };
+    let mut all_reasoning = String::new();
+    let mut all_visible = String::new();
+    for chunk in [
+        r#"{"choices":[{"delta":{"content":"<thi"}}]}"#,
+        r#"{"choices":[{"delta":{"content":"nk>think text</thin"}}]}"#,
+        r#"{"choices":[{"delta":{"content":"k>visible"}}]}"#,
+    ] {
+        let events = parse_chat_event(chunk, &mut state).expect("delta");
+        for ev in events {
+            match ev {
+                LlmEvent::ReasoningDelta { text, .. } => all_reasoning.push_str(&text),
+                LlmEvent::TextDelta(text) => all_visible.push_str(&text),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(all_reasoning, "think text");
+    assert_eq!(all_visible, "visible");
+}
+
+#[test]
+fn split_inline_think_disabled_keeps_tags_in_content_for_default_presets() {
+    // The extractor is opt-in per preset. Default-preset streams
+    // must not strip `<think>` tags — some tools legitimately use
+    // the literal token in user-visible output (XML escape
+    // example, generated code).
+    let mut state = StreamState::default();
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{"content":"<think>internal</think>tail"}}]}"#,
+        &mut state,
+    )
+    .expect("delta");
+    let visible: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            LlmEvent::TextDelta(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(visible, vec!["<think>internal</think>tail".to_string()]);
+}
+
+#[test]
 fn parse_chat_event_emits_text_delta() {
     let mut state = StreamState::default();
     let events = parse_chat_event(

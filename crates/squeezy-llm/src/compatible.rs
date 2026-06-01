@@ -715,7 +715,15 @@ impl LlmProvider for OpenAiCompatibleProvider {
             yield LlmEvent::Started;
 
             let mut decoder = SseDecoder::default();
-            let mut state = StreamState::default();
+            let mut state = StreamState {
+                // H-43: opt into inline `<think>` extraction for CF
+                // Workers AI (DeepSeek-R1-distill / Kimi K2.6 /
+                // Gemma 4 ship reasoning that way on Cloudflare's
+                // OpenAI-compat path because no `reasoning_content`
+                // field is exposed).
+                extract_inline_think: matches!(preset, OpenAiCompatiblePreset::CloudflareWorkersAi),
+                ..StreamState::default()
+            };
             let mut server_model_echo = crate::ServerModelEcho::default();
             let mut bytes = response.bytes_stream();
 
@@ -1024,6 +1032,20 @@ fn preset_default_headers(preset: OpenAiCompatiblePreset) -> BTreeMap<String, St
 struct StreamState {
     response_id: Option<String>,
     cost: CostSnapshot,
+    /// H-43: when `true`, the parser scans content deltas for
+    /// inline `<think>...</think>` blocks (CF Workers AI's
+    /// DeepSeek-R1-distill / Kimi K2.6 / Gemma 4 ship reasoning
+    /// inline on the OpenAI-compat path because no
+    /// `reasoning_content` field is available). Tags that arrive
+    /// split across chunks are stitched together via
+    /// `think_tag_buf` and routed to `ReasoningDelta`.
+    extract_inline_think: bool,
+    /// Whether we are currently inside a `<think>...</think>`
+    /// block. Driven by [`split_inline_think`].
+    inside_think: bool,
+    /// Buffers a partial `<think>` or `</think>` opening/closing
+    /// tag that arrived split across delta chunks.
+    think_tag_buf: String,
     /// Tool-call accumulator partitioned by `(choice_index,
     /// tool_index)`. H-24: aggregators that relay multi-choice
     /// streams (rare today since we pin `n: 1` but legal under
@@ -1668,6 +1690,75 @@ fn format_chat_error(value: &Value, default_message: &str) -> String {
     }
 }
 
+/// H-43: split a content delta into reasoning + visible content
+/// spans by scanning for inline `<think>` / `</think>` tags.
+/// Tags split across chunks are stitched via `state.think_tag_buf`.
+/// Returns (reasoning_text, visible_text); either may be empty.
+fn split_inline_think(state: &mut StreamState, mut content: String) -> (String, String) {
+    if !state.extract_inline_think {
+        return (String::new(), content);
+    }
+    // Stitch a partial tag from the previous chunk back onto the
+    // front of this chunk so the scan sees the full token.
+    if !state.think_tag_buf.is_empty() {
+        let mut combined = std::mem::take(&mut state.think_tag_buf);
+        combined.push_str(&content);
+        content = combined;
+    }
+    let mut reasoning = String::new();
+    let mut visible = String::new();
+    let bytes = content.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let remaining = &content[cursor..];
+        if state.inside_think {
+            // Look for the closing tag.
+            if let Some(idx) = remaining.find("</think>") {
+                reasoning.push_str(&remaining[..idx]);
+                cursor += idx + "</think>".len();
+                state.inside_think = false;
+            } else if let Some(stub) = trailing_partial_tag(remaining, "</think>") {
+                reasoning.push_str(&remaining[..remaining.len() - stub.len()]);
+                state.think_tag_buf = stub.to_string();
+                cursor = content.len();
+            } else {
+                reasoning.push_str(remaining);
+                cursor = content.len();
+            }
+        } else {
+            // Look for the opening tag.
+            if let Some(idx) = remaining.find("<think>") {
+                visible.push_str(&remaining[..idx]);
+                cursor += idx + "<think>".len();
+                state.inside_think = true;
+            } else if let Some(stub) = trailing_partial_tag(remaining, "<think>") {
+                visible.push_str(&remaining[..remaining.len() - stub.len()]);
+                state.think_tag_buf = stub.to_string();
+                cursor = content.len();
+            } else {
+                visible.push_str(remaining);
+                cursor = content.len();
+            }
+        }
+    }
+    (reasoning, visible)
+}
+
+/// Returns the trailing partial-tag stub at the end of `slice` if
+/// the tail is a prefix of `tag` (longer than zero, shorter than
+/// the full tag). Used to buffer split-across-chunk tag tokens.
+fn trailing_partial_tag<'a>(slice: &'a str, tag: &str) -> Option<&'a str> {
+    let mut len = (tag.len() - 1).min(slice.len());
+    while len > 0 {
+        let tail = &slice[slice.len() - len..];
+        if tag.starts_with(tail) {
+            return Some(tail);
+        }
+        len -= 1;
+    }
+    None
+}
+
 fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>> {
     if data == "[DONE]" {
         let mut events = state.drain_tool_calls()?;
@@ -1752,8 +1843,28 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                 }
                 let content = collect_delta_text(delta.get("content"));
                 if !content.is_empty() {
-                    state.saw_visible_output = true;
-                    events.push(LlmEvent::TextDelta(content));
+                    // H-43: when the preset is CF Workers AI (or
+                    // another upstream we know inlines reasoning
+                    // via `<think>...</think>` tags on the
+                    // OpenAI-compat path), split the content into
+                    // reasoning + visible spans before emitting.
+                    // The reasoning span lands as a
+                    // `ReasoningDelta` so the TUI promotes it to
+                    // the thinking pane and downstream cost /
+                    // event consumers see the right kind of
+                    // signal.
+                    let (reasoning_span, visible_span) = split_inline_think(state, content);
+                    if !reasoning_span.is_empty() {
+                        state.reasoning_buf.push_str(&reasoning_span);
+                        events.push(LlmEvent::ReasoningDelta {
+                            text: reasoning_span,
+                            kind: ReasoningKind::Summary,
+                        });
+                    }
+                    if !visible_span.is_empty() {
+                        state.saw_visible_output = true;
+                        events.push(LlmEvent::TextDelta(visible_span));
+                    }
                 }
                 if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for tool_call in tool_calls {
