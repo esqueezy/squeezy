@@ -2867,7 +2867,7 @@ fn preview_overlay_lines(lines: &[squeezy_tools::preview::PreviewLine]) -> Vec<S
 }
 
 fn normalize_overlay_text(text: &str) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = collapse_whitespace(text);
     let mut out = String::with_capacity(collapsed.len());
     let mut chars = collapsed.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -2878,6 +2878,20 @@ fn normalize_overlay_text(text: &str) -> String {
         {
             out.push(' ');
         }
+    }
+    out
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    let mut words = text.split_whitespace();
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(text.len());
+    out.push_str(first);
+    for word in words {
+        out.push(' ');
+        out.push_str(word);
     }
     out
 }
