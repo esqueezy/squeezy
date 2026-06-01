@@ -1370,6 +1370,74 @@ fn merge_oauth_beta_header_returns_none_for_api_key_without_caller() {
     );
 }
 
+/// H-01: the 4-slot allocator must consume in tools → system →
+/// messages order so a future caller marker only ever displaces the
+/// most-volatile slot. Today's auto-3 policy fits comfortably under
+/// the cap; once exhausted, additional consume calls drop+warn.
+#[test]
+fn breakpoint_budget_allocates_within_cap_and_drops_overflow() {
+    let mut budget = super::BreakpointBudget::new();
+    assert!(budget.consume("tools"));
+    assert!(budget.consume("system"));
+    assert!(budget.consume("messages"));
+    assert_eq!(budget.remaining, 1);
+    assert!(budget.consume("future-marker"));
+    assert_eq!(budget.remaining, 0);
+    assert!(!budget.consume("overflow-1"));
+    assert!(!budget.consume("overflow-2"));
+    assert_eq!(budget.dropped, 2);
+}
+
+/// H-01 regression guard: the auto-3 policy still emits markers on
+/// system / last user block / last stable tool — the 4-slot allocator
+/// must not regress the happy path.
+#[test]
+fn request_body_marks_all_three_auto_breakpoints_within_budget() {
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system prompt".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
+        tools: Arc::from(vec![
+            LlmToolSpec {
+                name: "read_file".to_string(),
+                description: "read".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+        ]),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    let tools = body["tools"].as_array().expect("tools");
+    assert_eq!(tools[0]["cache_control"]["type"], "ephemeral");
+    let last_user = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "user")
+        .expect("user message");
+    let last_block = last_user["content"]
+        .as_array()
+        .expect("content")
+        .last()
+        .expect("last block");
+    assert_eq!(last_block["cache_control"]["type"], "ephemeral");
+}
+
 #[test]
 fn request_body_encodes_image_as_base64_content_block() {
     // Synthetic 8-byte PNG-magic prefix; the bytes here don't have to be

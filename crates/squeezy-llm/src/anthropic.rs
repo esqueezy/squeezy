@@ -167,15 +167,27 @@ impl AnthropicProvider {
         // failure modes are common after a mid-session
         // `anthropic/claude-X → openai/gpt-Y → anthropic/...` swap.
         let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
+        // 4-slot budget enforces Anthropic's hard 4-breakpoint
+        // cache_control cap. Invalidation order (most-volatile last):
+        // tools change the least frequently, system next, messages
+        // most often — so we allocate tools first, then system,
+        // then messages. When a future caller-supplied marker (skill
+        // layer, multi-system blocks) pushes the count past 4 we
+        // drop the most-volatile slot rather than 400 the request.
+        let mut budget = BreakpointBudget::new();
+        let tools_marker =
+            prompt_caching && policy.tools && !request.tools.is_empty() && budget.consume("tools");
+        let system_marker = prompt_caching && policy.system && budget.consume("system");
+        let messages_marker = prompt_caching && budget.consume("messages");
         let mut body = json!({
             "model": request.model,
             "system": anthropic_system(
                 &request.instructions,
-                prompt_caching && policy.system,
+                system_marker,
                 auth,
                 retention,
             ),
-            "messages": anthropic_messages(&normalized_input, prompt_caching, policy, retention),
+            "messages": anthropic_messages(&normalized_input, messages_marker, policy, retention),
             "max_tokens": max_tokens,
             "stream": true,
         });
@@ -233,12 +245,65 @@ impl AnthropicProvider {
                     })
                 })
                 .collect();
-            if prompt_caching && policy.tools {
+            if tools_marker {
                 json_markers::mark_last_stable_tool(&mut tool_values, retention);
             }
             body["tools"] = Value::Array(tool_values);
         }
         body
+    }
+}
+
+/// Anthropic accepts at most four `cache_control` breakpoints per
+/// request across `tools`, `system`, and `messages`. Beyond the cap
+/// the Messages API returns a 400 with
+/// `invalid_request_error: cache_control breakpoint limit exceeded`.
+///
+/// `BreakpointBudget` mirrors opencode's `Cache.Breakpoints` slot
+/// allocator (`packages/llm/src/protocols/anthropic-messages.ts:239-247`)
+/// so the lowering layer can sit in front of every helper that emits
+/// a marker, decrement on consumption, and drop-and-warn when the
+/// budget is exhausted. Today the auto policy only ever consumes 3
+/// slots (tools / system / messages), but the cap is enforced
+/// defensively so any future caller-supplied marker (skill-loaded
+/// tool def, multi-system blocks) skips silently instead of
+/// 4xx-ing the request.
+struct BreakpointBudget {
+    remaining: u32,
+    dropped: u32,
+}
+
+impl BreakpointBudget {
+    /// Anthropic's hard cap on `cache_control` breakpoints per
+    /// request. Documented at
+    /// <https://platform.claude.com/docs/en/docs/build-with-claude/prompt-caching>.
+    const CAP: u32 = 4;
+
+    fn new() -> Self {
+        Self {
+            remaining: Self::CAP,
+            dropped: 0,
+        }
+    }
+
+    /// Try to consume one slot for the named section. Returns `true`
+    /// when the marker should be emitted, `false` when the budget is
+    /// exhausted (and warns once per dropped marker so operators can
+    /// see when their caller layout outgrew the cap).
+    fn consume(&mut self, section: &'static str) -> bool {
+        if self.remaining == 0 {
+            self.dropped = self.dropped.saturating_add(1);
+            tracing::warn!(
+                provider = "anthropic",
+                section,
+                cap = Self::CAP,
+                dropped = self.dropped,
+                "anthropic cache_control breakpoint dropped: per-request cap exceeded",
+            );
+            return false;
+        }
+        self.remaining -= 1;
+        true
     }
 }
 
