@@ -52,7 +52,18 @@ fn decode_sse_event(bytes: &[u8]) -> Option<String> {
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
         if let Some(data) = line.strip_prefix("data:") {
-            data_lines.push(data.trim_start());
+            // SSE spec (WHATWG EventSource §9.2) allows empty `data:`
+            // lines as keep-alive padding. Some providers (notably OpenAI
+            // on long reasoning turns) emit them between real chunks;
+            // forwarding `""` to `serde_json::from_str` crashes the
+            // stream. Drop empties; also tolerate trailing whitespace
+            // around the `[DONE]` sentinel (some providers send
+            // `data: [DONE] \n`).
+            let payload = data.trim();
+            if payload.is_empty() {
+                continue;
+            }
+            data_lines.push(payload);
         }
     }
     if data_lines.is_empty() {

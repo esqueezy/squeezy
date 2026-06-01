@@ -62,3 +62,43 @@ fn finish_drops_buffer_with_no_data_lines() {
     assert!(decoder.push(b": just-a-comment").is_empty());
     assert!(decoder.finish().is_empty());
 }
+
+#[test]
+fn decode_drops_empty_data_lines() {
+    // X-02: WHATWG EventSource §9.2 allows empty `data:` heartbeats.
+    // OpenAI emits them on long reasoning turns; forwarding `""` to
+    // `serde_json::from_str` would crash the stream with EOF.
+    let mut decoder = SseDecoder::default();
+    let events = decoder.push(b"data:\n\n");
+    assert!(
+        events.is_empty(),
+        "empty `data:` heartbeat must not surface as an event"
+    );
+}
+
+#[test]
+fn decode_drops_whitespace_only_data_lines() {
+    // X-02: `data:   \n\n` (only whitespace) is still a heartbeat.
+    let mut decoder = SseDecoder::default();
+    let events = decoder.push(b"data:    \n\n");
+    assert!(events.is_empty());
+}
+
+#[test]
+fn decode_keeps_payload_when_only_some_data_lines_empty() {
+    // X-02: a multi-`data:` event with one empty line should still yield
+    // the non-empty payload (not be dropped as fully empty).
+    let mut decoder = SseDecoder::default();
+    let events = decoder.push(b"data: real\ndata:\n\n");
+    assert_eq!(events, vec!["real".to_string()]);
+}
+
+#[test]
+fn decode_trims_whitespace_around_done_sentinel() {
+    // X-02: providers like Together / vLLM occasionally emit
+    // `data: [DONE] \n\n` (trailing space). Downstream `[DONE]` literal
+    // comparisons must match after trim.
+    let mut decoder = SseDecoder::default();
+    let events = decoder.push(b"data: [DONE] \n\n");
+    assert_eq!(events, vec!["[DONE]".to_string()]);
+}
