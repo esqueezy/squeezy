@@ -88,7 +88,7 @@ pub const DEFAULT_GROQ_MODEL: &str = "llama-3.3-70b-versatile";
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_XAI_MODEL: &str = "grok-4.3";
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
-pub const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-chat";
+pub const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 // Google Cloud Vertex AI's OpenAI-compatible endpoint. The base URL is
 // per-project + per-region, so users must set `vertex_project` and
 // `vertex_location` (or override `base_url` directly).

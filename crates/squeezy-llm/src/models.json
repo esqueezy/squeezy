@@ -772,7 +772,7 @@
   },
   {
     "provider": "deepseek",
-    "id": "deepseek-chat",
+    "id": "deepseek-v4-flash",
     "profile": "balanced",
     "capabilities": {
       "streaming": true,
@@ -786,14 +786,14 @@
       "prompt_caching": false
     },
     "pricing": {
-      "input_usd_micros_per_mtok": 270000,
-      "output_usd_micros_per_mtok": 1100000,
-      "cache_read_usd_micros_per_mtok": 27000,
+      "input_usd_micros_per_mtok": 140000,
+      "output_usd_micros_per_mtok": 280000,
+      "cache_read_usd_micros_per_mtok": 2800,
       "cache_write_usd_micros_per_mtok": null
     },
     "limits": {
-      "context_window_tokens": 131072,
-      "max_output_tokens": 8192,
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 393216,
       "effective_context_window_percent": 95
     },
     "tokenizer": "openai_compatible",
@@ -802,7 +802,7 @@
   },
   {
     "provider": "deepseek",
-    "id": "deepseek-reasoner",
+    "id": "deepseek-reasoner-v4",
     "profile": "strong",
     "capabilities": {
       "streaming": true,
@@ -816,14 +816,14 @@
       "prompt_caching": false
     },
     "pricing": {
-      "input_usd_micros_per_mtok": 550000,
-      "output_usd_micros_per_mtok": 2190000,
-      "cache_read_usd_micros_per_mtok": 55000,
+      "input_usd_micros_per_mtok": 1740000,
+      "output_usd_micros_per_mtok": 3480000,
+      "cache_read_usd_micros_per_mtok": 14500,
       "cache_write_usd_micros_per_mtok": null
     },
     "limits": {
-      "context_window_tokens": 131072,
-      "max_output_tokens": 8192,
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 393216,
       "effective_context_window_percent": 95
     },
     "tokenizer": "openai_compatible",
