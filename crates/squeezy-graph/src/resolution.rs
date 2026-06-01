@@ -841,16 +841,20 @@ impl SemanticGraph {
             return None;
         }
         let caller = self.symbols.get(caller_id)?;
-        let candidates = self
+        let mut candidates = Vec::new();
+        for import in self
             .imports_for_file(&caller.file_id)
             .filter(|import| self.import_visible_from_symbol(import, caller))
             .filter(|import| import.span.start_byte <= call.span.start_byte)
             .filter(|import| import.alias.as_deref() == Some(call.name.as_str()))
-            .flat_map(|import| {
-                let target_name = last_path_segment(&import.path);
-                self.symbols_by_name_or_scan(&target_name)
+        {
+            let target_name = last_path_segment_str(&import.path);
+            candidates.extend(
+                self.symbols_by_name
+                    .get(target_name)
                     .into_iter()
-                    .filter_map(|id| self.symbols.get(&id))
+                    .flatten()
+                    .filter_map(|id| self.symbols.get(id))
                     .filter(|symbol| {
                         matches!(
                             symbol.kind,
@@ -860,10 +864,10 @@ impl SemanticGraph {
                                 | SymbolKind::Test
                         ) && self.import_matches_symbol(import, symbol)
                     })
-                    .map(|symbol| symbol.id.clone())
-                    .collect::<Vec<_>>()
-            });
-        single_symbol(candidates)
+                    .map(|symbol| symbol.id.clone()),
+            );
+        }
+        single_symbol(candidates.into_iter())
     }
 
     pub(crate) fn package_local_direct_call(
