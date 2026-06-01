@@ -7740,14 +7740,16 @@ async fn run_subagent_dispatch(
         tokio::select! {
             execution = &mut subagent_future => break execution,
             _ = progress_ticker.tick() => {
-                let _ = progress_tx
-                    .send(AgentEvent::ToolProgress {
-                        turn_id: progress_turn_id,
-                        call_id: progress_call_id.clone(),
-                        tool_name: progress_tool_name.clone(),
-                        elapsed_ms: subagent_started.elapsed().as_millis() as u64,
-                    })
-                    .await;
+                // try_send instead of send().await: heartbeats are advisory
+                // and dropping one on a full buffer is benign, but blocking
+                // the select! loop on a full mpsc deadlocks the tool —
+                // 6-hour Flutter SDK hang was reproduced this way.
+                let _ = progress_tx.try_send(AgentEvent::ToolProgress {
+                    turn_id: progress_turn_id,
+                    call_id: progress_call_id.clone(),
+                    tool_name: progress_tool_name.clone(),
+                    elapsed_ms: subagent_started.elapsed().as_millis() as u64,
+                });
             }
         }
     };
@@ -10659,15 +10661,15 @@ async fn run_tool_exec_with_progress(
         tokio::select! {
             r = &mut exec_future => break r,
             _ = progress_ticker.tick() => {
-                let _ = context
-                    .tx
-                    .send(AgentEvent::ToolProgress {
-                        turn_id: context.turn_id,
-                        call_id: progress_call_id.to_string(),
-                        tool_name: progress_tool_name.to_string(),
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                    })
-                    .await;
+                // See subagent heartbeat above for rationale: try_send so a
+                // full mpsc buffer can never block the select! loop and
+                // deadlock the running tool.
+                let _ = context.tx.try_send(AgentEvent::ToolProgress {
+                    turn_id: context.turn_id,
+                    call_id: progress_call_id.to_string(),
+                    tool_name: progress_tool_name.to_string(),
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                });
             }
         }
     }
