@@ -1314,3 +1314,76 @@ fn conversation_messages_reject_unknown_document_mime() {
         "error must mention the unsupported MIME: {err}",
     );
 }
+
+#[test]
+fn bedrock_image_block_rejects_images_over_3_75_mib() {
+    // Bedrock rejects Claude images larger than 3.75 MB with
+    // `ValidationException` and an opaque message. The local guard
+    // surfaces a structured error pointing the operator at the
+    // offending image instead of letting the AWS SDK error propagate.
+    let oversized: Arc<[u8]> = Arc::from(vec![0u8; 3_932_161]);
+    let err = super::bedrock_image_block("image/png", &oversized)
+        .expect_err("oversized image must surface an explicit ProviderRequest error");
+    let message = err.to_string();
+    assert!(
+        message.contains("3932160"),
+        "error must mention the byte limit; got `{message}`",
+    );
+    assert!(
+        message.contains("3932161"),
+        "error must mention the actual byte size; got `{message}`",
+    );
+}
+
+#[test]
+fn bedrock_image_block_accepts_image_at_3_75_mib_boundary() {
+    // The boundary itself is allowed — `>` not `>=` — so an image that
+    // is exactly the documented cap still ships.
+    let on_boundary: Arc<[u8]> = Arc::from(vec![0u8; 3_932_160]);
+    super::bedrock_image_block("image/png", &on_boundary)
+        .expect("boundary-size image must build cleanly");
+}
+
+#[test]
+fn handle_bedrock_event_replaces_signature_deltas() {
+    use aws_sdk_bedrockruntime::types::{
+        ContentBlockDelta as DeltaEnum, ContentBlockDeltaEvent, ReasoningContentBlockDelta,
+    };
+    // Multiple `Signature` deltas in a single block must replace
+    // (not concat) so the next-turn replay can present the
+    // upstream-canonical signature unchanged. Anthropic's reasoning
+    // signature is a full opaque base64 token, not a streaming buffer.
+    let mut state = BedrockStreamState::default();
+    let first = ContentBlockDeltaEvent::builder()
+        .content_block_index(0)
+        .delta(DeltaEnum::ReasoningContent(
+            ReasoningContentBlockDelta::Signature("first-signature".to_string()),
+        ))
+        .build()
+        .expect("build first signature event");
+    let events = handle_bedrock_event(ConverseStreamOutput::ContentBlockDelta(first), &mut state)
+        .expect("handle first signature");
+    assert!(events.is_empty());
+
+    let second = ContentBlockDeltaEvent::builder()
+        .content_block_index(0)
+        .delta(DeltaEnum::ReasoningContent(
+            ReasoningContentBlockDelta::Signature("authoritative-signature".to_string()),
+        ))
+        .build()
+        .expect("build second signature event");
+    let events = handle_bedrock_event(ConverseStreamOutput::ContentBlockDelta(second), &mut state)
+        .expect("handle second signature");
+    assert!(events.is_empty());
+
+    let block = state
+        .reasoning_blocks
+        .get(&0)
+        .expect("reasoning block must persist across deltas");
+    assert_eq!(
+        block.signature.as_deref(),
+        Some("authoritative-signature"),
+        "second Signature delta must replace, not concat: got {:?}",
+        block.signature,
+    );
+}

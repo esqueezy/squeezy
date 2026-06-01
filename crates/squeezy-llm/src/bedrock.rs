@@ -34,6 +34,15 @@ use crate::{
     retry::{RetryPolicy, idle_timeout, with_stream_retry},
 };
 
+/// Bedrock's per-image byte limit for Claude on Converse — 3.75 MiB.
+/// AWS docs cap Claude images at 3.75 MB; the SDK surfaces the
+/// constraint as `ValidationException` with an opaque message, so we
+/// guard up-front with a structured error pointing operators at the
+/// offending image. Nova models lift this to ~20 MB but squeezy
+/// currently routes all Bedrock turns through the Claude allow-list so
+/// the lower limit is the safe default.
+const BEDROCK_IMAGE_MAX_BYTES: usize = 3_932_160; // 3.75 * 1024 * 1024
+
 /// Anthropic's hard floor for `thinking.budget_tokens` on Bedrock —
 /// the API rejects any request below this with
 /// `invalid_request_error`. Matches the Anthropic-native floor
@@ -467,10 +476,29 @@ fn handle_bedrock_event(
                             }
                         }
                         ReasoningContentBlockDelta::Signature(sig) => {
-                            match block.signature.as_mut() {
-                                Some(existing) => existing.push_str(&sig),
-                                None => block.signature = Some(sig),
+                            // Anthropic's reasoning `signature` is a
+                            // full opaque base64 token attached to the
+                            // closing reasoning block — not a streaming
+                            // buffer. The Bedrock API has historically
+                            // emitted it once per block; concatenating
+                            // multiple `Signature` deltas would yield a
+                            // corrupted signature that Anthropic
+                            // rejects on the next-turn replay. If the
+                            // upstream ever splits the signature across
+                            // multiple deltas (the type is
+                            // `#[non_exhaustive]`) we treat the latest
+                            // value as authoritative and warn so the
+                            // operator can flag it.
+                            if block.signature.is_some() {
+                                tracing::warn!(
+                                    provider = "bedrock",
+                                    block = ?index,
+                                    "Bedrock emitted multiple reasoning Signature deltas; \
+                                     replacing prior value with latest (Anthropic semantics \
+                                     expect a single opaque blob, not a streaming buffer)",
+                                );
                             }
+                            block.signature = Some(sig);
                             Ok(Vec::new())
                         }
                         ReasoningContentBlockDelta::RedactedContent(blob) => {
@@ -526,7 +554,19 @@ fn handle_bedrock_event(
             }
             Ok(Vec::new())
         }
-        _ => Ok(Vec::new()),
+        // `ConverseStreamOutput` is `#[non_exhaustive]`; future Bedrock
+        // features (citation deltas, guardrail traces, native
+        // multi-modal output blocks, etc.) surface as new variants.
+        // Log the discriminant so silent feature drift is observable
+        // in tracing logs instead of disappearing into `Vec::new()`.
+        other => {
+            tracing::debug!(
+                provider = "bedrock",
+                variant = ?std::mem::discriminant(&other),
+                "unhandled Bedrock ConverseStreamOutput variant; dropping"
+            );
+            Ok(Vec::new())
+        }
     }
 }
 
@@ -1104,6 +1144,14 @@ pub(crate) fn bedrock_image_block(media_type: &str, bytes: &Arc<[u8]>) -> Result
             )));
         }
     };
+    if bytes.len() > BEDROCK_IMAGE_MAX_BYTES {
+        return Err(SqueezyError::ProviderRequest(format!(
+            "image is {} bytes; exceeds Bedrock's {} byte limit for Claude vision. Resize before \
+             attaching or switch to a Nova-class model that supports larger payloads",
+            bytes.len(),
+            BEDROCK_IMAGE_MAX_BYTES,
+        )));
+    }
     ImageBlock::builder()
         .format(format)
         .source(ImageSource::Bytes(Blob::new(bytes.as_ref().to_vec())))
