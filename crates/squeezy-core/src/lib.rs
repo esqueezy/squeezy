@@ -86,7 +86,7 @@ pub const DEFAULT_PORTKEY_MODEL: &str = "anthropic/claude-opus-4-7";
 pub const DEFAULT_GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 pub const DEFAULT_GROQ_MODEL: &str = "llama-3.3-70b-versatile";
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
-pub const DEFAULT_XAI_MODEL: &str = "grok-4";
+pub const DEFAULT_XAI_MODEL: &str = "grok-4.3";
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 pub const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-chat";
 // Google Cloud Vertex AI's OpenAI-compatible endpoint. The base URL is

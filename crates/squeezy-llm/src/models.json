@@ -682,7 +682,7 @@
   },
   {
     "provider": "xai",
-    "id": "grok-4",
+    "id": "grok-4.3",
     "profile": "strong",
     "capabilities": {
       "streaming": true,
@@ -690,14 +690,14 @@
       "json_mode": true,
       "vision": true,
       "response_state": false,
-      "reasoning_tokens": false,
+      "reasoning_tokens": true,
       "reasoning_effort": false,
       "text_verbosity": false,
       "prompt_caching": false
     },
     "pricing": {
-      "input_usd_micros_per_mtok": 3000000,
-      "output_usd_micros_per_mtok": 15000000,
+      "input_usd_micros_per_mtok": 1250000,
+      "output_usd_micros_per_mtok": 2500000,
       "cache_read_usd_micros_per_mtok": null,
       "cache_write_usd_micros_per_mtok": null
     },
