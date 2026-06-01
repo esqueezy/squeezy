@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     env, fmt, fs,
     path::{Path, PathBuf},
     process,
@@ -6580,10 +6580,7 @@ impl StreamRedactor {
             };
         }
         self.buffer = text.split_off(emit_end);
-        StreamChunk {
-            text,
-            redactions,
-        }
+        StreamChunk { text, redactions }
     }
 }
 
@@ -8849,10 +8846,12 @@ impl McpSettings {
 
     fn merge(&mut self, next: Self) {
         for (name, server) in next.servers {
-            self.servers
-                .entry(name)
-                .and_modify(|existing| existing.merge(server.clone()))
-                .or_insert(server);
+            match self.servers.entry(name) {
+                Entry::Occupied(mut entry) => entry.get_mut().merge(server),
+                Entry::Vacant(entry) => {
+                    entry.insert(server);
+                }
+            }
         }
     }
 }
@@ -10177,10 +10176,12 @@ fn merge_provider_maps(
     };
     let target = target.get_or_insert_with(BTreeMap::new);
     for (name, provider) in next {
-        target
-            .entry(name)
-            .and_modify(|existing| existing.merge(provider.clone()))
-            .or_insert(provider);
+        match target.entry(name) {
+            Entry::Occupied(mut entry) => entry.get_mut().merge(provider),
+            Entry::Vacant(entry) => {
+                entry.insert(provider);
+            }
+        }
     }
 }
 
@@ -10189,10 +10190,12 @@ fn merge_tui_theme_maps(
     next: BTreeMap<String, TuiThemeSettings>,
 ) {
     for (name, theme) in next {
-        target
-            .entry(name)
-            .and_modify(|existing| existing.merge(theme.clone()))
-            .or_insert(theme);
+        match target.entry(name) {
+            Entry::Occupied(mut entry) => entry.get_mut().merge(theme),
+            Entry::Vacant(entry) => {
+                entry.insert(theme);
+            }
+        }
     }
 }
 
@@ -10205,10 +10208,12 @@ fn merge_profiles_maps(
     };
     let target = target.get_or_insert_with(BTreeMap::new);
     for (name, profile) in next {
-        target
-            .entry(name)
-            .and_modify(|existing| existing.merge(profile.clone()))
-            .or_insert(profile);
+        match target.entry(name) {
+            Entry::Occupied(mut entry) => entry.get_mut().merge(profile),
+            Entry::Vacant(entry) => {
+                entry.insert(profile);
+            }
+        }
     }
 }
 
@@ -10298,14 +10303,28 @@ impl ReasoningPayload {
     pub fn display_text(&self) -> String {
         match self {
             ReasoningPayload::OpenAi { summary, .. } => summary.join("\n\n"),
-            ReasoningPayload::Anthropic { blocks } => blocks
-                .iter()
-                .map(|block| match block.kind {
-                    AnthropicThinkingKind::Thinking => block.text.clone(),
-                    AnthropicThinkingKind::Redacted => "[redacted reasoning]".to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n"),
+            ReasoningPayload::Anthropic { blocks } => {
+                const REDACTED_REASONING: &str = "[redacted reasoning]";
+                let capacity = blocks
+                    .iter()
+                    .map(|block| match block.kind {
+                        AnthropicThinkingKind::Thinking => block.text.len(),
+                        AnthropicThinkingKind::Redacted => REDACTED_REASONING.len(),
+                    })
+                    .sum::<usize>()
+                    + blocks.len().saturating_sub(1) * 2;
+                let mut text = String::with_capacity(capacity);
+                for (index, block) in blocks.iter().enumerate() {
+                    if index > 0 {
+                        text.push_str("\n\n");
+                    }
+                    match block.kind {
+                        AnthropicThinkingKind::Thinking => text.push_str(&block.text),
+                        AnthropicThinkingKind::Redacted => text.push_str(REDACTED_REASONING),
+                    }
+                }
+                text
+            }
             ReasoningPayload::Google { summary, .. } => summary.join("\n\n"),
         }
     }
@@ -11660,24 +11679,29 @@ impl TaskStateSnapshot {
     }
 
     pub fn compact_summary(&self) -> String {
-        let mut parts = Vec::new();
+        let mut summary = String::with_capacity(
+            self.task.len()
+                + self.blocker.as_ref().map_or(0, String::len)
+                + self.next_action.as_ref().map_or(0, String::len)
+                + 64,
+        );
         if !self.task.is_empty() {
-            parts.push(self.task.clone());
+            push_compact_summary_part(&mut summary, "", &self.task);
         }
-        parts.push(format!("status={}", self.status.as_str()));
+        push_compact_summary_part(&mut summary, "status=", self.status.as_str());
         if let Some(step) = self.active_step_title()
             && !step.is_empty()
         {
-            parts.push(format!("active={step}"));
+            push_compact_summary_part(&mut summary, "active=", step);
         }
         if let Some(blocker) = &self.blocker {
-            parts.push(format!("blocker={blocker}"));
+            push_compact_summary_part(&mut summary, "blocker=", blocker);
         }
         if let Some(next_action) = &self.next_action {
-            parts.push(format!("next={next_action}"));
+            push_compact_summary_part(&mut summary, "next=", next_action);
         }
-        parts.push(format!("verification={}", self.verification.as_str()));
-        parts.join(" | ")
+        push_compact_summary_part(&mut summary, "verification=", self.verification.as_str());
+        summary
     }
 
     pub fn normalized(mut self) -> Self {
@@ -11707,6 +11731,14 @@ impl TaskStateSnapshot {
         }
         self
     }
+}
+
+fn push_compact_summary_part(summary: &mut String, prefix: &str, value: &str) {
+    if !summary.is_empty() {
+        summary.push_str(" | ");
+    }
+    summary.push_str(prefix);
+    summary.push_str(value);
 }
 
 fn normalize_optional_task_text(value: Option<String>, limit: usize) -> Option<String> {
