@@ -233,11 +233,7 @@ fn apply_scalar(root: &mut Table, parents: &[&str], leaf: &str, op: &EditOp) -> 
         let Some(parent) = descend_existing_table(root, parents) else {
             return false;
         };
-        if parent.contains_key(leaf) {
-            parent.remove(leaf);
-            return true;
-        }
-        return false;
+        return parent.remove(leaf).is_some();
     }
 
     let parent = descend_or_create_table(root, parents);
@@ -248,10 +244,7 @@ fn apply_scalar(root: &mut Table, parents: &[&str], leaf: &str, op: &EditOp) -> 
         EditOp::SetBool(v) => set_leaf(parent, leaf, value(*v)),
         EditOp::SetPath(p) => set_leaf(parent, leaf, value(p.display().to_string().as_str())),
         EditOp::SetArrayOfStrings(items) => {
-            let mut arr = Array::new();
-            for item in items {
-                arr.push(item.as_str());
-            }
+            let arr = items.iter().map(String::as_str).collect::<Array>();
             set_leaf(parent, leaf, Item::Value(Value::Array(arr)))
         }
         EditOp::Unset => unreachable!("handled before parent table creation"),
@@ -304,12 +297,7 @@ fn apply_remove_table_entry(doc: &mut DocumentMut, table_path: SettingsPath, key
     let Some(parent) = descend_existing_table(doc.as_table_mut(), table_path) else {
         return false;
     };
-    if parent.contains_key(key) {
-        parent.remove(key);
-        true
-    } else {
-        false
-    }
+    parent.remove(key).is_some()
 }
 
 fn apply_append_array_of_tables(
@@ -354,13 +342,7 @@ fn apply_remove_array_of_tables_by_match(
     let Some(Item::ArrayOfTables(aot)) = parent.get_mut(leaf) else {
         return false;
     };
-    let mut idx_to_remove: Option<usize> = None;
-    for (i, row) in aot.iter().enumerate() {
-        if row_matches(row, predicate) {
-            idx_to_remove = Some(i);
-            break;
-        }
-    }
+    let idx_to_remove = aot.iter().position(|row| row_matches(row, predicate));
     match idx_to_remove {
         Some(i) => {
             aot.remove(i);
@@ -401,12 +383,7 @@ fn apply_remove_theme_color(doc: &mut DocumentMut, theme: &str, token: &str) -> 
     let Some(colors) = existing_theme_colors_table(doc, theme) else {
         return false;
     };
-    if colors.contains_key(token) {
-        colors.remove(token);
-        true
-    } else {
-        false
-    }
+    colors.remove(token).is_some()
 }
 
 fn existing_theme_colors_table<'a>(doc: &'a mut DocumentMut, theme: &str) -> Option<&'a mut Table> {
@@ -470,10 +447,7 @@ fn theme_colors_table<'a>(doc: &'a mut DocumentMut, theme: &str) -> &'a mut Tabl
 }
 
 fn rgb_item(rgb: [u8; 3]) -> Item {
-    let mut arr = Array::new();
-    arr.push(i64::from(rgb[0]));
-    arr.push(i64::from(rgb[1]));
-    arr.push(i64::from(rgb[2]));
+    let arr = rgb.into_iter().map(i64::from).collect::<Array>();
     Item::Value(Value::Array(arr))
 }
 
