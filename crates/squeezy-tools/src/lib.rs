@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    fmt::Write as FmtWrite,
     fs::{self, OpenOptions},
     future::Future,
     io::{Read, Seek, SeekFrom, Write},
@@ -547,7 +548,7 @@ impl ToolCostHint {
     ) -> BTreeMap<String, u32> {
         let mut map: BTreeMap<String, u32> = BTreeMap::new();
         for c in confidences {
-            *map.entry(c.id().to_string()).or_insert(0) += 1;
+            increment_confidence_count(&mut map, c);
         }
         map
     }
@@ -563,10 +564,19 @@ impl ToolCostHint {
                 continue;
             };
             if let Some(c) = confidence_from_label(label) {
-                *map.entry(c.id().to_string()).or_insert(0) += 1;
+                increment_confidence_count(&mut map, c);
             }
         }
         map
+    }
+}
+
+fn increment_confidence_count(map: &mut BTreeMap<String, u32>, confidence: Confidence) {
+    let id = confidence.id();
+    if let Some(count) = map.get_mut(id) {
+        *count += 1;
+    } else {
+        map.insert(id.to_string(), 1);
     }
 }
 
@@ -576,10 +586,19 @@ impl ToolCostHint {
 /// captured packets continue to aggregate. Returns `None` for unknown
 /// strings.
 fn confidence_from_label(label: &str) -> Option<Confidence> {
-    Confidence::ALL
-        .iter()
-        .copied()
-        .find(|c| c.id() == label || format!("{c:?}") == label)
+    match label {
+        "exact_syntax" | "ExactSyntax" => Some(Confidence::ExactSyntax),
+        "import_resolved" | "ImportResolved" => Some(Confidence::ImportResolved),
+        "heuristic" | "Heuristic" => Some(Confidence::Heuristic),
+        "candidate_set" | "CandidateSet" => Some(Confidence::CandidateSet),
+        "external" | "External" => Some(Confidence::External),
+        "macro_opaque" | "MacroOpaque" => Some(Confidence::MacroOpaque),
+        "conditional_unknown" | "ConditionalUnknown" => Some(Confidence::ConditionalUnknown),
+        "unsupported" | "Unsupported" => Some(Confidence::Unsupported),
+        "stale" | "Stale" => Some(Confidence::Stale),
+        "partial" | "Partial" => Some(Confidence::Partial),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -927,11 +946,14 @@ fn path_list_metadata(paths: &[PathBuf]) -> String {
     if paths.is_empty() {
         "none".to_string()
     } else {
-        paths
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(",")
+        let mut output = String::new();
+        for path in paths {
+            if !output.is_empty() {
+                output.push(',');
+            }
+            let _ = write!(&mut output, "{}", path.display());
+        }
+        output
     }
 }
 
@@ -4485,7 +4507,18 @@ pub(crate) fn unix_timestamp_millis(time: SystemTime) -> u128 {
 }
 
 pub(crate) fn collapse_whitespace(input: &str) -> String {
-    input.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut parts = input.split_whitespace();
+    let Some(first) = parts.next() else {
+        return String::new();
+    };
+
+    let mut output = String::with_capacity(input.len());
+    output.push_str(first);
+    for part in parts {
+        output.push(' ');
+        output.push_str(part);
+    }
+    output
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5613,7 +5646,8 @@ pub(crate) fn sha256_file(path: &Path) -> std::result::Result<String, std::io::E
     let digest = hasher.finalize();
     let mut output = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        output.push_str(&format!("{byte:02x}"));
+        output.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+        output.push(HEX_DIGITS[(byte & 0x0f) as usize] as char);
     }
     Ok(output)
 }
@@ -5935,10 +5969,13 @@ pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     let digest = Sha256::digest(bytes.as_ref());
     let mut output = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        output.push_str(&format!("{byte:02x}"));
+        output.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+        output.push(HEX_DIGITS[(byte & 0x0f) as usize] as char);
     }
     output
 }
+
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]
