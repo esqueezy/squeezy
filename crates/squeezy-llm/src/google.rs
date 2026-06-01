@@ -153,6 +153,33 @@ fn tool_choice_to_gemini_mode(choice: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Gemini's `:streamGenerateContent` endpoint rejects requests whose
+/// total body exceeds 20 MB. Each `Image` becomes a base64
+/// `inlineData` part (~33% larger than raw bytes), so 15 MB of raw
+/// image already saturates the cap. Pre-check inline image sizes so
+/// callers see a structured error pointing at the File API rather
+/// than a vendor 400 INVALID_ARGUMENT.
+const GEMINI_INLINE_IMAGE_LIMIT_BYTES: usize = 20 * 1024 * 1024;
+
+fn check_inline_image_cap(request: &LlmRequest) -> Result<()> {
+    let mut encoded_total: usize = 0;
+    for item in request.input.iter() {
+        if let LlmInputItem::Image { bytes, .. } = item {
+            // base64 expands 3 bytes → 4 chars.
+            encoded_total = encoded_total.saturating_add(bytes.len().div_ceil(3).saturating_mul(4));
+            if encoded_total > GEMINI_INLINE_IMAGE_LIMIT_BYTES {
+                return Err(SqueezyError::ProviderRequest(format!(
+                    "Google inline image payload exceeds Gemini's 20 MB limit \
+                     (~{} MB encoded). Use Google's File API for larger \
+                     uploads.",
+                    encoded_total / (1024 * 1024)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Clamp a raw `thinking_budget_tokens` value (from `ReasoningEffort`)
 /// to the per-model max / min that Phase 3 stamps into the registry.
 /// `caps == None` (off-registry model) or `caps` without the new fields
@@ -270,6 +297,9 @@ impl LlmProvider for GoogleProvider {
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
         if let Err(err) = request.ensure_vision_support("google") {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
+        if let Err(err) = check_inline_image_cap(&request) {
             return Box::pin(futures_util::stream::once(async move { Err(err) }));
         }
         let client = self.client.clone();

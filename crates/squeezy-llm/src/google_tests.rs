@@ -576,6 +576,47 @@ fn explicit_reasoning_effort_emits_thinking_config_with_budget() {
 }
 
 #[test]
+fn check_inline_image_cap_rejects_oversize_payload() {
+    // 16 MB of raw bytes -> ~21.3 MB base64-encoded, just over Gemini's
+    // 20 MB inline cap.
+    let big: Arc<[u8]> = Arc::from(vec![0u8; 16 * 1024 * 1024]);
+    let request = LlmRequest {
+        model: "gemini-test".to_string().into(),
+        instructions: "describe images".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::Image {
+            media_type: "image/png".to_string(),
+            bytes: big,
+        }]),
+        ..LlmRequest::default()
+    };
+    let err = check_inline_image_cap(&request).expect_err("oversize image must error");
+    let message = err.to_string();
+    assert!(
+        message.contains("20 MB"),
+        "error should reference the 20 MB cap, got `{message}`"
+    );
+    assert!(
+        message.contains("File API"),
+        "error should suggest File API, got `{message}`"
+    );
+}
+
+#[test]
+fn check_inline_image_cap_accepts_small_payload() {
+    let small: Arc<[u8]> = Arc::from(vec![0u8; 1024]);
+    let request = LlmRequest {
+        model: "gemini-test".to_string().into(),
+        instructions: "describe images".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::Image {
+            media_type: "image/png".to_string(),
+            bytes: small,
+        }]),
+        ..LlmRequest::default()
+    };
+    check_inline_image_cap(&request).expect("small image must pass");
+}
+
+#[test]
 fn token_split_pins_visible_vs_thoughts() {
     // Pins the convention: output_tokens = candidatesTokenCount
     // (visible), reasoning_output_tokens = thoughtsTokenCount; they
