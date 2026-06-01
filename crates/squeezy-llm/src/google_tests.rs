@@ -576,6 +576,45 @@ fn explicit_reasoning_effort_emits_thinking_config_with_budget() {
 }
 
 #[test]
+fn parser_includes_error_status_and_code_in_message() {
+    let mut cost = CostSnapshot::default();
+    let mut last_finish_reason: Option<String> = None;
+    let mut reasoning_buf = GoogleReasoningBuffer::default();
+    let mut server_model_slot: Option<String> = None;
+    let mut tool_call_counter: usize = 0;
+    let mut response_id_slot: Option<String> = None;
+    let err = parse_google_event(
+        r#"{
+          "error":{
+            "code":429,
+            "message":"Quota exceeded for quota metric",
+            "status":"RESOURCE_EXHAUSTED"
+          }
+        }"#,
+        &mut cost,
+        &mut last_finish_reason,
+        &mut reasoning_buf,
+        &mut server_model_slot,
+        &mut tool_call_counter,
+        &mut response_id_slot,
+    )
+    .expect_err("error envelope must surface as ProviderStream error");
+    let message = err.to_string();
+    assert!(
+        message.contains("RESOURCE_EXHAUSTED"),
+        "status must reach the error message, got `{message}`"
+    );
+    assert!(
+        message.contains("429"),
+        "code must reach the error message, got `{message}`"
+    );
+    assert!(
+        message.contains("Quota exceeded"),
+        "original message must still be present, got `{message}`"
+    );
+}
+
+#[test]
 fn check_inline_image_cap_rejects_oversize_payload() {
     // 16 MB of raw bytes -> ~21.3 MB base64-encoded, just over Gemini's
     // 20 MB inline cap.

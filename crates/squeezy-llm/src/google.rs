@@ -625,11 +625,30 @@ fn parse_google_event(
     let value: Value = serde_json::from_str(data)
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid Google SSE JSON: {err}")))?;
     if let Some(error) = value.get("error") {
+        // Google's standard error envelope is
+        // `{error:{code,message,status,details}}`. The previous code
+        // only surfaced `message`, which made
+        // `retry.rs::is_terminal_quota_error` miss Gemini billing
+        // exhaustion (status == "RESOURCE_EXHAUSTED") and the full
+        // retry budget burned on each 429. Concatenate status + code
+        // + message so the downstream classifier sees the salient
+        // tokens. Reference: https://cloud.google.com/apis/design/errors
         let message = error
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("Google stream error");
-        return Err(SqueezyError::ProviderStream(message.to_string()));
+        let status = error.get("status").and_then(Value::as_str);
+        let code = error.get("code").and_then(Value::as_i64);
+        let mut text = String::new();
+        if let Some(status) = status {
+            text.push_str(status);
+            text.push_str(": ");
+        }
+        if let Some(code) = code {
+            text.push_str(&format!("[{code}] "));
+        }
+        text.push_str(message);
+        return Err(SqueezyError::ProviderStream(text));
     }
     // Safety / content-policy blocks on the *prompt* arrive as an SSE
     // event with no candidates, only `promptFeedback.blockReason`.
