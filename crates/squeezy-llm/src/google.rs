@@ -166,6 +166,15 @@ impl LlmProvider for GoogleProvider {
             let mut server_model_echo = crate::ServerModelEcho::default();
             let mut saw_any = false;
             let mut reasoning_buf = GoogleReasoningBuffer::default();
+            // Per-stream tool-call counter. Gemini doesn't issue tool-call
+            // ids on the wire — we synthesize one. Two streamed events
+            // each carrying `functionCall` at `parts[0]` previously
+            // collided on `google_call_0` because the counter was the
+            // part index within a *single* SSE event. The replay
+            // canonicalizer then collapsed both calls and the second
+            // FunctionCallOutput overrode the first. Lift the counter
+            // to a per-stream usize so parallel calls keep distinct ids.
+            let mut tool_call_counter: usize = 0;
             let mut bytes = response.bytes_stream();
             loop {
                 let polled = tokio::select! {
@@ -188,6 +197,7 @@ impl LlmProvider for GoogleProvider {
                         &mut last_finish_reason,
                         &mut reasoning_buf,
                         &mut server_model_slot,
+                        &mut tool_call_counter,
                     )?;
                     if let Some(server) = server_model_slot.take()
                         && let Some(echo) = server_model_echo.observe(&request.model, &server)
@@ -207,6 +217,7 @@ impl LlmProvider for GoogleProvider {
                     &mut last_finish_reason,
                     &mut reasoning_buf,
                     &mut server_model_slot,
+                    &mut tool_call_counter,
                 )?;
                 if let Some(server) = server_model_slot.take()
                     && let Some(echo) = server_model_echo.observe(&request.model, &server)
@@ -363,6 +374,7 @@ fn parse_google_event(
     last_finish_reason: &mut Option<String>,
     reasoning_buf: &mut GoogleReasoningBuffer,
     server_model_slot: &mut Option<String>,
+    tool_call_counter: &mut usize,
 ) -> Result<Vec<LlmEvent>> {
     let value: Value = serde_json::from_str(data)
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid Google SSE JSON: {err}")))?;
@@ -426,7 +438,7 @@ fn parse_google_event(
     let Some(parts) = parts else {
         return Ok(events);
     };
-    for (index, part) in parts.iter().enumerate() {
+    for part in parts.iter() {
         let is_thought = part
             .get("thought")
             .and_then(Value::as_bool)
@@ -463,8 +475,13 @@ fn parse_google_event(
                 .get("args")
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Default::default()));
+            // Per-stream counter: parallel functionCall parts spread across
+            // SSE events previously collided on `google_call_0` because the
+            // index here was the part index within one event.
+            let id = *tool_call_counter;
+            *tool_call_counter += 1;
             events.push(LlmEvent::ToolCall(LlmToolCall {
-                call_id: format!("google_call_{index}"),
+                call_id: format!("google_call_{id}"),
                 name,
                 arguments,
             }));

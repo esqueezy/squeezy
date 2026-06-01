@@ -153,6 +153,7 @@ fn parser_extracts_text_tool_calls_and_usage() {
     let mut last_finish_reason: Option<String> = None;
     let mut reasoning_buf = GoogleReasoningBuffer::default();
     let mut server_model_slot: Option<String> = None;
+    let mut tool_call_counter: usize = 0;
     let events = parse_google_event(
         r#"{
           "candidates":[{
@@ -172,6 +173,7 @@ fn parser_extracts_text_tool_calls_and_usage() {
         &mut last_finish_reason,
         &mut reasoning_buf,
         &mut server_model_slot,
+        &mut tool_call_counter,
     )
     .expect("valid event");
 
@@ -179,7 +181,7 @@ fn parser_extracts_text_tool_calls_and_usage() {
     assert_eq!(
         events[1],
         LlmEvent::ToolCall(LlmToolCall {
-            call_id: "google_call_1".to_string(),
+            call_id: "google_call_0".to_string(),
             name: "grep".to_string(),
             arguments: json!({"pattern": "needle"}),
         })
@@ -188,6 +190,63 @@ fn parser_extracts_text_tool_calls_and_usage() {
     assert_eq!(cost.output_tokens, Some(3));
     assert_eq!(cost.cached_input_tokens, Some(2));
     assert_eq!(server_model_slot.as_deref(), Some("gemini-2.5-pro-002"));
+}
+
+#[test]
+fn parallel_tool_calls_across_chunks_get_distinct_ids() {
+    let mut cost = CostSnapshot::default();
+    let mut last_finish_reason: Option<String> = None;
+    let mut reasoning_buf = GoogleReasoningBuffer::default();
+    let mut server_model_slot: Option<String> = None;
+    let mut tool_call_counter: usize = 0;
+    // Two separate SSE events, each carrying functionCall at parts[0].
+    // Pre-fix both got `google_call_0` because the counter was the part
+    // index within a single event; canonicalization then collapsed
+    // both calls and the agent dropped one.
+    let first = parse_google_event(
+        r#"{
+          "candidates":[{
+            "content":{"parts":[
+              {"functionCall":{"name":"grep","args":{"pattern":"first"}}}
+            ]}
+          }]
+        }"#,
+        &mut cost,
+        &mut last_finish_reason,
+        &mut reasoning_buf,
+        &mut server_model_slot,
+        &mut tool_call_counter,
+    )
+    .expect("valid first event");
+    let second = parse_google_event(
+        r#"{
+          "candidates":[{
+            "content":{"parts":[
+              {"functionCall":{"name":"grep","args":{"pattern":"second"}}}
+            ]}
+          }]
+        }"#,
+        &mut cost,
+        &mut last_finish_reason,
+        &mut reasoning_buf,
+        &mut server_model_slot,
+        &mut tool_call_counter,
+    )
+    .expect("valid second event");
+    let LlmEvent::ToolCall(ref first_call) = first[0] else {
+        panic!("expected first ToolCall, got {:?}", first[0]);
+    };
+    let LlmEvent::ToolCall(ref second_call) = second[0] else {
+        panic!("expected second ToolCall, got {:?}", second[0]);
+    };
+    assert_ne!(
+        first_call.call_id, second_call.call_id,
+        "parallel tool calls in separate SSE events must get distinct ids \
+         (got `{}` and `{}`)",
+        first_call.call_id, second_call.call_id
+    );
+    assert_eq!(first_call.call_id, "google_call_0");
+    assert_eq!(second_call.call_id, "google_call_1");
 }
 
 #[test]
@@ -218,6 +277,7 @@ fn parser_surfaces_prompt_feedback_block_reason_as_error() {
     let mut last_finish_reason: Option<String> = None;
     let mut reasoning_buf = GoogleReasoningBuffer::default();
     let mut server_model_slot: Option<String> = None;
+    let mut tool_call_counter: usize = 0;
     let err = parse_google_event(
         r#"{
           "promptFeedback":{"blockReason":"SAFETY"},
@@ -227,6 +287,7 @@ fn parser_surfaces_prompt_feedback_block_reason_as_error() {
         &mut last_finish_reason,
         &mut reasoning_buf,
         &mut server_model_slot,
+        &mut tool_call_counter,
     )
     .expect_err("blocked prompt must surface as ProviderStream error");
     let message = err.to_string();
