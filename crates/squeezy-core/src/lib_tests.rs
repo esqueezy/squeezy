@@ -3006,6 +3006,124 @@ fn cloudflare_ai_gateway_defaults_gateway_id_when_omitted() {
 }
 
 #[test]
+fn cloudflare_ai_gateway_parses_typed_cf_aig_knobs() {
+    // The typed surface lives in `[providers.cloudflare_ai_gateway.cf_ai_gateway]`
+    // so users no longer have to paste raw `cf-aig-*` headers into
+    // `headers` — caching, observability, and per-request cost
+    // overrides each map to a named field that the LLM client
+    // projects onto a `cf-aig-*` header at request time.
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[providers.cloudflare_ai_gateway]
+cloudflare_account_id = "acct-abc"
+
+[providers.cloudflare_ai_gateway.cf_ai_gateway]
+cache_ttl = 600
+skip_cache = false
+event_id = "evt_run_42"
+step = "plan"
+collect_log = true
+skip_log = false
+metadata = "{\"team\":\"sre\"}"
+cache_key = "user-42:probe"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("cloudflare_ai_gateway"),
+        |name| match name {
+            "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+            _ => None,
+        },
+    )
+    .expect("AI Gateway config builds with typed knobs");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("cloudflare_ai_gateway must map to OpenAiCompatible");
+    };
+    let cf = compatible
+        .cf_ai_gateway
+        .as_ref()
+        .expect("cf_ai_gateway block must round-trip");
+    assert_eq!(cf.cache_ttl, Some(600));
+    assert!(!cf.skip_cache);
+    assert_eq!(cf.event_id.as_deref(), Some("evt_run_42"));
+    assert_eq!(cf.step.as_deref(), Some("plan"));
+    assert!(cf.collect_log);
+    assert!(!cf.skip_log);
+    assert_eq!(cf.metadata.as_deref(), Some("{\"team\":\"sre\"}"));
+    assert_eq!(cf.cache_key.as_deref(), Some("user-42:probe"));
+}
+
+#[test]
+fn cloudflare_ai_gateway_typed_knobs_default_to_none() {
+    // Omitting the `[…cf_ai_gateway]` block leaves the typed surface
+    // unset so the gateway's configured defaults stay in effect —
+    // we never invent traffic the user didn't ask for.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "cloudflare_ai_gateway".to_string(),
+        ProviderSettings {
+            cloudflare_account_id: Some("acct-abc".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("cloudflare_ai_gateway"),
+        |name| match name {
+            "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+            _ => None,
+        },
+    )
+    .expect("AI Gateway config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("cloudflare_ai_gateway must map to OpenAiCompatible");
+    };
+    assert!(compatible.cf_ai_gateway.is_none());
+}
+
+#[test]
+fn non_cf_ai_gateway_presets_drop_cf_aig_knobs() {
+    // A stray `[providers.workers_ai.cf_ai_gateway]` table on the
+    // Workers AI preset (which talks to Cloudflare directly, no
+    // gateway in front) must not flow through — those headers
+    // would be silent-no-ops there.
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[providers.cloudflare_workers_ai]
+cloudflare_account_id = "acct-abc"
+
+[providers.cloudflare_workers_ai.cf_ai_gateway]
+cache_ttl = 600
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("cloudflare_workers_ai"),
+        |name| match name {
+            "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+            _ => None,
+        },
+    )
+    .expect("workers AI config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("cloudflare_workers_ai must map to OpenAiCompatible");
+    };
+    assert!(
+        compatible.cf_ai_gateway.is_none(),
+        "cf_ai_gateway knob surface must only light up for the AI Gateway preset",
+    );
+}
+
+#[test]
 fn cloudflare_ai_gateway_user_supplied_header_wins_over_env_token() {
     let mut providers = std::collections::BTreeMap::new();
     let mut headers = std::collections::BTreeMap::new();

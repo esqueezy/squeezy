@@ -2021,6 +2021,72 @@ pub struct OpenAiCompatibleConfig {
     /// shared-endpoint contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_id: Option<String>,
+    /// Cloudflare AI Gateway typed knobs forwarded as `cf-aig-*`
+    /// request headers. Populated when the active preset is
+    /// [`OpenAiCompatiblePreset::CloudflareAiGateway`]; `None` for
+    /// every other preset (so the schema cost is zero for them).
+    /// User-supplied entries in [`Self::extra_headers`] always win
+    /// over the values projected from this struct, matching the
+    /// existing precedence for `cf-aig-authorization`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cf_ai_gateway: Option<CloudflareAiGatewayConfig>,
+}
+
+/// Typed `cf-aig-*` knob surface for the Cloudflare AI Gateway preset.
+/// Each field maps 1:1 to a documented request header that the LLM
+/// client emits at request time (header emission itself lives in
+/// `squeezy-llm::compatible` so the schema layer stays
+/// transport-agnostic). All fields are optional — leaving them unset
+/// preserves the gateway's defaults. See Cloudflare's "AI Gateway
+/// configuration headers" reference for the live list; squeezy
+/// exposes the stable subset that covers caching, observability, and
+/// per-request cost overrides.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudflareAiGatewayConfig {
+    /// `cf-aig-cache-ttl` — overrides the gateway-configured cache
+    /// TTL (seconds). Values are clamped by Cloudflare's bounds
+    /// (60s – 1mo); squeezy passes the integer through so a new
+    /// upper bound lands without a client release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<u32>,
+    /// `cf-aig-skip-cache: true` — bypasses the gateway cache for
+    /// this request. Useful for refresh probes and load tests.
+    #[serde(default, skip_serializing_if = "is_default_bool")]
+    pub skip_cache: bool,
+    /// `cf-aig-event-id` — correlates this request with an upstream
+    /// event in the operator's tracing system. Free-form string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// `cf-aig-step` — names the pipeline step (e.g. `"plan"` /
+    /// `"act"`) so multi-step workflows can be filtered in the
+    /// AI Gateway log explorer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    /// `cf-aig-collect-log: true` — opts into the gateway's
+    /// per-request log capture. Default is the gateway's
+    /// configured policy.
+    #[serde(default, skip_serializing_if = "is_default_bool")]
+    pub collect_log: bool,
+    /// `cf-aig-skip-log: true` — opts the request out of logging
+    /// (e.g. for PII-bearing inputs). Wins over [`Self::collect_log`]
+    /// when both are set; Cloudflare also enforces this precedence.
+    #[serde(default, skip_serializing_if = "is_default_bool")]
+    pub skip_log: bool,
+    /// `cf-aig-metadata` — JSON-stringified blob attached to the
+    /// gateway log entry. Carry-through string; squeezy does not
+    /// validate JSON syntax so newly-added fields land without
+    /// migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+    /// `cf-aig-cache-key` — overrides the cache key derivation so
+    /// callers can dedupe requests across cosmetically-different
+    /// prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
+}
+
+fn is_default_bool(value: &bool) -> bool {
+    !*value
 }
 
 /// Named presets for the OpenAI-compatible (Chat Completions) provider. Each
@@ -2958,6 +3024,12 @@ pub struct ProviderSettings {
     /// `{deployment_id}` in the resolved `base_url`. Ignored by every
     /// other preset.
     pub deployment_id: Option<String>,
+    /// Cloudflare AI Gateway only: typed `cf-aig-*` knob surface.
+    /// Stored as a tri-state nested table — `None` means the TOML
+    /// section omitted the `[providers.cloudflare_ai_gateway.cf_ai_gateway]`
+    /// block entirely, so the higher-precedence layer's value (if any)
+    /// remains in effect during merge.
+    pub cf_ai_gateway: Option<CloudflareAiGatewayConfig>,
 }
 
 impl ProviderSettings {
@@ -2989,6 +3061,7 @@ impl ProviderSettings {
                 "project",
                 "service_tier",
                 "deployment_id",
+                "cf_ai_gateway",
             ],
             source,
             path,
@@ -3035,6 +3108,90 @@ impl ProviderSettings {
                 return Err(SqueezyError::Config(format!(
                     "{source}: {} must be a TOML table of string deployment names",
                     field(path, "deployment_name_map"),
+                )));
+            }
+        };
+        let cf_ai_gateway = match table.get("cf_ai_gateway") {
+            None => None,
+            Some(toml::Value::Table(inner)) => {
+                let inner_path = field(path, "cf_ai_gateway");
+                reject_unknown_keys(
+                    inner,
+                    &[
+                        "cache_ttl",
+                        "skip_cache",
+                        "event_id",
+                        "step",
+                        "collect_log",
+                        "skip_log",
+                        "metadata",
+                        "cache_key",
+                    ],
+                    source,
+                    &inner_path,
+                )?;
+                Some(CloudflareAiGatewayConfig {
+                    cache_ttl: match u64_nonnegative_value(
+                        inner,
+                        "cache_ttl",
+                        source,
+                        &field(&inner_path, "cache_ttl"),
+                    )? {
+                        None => None,
+                        Some(value) if value <= u32::MAX as u64 => Some(value as u32),
+                        Some(value) => {
+                            return Err(SqueezyError::Config(format!(
+                                "{source}: {}: expected an integer fitting in u32 (got {value})",
+                                field(&inner_path, "cache_ttl"),
+                            )));
+                        }
+                    },
+                    skip_cache: bool_value(
+                        inner,
+                        "skip_cache",
+                        source,
+                        &field(&inner_path, "skip_cache"),
+                    )?
+                    .unwrap_or(false),
+                    event_id: string_value(
+                        inner,
+                        "event_id",
+                        source,
+                        &field(&inner_path, "event_id"),
+                    )?,
+                    step: string_value(inner, "step", source, &field(&inner_path, "step"))?,
+                    collect_log: bool_value(
+                        inner,
+                        "collect_log",
+                        source,
+                        &field(&inner_path, "collect_log"),
+                    )?
+                    .unwrap_or(false),
+                    skip_log: bool_value(
+                        inner,
+                        "skip_log",
+                        source,
+                        &field(&inner_path, "skip_log"),
+                    )?
+                    .unwrap_or(false),
+                    metadata: string_value(
+                        inner,
+                        "metadata",
+                        source,
+                        &field(&inner_path, "metadata"),
+                    )?,
+                    cache_key: string_value(
+                        inner,
+                        "cache_key",
+                        source,
+                        &field(&inner_path, "cache_key"),
+                    )?,
+                })
+            }
+            Some(_) => {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {} must be a TOML table of cf-aig-* knobs",
+                    field(path, "cf_ai_gateway"),
                 )));
             }
         };
@@ -3118,6 +3275,7 @@ impl ProviderSettings {
                 source,
                 &field(path, "deployment_id"),
             )?,
+            cf_ai_gateway,
         })
     }
 
@@ -3147,6 +3305,7 @@ impl ProviderSettings {
         replace_if_some(&mut self.project, next.project);
         replace_if_some(&mut self.service_tier, next.service_tier);
         replace_if_some(&mut self.deployment_id, next.deployment_id);
+        replace_if_some(&mut self.cf_ai_gateway, next.cf_ai_gateway);
     }
 }
 
@@ -8941,6 +9100,17 @@ fn build_openai_compatible_config(
     } else {
         None
     };
+    // The cf-aig-* knob surface only lights up for the AI Gateway preset.
+    // Workers AI talks to Cloudflare directly and has no gateway between
+    // squeezy and the model, so forwarding the same knobs there would
+    // produce silent-no-op headers.
+    let cf_ai_gateway = if matches!(preset, OpenAiCompatiblePreset::CloudflareAiGateway) {
+        providers
+            .get(section)
+            .and_then(|settings| settings.cf_ai_gateway.clone())
+    } else {
+        None
+    };
     Ok(ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
         preset,
         api_key_env,
@@ -8951,6 +9121,7 @@ fn build_openai_compatible_config(
         account_id,
         gateway_id,
         deployment_id,
+        cf_ai_gateway,
     }))
 }
 
