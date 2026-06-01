@@ -23,6 +23,7 @@ async fn unavailable_provider_reports_configuration_error() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let mut stream = provider.stream_response(request, CancellationToken::new());
@@ -176,6 +177,7 @@ fn request_context_estimate_reports_budget_when_model_limit_exists() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let estimate =
@@ -223,6 +225,7 @@ fn calibrated_request_context_estimate_uses_provided_bytes_per_token() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let default_estimate =
@@ -581,6 +584,7 @@ fn request_context_estimate_uses_fallback_metadata_for_unknown_models() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let estimate = estimate_request_context("openai", "custom-model", &request, None);
@@ -645,6 +649,7 @@ fn ensure_vision_support_rejects_text_only_model() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let err = request
@@ -684,6 +689,7 @@ fn ensure_vision_support_accepts_vision_capable_model() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     request
@@ -710,6 +716,7 @@ fn ensure_vision_support_is_noop_for_text_only_request() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     request

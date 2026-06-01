@@ -30,6 +30,7 @@ fn request_body_uses_chat_stream_shape() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OllamaProvider::request_body(&request);
@@ -75,6 +76,7 @@ fn request_body_preserves_function_tool_order() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OllamaProvider::request_body(&request);
@@ -318,6 +320,7 @@ fn request_body_emits_image_in_native_images_array() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OllamaProvider::request_body(&request);

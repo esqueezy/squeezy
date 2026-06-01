@@ -33,6 +33,7 @@ fn request_body_uses_responses_streaming_shape() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -91,6 +92,7 @@ fn request_body_serializes_tool_outputs_as_input_items() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -133,6 +135,7 @@ fn request_body_preserves_function_tool_order() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -160,6 +163,7 @@ fn request_body_includes_reasoning_and_text_verbosity_when_set() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -194,6 +198,7 @@ fn request_body_maps_squeezy_verbosity_to_openai_values() {
             output_schema: None,
             parallel_tool_calls: None,
             beta_headers: std::sync::Arc::from(Vec::new()),
+            ..LlmRequest::default()
         };
 
         let body = OpenAiProvider::request_body(&request, "openai");
@@ -220,6 +225,7 @@ fn request_body_emits_prompt_cache_key_when_set() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -244,6 +250,7 @@ fn request_body_omits_prompt_cache_key_when_unset() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -274,6 +281,7 @@ fn request_body_emits_prompt_cache_retention_24h_for_long_retention() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -308,6 +316,7 @@ fn request_body_clamps_prompt_cache_key_to_sixty_four_codepoints() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -341,6 +350,7 @@ fn request_body_preserves_multibyte_prompt_cache_key_under_codepoint_limit() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -368,6 +378,7 @@ fn request_body_clamps_multibyte_prompt_cache_key_at_codepoint_boundary() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -401,6 +412,7 @@ fn affinity_headers_emitted_with_cache_key_carry_full_unclamped_value() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let headers = OpenAiProvider::affinity_headers(&request);
@@ -436,6 +448,7 @@ fn affinity_headers_present_when_cache_spec_carries_key() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let headers = OpenAiProvider::affinity_headers(&request);
@@ -466,6 +479,7 @@ fn affinity_headers_absent_when_no_cache_key() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     assert!(OpenAiProvider::affinity_headers(&request).is_empty());
@@ -493,6 +507,7 @@ fn request_body_omits_prompt_cache_retention_for_short_retention() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -803,6 +818,7 @@ fn request_body_emits_text_format_when_output_schema_set() {
             strict: true,
         }),
         tool_choice: None,
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -833,6 +849,7 @@ fn request_body_omits_text_format_when_output_schema_unset() {
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
         tool_choice: None,
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -867,6 +884,7 @@ fn request_body_emits_text_format_without_verbosity_when_only_schema_set() {
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
         tool_choice: None,
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -893,6 +911,7 @@ fn request_body_emits_parallel_tool_calls_false_when_disabled() {
         parallel_tool_calls: Some(false),
         tool_choice: None,
         beta_headers: Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -918,6 +937,7 @@ fn request_body_omits_parallel_tool_calls_when_unset_or_default_true() {
             parallel_tool_calls: value,
             tool_choice: None,
             beta_headers: Arc::from(Vec::new()),
+            ..LlmRequest::default()
         };
 
         let body = OpenAiProvider::request_body(&request, "openai");
@@ -955,6 +975,7 @@ fn request_body_encodes_image_as_input_image_data_url() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");

@@ -705,6 +705,7 @@ pub(crate) async fn compact_conversation_with_strategy(
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
     let cancel = CancellationToken::new();
     let mut stream = provider.stream_response(request, cancel);

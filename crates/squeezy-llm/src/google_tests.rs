@@ -46,6 +46,7 @@ fn request_body_uses_generate_content_shape() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = GoogleProvider::request_body(&request);
@@ -93,6 +94,7 @@ fn request_body_preserves_function_tool_order() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = GoogleProvider::request_body(&request);
@@ -134,6 +136,7 @@ fn request_body_preserves_function_response_name() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = GoogleProvider::request_body(&request);
@@ -213,6 +216,7 @@ fn request_body_encodes_image_as_inline_data_part() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = GoogleProvider::request_body(&request);

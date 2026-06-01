@@ -177,6 +177,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
     let timeout = Duration::from_secs(reviewer.timeout_secs);
     let response = match tokio::time::timeout(

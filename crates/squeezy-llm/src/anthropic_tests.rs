@@ -35,6 +35,7 @@ fn request_body_uses_messages_streaming_shape() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -86,6 +87,7 @@ fn request_body_preserves_function_tool_order() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -112,6 +114,7 @@ fn request_body_uses_model_limit_when_output_cap_unset() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -150,6 +153,7 @@ fn request_body_maps_tool_roundtrip_messages() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -198,6 +202,7 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -262,6 +267,7 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -325,6 +331,7 @@ fn request_body_places_tool_cache_control_on_last_first_party_tool_when_mcp_tool
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -377,6 +384,7 @@ fn request_body_falls_back_to_last_tool_when_all_advertised_tools_are_mcp() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -412,6 +420,7 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -462,6 +471,7 @@ fn request_body_emits_one_hour_ttl_marker_for_long_retention() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -515,6 +525,7 @@ fn request_body_omits_ttl_for_short_retention_via_legacy_cache_key() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -543,6 +554,7 @@ fn request_body_skips_cache_control_when_cache_key_is_absent() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -583,6 +595,7 @@ fn request_body_omits_thinking_when_max_output_tokens_below_1024_floor() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -621,6 +634,7 @@ fn request_body_emits_thinking_clamped_to_max_output_minus_reply_headroom() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -694,6 +708,7 @@ fn request_body_uses_adaptive_thinking_for_claude_4_6_and_4_7() {
             output_schema: None,
             parallel_tool_calls: None,
             beta_headers: std::sync::Arc::from(Vec::new()),
+            ..LlmRequest::default()
         };
 
         let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -727,6 +742,7 @@ fn request_body_keeps_enabled_thinking_for_legacy_anthropic_models() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -1082,6 +1098,7 @@ fn beta_headers_route_into_http_header() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: betas,
+        ..LlmRequest::default()
     };
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     assert!(
@@ -1145,6 +1162,7 @@ fn oauth_auth_scheme_prepends_claude_code_identity_to_system() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::Oauth);
     let system = body.get("system").expect("system block must be present");
@@ -1189,6 +1207,7 @@ fn api_key_auth_scheme_keeps_system_string_unchanged() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     assert_eq!(body["system"], "user-supplied instructions");
@@ -1265,6 +1284,7 @@ fn request_body_encodes_image_as_base64_content_block() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);

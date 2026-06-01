@@ -50,6 +50,7 @@ async fn anthropic_messages_streaming_costly() -> Result<()> {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let mut stream = provider.stream_response(request, CancellationToken::new());

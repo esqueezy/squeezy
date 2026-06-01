@@ -126,7 +126,7 @@ pub use xai::XaiProvider;
 
 pub type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmRequest {
     pub model: Arc<str>,
     pub instructions: Arc<str>,
@@ -173,6 +173,62 @@ pub struct LlmRequest {
     /// providers ignore the field.
     #[serde(default = "empty_beta_headers")]
     pub beta_headers: Arc<[Arc<str>]>,
+    /// Sampling temperature. `None` leaves the provider's default in
+    /// place (matches squeezy's historical behavior). Per-provider
+    /// lowering to the wire body lands in Phase 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Nucleus-sampling cutoff. `None` leaves the provider's default
+    /// in place. Per-provider lowering lands in Phase 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Deterministic seed forwarded where the provider supports it
+    /// (OpenAI Chat-Completions / Responses, Bedrock Converse `seed`,
+    /// Ollama `options.seed`). `None` keeps generation
+    /// non-deterministic. Per-provider lowering lands in Phase 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// Stop-sequence list (Anthropic `stop_sequences`, OpenAI `stop`,
+    /// Google `stopSequences`, Bedrock `stopSequences`). Empty leaves
+    /// the provider default. Per-provider lowering lands in Phase 4.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
+    /// OpenAI-style `frequency_penalty`. `None` keeps the default.
+    /// Per-provider lowering lands in Phase 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// OpenAI-style `presence_penalty`. `None` keeps the default.
+    /// Per-provider lowering lands in Phase 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+}
+
+impl Default for LlmRequest {
+    fn default() -> Self {
+        Self {
+            model: Arc::from(""),
+            instructions: Arc::from(""),
+            input: Arc::from(Vec::new()),
+            max_output_tokens: None,
+            response_verbosity: None,
+            reasoning_effort: None,
+            previous_response_id: None,
+            cache_key: None,
+            cache: CacheSpec::default(),
+            tools: Arc::from(Vec::new()),
+            store: false,
+            tool_choice: None,
+            output_schema: None,
+            parallel_tool_calls: None,
+            beta_headers: empty_beta_headers(),
+            temperature: None,
+            top_p: None,
+            seed: None,
+            stop: Vec::new(),
+            frequency_penalty: None,
+            presence_penalty: None,
+        }
+    }
 }
 
 fn empty_beta_headers() -> Arc<[Arc<str>]> {
@@ -191,17 +247,7 @@ impl LlmRequest {
             instructions: Arc::from(instructions),
             input: Arc::from(vec![LlmInputItem::UserText(input)]),
             max_output_tokens,
-            response_verbosity: None,
-            reasoning_effort: None,
-            previous_response_id: None,
-            cache_key: None,
-            cache: CacheSpec::default(),
-            tools: Arc::from(Vec::new()),
-            store: false,
-            tool_choice: None,
-            output_schema: None,
-            parallel_tool_calls: None,
-            beta_headers: empty_beta_headers(),
+            ..Self::default()
         }
     }
 

@@ -79,6 +79,7 @@ pub fn echo_request(model: &str, prompt: &str) -> LlmRequest {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     }
 }
 
