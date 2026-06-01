@@ -434,6 +434,12 @@ impl ToolRegistry {
                         stop_search = true;
                         break;
                     }
+                    if matches!(output_mode, GrepOutputMode::FilesWithMatches) {
+                        // The file is already recorded; files-with-matches only
+                        // reports each path once, so skip its remaining lines
+                        // instead of re-running the regex and re-cloning the path.
+                        break;
+                    }
                 }
             } else {
                 let lines: Vec<&str> = text.lines().collect();
@@ -504,6 +510,12 @@ impl ToolRegistry {
                     if output_mode.is_limited(matches.len(), paths.len(), max_matches) {
                         cost.truncated = true;
                         stop_search = true;
+                        break;
+                    }
+                    if matches!(output_mode, GrepOutputMode::FilesWithMatches) {
+                        // The file is already recorded; files-with-matches only
+                        // reports each path once, so skip its remaining lines
+                        // instead of re-running the regex and re-cloning the path.
                         break;
                     }
                 }
