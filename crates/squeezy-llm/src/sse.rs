@@ -27,9 +27,7 @@ impl SseDecoder {
                     // (the boundary itself is part of that prefix), so
                     // resume from byte 0 of the now-shorter buffer.
                     self.scan_pos = 0;
-                    if let Some(data) = decode_sse_event(&event) {
-                        events.push(data);
-                    }
+                    events.extend(decode_sse_event(&event));
                 }
                 None => {
                     // No boundary yet. Park the cursor near the tail so
@@ -52,7 +50,7 @@ impl SseDecoder {
         }
 
         let event = std::mem::take(&mut self.buffer);
-        decode_sse_event(&event).into_iter().collect()
+        decode_sse_event(&event)
     }
 }
 
@@ -71,9 +69,11 @@ fn find_event_boundary(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
     [lf, crlf].into_iter().flatten().min_by_key(|b| b.0)
 }
 
-fn decode_sse_event(bytes: &[u8]) -> Option<String> {
+fn decode_sse_event(bytes: &[u8]) -> Vec<String> {
+    const DONE_SENTINEL: &str = "[DONE]";
     let text = String::from_utf8_lossy(bytes);
-    let mut data_lines = Vec::new();
+    let mut events: Vec<String> = Vec::new();
+    let mut pending: Vec<&str> = Vec::new();
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
         if let Some(data) = line.strip_prefix("data:") {
@@ -88,14 +88,28 @@ fn decode_sse_event(bytes: &[u8]) -> Option<String> {
             if payload.is_empty() {
                 continue;
             }
-            data_lines.push(payload);
+            // L4: if a provider mis-frames the terminal `[DONE]`
+            // sentinel into the same SSE event as a preceding JSON
+            // payload (e.g. `data: {usage:...}\ndata: [DONE]\n\n`),
+            // splitting on the data-line boundary lets the JSON parse
+            // before the sentinel surfaces. Outside this case, multi
+            // `data:` lines are still joined with `\n` per the SSE
+            // spec.
+            if payload == DONE_SENTINEL {
+                if !pending.is_empty() {
+                    events.push(pending.join("\n"));
+                    pending.clear();
+                }
+                events.push(payload.to_string());
+            } else {
+                pending.push(payload);
+            }
         }
     }
-    if data_lines.is_empty() {
-        None
-    } else {
-        Some(data_lines.join("\n"))
+    if !pending.is_empty() {
+        events.push(pending.join("\n"));
     }
+    events
 }
 
 #[cfg(test)]

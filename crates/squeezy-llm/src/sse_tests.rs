@@ -146,3 +146,42 @@ fn lf_boundary_split_across_pushes() {
     let events = decoder.push(b"\n");
     assert_eq!(events, vec!["hi".to_string()]);
 }
+
+#[test]
+fn done_joined_with_prior_json() {
+    // L4: providers occasionally mis-frame `[DONE]` into the same SSE
+    // event as the preceding JSON payload (`data: {usage:...}\ndata:
+    // [DONE]\n\n`). Joining both with `\n` produces invalid JSON that
+    // crashes the chat-completions parser. Split into two events so
+    // the JSON parses cleanly before the sentinel surfaces.
+    let mut decoder = SseDecoder::default();
+    let events = decoder.push(b"data: {\"usage\":{\"total_tokens\":42}}\ndata: [DONE]\n\n");
+    assert_eq!(
+        events,
+        vec![
+            "{\"usage\":{\"total_tokens\":42}}".to_string(),
+            "[DONE]".to_string(),
+        ],
+        "JSON payload and [DONE] must arrive as separate events"
+    );
+}
+
+#[test]
+fn done_alone_remains_a_single_event() {
+    // L4: the common shape `data: [DONE]\n\n` must still yield exactly
+    // one event so downstream consumers don't see a spurious empty
+    // payload before the sentinel.
+    let mut decoder = SseDecoder::default();
+    let events = decoder.push(b"data: [DONE]\n\n");
+    assert_eq!(events, vec!["[DONE]".to_string()]);
+}
+
+#[test]
+fn multiple_data_lines_still_joined_when_no_done() {
+    // L4: ordinary multi-`data:` events must still be joined with `\n`
+    // per the SSE spec. The split rule applies only when the literal
+    // `[DONE]` sentinel is present in the frame.
+    let mut decoder = SseDecoder::default();
+    let events = decoder.push(b"data: first\ndata: second\ndata: third\n\n");
+    assert_eq!(events, vec!["first\nsecond\nthird".to_string()]);
+}
