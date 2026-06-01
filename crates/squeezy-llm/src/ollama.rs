@@ -230,6 +230,47 @@ pub async fn fetch_ollama_context_window(base_url: &str, model: &str) -> Option<
     ollama_context_window_from_show(&value)
 }
 
+/// Ping `/api/version` to detect a running Ollama server. Returns the
+/// server-reported version string on success, or a connection-refused-aware
+/// `ProviderRequest` error so callers can render a friendlier
+/// "is `ollama serve` running?" hint instead of a raw transport message.
+//
+// Re-exported by `crates/squeezy-llm/src/lib.rs` in the same follow-up that
+// adds the model-picker startup probe; in-crate dead-code lint suppressed
+// until that re-export lands.
+#[allow(dead_code)]
+pub async fn probe_server(base_url: &str) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .map_err(|err| SqueezyError::ProviderRequest(format!("ollama probe client: {err}")))?;
+    let url = api_endpoint_url(base_url, "version");
+    let response = client.get(url).send().await.map_err(|err| {
+        if err.is_connect() {
+            SqueezyError::ProviderRequest(format!(
+                "could not reach Ollama at {base_url} — is `ollama serve` running? ({err})"
+            ))
+        } else {
+            SqueezyError::ProviderRequest(format!("ollama probe failed: {err}"))
+        }
+    })?;
+    if !response.status().is_success() {
+        return Err(SqueezyError::ProviderRequest(format!(
+            "ollama probe {} at {base_url}",
+            response.status()
+        )));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|err| SqueezyError::ProviderRequest(format!("ollama probe decode: {err}")))?;
+    Ok(body
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string())
+}
+
 /// Fetch the set of capabilities Ollama advertises for `model` via `/api/show`.
 ///
 /// Returns `None` on any transport / parse failure (caller should treat as
@@ -455,7 +496,7 @@ impl LlmProvider for OllamaProvider {
                 })?;
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
-                for line in decoder.push(&chunk) {
+                for line in decoder.push(&chunk)? {
                     let parsed = parse_ollama_line(&line, &mut server_model_slot)?;
                     if let Some(server) = server_model_slot.take()
                         && let Some(echo) = server_model_echo.observe(&request.model, &server)
@@ -565,13 +606,20 @@ fn ollama_messages(instructions: &str, input: &[LlmInputItem]) -> Value {
     Value::Array(messages)
 }
 
+/// Upper bound for a single NDJSON line accumulated by [`JsonLineDecoder`].
+/// Ollama's lines are typically a few hundred bytes; tool-call JSON blocks
+/// can climb but stay well under a megabyte. A misbehaving server feeding
+/// `\n`-less bytes indefinitely would otherwise OOM. 1 MB matches the
+/// effective ceiling on legitimate Ollama frames.
+const MAX_NDJSON_LINE_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Default)]
 struct JsonLineDecoder {
     buffer: Vec<u8>,
 }
 
 impl JsonLineDecoder {
-    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>> {
         self.buffer.extend_from_slice(bytes);
         let mut lines = Vec::new();
         while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
@@ -583,7 +631,12 @@ impl JsonLineDecoder {
                 }
             }
         }
-        lines
+        if self.buffer.len() > MAX_NDJSON_LINE_BYTES {
+            return Err(SqueezyError::ProviderStream(format!(
+                "Ollama NDJSON line exceeded {MAX_NDJSON_LINE_BYTES} bytes without a newline",
+            )));
+        }
+        Ok(lines)
     }
 
     fn finish(&mut self) -> Vec<String> {
@@ -822,7 +875,7 @@ pub fn pull_model_with_transport(
             })?;
             let Some(chunk) = next else { break; };
             let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
-            for line in decoder.push(&chunk) {
+            for line in decoder.push(&chunk)? {
                 match parse_pull_line(&line)? {
                     Some(event @ PullEvent::Success) => {
                         yield event;

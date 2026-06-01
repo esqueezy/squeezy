@@ -319,6 +319,23 @@ fn parser_marks_invalid_string_encoded_tool_arguments() {
 }
 
 #[test]
+fn ndjson_decoder_caps_line_size_at_one_megabyte() {
+    let mut decoder = JsonLineDecoder::default();
+    // 1.5 MB of newline-less bytes with no terminating `\n`.
+    let oversized = vec![b'a'; MAX_NDJSON_LINE_BYTES + (MAX_NDJSON_LINE_BYTES / 2)];
+    let err = decoder
+        .push(&oversized)
+        .expect_err("oversized line surfaces error");
+    let SqueezyError::ProviderStream(message) = err else {
+        panic!("expected ProviderStream, got {err:?}");
+    };
+    assert!(
+        message.contains("exceeded"),
+        "expected size cap message, got {message}"
+    );
+}
+
+#[test]
 fn parser_treats_load_and_unload_done_reasons_as_noop() {
     // Ollama emits `{"done":true,"done_reason":"load"}` and `"unload"`
     // housekeeping frames around model lifecycle. They are not turn
