@@ -1845,12 +1845,12 @@ fn preset_full_tier_matches_documented_set() {
         .copied()
         .filter(|p| p.is_full_tier())
         .collect();
+    // PortKey dropped from full-tier per K-07 (no curated models.json entries).
     assert_eq!(
         full,
         vec![
             OpenAiCompatiblePreset::OpenRouter,
             OpenAiCompatiblePreset::Vercel,
-            OpenAiCompatiblePreset::PortKey,
             OpenAiCompatiblePreset::Groq,
             OpenAiCompatiblePreset::XAi,
             OpenAiCompatiblePreset::DeepSeek,
