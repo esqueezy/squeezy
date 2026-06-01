@@ -388,7 +388,15 @@ impl LlmProvider for OpenAiProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
-                    let parsed = parse_openai_event(&event, &mut reasoning_acc)?;
+                    let parsed = parse_openai_event(&event, &mut reasoning_acc);
+                    // H-06: drain pre-yield (`ContextOverflow` etc.)
+                    // *before* propagating either the parsed event or a
+                    // terminal error so the agent's recovery layer sees
+                    // the structured signal first.
+                    for pre in reasoning_acc.drain_pre_yield() {
+                        yield pre;
+                    }
+                    let parsed = parsed?;
                     if let Some(server) = reasoning_acc.take_server_model()
                         && let Some(echo) = server_model_echo.observe(&request.model, &server)
                     {
@@ -404,7 +412,11 @@ impl LlmProvider for OpenAiProvider {
             }
 
             for event in decoder.finish() {
-                let parsed = parse_openai_event(&event, &mut reasoning_acc)?;
+                let parsed = parse_openai_event(&event, &mut reasoning_acc);
+                for pre in reasoning_acc.drain_pre_yield() {
+                    yield pre;
+                }
+                let parsed = parsed?;
                 if let Some(server) = reasoning_acc.take_server_model()
                     && let Some(echo) = server_model_echo.observe(&request.model, &server)
                 {
@@ -469,6 +481,13 @@ pub(crate) struct ReasoningAccumulator {
     /// produces the canonical `LlmEvent::ToolCall` with the fully
     /// assembled arguments, so consumers may also ignore the deltas.
     tool_call_names: std::collections::HashMap<String, String>,
+    /// Events the parser wants to yield *before* the next return value
+    /// fires (typically an [`LlmEvent::ContextOverflow`] preceding the
+    /// `response.failed` terminal error — H-06). The outer stream loop
+    /// drains this after every `parse_openai_event` call (including the
+    /// error path) so the signal reaches consumers before the
+    /// `SqueezyError::ProviderStream` terminal value lands.
+    pre_yield: std::collections::VecDeque<LlmEvent>,
 }
 
 impl ReasoningAccumulator {
@@ -487,6 +506,17 @@ impl ReasoningAccumulator {
 
     pub(crate) fn take_server_model(&mut self) -> Option<String> {
         self.server_model.take()
+    }
+
+    /// Drain queued events the parser wants to surface ahead of the
+    /// next return value. Used by H-06's `response.failed` path to
+    /// emit a [`LlmEvent::ContextOverflow`] before the terminal
+    /// `SqueezyError::ProviderStream` value lands. The outer stream
+    /// loop calls this after every `parse_openai_event` invocation —
+    /// including the error path — so the pre-yield signal always
+    /// reaches consumers.
+    pub(crate) fn drain_pre_yield(&mut self) -> std::collections::vec_deque::IntoIter<LlmEvent> {
+        std::mem::take(&mut self.pre_yield).into_iter()
     }
 }
 
@@ -710,13 +740,79 @@ pub(crate) fn parse_openai_event(
             }))
         }
         "error" | "response.failed" => {
-            let message = value
-                .get("error")
-                .and_then(|error| error.get("message"))
+            // H-06: parse the `error.{code,message,param}` envelope and
+            // branch on `code` so the agent's recovery layer sees a
+            // structured signal instead of a flat stringified error.
+            // `response.failed.response.error` is the canonical envelope
+            // (codex models the same shape in `codex-rs/codex-api/src/sse/responses.rs`).
+            // Stale-`previous_response_id` (M-05) is handled here too —
+            // surfaced with a `previous_response_not_found:` marker prefix
+            // so the agent layer can detect it without a SqueezyError
+            // schema add (squeezy-core scope, Phase 4I).
+            let response_error = value
+                .get("response")
+                .and_then(|response| response.get("error"));
+            let error_obj = response_error
+                .or_else(|| value.get("error"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let code = error_obj
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let message = error_obj
+                .get("message")
                 .and_then(Value::as_str)
                 .or_else(|| value.get("message").and_then(Value::as_str))
                 .unwrap_or("OpenAI stream error");
-            Err(SqueezyError::ProviderStream(message.to_string()))
+            let param = error_obj.get("param").and_then(Value::as_str);
+
+            // Stitch a descriptive prefix that downstream marker-prefix
+            // detectors (M-05 stale `previous_response_id`, agent's
+            // overflow recovery) can match without a SqueezyError schema
+            // add. Falls back to the bare provider message when no
+            // recognised code lands.
+            let prefixed = match code {
+                "context_length_exceeded" => {
+                    // Push the canonical `ContextOverflow` event ahead of
+                    // the terminal error so the agent's compact-and-
+                    // retry recovery fires before the bare provider
+                    // error reaches the turn loop.
+                    reasoning_acc
+                        .pre_yield
+                        .push_back(LlmEvent::ContextOverflow {
+                            provider: "openai".to_string(),
+                            signal: crate::OverflowSignal::ErrorPattern(message.to_string()),
+                        });
+                    format!("context_length_exceeded: {message}")
+                }
+                "rate_limit_exceeded" => {
+                    // Embed any "try again in 3s" hint the upstream
+                    // ships in the message so the agent's retry layer
+                    // can honor the Retry-After-style delay.
+                    format!("rate_limit_exceeded: {message}")
+                }
+                "insufficient_quota" => format!("insufficient_quota: {message}"),
+                "cyber_policy" => format!("cyber_policy: {message}"),
+                "previous_response_not_found" => {
+                    // M-05: mark stale `previous_response_id` 404s so
+                    // the agent layer can drop the stored id and resend
+                    // the materialized input. Squeezy-core's
+                    // `SqueezyError` schema add lives in Phase 4I; the
+                    // marker prefix keeps detection working today.
+                    format!("previous_response_not_found: {message}")
+                }
+                "" => message.to_string(),
+                other => format!("{other}: {message}"),
+            };
+            // Stash `param` in the message tail when present so debug
+            // dashboards keep the field that points at the offending
+            // request slot.
+            let final_message = match param {
+                Some(p) if !p.is_empty() => format!("{prefixed} (param: {p})"),
+                _ => prefixed,
+            };
+            Err(SqueezyError::ProviderStream(final_message))
         }
         _ => {
             tracing::debug!(

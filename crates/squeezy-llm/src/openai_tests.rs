@@ -633,6 +633,105 @@ fn parser_surfaces_error_events() {
 }
 
 #[test]
+fn parser_classifies_context_length_exceeded_and_queues_overflow_event() {
+    // H-06: `response.failed` with `error.code = context_length_exceeded`
+    // MUST queue a `ContextOverflow` LlmEvent on the accumulator (the
+    // outer loop drains it before propagating the error) and surface a
+    // prefixed error string so the agent's overflow recovery sees the
+    // canonical signal instead of a bare provider error.
+    let mut acc = ReasoningAccumulator::default();
+    let err = parse_openai_event(
+        r#"{
+          "type":"response.failed",
+          "response":{
+            "id":"resp_overflow",
+            "error":{"code":"context_length_exceeded","message":"This model's maximum context length is 200000 tokens."}
+          }
+        }"#,
+        &mut acc,
+    )
+    .expect_err("response.failed surfaces ProviderStream");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("context_length_exceeded"),
+        "expected prefixed code in error, got {err_str}",
+    );
+
+    let queued: Vec<LlmEvent> = acc.drain_pre_yield().collect();
+    assert_eq!(
+        queued.len(),
+        1,
+        "exactly one ContextOverflow event must be queued"
+    );
+    match &queued[0] {
+        LlmEvent::ContextOverflow { provider, signal } => {
+            assert_eq!(provider, "openai");
+            assert!(matches!(signal, crate::OverflowSignal::ErrorPattern(_)));
+        }
+        other => panic!("expected ContextOverflow, got {other:?}"),
+    }
+}
+
+#[test]
+fn parser_classifies_rate_limit_exceeded_with_prefix() {
+    let mut acc = ReasoningAccumulator::default();
+    let err = parse_openai_event(
+        r#"{
+          "type":"response.failed",
+          "response":{
+            "error":{"code":"rate_limit_exceeded","message":"Rate limit reached. Please try again in 3s."}
+          }
+        }"#,
+        &mut acc,
+    )
+    .expect_err("rate-limit surfaces error");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("rate_limit_exceeded"),
+        "expected rate_limit_exceeded prefix, got {err_str}",
+    );
+    assert!(err_str.contains("3s"));
+}
+
+#[test]
+fn parser_classifies_previous_response_not_found_with_marker_prefix() {
+    // M-05: stale `previous_response_id` 404 MUST surface with a
+    // `previous_response_not_found:` marker prefix so the agent layer
+    // can detect it without a SqueezyError schema add.
+    let mut acc = ReasoningAccumulator::default();
+    let err = parse_openai_event(
+        r#"{
+          "type":"response.failed",
+          "response":{
+            "error":{"code":"previous_response_not_found","message":"Response resp_old not found."}
+          }
+        }"#,
+        &mut acc,
+    )
+    .expect_err("stale id surfaces error");
+    assert!(
+        err.to_string().contains("previous_response_not_found"),
+        "expected marker prefix, got {err}",
+    );
+}
+
+#[test]
+fn parser_attaches_error_param_when_present() {
+    let mut acc = ReasoningAccumulator::default();
+    let err = parse_openai_event(
+        r#"{
+          "type":"response.failed",
+          "response":{
+            "error":{"code":"invalid_request","message":"bad","param":"input[0]"}
+          }
+        }"#,
+        &mut acc,
+    )
+    .expect_err("error");
+    assert!(err.to_string().contains("(param: input[0])"));
+}
+
+#[test]
 fn parser_reconciles_output_text_done_with_no_divergence() {
     // H-08: the common case — every `output_text.delta` was observed,
     // the `output_text.done` text matches the cumulative buffer, no
