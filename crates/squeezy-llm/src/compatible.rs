@@ -1027,11 +1027,28 @@ struct StreamState {
     server_model: Option<String>,
 }
 
+/// Upper bound on the accumulated tool-call arguments string for a
+/// single call. H-25: a misbehaving upstream that keeps streaming
+/// `function.arguments` deltas without ever sending a
+/// `finish_reason` could grow the buffer to gigabytes before the
+/// idle timeout fires. 1 MiB is well above any real tool's
+/// argument payload (OpenAI documents 8 KiB as the practical limit)
+/// while still leaving ample headroom for adversarial inputs to
+/// fall harmlessly into the invalid-arguments path.
+const MAX_TOOL_ARGUMENTS_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Default)]
 struct PartialToolCall {
     call_id: Option<String>,
     name: Option<String>,
     arguments: String,
+    /// Latches `true` the first time an arguments delta is dropped
+    /// because the accumulator would have exceeded
+    /// [`MAX_TOOL_ARGUMENTS_BYTES`]. `drain_tool_calls` consults
+    /// this to surface an `INVALID_TOOL_ARGUMENTS_*` envelope
+    /// instead of pretending the call succeeded with truncated
+    /// args.
+    arguments_overflow: bool,
 }
 
 impl StreamState {
@@ -1082,7 +1099,30 @@ impl StreamState {
                 self.saw_visible_output = true;
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                entry.arguments.push_str(arguments);
+                // H-25: cap the accumulator so a pathological
+                // stream that keeps shipping arguments deltas
+                // without ever sending finish_reason cannot grow
+                // the buffer to gigabytes. Once we cross the
+                // ceiling we keep parsing the rest of the stream
+                // (so finish_reason / [DONE] still land) but stop
+                // appending — `drain_tool_calls` will surface the
+                // INVALID_TOOL_ARGUMENTS envelope so the agent
+                // loop can decide to retry or abort.
+                if entry.arguments.len().saturating_add(arguments.len()) > MAX_TOOL_ARGUMENTS_BYTES
+                {
+                    if !entry.arguments_overflow {
+                        tracing::warn!(
+                            target: "squeezy_llm::compatible",
+                            choice_index,
+                            tool_index = resolved_tool_index,
+                            cap_bytes = MAX_TOOL_ARGUMENTS_BYTES,
+                            "tool-call arguments accumulator hit cap; further deltas dropped"
+                        );
+                    }
+                    entry.arguments_overflow = true;
+                } else {
+                    entry.arguments.push_str(arguments);
+                }
             }
         }
     }
@@ -1130,7 +1170,27 @@ impl StreamState {
             // so the existing `INVALID_TOOL_ARGUMENTS_*` markers continue
             // to flow through.
             let arguments = if partial.arguments.is_empty() {
+                // M-29 (Phase 4FH-AB): an empty arguments string from
+                // a zero-arg tool call surfaces as `Value::Null` so the
+                // dispatcher can distinguish "model sent no arguments"
+                // from "model sent `{}`". H-25 cap does not apply here
+                // because the cap only latches when *deltas* arrive.
                 Value::Null
+            } else if partial.arguments_overflow {
+                // H-25: if the accumulator hit the byte cap mid-stream
+                // the args we have are necessarily truncated. Surface
+                // the synthetic invalid-arguments envelope so the
+                // agent loop can decide what to do (retry / abort)
+                // instead of feeding the model a half-JSON blob that
+                // would parse-fail later in the tool dispatcher.
+                let arguments_text = partial.arguments;
+                json!({
+                    INVALID_TOOL_ARGUMENTS_KEY: true,
+                    INVALID_TOOL_ARGUMENTS_ERROR_KEY: format!(
+                        "tool-call arguments exceeded {MAX_TOOL_ARGUMENTS_BYTES} bytes; truncated"
+                    ),
+                    INVALID_TOOL_ARGUMENTS_RAW_KEY: arguments_text,
+                })
             } else {
                 let arguments_text = partial.arguments;
                 serde_json::from_str::<Value>(&arguments_text).unwrap_or_else(|err| {

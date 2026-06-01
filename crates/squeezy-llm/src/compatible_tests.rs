@@ -612,6 +612,64 @@ fn parse_chat_event_accumulates_tool_call_across_deltas() {
 }
 
 #[test]
+fn accumulate_tool_call_caps_arguments_at_one_mib() {
+    // H-25: a misbehaving upstream that keeps shipping
+    // function.arguments deltas without ever closing the call
+    // must NOT be able to grow the accumulator to gigabytes.
+    // After the 1 MiB cap we drop the deltas but keep parsing
+    // the stream so finish_reason / [DONE] still land. The
+    // emitted tool call surfaces an INVALID_TOOL_ARGUMENTS
+    // envelope so the agent loop can react.
+    let mut state = StreamState::default();
+    parse_chat_event(
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"oom"}}]}}]}"#,
+        &mut state,
+    )
+    .expect("open call");
+    // Push ~2 MiB of garbage in 4 KiB chunks. The accumulator
+    // must clamp at 1 MiB.
+    let chunk = "x".repeat(4096);
+    let payload = format!(
+        r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"function":{{"arguments":"{chunk}"}}}}]}}}}]}}"#
+    );
+    for _ in 0..520 {
+        parse_chat_event(&payload, &mut state).expect("delta keeps parsing");
+    }
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        &mut state,
+    )
+    .expect("finish");
+    let LlmEvent::ToolCall(call) = events
+        .iter()
+        .find(|e| matches!(e, LlmEvent::ToolCall(_)))
+        .expect("ToolCall event")
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        call.arguments[crate::INVALID_TOOL_ARGUMENTS_KEY],
+        Value::Bool(true),
+        "overflow must surface the invalid-arguments envelope"
+    );
+    let err_text = call.arguments[crate::INVALID_TOOL_ARGUMENTS_ERROR_KEY]
+        .as_str()
+        .expect("error text");
+    assert!(
+        err_text.contains("exceeded") && err_text.contains("bytes"),
+        "error text must explain the cap: {err_text}"
+    );
+    let raw = call.arguments[crate::INVALID_TOOL_ARGUMENTS_RAW_KEY]
+        .as_str()
+        .expect("raw text preserved");
+    assert!(
+        raw.len() <= 1024 * 1024,
+        "raw text must not exceed the cap: {}",
+        raw.len()
+    );
+}
+
+#[test]
 fn parse_chat_event_marks_invalid_tool_arguments() {
     let mut state = StreamState::default();
     parse_chat_event(
