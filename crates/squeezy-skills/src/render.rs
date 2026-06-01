@@ -219,12 +219,9 @@ pub fn render_skill_preamble(
             summary.source.as_str(),
             summary.name
         );
-        let mut attempt = lines.clone();
-        attempt.push(line);
-        let body = wrap_preamble(&attempt);
-        if char_count(&body) <= budget_chars {
-            lines = attempt;
-        } else {
+        lines.push(line);
+        if char_count(&wrap_preamble(&lines)) > budget_chars {
+            lines.pop();
             omitted += 1;
         }
     }
