@@ -193,6 +193,65 @@ fn parser_extracts_text_tool_calls_and_usage() {
 }
 
 #[test]
+fn function_response_uses_error_key_when_is_error_set() {
+    let request = LlmRequest {
+        model: "gemini-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::FunctionCall {
+                call_id: "call-1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle"}),
+            },
+            LlmInputItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: "permission denied".to_string(),
+                content_parts: None,
+                is_error: true,
+            },
+        ]),
+        ..LlmRequest::default()
+    };
+    let body = GoogleProvider::request_body(&request);
+    let resp = &body["contents"][1]["parts"][0]["functionResponse"]["response"];
+    assert!(
+        resp.get("error").is_some(),
+        "is_error=true must produce `error` key, got {resp}"
+    );
+    assert!(
+        resp.get("output").is_none(),
+        "is_error=true must not produce `output` key, got {resp}"
+    );
+    assert_eq!(resp["error"], "permission denied");
+}
+
+#[test]
+fn function_response_uses_output_key_when_not_error() {
+    let request = LlmRequest {
+        model: "gemini-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::FunctionCall {
+                call_id: "call-1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle"}),
+            },
+            LlmInputItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: "match: foo".to_string(),
+                content_parts: None,
+                is_error: false,
+            },
+        ]),
+        ..LlmRequest::default()
+    };
+    let body = GoogleProvider::request_body(&request);
+    let resp = &body["contents"][1]["parts"][0]["functionResponse"]["response"];
+    assert_eq!(resp["output"], "match: foo");
+    assert!(resp.get("error").is_none());
+}
+
+#[test]
 fn sanitize_for_gemini_drops_unsupported_keys_and_synthesizes_properties() {
     let raw = json!({
         "type": "object",

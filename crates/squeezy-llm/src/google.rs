@@ -368,18 +368,29 @@ fn google_contents(input: &[LlmInputItem]) -> Value {
                 }));
             }
             LlmInputItem::FunctionCallOutput {
-                call_id, output, ..
+                call_id,
+                output,
+                is_error,
+                ..
             } => {
                 let name = tool_names_by_call_id
                     .get(call_id.as_str())
                     .copied()
                     .unwrap_or("tool");
+                // Gemini's `functionResponse.response` switches its
+                // shape on success vs failure: `{output: str}` on
+                // success, `{error: str}` on failure. Treating every
+                // result as success made the model re-call after
+                // errors. Use the Phase 1 `is_error` flag to pick the
+                // right key. Reference: opencode / pi google-shared
+                // protocol.
+                let key = if *is_error { "error" } else { "output" };
                 contents.push(json!({
-                "role": "function",
-                "parts": [{"functionResponse": {
-                    "name": name,
-                    "response": {"output": output},
-                }}],
+                    "role": "function",
+                    "parts": [{"functionResponse": {
+                        "name": name,
+                        "response": {key: output},
+                    }}],
                 }));
             }
             LlmInputItem::Image { media_type, bytes } => contents.push(json!({
