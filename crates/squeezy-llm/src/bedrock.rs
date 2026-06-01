@@ -13,10 +13,11 @@ use aws_sdk_bedrockruntime::{
     primitives::event_stream::EventReceiver,
     types::{
         CachePointBlock, CachePointType, CacheTtl, ContentBlock, ContentBlockDelta,
-        ContentBlockStart, ConversationRole, ImageBlock, ImageFormat, ImageSource,
-        InferenceConfiguration, Message, ReasoningContentBlock, ReasoningContentBlockDelta,
-        ReasoningTextBlock, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
-        ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
+        ContentBlockStart, ConversationRole, DocumentBlock, DocumentFormat, DocumentSource,
+        ImageBlock, ImageFormat, ImageSource, InferenceConfiguration, Message,
+        ReasoningContentBlock, ReasoningContentBlockDelta, ReasoningTextBlock, SystemContentBlock,
+        Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock,
+        ToolSpecification, ToolUseBlock,
     },
 };
 use aws_smithy_types::{Blob, Document, Number};
@@ -852,16 +853,17 @@ pub(crate) fn conversation_messages(
             }
             // Reasoning items from other providers are dropped when replaying to Bedrock.
             LlmInputItem::Reasoning(_) => {}
-            // Bedrock Converse accepts document content blocks up to
-            // 4.5 MB (pdf/csv/docx/xlsx/html/txt/md). Per-provider
-            // lowering lands in Phase 4; for now we debug-log and
-            // skip so the request still ships.
-            LlmInputItem::Document { name, .. } => {
-                tracing::debug!(
-                    target: "squeezy_llm::bedrock",
-                    name = name.as_str(),
-                    "bedrock document content block not yet implemented; skipping",
-                );
+            LlmInputItem::Document {
+                media_type,
+                name,
+                bytes,
+            } => {
+                let document = bedrock_document_block(media_type, name, bytes)?;
+                push_message(
+                    &mut messages,
+                    ConversationRole::User,
+                    ContentBlock::Document(document),
+                )?;
             }
         }
     }
@@ -1083,6 +1085,95 @@ pub(crate) fn bedrock_image_block(media_type: &str, bytes: &Arc<[u8]>) -> Result
         .map_err(|err| {
             SqueezyError::ProviderRequest(format!("failed to build Bedrock image block: {err}"))
         })
+}
+
+/// Build a Bedrock `DocumentBlock` from an `LlmInputItem::Document`
+/// payload. Maps canonical MIME strings (and a couple of common
+/// vendor-prefixed equivalents) to the SDK's `DocumentFormat` enum and
+/// wraps the raw bytes in a `Blob` so the Converse API receives the
+/// binary payload directly. Returns a structured error for unknown
+/// MIME types instead of silently dropping the document.
+///
+/// The Bedrock Converse API enforces a strict allow-list on the `name`
+/// field (alphanumeric, single spaces, hyphens, parentheses, square
+/// brackets) and rejects anything else with `ValidationException`.
+/// We canonicalize here so a callers' arbitrary filename
+/// (`/tmp/foo bar.pdf`) round-trips into a Bedrock-safe `name` instead
+/// of failing every request.
+pub(crate) fn bedrock_document_block(
+    media_type: &str,
+    name: &str,
+    bytes: &Arc<[u8]>,
+) -> Result<DocumentBlock> {
+    let format = match media_type.to_ascii_lowercase().as_str() {
+        "application/pdf" | "application/x-pdf" => DocumentFormat::Pdf,
+        "text/csv" | "application/csv" => DocumentFormat::Csv,
+        "application/msword" => DocumentFormat::Doc,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            DocumentFormat::Docx
+        }
+        "application/vnd.ms-excel" => DocumentFormat::Xls,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => DocumentFormat::Xlsx,
+        "text/html" | "application/xhtml+xml" => DocumentFormat::Html,
+        "text/markdown" | "text/x-markdown" => DocumentFormat::Md,
+        "text/plain" => DocumentFormat::Txt,
+        other => {
+            return Err(SqueezyError::ProviderRequest(format!(
+                "Bedrock does not support document MIME `{other}`; expected one of \
+                 application/pdf, text/csv, application/msword, \
+                 application/vnd.openxmlformats-officedocument.wordprocessingml.document, \
+                 application/vnd.ms-excel, \
+                 application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, \
+                 text/html, text/markdown, text/plain",
+            )));
+        }
+    };
+    let canonical_name = sanitize_bedrock_document_name(name);
+    DocumentBlock::builder()
+        .format(format)
+        .name(canonical_name)
+        .source(DocumentSource::Bytes(Blob::new(bytes.as_ref().to_vec())))
+        .build()
+        .map_err(|err| {
+            SqueezyError::ProviderRequest(format!("failed to build Bedrock document block: {err}"))
+        })
+}
+
+/// Canonicalize a caller-supplied filename for Bedrock's document
+/// `name` field. The Converse API rejects anything outside
+/// alphanumerics, single spaces, hyphens, parentheses, or square
+/// brackets with `ValidationException`. We replace disallowed runs
+/// with a single hyphen, collapse multi-space runs, and trim
+/// surrounding whitespace so the name still resembles the caller's
+/// intent. An entirely-disallowed input falls back to `document` so
+/// the request can still ship.
+fn sanitize_bedrock_document_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_replaced = false;
+    let mut prev_space = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '(' | ')' | '[' | ']') {
+            out.push(c);
+            prev_replaced = false;
+            prev_space = false;
+        } else if c == ' ' {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+                prev_space = true;
+            }
+            prev_replaced = false;
+        } else if !prev_replaced && !out.is_empty() {
+            out.push('-');
+            prev_replaced = true;
+            prev_space = false;
+        }
+    }
+    let trimmed = out.trim_matches(|c: char| c == ' ' || c == '-').to_string();
+    if trimmed.is_empty() {
+        "document".to_string()
+    } else {
+        trimmed
+    }
 }
 
 pub(crate) fn json_to_document(value: &Value) -> Document {

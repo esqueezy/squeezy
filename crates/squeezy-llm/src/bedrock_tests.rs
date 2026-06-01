@@ -17,10 +17,11 @@ use squeezy_core::{BedrockConfig, ProviderTransportConfig};
 
 use super::{
     BedrockProvider, BedrockStreamState, apply_inference_profile_prefix,
-    apply_thinking_extra_fields, bedrock_effort_label, bedrock_request_metadata_map,
-    bedrock_tool_choice, build_bedrock_client, compute_thinking_extra_fields,
-    conversation_messages, current_bearer_token, handle_bedrock_event, inference_configuration,
-    json_to_document, region_prefix, system_blocks, tool_configuration,
+    apply_thinking_extra_fields, bedrock_document_block, bedrock_effort_label,
+    bedrock_request_metadata_map, bedrock_tool_choice, build_bedrock_client,
+    compute_thinking_extra_fields, conversation_messages, current_bearer_token,
+    handle_bedrock_event, inference_configuration, json_to_document, region_prefix,
+    sanitize_bedrock_document_name, system_blocks, tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{CacheRetention, LlmInputItem, LlmRequest, LlmToolSpec};
@@ -1174,4 +1175,142 @@ fn tool_configuration_forwards_tool_choice() {
         choice,
         aws_sdk_bedrockruntime::types::ToolChoice::Any(_)
     ));
+}
+
+#[test]
+fn bedrock_document_block_round_trips_pdf_bytes() {
+    use aws_sdk_bedrockruntime::types::{DocumentFormat, DocumentSource};
+    let bytes: Arc<[u8]> = Arc::from(b"%PDF-1.4 fake".to_vec());
+    let block = bedrock_document_block("application/pdf", "report.pdf", &bytes)
+        .expect("pdf must round-trip");
+    assert_eq!(block.format(), &DocumentFormat::Pdf);
+    // The Bedrock name allow-list rejects `.` so `report.pdf` becomes
+    // `report-pdf`; the sanitizer keeps the caller's intent visible.
+    assert_eq!(block.name(), "report-pdf");
+    let source = block.source().expect("source must be set");
+    let blob = source.as_bytes().expect("Bytes source");
+    assert_eq!(blob.as_ref(), bytes.as_ref());
+}
+
+#[test]
+fn bedrock_document_block_maps_each_supported_mime() {
+    use aws_sdk_bedrockruntime::types::DocumentFormat;
+    let bytes: Arc<[u8]> = Arc::from(vec![1u8, 2, 3]);
+    for (mime, expected) in [
+        ("application/pdf", DocumentFormat::Pdf),
+        ("application/x-pdf", DocumentFormat::Pdf),
+        ("text/csv", DocumentFormat::Csv),
+        ("application/csv", DocumentFormat::Csv),
+        ("application/msword", DocumentFormat::Doc),
+        (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            DocumentFormat::Docx,
+        ),
+        ("application/vnd.ms-excel", DocumentFormat::Xls),
+        (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            DocumentFormat::Xlsx,
+        ),
+        ("text/html", DocumentFormat::Html),
+        ("application/xhtml+xml", DocumentFormat::Html),
+        ("text/markdown", DocumentFormat::Md),
+        ("text/x-markdown", DocumentFormat::Md),
+        ("text/plain", DocumentFormat::Txt),
+    ] {
+        let block = bedrock_document_block(mime, "doc", &bytes)
+            .unwrap_or_else(|err| panic!("{mime} must map: {err}"));
+        assert_eq!(block.format(), &expected, "wrong format for {mime}");
+    }
+}
+
+#[test]
+fn bedrock_document_block_rejects_unknown_mime() {
+    let bytes: Arc<[u8]> = Arc::from(vec![1u8]);
+    let err = bedrock_document_block("application/zip", "doc", &bytes)
+        .expect_err("unsupported MIME must surface an explicit ProviderRequest error");
+    assert!(
+        err.to_string().contains("application/zip"),
+        "error must mention the unsupported MIME: {err}",
+    );
+}
+
+#[test]
+fn sanitize_bedrock_document_name_canonicalises_input() {
+    // Allow-list: alphanumerics + single space + hyphen + ()/[]. Runs
+    // of disallowed characters collapse to a single hyphen so the
+    // resulting name still resembles the caller's intent.
+    assert_eq!(
+        sanitize_bedrock_document_name("/tmp/foo bar.pdf"),
+        "tmp-foo bar-pdf",
+    );
+    // Multi-space collapses to a single space.
+    assert_eq!(
+        sanitize_bedrock_document_name("report   draft"),
+        "report draft",
+    );
+    // Surrounding whitespace and runs of disallowed characters trim.
+    assert_eq!(sanitize_bedrock_document_name("  ---@@@  "), "document");
+    // Empty input gets a safe default name so the request can still
+    // ship.
+    assert_eq!(sanitize_bedrock_document_name(""), "document");
+    // Allowed characters round-trip verbatim.
+    assert_eq!(
+        sanitize_bedrock_document_name("section-1 (draft) [v2]"),
+        "section-1 (draft) [v2]",
+    );
+}
+
+#[test]
+fn conversation_messages_emit_document_content_block() {
+    use aws_sdk_bedrockruntime::types::DocumentFormat;
+    let bytes: Arc<[u8]> = Arc::from(b"%PDF-1.4 fake".to_vec());
+    let messages = conversation_messages(
+        &[
+            LlmInputItem::UserText("here's the report".to_string()),
+            LlmInputItem::Document {
+                media_type: "application/pdf".to_string(),
+                name: "Q4 forecast.pdf".to_string(),
+                bytes: bytes.clone(),
+            },
+        ],
+        CacheRetention::None,
+    )
+    .expect("build messages");
+
+    // User text + document coalesce into a single user message with
+    // two content blocks so the Converse API sees them as one turn.
+    assert_eq!(messages.len(), 1);
+    assert_eq!(*messages[0].role(), ConversationRole::User);
+    let content = messages[0].content();
+    assert_eq!(content.len(), 2);
+    assert!(matches!(&content[0], ContentBlock::Text(text) if text == "here's the report"));
+    let ContentBlock::Document(document) = &content[1] else {
+        panic!(
+            "expected ContentBlock::Document for document input, got {:?}",
+            content[1]
+        );
+    };
+    assert_eq!(document.format(), &DocumentFormat::Pdf);
+    assert_eq!(document.name(), "Q4 forecast-pdf");
+    let source = document.source().expect("document source");
+    let blob = source.as_bytes().expect("Bytes source");
+    assert_eq!(blob.as_ref(), bytes.as_ref());
+}
+
+#[test]
+fn conversation_messages_reject_unknown_document_mime() {
+    let bytes: Arc<[u8]> = Arc::from(vec![1u8, 2]);
+    let err = conversation_messages(
+        &[LlmInputItem::Document {
+            media_type: "application/octet-stream".to_string(),
+            name: "binary".to_string(),
+            bytes,
+        }],
+        CacheRetention::None,
+    )
+    .expect_err("unsupported document MIME must surface an explicit ProviderRequest error");
+    assert!(
+        err.to_string().contains("application/octet-stream"),
+        "error must mention the unsupported MIME: {err}",
+    );
 }
