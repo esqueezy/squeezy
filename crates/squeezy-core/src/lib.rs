@@ -3193,6 +3193,27 @@ impl ProviderSettings {
                         )));
                     };
                     let resolved = resolve_shell_escape(value.clone(), source, &header_path)?;
+                    // M-65: reject CR/LF (and any other non-`HeaderValue`
+                    // byte) at config-load. `http::HeaderValue` already
+                    // refuses anything outside `[0x20..0x7E] ∪ {0x09}`
+                    // at request time, but the failure mode there is a
+                    // deferred reqwest builder error ("invalid HTTP
+                    // header value") with no field name — the operator
+                    // sees the error mid-stream and has to guess which
+                    // header tripped it. Failing here points at the
+                    // exact TOML path and notes that CR/LF are forbidden
+                    // so a copy-paste-from-curl mishap surfaces with a
+                    // usable hint. Header *names* are not validated
+                    // here: `reqwest` already rejects bad names at
+                    // request-construction time and the audit (M-65)
+                    // explicitly scopes this check to values only.
+                    if http::HeaderValue::from_str(&resolved).is_err() {
+                        return Err(SqueezyError::Config(format!(
+                            "{source}: {header_path} contains bytes that cannot be sent as an \
+                             HTTP header value (CR/LF and other control characters are \
+                             forbidden); strip them or escape them out of band"
+                        )));
+                    }
                     map.insert(key.clone(), resolved);
                 }
                 Some(map)

@@ -4292,6 +4292,89 @@ api_key_env = "FAKE_KEY"
 }
 
 #[test]
+fn extra_headers_reject_crlf_at_config_load() {
+    // M-65: a header value containing CR/LF is request-smuggling
+    // shrapnel — http::HeaderValue refuses anything outside
+    // [0x20..0x7E] ∪ {0x09} at request-construction time, but the
+    // failure mode there is a deferred reqwest builder error with no
+    // field name, surfacing mid-stream as a confusing "invalid HTTP
+    // header value". Pin the contract that config-load catches the
+    // offending TOML path up-front and surfaces a usable hint. Cover
+    // the canonical request-smuggling shape (`\r\n` + spliced Host
+    // header) and the lone-`\n` flavor that bypasses sloppy CR/LF
+    // string-search filters.
+    for (literal, label) in [
+        (r#""value\r\nHost: attacker.example""#, "x-evil-crlf"),
+        (r#""value\nX-Smuggled: true""#, "x-evil-lf"),
+        (r#""value\rsplit""#, "x-evil-cr"),
+    ] {
+        let toml = format!(
+            r#"
+[model]
+provider = "openai_compatible"
+
+[providers.openai_compatible]
+base_url = "https://api.example.com/v1"
+api_key_env = "FAKE_KEY"
+
+[providers.openai_compatible.headers]
+"{label}" = {literal}
+"#
+        );
+        // ProviderSettings::from_table runs as part of from_toml_str, so
+        // the CR/LF rejection surfaces here — it would otherwise be a
+        // deferred reqwest builder error at request time with no field
+        // name. Pin both the field path and the CR/LF hint so a future
+        // refactor that moved this check elsewhere or stripped the hint
+        // would fail the assertion.
+        let err = SettingsFile::from_toml_str(&toml, "test").unwrap_err();
+        assert!(
+            matches!(err, SqueezyError::Config(_)),
+            "{label}: CR/LF rejection must surface as SqueezyError::Config, got: {err:?}",
+        );
+        let message = err.to_string();
+        let expected_path = format!("providers.openai_compatible.headers.{label}");
+        assert!(
+            message.contains(&expected_path),
+            "{label}: error must name the offending TOML path {expected_path:?}; got: {message}",
+        );
+        assert!(
+            message.contains("CR/LF") || message.contains("control characters"),
+            "{label}: error must hint at the CR/LF restriction; got: {message}",
+        );
+    }
+}
+
+#[test]
+fn extra_headers_accept_visible_ascii_at_config_load() {
+    // Counterpart to `extra_headers_reject_crlf_at_config_load`: the
+    // common-case `HTTP-Referer` / `X-Title` / `cf-aig-authorization`
+    // shapes used in actual production deployments must still parse
+    // cleanly. Without this assertion a regression that tightened the
+    // filter too aggressively (e.g. rejecting whitespace, parens, or
+    // forward slashes) would shut out the OpenRouter attribution and
+    // Cloudflare AI Gateway dual-auth setups documented in the README.
+    let toml = r#"
+[model]
+provider = "openai_compatible"
+
+[providers.openai_compatible]
+base_url = "https://api.example.com/v1"
+api_key_env = "FAKE_KEY"
+
+[providers.openai_compatible.headers]
+HTTP-Referer = "https://github.com/esqueezy/squeezy"
+X-Title = "Squeezy (1.2.3)"
+cf-aig-authorization = "Bearer sk-test-1234"
+"#;
+    let settings = SettingsFile::from_toml_str(toml, "test").expect("settings parse");
+    AppConfig::try_from_settings_and_env_vars(settings, None, |name| {
+        (name == "FAKE_KEY").then(|| "k".to_string())
+    })
+    .expect("standard ASCII header values must round-trip cleanly");
+}
+
+#[test]
 fn non_custom_preset_does_not_emit_allow_list_warning() {
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
