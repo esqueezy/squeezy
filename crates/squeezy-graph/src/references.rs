@@ -35,16 +35,22 @@ impl SemanticGraph {
         if let Some(exact) = self.references_by_text.get(text) {
             indexes.extend(exact.iter().copied());
         }
-        let colon_suffix = format!("::{text}");
-        if let Some(segment) = self.references_by_text.get(&colon_suffix) {
+        let mut suffix = String::with_capacity(text.len() + 2);
+        suffix.push_str("::");
+        suffix.push_str(text);
+        if let Some(segment) = self.references_by_text.get(&suffix) {
             indexes.extend(segment.iter().copied());
         }
-        let dot_suffix = format!(".{text}");
-        if let Some(segment) = self.references_by_text.get(&dot_suffix) {
+        suffix.clear();
+        suffix.push('.');
+        suffix.push_str(text);
+        if let Some(segment) = self.references_by_text.get(&suffix) {
             indexes.extend(segment.iter().copied());
         }
-        let arrow_suffix = format!("->{text}");
-        if let Some(segment) = self.references_by_text.get(&arrow_suffix) {
+        suffix.clear();
+        suffix.push_str("->");
+        suffix.push_str(text);
+        if let Some(segment) = self.references_by_text.get(&suffix) {
             indexes.extend(segment.iter().copied());
         }
         indexes.into_iter().collect()
@@ -397,9 +403,10 @@ impl SemanticGraph {
         else {
             return false;
         };
+        let symbol_module_path = self.module_path_for_symbol(symbol);
         self.receiver_module_paths(owner, &reference_path.join("::"))
             .into_iter()
-            .any(|path| path == self.module_path_for_symbol(symbol))
+            .any(|path| path == symbol_module_path)
     }
 
     pub(crate) fn impl_method_implements_trait_method(
@@ -479,9 +486,10 @@ impl SemanticGraph {
             return segments == expected;
         }
         let receiver = segments[..segments.len() - 1].join("::");
+        let trait_module_path = self.module_path_for_symbol(trait_symbol);
         self.receiver_module_paths(impl_anchor, &receiver)
             .into_iter()
-            .any(|receiver_path| receiver_path == self.module_path_for_symbol(trait_symbol))
+            .any(|receiver_path| receiver_path == trait_module_path)
     }
 
     pub(crate) fn reference_is_impl_method_declaration_for_trait(
@@ -587,9 +595,10 @@ impl SemanticGraph {
             return false;
         };
         let receiver = path[..path.len() - 1].join("::");
+        let trait_module_path = self.module_path_for_symbol(trait_symbol);
         self.receiver_module_paths(owner, &receiver)
             .into_iter()
-            .any(|receiver_path| receiver_path == self.module_path_for_symbol(trait_symbol))
+            .any(|receiver_path| receiver_path == trait_module_path)
     }
 
     pub(crate) fn symbol_or_ancestors_have_cfg_attribute(&self, symbol: &GraphSymbol) -> bool {
@@ -700,15 +709,9 @@ impl SemanticGraph {
         let Some(prefix) = source.get(..reference.span.start_byte as usize) else {
             return false;
         };
-        let scope = prefix
-            .chars()
-            .rev()
-            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == ':')
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>();
-        let scope = scope.trim_end_matches("::");
+        let Some(scope) = scope_prefix_before(prefix) else {
+            return false;
+        };
         !scope.is_empty()
             && path_starts_with_external_root(scope, self.reference_language(reference))
     }
@@ -726,15 +729,9 @@ impl SemanticGraph {
         let Some(prefix) = source.get(..reference.span.start_byte as usize) else {
             return false;
         };
-        let scope = prefix
-            .chars()
-            .rev()
-            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == ':')
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>();
-        let scope = scope.trim_end_matches("::");
+        let Some(scope) = scope_prefix_before(prefix) else {
+            return false;
+        };
         !scope.is_empty()
             && scope
                 .rsplit("::")
@@ -826,4 +823,19 @@ impl SemanticGraph {
         };
         same_file_candidates.next().is_none() && only.id == symbol.id
     }
+}
+
+fn scope_prefix_before(prefix: &str) -> Option<&str> {
+    let bytes = prefix.as_bytes();
+    let mut start = bytes.len();
+    while start > 0 {
+        let byte = bytes[start - 1];
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b':' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let scope = prefix[start..].trim_end_matches("::");
+    if scope.is_empty() { None } else { Some(scope) }
 }
