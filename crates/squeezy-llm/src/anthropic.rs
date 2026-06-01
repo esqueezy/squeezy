@@ -611,7 +611,19 @@ fn anthropic_stream_attempt(
             let Some(chunk) = next else { break; };
             let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
             for event in decoder.push(&chunk) {
-                let parsed = parse_anthropic_event(&event, &mut state)?;
+                let parsed = parse_anthropic_event(&event, &mut state);
+                // Mid-stream `event: error` may have stashed an
+                // overflow signal on state; yield the additive
+                // `ContextOverflow` event before propagating the
+                // terminal error so the agent sees the same shape
+                // as the pre-200 HTTP-error path.
+                if let Some(signal) = state.pending_overflow_signal.take() {
+                    yield LlmEvent::ContextOverflow {
+                        provider: ANTHROPIC_PROVIDER_NAME.to_string(),
+                        signal,
+                    };
+                }
+                let parsed = parsed?;
                 // `message_start` populates `state.server_model` but
                 // yields no `LlmEvent`s, so drain the field at the
                 // frame boundary rather than per-event to make sure
@@ -645,7 +657,14 @@ fn anthropic_stream_attempt(
         }
 
         for event in decoder.finish() {
-            let parsed = parse_anthropic_event(&event, &mut state)?;
+            let parsed = parse_anthropic_event(&event, &mut state);
+            if let Some(signal) = state.pending_overflow_signal.take() {
+                yield LlmEvent::ContextOverflow {
+                    provider: ANTHROPIC_PROVIDER_NAME.to_string(),
+                    signal,
+                };
+            }
+            let parsed = parsed?;
             if let Some(server) = state.server_model.take()
                 && let Some(echo) = server_model_echo.observe(&request.model, &server)
             {
@@ -741,6 +760,15 @@ struct AnthropicStreamState {
     /// SSE frame of every successful turn) and once the outer loop
     /// has drained it, it stays `None` for the rest of the stream.
     server_model: Option<String>,
+    /// Overflow signal captured by the mid-stream `event: error`
+    /// handler. The outer attempt loop drains this between
+    /// `parse_anthropic_event` and the `?` propagation so a
+    /// `model_context_window_exceeded` mid-stream surfaces a
+    /// `ContextOverflow` event additively before the terminal error,
+    /// matching the pre-200 HTTP-error path. `None` for the healthy
+    /// case and for stream errors that don't fit any overflow
+    /// pattern. See `parse_anthropic_event`'s `"error"` branch.
+    pending_overflow_signal: Option<OverflowSignal>,
 }
 
 impl AnthropicStreamState {
@@ -1043,12 +1071,71 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
             Ok(events)
         }
         "error" => {
-            let message = value
-                .get("error")
+            // Mid-stream `event: error` after a 200 OK can carry any
+            // shape Anthropic might surface — `overloaded_error`,
+            // `rate_limit_error`, `model_context_window_exceeded`,
+            // `invalid_request_error`, or `api_error`. The pre-200
+            // path runs `classify_terminal` and emits a
+            // `ContextOverflow` signal; the post-200 path used to
+            // wrap every variant in `ProviderStream`, so the retry
+            // layer would happily reconnect 5x against an immutable
+            // failure (`model_context_window_exceeded`) or pile on
+            // load (`overloaded_error`). We mirror the pre-200
+            // categorization here: classify the (type, message)
+            // pair through `classify_terminal`, push the resulting
+            // overflow signal onto `state.pending_overflow_signal`,
+            // and route the resulting `SqueezyError` through
+            // `ProviderRequest` (with the non-retryable marker for
+            // hard-config errors) instead of `ProviderStream` so
+            // the outer attempt loop can yield the overflow event
+            // before propagating the error.
+            let error_obj = value.get("error");
+            let error_type = error_obj
+                .and_then(|error| error.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("error")
+                .to_string();
+            let message = error_obj
                 .and_then(|error| error.get("message"))
                 .and_then(Value::as_str)
-                .unwrap_or("Anthropic stream error");
-            Err(SqueezyError::ProviderStream(message.to_string()))
+                .unwrap_or("Anthropic stream error")
+                .to_string();
+            let raw_for_classifier = format!("{error_type}: {message}");
+            state.pending_overflow_signal = classify_terminal(
+                ANTHROPIC_PROVIDER_NAME,
+                None,
+                Some(&raw_for_classifier),
+                None,
+                true,
+            );
+            let human = format!("Anthropic stream error ({error_type}): {message}");
+            let err = match error_type.as_str() {
+                // Retryable transient errors: keep the retry path
+                // open but route through `ProviderRequest` so the
+                // pre/post-200 paths surface in the same shape.
+                "overloaded_error" | "rate_limit_error" | "api_error" => {
+                    SqueezyError::ProviderRequest(human)
+                }
+                // Hard-config errors and overflow: stamp the
+                // non-retryable marker so the TUI can suppress the
+                // retry suffix; the marker is also what future
+                // retry-layer work consumes to short-circuit the
+                // reconnect loop.
+                "invalid_request_error"
+                | "model_context_window_exceeded"
+                | "not_found_error"
+                | "authentication_error"
+                | "permission_error" => SqueezyError::ProviderRequest(format!(
+                    "{}{human}",
+                    crate::anthropic_error::NON_RETRYABLE_MARKER
+                )),
+                // Unknown error class: surface as a stream error so
+                // the retry layer still attempts a reconnect (which
+                // is what we want for genuinely transient transport
+                // shapes), but with the typed message attached.
+                _ => SqueezyError::ProviderStream(human),
+            };
+            Err(err)
         }
         _ => none(),
     }

@@ -927,7 +927,121 @@ fn parser_surfaces_error_events() {
     )
     .expect_err("stream error");
 
+    // Default (unknown) error type stays on the ProviderStream
+    // path so the retry layer still attempts a reconnect for
+    // genuinely transient transport shapes.
+    assert!(matches!(err, squeezy_core::SqueezyError::ProviderStream(_)));
     assert!(err.to_string().contains("bad request"));
+    // No overflow signal latched for an unrecognised error shape.
+    assert!(state.pending_overflow_signal.is_none());
+}
+
+/// C-01: a mid-stream `event: error` carrying
+/// `model_context_window_exceeded` must (a) latch an additive
+/// `ContextOverflow` signal on the stream state and (b) surface
+/// as a non-retryable `ProviderRequest` so the retry layer doesn't
+/// reconnect against an immutable failure.
+#[test]
+fn parser_classifies_mid_stream_context_window_exceeded_as_non_retryable() {
+    let mut state = AnthropicStreamState::default();
+    let err = parse_anthropic_event(
+        r#"{
+          "type":"error",
+          "error":{
+            "type":"model_context_window_exceeded",
+            "message":"prompt is too long for this model"
+          }
+        }"#,
+        &mut state,
+    )
+    .expect_err("error event surfaces error");
+    assert!(
+        matches!(err, squeezy_core::SqueezyError::ProviderRequest(_)),
+        "context-window errors must surface as ProviderRequest, got {err:?}",
+    );
+    assert!(
+        err.to_string()
+            .contains(crate::anthropic_error::NON_RETRYABLE_MARKER),
+        "context-window errors must carry the non-retryable marker, got {}",
+        err
+    );
+    let signal = state
+        .pending_overflow_signal
+        .take()
+        .expect("overflow signal must be latched for context-window errors");
+    assert!(matches!(
+        signal,
+        crate::overflow::OverflowSignal::ErrorPattern(_)
+    ));
+}
+
+/// C-01: `overloaded_error` and `rate_limit_error` mid-stream errors
+/// must surface as `ProviderRequest` (so the pre/post-200 paths use the
+/// same shape), without latching an overflow signal.
+#[test]
+fn parser_classifies_mid_stream_overloaded_as_provider_request() {
+    for (raw, want_type) in [
+        (
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}"#,
+            "overloaded",
+        ),
+        (
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
+            "slow down",
+        ),
+        (
+            r#"{"type":"error","error":{"type":"api_error","message":"generic 5xx"}}"#,
+            "generic 5xx",
+        ),
+    ] {
+        let mut state = AnthropicStreamState::default();
+        let err = parse_anthropic_event(raw, &mut state).expect_err("stream error");
+        assert!(
+            matches!(err, squeezy_core::SqueezyError::ProviderRequest(_)),
+            "transient errors must surface as ProviderRequest, got {err:?} for {raw}",
+        );
+        assert!(
+            err.to_string().contains(want_type),
+            "error message must round-trip the upstream prose, got {err} for {raw}",
+        );
+        assert!(
+            !err.to_string()
+                .contains(crate::anthropic_error::NON_RETRYABLE_MARKER),
+            "transient errors must not carry the non-retryable marker: {err}",
+        );
+        assert!(
+            state.pending_overflow_signal.is_none(),
+            "transient errors must not latch an overflow signal",
+        );
+    }
+}
+
+/// C-01: `invalid_request_error` (e.g. budget_tokens too small) must
+/// surface non-retryable so the retry layer can short-circuit instead
+/// of replaying the identical bad request five times.
+#[test]
+fn parser_classifies_mid_stream_invalid_request_as_non_retryable() {
+    let mut state = AnthropicStreamState::default();
+    let err = parse_anthropic_event(
+        r#"{
+          "type":"error",
+          "error":{
+            "type":"invalid_request_error",
+            "message":"thinking.enabled.budget_tokens must be >= 1024"
+          }
+        }"#,
+        &mut state,
+    )
+    .expect_err("invalid request surfaces error");
+    assert!(matches!(
+        err,
+        squeezy_core::SqueezyError::ProviderRequest(_)
+    ));
+    assert!(
+        err.to_string()
+            .contains(crate::anthropic_error::NON_RETRYABLE_MARKER),
+    );
+    assert!(state.pending_overflow_signal.is_none());
 }
 
 #[test]
