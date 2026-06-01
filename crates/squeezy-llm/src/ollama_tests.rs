@@ -39,7 +39,37 @@ fn request_body_uses_chat_stream_shape() {
     assert_eq!(body["messages"][0]["role"], "system");
     assert_eq!(body["messages"][1]["role"], "user");
     assert_eq!(body["options"]["num_predict"], 16);
+    assert_eq!(body["options"]["num_ctx"], DEFAULT_NUM_CTX);
     assert_eq!(body["tools"][0]["function"]["name"], "grep");
+}
+
+#[test]
+fn request_body_always_sets_num_ctx_default() {
+    let request = LlmRequest {
+        model: "qwen3".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = OllamaProvider::request_body(&request);
+
+    // Ollama's server default `num_ctx` is 4096, which silently truncates
+    // agent prompts. The provider must stamp the explicit default on
+    // every request, even when the caller asked for nothing else.
+    assert_eq!(body["options"]["num_ctx"], DEFAULT_NUM_CTX);
+    assert!(body["options"]["num_predict"].is_null());
 }
 
 #[test]
