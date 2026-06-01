@@ -59,9 +59,27 @@ pub(crate) fn model_uses_adaptive_thinking(model: &str) -> bool {
 }
 
 fn extract_claude_version(model: &str, family: &str) -> Option<(u32, u32)> {
-    let needle = format!("{family}-");
+    // Anchor the match on `claude-<family>-` and require the trailing
+    // `MAJOR-MINOR` segment to terminate on `-`, `@`, `:`, or
+    // end-of-string. A naive substring match on `opus-N-M` previously
+    // activated adaptive thinking + the EFFORT beta against any
+    // aggregator alias whose model id happened to contain the
+    // substring (e.g. a third-party model literally named
+    // `opus-4-7`, or any future aggregator that uses the same family
+    // tag for a non-Anthropic model). The `claude-{family}-` anchor
+    // still matches the Vertex (`vertex/anthropic/claude-opus-4-7`)
+    // and OpenRouter (`anthropic/claude-opus-4-7:nitro`) shells
+    // because `find` searches for the substring anywhere in the id;
+    // the rejection bites for ids that lack the `claude-` prefix
+    // entirely. See `.audit/providers/anthropic.md` HIGH #4.
+    let needle = format!("claude-{family}-");
     let start = model.find(&needle)? + needle.len();
-    let mut parts = model[start..].split('-');
+    let tail = &model[start..];
+    let segment_end = tail
+        .find(|c: char| c == '@' || c == ':')
+        .unwrap_or(tail.len());
+    let segment = &tail[..segment_end];
+    let mut parts = segment.split('-');
     let major: u32 = parts.next()?.parse().ok()?;
     let minor: u32 = parts.next()?.parse().ok()?;
     Some((major, minor))

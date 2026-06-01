@@ -683,6 +683,46 @@ fn model_uses_adaptive_thinking_covers_4_6_and_later_opus_and_sonnet() {
     }
 }
 
+/// H-04: the detection heuristic must not fire for non-Claude model
+/// ids that happen to contain the `opus-N-M` / `sonnet-N-M` substring
+/// (a custom proxy literal like `opus-4-7`, a third-party model named
+/// `myorg/opus-4-7`, or any future aggregator that uses the same
+/// family tag for a non-Anthropic model). Aggregator routes that DO
+/// wrap a real Claude model (Vertex region tag `@001`, OpenRouter
+/// route tag `:nitro`, OpenRouter prefix `anthropic/`) must still
+/// activate adaptive thinking so the OAuth quota path keeps working.
+#[test]
+fn model_uses_adaptive_thinking_requires_claude_prefix_and_anchors_version_segment() {
+    // Non-Claude proxies and lookalikes: must NOT activate adaptive
+    // thinking.
+    for model in [
+        "opus-4-7",
+        "opus-4-7-instruct",
+        "myorg/opus-4-7",
+        "sonnet-5-0",
+        "anthropic/opus-4-7",
+        "vertex/anthropic/opus-4-7",
+    ] {
+        assert!(
+            !model_uses_adaptive_thinking(model),
+            "non-Claude id `{model}` must not activate adaptive thinking",
+        );
+    }
+
+    // Aggregator wrappers around real Claude models: MUST activate.
+    for model in [
+        "anthropic/claude-opus-4-7",
+        "anthropic/claude-opus-4-7:nitro",
+        "vertex/anthropic/claude-opus-4-7@001",
+        "openrouter/anthropic/claude-sonnet-4-6:beta",
+    ] {
+        assert!(
+            model_uses_adaptive_thinking(model),
+            "aggregator wrapper `{model}` must still activate adaptive thinking",
+        );
+    }
+}
+
 #[test]
 fn request_body_uses_adaptive_thinking_for_claude_4_6_and_4_7() {
     use squeezy_core::ReasoningEffort;
