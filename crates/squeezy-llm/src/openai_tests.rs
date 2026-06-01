@@ -633,6 +633,53 @@ fn parser_surfaces_error_events() {
 }
 
 #[test]
+fn parser_emits_refusal_event_and_latches_refusal_stop_reason() {
+    // C-02: `response.refusal.delta` events MUST surface as visible
+    // `LlmEvent::Refusal` chunks, and the terminal `response.completed`
+    // (which arrives without `incomplete_details` because the refusal
+    // IS the completion) MUST normalize to `StopReason::Refusal`.
+    let mut acc = ReasoningAccumulator::default();
+
+    let first = parse_openai_event(
+        r#"{"type":"response.refusal.delta","delta":"I'm sorry, I can't help with that."}"#,
+        &mut acc,
+    )
+    .expect("valid refusal delta")
+    .expect("refusal delta must emit");
+    assert_eq!(
+        first,
+        LlmEvent::Refusal {
+            content: "I'm sorry, I can't help with that.".to_string(),
+        },
+    );
+
+    let done = parse_openai_event(
+        r#"{"type":"response.refusal.done","refusal":"I'm sorry, I can't help with that."}"#,
+        &mut acc,
+    )
+    .expect("valid refusal done");
+    assert!(done.is_none(), "refusal.done is internal-only");
+
+    let completed = parse_openai_event(
+        r#"{"type":"response.completed","response":{"id":"resp_ref","usage":{"input_tokens":4,"output_tokens":12}}}"#,
+        &mut acc,
+    )
+    .expect("valid completed")
+    .expect("completion must emit");
+    match completed {
+        LlmEvent::Completed {
+            stop_reason,
+            response_id,
+            ..
+        } => {
+            assert_eq!(stop_reason, Some(crate::StopReason::Refusal));
+            assert_eq!(response_id.as_deref(), Some("resp_ref"));
+        }
+        other => panic!("expected Completed event, got {other:?}"),
+    }
+}
+
+#[test]
 fn parser_surfaces_incomplete_events() {
     let mut acc = ReasoningAccumulator::default();
     let event = parse_openai_event(

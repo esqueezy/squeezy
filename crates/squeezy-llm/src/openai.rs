@@ -446,6 +446,20 @@ pub(crate) struct ReasoningAccumulator {
     /// for every event that doesn't include a `response.model` field —
     /// the loop only acts on the first observation per stream.
     server_model: Option<String>,
+    /// Cumulative streamed text from `response.output_text.delta` events.
+    /// Used by `response.output_text.done` (H-08) to reconcile against
+    /// the authoritative final string and emit a corrective `TextDelta`
+    /// for any suffix divergence (re-ordering or dropped delta during
+    /// reconnect-without-skip).
+    text_buffer: String,
+    /// `true` once a `response.refusal.delta` or `response.refusal.done`
+    /// has been observed in this stream. Drives the C-02 normalization:
+    /// the terminal `response.completed` event normally lands with no
+    /// `incomplete_details` (refusals ARE the completion, not an
+    /// incomplete state), so we override `stop_reason` to
+    /// `StopReason::Refusal` here. The TUI also sees per-delta refusal
+    /// text via `LlmEvent::Refusal` while the refusal streams.
+    refusal_latched: bool,
 }
 
 impl ReasoningAccumulator {
@@ -508,7 +522,31 @@ pub(crate) fn parse_openai_event(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            // Cumulative buffer feeds the H-08 `output_text.done`
+            // reconcile path below.
+            reasoning_acc.text_buffer.push_str(&delta);
             Ok(Some(LlmEvent::TextDelta(delta)))
+        }
+        "response.refusal.delta" => {
+            // C-02: safety-refusal text streams through `refusal.delta`
+            // chunks ending with `refusal.done`. Surface each delta as a
+            // typed `Refusal` event so the TUI shows the running refusal
+            // text, and latch the flag so the terminal `response.completed`
+            // (which arrives without `incomplete_details`) normalizes to
+            // `StopReason::Refusal` instead of `EndTurn`.
+            let delta = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            reasoning_acc.refusal_latched = true;
+            Ok(Some(LlmEvent::Refusal { content: delta }))
+        }
+        "response.refusal.done" => {
+            // Latch even when no `delta` event preceded the done (defensive
+            // — production streams always start with at least one delta).
+            reasoning_acc.refusal_latched = true;
+            Ok(None)
         }
         "response.reasoning_summary_text.delta" => {
             let delta = value
@@ -553,12 +591,20 @@ pub(crate) fn parse_openai_event(
             // Successful completions don't carry `incomplete_details`;
             // treat their absence as `EndTurn` so the agent's turn loop
             // sees a normalized stop reason on every provider event.
-            let stop_reason = response
-                .and_then(|response| response.get("incomplete_details"))
-                .and_then(|details| details.get("reason"))
-                .and_then(Value::as_str)
-                .map(crate::StopReason::from_openai_incomplete)
-                .or(Some(crate::StopReason::EndTurn));
+            // C-02: when a `response.refusal.delta` latched earlier in
+            // the same stream, override to `Refusal` — the terminal
+            // event arrives without `incomplete_details` because the
+            // refusal text IS the completion, not an incomplete state.
+            let stop_reason = if reasoning_acc.refusal_latched {
+                Some(crate::StopReason::Refusal)
+            } else {
+                response
+                    .and_then(|response| response.get("incomplete_details"))
+                    .and_then(|details| details.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(crate::StopReason::from_openai_incomplete)
+                    .or(Some(crate::StopReason::EndTurn))
+            };
             Ok(Some(LlmEvent::Completed {
                 response_id,
                 cost: parse_cost(response),
