@@ -5,8 +5,10 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{
-    CostSnapshot, OllamaConfig, OllamaRoute, ProviderTransportConfig, Result, SqueezyError,
+    CostSnapshot, OllamaConfig, OllamaRoute, OpenAiCompatiblePreset, ProviderTransportConfig,
+    Result, SqueezyError,
 };
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -14,7 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
-    lmstudio::{LMStudioConfig, LMStudioProvider},
+    compatible::OpenAiCompatibleProvider,
+    credentials::static_api_key_source,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
     transport::shared_client,
 };
@@ -24,7 +27,7 @@ pub struct OllamaProvider {
     client: reqwest::Client,
     base_url: String,
     transport: ProviderTransportConfig,
-    compat: Option<LMStudioProvider>,
+    compat: Option<OpenAiCompatibleProvider>,
 }
 
 impl OllamaProvider {
@@ -32,11 +35,20 @@ impl OllamaProvider {
         let base_url = config.base_url.trim_end_matches('/').to_string();
         let compat = match config.route_style {
             OllamaRoute::Native => None,
-            OllamaRoute::OpenAiCompatible => Some(LMStudioProvider::from_config(&LMStudioConfig {
-                base_url: openai_compat_base_url(&base_url),
-                api_key: None,
-                transport: config.transport,
-            })),
+            // OpenAI-compatible route → reuse the shared chat-completions
+            // client under the LM Studio preset. Ollama's `/v1` server does
+            // not authenticate by default, so we build the provider with a
+            // bypass-style empty static key rather than walking through
+            // `OpenAiCompatibleProvider::from_config` (which insists on
+            // resolving an env / inline key). Extra headers stay empty —
+            // the LM Studio preset has no defaults to merge.
+            OllamaRoute::OpenAiCompatible => Some(OpenAiCompatibleProvider::with_api_key_source(
+                OpenAiCompatiblePreset::LMStudio,
+                static_api_key_source(String::new(), OpenAiCompatiblePreset::LMStudio.as_str()),
+                openai_compat_base_url(&base_url),
+                BTreeMap::new(),
+                config.transport,
+            )),
         };
         Self {
             client: shared_client(&config.transport),
