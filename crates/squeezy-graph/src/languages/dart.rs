@@ -130,12 +130,11 @@ impl SemanticGraph {
     pub(crate) fn dart_class_symbols_by_name(&self, name: &str) -> Vec<SymbolId> {
         self.symbols_by_name
             .get(name)
-            .cloned()
-            .unwrap_or_default()
             .into_iter()
+            .flatten()
             .filter(|id| {
                 self.symbols
-                    .get(id)
+                    .get(*id)
                     .and_then(|symbol| self.files.get(&symbol.file_id).map(|file| (symbol, file)))
                     .map(|(symbol, file)| {
                         file.language == LanguageKind::Dart
@@ -150,6 +149,7 @@ impl SemanticGraph {
                     })
                     .unwrap_or(false)
             })
+            .cloned()
             .collect()
     }
 
@@ -353,11 +353,11 @@ impl SemanticGraph {
         }
         // Look for a `dart-local:<receiver>:<type>` attribute recorded by
         // the parser for typed/inferable body locals.
-        let local_prefix = format!("dart-local:{receiver}:");
         if let Some(ty) = caller
             .attributes
             .iter()
-            .find_map(|attr| attr.strip_prefix(&local_prefix))
+            .filter_map(|attr| attr.strip_prefix("dart-local:"))
+            .find_map(|attr| attr.strip_prefix(receiver)?.strip_prefix(':'))
         {
             return Some(ty.trim().to_string());
         }
@@ -406,22 +406,20 @@ fn dart_literal_receiver_type(receiver: &str) -> Option<&'static str> {
     }
 }
 
-fn dart_ancestor_attributes(
-    symbol: &GraphSymbol,
-) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+fn dart_ancestor_attributes(symbol: &GraphSymbol) -> (Vec<&str>, Vec<&str>, Vec<&str>, Vec<&str>) {
     let mut mixins = Vec::new();
     let mut bases = Vec::new();
     let mut ifaces = Vec::new();
     let mut ons = Vec::new();
     for attr in &symbol.attributes {
         if let Some(rest) = attr.strip_prefix("mixin:") {
-            mixins.push(rest.to_string());
+            mixins.push(rest);
         } else if let Some(rest) = attr.strip_prefix("base:") {
-            bases.push(rest.to_string());
+            bases.push(rest);
         } else if let Some(rest) = attr.strip_prefix("iface:") {
-            ifaces.push(rest.to_string());
+            ifaces.push(rest);
         } else if let Some(rest) = attr.strip_prefix("mixin-on:") {
-            ons.push(rest.to_string());
+            ons.push(rest);
         }
     }
     (mixins, bases, ifaces, ons)
