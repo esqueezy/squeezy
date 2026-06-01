@@ -16,9 +16,10 @@ use aws_sdk_bedrockruntime::operation::converse_stream::builders::ConverseStream
 use squeezy_core::{BedrockConfig, ProviderTransportConfig};
 
 use super::{
-    BedrockProvider, BedrockStreamState, bedrock_request_metadata_map, build_bedrock_client,
-    conversation_messages, handle_bedrock_event, inference_configuration, json_to_document,
-    system_blocks, tool_configuration,
+    BedrockProvider, BedrockStreamState, apply_inference_profile_prefix,
+    bedrock_request_metadata_map, build_bedrock_client, conversation_messages,
+    handle_bedrock_event, inference_configuration, json_to_document, region_prefix, system_blocks,
+    tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{CacheRetention, LlmInputItem, LlmRequest, LlmToolSpec};
@@ -744,5 +745,114 @@ fn missing_bearer_token_falls_back_to_default_credential_chain() {
     assert!(
         message.contains("aws configure") || message.contains("AWS_PROFILE"),
         "error must also point at the standard credential-chain recovery paths: {message}",
+    );
+}
+
+#[test]
+fn region_prefix_maps_known_aws_regions() {
+    // Static prefix list from AWS docs: us-* → us, eu-* → eu,
+    // ap-* → apac, jp-* → jp. GovCloud / future regions return None
+    // so the caller passes the model id through verbatim.
+    assert_eq!(region_prefix("us-east-1"), Some("us"));
+    assert_eq!(region_prefix("us-west-2"), Some("us"));
+    assert_eq!(region_prefix("eu-central-1"), Some("eu"));
+    assert_eq!(region_prefix("ap-southeast-2"), Some("apac"));
+    assert_eq!(region_prefix("jp-east-1"), Some("jp"));
+    // Mixed case must canonicalise; AWS region ids ship lowercase but
+    // defensive parsing keeps the contract well-defined.
+    assert_eq!(region_prefix("US-EAST-1"), Some("us"));
+    // Unknown / GovCloud / non-region strings fall through to None so
+    // the caller pre-prefixes (or accepts the upstream rejection) on
+    // their own.
+    assert!(region_prefix("us-gov-west-1").is_none());
+    assert!(region_prefix("local").is_none());
+    assert!(region_prefix("").is_none());
+}
+
+#[test]
+fn apply_inference_profile_prefix_rewrites_bare_anthropic_models() {
+    // Newer Anthropic Claude families on Bedrock require a cross-
+    // region inference profile and reject the bare `anthropic.claude-*`
+    // id with `ValidationException`. The helper must rewrite to the
+    // configured region's prefix so on-demand throughput failures
+    // surface as the actually-resolved id and operators don't have to
+    // pre-prefix every model in their config.
+    assert_eq!(
+        apply_inference_profile_prefix("anthropic.claude-sonnet-4-6-20251001-v1:0", "us-east-1",),
+        "us.anthropic.claude-sonnet-4-6-20251001-v1:0",
+    );
+    assert_eq!(
+        apply_inference_profile_prefix("anthropic.claude-opus-4-6-20251101-v1:0", "eu-central-1",),
+        "eu.anthropic.claude-opus-4-6-20251101-v1:0",
+    );
+    assert_eq!(
+        apply_inference_profile_prefix(
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+            "ap-southeast-2",
+        ),
+        "apac.anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+}
+
+#[test]
+fn apply_inference_profile_prefix_passes_already_prefixed_ids_through() {
+    // Operators who already opted in must not see double prefixes.
+    // `us.`, `eu.`, `apac.`, `jp.`, and `global.` round-trip verbatim.
+    for prefixed in [
+        "us.anthropic.claude-sonnet-4-6-20251001-v1:0",
+        "eu.anthropic.claude-opus-4-6-20251101-v1:0",
+        "apac.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "jp.anthropic.claude-sonnet-4-6-20251001-v1:0",
+        "global.anthropic.claude-sonnet-4-6-20251001-v1:0",
+    ] {
+        assert_eq!(
+            apply_inference_profile_prefix(prefixed, "us-east-1"),
+            prefixed,
+            "already-prefixed id `{prefixed}` must pass through verbatim",
+        );
+    }
+}
+
+#[test]
+fn apply_inference_profile_prefix_passes_arns_through() {
+    // ARNs (inference-profile or application-inference-profile)
+    // carry their own routing and must not be touched.
+    let arn = "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-4-6-20251001-v1:0";
+    assert_eq!(apply_inference_profile_prefix(arn, "us-east-1"), arn);
+    let app_arn =
+        "arn:aws:bedrock:eu-central-1:123456789012:application-inference-profile/my-profile";
+    assert_eq!(
+        apply_inference_profile_prefix(app_arn, "eu-central-1"),
+        app_arn
+    );
+}
+
+#[test]
+fn apply_inference_profile_prefix_skips_non_anthropic_vendors() {
+    // Mistral / Cohere / Amazon Titan ship as on-demand throughput
+    // without inference profiles. The helper must not silently
+    // route them through Anthropic's cross-region prefix.
+    assert_eq!(
+        apply_inference_profile_prefix("amazon.titan-text-express-v1", "us-east-1"),
+        "amazon.titan-text-express-v1",
+    );
+    assert_eq!(
+        apply_inference_profile_prefix("mistral.mistral-large-2407-v1:0", "us-east-1"),
+        "mistral.mistral-large-2407-v1:0",
+    );
+}
+
+#[test]
+fn apply_inference_profile_prefix_falls_back_on_unmapped_region() {
+    // GovCloud / future regions with no defined prefix pass the id
+    // through verbatim — the upstream rejection points the operator at
+    // their model/region mismatch instead of squeezy silently routing
+    // through a wrong prefix.
+    assert_eq!(
+        apply_inference_profile_prefix(
+            "anthropic.claude-sonnet-4-6-20251001-v1:0",
+            "us-gov-west-1",
+        ),
+        "anthropic.claude-sonnet-4-6-20251001-v1:0",
     );
 }

@@ -138,7 +138,25 @@ impl LlmProvider for BedrockProvider {
                 result = provider.client() => result,
             };
             let client = client_result?;
-            let model = request.model.to_string();
+            let requested_model = request.model.to_string();
+            // Newer Anthropic Claude families (Sonnet 4.5 / Opus 4.6 /
+            // Sonnet 4.6) on Bedrock require a cross-region inference
+            // profile and reject the bare `anthropic.claude-*` id with
+            // `ValidationException`. Rewrite to `us./eu./apac./jp.`
+            // based on the configured region; ARNs and ids that already
+            // carry a profile prefix pass through verbatim. The
+            // resolved id is surfaced via `LlmEvent::ServerModel` so
+            // the transcript / cost-attribution layers see the actual
+            // model that produced the turn.
+            let model = apply_inference_profile_prefix(&requested_model, &provider.region);
+            if model != requested_model {
+                tracing::info!(
+                    provider = "bedrock",
+                    requested = %requested_model,
+                    resolved = %model,
+                    "rewrote Bedrock model id to cross-region inference profile"
+                );
+            }
             let prompt_caching = should_apply_caching("bedrock", &request);
             // Honor `CacheRetention::Long` end-to-end so Bedrock cache
             // points carry `ttl: 1h` instead of silently degrading to
@@ -221,6 +239,16 @@ impl LlmProvider for BedrockProvider {
             let response = send_result.map_err(sdk_error_to_squeezy)?;
 
             yield LlmEvent::Started;
+
+            // Surface the auto-applied inference-profile prefix so the
+            // TUI / transcript / cost-attribution layers see the actual
+            // model that produced the turn. Emitted at most once per
+            // stream — matches the cross-provider [`LlmEvent::ServerModel`]
+            // contract.
+            let mut server_model_echo = crate::ServerModelEcho::default();
+            if let Some(echo) = server_model_echo.observe(&requested_model, &model) {
+                yield echo;
+            }
 
             let mut stream = response.stream;
             let mut state = BedrockStreamState::default();
@@ -444,6 +472,75 @@ fn handle_bedrock_event(
         }
         _ => Ok(Vec::new()),
     }
+}
+
+/// Map an AWS region id (`us-east-1`, `eu-west-1`, `ap-southeast-2`,
+/// `jp-east-1`, etc.) to the cross-region inference profile prefix
+/// Bedrock expects on Claude foundation models.
+///
+/// Returns `None` for regions that don't have a defined prefix
+/// (`us-gov-*`, future regions, etc.) — the caller passes the model
+/// id through verbatim in that case. The mapping mirrors clear-code's
+/// `getBedrockRegionPrefix` and the static prefix list at
+/// <https://docs.aws.amazon.com/bedrock/latest/userguide/inference-api-restrictions.html>:
+/// `us-*` → `us`, `eu-*` → `eu`, `ap-*` → `apac`, `jp-*` → `jp`.
+pub(crate) fn region_prefix(region: &str) -> Option<&'static str> {
+    let region = region.to_ascii_lowercase();
+    // GovCloud (`us-gov-east-1`, `us-gov-west-1`) doesn't carry
+    // inference-profile prefixes; the rewrite falls back to verbatim
+    // so the upstream rejection points operators at their
+    // model/region mismatch instead of squeezy silently routing
+    // through a wrong prefix.
+    if region.starts_with("us-gov-") {
+        None
+    } else if region.starts_with("us-") {
+        Some("us")
+    } else if region.starts_with("eu-") {
+        Some("eu")
+    } else if region.starts_with("ap-") {
+        Some("apac")
+    } else if region.starts_with("jp-") {
+        Some("jp")
+    } else {
+        None
+    }
+}
+
+/// Rewrite `anthropic.claude-*` foundation-model ids to the
+/// cross-region inference profile form (`us.anthropic.claude-*` /
+/// `eu.anthropic.claude-*` / etc.) when the configured AWS region
+/// requires one. Ids that already carry a profile prefix, ARNs
+/// (`arn:aws:bedrock:...:inference-profile/...` or
+/// `application-inference-profile/...`), and non-Anthropic vendor ids
+/// pass through verbatim — the caller has already told Bedrock how it
+/// wants to be routed and we must not double-prefix.
+///
+/// Newer Claude families (Sonnet 4.5, Opus 4.6, Sonnet 4.6) on Bedrock
+/// reject the bare `anthropic.claude-*` form with `ValidationException`
+/// because they only ship via cross-region inference profiles. Without
+/// the rewrite an operator who pointed squeezy at `claude-sonnet-4-6`
+/// has to manually pre-prefix every model id in their config.
+pub(crate) fn apply_inference_profile_prefix(model: &str, region: &str) -> String {
+    // ARN: caller specified the inference profile directly.
+    if model.starts_with("arn:") {
+        return model.to_string();
+    }
+    // Already prefixed (`us.`, `eu.`, `apac.`, `jp.`, `global.`).
+    if let Some((head, _)) = model.split_once('.')
+        && matches!(head, "us" | "eu" | "apac" | "jp" | "global")
+    {
+        return model.to_string();
+    }
+    // Only Anthropic Claude models on Bedrock require the cross-region
+    // profile rewrite today; Mistral / Cohere / Amazon Titan ship as
+    // on-demand throughput.
+    if !model.starts_with("anthropic.claude-") {
+        return model.to_string();
+    }
+    let Some(prefix) = region_prefix(region) else {
+        return model.to_string();
+    };
+    format!("{prefix}.{model}")
 }
 
 fn hex_encode(blob: &Blob) -> String {
