@@ -2140,6 +2140,11 @@ impl OpenAiCompatiblePreset {
             // Cloudflare's cURL + AI Gateway docs use CLOUDFLARE_API_TOKEN;
             // only the JS SDK uses CLOUDFLARE_API_KEY. Both are valid.
             Self::CloudflareWorkersAi | Self::CloudflareAiGateway => &["CLOUDFLARE_API_TOKEN"],
+            // DeepInfra's vendor docs use DEEPINFRA_TOKEN in every code
+            // sample; LangChain uses DEEPINFRA_API_TOKEN; only the Vercel
+            // AI SDK uses DEEPINFRA_API_KEY. Accept all three so users
+            // who copy from DeepInfra's docs are not bounced.
+            Self::DeepInfra => &["DEEPINFRA_TOKEN", "DEEPINFRA_API_TOKEN"],
             _ => &[],
         }
     }
