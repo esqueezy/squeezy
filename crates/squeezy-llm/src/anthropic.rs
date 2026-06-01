@@ -75,9 +75,7 @@ fn extract_claude_version(model: &str, family: &str) -> Option<(u32, u32)> {
     let needle = format!("claude-{family}-");
     let start = model.find(&needle)? + needle.len();
     let tail = &model[start..];
-    let segment_end = tail
-        .find(|c: char| c == '@' || c == ':')
-        .unwrap_or(tail.len());
+    let segment_end = tail.find(['@', ':']).unwrap_or(tail.len());
     let segment = &tail[..segment_end];
     let mut parts = segment.split('-');
     let major: u32 = parts.next()?.parse().ok()?;
