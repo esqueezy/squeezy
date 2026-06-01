@@ -576,6 +576,48 @@ fn explicit_reasoning_effort_emits_thinking_config_with_budget() {
 }
 
 #[test]
+fn image_with_unknown_mime_falls_back_to_inferred_type() {
+    // PNG magic bytes shipped with a wrong media_type. google_contents
+    // should infer from the bytes and ship `image/png` over the wire.
+    let png_bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let request = LlmRequest {
+        model: "gemini-test".to_string().into(),
+        instructions: "describe".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::Image {
+            media_type: "application/octet-stream".to_string(),
+            bytes: png_bytes,
+        }]),
+        ..LlmRequest::default()
+    };
+    let body = GoogleProvider::request_body(&request);
+    let mime = &body["contents"][0]["parts"][0]["inlineData"]["mimeType"];
+    assert_eq!(
+        mime, "image/png",
+        "unknown MIME should be replaced with inferred image/png, got {mime}"
+    );
+}
+
+#[test]
+fn image_with_supported_mime_passes_through() {
+    let png_bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let request = LlmRequest {
+        model: "gemini-test".to_string().into(),
+        instructions: "describe".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::Image {
+            media_type: "image/jpeg".to_string(),
+            bytes: png_bytes,
+        }]),
+        ..LlmRequest::default()
+    };
+    let body = GoogleProvider::request_body(&request);
+    let mime = &body["contents"][0]["parts"][0]["inlineData"]["mimeType"];
+    assert_eq!(
+        mime, "image/jpeg",
+        "supported MIME must pass through unchanged, got {mime}"
+    );
+}
+
+#[test]
 fn validate_base_url_accepts_versioned_paths() {
     validate_google_base_url("https://generativelanguage.googleapis.com/v1beta").unwrap();
     validate_google_base_url("https://generativelanguage.googleapis.com/v1").unwrap();

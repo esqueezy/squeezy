@@ -161,6 +161,16 @@ fn tool_choice_to_gemini_mode(choice: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Gemini's documented inline image MIME list. Anything outside this
+/// set returns a 400. Reference:
+/// https://ai.google.dev/gemini-api/docs/image-understanding.
+fn is_supported_gemini_image_mime(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        "image/png" | "image/jpeg" | "image/webp" | "image/heic" | "image/heif"
+    )
+}
+
 /// Validate that the Google base URL ends in a `/vN[suffix]` API
 /// version segment. The Gemini wire shape is
 /// `{base}/models/{model}:streamGenerateContent`; bare hosts produce
@@ -560,15 +570,32 @@ fn google_contents(input: &[LlmInputItem]) -> Value {
                     }}],
                 }));
             }
-            LlmInputItem::Image { media_type, bytes } => contents.push(json!({
-                "role": "user",
-                "parts": [{
-                    "inlineData": {
-                        "mimeType": media_type,
-                        "data": BASE64_STANDARD.encode(bytes.as_ref()),
-                    },
-                }],
-            })),
+            LlmInputItem::Image { media_type, bytes } => {
+                // NIT — validate against Gemini's documented inline
+                // image MIME list. Caller-supplied media_type is
+                // shipped to the wire as-is; if it doesn't match a
+                // supported type the upstream returns a 400. Replace
+                // a clearly-wrong MIME with one inferred from the
+                // bytes when possible (falls back to caller's value
+                // for sniffer misses so we don't regress shipping
+                // unrecognized-but-valid types).
+                let effective_mime: &str = if is_supported_gemini_image_mime(media_type) {
+                    media_type
+                } else if let Some(inferred) = crate::infer_image_mime(bytes.as_ref()) {
+                    inferred
+                } else {
+                    media_type
+                };
+                contents.push(json!({
+                    "role": "user",
+                    "parts": [{
+                        "inlineData": {
+                            "mimeType": effective_mime,
+                            "data": BASE64_STANDARD.encode(bytes.as_ref()),
+                        },
+                    }],
+                }));
+            }
             LlmInputItem::Reasoning(ReasoningPayload::Google {
                 summary,
                 thought_signature,
@@ -610,6 +637,21 @@ fn google_contents(input: &[LlmInputItem]) -> Value {
     Value::Array(contents)
 }
 
+/// TODO (M-08 / M-09): per-part `thoughtSignature` preservation. Today
+/// `ReasoningPayload::Google` carries `summary: Vec<String>` + a single
+/// `Option<String>` signature, so on replay every summary part gets
+/// the same signature and signatures on text / functionCall parts are
+/// dropped entirely. This works for Gemini 2.5 by coincidence but
+/// breaks Gemini 3 multi-turn tool use (pi #1829).
+///
+/// The full fix needs `ReasoningPayload::Google` to carry
+/// `Vec<(text, Option<sig>)>` and the lib-side `LlmInputItem::AssistantText`
+/// / `FunctionCall` variants to grow optional `thoughtSignature` fields.
+/// Both live in lib.rs / squeezy-core (outside this provider's
+/// ownership window). The buffer below preserves the *last* signature
+/// observed within a chunk; that's the de facto Gemini 2.5 shape pi
+/// historically shipped and unblocks the Phase 4C migration without a
+/// schema change.
 #[derive(Debug, Default)]
 struct GoogleReasoningBuffer {
     summary: Vec<String>,
