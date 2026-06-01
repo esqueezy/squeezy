@@ -3,6 +3,19 @@
 //! Gemini, Anthropic Messages). Each provider parses the `data:` payload
 //! itself; this module only frames the byte stream into individual events.
 
+/// A decoded SSE event: the joined `data:` payload alongside the
+/// optional `event:` name. Most providers only consume the `data:`
+/// payload (and call [`SseDecoder::push`] / [`SseDecoder::finish`]),
+/// but the `event:` field is preserved here so future call sites that
+/// need stream-phase disambiguation can switch to
+/// [`SseDecoder::push_with_events`] / [`SseDecoder::finish_with_events`]
+/// without another decoder refactor (L3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SseEvent {
+    pub data: String,
+    pub event: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct SseDecoder {
     buffer: Vec<u8>,
@@ -16,6 +29,30 @@ pub(crate) struct SseDecoder {
 
 impl SseDecoder {
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.push_with_events(bytes)
+            .into_iter()
+            .map(|e| e.data)
+            .collect()
+    }
+
+    pub(crate) fn finish(&mut self) -> Vec<String> {
+        self.finish_with_events()
+            .into_iter()
+            .map(|e| e.data)
+            .collect()
+    }
+
+    /// Like [`Self::push`] but preserves the `event:` field on each
+    /// returned event. The `data` payload is identical to what
+    /// [`Self::push`] would produce. No production caller reads
+    /// `event` yet (see L3 audit note in `.audit/providers/openai-compatible.md`);
+    /// when one needs it (Cohere, future OpenAI Responses Mux phases,
+    /// MCP server-streaming), swap the call site over without
+    /// changing this module.
+    // TODO(L3): migrate `google.rs`, `compatible.rs`, `lmstudio.rs`,
+    // `openai.rs`, `oauth/openai_codex.rs`, `anthropic.rs` to
+    // `push_with_events` if/when any of them needs the `event:` name.
+    pub(crate) fn push_with_events(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
         self.buffer.extend_from_slice(bytes);
         let mut events = Vec::new();
 
@@ -43,7 +80,7 @@ impl SseDecoder {
         events
     }
 
-    pub(crate) fn finish(&mut self) -> Vec<String> {
+    pub(crate) fn finish_with_events(&mut self) -> Vec<SseEvent> {
         self.scan_pos = 0;
         if self.buffer.is_empty() {
             return Vec::new();
@@ -69,14 +106,33 @@ fn find_event_boundary(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
     [lf, crlf].into_iter().flatten().min_by_key(|b| b.0)
 }
 
-fn decode_sse_event(bytes: &[u8]) -> Vec<String> {
+fn decode_sse_event(bytes: &[u8]) -> Vec<SseEvent> {
     const DONE_SENTINEL: &str = "[DONE]";
     let text = String::from_utf8_lossy(bytes);
-    let mut events: Vec<String> = Vec::new();
+    let mut events: Vec<SseEvent> = Vec::new();
     let mut pending: Vec<&str> = Vec::new();
+    // L3: SSE allows an `event: <name>` line per event. Capture the
+    // last such name in the frame; it applies to every payload that
+    // the frame surfaces (including any post-`[DONE]` split).
+    let mut event_name: Option<String> = None;
+    let push_pending =
+        |events: &mut Vec<SseEvent>, pending: &mut Vec<&str>, name: &Option<String>| {
+            if !pending.is_empty() {
+                events.push(SseEvent {
+                    data: pending.join("\n"),
+                    event: name.clone(),
+                });
+                pending.clear();
+            }
+        };
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
-        if let Some(data) = line.strip_prefix("data:") {
+        if let Some(name) = line.strip_prefix("event:") {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                event_name = Some(trimmed.to_string());
+            }
+        } else if let Some(data) = line.strip_prefix("data:") {
             // SSE spec (WHATWG EventSource §9.2) allows empty `data:`
             // lines as keep-alive padding. Some providers (notably OpenAI
             // on long reasoning turns) emit them between real chunks;
@@ -96,19 +152,17 @@ fn decode_sse_event(bytes: &[u8]) -> Vec<String> {
             // `data:` lines are still joined with `\n` per the SSE
             // spec.
             if payload == DONE_SENTINEL {
-                if !pending.is_empty() {
-                    events.push(pending.join("\n"));
-                    pending.clear();
-                }
-                events.push(payload.to_string());
+                push_pending(&mut events, &mut pending, &event_name);
+                events.push(SseEvent {
+                    data: payload.to_string(),
+                    event: event_name.clone(),
+                });
             } else {
                 pending.push(payload);
             }
         }
     }
-    if !pending.is_empty() {
-        events.push(pending.join("\n"));
-    }
+    push_pending(&mut events, &mut pending, &event_name);
     events
 }
 

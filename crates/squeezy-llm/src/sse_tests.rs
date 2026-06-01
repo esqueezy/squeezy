@@ -1,4 +1,4 @@
-use super::SseDecoder;
+use super::{SseDecoder, SseEvent};
 
 #[test]
 fn splits_single_event() {
@@ -184,4 +184,82 @@ fn multiple_data_lines_still_joined_when_no_done() {
     let mut decoder = SseDecoder::default();
     let events = decoder.push(b"data: first\ndata: second\ndata: third\n\n");
     assert_eq!(events, vec!["first\nsecond\nthird".to_string()]);
+}
+
+#[test]
+fn event_field_preserved() {
+    // L3: `push_with_events` must surface the `event:` field. The
+    // backward-compat `push` projection drops it; both APIs must agree
+    // on `data`.
+    let mut decoder = SseDecoder::default();
+    let events = decoder.push_with_events(b"event: response.refusal.delta\ndata: payload\n\n");
+    assert_eq!(
+        events,
+        vec![SseEvent {
+            data: "payload".to_string(),
+            event: Some("response.refusal.delta".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn event_field_absent_is_none() {
+    // L3: a frame with no `event:` line yields `event: None` on the
+    // returned struct.
+    let mut decoder = SseDecoder::default();
+    let events = decoder.push_with_events(b"data: payload\n\n");
+    assert_eq!(
+        events,
+        vec![SseEvent {
+            data: "payload".to_string(),
+            event: None,
+        }]
+    );
+}
+
+#[test]
+fn event_field_empty_value_treated_as_none() {
+    // L3: an empty `event:` line (only whitespace) should not latch a
+    // bogus phase name.
+    let mut decoder = SseDecoder::default();
+    let events = decoder.push_with_events(b"event:   \ndata: payload\n\n");
+    assert_eq!(
+        events,
+        vec![SseEvent {
+            data: "payload".to_string(),
+            event: None,
+        }]
+    );
+}
+
+#[test]
+fn event_field_applies_to_split_payloads() {
+    // L3 + L4: when a frame is split because of the `[DONE]` rule, the
+    // captured `event:` name must apply to every surfaced payload.
+    let mut decoder = SseDecoder::default();
+    let events = decoder
+        .push_with_events(b"event: response.completed\ndata: {\"ok\":true}\ndata: [DONE]\n\n");
+    assert_eq!(
+        events,
+        vec![
+            SseEvent {
+                data: "{\"ok\":true}".to_string(),
+                event: Some("response.completed".to_string()),
+            },
+            SseEvent {
+                data: "[DONE]".to_string(),
+                event: Some("response.completed".to_string()),
+            },
+        ]
+    );
+}
+
+#[test]
+fn push_projection_drops_event_field_for_legacy_callers() {
+    // L3: the backward-compatible `push` API still returns only the
+    // `data` payload so existing callers (`google.rs`, `compatible.rs`,
+    // etc.) compile unchanged.
+    let mut decoder = SseDecoder::default();
+    let events = decoder.push(b"event: response.completed\ndata: payload\n\n");
+    assert_eq!(events, vec!["payload".to_string()]);
 }
