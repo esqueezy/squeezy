@@ -341,7 +341,11 @@ fn google_stream_attempt(
             unreachable!("provider error returned above");
         };
 
-        yield LlmEvent::Started;
+        // Defer Started until the first successful parse_google_event.
+        // Pre-fix Started fired right after HTTP 200, so first-chunk
+        // parse failures, empty 200 bodies, and pre-stream errors
+        // surfaced as "Started but no Completed" dangling state.
+        let mut started_emitted = false;
         let mut decoder = SseDecoder::default();
         let mut last_cost = CostSnapshot::default();
         let mut last_finish_reason: Option<String> = None;
@@ -384,6 +388,10 @@ fn google_stream_attempt(
                     &mut tool_call_counter,
                     &mut response_id_slot,
                 )?;
+                if !started_emitted {
+                    started_emitted = true;
+                    yield LlmEvent::Started;
+                }
                 if let Some(server) = server_model_slot.take()
                     && let Some(echo) = server_model_echo.observe(&request.model, &server)
                 {
@@ -405,6 +413,10 @@ fn google_stream_attempt(
                 &mut tool_call_counter,
                 &mut response_id_slot,
             )?;
+            if !started_emitted {
+                started_emitted = true;
+                yield LlmEvent::Started;
+            }
             if let Some(server) = server_model_slot.take()
                 && let Some(echo) = server_model_echo.observe(&request.model, &server)
             {
@@ -416,6 +428,13 @@ fn google_stream_attempt(
         }
         if !saw_any {
             Err(SqueezyError::ProviderStream("Google stream ended without events".to_string()))?;
+        }
+        // Defensive: if every parsed event returned Ok(vec![]) (no
+        // candidates, no usage, no parts) the Started latch never
+        // flipped. Emit it now so consumers always see Started before
+        // Completed.
+        if !started_emitted {
+            yield LlmEvent::Started;
         }
         if let Some(payload) = reasoning_buf.flush() {
             yield LlmEvent::ReasoningDone(payload);
