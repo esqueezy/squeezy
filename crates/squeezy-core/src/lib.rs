@@ -96,7 +96,7 @@ pub const DEFAULT_VERTEX_LOCATION: &str = "us-central1";
 pub const DEFAULT_VERTEX_MODEL: &str = "google/gemini-2.5-pro";
 // OpenAI-compatible single-vendor (light preset tier — no curated models, no dedicated costly test).
 pub const DEFAULT_MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
-pub const DEFAULT_MISTRAL_MODEL: &str = "mistral-large-latest";
+pub const DEFAULT_MISTRAL_MODEL: &str = "mistral-large-2512";
 pub const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
 pub const DEFAULT_TOGETHER_MODEL: &str = "meta-llama/Llama-3.3-70B-Instruct-Turbo";
 pub const DEFAULT_FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
