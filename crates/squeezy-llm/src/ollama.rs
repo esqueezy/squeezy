@@ -258,8 +258,9 @@ impl LlmProvider for OllamaProvider {
 }
 
 fn ollama_messages(instructions: &str, input: &[LlmInputItem]) -> Value {
-    let mut messages = Vec::new();
-    if !instructions.trim().is_empty() {
+    let has_instructions = !instructions.trim().is_empty();
+    let mut messages = Vec::with_capacity(input.len() + usize::from(has_instructions));
+    if has_instructions {
         messages.push(json!({ "role": "system", "content": instructions }));
     }
     for item in input {
