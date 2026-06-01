@@ -358,6 +358,7 @@ fn google_stream_attempt(
         // FunctionCallOutput overrode the first. Lift the counter
         // to a per-stream usize so parallel calls keep distinct ids.
         let mut tool_call_counter: usize = 0;
+        let mut response_id_slot: Option<String> = None;
         let mut bytes = response.bytes_stream();
         loop {
             let polled = tokio::select! {
@@ -381,6 +382,7 @@ fn google_stream_attempt(
                     &mut reasoning_buf,
                     &mut server_model_slot,
                     &mut tool_call_counter,
+                    &mut response_id_slot,
                 )?;
                 if let Some(server) = server_model_slot.take()
                     && let Some(echo) = server_model_echo.observe(&request.model, &server)
@@ -401,6 +403,7 @@ fn google_stream_attempt(
                 &mut reasoning_buf,
                 &mut server_model_slot,
                 &mut tool_call_counter,
+                &mut response_id_slot,
             )?;
             if let Some(server) = server_model_slot.take()
                 && let Some(echo) = server_model_echo.observe(&request.model, &server)
@@ -418,7 +421,7 @@ fn google_stream_attempt(
             yield LlmEvent::ReasoningDone(payload);
         }
         yield LlmEvent::Completed {
-            response_id: None,
+            response_id: response_id_slot,
             cost: last_cost,
             stop_reason: last_finish_reason
                 .as_deref()
@@ -568,6 +571,7 @@ fn parse_google_event(
     reasoning_buf: &mut GoogleReasoningBuffer,
     server_model_slot: &mut Option<String>,
     tool_call_counter: &mut usize,
+    response_id_slot: &mut Option<String>,
 ) -> Result<Vec<LlmEvent>> {
     let value: Value = serde_json::from_str(data)
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid Google SSE JSON: {err}")))?;
@@ -604,6 +608,15 @@ fn parse_google_event(
         // outer stream loop drains the slot and emits `ServerModel`
         // once when the snapshot id differs from `request.model`.
         *server_model_slot = Some(server_model.to_string());
+    }
+    // Gemini's GenerateContentResponse carries `responseId` — the
+    // natural correlation id for tracing / replay. Pre-fix it was
+    // ignored and Completed.response_id was hard-coded to None.
+    if response_id_slot.is_none()
+        && let Some(rid) = value.get("responseId").and_then(Value::as_str)
+        && !rid.is_empty()
+    {
+        *response_id_slot = Some(rid.to_string());
     }
     if let Some(usage) = value.get("usageMetadata") {
         cost.input_tokens = usage.get("promptTokenCount").and_then(Value::as_u64);

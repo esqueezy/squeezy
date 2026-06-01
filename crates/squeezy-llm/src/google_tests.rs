@@ -154,6 +154,7 @@ fn parser_extracts_text_tool_calls_and_usage() {
     let mut reasoning_buf = GoogleReasoningBuffer::default();
     let mut server_model_slot: Option<String> = None;
     let mut tool_call_counter: usize = 0;
+    let mut response_id_slot: Option<String> = None;
     let events = parse_google_event(
         r#"{
           "candidates":[{
@@ -167,13 +168,15 @@ fn parser_extracts_text_tool_calls_and_usage() {
             "candidatesTokenCount":3,
             "cachedContentTokenCount":2
           },
-          "modelVersion":"gemini-2.5-pro-002"
+          "modelVersion":"gemini-2.5-pro-002",
+          "responseId":"resp-abc123"
         }"#,
         &mut cost,
         &mut last_finish_reason,
         &mut reasoning_buf,
         &mut server_model_slot,
         &mut tool_call_counter,
+        &mut response_id_slot,
     )
     .expect("valid event");
 
@@ -190,6 +193,7 @@ fn parser_extracts_text_tool_calls_and_usage() {
     assert_eq!(cost.output_tokens, Some(3));
     assert_eq!(cost.cached_input_tokens, Some(2));
     assert_eq!(server_model_slot.as_deref(), Some("gemini-2.5-pro-002"));
+    assert_eq!(response_id_slot.as_deref(), Some("resp-abc123"));
 }
 
 #[test]
@@ -352,6 +356,7 @@ fn parallel_tool_calls_across_chunks_get_distinct_ids() {
     let mut reasoning_buf = GoogleReasoningBuffer::default();
     let mut server_model_slot: Option<String> = None;
     let mut tool_call_counter: usize = 0;
+    let mut response_id_slot: Option<String> = None;
     // Two separate SSE events, each carrying functionCall at parts[0].
     // Pre-fix both got `google_call_0` because the counter was the part
     // index within a single event; canonicalization then collapsed
@@ -369,6 +374,7 @@ fn parallel_tool_calls_across_chunks_get_distinct_ids() {
         &mut reasoning_buf,
         &mut server_model_slot,
         &mut tool_call_counter,
+        &mut response_id_slot,
     )
     .expect("valid first event");
     let second = parse_google_event(
@@ -384,6 +390,7 @@ fn parallel_tool_calls_across_chunks_get_distinct_ids() {
         &mut reasoning_buf,
         &mut server_model_slot,
         &mut tool_call_counter,
+        &mut response_id_slot,
     )
     .expect("valid second event");
     let LlmEvent::ToolCall(ref first_call) = first[0] else {
@@ -575,6 +582,7 @@ fn parser_surfaces_prompt_feedback_block_reason_as_error() {
     let mut reasoning_buf = GoogleReasoningBuffer::default();
     let mut server_model_slot: Option<String> = None;
     let mut tool_call_counter: usize = 0;
+    let mut response_id_slot: Option<String> = None;
     let err = parse_google_event(
         r#"{
           "promptFeedback":{"blockReason":"SAFETY"},
@@ -585,6 +593,7 @@ fn parser_surfaces_prompt_feedback_block_reason_as_error() {
         &mut reasoning_buf,
         &mut server_model_slot,
         &mut tool_call_counter,
+        &mut response_id_slot,
     )
     .expect_err("blocked prompt must surface as ProviderStream error");
     let message = err.to_string();
