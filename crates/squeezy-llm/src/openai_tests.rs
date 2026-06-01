@@ -633,6 +633,75 @@ fn parser_surfaces_error_events() {
 }
 
 #[test]
+fn parser_emits_tool_call_delta_for_function_call_arguments_streaming() {
+    // H-07: `response.function_call_arguments.delta` MUST surface as
+    // `LlmEvent::ToolCallDelta` so the UI shows progress before the
+    // full `output_item.done` lands. The function name is captured from
+    // the preceding `response.output_item.added` event.
+    let mut acc = ReasoningAccumulator::default();
+
+    let added = parse_openai_event(
+        r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"item_42","call_id":"call_42","name":"apply_patch"}}"#,
+        &mut acc,
+    )
+    .expect("valid added event");
+    assert!(added.is_none(), "added event is internal-only");
+
+    let first_chunk = parse_openai_event(
+        r#"{"type":"response.function_call_arguments.delta","item_id":"item_42","delta":"{\"patch\":\""}"#,
+        &mut acc,
+    )
+    .expect("valid delta")
+    .expect("delta event must emit");
+    assert_eq!(
+        first_chunk,
+        LlmEvent::ToolCallDelta {
+            call_id: "item_42".to_string(),
+            name: "apply_patch".to_string(),
+            arguments_chunk: "{\"patch\":\"".to_string(),
+        },
+    );
+
+    let second_chunk = parse_openai_event(
+        r#"{"type":"response.function_call_arguments.delta","item_id":"item_42","delta":"diff..."}"#,
+        &mut acc,
+    )
+    .expect("valid second delta")
+    .expect("delta event must emit");
+    assert_eq!(
+        second_chunk,
+        LlmEvent::ToolCallDelta {
+            call_id: "item_42".to_string(),
+            name: "apply_patch".to_string(),
+            arguments_chunk: "diff...".to_string(),
+        },
+    );
+}
+
+#[test]
+fn parser_tool_call_delta_falls_back_to_empty_name_when_added_event_missed() {
+    // Defensive — if reconnect-without-skip drops the
+    // `response.output_item.added` event the deltas still surface, just
+    // with an empty function-name string. Better than dropping the
+    // chunk on the floor.
+    let mut acc = ReasoningAccumulator::default();
+    let event = parse_openai_event(
+        r#"{"type":"response.function_call_arguments.delta","item_id":"item_orphan","delta":"...]}"}"#,
+        &mut acc,
+    )
+    .expect("valid event")
+    .expect("event must emit");
+    assert_eq!(
+        event,
+        LlmEvent::ToolCallDelta {
+            call_id: "item_orphan".to_string(),
+            name: String::new(),
+            arguments_chunk: "...]}".to_string(),
+        },
+    );
+}
+
+#[test]
 fn parser_emits_refusal_event_and_latches_refusal_stop_reason() {
     // C-02: `response.refusal.delta` events MUST surface as visible
     // `LlmEvent::Refusal` chunks, and the terminal `response.completed`

@@ -460,6 +460,15 @@ pub(crate) struct ReasoningAccumulator {
     /// `StopReason::Refusal` here. The TUI also sees per-delta refusal
     /// text via `LlmEvent::Refusal` while the refusal streams.
     refusal_latched: bool,
+    /// Per-item-id (call_id) cache of the function name observed on the
+    /// matching `response.output_item.added` event. Needed because
+    /// `response.function_call_arguments.delta` (H-07) carries only the
+    /// `item_id` + chunk text, not the function name — downstream
+    /// consumers need the name to render a meaningful "calling tool X"
+    /// hint. The terminal `response.output_item.done` event still
+    /// produces the canonical `LlmEvent::ToolCall` with the fully
+    /// assembled arguments, so consumers may also ignore the deltas.
+    tool_call_names: std::collections::HashMap<String, String>,
 }
 
 impl ReasoningAccumulator {
@@ -547,6 +556,53 @@ pub(crate) fn parse_openai_event(
             // — production streams always start with at least one delta).
             reasoning_acc.refusal_latched = true;
             Ok(None)
+        }
+        "response.output_item.added" => {
+            // H-07: pre-register the call_id → name mapping the
+            // subsequent `response.function_call_arguments.delta`
+            // events need to surface a meaningful name. The terminal
+            // `response.output_item.done` still emits the canonical
+            // `ToolCall` with the assembled arguments so consumers
+            // that only watch the final event keep working.
+            if let Some(item) = value.get("item")
+                && item.get("type").and_then(Value::as_str) == Some("function_call")
+                && let (Some(item_id), Some(name)) = (
+                    item.get("id").and_then(Value::as_str),
+                    item.get("name").and_then(Value::as_str),
+                )
+            {
+                reasoning_acc
+                    .tool_call_names
+                    .insert(item_id.to_string(), name.to_string());
+            }
+            Ok(None)
+        }
+        "response.function_call_arguments.delta" => {
+            // H-07: incremental tool-arguments delta. OpenAI's Responses
+            // streams `apply_patch` / multi-file diff arguments
+            // chunk-by-chunk; surfacing them lets the UI show progress
+            // before the full call materializes. The canonical
+            // `LlmEvent::ToolCall` still lands at `output_item.done`.
+            let item_id = value
+                .get("item_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let chunk = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = reasoning_acc
+                .tool_call_names
+                .get(&item_id)
+                .cloned()
+                .unwrap_or_default();
+            Ok(Some(LlmEvent::ToolCallDelta {
+                call_id: item_id,
+                name,
+                arguments_chunk: chunk,
+            }))
         }
         "response.reasoning_summary_text.delta" => {
             let delta = value
