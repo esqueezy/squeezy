@@ -363,6 +363,22 @@ fn parse_google_event(
             .unwrap_or("Google stream error");
         return Err(SqueezyError::ProviderStream(message.to_string()));
     }
+    // Safety / content-policy blocks on the *prompt* arrive as an SSE
+    // event with no candidates, only `promptFeedback.blockReason`.
+    // Without this branch, `Ok(vec![])` returns and the outer loop
+    // closes with `Completed { stop_reason: None }` — the agent sees
+    // a silent zero-output success and retries forever. Surface the
+    // block reason as a hard error so callers can show a real
+    // message. Docs: https://ai.google.dev/api/generate-content
+    if let Some(block_reason) = value
+        .get("promptFeedback")
+        .and_then(|fb| fb.get("blockReason"))
+        .and_then(Value::as_str)
+    {
+        return Err(SqueezyError::ProviderStream(format!(
+            "Google blocked prompt: {block_reason}"
+        )));
+    }
     if server_model_slot.is_none()
         && let Some(server_model) = value.get("modelVersion").and_then(Value::as_str)
         && !server_model.is_empty()

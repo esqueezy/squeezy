@@ -191,6 +191,34 @@ fn parser_extracts_text_tool_calls_and_usage() {
 }
 
 #[test]
+fn parser_surfaces_prompt_feedback_block_reason_as_error() {
+    let mut cost = CostSnapshot::default();
+    let mut last_finish_reason: Option<String> = None;
+    let mut reasoning_buf = GoogleReasoningBuffer::default();
+    let mut server_model_slot: Option<String> = None;
+    let err = parse_google_event(
+        r#"{
+          "promptFeedback":{"blockReason":"SAFETY"},
+          "usageMetadata":{"promptTokenCount":4}
+        }"#,
+        &mut cost,
+        &mut last_finish_reason,
+        &mut reasoning_buf,
+        &mut server_model_slot,
+    )
+    .expect_err("blocked prompt must surface as ProviderStream error");
+    let message = err.to_string();
+    assert!(
+        message.contains("Google blocked prompt"),
+        "expected blocked-prompt prefix, got `{message}`"
+    );
+    assert!(
+        message.contains("SAFETY"),
+        "expected block reason in message, got `{message}`"
+    );
+}
+
+#[test]
 fn request_body_encodes_image_as_inline_data_part() {
     let bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
     let request = LlmRequest {
