@@ -19,8 +19,8 @@ use super::{
     BedrockProvider, BedrockStreamState, apply_inference_profile_prefix,
     apply_thinking_extra_fields, bedrock_effort_label, bedrock_request_metadata_map,
     build_bedrock_client, compute_thinking_extra_fields, conversation_messages,
-    handle_bedrock_event, inference_configuration, json_to_document, region_prefix, system_blocks,
-    tool_configuration,
+    current_bearer_token, handle_bedrock_event, inference_configuration, json_to_document,
+    region_prefix, system_blocks, tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{CacheRetention, LlmInputItem, LlmRequest, LlmToolSpec};
@@ -993,6 +993,73 @@ fn apply_thinking_extra_fields_no_emit_without_reasoning_effort() {
         "no reasoning_effort means no thinking emission; got {:?}",
         fields,
     );
+}
+
+// `current_bearer_token` reads a real environment variable. Tests
+// that set/clear `AWS_BEARER_TOKEN_BEDROCK` must execute serially
+// because Rust runs tests in parallel by default and env mutation is
+// process-global. Each test guards itself with a single mutex to
+// prevent racing with a sibling test that observes the variable.
+static BEARER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn current_bearer_token_prefers_live_env_var_over_fallback() {
+    let _guard = BEARER_ENV_LOCK.lock().unwrap();
+    let original = std::env::var("AWS_BEARER_TOKEN_BEDROCK").ok();
+    // SAFETY: lock taken above + restore on drop below; single-process tests.
+    unsafe {
+        std::env::set_var("AWS_BEARER_TOKEN_BEDROCK", "rotated-token-12345");
+    }
+    let resolved = current_bearer_token(Some("config-time-fallback"));
+    assert_eq!(
+        resolved.as_deref(),
+        Some("rotated-token-12345"),
+        "env wins so the live shell can rotate without rebuilding the provider",
+    );
+    // Whitespace must be trimmed so a shell heredoc doesn't poison
+    // the bearer header.
+    unsafe {
+        std::env::set_var("AWS_BEARER_TOKEN_BEDROCK", "   padded-token\n");
+    }
+    assert_eq!(
+        current_bearer_token(Some("config-fallback")).as_deref(),
+        Some("padded-token"),
+    );
+    match original {
+        Some(value) => unsafe { std::env::set_var("AWS_BEARER_TOKEN_BEDROCK", value) },
+        None => unsafe { std::env::remove_var("AWS_BEARER_TOKEN_BEDROCK") },
+    }
+}
+
+#[test]
+fn current_bearer_token_falls_back_when_env_unset_or_blank() {
+    let _guard = BEARER_ENV_LOCK.lock().unwrap();
+    let original = std::env::var("AWS_BEARER_TOKEN_BEDROCK").ok();
+    // Unset env -> use fallback (config-time value).
+    unsafe {
+        std::env::remove_var("AWS_BEARER_TOKEN_BEDROCK");
+    }
+    assert_eq!(
+        current_bearer_token(Some("config-value")).as_deref(),
+        Some("config-value"),
+    );
+    assert!(
+        current_bearer_token(None).is_none(),
+        "no env and no fallback means no bearer (caller falls back to SigV4)",
+    );
+    // Blank/whitespace env -> treat as "unset" and use fallback.
+    unsafe {
+        std::env::set_var("AWS_BEARER_TOKEN_BEDROCK", "   ");
+    }
+    assert_eq!(
+        current_bearer_token(Some("config-value")).as_deref(),
+        Some("config-value"),
+        "blank env must not poison the bearer header",
+    );
+    match original {
+        Some(value) => unsafe { std::env::set_var("AWS_BEARER_TOKEN_BEDROCK", value) },
+        None => unsafe { std::env::remove_var("AWS_BEARER_TOKEN_BEDROCK") },
+    }
 }
 
 #[test]

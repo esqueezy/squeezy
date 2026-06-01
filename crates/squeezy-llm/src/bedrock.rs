@@ -83,7 +83,35 @@ impl BedrockProvider {
             .shared
             .get_or_init(|| async move { load_aws_config(region, base_url).await })
             .await;
-        build_bedrock_client(shared, self.bearer_token.as_deref())
+        // Bedrock API keys carry an expiry — short-term keys last up
+        // to 12h, long-term keys 1/5/30/90/365d. Re-read the env var
+        // on every `client()` call so a rotated `AWS_BEARER_TOKEN_BEDROCK`
+        // is picked up without restarting the agent. The configured
+        // value (loaded at provider-construction time) is the fallback
+        // — env wins so the live shell can override the config without
+        // forcing operators to rebuild the provider.
+        let bearer_token = current_bearer_token(self.bearer_token.as_deref());
+        build_bedrock_client(shared, bearer_token.as_deref())
+    }
+}
+
+/// Resolve the bearer token to use on the next Bedrock client build.
+/// Prefers the live `AWS_BEARER_TOKEN_BEDROCK` env var so a rotated
+/// shell secret takes effect immediately; falls back to the
+/// provider-construction-time value when the env is unset. An empty
+/// or whitespace-only env value is treated as "unset" so a shell that
+/// exports the var blank doesn't poison the bearer header.
+fn current_bearer_token(fallback: Option<&str>) -> Option<String> {
+    match std::env::var("AWS_BEARER_TOKEN_BEDROCK").ok() {
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                fallback.map(|s| s.to_string())
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        None => fallback.map(|s| s.to_string()),
     }
 }
 
