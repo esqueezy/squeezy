@@ -191,6 +191,28 @@ fn parser_extracts_text_tool_calls_and_usage() {
 }
 
 #[test]
+fn explicit_reasoning_effort_emits_thinking_config_with_budget() {
+    use squeezy_core::ReasoningEffort;
+    let request = LlmRequest {
+        model: "gemini-2.5-pro".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        reasoning_effort: Some(ReasoningEffort::Medium),
+        ..LlmRequest::default()
+    };
+    let body = GoogleProvider::request_body(&request);
+    let thinking = &body["generationConfig"]["thinkingConfig"];
+    assert_eq!(
+        thinking["includeThoughts"], true,
+        "explicit reasoning_effort must turn includeThoughts on"
+    );
+    assert!(
+        thinking["thinkingBudget"].is_number(),
+        "explicit reasoning_effort must carry a thinkingBudget"
+    );
+}
+
+#[test]
 fn parser_surfaces_prompt_feedback_block_reason_as_error() {
     let mut cost = CostSnapshot::default();
     let mut last_finish_reason: Option<String> = None;

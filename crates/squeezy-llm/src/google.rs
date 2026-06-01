@@ -77,8 +77,18 @@ impl GoogleProvider {
         // summaries unless `includeThoughts` is on. Mirror OpenAI: request
         // summaries whenever the model is reasoning-capable, and only set
         // an explicit `thinkingBudget` when the caller picked an effort.
-        let reasoning_capable = crate::capabilities_for("google", &request.model)
-            .is_some_and(|caps| caps.reasoning_effort);
+        //
+        // Caps signal is OR-of-three: either the legacy `reasoning_effort`
+        // flag, the Phase 1 `default_reasoning_effort` (registers a
+        // recommended baseline even when the wire field is fixed), or an
+        // explicit per-request `reasoning_effort`. Without the
+        // `default_reasoning_effort` arm, Gemini 2.5 models which carry
+        // `reasoning_effort: false` in models.json never get
+        // `includeThoughts` and the ReasoningDelta path is dead code even
+        // though users are billed for `thoughtsTokenCount`.
+        let caps = crate::capabilities_for("google", &request.model);
+        let reasoning_capable = caps.is_some_and(|c| c.reasoning_effort)
+            || caps.is_some_and(|c| c.default_reasoning_effort.is_some());
         if reasoning_capable || request.reasoning_effort.is_some() {
             let mut thinking = json!({ "includeThoughts": true });
             if let Some(effort) = request.reasoning_effort {
