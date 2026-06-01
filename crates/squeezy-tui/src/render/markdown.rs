@@ -830,16 +830,28 @@ fn middle_truncate_chars(text: &str, max_chars: usize) -> String {
     let keep = max_chars - marker.len();
     let head = keep / 2;
     let tail = keep - head;
-    let prefix: String = text.chars().take(head).collect();
-    let suffix: String = text
-        .chars()
-        .rev()
-        .take(tail)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{prefix}{marker}{suffix}")
+    let prefix_end = if head == 0 {
+        0
+    } else {
+        text.char_indices()
+            .nth(head)
+            .map(|(idx, _)| idx)
+            .unwrap_or(text.len())
+    };
+    let suffix_start = if tail == 0 {
+        text.len()
+    } else {
+        text.char_indices()
+            .nth(len - tail)
+            .map(|(idx, _)| idx)
+            .unwrap_or(text.len())
+    };
+    let mut out =
+        String::with_capacity(prefix_end + marker.len() + text.len().saturating_sub(suffix_start));
+    out.push_str(&text[..prefix_end]);
+    out.push_str(marker);
+    out.push_str(&text[suffix_start..]);
+    out
 }
 
 fn compact_unbroken_text_tokens(text: &str) -> String {
