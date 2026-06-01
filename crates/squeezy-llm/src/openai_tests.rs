@@ -1535,6 +1535,93 @@ fn request_body_falls_back_to_string_output_when_content_parts_unset() {
 }
 
 #[test]
+fn build_responses_url_appends_preview_api_version_for_azure() {
+    // C-13: caller-supplied `?api-version=preview` MUST land verbatim on
+    // the URL. The DEFAULT_AZURE_OPENAI_API_VERSION constant in
+    // squeezy-core is `"v1"` (wrong for Responses) — squeezy-core is
+    // outside Phase 4B scope; this test verifies the URL-build path
+    // correctly carries whatever the caller chose.
+    let url = super::build_responses_url(
+        "https://resource.openai.azure.com/openai/v1",
+        Some("preview"),
+        false,
+    );
+    assert_eq!(
+        url,
+        "https://resource.openai.azure.com/openai/v1/responses?api-version=preview"
+    );
+}
+
+#[test]
+fn build_responses_url_percent_encodes_api_version_typos() {
+    // AZ-M4 / M-56: typos like `"preview "` (trailing space) MUST be
+    // percent-encoded so the URL remains valid instead of breaking the
+    // HTTP request builder.
+    let url = super::build_responses_url(
+        "https://resource.openai.azure.com/openai/v1",
+        Some("preview "),
+        false,
+    );
+    assert!(
+        url.ends_with("?api-version=preview%20"),
+        "expected trailing-space percent-encoded, got `{url}`",
+    );
+}
+
+#[test]
+fn build_responses_url_uses_ampersand_when_base_already_has_query_string() {
+    // AZ-M4: when the user's `base_url` already carries a query string,
+    // `api-version` joins with `&` instead of producing two `?`s.
+    let url = super::build_responses_url(
+        "https://resource.openai.azure.com/openai/v1?subscription-key=abc",
+        Some("preview"),
+        false,
+    );
+    assert_eq!(
+        url,
+        "https://resource.openai.azure.com/openai/v1?subscription-key=abc/responses&api-version=preview",
+        "ampersand separator must join the second query parameter"
+    );
+}
+
+#[test]
+fn build_responses_url_omits_query_when_api_version_is_none() {
+    // Standard OpenAI / xAI: no api-version, plain `/responses`.
+    let url = super::build_responses_url("https://api.openai.com/v1", None, false);
+    assert_eq!(url, "https://api.openai.com/v1/responses");
+}
+
+#[test]
+fn is_classic_azure_deployment_url_detects_old_url_shape() {
+    // H-36: detect the classic `/openai/deployments/{deployment}` URL
+    // shape that older Azure Government / Mooncake resources still use.
+    let config = squeezy_core::AzureOpenAiConfig {
+        api_key_env: "AZURE_TEST_KEY_ENV_DOES_NOT_NEED_TO_EXIST".to_string(),
+        api_key: Some("test-key".to_string()),
+        base_url: "https://gov.openai.azure.us/openai/deployments/my-deploy".to_string(),
+        api_version: "2024-10-21".to_string(),
+        deployment_name_map: std::collections::BTreeMap::new(),
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    };
+    let provider = OpenAiProvider::from_azure_config(&config).expect("provider build");
+    assert!(provider.is_classic_azure_deployment_url());
+}
+
+#[test]
+fn is_classic_azure_deployment_url_false_for_v1_url() {
+    let config = squeezy_core::AzureOpenAiConfig {
+        api_key_env: "AZURE_TEST_KEY_ENV_DOES_NOT_NEED_TO_EXIST".to_string(),
+        api_key: Some("test-key".to_string()),
+        base_url: "https://resource.openai.azure.com/openai/v1".to_string(),
+        api_version: "preview".to_string(),
+        deployment_name_map: std::collections::BTreeMap::new(),
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    };
+    let provider = OpenAiProvider::from_azure_config(&config).expect("provider build");
+    assert!(!provider.is_classic_azure_deployment_url());
+}
+
+#[test]
 fn azure_deployment_name_map_translates_mapped_model() {
     let config = squeezy_core::AzureOpenAiConfig {
         api_key_env: "AZURE_TEST_KEY_ENV_DOES_NOT_NEED_TO_EXIST".to_string(),

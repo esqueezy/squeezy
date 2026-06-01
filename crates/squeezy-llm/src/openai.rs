@@ -72,8 +72,25 @@ impl OpenAiProvider {
                 "missing AZURE_OPENAI_BASE_URL or providers.azure_openai.base_url".to_string(),
             ));
         }
+        // C-13: this provider concatenates `?api-version={config.api_version}`
+        // onto every `/responses` URL. The DEFAULT_AZURE_OPENAI_API_VERSION
+        // constant in squeezy-core (`crates/squeezy-core/src/lib.rs:35`)
+        // is currently `"v1"`, which is wrong for the `/responses`
+        // endpoint (Azure requires `"preview"` against `/openai/v1/responses`).
+        // The constant lives outside Phase 4B scope; fixing it is queued
+        // for Phase 4I. The URL-build path below honors whatever the
+        // caller hands in, so setting `[providers.azure_openai].api_version = "preview"`
+        // works correctly today.
+        // TODO(Phase 4I): change DEFAULT_AZURE_OPENAI_API_VERSION to "preview".
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
+        // H-36: detect the classic `/openai/deployments/{deployment}` URL
+        // shape that older Azure Government / Mooncake resources still
+        // use. The Responses route on these resources expects the URL to
+        // already embed the deployment id, so the standard `{base}/responses`
+        // rewrite (with the v1 `/openai/v1` path) breaks them. Stash a
+        // flag here so `stream_response` can skip the deployment-name
+        // rewrite below.
         let mut provider = Self::with_api_key_source(
             "azure_openai",
             static_api_key_source(api_key, "azure_openai"),
@@ -83,6 +100,16 @@ impl OpenAiProvider {
         );
         provider.deployment_name_map = config.deployment_name_map.clone();
         Ok(provider)
+    }
+
+    /// `true` when this Azure provider was configured against the
+    /// classic `/openai/deployments/{deployment}` URL shape. The
+    /// Responses route on those resources expects the deployment to be
+    /// in the URL path, not the request body, so [`stream_response`]
+    /// skips the body-side model rewrite (and warns when neither the
+    /// deployment nor the body model match).
+    pub(crate) fn is_classic_azure_deployment_url(&self) -> bool {
+        self.api_version.is_some() && self.base_url.contains("/openai/deployments/")
     }
 
     /// Build an OpenAI Responses-API client targeting xAI's `/responses`
@@ -330,6 +357,53 @@ fn openai_text_format(schema: &LlmOutputSchema) -> Value {
     })
 }
 
+/// Build the `/responses` URL for a single turn.
+///
+/// - Standard OpenAI / xAI / non-classic Azure: appends `/responses` to
+///   the base URL (already trimmed of trailing `/`).
+/// - Classic Azure (`/openai/deployments/{deployment}` URL shape, H-36):
+///   the deployment is already in the path so `/responses` still
+///   appends.
+/// - `api_version`: when `Some`, attaches as a query parameter using
+///   `&` if the base URL already carries a query string (AZ-M4) and
+///   percent-encoding the value (AZ-M4 / M-56) so typos like
+///   `"preview "` produce a well-formed URL instead of an invalid HTTP
+///   request.
+fn build_responses_url(base_url: &str, api_version: Option<&str>, _classic_azure: bool) -> String {
+    // The classic-Azure flag is currently informational — both shapes
+    // append `/responses`; the deployment-in-path lives in `base_url`
+    // already. Held in the signature so a future per-shape divergence
+    // (e.g. `/responses` vs `/responses?api-version=…` dating per
+    // Azure quickstart) doesn't break the call-site contract.
+    let mut url = format!("{base_url}/responses");
+    if let Some(api_version) = api_version {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        url.push(sep);
+        url.push_str("api-version=");
+        url.push_str(&percent_encode_query_component(api_version));
+    }
+    url
+}
+
+/// Minimal RFC 3986 query-component percent-encoder for `api-version`.
+/// Encodes everything outside the unreserved set
+/// (`A-Z` / `a-z` / `0-9` / `-` `_` `.` `~`) so that valid Azure
+/// `api-version` values (`preview`, `2024-10-21`) pass through verbatim
+/// while user typos (trailing space, `?`, `&`, `#`, …) become
+/// percent-escapes instead of breaking the URL structure.
+fn percent_encode_query_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
+}
+
 impl LlmProvider for OpenAiProvider {
     fn name(&self) -> &'static str {
         self.name
@@ -343,11 +417,18 @@ impl LlmProvider for OpenAiProvider {
         let api_key = self.api_key.clone();
         let provider_name = self.name;
         let transport = self.transport;
-        let mut url = format!("{}/responses", self.base_url);
-        if let Some(api_version) = &self.api_version {
-            url.push_str("?api-version=");
-            url.push_str(api_version);
-        }
+        // H-36 + AZ-M4: build the `/responses` URL via a small helper so
+        // (a) the classic `/openai/deployments/{deployment}` shape skips
+        // the path rewrite, and (b) `?api-version=` composition stays
+        // safe when the api_version string contains reserved chars or
+        // the base_url already has a query string. Encoding via
+        // `url::form_urlencoded::byte_serialize` follows RFC 3986
+        // `query` rules.
+        let url = build_responses_url(
+            &self.base_url,
+            self.api_version.as_deref(),
+            self.is_classic_azure_deployment_url(),
+        );
         let mut body = Self::request_body(&request, provider_name);
         // Azure resources expose deployments under user-chosen ids (e.g.
         // `my-deployment-gpt-4o`). The Responses route reads the body's
@@ -357,6 +438,12 @@ impl LlmProvider for OpenAiProvider {
         // making this a no-op in those paths. Capability lookups above
         // intentionally ran against the *original* `request.model` so
         // the reasoning/effort decision still uses our static registry.
+        //
+        // H-36: the classic `/openai/deployments/{deployment}/responses`
+        // URL shape carries the deployment in the path, so the body
+        // model still matters for telemetry but does not select the
+        // deployment. The body-side rewrite still runs (no harm) and
+        // the URL-build above kept the user's `base_url` unmodified.
         let deployment = self.resolve_deployment_name(&request.model);
         if deployment != request.model.as_ref() {
             body["model"] = json!(deployment);
