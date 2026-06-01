@@ -2435,6 +2435,269 @@ fn openrouter_provider_resolves_to_compatible_variant_with_preset_defaults() {
 }
 
 #[test]
+fn openai_carries_org_project_and_service_tier_from_env() {
+    // Env vars beat TOML on these knobs so a per-shell override of
+    // `OPENAI_PROJECT_ID` (e.g. `direnv`) doesn't get masked by a
+    // checked-in repo `[providers.openai]` block. The provider then
+    // emits `OpenAI-Organization` / `OpenAI-Project` headers and a
+    // `service_tier` body field so spend attribution and tier
+    // selection both land correctly without forking the provider.
+    let openai = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("openai".to_string()),
+        "OPENAI_ORG_ID" => Some("org-PAYG".to_string()),
+        "OPENAI_PROJECT_ID" => Some("proj_abc".to_string()),
+        "OPENAI_SERVICE_TIER" => Some("flex".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::OpenAi(config) = &openai.provider else {
+        panic!("expected openai");
+    };
+    assert_eq!(config.organization.as_deref(), Some("org-PAYG"));
+    assert_eq!(config.project.as_deref(), Some("proj_abc"));
+    assert_eq!(config.service_tier.as_deref(), Some("flex"));
+}
+
+#[test]
+fn openai_falls_back_to_toml_for_org_project_service_tier() {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "openai".to_string(),
+        ProviderSettings {
+            organization: Some("org-fromtoml".to_string()),
+            project: Some("proj_fromtoml".to_string()),
+            service_tier: Some("priority".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(settings, Some("openai"), |_| None)
+        .expect("openai config builds");
+    let ProviderConfig::OpenAi(openai) = &config.provider else {
+        panic!("expected openai");
+    };
+    assert_eq!(openai.organization.as_deref(), Some("org-fromtoml"));
+    assert_eq!(openai.project.as_deref(), Some("proj_fromtoml"));
+    assert_eq!(openai.service_tier.as_deref(), Some("priority"));
+}
+
+#[test]
+fn openai_org_project_service_tier_default_to_none() {
+    let openai = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("openai".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::OpenAi(config) = &openai.provider else {
+        panic!("expected openai");
+    };
+    assert!(config.organization.is_none());
+    assert!(config.project.is_none());
+    assert!(config.service_tier.is_none());
+}
+
+#[test]
+fn azure_openai_carries_extra_headers_from_settings() {
+    // Operators wire `Apim-Subscription-Key` (and Entra ID `Authorization`
+    // overrides) through the standard `[providers.azure_openai.headers]`
+    // table so squeezy can front API-Management-protected endpoints
+    // without forking the provider. The new `extra_headers` slot mirrors
+    // the OpenAI-compatible preset shape so callers learn one TOML
+    // convention.
+    let mut providers = std::collections::BTreeMap::new();
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert(
+        "Apim-Subscription-Key".to_string(),
+        "apim-secret".to_string(),
+    );
+    headers.insert(
+        "x-ms-client-request-id".to_string(),
+        "trace-123".to_string(),
+    );
+    providers.insert(
+        "azure_openai".to_string(),
+        ProviderSettings {
+            headers: Some(headers),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("azure_openai"),
+        |name| match name {
+            "AZURE_OPENAI_BASE_URL" => {
+                Some("https://resource.openai.azure.com/openai/v1".to_string())
+            }
+            _ => None,
+        },
+    )
+    .expect("azure config builds");
+    let ProviderConfig::AzureOpenAi(azure) = &config.provider else {
+        panic!("azure_openai must map to AzureOpenAi");
+    };
+    assert_eq!(
+        azure
+            .extra_headers
+            .get("Apim-Subscription-Key")
+            .map(String::as_str),
+        Some("apim-secret"),
+    );
+    assert_eq!(
+        azure
+            .extra_headers
+            .get("x-ms-client-request-id")
+            .map(String::as_str),
+        Some("trace-123"),
+    );
+}
+
+#[test]
+fn azure_openai_opts_into_entra_id_when_bearer_token_present() {
+    // Operators that pre-populate `AZURE_OPENAI_BEARER_TOKEN` (via
+    // `az account get-access-token`, IMDS, or a sidecar) don't need to
+    // separately flip `use_entra_id`: presence of the token is enough
+    // signal that the api-key path is the wrong default. The provider
+    // surface then swaps `api-key` for `Authorization: Bearer …`.
+    let azure = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("azure_openai".to_string()),
+        "AZURE_OPENAI_BASE_URL" => Some("https://resource.openai.azure.com/openai/v1".to_string()),
+        "AZURE_OPENAI_BEARER_TOKEN" => Some("entra-jwt".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::AzureOpenAi(config) = &azure.provider else {
+        panic!("expected azure");
+    };
+    assert!(config.use_entra_id, "bearer token must imply Entra ID");
+    assert_eq!(
+        config.entra_bearer_token.as_deref(),
+        Some("entra-jwt"),
+        "bearer token must flow through the config so the provider can emit it",
+    );
+}
+
+#[test]
+fn azure_openai_use_entra_id_setting_persists_without_bearer_token() {
+    // The TOML flag stays sticky even when the bearer token has not yet
+    // been issued — the LLM provider's `from_azure_config` is responsible
+    // for surfacing an explicit error rather than silently degrading to
+    // the api-key path, so config-build cannot lose that signal.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "azure_openai".to_string(),
+        ProviderSettings {
+            use_entra_id: Some(true),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("azure_openai"),
+        |name| match name {
+            "AZURE_OPENAI_BASE_URL" => {
+                Some("https://resource.openai.azure.com/openai/v1".to_string())
+            }
+            _ => None,
+        },
+    )
+    .expect("azure config builds");
+    let ProviderConfig::AzureOpenAi(azure) = &config.provider else {
+        panic!("expected azure");
+    };
+    assert!(azure.use_entra_id);
+    assert!(azure.entra_bearer_token.is_none());
+}
+
+#[test]
+fn azure_openai_extra_headers_default_to_empty_map() {
+    let azure = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("azure_openai".to_string()),
+        "AZURE_OPENAI_BASE_URL" => Some("https://resource.openai.azure.com/openai/v1".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::AzureOpenAi(config) = &azure.provider else {
+        panic!("expected azure");
+    };
+    assert!(
+        config.extra_headers.is_empty(),
+        "missing TOML section must leave the map empty so callers cannot accidentally forward stale headers",
+    );
+}
+
+#[test]
+fn vertex_base_url_uses_bare_host_for_global_location() {
+    // Gemini 3.x is GA only via the `global` location, which lives at
+    // bare `aiplatform.googleapis.com` (Google does not run a regional
+    // Anycast frontend named `global`). The historical
+    // `{location}-aiplatform.googleapis.com` shape DNS-fails for
+    // `global`, so the helper must special-case it.
+    assert_eq!(
+        vertex_base_url("my-proj", "global"),
+        "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/endpoints/openapi",
+    );
+    // Casing is normalized so a config that writes `Global` keeps
+    // working.
+    assert_eq!(
+        vertex_base_url("my-proj", "Global"),
+        "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/endpoints/openapi",
+    );
+}
+
+#[test]
+fn vertex_base_url_keeps_regional_shape_for_named_regions() {
+    // Regions (and continental pseudo-regions like `us`/`eu`) keep the
+    // historical `{location}-aiplatform.googleapis.com` host so existing
+    // production deployments are unchanged.
+    assert_eq!(
+        vertex_base_url("my-proj", "us-central1"),
+        "https://us-central1-aiplatform.googleapis.com/v1/projects/my-proj/locations/us-central1/endpoints/openapi",
+    );
+    assert_eq!(
+        vertex_base_url("my-proj", "europe-west4"),
+        "https://europe-west4-aiplatform.googleapis.com/v1/projects/my-proj/locations/europe-west4/endpoints/openapi",
+    );
+}
+
+#[test]
+fn vertex_preset_resolves_global_location_to_bare_host() {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "vertex".to_string(),
+        ProviderSettings {
+            vertex_project: Some("my-project".to_string()),
+            vertex_location: Some("global".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("vertex"), |name| match name {
+            "VERTEX_ACCESS_TOKEN" => Some("ya29.fake".to_string()),
+            _ => None,
+        })
+        .expect("vertex config builds with global location");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("vertex must map to OpenAiCompatible");
+    };
+    assert_eq!(
+        compatible.base_url,
+        "https://aiplatform.googleapis.com/v1/projects/my-project/locations/global/endpoints/openapi",
+        "the `global` location must resolve to the bare host, not `https://global-aiplatform.googleapis.com/...`",
+    );
+}
+
+#[test]
 fn vertex_preset_templates_base_url_from_project_and_location() {
     let mut providers = std::collections::BTreeMap::new();
     providers.insert(
@@ -2467,6 +2730,100 @@ fn vertex_preset_templates_base_url_from_project_and_location() {
 }
 
 #[test]
+fn vertex_preset_opts_into_oauth_when_setting_set() {
+    // The new `use_oauth = true` TOML setting flips the config flag
+    // so the LLM client can construct a refreshing `VertexOAuthSource`
+    // instead of snapshotting `VERTEX_ACCESS_TOKEN` at startup.
+    // squeezy-core only surfaces the intent; the OAuth implementation
+    // lives in squeezy-llm to keep the core layer transport-agnostic.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "vertex".to_string(),
+        ProviderSettings {
+            vertex_project: Some("my-project".to_string()),
+            vertex_location: Some("us-central1".to_string()),
+            use_oauth: Some(true),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(settings, Some("vertex"), |_| None)
+        .expect("vertex config builds with oauth opt-in");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("vertex must map to OpenAiCompatible");
+    };
+    assert!(compatible.use_oauth);
+}
+
+#[test]
+fn vertex_preset_infers_oauth_from_application_credentials_env() {
+    // When the operator has `GOOGLE_APPLICATION_CREDENTIALS` pointed at
+    // a service-account JSON and has NOT pasted a static
+    // `VERTEX_ACCESS_TOKEN`, infer that they want OAuth. This matches
+    // gcloud / opencode behavior and removes the per-session token
+    // refresh chore from the user's workflow.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "vertex".to_string(),
+        ProviderSettings {
+            vertex_project: Some("my-project".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("vertex"), |name| match name {
+            "GOOGLE_APPLICATION_CREDENTIALS" => Some("/path/to/sa.json".to_string()),
+            _ => None,
+        })
+        .expect("vertex config builds with ADC env");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("vertex must map to OpenAiCompatible");
+    };
+    assert!(
+        compatible.use_oauth,
+        "ADC-style env without a static token must imply OAuth intent",
+    );
+}
+
+#[test]
+fn vertex_preset_static_token_disables_oauth_inference() {
+    // The inference path defers to the user's choice: a static
+    // `VERTEX_ACCESS_TOKEN` means they're managing refresh themselves
+    // (e.g. a sidecar that rewrites the env every 50 minutes), so
+    // we keep the legacy static-snapshot behavior.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "vertex".to_string(),
+        ProviderSettings {
+            vertex_project: Some("my-project".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("vertex"), |name| match name {
+            "GOOGLE_APPLICATION_CREDENTIALS" => Some("/path/to/sa.json".to_string()),
+            "VERTEX_ACCESS_TOKEN" => Some("ya29.live".to_string()),
+            _ => None,
+        })
+        .expect("vertex config builds with both ADC env and static token");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("vertex must map to OpenAiCompatible");
+    };
+    assert!(!compatible.use_oauth);
+}
+
+#[test]
 fn vertex_preset_rejects_missing_project() {
     let settings = SettingsFile::default();
     let error = AppConfig::try_from_settings_and_env_vars(settings, Some("vertex"), |_| None)
@@ -2474,6 +2831,225 @@ fn vertex_preset_rejects_missing_project() {
     assert!(
         format!("{error}").contains("vertex_project"),
         "error must explain the missing field, got: {error}"
+    );
+}
+
+#[test]
+fn cerebras_preset_emits_max_completion_tokens_migration_warning() {
+    // Cerebras' chat-completions v1 accepts `max_tokens`; v2
+    // (default 2026-07-21) tightens validation to require
+    // `max_completion_tokens`. The config layer surfaces a soft
+    // warning when operators ship a config that pre-dates the
+    // switch so they're not blindsided by the cutover.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "cerebras".to_string(),
+        ProviderSettings {
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        model_settings: Some(ModelSettings {
+            max_output_tokens: Some(4096),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("cerebras"), |name| match name {
+            "CEREBRAS_API_KEY" => Some("cb-key".to_string()),
+            _ => None,
+        })
+        .expect("cerebras config builds");
+    assert!(
+        config
+            .config_warnings
+            .iter()
+            .any(|w| w.source == "providers.cerebras" && w.field.contains("max_completion_tokens")),
+        "cerebras + max_output_tokens must surface the v2-cutover warning, got: {:?}",
+        config.config_warnings,
+    );
+}
+
+#[test]
+fn cerebras_preset_without_explicit_max_output_tokens_skips_warning() {
+    // `DEFAULT_MAX_OUTPUT_TOKENS` may be `Some(...)` even without a
+    // user-set cap, so the warning fires whenever the resolved
+    // value is non-None on Cerebras. (Operators who want to suppress
+    // the warning entirely can leave the default and accept the v2
+    // wire-key switch.) This test pins the contract so a future
+    // refactor of `DEFAULT_MAX_OUTPUT_TOKENS = None` flips a silent
+    // expectation rather than reintroducing a warning-storm
+    // regression.
+    let config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("openrouter".to_string()),
+        "OPENROUTER_API_KEY" => Some("or-key".to_string()),
+        _ => None,
+    });
+    assert!(
+        config
+            .config_warnings
+            .iter()
+            .all(|w| w.source != "providers.cerebras"),
+        "non-Cerebras providers must not emit the Cerebras v2 warning",
+    );
+}
+
+#[test]
+fn vercel_preset_falls_back_to_oidc_token_env() {
+    // Vercel runtimes inject `VERCEL_OIDC_TOKEN` (12h TTL) into every
+    // function deployment. When the user has not pasted an
+    // `AI_GATEWAY_API_KEY`, fall back to the OIDC token so a squeezy
+    // session inside a Vercel function authenticates against AI Gateway
+    // without per-deploy env juggling.
+    let config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("vercel".to_string()),
+        "VERCEL_OIDC_TOKEN" => Some("eyJ.fake.oidc".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("vercel must map to OpenAiCompatible");
+    };
+    assert_eq!(
+        compatible.api_key_env, "VERCEL_OIDC_TOKEN",
+        "missing AI_GATEWAY_API_KEY must fall back to VERCEL_OIDC_TOKEN",
+    );
+}
+
+#[test]
+fn vercel_preset_canonical_env_wins_over_oidc_alias() {
+    let config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("vercel".to_string()),
+        "AI_GATEWAY_API_KEY" => Some("user-set".to_string()),
+        "VERCEL_OIDC_TOKEN" => Some("eyJ.fake.oidc".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("vercel must map to OpenAiCompatible");
+    };
+    assert_eq!(compatible.api_key_env, "AI_GATEWAY_API_KEY");
+}
+
+#[test]
+fn cloudflare_presets_honor_api_token_alias() {
+    // Cloudflare's dashboard names the credential `CLOUDFLARE_API_TOKEN`
+    // while squeezy historically reads `CLOUDFLARE_API_KEY`. Honor the
+    // dashboard name as a fallback so operators don't have to rename a
+    // CI secret on the way in.
+    let config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("cloudflare_workers_ai".to_string()),
+        "CLOUDFLARE_ACCOUNT_ID" => Some("acct-abc".to_string()),
+        "CLOUDFLARE_API_TOKEN" => Some("token-value".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("workers AI must map to OpenAiCompatible");
+    };
+    assert_eq!(compatible.api_key_env, "CLOUDFLARE_API_TOKEN");
+}
+
+#[test]
+fn deepinfra_preset_honors_token_alias() {
+    let config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("deepinfra".to_string()),
+        "DEEPINFRA_TOKEN" => Some("token-value".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("deepinfra must map to OpenAiCompatible");
+    };
+    assert_eq!(compatible.api_key_env, "DEEPINFRA_TOKEN");
+}
+
+#[test]
+fn baseten_preset_carries_deployment_id_for_per_deployment_url() {
+    // Baseten dedicated deployments live behind per-deployment hosts
+    // (`https://model-{deployment_id}.api.baseten.co/...`). The
+    // placeholder substitution lives in the LLM client; the config
+    // builder's job is to surface the id without making users
+    // downgrade to the `Custom` preset (which would lose
+    // `BASETEN_API_KEY` autoload + the `baseten` registry label).
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "baseten".to_string(),
+        ProviderSettings {
+            deployment_id: Some("4qj0wr".to_string()),
+            base_url: Some(
+                "https://model-{deployment_id}.api.baseten.co/environments/production/sync/v1"
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("baseten"), |name| match name {
+            "BASETEN_API_KEY" => Some("baseten-key".to_string()),
+            _ => None,
+        })
+        .expect("baseten config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("baseten must map to OpenAiCompatible");
+    };
+    assert_eq!(compatible.preset, OpenAiCompatiblePreset::Baseten);
+    assert_eq!(compatible.deployment_id.as_deref(), Some("4qj0wr"));
+    assert!(
+        compatible.base_url.contains("{deployment_id}"),
+        "config layer keeps the placeholder template; substitution lives in the LLM client",
+    );
+}
+
+#[test]
+fn baseten_env_override_beats_toml_deployment_id() {
+    // `BASETEN_DEPLOYMENT_ID` lets operators pivot between deployments
+    // per-shell without editing committed config — common when shipping
+    // a release-candidate alongside a baseline.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "baseten".to_string(),
+        ProviderSettings {
+            deployment_id: Some("from-toml".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("baseten"), |name| match name {
+            "BASETEN_API_KEY" => Some("baseten-key".to_string()),
+            "BASETEN_DEPLOYMENT_ID" => Some("from-env".to_string()),
+            _ => None,
+        })
+        .expect("baseten config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("baseten must map to OpenAiCompatible");
+    };
+    assert_eq!(compatible.deployment_id.as_deref(), Some("from-env"));
+}
+
+#[test]
+fn non_baseten_presets_ignore_deployment_id_env() {
+    // The env-var read is preset-scoped: a stray `BASETEN_DEPLOYMENT_ID`
+    // in a shell that's also running an OpenRouter session must not
+    // leak into the OpenRouter config.
+    let config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("openrouter".to_string()),
+        "OPENROUTER_API_KEY" => Some("or-key".to_string()),
+        "BASETEN_DEPLOYMENT_ID" => Some("stray".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("openrouter must map to OpenAiCompatible");
+    };
+    assert!(
+        compatible.deployment_id.is_none(),
+        "the env-var read must be preset-scoped to Baseten",
     );
 }
 
@@ -2648,6 +3224,124 @@ fn cloudflare_ai_gateway_defaults_gateway_id_when_omitted() {
         !compatible
             .extra_headers
             .contains_key("cf-aig-authorization")
+    );
+}
+
+#[test]
+fn cloudflare_ai_gateway_parses_typed_cf_aig_knobs() {
+    // The typed surface lives in `[providers.cloudflare_ai_gateway.cf_ai_gateway]`
+    // so users no longer have to paste raw `cf-aig-*` headers into
+    // `headers` — caching, observability, and per-request cost
+    // overrides each map to a named field that the LLM client
+    // projects onto a `cf-aig-*` header at request time.
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[providers.cloudflare_ai_gateway]
+cloudflare_account_id = "acct-abc"
+
+[providers.cloudflare_ai_gateway.cf_ai_gateway]
+cache_ttl = 600
+skip_cache = false
+event_id = "evt_run_42"
+step = "plan"
+collect_log = true
+skip_log = false
+metadata = "{\"team\":\"sre\"}"
+cache_key = "user-42:probe"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("cloudflare_ai_gateway"),
+        |name| match name {
+            "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+            _ => None,
+        },
+    )
+    .expect("AI Gateway config builds with typed knobs");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("cloudflare_ai_gateway must map to OpenAiCompatible");
+    };
+    let cf = compatible
+        .cf_ai_gateway
+        .as_ref()
+        .expect("cf_ai_gateway block must round-trip");
+    assert_eq!(cf.cache_ttl, Some(600));
+    assert!(!cf.skip_cache);
+    assert_eq!(cf.event_id.as_deref(), Some("evt_run_42"));
+    assert_eq!(cf.step.as_deref(), Some("plan"));
+    assert!(cf.collect_log);
+    assert!(!cf.skip_log);
+    assert_eq!(cf.metadata.as_deref(), Some("{\"team\":\"sre\"}"));
+    assert_eq!(cf.cache_key.as_deref(), Some("user-42:probe"));
+}
+
+#[test]
+fn cloudflare_ai_gateway_typed_knobs_default_to_none() {
+    // Omitting the `[…cf_ai_gateway]` block leaves the typed surface
+    // unset so the gateway's configured defaults stay in effect —
+    // we never invent traffic the user didn't ask for.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "cloudflare_ai_gateway".to_string(),
+        ProviderSettings {
+            cloudflare_account_id: Some("acct-abc".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("cloudflare_ai_gateway"),
+        |name| match name {
+            "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+            _ => None,
+        },
+    )
+    .expect("AI Gateway config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("cloudflare_ai_gateway must map to OpenAiCompatible");
+    };
+    assert!(compatible.cf_ai_gateway.is_none());
+}
+
+#[test]
+fn non_cf_ai_gateway_presets_drop_cf_aig_knobs() {
+    // A stray `[providers.workers_ai.cf_ai_gateway]` table on the
+    // Workers AI preset (which talks to Cloudflare directly, no
+    // gateway in front) must not flow through — those headers
+    // would be silent-no-ops there.
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[providers.cloudflare_workers_ai]
+cloudflare_account_id = "acct-abc"
+
+[providers.cloudflare_workers_ai.cf_ai_gateway]
+cache_ttl = 600
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("cloudflare_workers_ai"),
+        |name| match name {
+            "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+            _ => None,
+        },
+    )
+    .expect("workers AI config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("cloudflare_workers_ai must map to OpenAiCompatible");
+    };
+    assert!(
+        compatible.cf_ai_gateway.is_none(),
+        "cf_ai_gateway knob surface must only light up for the AI Gateway preset",
     );
 }
 

@@ -1754,6 +1754,9 @@ fn azure_deployment_name_map_translates_mapped_model() {
             ("gpt-4o".to_string(), "my-deployment-gpt-4o".to_string()),
             ("gpt-5".to_string(), "my-deployment-gpt-5".to_string()),
         ]),
+        extra_headers: std::collections::BTreeMap::new(),
+        use_entra_id: false,
+        entra_bearer_token: None,
         transport: squeezy_core::ProviderTransportConfig::default(),
     };
     let provider = OpenAiProvider::from_azure_config(&config).expect("provider build");
@@ -1780,6 +1783,9 @@ fn azure_deployment_name_map_passes_unmapped_model_through() {
             "gpt-4o".to_string(),
             "my-deployment-gpt-4o".to_string(),
         )]),
+        extra_headers: std::collections::BTreeMap::new(),
+        use_entra_id: false,
+        entra_bearer_token: None,
         transport: squeezy_core::ProviderTransportConfig::default(),
     };
     let provider = OpenAiProvider::from_azure_config(&config).expect("provider build");

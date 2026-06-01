@@ -42,6 +42,9 @@ async fn azure_openai_responses_streaming_costly() -> Result<()> {
         base_url,
         api_version,
         deployment_name_map: std::collections::BTreeMap::new(),
+        extra_headers: std::collections::BTreeMap::new(),
+        use_entra_id: false,
+        entra_bearer_token: None,
         transport: ProviderTransportConfig::default(),
     })?;
     let request = LlmRequest {

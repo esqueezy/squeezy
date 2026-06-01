@@ -1006,6 +1006,9 @@ fn cloudflare_presets_substitute_account_and_gateway_placeholders_in_base_url() 
         transport: ProviderTransportConfig::default(),
         account_id: Some("acct-abc".to_string()),
         gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
     })
     .expect("workers AI provider builds with account_id");
     assert_eq!(
@@ -1023,6 +1026,9 @@ fn cloudflare_presets_substitute_account_and_gateway_placeholders_in_base_url() 
         transport: ProviderTransportConfig::default(),
         account_id: Some("acct-abc".to_string()),
         gateway_id: Some("my-gateway".to_string()),
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
     })
     .expect("AI Gateway provider builds with account_id + gateway_id");
     assert_eq!(
@@ -1050,6 +1056,9 @@ fn cloudflare_workers_ai_missing_account_id_fails_with_clear_error() {
         transport: ProviderTransportConfig::default(),
         account_id: None,
         gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
     })
     .expect_err("missing account_id must fail provider construction");
     assert!(
@@ -1082,6 +1091,9 @@ fn cloudflare_workers_ai_missing_account_id_fails_with_clear_error() {
         transport: ProviderTransportConfig::default(),
         account_id: Some("   ".to_string()),
         gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
     })
     .expect_err("whitespace-only account_id must also fail");
     assert!(
