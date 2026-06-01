@@ -202,20 +202,17 @@ fn write_messages(
                 if !opts.include_tool_outputs {
                     continue;
                 }
-                let call_id = output
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+                let call_id = output.get("call_id").and_then(Value::as_str);
                 let body = output
                     .get("output")
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| pretty_json(&output));
-                let matched = call_id.as_ref().and_then(|id| pending_calls.remove(id));
+                let matched = call_id.and_then(|id| pending_calls.remove(id));
                 if let Some(call) = matched {
                     write_tool_call(out, &call.tool, &call.arguments, Some(&body))?;
                 } else {
-                    write_tool_result_only(out, call_id.as_deref(), &body)?;
+                    write_tool_result_only(out, call_id, &body)?;
                 }
             }
             SessionEventKind::Reasoning { .. } => {
@@ -333,15 +330,16 @@ fn write_tool_result_only(
     call_id: Option<&str>,
     body: &str,
 ) -> Result<(), ExportError> {
-    let label = call_id
-        .map(|id| format!("Tool result · {id}"))
-        .unwrap_or_else(|| "Tool result".to_string());
     writeln!(out, "      <li class=\"msg msg-tool\">")?;
-    writeln!(
-        out,
-        "        <div class=\"role\">{}</div>",
-        escape_html(&label)
-    )?;
+    if let Some(id) = call_id {
+        writeln!(
+            out,
+            "        <div class=\"role\">Tool result · {}</div>",
+            escape_html(id)
+        )?;
+    } else {
+        writeln!(out, "        <div class=\"role\">Tool result</div>")?;
+    }
     writeln!(
         out,
         "        <div class=\"tool-output\">{}</div>",
@@ -391,14 +389,18 @@ fn escape_html(s: &str) -> String {
 
 fn push_escaped_html(out: &mut String, s: &str) {
     for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#x27;"),
-            _ => out.push(ch),
-        }
+        push_escaped_char(out, ch);
+    }
+}
+
+fn push_escaped_char(out: &mut String, ch: char) {
+    match ch {
+        '&' => out.push_str("&amp;"),
+        '<' => out.push_str("&lt;"),
+        '>' => out.push_str("&gt;"),
+        '"' => out.push_str("&quot;"),
+        '\'' => out.push_str("&#x27;"),
+        _ => out.push(ch),
     }
 }
 
@@ -447,36 +449,47 @@ impl TextStyle {
     }
 
     fn inline_css(self) -> String {
-        let mut parts: Vec<String> = Vec::new();
+        let mut css = String::new();
         if let Some(color) = self.fg {
-            parts.push(format!("color:{}", color_hex(color)));
+            push_color_decl(&mut css, "color", color);
         }
         if let Some(color) = self.bg {
-            parts.push(format!("background-color:{}", color_hex(color)));
+            push_color_decl(&mut css, "background-color", color);
         }
         if self.bold {
-            parts.push("font-weight:bold".to_string());
+            push_css_decl(&mut css, "font-weight:bold");
         }
         if self.dim {
-            parts.push("opacity:0.6".to_string());
+            push_css_decl(&mut css, "opacity:0.6");
         }
         if self.italic {
-            parts.push("font-style:italic".to_string());
+            push_css_decl(&mut css, "font-style:italic");
         }
         if self.underline {
-            parts.push("text-decoration:underline".to_string());
+            push_css_decl(&mut css, "text-decoration:underline");
         }
-        parts.join(";")
+        css
     }
 }
 
-fn color_hex(rgb: u32) -> String {
-    format!(
-        "#{:02x}{:02x}{:02x}",
+fn push_css_decl(out: &mut String, decl: &str) {
+    if !out.is_empty() {
+        out.push(';');
+    }
+    out.push_str(decl);
+}
+
+fn push_color_decl(out: &mut String, property: &str, rgb: u32) {
+    if !out.is_empty() {
+        out.push(';');
+    }
+    let _ = write!(
+        out,
+        "{property}:#{:02x}{:02x}{:02x}",
         (rgb >> 16) & 0xff,
         (rgb >> 8) & 0xff,
         rgb & 0xff,
-    )
+    );
 }
 
 fn palette_color(index: u8) -> u32 {
@@ -607,7 +620,7 @@ pub(crate) fn ansi_to_html(text: &str) -> String {
         // UTF-8 sequence with the index-based byte cursor.
         let remaining = std::str::from_utf8(&bytes[cursor..]).unwrap_or("");
         if let Some(ch) = remaining.chars().next() {
-            push_escaped_html(&mut out, &ch.to_string());
+            push_escaped_char(&mut out, ch);
             cursor += ch.len_utf8();
         } else {
             cursor += 1;

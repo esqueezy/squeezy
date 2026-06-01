@@ -349,16 +349,17 @@ pub(crate) fn compact_conversation(
 /// "nothing left to compact" and bails out without bumping generation.
 fn snap_compaction_split(conversation: &[LlmInputItem], initial_split: usize) -> usize {
     let mut split = initial_split;
+    let declared_in_older: BTreeSet<&str> = conversation[..initial_split]
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
     while split < conversation.len() {
         match &conversation[split] {
             LlmInputItem::FunctionCallOutput { call_id, .. } => {
-                let declared_in_older = conversation[..split].iter().any(|item| match item {
-                    LlmInputItem::FunctionCall {
-                        call_id: declared, ..
-                    } => declared == call_id,
-                    _ => false,
-                });
-                if declared_in_older {
+                if declared_in_older.contains(call_id.as_str()) {
                     split += 1;
                 } else {
                     break;
@@ -375,21 +376,19 @@ fn snap_compaction_split(conversation: &[LlmInputItem], initial_split: usize) ->
 /// the kept slice cannot reference a tool call that lived only in the
 /// summarized older slice. Order is preserved.
 pub(crate) fn drop_orphan_function_call_outputs(items: Vec<LlmInputItem>) -> Vec<LlmInputItem> {
-    use std::collections::BTreeSet;
-    let declared: BTreeSet<&str> = items
+    let declared: BTreeSet<String> = items
         .iter()
         .filter_map(|item| match item {
-            LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+            LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.clone()),
             _ => None,
         })
         .collect();
     items
-        .iter()
+        .into_iter()
         .filter(|item| match item {
             LlmInputItem::FunctionCallOutput { call_id, .. } => declared.contains(call_id.as_str()),
             _ => true,
         })
-        .cloned()
         .collect()
 }
 
@@ -402,23 +401,37 @@ pub(crate) fn drop_orphan_function_call_outputs(items: Vec<LlmInputItem>) -> Vec
 /// *"tool_use blocks must be followed by a tool_result"* and the failure
 /// is sticky until `/clear`. Order is preserved.
 pub(crate) fn repair_orphan_function_calls(items: Vec<LlmInputItem>) -> Vec<LlmInputItem> {
-    let answered: BTreeSet<&str> = items
+    let answered: BTreeSet<String> = items
         .iter()
         .filter_map(|item| match item {
-            LlmInputItem::FunctionCallOutput { call_id, .. } => Some(call_id.as_str()),
+            LlmInputItem::FunctionCallOutput { call_id, .. } => Some(call_id.clone()),
             _ => None,
         })
         .collect();
     let mut repaired = Vec::with_capacity(items.len());
-    for item in items.iter() {
-        repaired.push(item.clone());
-        if let LlmInputItem::FunctionCall { call_id, .. } = item
-            && !answered.contains(call_id.as_str())
-        {
-            repaired.push(LlmInputItem::FunctionCallOutput {
-                call_id: call_id.clone(),
-                output: "{\"error\":\"tool call interrupted\",\"is_error\":true}".to_string(),
-            });
+    for item in items {
+        match item {
+            LlmInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                let missing_output = !answered.contains(call_id.as_str());
+                let output_call_id = missing_output.then(|| call_id.clone());
+                repaired.push(LlmInputItem::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                });
+                if let Some(call_id) = output_call_id {
+                    repaired.push(LlmInputItem::FunctionCallOutput {
+                        call_id,
+                        output: "{\"error\":\"tool call interrupted\",\"is_error\":true}"
+                            .to_string(),
+                    });
+                }
+            }
+            item => repaired.push(item),
         }
     }
     repaired
@@ -953,11 +966,11 @@ pub(crate) fn build_compaction_summary(
         lines.push("Unresolved questions:".to_string());
         lines.extend(unresolved);
     }
-    let active_attachments = attachments
+    let mut active_attachments = attachments
         .iter()
         .filter(|attachment| attachment.is_active())
-        .collect::<Vec<_>>();
-    if !active_attachments.is_empty() {
+        .peekable();
+    if active_attachments.peek().is_some() {
         lines.push("Active attached context:".to_string());
         for attachment in active_attachments {
             lines.push(format!(

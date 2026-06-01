@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     pin::Pin,
@@ -12154,7 +12156,12 @@ fn tool_schema_index(
             + rows.len(),
     );
     index.push_str(TOOLS_INDEX_OPENER);
-    index.push_str(&rows.join("\n"));
+    for (idx, row) in rows.iter().enumerate() {
+        if idx > 0 {
+            index.push('\n');
+        }
+        index.push_str(row);
+    }
     index.push_str(TOOLS_INDEX_CLOSER);
     Some(index)
 }
@@ -12172,13 +12179,8 @@ fn instructions_with_tool_index(
     }
 }
 
-fn first_line_of_description(description: &str) -> String {
-    description
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+fn first_line_of_description(description: &str) -> &str {
+    description.lines().next().unwrap_or_default().trim()
 }
 
 /// Returns `true` when `tool`'s full JSON schema must be sent on every
@@ -12519,8 +12521,9 @@ fn format_user_text_with_context(input: &str, attachments: &[ContextAttachment])
     let mut output = input.to_string();
     output.push_str("\n\nAttached context references:\n");
     for attachment in attachments {
-        output.push_str(&format!(
-            "- {reference} id={id} source={source} kind={kind} label={label:?} bytes={bytes} stored_bytes={stored_bytes} truncated={truncated}\n",
+        let _ = writeln!(
+            output,
+            "- {reference} id={id} source={source} kind={kind} label={label:?} bytes={bytes} stored_bytes={stored_bytes} truncated={truncated}",
             reference = attachment.reference(),
             id = attachment.id,
             source = attachment.source.as_str(),
@@ -12529,9 +12532,9 @@ fn format_user_text_with_context(input: &str, attachments: &[ContextAttachment])
             bytes = attachment.original_bytes,
             stored_bytes = attachment.stored_bytes,
             truncated = attachment.truncated,
-        ));
+        );
         if let Some(path) = &attachment.path {
-            output.push_str(&format!("  path={path:?}\n"));
+            let _ = writeln!(output, "  path={path:?}");
         }
         if !attachment.preview.is_empty() {
             output.push_str("  redacted_preview:\n");
@@ -12718,7 +12721,17 @@ fn tool_result_output_handle(result: &ToolResult) -> Option<String> {
 }
 
 pub(crate) fn collapse_status_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut words = text.split_whitespace();
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    let mut output = String::with_capacity(text.len());
+    output.push_str(first);
+    for word in words {
+        output.push(' ');
+        output.push_str(word);
+    }
+    output
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
