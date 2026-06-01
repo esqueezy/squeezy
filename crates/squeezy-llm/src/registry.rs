@@ -480,6 +480,15 @@ fn estimate_input_item_tokens(item: &LlmInputItem, bytes_per_token: f64) -> u64 
             let wire_tokens = (wire_bytes / bytes_per_token.max(0.1)).ceil() as u64;
             wire_tokens.saturating_add(1024)
         }
+        // Documents lower to bytes on the wire too; charge the same
+        // base64 overhead estimate as `Image`. Providers that don't
+        // accept documents will drop the item at build time, but the
+        // budget keeps headroom symmetric until then.
+        LlmInputItem::Document { bytes, .. } => {
+            let wire_bytes = (bytes.len() as f64 * 4.0 / 3.0).ceil();
+            let wire_tokens = (wire_bytes / bytes_per_token.max(0.1)).ceil() as u64;
+            wire_tokens.saturating_add(1024)
+        }
     }
 }
 

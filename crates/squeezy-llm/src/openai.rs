@@ -677,6 +677,17 @@ fn openai_input_item(item: &LlmInputItem) -> Option<Value> {
         }
         // Reasoning items from other providers are dropped when replaying to OpenAI.
         LlmInputItem::Reasoning(_) => return None,
+        // OpenAI Responses accepts document inputs via the `input_file`
+        // content block. Per-provider lowering lands in Phase 4; for
+        // now we skip with a debug log so the request still ships.
+        LlmInputItem::Document { name, .. } => {
+            tracing::debug!(
+                target: "squeezy_llm::openai",
+                name = name.as_str(),
+                "openai document content block not yet implemented; skipping",
+            );
+            return None;
+        }
     })
 }
 

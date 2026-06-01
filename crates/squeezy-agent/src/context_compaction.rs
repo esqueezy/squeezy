@@ -595,6 +595,10 @@ fn llm_item_estimated_bytes(item: &LlmInputItem) -> usize {
         // budget). Bill the raw byte count here so compaction's "context
         // pressure" signal still reflects payload size on the wire.
         LlmInputItem::Image { bytes, .. } => bytes.len(),
+        // Documents follow the same wire-billing rule as images: count
+        // the raw payload bytes so compaction sees pressure when the
+        // user attaches a large PDF.
+        LlmInputItem::Document { bytes, .. } => bytes.len(),
         // `LlmInputItem` is `#[non_exhaustive]`; an unknown future variant
         // contributes zero bytes to the heuristic until a dedicated arm
         // exists. Compaction will still fire on the items it understands.
@@ -1226,6 +1230,12 @@ fn durable_context_lines(items: &[LlmInputItem]) -> Vec<String> {
             // MIME type so the summary preserves a hint that an image was
             // shown but skip the raw bytes.
             LlmInputItem::Image { media_type, .. } => Some(format!("- user image: {media_type}")),
+            // Document attachments are similar: keep a one-line hint
+            // (filename + MIME) so the summary records the upload, drop
+            // the raw bytes.
+            LlmInputItem::Document {
+                name, media_type, ..
+            } => Some(format!("- user document {name}: {media_type}")),
             // Unknown future variants contribute nothing to the durable
             // summary — preserves forward compatibility without polluting
             // the summary with an opaque placeholder.

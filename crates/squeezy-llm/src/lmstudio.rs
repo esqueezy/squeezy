@@ -352,6 +352,17 @@ fn lmstudio_message(item: &LlmInputItem) -> Option<Value> {
         }),
         // Local OSS models have no signed reasoning replay format; skip.
         LlmInputItem::Reasoning(_) => return None,
+        // LM Studio's local-chat-completions surface has no document
+        // content block; skip with a debug log until Phase 4 lowers
+        // documents through a `file` part where supported.
+        LlmInputItem::Document { name, .. } => {
+            tracing::debug!(
+                target: "squeezy_llm::lmstudio",
+                name = name.as_str(),
+                "lmstudio document content block not yet implemented; skipping",
+            );
+            return None;
+        }
     })
 }
 

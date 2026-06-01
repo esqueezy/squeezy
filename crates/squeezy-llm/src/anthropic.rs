@@ -421,6 +421,17 @@ fn anthropic_messages(
             }
             // Reasoning items from other providers are dropped when replaying to Anthropic.
             LlmInputItem::Reasoning(_) => {}
+            // Document attachments lower via Anthropic's `document`
+            // content block; per-provider implementation lands in
+            // Phase 4. Until then we skip with a debug log so the
+            // request still ships instead of erroring at the wire.
+            LlmInputItem::Document { name, .. } => {
+                tracing::debug!(
+                    target: "squeezy_llm::anthropic",
+                    name = name.as_str(),
+                    "anthropic document content block not yet implemented; skipping",
+                );
+            }
         }
     }
     if prompt_caching {

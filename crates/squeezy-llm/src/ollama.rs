@@ -308,6 +308,16 @@ fn ollama_messages(instructions: &str, input: &[LlmInputItem]) -> Value {
             }
             // Ollama has no signed reasoning replay format. Skip on replay.
             LlmInputItem::Reasoning(_) => {}
+            // Ollama's native chat API doesn't surface document content
+            // blocks; skip with a debug log until Phase 4 wires a route
+            // for vision-document models like nanonets-ocr.
+            LlmInputItem::Document { name, .. } => {
+                tracing::debug!(
+                    target: "squeezy_llm::ollama",
+                    name = name.as_str(),
+                    "ollama document content block not yet implemented; skipping",
+                );
+            }
         }
     }
     Value::Array(messages)

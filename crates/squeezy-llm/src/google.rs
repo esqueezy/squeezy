@@ -303,6 +303,16 @@ fn google_contents(input: &[LlmInputItem]) -> Value {
             }
             // Reasoning items from other providers are dropped when replaying to Google.
             LlmInputItem::Reasoning(_) => {}
+            // Google Gemini accepts document inlineData (pdf etc.).
+            // Per-provider lowering lands in Phase 4; for now we skip
+            // with a debug log.
+            LlmInputItem::Document { name, .. } => {
+                tracing::debug!(
+                    target: "squeezy_llm::google",
+                    name = name.as_str(),
+                    "google document content block not yet implemented; skipping",
+                );
+            }
         }
     }
     Value::Array(contents)

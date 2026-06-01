@@ -296,6 +296,22 @@ pub enum LlmInputItem {
         #[serde(deserialize_with = "deserialize_image_bytes_b64")]
         bytes: Arc<[u8]>,
     },
+    /// Document attachment — PDF, DOCX, CSV, XLSX, etc. Bedrock
+    /// Converse accepts document content blocks up to ~4.5 MB with a
+    /// caller-supplied `name` and a MIME-typed payload. Anthropic
+    /// Claude PDFs ride a similar `document` content block. Other
+    /// providers route this item to a debug log + skip until a Phase 4
+    /// lowering lands. `media_type` follows the same MIME convention
+    /// as `Image`; `name` is the human-facing filename (Bedrock
+    /// requires it, other providers persist it in transcript metadata).
+    /// `bytes` round-trips as base64 like `Image::bytes`.
+    Document {
+        media_type: String,
+        name: String,
+        #[serde(serialize_with = "serialize_image_bytes_b64")]
+        #[serde(deserialize_with = "deserialize_image_bytes_b64")]
+        bytes: Arc<[u8]>,
+    },
 }
 
 /// Structured content block carried inside
@@ -347,10 +363,32 @@ impl LlmInputItem {
         }
     }
 
+    /// Construct a `Document` item from a MIME-typed payload and a
+    /// human-facing filename. Mirrors [`Self::image`]'s shape;
+    /// Bedrock's Converse API uses `name` directly while other
+    /// providers stash it in transcript metadata.
+    pub fn document(
+        media_type: impl Into<String>,
+        name: impl Into<String>,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Self {
+        Self::Document {
+            media_type: media_type.into(),
+            name: name.into(),
+            bytes: bytes.into(),
+        }
+    }
+
     /// `true` for the `Image` variant. Used by the per-provider request
     /// builders and the vision-capability check below.
     pub fn is_image(&self) -> bool {
         matches!(self, Self::Image { .. })
+    }
+
+    /// `true` for the `Document` variant. Used by per-provider request
+    /// builders to gate Bedrock's document content block path.
+    pub fn is_document(&self) -> bool {
+        matches!(self, Self::Document { .. })
     }
 }
 

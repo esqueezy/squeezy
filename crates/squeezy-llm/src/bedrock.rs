@@ -575,6 +575,17 @@ pub(crate) fn conversation_messages(
             }
             // Reasoning items from other providers are dropped when replaying to Bedrock.
             LlmInputItem::Reasoning(_) => {}
+            // Bedrock Converse accepts document content blocks up to
+            // 4.5 MB (pdf/csv/docx/xlsx/html/txt/md). Per-provider
+            // lowering lands in Phase 4; for now we debug-log and
+            // skip so the request still ships.
+            LlmInputItem::Document { name, .. } => {
+                tracing::debug!(
+                    target: "squeezy_llm::bedrock",
+                    name = name.as_str(),
+                    "bedrock document content block not yet implemented; skipping",
+                );
+            }
         }
     }
     if prompt_caching {

@@ -678,6 +678,17 @@ fn chat_message(item: &LlmInputItem, cache_control: Option<&Value>) -> Option<Va
         // Chat Completions has no signed reasoning replay format. Reasoning
         // items are rendered in the UI but skipped when replaying.
         LlmInputItem::Reasoning(_) => return None,
+        // Chat Completions has no first-class document content block;
+        // Phase 4 may inline as a `file` part where the route supports
+        // it. For now we skip with a debug log.
+        LlmInputItem::Document { name, .. } => {
+            tracing::debug!(
+                target: "squeezy_llm::compatible",
+                name = name.as_str(),
+                "chat-completions document content block not yet implemented; skipping",
+            );
+            return None;
+        }
     })
 }
 
