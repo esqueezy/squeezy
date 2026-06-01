@@ -201,6 +201,43 @@ pub struct LlmRequest {
     /// Per-provider lowering lands in Phase 4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f32>,
+    /// Provider-hosted tool registry. xAI Live Search (H-23),
+    /// OpenAI's hosted web/file search, and Anthropic's computer-use
+    /// tool live here so we can advertise them alongside the
+    /// agent-defined [`LlmToolSpec`] list. Per-provider lowering
+    /// lands in Phase 4.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosted_tools: Vec<Arc<LlmHostedTool>>,
+}
+
+/// Provider-hosted tool specification. Unlike [`LlmToolSpec`] (a
+/// caller-defined function the agent will execute locally), these
+/// describe tools the model invokes server-side: xAI Live Search,
+/// OpenAI hosted web/file search, Anthropic computer-use, etc.
+///
+/// `#[non_exhaustive]` so future hosted tools (image-gen, code
+/// interpreter, …) can land without breaking downstream `match`
+/// statements.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LlmHostedTool {
+    /// xAI Live Search / OpenAI `web_search_preview` style hosted
+    /// search. `filters` carries provider-specific tuning
+    /// (`allowed_domains`, `recency`, etc.) as opaque JSON.
+    WebSearch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filters: Option<Value>,
+    },
+    /// OpenAI Responses `file_search` over a managed vector store.
+    /// `vector_store_ids` lists the stores the model may search.
+    FileSearch {
+        #[serde(default)]
+        vector_store_ids: Vec<String>,
+    },
+    /// Anthropic computer-use / OpenAI `computer_use_preview`. No
+    /// parameters; presence advertises the capability.
+    ComputerUse,
 }
 
 impl Default for LlmRequest {
@@ -227,6 +264,7 @@ impl Default for LlmRequest {
             stop: Vec::new(),
             frequency_penalty: None,
             presence_penalty: None,
+            hosted_tools: Vec::new(),
         }
     }
 }
