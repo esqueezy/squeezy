@@ -386,6 +386,27 @@ fn show_metadata_extracts_context_window_from_parameters_fallback() {
 }
 
 #[test]
+fn show_metadata_extracts_capabilities_array() {
+    let value = json!({
+        "capabilities": ["completion", "tools", "thinking", "vision"]
+    });
+    assert_eq!(
+        ollama_capabilities_from_show(&value),
+        Some(vec![
+            "completion".to_string(),
+            "tools".to_string(),
+            "thinking".to_string(),
+            "vision".to_string(),
+        ])
+    );
+
+    // Missing capabilities field: helper returns `None` so callers treat as
+    // "unknown" rather than "no capabilities".
+    let value = json!({});
+    assert_eq!(ollama_capabilities_from_show(&value), None);
+}
+
+#[test]
 fn tags_metadata_extracts_installed_model_names() {
     let value = json!({
         "models": [

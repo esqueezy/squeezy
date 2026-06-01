@@ -227,6 +227,56 @@ pub async fn fetch_ollama_context_window(base_url: &str, model: &str) -> Option<
     ollama_context_window_from_show(&value)
 }
 
+/// Fetch the set of capabilities Ollama advertises for `model` via `/api/show`.
+///
+/// Returns `None` on any transport / parse failure (caller should treat as
+/// "capabilities unknown" rather than "no capabilities"). The returned
+/// strings come straight from Ollama's `capabilities` array — at the time of
+/// writing the documented members are `"completion"`, `"tools"`,
+/// `"thinking"`, `"vision"`, `"insert"`, and `"embedding"`.
+///
+/// Intended for gating tool-bearing requests against models whose Modelfile
+/// has no `tools` template — those models silently no-op the tool list,
+/// producing baffling agent UX. Callers that have already loaded the model
+/// can short-circuit by passing `Some` through to the request layer.
+///
+/// TODO(audit M-21): the matching `LlmRequest::ensure_tool_support` helper
+/// lives in `crates/squeezy-llm/src/lib.rs` and is out of this file's scope;
+/// the gate will hook this helper through that ensure_* method in a follow-up
+/// commit on a sibling-owned file.
+// Re-exported by `crates/squeezy-llm/src/lib.rs` in the same Phase 4FH commit
+// that adds `LlmRequest::ensure_tool_support`; without that, the in-crate
+// dead-code lint trips even though we want the symbol public.
+#[allow(dead_code)]
+pub async fn fetch_ollama_capabilities(base_url: &str, model: &str) -> Option<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .ok()?;
+    let url = api_endpoint_url(base_url, "show");
+    let value: Value = client
+        .post(url)
+        .json(&json!({ "model": model }))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    ollama_capabilities_from_show(&value)
+}
+
+pub(crate) fn ollama_capabilities_from_show(value: &Value) -> Option<Vec<String>> {
+    value
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+}
+
 pub async fn fetch_ollama_model_names(base_url: &str) -> Vec<String> {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_millis(250))
