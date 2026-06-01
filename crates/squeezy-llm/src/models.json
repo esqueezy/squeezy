@@ -1077,7 +1077,7 @@
       "reasoning_tokens": false,
       "reasoning_effort": false,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": {
       "input_usd_micros_per_mtok": 140000,
@@ -1107,7 +1107,7 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": {
       "input_usd_micros_per_mtok": 1740000,
