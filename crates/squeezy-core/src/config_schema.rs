@@ -1645,6 +1645,7 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
             base_url: DEFAULT_AZURE_OPENAI_BASE_URL.to_string(),
             api_version: DEFAULT_AZURE_OPENAI_API_VERSION.to_string(),
             deployment_name_map: BTreeMap::new(),
+            extra_headers: BTreeMap::new(),
             transport,
         }),
         "bedrock" => ProviderConfig::Bedrock(BedrockConfig {

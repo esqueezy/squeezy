@@ -2435,6 +2435,81 @@ fn openrouter_provider_resolves_to_compatible_variant_with_preset_defaults() {
 }
 
 #[test]
+fn azure_openai_carries_extra_headers_from_settings() {
+    // Operators wire `Apim-Subscription-Key` (and Entra ID `Authorization`
+    // overrides) through the standard `[providers.azure_openai.headers]`
+    // table so squeezy can front API-Management-protected endpoints
+    // without forking the provider. The new `extra_headers` slot mirrors
+    // the OpenAI-compatible preset shape so callers learn one TOML
+    // convention.
+    let mut providers = std::collections::BTreeMap::new();
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert(
+        "Apim-Subscription-Key".to_string(),
+        "apim-secret".to_string(),
+    );
+    headers.insert(
+        "x-ms-client-request-id".to_string(),
+        "trace-123".to_string(),
+    );
+    providers.insert(
+        "azure_openai".to_string(),
+        ProviderSettings {
+            headers: Some(headers),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("azure_openai"),
+        |name| match name {
+            "AZURE_OPENAI_BASE_URL" => {
+                Some("https://resource.openai.azure.com/openai/v1".to_string())
+            }
+            _ => None,
+        },
+    )
+    .expect("azure config builds");
+    let ProviderConfig::AzureOpenAi(azure) = &config.provider else {
+        panic!("azure_openai must map to AzureOpenAi");
+    };
+    assert_eq!(
+        azure
+            .extra_headers
+            .get("Apim-Subscription-Key")
+            .map(String::as_str),
+        Some("apim-secret"),
+    );
+    assert_eq!(
+        azure
+            .extra_headers
+            .get("x-ms-client-request-id")
+            .map(String::as_str),
+        Some("trace-123"),
+    );
+}
+
+#[test]
+fn azure_openai_extra_headers_default_to_empty_map() {
+    let azure = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("azure_openai".to_string()),
+        "AZURE_OPENAI_BASE_URL" => Some("https://resource.openai.azure.com/openai/v1".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::AzureOpenAi(config) = &azure.provider else {
+        panic!("expected azure");
+    };
+    assert!(
+        config.extra_headers.is_empty(),
+        "missing TOML section must leave the map empty so callers cannot accidentally forward stale headers",
+    );
+}
+
+#[test]
 fn vertex_preset_templates_base_url_from_project_and_location() {
     let mut providers = std::collections::BTreeMap::new();
     providers.insert(

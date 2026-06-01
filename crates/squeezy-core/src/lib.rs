@@ -628,6 +628,11 @@ impl AppConfig {
                         &providers,
                         &["azure_openai", "azure"],
                     ),
+                    extra_headers: provider_setting_headers_any(
+                        &providers,
+                        &["azure_openai", "azure"],
+                    )
+                    .unwrap_or_default(),
                     transport: provider_transport_settings(&providers, &["azure_openai", "azure"]),
                 })
             }
@@ -2271,6 +2276,17 @@ pub struct AzureOpenAiConfig {
     /// "deployment id is the model id" behavior.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub deployment_name_map: BTreeMap<String, String>,
+    /// Operator-controlled HTTP headers forwarded on every Azure OpenAI
+    /// request. Lets users wire `Apim-Subscription-Key` for API Management
+    /// fronted deployments, `x-ms-client-request-id` for correlation,
+    /// `x-ms-region` pinning, or an explicit `Authorization: Bearer …`
+    /// that overrides the default `api-key` header (Entra ID / managed
+    /// identity flows resolved out-of-band). User-supplied headers always
+    /// win over the provider's defaults so an override is honored
+    /// verbatim. Keyed via the standard `[providers.azure_openai.headers]`
+    /// TOML table, matching the OpenAI-compatible preset shape.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_headers: BTreeMap<String, String>,
     pub transport: ProviderTransportConfig,
 }
 
@@ -8507,6 +8523,27 @@ fn provider_setting_headers(
     provider: &str,
 ) -> Option<BTreeMap<String, String>> {
     providers.get(provider)?.headers.clone()
+}
+
+/// Resolve a `[providers.<section>.headers]` table from the first section
+/// in `sections` that defines a non-empty map. Lets providers that accept
+/// multiple TOML section aliases (e.g. Azure's `azure_openai` / `azure`)
+/// share one header table without duplicating the lookup at every call
+/// site.
+fn provider_setting_headers_any(
+    providers: &BTreeMap<String, ProviderSettings>,
+    sections: &[&str],
+) -> Option<BTreeMap<String, String>> {
+    for section in sections {
+        if let Some(headers) = providers
+            .get(*section)
+            .and_then(|settings| settings.headers.as_ref())
+            && !headers.is_empty()
+        {
+            return Some(headers.clone());
+        }
+    }
+    None
 }
 
 /// Resolve the Azure `deployment_name_map` from the first section in
