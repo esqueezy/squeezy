@@ -259,12 +259,13 @@ async fn mistral_reasoning_effort_emits_both_shapes_today() {
         Some("high"),
         "top-level reasoning_effort sent verbatim"
     );
+    // MIS-2 / H-55 fix: nested reasoning.effort dropped for Mistral.
     assert_eq!(
         body.get("reasoning")
             .and_then(|r| r.get("effort"))
             .and_then(Value::as_str),
-        Some("high"),
-        "nested reasoning.effort sent today; Mistral 422s on this — gating fix is MIS-2",
+        None,
+        "nested reasoning.effort gated off for Mistral (H-55)",
     );
 }
 
@@ -288,10 +289,11 @@ async fn mistral_emits_prompt_cache_retention_today() {
 
     let (_, body_text, _) = captured.snapshot();
     let body: Value = serde_json::from_str(&body_text).expect("body is JSON");
+    // MIS-3 / H-56 fix: prompt_cache_retention dropped for Mistral.
     assert_eq!(
         body.get("prompt_cache_retention").and_then(Value::as_str),
-        Some("24h"),
-        "prompt_cache_retention sent today; Mistral 422s on this — gating fix is MIS-3",
+        None,
+        "prompt_cache_retention gated off for Mistral (H-56)",
     );
     assert_eq!(
         body.get("prompt_cache_key").and_then(Value::as_str),
