@@ -267,7 +267,29 @@ fn bedrock_stream_attempt(
     cancel: CancellationToken,
 ) -> LlmStream {
     let transport = provider.transport;
+    // NIT: scope every tracing call from this attempt under one span
+    // so per-request `model` / `region` fields show up on every
+    // event (rewrite info, cache-budget warns, idle timeout, unhandled
+    // variant debug, etc.) without each call having to re-thread
+    // them. `requested_model` is what the caller asked for; the
+    // post-rewrite resolved id lands on `LlmEvent::ServerModel` so
+    // the span doesn't need to carry it. `Empty` placeholders let
+    // us record the resolved model and prompt-cache retention once
+    // they're known inside the stream body via `Span::record`.
+    let attempt_span = tracing::info_span!(
+        "bedrock.stream",
+        provider = "bedrock",
+        region = %provider.region,
+        model = %request.model,
+        resolved_model = tracing::field::Empty,
+        retention = tracing::field::Empty,
+    );
     Box::pin(try_stream! {
+        // Hold the span as a local so each `tracing::*!` call can wrap
+        // itself in `attempt_span.in_scope(|| ...)`. Cannot use the
+        // `_guard = span.entered()` pattern because the resulting
+        // `Entered<'_>` is `!Send` and breaks crossing `.await`.
+        let attempt_span = attempt_span;
         let client_result = tokio::select! {
             _ = cancel.cancelled() => {
                 yield LlmEvent::Cancelled;
@@ -287,13 +309,15 @@ fn bedrock_stream_attempt(
         // the transcript / cost-attribution layers see the actual
         // model that produced the turn.
         let model = apply_inference_profile_prefix(&requested_model, &provider.region);
+        attempt_span.record("resolved_model", tracing::field::display(&model));
         if model != requested_model {
-            tracing::info!(
-                provider = "bedrock",
-                requested = %requested_model,
-                resolved = %model,
-                "rewrote Bedrock model id to cross-region inference profile"
-            );
+            attempt_span.in_scope(|| {
+                tracing::info!(
+                    requested = %requested_model,
+                    resolved = %model,
+                    "rewrote Bedrock model id to cross-region inference profile"
+                );
+            });
         }
         let prompt_caching = should_apply_caching("bedrock", &request);
         // Honor `CacheRetention::Long` end-to-end so Bedrock cache
@@ -305,6 +329,7 @@ fn bedrock_stream_attempt(
         } else {
             CacheRetention::None
         };
+        attempt_span.record("retention", tracing::field::debug(retention));
         // Bedrock's hard cap is 4 `cachePoint` blocks per request,
         // ordered tools -> system -> messages (longer-TTL must
         // precede shorter-TTL). The auto policy currently emits
@@ -439,11 +464,11 @@ fn bedrock_stream_attempt(
             ))?;
         }
         if !state.saw_metadata {
-            tracing::warn!(
-                provider = "bedrock",
-                model = %model,
-                "Bedrock stream ended without metadata event; usage tokens unavailable for this turn"
-            );
+            attempt_span.in_scope(|| {
+                tracing::warn!(
+                    "Bedrock stream ended without metadata event; usage tokens unavailable for this turn"
+                );
+            });
         }
         // M-15: if Bedrock echoed a resolved model id on
         // `messageStop.additionalModelResponseFields` (typical for
