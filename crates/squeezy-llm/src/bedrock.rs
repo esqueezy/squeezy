@@ -12,11 +12,11 @@ use aws_sdk_bedrockruntime::{
     error::SdkError,
     primitives::event_stream::EventReceiver,
     types::{
-        CachePointBlock, CachePointType, ContentBlock, ContentBlockDelta, ContentBlockStart,
-        ConversationRole, ImageBlock, ImageFormat, ImageSource, InferenceConfiguration, Message,
-        ReasoningContentBlock, ReasoningContentBlockDelta, ReasoningTextBlock, SystemContentBlock,
-        Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock,
-        ToolSpecification, ToolUseBlock,
+        CachePointBlock, CachePointType, CacheTtl, ContentBlock, ContentBlockDelta,
+        ContentBlockStart, ConversationRole, ImageBlock, ImageFormat, ImageSource,
+        InferenceConfiguration, Message, ReasoningContentBlock, ReasoningContentBlockDelta,
+        ReasoningTextBlock, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
+        ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
     },
 };
 use aws_smithy_types::{Blob, Document, Number};
@@ -26,8 +26,8 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
-    LlmStream, LlmToolCall, LlmToolSpec, ReasoningKind, ReasoningPayload,
+    AnthropicThinkingBlock, AnthropicThinkingKind, CacheRetention, LlmEvent, LlmInputItem,
+    LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec, ReasoningKind, ReasoningPayload,
     anthropic_betas::bedrock_extra_body_betas,
     cache_policy::{DYNAMIC_TOOL_NAME_PREFIX, should_apply_caching},
     retry::idle_timeout,
@@ -140,8 +140,17 @@ impl LlmProvider for BedrockProvider {
             let client = client_result?;
             let model = request.model.to_string();
             let prompt_caching = should_apply_caching("bedrock", &request);
+            // Honor `CacheRetention::Long` end-to-end so Bedrock cache
+            // points carry `ttl: 1h` instead of silently degrading to
+            // the 5-minute default. When caching is disabled at the
+            // policy gate we pass `None` so no breakpoints are emitted.
+            let retention = if prompt_caching {
+                request.effective_cache_spec().retention
+            } else {
+                CacheRetention::None
+            };
             let mut builder = client.converse_stream().model_id(&model);
-            for block in system_blocks(&request.instructions, prompt_caching)? {
+            for block in system_blocks(&request.instructions, retention)? {
                 builder = builder.system(block);
             }
             // Canonicalize cross-provider tool-call ids and
@@ -154,10 +163,10 @@ impl LlmProvider for BedrockProvider {
             // produce ids Bedrock either rejects on shape or fails
             // to match.
             let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
-            for message in conversation_messages(&normalized_input, prompt_caching)? {
+            for message in conversation_messages(&normalized_input, retention)? {
                 builder = builder.messages(message);
             }
-            if let Some(config) = tool_configuration(&request.tools, prompt_caching)? {
+            if let Some(config) = tool_configuration(&request.tools, retention)? {
                 builder = builder.tool_config(config);
             }
             if let Some(inference) = inference_configuration(&request) {
@@ -456,32 +465,42 @@ fn hex_decode(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-fn cache_point_block() -> Result<CachePointBlock> {
-    CachePointBlock::builder()
-        .r#type(CachePointType::Default)
-        .build()
-        .map_err(|err| {
-            SqueezyError::ProviderRequest(format!("failed to build Bedrock cachePoint: {err}"))
-        })
+/// Build a Bedrock `CachePointBlock`, opting into the 1-hour TTL when
+/// the caller asked for [`CacheRetention::Long`]. Bedrock honors
+/// `ttl: "1h"` for Claude Opus 4.5 / Sonnet 4.5 / Haiku 4.5; without
+/// the setter the breakpoint silently degrades to the 5-minute
+/// provider default, defeating the intent of the cross-provider
+/// `CacheSpec` knob. `CacheRetention::Short` and `None` map to the
+/// 5-minute default by omitting `ttl`.
+pub(crate) fn cache_point_block(retention: CacheRetention) -> Result<CachePointBlock> {
+    let mut builder = CachePointBlock::builder().r#type(CachePointType::Default);
+    if retention == CacheRetention::Long {
+        builder = builder.ttl(CacheTtl::OneHour);
+    }
+    builder.build().map_err(|err| {
+        SqueezyError::ProviderRequest(format!("failed to build Bedrock cachePoint: {err}"))
+    })
 }
 
 pub(crate) fn system_blocks(
     instructions: &str,
-    prompt_caching: bool,
+    retention: CacheRetention,
 ) -> Result<Vec<SystemContentBlock>> {
     if instructions.trim().is_empty() {
         return Ok(Vec::new());
     }
     let mut blocks = vec![SystemContentBlock::Text(instructions.to_string())];
-    if prompt_caching {
-        blocks.push(SystemContentBlock::CachePoint(cache_point_block()?));
+    if retention != CacheRetention::None {
+        blocks.push(SystemContentBlock::CachePoint(cache_point_block(
+            retention,
+        )?));
     }
     Ok(blocks)
 }
 
 pub(crate) fn conversation_messages(
     input: &[LlmInputItem],
-    prompt_caching: bool,
+    retention: CacheRetention,
 ) -> Result<Vec<Message>> {
     let mut messages: Vec<Message> = Vec::new();
     let mut tool_names_by_id: HashMap<String, String> = HashMap::new();
@@ -591,13 +610,16 @@ pub(crate) fn conversation_messages(
             }
         }
     }
-    if prompt_caching {
-        append_cache_point_to_last_user(&mut messages)?;
+    if retention != CacheRetention::None {
+        append_cache_point_to_last_user(&mut messages, retention)?;
     }
     Ok(messages)
 }
 
-fn append_cache_point_to_last_user(messages: &mut [Message]) -> Result<()> {
+fn append_cache_point_to_last_user(
+    messages: &mut [Message],
+    retention: CacheRetention,
+) -> Result<()> {
     let Some(index) = messages
         .iter()
         .rposition(|message| *message.role() == ConversationRole::User)
@@ -606,7 +628,7 @@ fn append_cache_point_to_last_user(messages: &mut [Message]) -> Result<()> {
     };
     let target = &messages[index];
     let mut content = target.content().to_vec();
-    content.push(ContentBlock::CachePoint(cache_point_block()?));
+    content.push(ContentBlock::CachePoint(cache_point_block(retention)?));
     let rebuilt = Message::builder()
         .role(ConversationRole::User)
         .set_content(Some(content))
@@ -653,12 +675,13 @@ fn push_message(
 
 pub(crate) fn tool_configuration(
     specs: &[Arc<LlmToolSpec>],
-    prompt_caching: bool,
+    retention: CacheRetention,
 ) -> Result<Option<ToolConfiguration>> {
     if specs.is_empty() {
         return Ok(None);
     }
-    let mut tools = Vec::with_capacity(specs.len() + usize::from(prompt_caching));
+    let caching = retention != CacheRetention::None;
+    let mut tools = Vec::with_capacity(specs.len() + usize::from(caching));
     for spec in specs {
         let schema = ToolInputSchema::Json(json_to_document(&spec.parameters));
         let tool_spec = ToolSpecification::builder()
@@ -671,12 +694,12 @@ pub(crate) fn tool_configuration(
             })?;
         tools.push(Tool::ToolSpec(tool_spec));
     }
-    if prompt_caching
+    if caching
         && let Some(idx) = specs
             .iter()
             .rposition(|spec| !spec.name.starts_with(DYNAMIC_TOOL_NAME_PREFIX))
     {
-        tools.insert(idx + 1, Tool::CachePoint(cache_point_block()?));
+        tools.insert(idx + 1, Tool::CachePoint(cache_point_block(retention)?));
     }
     let config = ToolConfiguration::builder()
         .set_tools(Some(tools))

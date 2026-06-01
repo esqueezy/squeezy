@@ -4,7 +4,7 @@ use std::sync::Arc;
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_sdk_bedrockruntime::config::{Credentials, Region, SharedCredentialsProvider};
 use aws_sdk_bedrockruntime::types::{
-    CachePointType, ContentBlock, ConversationRole, ConverseStreamMetadataEvent,
+    CachePointType, CacheTtl, ContentBlock, ConversationRole, ConverseStreamMetadataEvent,
     ConverseStreamOutput, MessageStopEvent, StopReason, SystemContentBlock, TokenUsage,
     ToolInputSchema,
 };
@@ -21,18 +21,30 @@ use super::{
     system_blocks, tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
-use crate::{LlmInputItem, LlmRequest, LlmToolSpec};
+use crate::{CacheRetention, LlmInputItem, LlmRequest, LlmToolSpec};
 
 #[test]
 fn system_blocks_skip_blank_instructions() {
-    assert!(system_blocks("", false).expect("ok").is_empty());
-    assert!(system_blocks("   \n  ", false).expect("ok").is_empty());
-    assert!(system_blocks("", true).expect("ok").is_empty());
+    assert!(
+        system_blocks("", CacheRetention::None)
+            .expect("ok")
+            .is_empty()
+    );
+    assert!(
+        system_blocks("   \n  ", CacheRetention::None)
+            .expect("ok")
+            .is_empty()
+    );
+    assert!(
+        system_blocks("", CacheRetention::Short)
+            .expect("ok")
+            .is_empty()
+    );
 }
 
 #[test]
 fn system_blocks_emit_single_text_block() {
-    let blocks = system_blocks("be helpful", false).expect("ok");
+    let blocks = system_blocks("be helpful", CacheRetention::None).expect("ok");
     assert_eq!(blocks.len(), 1);
     match &blocks[0] {
         SystemContentBlock::Text(text) => assert_eq!(text, "be helpful"),
@@ -42,13 +54,33 @@ fn system_blocks_emit_single_text_block() {
 
 #[test]
 fn system_blocks_append_cache_point_when_caching_enabled() {
-    let blocks = system_blocks("be helpful", true).expect("ok");
+    let blocks = system_blocks("be helpful", CacheRetention::Short).expect("ok");
     assert_eq!(blocks.len(), 2);
     assert!(matches!(&blocks[0], SystemContentBlock::Text(text) if text == "be helpful"));
     let SystemContentBlock::CachePoint(cache_point) = &blocks[1] else {
         panic!("expected CachePoint after system text, got {:?}", blocks[1]);
     };
     assert_eq!(*cache_point.r#type(), CachePointType::Default);
+    // CacheRetention::Short omits ttl so Bedrock applies its 5-minute
+    // default — the cross-provider knob for the historical behavior.
+    assert!(
+        cache_point.ttl().is_none(),
+        "Short retention must not set ttl; got {:?}",
+        cache_point.ttl(),
+    );
+}
+
+#[test]
+fn system_blocks_cache_point_carries_one_hour_ttl_for_long_retention() {
+    // CacheRetention::Long must surface as `ttl: 1h` on the Bedrock
+    // cache point so cross-provider Long retention actually amortizes
+    // the cache write across multi-hour runs. Without the setter the
+    // breakpoint silently degrades to the 5-minute default.
+    let blocks = system_blocks("be helpful", CacheRetention::Long).expect("ok");
+    let SystemContentBlock::CachePoint(cache_point) = &blocks[1] else {
+        panic!("expected CachePoint after system text, got {:?}", blocks[1]);
+    };
+    assert_eq!(cache_point.ttl(), Some(&CacheTtl::OneHour));
 }
 
 #[test]
@@ -59,7 +91,7 @@ fn conversation_messages_merge_consecutive_user_turns() {
             LlmInputItem::UserText("again".to_string()),
             LlmInputItem::AssistantText("hi".to_string()),
         ],
-        false,
+        CacheRetention::None,
     )
     .expect("build messages");
 
@@ -85,7 +117,7 @@ fn conversation_messages_round_trip_tool_call_and_result() {
                 is_error: false,
             },
         ],
-        false,
+        CacheRetention::None,
     )
     .expect("build messages");
 
@@ -115,7 +147,7 @@ fn conversation_messages_append_cache_point_to_last_user_message() {
             LlmInputItem::AssistantText("ack".to_string()),
             LlmInputItem::UserText("second".to_string()),
         ],
-        true,
+        CacheRetention::Short,
     )
     .expect("build messages");
 
@@ -146,8 +178,11 @@ fn conversation_messages_append_cache_point_to_last_user_message() {
 
 #[test]
 fn conversation_messages_skip_cache_point_when_no_user_message() {
-    let messages = conversation_messages(&[LlmInputItem::AssistantText("solo".to_string())], true)
-        .expect("build messages");
+    let messages = conversation_messages(
+        &[LlmInputItem::AssistantText("solo".to_string())],
+        CacheRetention::Short,
+    )
+    .expect("build messages");
 
     assert_eq!(messages.len(), 1);
     assert_eq!(*messages[0].role(), ConversationRole::Assistant);
@@ -157,6 +192,53 @@ fn conversation_messages_skip_cache_point_when_no_user_message() {
             "assistant message should not carry a cache point"
         );
     }
+}
+
+#[test]
+fn conversation_messages_cache_point_carries_one_hour_ttl_for_long() {
+    // Cache markers on the last user message and tools tail must also
+    // carry the 1-hour TTL when the caller asked for Long retention.
+    // The TTL is what differentiates the cross-provider Long band from
+    // the historical 5-minute default — without it the cache write
+    // gets billed but the read pays full price every 5 minutes.
+    let messages = conversation_messages(
+        &[LlmInputItem::UserText("first".to_string())],
+        CacheRetention::Long,
+    )
+    .expect("build messages");
+    let final_user = messages.last().expect("at least one message");
+    let ContentBlock::CachePoint(cache_point) = final_user
+        .content()
+        .last()
+        .expect("user message must have content")
+    else {
+        panic!(
+            "expected trailing CachePoint on final user message, got {:?}",
+            final_user.content().last()
+        );
+    };
+    assert_eq!(cache_point.ttl(), Some(&CacheTtl::OneHour));
+}
+
+#[test]
+fn tool_configuration_cache_point_carries_one_hour_ttl_for_long() {
+    let specs: Vec<Arc<LlmToolSpec>> = vec![
+        LlmToolSpec {
+            name: "search".to_string(),
+            description: "Web search".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: false,
+        }
+        .into(),
+    ];
+    let config = tool_configuration(&specs, CacheRetention::Long)
+        .expect("ok")
+        .expect("present");
+    let tools = config.tools();
+    let aws_sdk_bedrockruntime::types::Tool::CachePoint(cache_point) = &tools[1] else {
+        panic!("expected CachePoint after tool spec, got {:?}", tools[1]);
+    };
+    assert_eq!(cache_point.ttl(), Some(&CacheTtl::OneHour));
 }
 
 #[test]
@@ -176,7 +258,7 @@ fn tool_configuration_round_trips_json_schema() {
         }
         .into(),
     ];
-    let config = tool_configuration(&specs, false)
+    let config = tool_configuration(&specs, CacheRetention::None)
         .expect("ok")
         .expect("present");
     assert_eq!(config.tools().len(), 1);
@@ -213,7 +295,7 @@ fn tool_configuration_appends_cache_point_after_last_tool() {
         }
         .into(),
     ];
-    let config = tool_configuration(&specs, true)
+    let config = tool_configuration(&specs, CacheRetention::Short)
         .expect("ok")
         .expect("present");
     let tools = config.tools();
@@ -234,9 +316,15 @@ fn tool_configuration_appends_cache_point_after_last_tool() {
 
 #[test]
 fn tool_configuration_returns_none_when_empty() {
-    assert!(tool_configuration(&[], false).expect("ok").is_none());
     assert!(
-        tool_configuration(&[], true).expect("ok").is_none(),
+        tool_configuration(&[], CacheRetention::None)
+            .expect("ok")
+            .is_none()
+    );
+    assert!(
+        tool_configuration(&[], CacheRetention::Short)
+            .expect("ok")
+            .is_none(),
         "no tools means no tool config, even when caching is requested"
     );
 }
@@ -259,7 +347,7 @@ fn tool_configuration_cache_point_skips_mcp_prefixed_tools() {
         }
         .into(),
     ];
-    let config = tool_configuration(&specs, true)
+    let config = tool_configuration(&specs, CacheRetention::Short)
         .expect("ok")
         .expect("present");
     let tools = config.tools();
@@ -296,7 +384,7 @@ fn tool_configuration_cache_point_skips_mcp_prefixed_tools() {
         }
         .into(),
     ];
-    let config = tool_configuration(&all_mcp, true)
+    let config = tool_configuration(&all_mcp, CacheRetention::Short)
         .expect("ok")
         .expect("present");
     let tools = config.tools();
@@ -416,7 +504,7 @@ fn conversation_messages_emit_image_content_block() {
                 bytes: bytes.clone(),
             },
         ],
-        false,
+        CacheRetention::None,
     )
     .expect("build messages");
 
@@ -556,7 +644,7 @@ fn conversation_messages_reject_unknown_image_mime() {
             media_type: "image/avif".to_string(),
             bytes,
         }],
-        false,
+        CacheRetention::None,
     )
     .expect_err("unsupported MIME must surface an explicit ProviderRequest error");
     let message = err.to_string();
