@@ -579,7 +579,7 @@ impl McpClientRegistry {
                     .session_for(&server_name_owned, &server_for_call)
                     .await?;
                 let response = service
-                    .read_resource(ReadResourceRequestParams::new(uri_owned.clone()))
+                    .read_resource(ReadResourceRequestParams::new(uri_owned))
                     .await
                     .map_err(|err| service_error_to_mcp(&server_name_owned, err))?;
                 serde_json::to_value(response).map_err(|err| McpError::Transport {
@@ -625,12 +625,12 @@ impl McpClientRegistry {
                     .list_all_tools()
                     .await
                     .map_err(|err| service_error_to_mcp(&server_name_owned, err))?;
-                Ok((server_name_owned, tools))
+                Ok(tools)
             },
         )
         .await;
         match result {
-            Ok((_, tools)) => Ok(convert_tools(server_name, server, tools)),
+            Ok(tools) => Ok(convert_tools(server_name, server, tools)),
             Err(error) => {
                 self.invalidate_session(server_name).await;
                 Err(error)
@@ -695,8 +695,7 @@ impl McpClientRegistry {
                     .await?;
                 let response = service
                     .call_tool(
-                        CallToolRequestParams::new(tool_name_owned.clone())
-                            .with_arguments(arguments),
+                        CallToolRequestParams::new(tool_name_owned).with_arguments(arguments),
                     )
                     .await
                     .map_err(|err| service_error_to_mcp(&server_name_owned, err))?;
@@ -1777,11 +1776,14 @@ fn prune_unreachable_defs(mut value: Value) -> Value {
             object.remove(key);
             continue;
         }
-        let defs = defs.clone();
         // Build the set of refs that appear OUTSIDE the defs block itself.
         let prefix = ref_prefix(key);
         let mut referenced = BTreeSet::new();
         collect_refs_outside_key(object, key, &prefix, &mut referenced);
+        let Some(defs) = object.get_mut(key).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let defs = std::mem::take(defs);
         // Walk over def bodies too — a referenced def may itself ref another def.
         let mut frontier: Vec<String> = referenced.iter().cloned().collect();
         while let Some(name) = frontier.pop() {
@@ -1802,8 +1804,8 @@ fn prune_unreachable_defs(mut value: Value) -> Value {
             .collect();
         if kept.is_empty() {
             object.remove(key);
-        } else {
-            object.insert(key.to_string(), Value::Object(kept));
+        } else if let Some(defs) = object.get_mut(key) {
+            *defs = Value::Object(kept);
         }
     }
     value
@@ -1845,7 +1847,9 @@ fn collect_ref_field(key: &str, child: &Value, prefix: &str, out: &mut BTreeSet<
         && let Some(text) = child.as_str()
         && let Some(name) = text.strip_prefix(prefix)
     {
-        out.insert(name.to_string());
+        if !out.contains(name) {
+            out.insert(name.to_string());
+        }
     }
 }
 
@@ -1910,33 +1914,55 @@ fn normalize_palette(tools: Vec<ExternalMcpTool>) -> BTreeMap<String, ExternalMc
     }
     let mut next = BTreeMap::new();
     for mut tool in tools {
-        let raw_identity = format!("{}\0{}", tool.server, tool.raw_name);
-        let base = tool.model_name.clone();
-        let collides = by_base.get(&base).copied().unwrap_or_default() > 1;
-        tool.model_name = fit_model_name(&base, &raw_identity, collides || base.len() > 64);
-        let mut attempt = 0u32;
-        while next.contains_key(&tool.model_name) {
-            attempt = attempt.saturating_add(1);
-            tool.model_name = fit_model_name(&base, &format!("{raw_identity}\0{attempt}"), true);
+        let force_hash = by_base
+            .get(tool.model_name.as_str())
+            .copied()
+            .unwrap_or_default()
+            > 1
+            || tool.model_name.len() > MAX_MODEL_TOOL_NAME_BYTES;
+        if force_hash || next.contains_key(tool.model_name.as_str()) {
+            ensure_unique_model_name(&mut tool, &next, force_hash);
         }
         next.insert(tool.model_name.clone(), tool);
     }
     next
 }
 
+fn ensure_unique_model_name(
+    tool: &mut ExternalMcpTool,
+    existing: &BTreeMap<String, ExternalMcpTool>,
+    force_initial_hash: bool,
+) {
+    let base = tool.model_name.clone();
+    let raw_identity = format!("{}\0{}", tool.server, tool.raw_name);
+    if force_initial_hash {
+        tool.model_name = fit_model_name(&base, &raw_identity, true);
+    }
+    let mut attempt = 0u32;
+    while existing.contains_key(tool.model_name.as_str()) {
+        attempt = attempt.saturating_add(1);
+        tool.model_name = fit_model_name(&base, &format!("{raw_identity}\0{attempt}"), true);
+    }
+}
+
 fn fit_model_name(base: &str, raw_identity: &str, force_hash: bool) -> String {
     if !force_hash && base.len() <= MAX_MODEL_TOOL_NAME_BYTES {
         return base.to_string();
     }
-    let suffix = format!(
-        "_{}",
-        &sha256_hex(raw_identity.as_bytes())[..HASH_SUFFIX_BYTES]
-    );
-    let max_prefix = MAX_MODEL_TOOL_NAME_BYTES.saturating_sub(suffix.len());
-    format!("{}{}", truncate_ascii(base, max_prefix), suffix)
+    let hash = sha256_hex_prefix(raw_identity.as_bytes(), HASH_SUFFIX_BYTES);
+    let max_prefix = MAX_MODEL_TOOL_NAME_BYTES.saturating_sub(1 + hash.len());
+    let prefix = truncate_ascii(base, max_prefix);
+    let mut out = String::with_capacity(prefix.len() + 1 + hash.len());
+    out.push_str(&prefix);
+    out.push('_');
+    out.push_str(&hash);
+    out
 }
 
 fn truncate_ascii(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
     value.chars().take(max_bytes).collect()
 }
 
@@ -1960,19 +1986,16 @@ fn strip_untrusted_meta(mut value: Value) -> Value {
 }
 
 fn service_error_to_mcp(server: &str, err: rmcp::ServiceError) -> McpError {
-    if service_error_is_session_expired(&err) {
+    let message = err.to_string();
+    if message.contains("Session expired (HTTP 404)") {
         return McpError::SessionExpired {
             server: server.to_string(),
         };
     }
     McpError::Transport {
         server: server.to_string(),
-        message: err.to_string(),
+        message,
     }
-}
-
-fn service_error_is_session_expired(err: &rmcp::ServiceError) -> bool {
-    err.to_string().contains("Session expired (HTTP 404)")
 }
 
 fn can_auto_accept_elicitation(request: &CreateElicitationRequestParams) -> bool {
@@ -2103,6 +2126,19 @@ fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     for byte in digest {
         write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
     }
+    output
+}
+
+fn sha256_hex_prefix(bytes: impl AsRef<[u8]>, max_hex_chars: usize) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(bytes.as_ref());
+    let digest_bytes = ((max_hex_chars + 1) / 2).min(digest.len());
+    let mut output = String::with_capacity(digest_bytes * 2);
+    for &byte in digest.iter().take(digest_bytes) {
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output.truncate(max_hex_chars);
     output
 }
 
