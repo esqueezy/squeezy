@@ -386,6 +386,21 @@ fn show_metadata_extracts_context_window_from_parameters_fallback() {
 }
 
 #[test]
+fn show_metadata_parses_quoted_num_ctx_fallback() {
+    // Some Modelfile parameter strings quote the value (`num_ctx "8192"`)
+    // — the fallback must strip the quotes before parsing.
+    let value = json!({
+        "parameters": "temperature 0.7\nnum_ctx \"16384\"\n"
+    });
+    assert_eq!(ollama_context_window_from_show(&value), Some(16_384));
+
+    let value = json!({
+        "parameters": "num_ctx '4096'\n"
+    });
+    assert_eq!(ollama_context_window_from_show(&value), Some(4_096));
+}
+
+#[test]
 fn show_metadata_extracts_capabilities_array() {
     let value = json!({
         "capabilities": ["completion", "tools", "thinking", "vision"]

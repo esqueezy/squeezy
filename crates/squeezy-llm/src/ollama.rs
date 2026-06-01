@@ -210,8 +210,11 @@ fn is_gpt_oss_model(model: &str) -> bool {
 }
 
 pub async fn fetch_ollama_context_window(base_url: &str, model: &str) -> Option<u64> {
+    // 250 ms was fine on localhost but too tight for any remote / Tailscale /
+    // Docker-networked Ollama. 1 s keeps the probe snappy on healthy boxes
+    // while letting cold-cache or slow-link servers actually answer.
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(250))
+        .timeout(Duration::from_secs(1))
         .build()
         .ok()?;
     let url = api_endpoint_url(base_url, "show");
@@ -279,7 +282,7 @@ pub(crate) fn ollama_capabilities_from_show(value: &Value) -> Option<Vec<String>
 
 pub async fn fetch_ollama_model_names(base_url: &str) -> Vec<String> {
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_millis(250))
+        .timeout(Duration::from_secs(1))
         .build()
     {
         Ok(client) => client,
@@ -335,7 +338,10 @@ fn parse_num_ctx(parameters: &str) -> Option<u64> {
     parameters.lines().find_map(|line| {
         let mut parts = line.split_whitespace();
         match (parts.next(), parts.next()) {
-            (Some("num_ctx"), Some(value)) => value.parse().ok(),
+            // Modelfile parameters can quote the value (`num_ctx "8192"`)
+            // or wrap it in single quotes; strip both before parsing so
+            // the fallback survives hand-built and older-server cases.
+            (Some("num_ctx"), Some(value)) => value.trim_matches(['"', '\'']).parse().ok(),
             _ => None,
         }
     })
