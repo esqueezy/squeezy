@@ -237,12 +237,15 @@ impl OpenAiProvider {
                     })
                     .collect::<Vec<_>>()
             );
-            // Forward `tool_choice` when the caller set one. See LlmRequest
-            // docs — `None` omits the field and falls back to the
-            // provider's `auto` default.
-            if let Some(choice) = request.tool_choice.as_deref() {
-                body["tool_choice"] = json!(choice);
-            }
+        }
+        // M-03: forward `tool_choice` unconditionally — Responses-state
+        // continuations re-attach the prior turn's tools via
+        // `previous_response_id`, so a caller saying
+        // `tool_choice: "none"` on a follow-up turn needs the field even
+        // when `request.tools` is empty. `None` omits the field and
+        // falls back to the provider's `auto` default.
+        if let Some(choice) = request.tool_choice.as_deref() {
+            body["tool_choice"] = json!(choice);
         }
         if let Some(parallel) = request.parallel_tool_calls {
             // OpenAI's Responses API defaults to parallel tool calls; only
