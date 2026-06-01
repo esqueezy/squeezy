@@ -1149,6 +1149,122 @@ fn parser_accumulates_thinking_block_with_signature() {
     }
 }
 
+/// H-03: an `end_turn` finish with no visible text/tool output and a
+/// populated reasoning buffer is the canonical "thinking-only" turn
+/// the agent loop should retry. The streamer must set
+/// `reasoning_only_stop=true` so the agent's retry branch fires.
+#[test]
+fn parser_marks_reasoning_only_stop_when_endturn_after_thinking_with_no_output() {
+    let mut state = AnthropicStreamState::default();
+    parse_anthropic_event(
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        &mut state,
+    )
+    .expect("start");
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"weigh"}}"#,
+        &mut state,
+    )
+    .expect("delta");
+    parse_anthropic_event(r#"{"type":"content_block_stop","index":0}"#, &mut state).expect("stop");
+    parse_anthropic_event(
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        &mut state,
+    )
+    .expect("message_delta");
+    let events = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop");
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            LlmEvent::Completed {
+                reasoning_only_stop,
+                stop_reason,
+                ..
+            } => Some((reasoning_only_stop, stop_reason.clone())),
+            _ => None,
+        })
+        .expect("Completed event emitted");
+    assert_eq!(completed.1, Some(crate::StopReason::EndTurn));
+    assert!(
+        *completed.0,
+        "reasoning-only EndTurn with non-empty thinking buffer must set the flag",
+    );
+}
+
+/// H-03 happy path: an `end_turn` finish with visible text output
+/// must keep `reasoning_only_stop=false` even when the model
+/// previously emitted reasoning.
+#[test]
+fn parser_does_not_mark_reasoning_only_stop_when_visible_text_was_emitted() {
+    let mut state = AnthropicStreamState::default();
+    parse_anthropic_event(
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        &mut state,
+    )
+    .expect("thinking start");
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"weigh"}}"#,
+        &mut state,
+    )
+    .expect("thinking delta");
+    parse_anthropic_event(r#"{"type":"content_block_stop","index":0}"#, &mut state)
+        .expect("thinking stop");
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello"}}"#,
+        &mut state,
+    )
+    .expect("text delta");
+    parse_anthropic_event(
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        &mut state,
+    )
+    .expect("message_delta");
+    let events = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop");
+    let reasoning_only = events
+        .iter()
+        .find_map(|event| match event {
+            LlmEvent::Completed {
+                reasoning_only_stop,
+                ..
+            } => Some(*reasoning_only_stop),
+            _ => None,
+        })
+        .expect("Completed event emitted");
+    assert!(
+        !reasoning_only,
+        "visible text output must clear reasoning_only_stop",
+    );
+}
+
+/// H-03 negative case: an `end_turn` finish with no thinking and no
+/// visible output must NOT mark `reasoning_only_stop` (the model
+/// just produced an empty turn — distinct from the thinking-only
+/// pattern the flag targets).
+#[test]
+fn parser_does_not_mark_reasoning_only_stop_when_no_thinking_was_seen() {
+    let mut state = AnthropicStreamState::default();
+    parse_anthropic_event(
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        &mut state,
+    )
+    .expect("message_delta");
+    let events = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop");
+    let reasoning_only = events
+        .iter()
+        .find_map(|event| match event {
+            LlmEvent::Completed {
+                reasoning_only_stop,
+                ..
+            } => Some(*reasoning_only_stop),
+            _ => None,
+        })
+        .expect("Completed event emitted");
+    assert!(
+        !reasoning_only,
+        "empty-thinking buffer must not trip reasoning_only_stop",
+    );
+}
+
 /// H-02: Anthropic streams a redacted-thinking block's encrypted
 /// payload over `signature_delta` frames (the `content_block_start`
 /// frame's `data` field is empty until those land). Accumulate them

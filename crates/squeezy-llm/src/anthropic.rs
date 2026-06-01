@@ -848,6 +848,22 @@ struct AnthropicStreamState {
     /// case and for stream errors that don't fit any overflow
     /// pattern. See `parse_anthropic_event`'s `"error"` branch.
     pending_overflow_signal: Option<OverflowSignal>,
+    /// Tracks whether a non-empty `text_delta` or any `tool_use` block
+    /// has been observed this stream. Used by the `message_stop`
+    /// handler to compute `reasoning_only_stop`: an `EndTurn` finish
+    /// with no visible output but a populated reasoning buffer is the
+    /// canonical "model spent the round thinking" pattern the agent
+    /// loop should retry. See `.audit/providers/anthropic.md` HIGH #3.
+    saw_visible_output: bool,
+    /// `true` once the parser has observed at least one finished
+    /// thinking block (text or redacted). Distinct from
+    /// `emitted_reasoning_done` (which only flips when the agent
+    /// downstream has received the consolidated `ReasoningDone`
+    /// event) because we want to detect a reasoning-only finish even
+    /// when `ReasoningDone` is emitted *as part of* the same
+    /// `message_stop` batch (i.e. the model finishes thinking and
+    /// then immediately stops with no visible output).
+    observed_thinking: bool,
 }
 
 impl AnthropicStreamState {
@@ -981,6 +997,7 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                             data: None,
                         },
                     );
+                    state.observed_thinking = true;
                     if initial_text.is_empty() {
                         none()
                     } else {
@@ -1004,6 +1021,7 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                             data,
                         },
                     );
+                    state.observed_thinking = true;
                     none()
                 }
                 _ => none(),
@@ -1023,13 +1041,15 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                             blocks,
                         }));
                     }
-                    events.push(LlmEvent::TextDelta(
-                        delta
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                    ));
+                    let text = delta
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if !text.is_empty() {
+                        state.saw_visible_output = true;
+                    }
+                    events.push(LlmEvent::TextDelta(text));
                     Ok(events)
                 }
                 Some("input_json_delta") => {
@@ -1129,6 +1149,7 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                     blocks,
                 }));
             }
+            state.saw_visible_output = true;
             events.push(LlmEvent::ToolCall(LlmToolCall {
                 call_id: tool_call.call_id,
                 name: tool_call.name,
@@ -1165,11 +1186,23 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                     blocks,
                 }));
             }
+            // `reasoning_only_stop` semantics: the agent loop branches
+            // on this flag to retry "thinking-only" turns where the
+            // model spent the round reasoning and finished `end_turn`
+            // with no actionable output. Anthropic adaptive thinking
+            // on Opus 4.7/4.8 with `display: "omitted"` is the
+            // canonical producer of this shape — see
+            // `crates/squeezy-llm/src/lib.rs:858-872` for the contract
+            // and `.audit/providers/anthropic.md` HIGH #3 for the
+            // detection rule.
+            let reasoning_only_stop = matches!(stop_reason, Some(crate::StopReason::EndTurn))
+                && !state.saw_visible_output
+                && state.observed_thinking;
             events.push(LlmEvent::Completed {
                 response_id: state.response_id.clone(),
                 cost: state.cost(),
                 stop_reason,
-                reasoning_only_stop: false,
+                reasoning_only_stop,
             });
             Ok(events)
         }
