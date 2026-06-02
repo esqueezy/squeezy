@@ -6704,7 +6704,7 @@ fn format_transcript_entry_expanded(
             ToolCardSurface::Plain,
         ),
         TranscriptEntryKind::Log(entry) => format_log_entry(entry, false, selected),
-        TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, false),
+        TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, false, width),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, false, selected),
         TranscriptEntryKind::Reasoning(snapshot) => {
             if show_reasoning {
@@ -7232,7 +7232,7 @@ fn format_transcript_entry_with_width(
         TranscriptEntryKind::Log(entry_log) => {
             format_log_entry(entry_log, entry.collapsed, selected)
         }
-        TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, entry.collapsed),
+        TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, entry.collapsed, width),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, entry.collapsed, selected),
         TranscriptEntryKind::Reasoning(snapshot) => {
             if show_reasoning {
@@ -7278,10 +7278,11 @@ fn format_slash_echo_line(data: &SlashEchoData, selected: bool) -> Line<'static>
 fn format_plan_card_entry(
     data: &render::plan_card::PlanCardData,
     collapsed: bool,
+    width: Option<u16>,
 ) -> Vec<Line<'static>> {
     // Collapsed cards show just the header so users can fold a long
     // plan out of view without losing the anchor.
-    let lines = render::plan_card::render_plan_card(data);
+    let lines = render::plan_card::render_plan_card(data, width);
     if collapsed {
         return lines.into_iter().take(1).collect();
     }
