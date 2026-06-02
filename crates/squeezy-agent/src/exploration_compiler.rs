@@ -210,6 +210,35 @@ fn compile_exploration_plan_inner(input: &str) -> Option<ExplorationPlan> {
         });
     }
 
+    if hierarchy_intent(&lowered)
+        && let Some(query) = symbolic_query.clone()
+    {
+        // A "subclasses of Foo" / "implementors of Trait" question is
+        // exactly what `hierarchy` answers — the model would otherwise
+        // grep for `extends Foo` / `: Foo` / etc. across the tree, which
+        // is both noisier and language-specific. Pre-issuing the graph
+        // call lets the model see the canonical subclass list in one
+        // round and decide whether to drill into individual subclasses.
+        //
+        // Hierarchy is checked BEFORE RouteDiscovery because
+        // `route_intent` matches anywhere `"route"` appears as a
+        // substring (lifecycle hook names like `didPopRoute` /
+        // `didPushRoute` trigger it on the dart Flutter benchmark) and
+        // would otherwise win even when the prompt is unambiguously a
+        // subclass query. Hierarchy keywords are tight enough not to
+        // false-positive.
+        return Some(ExplorationPlan {
+            intent: ExplorationIntent::Hierarchy,
+            query: Some(query.clone()),
+            calls: vec![tool_call(
+                "planner_hierarchy",
+                "hierarchy",
+                json!({"query": query, "max_results": PLANNER_GRAPH_MAX_RESULTS}),
+            )],
+            guard_raw_reads: true,
+        });
+    }
+
     if route_intent(&lowered)
         && let Some(query) = symbolic_query.clone()
     {
@@ -224,27 +253,6 @@ fn compile_exploration_plan_inner(input: &str) -> Option<ExplorationPlan> {
                     json!({"query": query.clone(), "max_depth": 3, "max_results": 25}),
                 ),
             ],
-            guard_raw_reads: true,
-        });
-    }
-
-    if hierarchy_intent(&lowered)
-        && let Some(query) = symbolic_query.clone()
-    {
-        // A "subclasses of Foo" / "implementors of Trait" question is
-        // exactly what `hierarchy` answers — the model would otherwise
-        // grep for `extends Foo` / `: Foo` / etc. across the tree, which
-        // is both noisier and language-specific. Pre-issuing the graph
-        // call lets the model see the canonical subclass list in one
-        // round and decide whether to drill into individual subclasses.
-        return Some(ExplorationPlan {
-            intent: ExplorationIntent::Hierarchy,
-            query: Some(query.clone()),
-            calls: vec![tool_call(
-                "planner_hierarchy",
-                "hierarchy",
-                json!({"query": query, "max_results": PLANNER_GRAPH_MAX_RESULTS}),
-            )],
             guard_raw_reads: true,
         });
     }
