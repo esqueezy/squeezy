@@ -12,12 +12,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    JITTER_FRACTION, RetryPolicy, apply_jitter, backoff, idle_timeout, is_terminal_quota_error,
-    jitter_sample, parse_retry_after, send_with_auth_retry, send_with_retry, split_delta_prefix,
-    with_stream_retry,
     JITTER_FRACTION, RetryPolicy, apply_jitter, backoff, capped_backoff, idle_timeout,
     is_terminal_quota_error, jitter_sample, parse_retry_after, send_with_auth_retry,
-    send_with_retry, skip_delta_prefix, with_stream_retry,
+    send_with_retry, split_delta_prefix, with_stream_retry,
 };
 use crate::credentials::{ApiKeyFuture, ApiKeySource};
 use crate::{LlmEvent, LlmStream, LlmToolCall};

@@ -1079,6 +1079,10 @@ fn resource_updated_notification_evicts_cached_read_within_ttl() {
             .cached_resource_read_for_test("docs", "file:///b.txt")
             .is_some(),
         "an unrelated resource read must stay cached"
+    );
+}
+
+#[test]
 fn resource_read_cache_stays_bounded_and_drops_oldest() {
     let mut cache: BTreeMap<(String, String), CachedResourceRead> = BTreeMap::new();
     let overflow = 17usize;
@@ -1145,6 +1149,9 @@ fn resource_list_changed_notification_evicts_only_that_servers_reads() {
             .is_some(),
         "other servers' cached reads must be untouched"
     );
+}
+
+#[test]
 fn resource_read_cache_prunes_expired_entries() {
     let mut cache: BTreeMap<(String, String), CachedResourceRead> = BTreeMap::new();
     // A long-stale entry whose age exceeds the TTL must be pruned on the next

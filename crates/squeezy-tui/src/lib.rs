@@ -12284,13 +12284,13 @@ fn render_subagent_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     {
         lines.push(subagent_record_row(app, index, record, area.width));
     }
-    if hidden_below > 0 {
-        if let Some(last) = lines.last_mut() {
-            last.spans.push(Span::styled(
-                format!(" · +{hidden_below} more"),
-                Style::default().fg(crate::render::theme::quiet()),
-            ));
-        }
+    if hidden_below > 0
+        && let Some(last) = lines.last_mut()
+    {
+        last.spans.push(Span::styled(
+            format!(" · +{hidden_below} more"),
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }

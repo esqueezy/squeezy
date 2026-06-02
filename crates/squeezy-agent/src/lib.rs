@@ -6236,50 +6236,49 @@ impl TurnRuntime {
                     self.finish_turn(&broker.metrics).await;
                     return Ok(());
                 }
-                Some(StopReason::PauseTurn) => {
-                    // Anthropic `pause_turn`: the model voluntarily paused
-                    // mid-turn (typically a hosted tool still processing) and
-                    // expects the caller to re-issue with the partial state.
-                    // Full re-issue-with-partial-state handling is deferred —
-                    // wiring it risks an unbounded re-issue loop without a
-                    // dedicated guard. For now, when the pause carried tool
-                    // calls we fall through to the normal tool-execution path
-                    // below (results feed the next round, the closest safe
-                    // approximation of re-issue). When it carried nothing
-                    // actionable we surface an explicit failure rather than
-                    // letting it masquerade as a clean `EndTurn`, so the user
-                    // is not left staring at a silently truncated turn.
-                    // TODO: implement true pause_turn re-issue with a bounded
-                    // retry guard once the partial-state replay path lands.
-                    if tool_calls.is_empty() {
-                        if let Some(tail) = self
-                            .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
-                            .await
-                        {
-                            self.record_replay_model_text_delta(&tail);
-                        }
-                        self.stamp_routing_savings(&mut broker.metrics);
-                        self.publish_terminal_task_state(
-                            TaskStateStatus::Failed,
-                            Some("model paused the turn".to_string()),
-                            &task_title,
-                        )
-                        .await;
-                        let _ = self
-                            .tx
-                            .send(AgentEvent::Failed {
-                                turn_id: self.turn_id,
-                                error: SqueezyError::Agent(
-                                    "model paused the turn (pause_turn) without an actionable continuation; re-issue handling is not yet implemented — retry the turn".to_string(),
-                                ),
-                            })
-                            .await;
-                        self.finish_turn(&broker.metrics).await;
-                        return Ok(());
+                // Anthropic `pause_turn`: the model voluntarily paused
+                // mid-turn (typically a hosted tool still processing) and
+                // expects the caller to re-issue with the partial state.
+                // Full re-issue-with-partial-state handling is deferred —
+                // wiring it risks an unbounded re-issue loop without a
+                // dedicated guard. For now, when the pause carried tool
+                // calls we fall through to the normal tool-execution path
+                // below (results feed the next round, the closest safe
+                // approximation of re-issue). When it carried nothing
+                // actionable we surface an explicit failure rather than
+                // letting it masquerade as a clean `EndTurn`, so the user
+                // is not left staring at a silently truncated turn.
+                // TODO: implement true pause_turn re-issue with a bounded
+                // retry guard once the partial-state replay path lands.
+                Some(StopReason::PauseTurn) if tool_calls.is_empty() => {
+                    if let Some(tail) = self
+                        .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                        .await
+                    {
+                        self.record_replay_model_text_delta(&tail);
                     }
-                    // Tool calls present: fall through to the existing
-                    // tool-execution / re-entry logic below.
+                    self.stamp_routing_savings(&mut broker.metrics);
+                    self.publish_terminal_task_state(
+                        TaskStateStatus::Failed,
+                        Some("model paused the turn".to_string()),
+                        &task_title,
+                    )
+                    .await;
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::Failed {
+                            turn_id: self.turn_id,
+                            error: SqueezyError::Agent(
+                                "model paused the turn (pause_turn) without an actionable continuation; re-issue handling is not yet implemented — retry the turn".to_string(),
+                            ),
+                        })
+                        .await;
+                    self.finish_turn(&broker.metrics).await;
+                    return Ok(());
                 }
+                // `Some(StopReason::PauseTurn)` with tool calls present falls
+                // through (via the `_` arm) to the existing tool-execution /
+                // re-entry logic below.
                 _ => {}
             }
 

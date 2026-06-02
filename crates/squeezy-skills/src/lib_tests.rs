@@ -1990,38 +1990,35 @@ fn temp_workspace(name: &str) -> PathBuf {
     path
 }
 
+thread_local! {
+    /// Per-thread capture buffer the global subscriber writes into while a
+    /// `capture_discover_logs` call is active on this thread.
+    static CAPTURE_BUFFER: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Routes each event to the calling thread's [`CAPTURE_BUFFER`], or drops it
+/// when none is installed. Cloned per `make_writer`, so it is cheap.
 #[derive(Clone, Default)]
-struct SharedLogWriter {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
+struct ThreadLocalLogWriter;
 
-impl SharedLogWriter {
-    fn contents(&self) -> String {
-        let bytes = self.buffer.lock().expect("log buffer").clone();
-        String::from_utf8(bytes).expect("logs are UTF-8")
-    }
-}
-
-impl<'writer> MakeWriter<'writer> for SharedLogWriter {
-    type Writer = SharedLogWrite;
+impl<'writer> MakeWriter<'writer> for ThreadLocalLogWriter {
+    type Writer = ThreadLocalLogWrite;
 
     fn make_writer(&'writer self) -> Self::Writer {
-        SharedLogWrite {
-            buffer: self.buffer.clone(),
-        }
+        ThreadLocalLogWrite
     }
 }
 
-struct SharedLogWrite {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
+struct ThreadLocalLogWrite;
 
-impl io::Write for SharedLogWrite {
+impl io::Write for ThreadLocalLogWrite {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer
-            .lock()
-            .expect("log buffer")
-            .extend_from_slice(buf);
+        CAPTURE_BUFFER.with(|cell| {
+            if let Some(buffer) = cell.borrow().as_ref() {
+                buffer.lock().expect("log buffer").extend_from_slice(buf);
+            }
+        });
         Ok(buf.len())
     }
 
@@ -2030,17 +2027,36 @@ impl io::Write for SharedLogWrite {
     }
 }
 
+/// A single process-global subscriber backs every capture. Installing it once
+/// (rather than per-call `with_default`) keeps the warning callsites' tracing
+/// interest live: a parallel test calling `discover` without a subscriber
+/// would otherwise be the first to hit a callsite, cache its interest as
+/// `never`, and silently suppress it for the capturing thread.
+fn install_capture_subscriber() {
+    use std::sync::Once;
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(ThreadLocalLogWriter)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        // Ignore an error: another crate's test harness may already own the
+        // global default. The thread-local routing only needs *a* live
+        // subscriber so callsite interest stays re-evaluated.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+}
+
 fn capture_discover_logs(workspace: &Path, config: &SkillsConfig) -> (SkillCatalog, String) {
+    install_capture_subscriber();
     let _guard = LOG_CAPTURE_LOCK.lock().expect("log capture lock");
-    let writer = SharedLogWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(writer.clone())
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    let catalog =
-        tracing::subscriber::with_default(subscriber, || SkillCatalog::discover(workspace, config));
-    (catalog, writer.contents())
+    let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+    CAPTURE_BUFFER.with(|cell| *cell.borrow_mut() = Some(buffer.clone()));
+    let catalog = SkillCatalog::discover(workspace, config);
+    CAPTURE_BUFFER.with(|cell| *cell.borrow_mut() = None);
+    let bytes = buffer.lock().expect("log buffer").clone();
+    (catalog, String::from_utf8(bytes).expect("logs are UTF-8"))
 }
 
 #[test]
