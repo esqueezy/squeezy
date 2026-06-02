@@ -441,9 +441,6 @@ python_realworld,python,with_graph,baseline,3,graph-vs-nograph-python-realworld-
 python_realworld,python,no_graph,baseline,1,graph-vs-nograph-python-realworld-no-graph-1780355342399,3,481,0,0,0,0,15703,0.0157,0,20,0.0,,squeezy no-graph gpt-5.4-mini post-fixes; tool_calls=3,gpt-5.4-mini
 python_realworld,python,no_graph,baseline,2,graph-vs-nograph-python-realworld-no-graph-1780355376142,3,530,0,0,0,0,12633,0.0126,0,20,0.0,,squeezy no-graph gpt-5.4-mini post-fixes; tool_calls=3,gpt-5.4-mini
 python_realworld,python,no_graph,baseline,3,graph-vs-nograph-python-realworld-no-graph-1780355406047,1,325,0,0,0,0,10757,0.0108,0,20,0.0,,squeezy no-graph gpt-5.4-mini post-fixes; tool_calls=1,gpt-5.4-mini
-ruby_realworld,ruby,with_graph,baseline,1,graph-vs-nograph-ruby-realworld-with-graph-1780352696403,32,1793,0,0,0,0,51307,0.0513,14,14,100.0,,squeezy with-graph gpt-5.4-mini post-prompt-tweak; tool_calls=32,gpt-5.4-mini
-ruby_realworld,ruby,with_graph,baseline,2,graph-vs-nograph-ruby-realworld-with-graph-1780352770290,28,1014,0,0,0,0,59364,0.0594,14,14,100.0,,squeezy with-graph gpt-5.4-mini post-prompt-tweak; tool_calls=28,gpt-5.4-mini
-ruby_realworld,ruby,with_graph,baseline,3,graph-vs-nograph-ruby-realworld-with-graph-1780391159702,4,437,0,0,0,0,0,0.0,0,14,0.0,,squeezy with-graph gpt-5.4-mini post-prompt-tweak; tool_calls=4,gpt-5.4-mini
 ruby_realworld,ruby,no_graph,baseline,1,graph-vs-nograph-ruby-realworld-no-graph-1780352850893,11,868,0,0,0,0,31494,0.0315,14,14,100.0,,squeezy no-graph gpt-5.4-mini post-prompt-tweak; tool_calls=11,gpt-5.4-mini
 ruby_realworld,ruby,no_graph,baseline,2,graph-vs-nograph-ruby-realworld-no-graph-1780352957731,22,359,0,0,0,0,0,0.0,0,14,0.0,,squeezy no-graph gpt-5.4-mini post-prompt-tweak; tool_calls=22,gpt-5.4-mini
 ruby_realworld,ruby,no_graph,baseline,3,graph-vs-nograph-ruby-realworld-no-graph-1780352983481,10,1934,0,0,0,0,70903,0.0709,14,14,100.0,,squeezy no-graph gpt-5.4-mini post-prompt-tweak; tool_calls=10,gpt-5.4-mini
@@ -453,9 +450,6 @@ scala_realworld,scala,with_graph,baseline,3,graph-vs-nograph-scala-realworld-wit
 scala_realworld,scala,no_graph,baseline,1,graph-vs-nograph-scala-realworld-no-graph-1780353942462,46,1691,0,0,0,0,59519,0.0595,12,12,100.0,,squeezy no-graph gpt-5.4-mini post-prompt-tweak; tool_calls=46,gpt-5.4-mini
 scala_realworld,scala,no_graph,baseline,2,graph-vs-nograph-scala-realworld-no-graph-1780354207259,19,451,0,0,0,0,0,0.0,0,12,0.0,,squeezy no-graph gpt-5.4-mini post-prompt-tweak; tool_calls=19,gpt-5.4-mini
 scala_realworld,scala,no_graph,baseline,3,graph-vs-nograph-scala-realworld-no-graph-1780354350702,36,1615,0,0,0,0,65392,0.0654,12,12,100.0,,squeezy no-graph gpt-5.4-mini post-prompt-tweak; tool_calls=36,gpt-5.4-mini
-php_realworld,php,with_graph,baseline,1,graph-vs-nograph-php-realworld-with-graph-1780354655392,42,689,0,0,0,0,63730,0.0637,12,12,100.0,,squeezy with-graph gpt-5.4-mini post-prompt-tweak; tool_calls=42,gpt-5.4-mini
-php_realworld,php,with_graph,baseline,2,graph-vs-nograph-php-realworld-with-graph-1780354828210,19,375,0,0,0,0,39760,0.0398,12,12,100.0,,squeezy with-graph gpt-5.4-mini post-prompt-tweak; tool_calls=19,gpt-5.4-mini
-php_realworld,php,with_graph,baseline,3,graph-vs-nograph-php-realworld-with-graph-1780391159702,1,19,0,0,0,0,0,0.0,0,12,0.0,,squeezy with-graph gpt-5.4-mini post-prompt-tweak; tool_calls=1,gpt-5.4-mini
 php_realworld,php,no_graph,baseline,1,graph-vs-nograph-php-realworld-no-graph-1780354944331,17,455,0,0,0,0,31401,0.0314,12,12,100.0,,squeezy no-graph gpt-5.4-mini post-prompt-tweak; tool_calls=17,gpt-5.4-mini
 php_realworld,php,no_graph,baseline,2,graph-vs-nograph-php-realworld-no-graph-1780355049066,14,631,0,0,0,0,33602,0.0336,12,12,100.0,,squeezy no-graph gpt-5.4-mini post-prompt-tweak; tool_calls=14,gpt-5.4-mini
 php_realworld,php,no_graph,baseline,3,graph-vs-nograph-php-realworld-no-graph-1780355133367,30,646,0,0,0,0,47657,0.0477,12,12,100.0,,squeezy no-graph gpt-5.4-mini post-prompt-tweak; tool_calls=30,gpt-5.4-mini
@@ -465,3 +459,9 @@ kotlin_realworld,kotlin,with_graph,baseline,3,graph-vs-nograph-kotlin-realworld-
 kotlin_realworld,kotlin,no_graph,baseline,1,graph-vs-nograph-kotlin-realworld-no-graph-1780355768382,24,857,0,0,0,0,40740,0.0407,15,15,100.0,,squeezy no-graph gpt-5.4-mini post-prompt-tweak; tool_calls=24,gpt-5.4-mini
 kotlin_realworld,kotlin,no_graph,baseline,2,graph-vs-nograph-kotlin-realworld-no-graph-1780355872393,12,1385,0,0,0,0,47043,0.047,15,15,100.0,,squeezy no-graph gpt-5.4-mini post-prompt-tweak; tool_calls=12,gpt-5.4-mini
 kotlin_realworld,kotlin,no_graph,baseline,3,graph-vs-nograph-kotlin-realworld-no-graph-1780356015775,13,1361,0,0,0,0,46376,0.0464,15,15,100.0,,squeezy no-graph gpt-5.4-mini post-prompt-tweak; tool_calls=13,gpt-5.4-mini
+ruby_realworld,ruby,with_graph,baseline,1,graph-vs-nograph-ruby-realworld-with-graph-1780399858111,0,1059,0,0,0,0,31338,0.0313,14,14,100.0,,squeezy with-graph gpt-5.4-mini post #1+#6; tool_calls=?,gpt-5.4-mini
+ruby_realworld,ruby,with_graph,baseline,2,graph-vs-nograph-ruby-realworld-with-graph-1780399919801,0,925,0,0,0,0,62345,0.0623,14,14,100.0,,squeezy with-graph gpt-5.4-mini post #1+#6; tool_calls=?,gpt-5.4-mini
+ruby_realworld,ruby,with_graph,baseline,3,graph-vs-nograph-ruby-realworld-with-graph-1780400029065,0,110,0,0,0,0,0,0.0,0,14,0.0,,squeezy with-graph gpt-5.4-mini post #1+#6; tool_calls=?,gpt-5.4-mini
+php_realworld,php,with_graph,baseline,1,graph-vs-nograph-php-realworld-with-graph-1780393874819,0,592,0,0,0,0,45157,0.0452,12,12,100.0,,squeezy with-graph gpt-5.4-mini post #1+#6; tool_calls=?,gpt-5.4-mini
+php_realworld,php,with_graph,baseline,2,graph-vs-nograph-php-realworld-with-graph-1780394172669,0,725,0,0,0,0,64264,0.0643,12,12,100.0,,squeezy with-graph gpt-5.4-mini post #1+#6; tool_calls=?,gpt-5.4-mini
+php_realworld,php,with_graph,baseline,3,graph-vs-nograph-php-realworld-with-graph-1780399858111,0,193,0,0,0,0,0,0.0,0,12,0.0,,squeezy with-graph gpt-5.4-mini post #1+#6; tool_calls=?,gpt-5.4-mini
