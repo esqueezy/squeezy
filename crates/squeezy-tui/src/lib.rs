@@ -14428,11 +14428,9 @@ impl TranscriptEntry {
         Self {
             id,
             kind: TranscriptEntryKind::Reasoning(Box::new(snapshot)),
-            // Default expanded so reasoning the user just watched stream in
-            // stays visible after the segment lands; auto-collapsing the
-            // full body to a one-line summary makes the text look like it
-            // vanished. Users on `transcript_default = "compact"` keep the
-            // collapsed shape, and Ctrl-E still toggles it either way.
+            // Reasoning is visible by default when `show_reasoning_usage`
+            // is enabled, but compact transcript mode keeps the body under
+            // a concise chip. Ctrl-T opens the full transcript with details.
             collapsed: transcript_default == TranscriptDefault::Compact,
             revision: 0,
         }
