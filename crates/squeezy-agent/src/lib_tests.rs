@@ -4678,6 +4678,23 @@ fn total_tokens_from_cost_sums_present_fields() {
         ..CostSnapshot::default()
     };
     assert_eq!(super::total_tokens_from_cost(&cost), Some(3_000));
+    // reasoning_output_tokens is a subset of output_tokens, so the
+    // total is input + output only (not input + output + reasoning).
+    assert_eq!(super::total_tokens_from_cost(&cost), Some(3_000));
+}
+
+#[test]
+fn total_tokens_from_cost_excludes_reasoning_subset() {
+    // OpenAI-family usage: output_tokens is the inclusive generated
+    // total and reasoning_output_tokens (2_500) is a subset of it, so
+    // the model actually consumed input + output = 4_000 — not 6_500.
+    let cost = CostSnapshot {
+        input_tokens: Some(1_000),
+        output_tokens: Some(3_000),
+        reasoning_output_tokens: Some(2_500),
+        ..CostSnapshot::default()
+    };
+    assert_eq!(super::total_tokens_from_cost(&cost), Some(4_000));
 }
 
 #[test]

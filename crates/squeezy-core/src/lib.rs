@@ -11731,6 +11731,11 @@ fn looks_like_config(label: Option<&str>, text: &str) -> bool {
 pub struct CostSnapshot {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Reasoning portion of `output_tokens`. By cross-provider
+    /// convention this is a *subset* of `output_tokens` (the inclusive
+    /// generated-token total), mirroring `cached_input_tokens` as a
+    /// subset of `input_tokens` — it is a breakdown, not an addend, so
+    /// total-token math must not add it on top of `output_tokens`.
     #[serde(default)]
     pub reasoning_output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,

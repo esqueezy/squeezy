@@ -845,6 +845,8 @@ fn thinking_tokens_fold_into_billed_output() {
     let mut last_finish_reason: Option<String> = None;
     let mut reasoning_buf = GoogleReasoningBuffer::default();
     let mut server_model_slot: Option<String> = None;
+    let mut tool_call_counter: usize = 0;
+    let mut response_id_slot: Option<String> = None;
     parse_google_event(
         r#"{
           "candidates":[{"content":{"parts":[{"text":"ok"}]}}],
@@ -859,6 +861,8 @@ fn thinking_tokens_fold_into_billed_output() {
         &mut last_finish_reason,
         &mut reasoning_buf,
         &mut server_model_slot,
+        &mut tool_call_counter,
+        &mut response_id_slot,
     )
     .expect("valid event");
 
