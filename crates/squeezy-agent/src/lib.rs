@@ -13622,19 +13622,18 @@ fn resume_item_to_llm_input(item: ResumeItem) -> LlmInputItem {
     }
 }
 
-/// Combined token count from a `CostSnapshot`. Sums `input_tokens`,
-/// `output_tokens`, and `reasoning_output_tokens` when present; falls back
-/// to `None` if the provider reported no usage.
+/// Combined token count from a `CostSnapshot`. Sums `input_tokens` and
+/// `output_tokens` when present; falls back to `None` if the provider
+/// reported no usage. `reasoning_output_tokens` is the subset of
+/// `output_tokens` that was reasoning (see
+/// docs/internal/cost-saving/10-token-accounting.md), so it is already
+/// inside `output_tokens` and must not be added again.
 fn total_tokens_from_cost(cost: &CostSnapshot) -> Option<u64> {
     let mut total: u64 = 0;
     let mut saw_any = false;
-    for value in [
-        cost.input_tokens,
-        cost.output_tokens,
-        cost.reasoning_output_tokens,
-    ]
-    .into_iter()
-    .flatten()
+    for value in [cost.input_tokens, cost.output_tokens]
+        .into_iter()
+        .flatten()
     {
         saw_any = true;
         total = total.saturating_add(value);

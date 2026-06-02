@@ -788,16 +788,28 @@ fn parse_google_event(
         // - `thoughtsTokenCount` — reasoning tokens consumed for
         //   the thinking pass (separate column on the bill).
         //
-        // The two sums are EXCLUSIVE: visible output excludes
-        // thoughts. Squeezy mirrors that split on CostSnapshot:
-        // `output_tokens = candidatesTokenCount` (visible) and
-        // `reasoning_output_tokens = thoughtsTokenCount`. Cost
-        // reporters that want a single billed-output number sum the
-        // two; tests below pin this invariant.
+        // Gemini keeps the two disjoint in `usageMetadata`, but the
+        // cross-provider `CostSnapshot` convention is the inclusive one:
+        // `output_tokens` is the total billed output and
+        // `reasoning_output_tokens` is the thoughts *subset* of it (see
+        // the fold below and `token_split_pins_visible_vs_thoughts`).
         cost.input_tokens = usage.get("promptTokenCount").and_then(Value::as_u64);
-        cost.output_tokens = usage.get("candidatesTokenCount").and_then(Value::as_u64);
         cost.cached_input_tokens = usage.get("cachedContentTokenCount").and_then(Value::as_u64);
-        cost.reasoning_output_tokens = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
+        // Gemini's `usageMetadata` keeps thinking tokens disjoint:
+        // `totalTokenCount = promptTokenCount + candidatesTokenCount
+        // + thoughtsTokenCount`. The cross-provider `CostSnapshot`
+        // convention (docs/internal/cost-saving/10-token-accounting.md)
+        // requires `output_tokens` to include reasoning and
+        // `reasoning_output_tokens` to be the subset breakdown, so fold
+        // `thoughtsTokenCount` into the billed output. Without this,
+        // `estimate_cost` prices thinking at $0.
+        let visible = usage.get("candidatesTokenCount").and_then(Value::as_u64);
+        let thoughts = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
+        cost.output_tokens = match (visible, thoughts) {
+            (None, None) => None,
+            (visible, thoughts) => Some(visible.unwrap_or(0) + thoughts.unwrap_or(0)),
+        };
+        cost.reasoning_output_tokens = thoughts;
     }
     if let Some(reason) = value
         .get("candidates")

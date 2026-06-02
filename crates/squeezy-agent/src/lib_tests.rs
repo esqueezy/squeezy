@@ -4535,13 +4535,16 @@ async fn mid_turn_compaction_fires_when_provider_reports_high_usage() {
 
 #[test]
 fn total_tokens_from_cost_sums_present_fields() {
+    // `reasoning_output_tokens` is the subset of `output_tokens` that was
+    // reasoning, so the total is input + output (reasoning is already
+    // inside output and must not be double-counted).
     let cost = CostSnapshot {
         input_tokens: Some(1_000),
         output_tokens: Some(2_000),
         reasoning_output_tokens: Some(500),
         ..CostSnapshot::default()
     };
-    assert_eq!(super::total_tokens_from_cost(&cost), Some(3_500));
+    assert_eq!(super::total_tokens_from_cost(&cost), Some(3_000));
 }
 
 #[test]
