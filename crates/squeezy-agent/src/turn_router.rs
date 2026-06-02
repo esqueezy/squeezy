@@ -208,7 +208,7 @@ pub(crate) fn heuristic_slam_dunk(user_input: &str, cfg: &RoutingConfig) -> Opti
     if trimmed.is_empty() {
         return None;
     }
-    if (trimmed.len() as u32) > cfg.heuristic_max_chars {
+    if (trimmed.chars().count() as u32) > cfg.heuristic_max_chars {
         return None;
     }
     if trimmed.contains("\n\n") {

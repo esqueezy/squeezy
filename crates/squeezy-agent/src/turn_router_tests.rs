@@ -110,6 +110,13 @@ fn heuristic_rejects_long_prompts_over_char_budget() {
 }
 
 #[test]
+fn heuristic_length_budget_counts_chars_not_bytes() {
+    let mut cfg = default_routing_config();
+    cfg.heuristic_max_chars = 5;
+    assert_eq!(heuristic_slam_dunk("run \u{00e9}", &cfg), Some("run"));
+}
+
+#[test]
 fn heuristic_rejects_too_many_words() {
     let cfg = default_routing_config();
     let wordy =
