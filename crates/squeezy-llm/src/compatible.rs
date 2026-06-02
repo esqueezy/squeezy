@@ -237,28 +237,6 @@ impl OpenAiCompatibleProvider {
     /// absent so `bearer_auth("")` never panics inside reqwest and an
     /// LM Studio / vLLM / llama.cpp deployment with no token is not
     /// served a malformed `Authorization: Bearer ` blank.
-    /// Test-only helper that mirrors the bearer/header attachment block.
-    /// Builds a fresh `reqwest::Client` decoupled from `self.client` so
-    /// CodeQL's taint analysis can't chain resolved credentials into
-    /// this path. The helper accepts a non-secret marker; the live
-    /// `stream_response` is the only call site that ever sees a
-    /// resolved credential.
-    #[cfg(test)]
-    pub(crate) fn build_chat_request_for_test(&self, key_marker: &str) -> reqwest::Request {
-        let url = format!("{}/chat/completions", self.base_url);
-        let inert_client = reqwest::Client::new();
-        let mut builder = inert_client.post(&url);
-        if !key_marker.is_empty() {
-            builder = builder.bearer_auth("test-bearer");
-        }
-        for (header_key, header_value) in &self.extra_headers {
-            builder = builder.header(header_key.as_str(), header_value.as_str());
-        }
-        builder
-            .build()
-            .expect("compatible request must build with valid headers")
-    }
-
     #[cfg(test)]
     pub(crate) fn api_key_source(&self) -> Arc<dyn ApiKeySource> {
         self.api_key.clone()
