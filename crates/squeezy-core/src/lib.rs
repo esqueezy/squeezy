@@ -1343,6 +1343,11 @@ impl AppConfig {
             "judge_max_chars = {}\n",
             self.routing.judge_max_chars
         ));
+        if let Some(judge_model) = &self.routing.judge_model {
+            output.push_str(&format!("judge_model = {}\n", toml_string(judge_model)));
+        } else {
+            output.push_str("# judge_model = unset  # defaults to the cheap tier\n");
+        }
         if self.routing.extra_heuristic_verbs.is_empty() {
             output.push_str("# extra_heuristic_verbs = []  # user-extended verb whitelist\n\n");
         } else {
@@ -3302,6 +3307,7 @@ pub struct RoutingConfig {
     pub large_attachment_bypass_bytes: u32,
     pub heuristic_max_chars: u32,
     pub judge_max_chars: u32,
+    pub judge_model: Option<String>,
     /// User-extended heuristic verb whitelist. The built-in whitelist
     /// is deliberately narrow because false positives bypass the LLM
     /// judge — adding an entry here widens the heuristic surface but
@@ -3370,6 +3376,7 @@ impl RoutingConfig {
                 .and_then(|raw| raw.parse::<u32>().ok())
                 .or(settings.judge_max_chars)
                 .unwrap_or(DEFAULT_ROUTING_JUDGE_MAX_CHARS),
+            judge_model: get_var("SQUEEZY_ROUTING_JUDGE_MODEL").or(settings.judge_model),
             extra_heuristic_verbs: get_var("SQUEEZY_ROUTING_EXTRA_HEURISTIC_VERBS")
                 .map(|raw| {
                     raw.split(',')
@@ -3407,6 +3414,7 @@ pub struct RoutingSettings {
     pub large_attachment_bypass_bytes: Option<u32>,
     pub heuristic_max_chars: Option<u32>,
     pub judge_max_chars: Option<u32>,
+    pub judge_model: Option<String>,
     pub extra_heuristic_verbs: Option<Vec<String>>,
 }
 
@@ -3424,6 +3432,7 @@ impl RoutingSettings {
                 "large_attachment_bypass_bytes",
                 "heuristic_max_chars",
                 "judge_max_chars",
+                "judge_model",
                 "extra_heuristic_verbs",
             ],
             source,
@@ -3479,6 +3488,7 @@ impl RoutingSettings {
                 source,
                 &field(path, "judge_max_chars"),
             )?,
+            judge_model: string_value(table, "judge_model", source, &field(path, "judge_model"))?,
             extra_heuristic_verbs: string_array_value(
                 table,
                 "extra_heuristic_verbs",
@@ -3510,6 +3520,7 @@ impl RoutingSettings {
         );
         replace_if_some(&mut self.heuristic_max_chars, next.heuristic_max_chars);
         replace_if_some(&mut self.judge_max_chars, next.judge_max_chars);
+        replace_if_some(&mut self.judge_model, next.judge_model);
         merge_string_lists(&mut self.extra_heuristic_verbs, next.extra_heuristic_verbs);
     }
 }

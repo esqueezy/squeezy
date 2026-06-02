@@ -490,10 +490,11 @@ pub(crate) async fn classify_turn(
     if prompt_chars == 0 || prompt_chars > cfg.judge_max_chars {
         return ClassifyResult::parent();
     }
+    let judge_model = judge_model_for(inputs.provider_name, inputs.config, &cheap);
     let (verdict, judge_cost) = run_judge(
         inputs.provider,
         inputs.provider_name,
-        &cheap,
+        &judge_model,
         inputs.user_input,
         cancel,
     )
@@ -511,6 +512,17 @@ pub(crate) async fn classify_turn(
             judge_cost,
         },
     }
+}
+
+fn judge_model_for(provider: &str, config: &AppConfig, cheap_model: &Arc<str>) -> Arc<str> {
+    let Some(model) = config.routing.judge_model.clone() else {
+        return cheap_model.clone();
+    };
+    Arc::from(
+        squeezy_core::resolve_model_alias(provider, &model)
+            .unwrap_or(&model)
+            .to_string(),
+    )
 }
 
 /// Estimate the savings of running this turn on the cheap tier
@@ -605,7 +617,7 @@ const JUDGE_MAX_OUTPUT_TOKENS: u32 = 512;
 async fn run_judge(
     provider: &Arc<dyn LlmProvider>,
     provider_name: &str,
-    cheap_model: &Arc<str>,
+    judge_model: &Arc<str>,
     user_input: &str,
     cancel: CancellationToken,
 ) -> (Option<bool>, CostSnapshot) {
@@ -617,7 +629,7 @@ async fn run_judge(
         retention: CacheRetention::None,
     };
     let request = LlmRequest {
-        model: cheap_model.clone(),
+        model: judge_model.clone(),
         instructions: Arc::from(judge_instructions_for(provider_name)),
         input: Arc::from(vec![LlmInputItem::UserText(user_input.to_string())]),
         max_output_tokens: Some(JUDGE_MAX_OUTPUT_TOKENS),
@@ -662,7 +674,7 @@ async fn run_judge(
         result = fetch => result,
     };
     if cost.estimated_usd_micros.is_none() {
-        cost.estimated_usd_micros = squeezy_llm::estimate_cost(provider_name, cheap_model, &cost);
+        cost.estimated_usd_micros = squeezy_llm::estimate_cost(provider_name, judge_model, &cost);
     }
     let verdict = raw.and_then(|text| parse_judge_reply(&text));
     (verdict, cost)

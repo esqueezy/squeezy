@@ -263,6 +263,27 @@ async fn llm_judge_cheap_verdict_routes_borderline_prompt() {
 }
 
 #[tokio::test]
+async fn configured_judge_model_dispatches_judge_only() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        judge_reply("cheap"),
+        end_turn_reply("here you go"),
+    ]));
+    let mut config = config_with_routing();
+    config.routing.judge_model = Some("sonnet".to_string());
+    let agent = Agent::new(config, provider.clone());
+    let _events = drain_until_terminal(agent.start_turn(
+        "explain how the cost broker tracks budgets".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(&*requests[0].model, "claude-sonnet-4-6");
+    assert_eq!(&*requests[1].model, CHEAP_MODEL);
+}
+
+#[tokio::test]
 async fn llm_judge_parent_verdict_skips_routing() {
     // Judge votes "parent"; the actual turn dispatches on the parent
     // model and no `TurnRouted` event is emitted.
