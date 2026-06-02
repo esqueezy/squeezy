@@ -6334,14 +6334,21 @@ impl PermissionPolicy {
         let legacy_defaults = settings.has_legacy_defaults();
         let custom_defaults = settings.custom.is_some();
         let legacy_compat = legacy_defaults && settings.mode.is_none();
+        let explicit_mode = settings.mode.is_some();
         let mode = settings
             .mode
             .unwrap_or(if legacy_defaults || custom_defaults {
                 PermissionPolicyMode::Custom
             } else {
-                PermissionPolicyMode::Default
+                PermissionPolicyMode::AutoReview
             });
         let ai_reviewer_settings = settings.ai_reviewer.clone();
+        let ai_reviewer_enabled_configured = ai_reviewer_settings
+            .as_ref()
+            .is_some_and(|settings| settings.enabled.is_some());
+        let ai_reviewer_allow_capabilities_configured = ai_reviewer_settings
+            .as_ref()
+            .is_some_and(|settings| settings.allow_capabilities.is_some());
         let shell_sandbox_settings = settings.shell_sandbox.clone();
         let shell_sandbox_network_configured = shell_sandbox_settings
             .as_ref()
@@ -6383,8 +6390,12 @@ impl PermissionPolicy {
         policy.ai_reviewer = AiReviewerConfig::from_settings(ai_reviewer_settings, source)?;
         match mode {
             PermissionPolicyMode::AutoReview => {
-                policy.ai_reviewer.enabled = true;
-                policy.ai_reviewer.allow_capabilities = auto_review_allow_capabilities();
+                if explicit_mode || !ai_reviewer_enabled_configured {
+                    policy.ai_reviewer.enabled = true;
+                }
+                if explicit_mode || !ai_reviewer_allow_capabilities_configured {
+                    policy.ai_reviewer.allow_capabilities = auto_review_allow_capabilities();
+                }
             }
             PermissionPolicyMode::FullAccess => {
                 policy.ai_reviewer.enabled = false;
@@ -6575,7 +6586,7 @@ pub fn target_is_effectively_wildcard(target: &str) -> bool {
 
 impl Default for PermissionPolicy {
     fn default() -> Self {
-        Self::preset(PermissionPolicyMode::Default)
+        Self::preset(PermissionPolicyMode::AutoReview)
     }
 }
 
@@ -8647,9 +8658,11 @@ pub fn user_settings_template() -> &'static str {
 # stream_idle_timeout_ms = 300000
 
 [permissions]
-# mode = "default"               # default | auto_review | full_access | custom
-# default mode allows workspace read/edit/search plus local shell/git/compiler;
-# web, MCP, destructive actions, and outside-workspace paths still ask.
+# mode = "auto_review"           # default | auto_review | full_access | custom
+# auto_review allows workspace read/edit/search plus local shell/git/compiler;
+# web, MCP, destructive actions, and outside-workspace paths still ask, with
+# model-backed pre-review for read/search/network/MCP prompts.
+# explicit default mode keeps the same capability defaults but disables AI review.
 # Top-level capability keys below are legacy aliases. Prefer [permissions.custom]
 # when mode = "custom".
 # read = "allow"
@@ -8677,7 +8690,7 @@ pub fn user_settings_template() -> &'static str {
 # destructive = "ask"
 
 # [permissions.ai_reviewer]
-# enabled = false
+# enabled = true
 # model = "gpt-5-mini"          # optional reviewer model override
 # allow_capabilities = ["read", "search", "network", "mcp"]
 # auto_review mode forces enabled=true and this allow_capabilities set.
@@ -8858,9 +8871,11 @@ pub fn project_settings_template() -> &'static str {
 # custom_patterns = []
 
 [permissions]
-# mode = "default"               # default | auto_review | full_access | custom
-# default mode allows workspace read/edit/search plus local shell/git/compiler;
-# web, MCP, destructive actions, and outside-workspace paths still ask.
+# mode = "auto_review"           # default | auto_review | full_access | custom
+# auto_review allows workspace read/edit/search plus local shell/git/compiler;
+# web, MCP, destructive actions, and outside-workspace paths still ask, with
+# model-backed pre-review for read/search/network/MCP prompts.
+# explicit default mode keeps the same capability defaults but disables AI review.
 # Use [permissions.custom] for granular custom-mode defaults.
 #
 # [permissions.custom]
@@ -8876,7 +8891,7 @@ pub fn project_settings_template() -> &'static str {
 # destructive = "ask"
 #
 # [permissions.ai_reviewer]
-# enabled = false
+# enabled = true
 # allow_capabilities = ["read", "search", "network", "mcp"]
 # auto_review mode forces enabled=true and this allow_capabilities set.
 #

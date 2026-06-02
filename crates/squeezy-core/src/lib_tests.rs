@@ -133,11 +133,17 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert_eq!(config.model, DEFAULT_OPENAI_MODEL);
     assert_eq!(config.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
     assert_eq!(config.permissions, PermissionPolicy::default());
+    assert_eq!(config.permissions.mode, PermissionPolicyMode::AutoReview);
     assert_eq!(config.permissions.edit, PermissionMode::Allow);
-    assert!(!config.permissions.ai_reviewer.enabled);
+    assert!(config.permissions.ai_reviewer.enabled);
     assert_eq!(
         config.permissions.ai_reviewer.allow_capabilities,
-        vec![PermissionCapability::Read, PermissionCapability::Search]
+        vec![
+            PermissionCapability::Read,
+            PermissionCapability::Search,
+            PermissionCapability::Network,
+            PermissionCapability::Mcp,
+        ]
     );
     assert_eq!(
         config.permissions.shell_sandbox.protected_metadata_names,
@@ -976,12 +982,42 @@ fn permission_mode_parses_expected_values() {
 
 #[test]
 fn permission_policy_modes_apply_presets() {
-    let default = AppConfig::from_env_vars(None, |_| None);
+    let implicit = AppConfig::from_env_vars(None, |_| None);
+    assert_eq!(implicit.permissions.mode, PermissionPolicyMode::AutoReview);
+    assert_eq!(implicit.permissions.read, PermissionMode::Allow);
+    assert_eq!(implicit.permissions.edit, PermissionMode::Allow);
+    assert_eq!(implicit.permissions.shell, PermissionMode::Allow);
+    assert_eq!(implicit.permissions.web, PermissionMode::Ask);
+    assert!(implicit.permissions.ai_reviewer.enabled);
+    assert_eq!(
+        implicit.permissions.ai_reviewer.allow_capabilities,
+        vec![
+            PermissionCapability::Read,
+            PermissionCapability::Search,
+            PermissionCapability::Network,
+            PermissionCapability::Mcp,
+        ]
+    );
+    assert_eq!(
+        implicit.permissions.shell_sandbox.network,
+        ShellSandboxNetworkPolicy::AllowWhenApproved
+    );
+
+    let default = SettingsFile::from_toml_str(
+        r#"
+[permissions]
+mode = "default"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let default = AppConfig::from_settings_and_env_vars(default, |_| None);
     assert_eq!(default.permissions.mode, PermissionPolicyMode::Default);
     assert_eq!(default.permissions.read, PermissionMode::Allow);
     assert_eq!(default.permissions.edit, PermissionMode::Allow);
     assert_eq!(default.permissions.shell, PermissionMode::Allow);
     assert_eq!(default.permissions.web, PermissionMode::Ask);
+    assert!(!default.permissions.ai_reviewer.enabled);
     assert_eq!(
         default.permissions.shell_sandbox.network,
         ShellSandboxNetworkPolicy::AllowWhenApproved

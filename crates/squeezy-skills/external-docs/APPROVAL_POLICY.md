@@ -1,6 +1,9 @@
 # Approval Policy
 
-Squeezy can optionally ask the configured model to review permission prompts before the user sees them. The reviewer is disabled in `permissions.mode = "default"` and enabled by `permissions.mode = "auto_review"` or explicit `[permissions.ai_reviewer]` settings.
+Squeezy asks the configured model to review permission prompts before the user
+sees them in the default `permissions.mode = "auto_review"` preset. The
+reviewer is disabled by explicit `permissions.mode = "default"` and can also be
+configured through `[permissions.ai_reviewer]` settings.
 
 `permissions.mode = "auto_review"` is a preset: it forces `permissions.ai_reviewer.enabled = true` and `permissions.ai_reviewer.allow_capabilities = ["read", "search", "network", "mcp"]`. Other reviewer fields such as `model`, `policy_file`, `timeout_secs`, and `max_transcript_tokens` still come from config.
 

@@ -111,7 +111,7 @@ commented examples so that built-in defaults can evolve over time:
 # default_model = "gpt-5.5"
 
 [permissions]
-# mode = "default"               # default | auto_review | full_access | custom
+# mode = "auto_review"           # default | auto_review | full_access | custom
 # read = "allow"
 # search = "allow"
 # edit = "allow"
@@ -137,7 +137,7 @@ commented examples so that built-in defaults can evolve over time:
 # source = "project"
 
 # [permissions.ai_reviewer]
-# enabled = false
+# enabled = true
 # model = "gpt-5-nano"
 # allow_capabilities = ["read", "search", "network", "mcp"]
 # policy_file = "docs/external/APPROVAL_POLICY.md"
@@ -290,8 +290,9 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   can only downgrade an `Ask` shell verdict to `Deny`; it spends one extra
   LLM round-trip per ambiguous shell call, so leave it off unless that cost
   is acceptable.
-- `[permissions.ai_reviewer]`: optional model-backed pre-review for permission
-  prompts. It is disabled by default. When enabled, it receives a bounded
+- `[permissions.ai_reviewer]`: model-backed pre-review for permission prompts.
+  It is enabled by the default `auto_review` permission mode. When enabled, it
+  receives a bounded
   transcript window, the pending permission request, and the approval policy
   document, then returns `allow`, `deny`, or `ask` JSON. It may deny any
   request, but it may only auto-allow capabilities listed in
