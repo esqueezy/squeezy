@@ -4105,6 +4105,51 @@ fn ingest_agents_md_truncates_at_byte_cap() {
 }
 
 #[test]
+fn ingest_agents_md_handles_multibyte_header_at_byte_cap() {
+    // Workspace under a directory whose name contains a multibyte char, so the
+    // per-file header (which embeds the full path) holds a `é` (2 bytes). When
+    // the byte budget runs out partway through that header it must not slice
+    // mid-character.
+    let base = temp_workspace("ingest_agents_md_multibyte");
+    let root = base.join("josé");
+    fs::create_dir_all(root.join(".git")).expect("create .git marker");
+    fs::write(root.join("AGENTS.md"), "root rule").expect("write root AGENTS.md");
+    let nested = root.join("crates").join("béta");
+    fs::create_dir_all(&nested).expect("create nested dir");
+    fs::write(nested.join("AGENTS.md"), "nested rule").expect("write nested AGENTS.md");
+
+    // Reproduce the header exactly as the function builds it for the nested
+    // file, then pick a `max_bytes` that lands inside one of its multibyte
+    // chars. The nested file is reached only after the root file consumes some
+    // budget, so size the cap to leave `remaining` inside the nested header.
+    let canonical = fs::canonicalize(&nested).expect("canonicalize");
+    let header = format!("--- {} ---\n", canonical.join("AGENTS.md").display());
+    let mid = header
+        .char_indices()
+        .find(|(_, c)| c.len_utf8() > 1)
+        .map(|(i, _)| i + 1)
+        .expect("multibyte char in header path");
+    assert!(!header.is_char_boundary(mid), "chose a mid-char index");
+
+    // Root header + root body + separator, then `mid` bytes into the nested
+    // header — without the fix the nested header slice panics here.
+    let root_header = format!(
+        "--- {} ---\n",
+        fs::canonicalize(&root)
+            .expect("canonicalize root")
+            .join("AGENTS.md")
+            .display()
+    );
+    // The "\n\n" separator is appended without decrementing `remaining`, so the
+    // budget reaching the nested header is exactly `mid`.
+    let max_bytes = root_header.len() + "root rule".len() + mid;
+
+    let combined = super::ingest_agents_md(&nested, max_bytes).expect("ingest");
+    assert!(combined.contains("root rule"));
+    assert!(combined.ends_with("[truncated]"));
+}
+
+#[test]
 fn ingest_user_memory_reads_from_home_squeezy() {
     let home = temp_workspace("ingest_user_memory");
     fs::create_dir_all(home.join(".squeezy")).expect("mkdir .squeezy");

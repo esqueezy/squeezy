@@ -4625,7 +4625,10 @@ fn ingest_agents_md(cwd: &std::path::Path, max_bytes: usize) -> Option<String> {
         if !combined.is_empty() {
             combined.push_str("\n\n");
         }
-        let header_bytes = header.len().min(remaining);
+        let mut header_bytes = header.len().min(remaining);
+        while header_bytes > 0 && !header.is_char_boundary(header_bytes) {
+            header_bytes -= 1;
+        }
         combined.push_str(&header[..header_bytes]);
         remaining = remaining.saturating_sub(header_bytes);
         if remaining == 0 {
