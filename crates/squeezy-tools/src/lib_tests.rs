@@ -10423,6 +10423,28 @@ fn shell_sandbox_runtime_unavailable_ignores_direct_backend() {
 }
 
 #[test]
+fn linux_seccomp_plan_does_not_export_ask_socket() {
+    // The linux-direct-syscalls seccomp filter denies socket(AF_UNIX, …),
+    // so `squeezy ask` could never connect; the socket must not be exported.
+    let seccomp_plan = fake_sandbox_plan("linux-direct-syscalls", true);
+    assert!(!seccomp_plan.exports_ask_socket());
+
+    // Backends without the AF_UNIX deny still advertise the ask socket.
+    for backend in [
+        "none",
+        "external",
+        "macos-sandbox-exec",
+        "windows-job-object",
+    ] {
+        let plan = fake_sandbox_plan(backend, false);
+        assert!(
+            plan.exports_ask_socket(),
+            "backend {backend} should export the ask socket",
+        );
+    }
+}
+
+#[test]
 fn grep_spec_promotes_graph_first() {
     let description = grep_spec().description;
     for marker in [

@@ -607,7 +607,14 @@ impl ToolRegistry {
         configure_shell_process_group(&mut command);
         configure_linux_shell_sandbox(&mut command, sandbox_plan);
         apply_shell_environment_policy(&mut command, &self.shell_sandbox);
-        let ask_server = if let Some(approver) = shell_ask_approver {
+        // Only export the `squeezy ask` socket when the active backend
+        // permits the child's `socket(AF_UNIX, …)` connect. The
+        // linux-direct-syscalls seccomp filter denies AF_UNIX sockets, so
+        // exporting `SQUEEZY_ASK_SOCKET` there would advertise an escalation
+        // path that is guaranteed to fail with a confusing `EPERM`.
+        let ask_server = if let Some(approver) =
+            shell_ask_approver.filter(|_| sandbox_plan.exports_ask_socket())
+        {
             match ShellAskServer::start(
                 &self.root,
                 &call.call_id,
