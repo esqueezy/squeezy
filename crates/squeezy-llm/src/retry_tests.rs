@@ -13,11 +13,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     JITTER_FRACTION, RetryPolicy, apply_jitter, backoff, idle_timeout, is_terminal_quota_error,
-    jitter_sample, parse_retry_after, send_with_auth_retry, send_with_retry, skip_delta_prefix,
+    jitter_sample, parse_retry_after, send_with_auth_retry, send_with_retry, split_delta_prefix,
     with_stream_retry,
 };
 use crate::credentials::{ApiKeyFuture, ApiKeySource};
-use crate::{LlmEvent, LlmStream};
+use crate::{LlmEvent, LlmStream, LlmToolCall};
 
 #[test]
 fn provider_requests_policy_inherits_transport_max_retries() {
@@ -99,20 +99,26 @@ fn full_event_sequence() -> Vec<LlmEvent> {
 }
 
 #[test]
-fn skip_delta_prefix_keeps_no_skip_path_allocation_free_for_callers() {
-    let (seen, forwarded) = skip_delta_prefix("hello".to_string(), 0);
-    assert_eq!(seen, 5);
-    assert_eq!(forwarded.as_deref(), Some("hello"));
+fn split_delta_prefix_forwards_whole_delta_when_nothing_to_skip() {
+    let (consumed, forwarded) = split_delta_prefix("hello", 0);
+    assert_eq!(consumed, 0);
+    assert_eq!(forwarded, Some("hello"));
 }
 
 #[test]
-fn skip_delta_prefix_splits_on_char_boundary() {
-    let (seen, forwarded) = skip_delta_prefix("héllo".to_string(), 1);
-    assert_eq!(seen, 5);
-    assert_eq!(forwarded.as_deref(), Some("éllo"));
+fn split_delta_prefix_splits_on_char_boundary() {
+    let (consumed, forwarded) = split_delta_prefix("héllo", 1);
+    assert_eq!(consumed, 1);
+    assert_eq!(forwarded, Some("éllo"));
 
-    let (seen, forwarded) = skip_delta_prefix("héllo".to_string(), 5);
-    assert_eq!(seen, 5);
+    let (consumed, forwarded) = split_delta_prefix("héllo", 5);
+    assert_eq!(consumed, 5);
+    assert!(forwarded.is_none());
+
+    // Skipping past the end reports only the chars actually present so the
+    // caller can tell the regenerated delta was shorter than the prefix.
+    let (consumed, forwarded) = split_delta_prefix("hi", 5);
+    assert_eq!(consumed, 2);
     assert!(forwarded.is_none());
 }
 
@@ -483,6 +489,139 @@ async fn tool_call_delta_trips_skip_accounting_gate() {
     });
 
     let _ = stream.collect::<Vec<_>>().await;
+}
+
+fn tool_call(call_id: &str) -> LlmToolCall {
+    LlmToolCall {
+        call_id: call_id.to_string(),
+        name: "do_thing".to_string(),
+        arguments: serde_json::json!({}),
+    }
+}
+
+#[tokio::test]
+async fn mock_transport_surfaces_error_when_reconnect_diverges_from_emitted_prefix() {
+    // Attempt 1 streams a long text prefix and tool call `A`, then drops.
+    // Attempt 2 is an independent sample: shorter text and a different tool
+    // call `B`. The count/positional skip would silently splice attempt 1's
+    // prefix + `A` onto attempt 2's `Completed` (a phantom tool call the final
+    // generation never asked for). The harness must instead surface a stream
+    // error rather than corrupt the turn.
+    let policy = RetryPolicy {
+        max_retries: 2,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let cancel = CancellationToken::new();
+    let attempts = Arc::new(Mutex::new(0u32));
+    let factory_attempts = attempts.clone();
+
+    let stream = with_stream_retry("mock", policy, cancel, move || {
+        let mut guard = factory_attempts.lock().expect("lock");
+        *guard += 1;
+        let attempt = *guard;
+        drop(guard);
+        if attempt == 1 {
+            mock_stream_attempt(
+                vec![
+                    LlmEvent::Started,
+                    LlmEvent::TextDelta("Let me look that up for you ".to_string()),
+                    LlmEvent::ToolCall(tool_call("call_A")),
+                ],
+                3, // drop after the tool call, before any Completed
+            )
+        } else {
+            mock_full_stream(vec![
+                LlmEvent::Started,
+                LlmEvent::TextDelta("Sure!".to_string()),
+                LlmEvent::ToolCall(tool_call("call_B")),
+                LlmEvent::completed(Some("resp_2".to_string()), CostSnapshot::default()),
+            ])
+        }
+    });
+
+    let collected = stream.collect::<Vec<_>>().await;
+
+    // The divergence must be reported as an error, not silently swallowed.
+    let err = collected
+        .last()
+        .expect("at least one yielded result")
+        .as_ref()
+        .expect_err("a diverging reconnect must surface as a stream error");
+    assert!(
+        matches!(err, SqueezyError::ProviderStream(_)),
+        "divergence must be a ProviderStream error, saw {err:?}",
+    );
+
+    // The corrupted turn must never reach the consumer: no Completed, and the
+    // mismatched attempt-2 tool call `call_B` must not be spliced behind the
+    // already-emitted `call_A`.
+    let yielded: Vec<&LlmEvent> = collected.iter().filter_map(|r| r.as_ref().ok()).collect();
+    assert!(
+        !yielded
+            .iter()
+            .any(|event| matches!(event, LlmEvent::Completed { .. })),
+        "a spliced Completed must not be forwarded",
+    );
+    assert!(
+        !yielded.iter().any(|event| matches!(
+            event,
+            LlmEvent::ToolCall(call) if call.call_id == "call_B"
+        )),
+        "the diverging tool call must not be spliced behind the emitted prefix",
+    );
+}
+
+#[tokio::test]
+async fn mock_transport_surfaces_error_when_reconnect_text_is_shorter() {
+    // Attempt 1 emits a longer text prefix than attempt 2 regenerates. The
+    // positional skip would discard all of attempt 2's text and glue attempt
+    // 1's truncated fragment to attempt 2's Completed. Detect the truncation
+    // and surface it instead.
+    let policy = RetryPolicy {
+        max_retries: 2,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let cancel = CancellationToken::new();
+    let attempts = Arc::new(Mutex::new(0u32));
+    let factory_attempts = attempts.clone();
+
+    let stream = with_stream_retry("mock", policy, cancel, move || {
+        let mut guard = factory_attempts.lock().expect("lock");
+        *guard += 1;
+        let attempt = *guard;
+        drop(guard);
+        if attempt == 1 {
+            mock_stream_attempt(
+                vec![
+                    LlmEvent::Started,
+                    LlmEvent::TextDelta("a fairly long first answer".to_string()),
+                ],
+                2,
+            )
+        } else {
+            mock_full_stream(vec![
+                LlmEvent::Started,
+                LlmEvent::TextDelta("short".to_string()),
+                LlmEvent::completed(Some("resp_2".to_string()), CostSnapshot::default()),
+            ])
+        }
+    });
+
+    let collected = stream.collect::<Vec<_>>().await;
+    let err = collected
+        .last()
+        .expect("at least one yielded result")
+        .as_ref()
+        .expect_err("a shorter regenerated text must surface as a stream error");
+    assert!(matches!(err, SqueezyError::ProviderStream(_)));
 }
 
 #[test]
