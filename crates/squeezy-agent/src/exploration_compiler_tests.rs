@@ -323,16 +323,33 @@ fn file_named_prompt_suppresses_speculative_planner() {
     // returns None instead of a plan so the planner doesn't burn tool
     // rounds + tokens on results the model never branches on.
     //
-    // Use a hierarchy-intent prompt so the inner planner would otherwise
-    // return Some(Hierarchy); the gate is what suppresses it. Avoid
-    // route/repo-map keywords ("flow", "reach", "architecture") so the
-    // exempt branches don't accidentally win.
-    let prompt = "Find every subclass of MyTrait declared in \
-        src/lib.rs and src/main.rs";
+    // Use a method-listing prompt so the inner planner would otherwise
+    // return Some(MethodListing); the gate is what suppresses it.
+    // Avoid hierarchy keywords (the exempt branch would win) and
+    // route/repo-map keywords (their bare tokens would, too).
+    let prompt = "list methods on Widget declared in src/lib.rs and src/main.rs";
     assert!(
         compile_exploration_plan(prompt).is_none(),
         "≥2 file paths should suppress speculative planner",
     );
+}
+
+#[test]
+fn hierarchy_intent_bypasses_file_path_gate() {
+    // Hierarchy queries fire `hierarchy(<base>)` upfront — the highest
+    // value preflight squeezy has, because the alternative is the
+    // model grepping across a whole folder subtree. The dart Flutter
+    // benchmark mentioned `binding.dart` twice in slightly different
+    // forms, the path counter saw two distinct file mentions, the gate
+    // suppressed the planner, and recall floated 50–94 % across runs.
+    // Hierarchy keywords ("subclass", "implementors", "that mixes in",
+    // …) are tight enough that we can trust the intent and let the
+    // graph call fly even with a positive path count.
+    let prompt = "find every subclass of WidgetsBindingObserver in \
+        packages/flutter/lib/src/widgets/binding.dart and the rest of \
+        packages/flutter/lib/src/material/foo.dart";
+    let plan = compile_exploration_plan(prompt).expect("hierarchy plan");
+    assert_eq!(plan.intent, ExplorationIntent::Hierarchy);
 }
 
 #[test]

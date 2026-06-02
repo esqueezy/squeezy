@@ -85,15 +85,27 @@ impl ExplorationTurnState {
 
 pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
     let plan = compile_exploration_plan_inner(input)?;
+    // Hierarchy intent is exempt from the file-path gate below: it only
+    // matches on tight subclass/implementors/extends keywords, so a
+    // hierarchy plan is exactly the case where firing `hierarchy(<base>)`
+    // upfront is high-value — the model would otherwise grep across a
+    // whole folder subtree (the dart Flutter benchmark walked 1.5 GB
+    // looking for `WidgetsBindingObserver` mixers). The bare-token
+    // false-positives that motivated removing RepoMap/RouteDiscovery
+    // exemptions do not apply here: "subclass", "that mixes in", and
+    // friends are intent-specific phrases.
+    if plan.intent == ExplorationIntent::Hierarchy {
+        return Some(plan);
+    }
     // File-named tasks (prompt mentions ≥2 explicit source file paths)
-    // are a poor fit for speculative graph plumbing: the model can read
-    // the named files directly. The earlier carve-out for RepoMap and
-    // RouteDiscovery turned out to be a foot-gun — RouteDiscovery
-    // matches anywhere "route" appears as a substring, so the swift
-    // benchmark's `RoutesBuilder` filename was triggering a 1k-token
-    // speculative repo_map + downstream_flow round on every run. If the
-    // user has already bounded the scope by naming the files, treat
-    // that as the source of truth regardless of which intent matched.
+    // are a poor fit for speculative graph plumbing on other intents:
+    // the model can read the named files directly. The earlier carve-out
+    // for RepoMap and RouteDiscovery turned out to be a foot-gun —
+    // RouteDiscovery matches anywhere "route" appears as a substring,
+    // so the swift benchmark's `RoutesBuilder` filename was triggering
+    // a 1k-token speculative repo_map + downstream_flow round on every
+    // run. Outside Hierarchy, if the user has already bounded the scope
+    // by naming the files, treat that as the source of truth.
     if explicit_file_path_count(input) >= 2 {
         return None;
     }
