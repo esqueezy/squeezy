@@ -89,8 +89,9 @@ impl SqueezyStore {
         let initial = open_database(&path)?;
         // Three cases:
         //   * On-disk schema already at target → reuse the open handle.
-        //   * On-disk schema at an unknown version → back up the file and
-        //     fall through to bootstrap, which reinitialises from scratch.
+        //   * On-disk schema at any other version (older or newer) → back up
+        //     the file, warn so the reset is observable, and fall through to
+        //     bootstrap, which reinitialises from scratch.
         //   * No schema stamped yet → bootstrap to the target version.
         // For the default cache layout we delegate bootstrap to the
         // centralised [`migrations::run_migrations`] orchestrator so new
@@ -100,10 +101,17 @@ impl SqueezyStore {
         // state path.
         let database = match current_schema_version(&initial)? {
             Some(SCHEMA_VERSION) => initial,
-            Some(old_version) => {
+            Some(on_disk_version) => {
                 drop(initial);
-                let backup = backup_path(&path, old_version);
+                let backup = backup_path(&path, on_disk_version);
                 fs::rename(&path, &backup)?;
+                tracing::warn!(
+                    target: "squeezy::store",
+                    on_disk_version,
+                    schema_version = SCHEMA_VERSION,
+                    backup = %backup.display(),
+                    "state.redb schema mismatch; existing store backed up and reinitialised",
+                );
                 bootstrap_store(workspace_root, cache_root)?;
                 open_database(&path)?
             }
@@ -822,8 +830,8 @@ pub(crate) fn current_schema_version(database: &Database) -> Result<Option<u64>>
     read_table_json(&table, "schema_version")
 }
 
-fn backup_path(path: &Path, old_version: u64) -> PathBuf {
-    let suffix = format!("schema-{old_version}-{}.redb.bak", unix_millis());
+fn backup_path(path: &Path, on_disk_version: u64) -> PathBuf {
+    let suffix = format!("schema-{on_disk_version}-{}.redb.bak", unix_millis());
     path.with_file_name(suffix)
 }
 
