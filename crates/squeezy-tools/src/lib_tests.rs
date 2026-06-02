@@ -4916,6 +4916,57 @@ async fn write_file_changed_content_marks_noop_false_and_writes() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn write_file_replaces_atomically_and_preserves_mode() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // A replace must not truncate-in-place: write_file routes through a
+    // sibling tempfile + rename so a crash leaves the original intact. The
+    // observable signatures are that the file's mode survives the edit and
+    // that the rename swaps in a fresh inode (an in-place `fs::write` would
+    // keep the same inode and could leave a half-written file on crash).
+    let root = temp_workspace("write_file_atomic_mode");
+    let target = root.join("script.sh");
+    fs::write(&target, "before").expect("write sample");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let ino_before = fs::metadata(&target).unwrap().ino();
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "atomic-write".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "script.sh",
+                    "content": "after",
+                    "expected_sha256": sha256_hex(b"before"),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-atomic".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "after");
+
+    let meta = fs::metadata(&target).unwrap();
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o755,
+        "replace must preserve the original file mode"
+    );
+    assert_ne!(
+        ino_before,
+        meta.ino(),
+        "atomic replace must swap a fresh inode in via rename, not truncate in place"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn shell_created_file_is_checkpointed_and_deleted_on_undo() {
     let root = temp_workspace("checkpoint_shell_undo");

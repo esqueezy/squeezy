@@ -3898,7 +3898,7 @@ impl ToolRegistry {
         {
             return tool_error(call, err);
         }
-        if let Err(err) = fs::write(&path, args.content.as_bytes()) {
+        if let Err(err) = write_atomic(&path, args.content.as_bytes()) {
             return tool_error(call, err);
         }
         self.invalidate_diff_cache();
@@ -4068,7 +4068,7 @@ impl ToolRegistry {
         if buf.last() != Some(&b'\n') {
             buf.push(b'\n');
         }
-        if let Err(err) = fs::write(&path, &buf) {
+        if let Err(err) = write_atomic(&path, &buf) {
             return tool_error(call, err);
         }
         self.invalidate_diff_cache();
@@ -5205,7 +5205,7 @@ impl StagedOp {
                     written.insert(*file_index);
                     return Ok(());
                 }
-                fs::write(&state.path, state.current.as_bytes())?;
+                write_atomic(&state.path, state.current.as_bytes())?;
                 written.insert(*file_index);
                 Ok(())
             }
@@ -5215,7 +5215,7 @@ impl StagedOp {
                 if let Some(parent) = abs_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(abs_path, contents.as_bytes())
+                write_atomic(abs_path, contents.as_bytes())
             }
             StagedOp::DeleteFile { abs_path, .. } => fs::remove_file(abs_path),
             StagedOp::MoveFile {
@@ -5227,7 +5227,7 @@ impl StagedOp {
                 if let Some(parent) = abs_to.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(abs_to, after_contents.as_bytes())?;
+                write_atomic(abs_to, after_contents.as_bytes())?;
                 fs::remove_file(abs_from)?;
                 Ok(())
             }
@@ -5688,6 +5688,64 @@ pub(crate) fn sha256_file(path: &Path) -> std::result::Result<String, std::io::E
 
 pub(crate) fn file_len(path: &Path) -> std::result::Result<u64, std::io::Error> {
     Ok(fs::metadata(path)?.len())
+}
+
+/// Write `bytes` to `target` crash-safely: the bytes land in a sibling
+/// tempfile that is `sync_all`'d and then `rename`d onto `target`. A crash in
+/// the write window leaves the original file intact instead of truncated, and
+/// the `rename` is atomic on POSIX. When `target` already exists its file mode
+/// is copied onto the tempfile before the rename so a replace preserves
+/// permissions (e.g. the executable bit on a `0o755` script).
+pub(crate) fn write_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let existing_mode = file_mode(target);
+    let tmp = sibling_tempfile(target);
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    #[cfg(unix)]
+    if let Some(mode) = existing_mode {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = existing_mode;
+    if let Err(err) = fs::rename(&tmp, target) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).ok().map(|meta| meta.mode())
+}
+
+#[cfg(not(unix))]
+fn file_mode(_path: &Path) -> Option<u32> {
+    None
+}
+
+fn sibling_tempfile(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tmp".to_string());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let new_name = format!(".{name}.{}.{nanos}.tmp", std::process::id());
+    match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(new_name),
+        _ => PathBuf::from(new_name),
+    }
 }
 
 pub(crate) fn is_secret_path(path: &Path) -> bool {
