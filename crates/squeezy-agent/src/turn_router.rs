@@ -594,17 +594,12 @@ async fn run_judge(
     user_input: &str,
     cancel: CancellationToken,
 ) -> (Option<bool>, CostSnapshot) {
-    // The judge's system prompt is static, so we mark the request for
-    // long-retention provider prompt caching keyed by the provider's
-    // short name. Anthropic plants a `cache_control` block on the
-    // system prompt, OpenAI Responses forwards `prompt_cache_key` +
-    // `prompt_cache_retention: 24h`, Bedrock plants a typed
-    // `CachePoint` block — the routing-judge prefix becomes a cache
-    // hit on every subsequent borderline turn within the retention
-    // window, which is the bulk of the judge's cost.
+    // The judge prompt is intentionally short. It sits below hosted
+    // providers' useful prompt-cache minimums, so leave caching off
+    // instead of surfacing misleading cache telemetry.
     let cache = CacheSpec {
-        key: Some(format!("routing-judge-v1:{provider_name}")),
-        retention: CacheRetention::Long,
+        key: None,
+        retention: CacheRetention::None,
     };
     let request = LlmRequest {
         model: cheap_model.clone(),

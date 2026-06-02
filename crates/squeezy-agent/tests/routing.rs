@@ -224,12 +224,8 @@ async fn llm_judge_cheap_verdict_routes_borderline_prompt() {
         "routed turn also dispatches on the cheap tier"
     );
     assert!(
-        requests[0]
-            .cache
-            .key
-            .as_deref()
-            .is_some_and(|key| key.starts_with("routing-judge-v1:")),
-        "judge request must carry the prompt-cache key"
+        requests[0].cache.key.is_none(),
+        "short judge prompt must not request provider prompt caching"
     );
     assert_eq!(requests[0].max_output_tokens, Some(512));
     assert_eq!(requests[0].reasoning_effort, Some(ReasoningEffort::Low));
