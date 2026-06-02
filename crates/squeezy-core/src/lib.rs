@@ -11989,6 +11989,8 @@ impl TurnMetrics {
 fn merge_cost_snapshot(total: &mut CostSnapshot, next: &CostSnapshot) {
     total.input_tokens = add_optional_u64(total.input_tokens, next.input_tokens);
     total.output_tokens = add_optional_u64(total.output_tokens, next.output_tokens);
+    total.reasoning_output_tokens =
+        add_optional_u64(total.reasoning_output_tokens, next.reasoning_output_tokens);
     total.cached_input_tokens =
         add_optional_u64(total.cached_input_tokens, next.cached_input_tokens);
     total.cache_write_input_tokens = add_optional_u64(

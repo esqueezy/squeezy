@@ -5018,3 +5018,17 @@ fn shell_escape_applies_inside_provider_headers_map() {
         Some("dynamic-value")
     );
 }
+
+#[test]
+fn merge_cost_snapshot_aggregates_reasoning_output_tokens() {
+    let mut total = CostSnapshot {
+        reasoning_output_tokens: Some(7),
+        ..CostSnapshot::default()
+    };
+    let next = CostSnapshot {
+        reasoning_output_tokens: Some(11),
+        ..CostSnapshot::default()
+    };
+    merge_cost_snapshot(&mut total, &next);
+    assert_eq!(total.reasoning_output_tokens, Some(18));
+}
