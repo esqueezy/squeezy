@@ -5,7 +5,7 @@ use squeezy_core::{
 
 use super::{
     CheapReason, EscalationReason, EscalationState, contains_refusal_phrase,
-    estimate_routing_savings,
+    estimate_routing_net_savings, estimate_routing_savings,
 };
 
 /// Test-only wrapper that keeps the previous `Option<&'static str>`
@@ -629,4 +629,6 @@ fn estimate_routing_savings_zero_when_actual_already_above_parent_estimate() {
     cheap_cost.estimated_usd_micros = Some(u64::MAX); // pretend cheap cost is enormous
     let savings = estimate_routing_savings("anthropic", "claude-opus-4-7", &cheap_cost);
     assert_eq!(savings, 0);
+    let net = estimate_routing_net_savings("anthropic", "claude-opus-4-7", &cheap_cost);
+    assert!(net < 0);
 }

@@ -10957,6 +10957,11 @@ pub struct SessionMetrics {
     /// the parent model.
     #[serde(default)]
     pub routing_estimated_savings_usd_micros: u64,
+    /// Cumulative net routing savings. Unlike
+    /// `routing_estimated_savings_usd_micros`, this signed value can
+    /// show tiny net-negative routed turns.
+    #[serde(default)]
+    pub routing_estimated_net_savings_usd_micros: i64,
 }
 
 impl SessionMetrics {
@@ -11002,6 +11007,9 @@ impl SessionMetrics {
         self.routing_estimated_savings_usd_micros = self
             .routing_estimated_savings_usd_micros
             .saturating_add(turn.routing_estimated_savings_usd_micros);
+        self.routing_estimated_net_savings_usd_micros = self
+            .routing_estimated_net_savings_usd_micros
+            .saturating_add(turn.routing_estimated_net_savings_usd_micros);
     }
 }
 
@@ -11062,6 +11070,11 @@ pub struct TurnMetrics {
     /// model registry has no pricing for either side.
     #[serde(default)]
     pub routing_estimated_savings_usd_micros: u64,
+    /// Signed net routing savings for this turn. Positive means the
+    /// cheap path saved money versus the parent estimate; negative
+    /// means judge/cheap overhead exceeded the estimated parent cost.
+    #[serde(default)]
+    pub routing_estimated_net_savings_usd_micros: i64,
 }
 
 impl TurnMetrics {

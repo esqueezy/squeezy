@@ -6544,6 +6544,12 @@ impl TurnRuntime {
         if !metrics.routed_to_cheap {
             return;
         }
+        let net = turn_router::estimate_routing_net_savings(
+            self.provider.name(),
+            &self.config.model,
+            &metrics.routing_cheap_main_provider,
+        );
+        metrics.routing_estimated_net_savings_usd_micros = net;
         metrics.routing_estimated_savings_usd_micros = turn_router::estimate_routing_savings(
             self.provider.name(),
             &self.config.model,

@@ -509,13 +509,24 @@ pub(crate) fn estimate_routing_savings(
     parent_model: &str,
     actual_cheap_cost: &CostSnapshot,
 ) -> u64 {
+    estimate_routing_net_savings(provider, parent_model, actual_cheap_cost)
+        .max(0)
+        .try_into()
+        .unwrap_or(0)
+}
+
+pub(crate) fn estimate_routing_net_savings(
+    provider: &str,
+    parent_model: &str,
+    actual_cheap_cost: &CostSnapshot,
+) -> i64 {
     let Some(parent_estimate) =
         squeezy_llm::estimate_cost(provider, parent_model, actual_cheap_cost)
     else {
         return 0;
     };
     let actual = actual_cheap_cost.estimated_usd_micros.unwrap_or(0);
-    parent_estimate.saturating_sub(actual)
+    (parent_estimate.min(i64::MAX as u64) as i64).saturating_sub(actual.min(i64::MAX as u64) as i64)
 }
 
 // Per-provider judge prompts. All three carry the same routing
