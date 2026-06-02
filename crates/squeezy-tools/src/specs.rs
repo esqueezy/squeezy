@@ -268,7 +268,7 @@ pub(crate) fn read_file_spec() -> ToolSpec {
     ToolSpec {
         name: "read_file".to_string(),
         description: format!(
-            "{preamble} Read a bounded byte slice from one workspace file and return its sha256 receipt. Each line in `content` is prefixed with its 1-based absolute line number followed by a tab (cat -n format); `start_line` carries the same number for the first line so the model never has to count newlines to report a line. Use `read_file` once the graph (or a free-form `grep`) has produced a path and span.",
+            "{preamble} Read a bounded byte slice from one workspace file and return its sha256 receipt. Each line in `content` is prefixed with its 1-based absolute line number followed by a tab (cat -n format); `start_line` carries the same number for the first line so the model never has to count newlines to report a line. Use `read_file` once the graph (or a free-form `grep`) has produced a path and span. When grep has flagged the relevant lines, pass `offset` and `limit` to fetch only that section — reading whole files when you only need one function body burns input tokens for no recall benefit. For symbol-shaped reads where a graph packet already returned a `symbol_id`, `read_slice` with `symbol_id` + `span_kind=body` is strictly cheaper.",
             preamble = graph_first_preamble("read_file"),
         ),
         capability: PermissionCapability::Read,
