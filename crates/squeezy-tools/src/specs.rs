@@ -191,29 +191,18 @@ pub(crate) fn diff_context_spec() -> ToolSpec {
     }
 }
 
-/// Comma-joined list of supported language families, generated from
-/// `squeezy_core::LanguageFamily::all()` so the prose stays in sync when
-/// new families are added.
-fn supported_language_list() -> String {
-    let names: Vec<&'static str> = squeezy_core::LanguageFamily::all()
-        .iter()
-        .map(|family| family.display_name())
-        .collect();
-    match names.as_slice() {
-        [] => String::new(),
-        [only] => only.to_string(),
-        [head @ .., last] => format!("{}, and {}", head.join(", "), last),
-    }
-}
-
 /// Preamble that promotes graph-anchored tools (`decl_search`,
 /// `reference_search`, `symbol_context`) over the lexical fallbacks
-/// (`grep`, `glob`, `read_file`). The language list is built from
-/// `LanguageFamily::all()` at runtime.
+/// (`grep`, `glob`, `read_file`). The list of supported languages used
+/// to live inline here but expanded to ~14 mainstream families; the
+/// per-prompt token overhead outweighed the guidance value once
+/// coverage was effectively universal, so the prose just says
+/// "indexed source files" now. Unsupported file types still resolve
+/// gracefully — graph tools return empty packets and the model falls
+/// back to the lexical tool on its own.
 fn graph_first_preamble(fallback_tool: &str) -> String {
     format!(
-        "Prefer `decl_search`, `reference_search`, or `symbol_context` for bare-name symbol queries in {languages} files — they follow imports and re-exports that regex misses. Use `{fallback_tool}` for literal text or files outside {languages}.",
-        languages = supported_language_list(),
+        "Prefer `decl_search`, `reference_search`, or `symbol_context` for bare-name symbol queries in indexed source files — they follow imports and re-exports that regex misses. Use `{fallback_tool}` for literal text or for file types the graph does not index.",
     )
 }
 
@@ -358,7 +347,7 @@ pub(crate) fn repo_map_spec() -> ToolSpec {
 pub(crate) fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search or count graph-backed declarations by signature/name or filters such as kind, language, path, visibility, and attribute. Use this for broad lists/counts; for a single defining file prefer definition_search. For inheritance queries in C#, Java, Kotlin, Scala, Rust, Swift, Ruby, PHP, or Dart pass `attribute=\"base:<TypeName>\"`; do not embed `base:` in `query`. One decl_search returns the whole matching declaration set at once — strongly prefer it over multiple greps when you're enumerating \"every X that does Y\". Do not call decl_search plus definition_search or symbol_context with the same query in one turn unless the first result is ambiguous.".to_string(),
+        description: "Search or count graph-backed declarations by signature/name or filters such as kind, language, path, visibility, and attribute. Use this for broad lists/counts; for a single defining file prefer definition_search. For inheritance queries in class-based languages pass `attribute=\"base:<TypeName>\"`; do not embed `base:` in `query`. One decl_search returns the whole matching declaration set at once — strongly prefer it over multiple greps when you're enumerating \"every X that does Y\". Do not call decl_search plus definition_search or symbol_context with the same query in one turn unless the first result is ambiguous.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({

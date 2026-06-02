@@ -10439,13 +10439,11 @@ fn grep_spec_promotes_graph_first() {
             "grep_spec must mention `{marker}`; got: {description}"
         );
     }
-    for family in squeezy_core::LanguageFamily::all() {
-        assert!(
-            description.contains(family.display_name()),
-            "grep_spec must name `{}` from LanguageFamily::all(); got: {description}",
-            family.display_name(),
-        );
-    }
+    // Earlier this enumerated every language from `LanguageFamily::all()` in
+    // the description. Coverage grew to ~14 mainstream families and the
+    // per-prompt token cost outweighed the guidance value, so the prose now
+    // says "indexed source files" instead. The golden-file assertion below
+    // is the canonical pin.
     let golden =
         include_str!("../tests/artifacts/tool-spec-descriptions/grep_spec_description.txt").trim();
     assert_eq!(description.trim(), golden);
