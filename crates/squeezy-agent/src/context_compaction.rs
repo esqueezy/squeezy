@@ -140,11 +140,22 @@ pub struct ContextCompactionReport {
 /// danger. Returns the produced compaction report when it fired; `None`
 /// when the feature is disabled, the window isn't configured, or the
 /// threshold hasn't been crossed.
-pub(crate) fn maybe_compact_mid_turn(
+///
+/// Routes through `compact_conversation_with_strategy` so a configured
+/// `ModelAssisted`/`LayeredFallback` strategy applies to the automatic
+/// mid-turn path, not only manual `/compact`. The strategy-aware path
+/// runs the extractive pipeline first and falls back to it on any model
+/// timeout/error/empty output, so the gate's contract is unchanged when
+/// the strategy is `Extractive` or no model is configured.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn maybe_compact_mid_turn(
     conversation: &mut Vec<LlmInputItem>,
     state: &mut ContextCompactionState,
     attachments: &[ContextAttachment],
     store: Option<&SqueezyStore>,
+    provider: &Arc<dyn LlmProvider>,
+    session: Option<&SessionHandle>,
+    redactor: &Redactor,
     config: &AppConfig,
     last_total_tokens: Option<u64>,
 ) -> Option<ContextCompactionReport> {
@@ -163,22 +174,35 @@ pub(crate) fn maybe_compact_mid_turn(
     if observed < threshold {
         return None;
     }
-    compact_conversation(
+    compact_conversation_with_strategy(
         conversation,
         state,
         attachments,
         store,
+        provider,
+        session,
+        redactor,
         config,
         ContextCompactionTrigger::Auto,
         true,
     )
+    .await
 }
 
-pub(crate) fn maybe_compact_conversation(
+/// Trigger post-turn auto-compaction when the conversation crosses the
+/// configured item/token budget. Routes through
+/// `compact_conversation_with_strategy` so the configured strategy
+/// applies to the automatic path as well as manual `/compact`; see
+/// `maybe_compact_mid_turn` for the extractive-fallback guarantee.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn maybe_compact_conversation(
     conversation: &mut Vec<LlmInputItem>,
     state: &mut ContextCompactionState,
     attachments: &[ContextAttachment],
     store: Option<&SqueezyStore>,
+    provider: &Arc<dyn LlmProvider>,
+    session: Option<&SessionHandle>,
+    redactor: &Redactor,
     config: &AppConfig,
     trigger: ContextCompactionTrigger,
 ) -> Option<ContextCompactionReport> {
@@ -191,15 +215,19 @@ pub(crate) fn maybe_compact_conversation(
     {
         return None;
     }
-    compact_conversation(
+    compact_conversation_with_strategy(
         conversation,
         state,
         attachments,
         store,
+        provider,
+        session,
+        redactor,
         config,
         trigger,
         false,
     )
+    .await
 }
 
 pub(crate) fn compact_conversation(

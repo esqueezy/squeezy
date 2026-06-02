@@ -5042,9 +5042,14 @@ impl TurnRuntime {
             &mut context_compaction,
             &active_attachments,
             self.store.as_deref(),
+            &self.provider,
+            self.session_log.as_ref(),
+            &self.redactor,
             &self.config,
             ContextCompactionTrigger::Auto,
-        ) {
+        )
+        .await
+        {
             self.dispatch_post_compact(
                 report.record.before.estimated_tokens,
                 report.record.after.estimated_tokens,
@@ -6608,9 +6613,13 @@ impl TurnRuntime {
                 &mut context_compaction,
                 &active_attachments,
                 self.store.as_deref(),
+                &self.provider,
+                self.session_log.as_ref(),
+                &self.redactor,
                 &self.config,
                 full_gate_observed_tokens,
-            );
+            )
+            .await;
             // Either tier mutates `conversation`, so the response-id reuse
             // path must invalidate the cached id and resend the full
             // conversation instead of the per-round outputs.

@@ -4420,70 +4420,101 @@ fn config_with_mid_turn(window: u64, threshold: u8) -> AppConfig {
     }
 }
 
-#[test]
-fn mid_turn_compaction_skips_when_disabled() {
+/// Empty no-model provider for the mid-turn gate tests. The gate either
+/// bails before reaching the model or runs with the default `Extractive`
+/// strategy, so the provider is never streamed.
+fn gate_test_provider() -> Arc<dyn LlmProvider> {
+    Arc::new(MockProvider::new(Vec::new()))
+}
+
+#[tokio::test]
+async fn mid_turn_compaction_skips_when_disabled() {
     let mut config = config_with_mid_turn(100_000, 80);
     config.context_compaction.enabled_mid_turn = false;
     let mut conversation = mid_turn_test_conversation();
     let mut state = ContextCompactionState::default();
+    let provider = gate_test_provider();
+    let redactor = Redactor::default();
     let report = super::maybe_compact_mid_turn(
         &mut conversation,
         &mut state,
         &[],
         None,
+        &provider,
+        None,
+        &redactor,
         &config,
         Some(90_000),
-    );
+    )
+    .await;
     assert!(report.is_none());
 }
 
-#[test]
-fn mid_turn_compaction_skips_without_window() {
+#[tokio::test]
+async fn mid_turn_compaction_skips_without_window() {
     let mut config = config_with_mid_turn(100_000, 80);
     config.context_compaction.model_context_window = None;
     let mut conversation = mid_turn_test_conversation();
     let mut state = ContextCompactionState::default();
+    let provider = gate_test_provider();
+    let redactor = Redactor::default();
     let report = super::maybe_compact_mid_turn(
         &mut conversation,
         &mut state,
         &[],
         None,
+        &provider,
+        None,
+        &redactor,
         &config,
         Some(90_000),
-    );
+    )
+    .await;
     assert!(report.is_none());
 }
 
-#[test]
-fn mid_turn_compaction_skips_below_threshold() {
+#[tokio::test]
+async fn mid_turn_compaction_skips_below_threshold() {
     let config = config_with_mid_turn(100_000, 80);
     let mut conversation = mid_turn_test_conversation();
     let mut state = ContextCompactionState::default();
+    let provider = gate_test_provider();
+    let redactor = Redactor::default();
     let report = super::maybe_compact_mid_turn(
         &mut conversation,
         &mut state,
         &[],
         None,
+        &provider,
+        None,
+        &redactor,
         &config,
         Some(50_000),
-    );
+    )
+    .await;
     assert!(report.is_none());
 }
 
-#[test]
-fn mid_turn_compaction_fires_at_threshold() {
+#[tokio::test]
+async fn mid_turn_compaction_fires_at_threshold() {
     let config = config_with_mid_turn(100_000, 80);
     let mut conversation = mid_turn_test_conversation();
     let original_len = conversation.len();
     let mut state = ContextCompactionState::default();
+    let provider = gate_test_provider();
+    let redactor = Redactor::default();
     let report = super::maybe_compact_mid_turn(
         &mut conversation,
         &mut state,
         &[],
         None,
+        &provider,
+        None,
+        &redactor,
         &config,
         Some(80_001),
     )
+    .await
     .expect("mid-turn compaction should fire");
     assert!(matches!(
         report.record.trigger,
@@ -6438,6 +6469,150 @@ async fn compact_with_strategy_falls_back_when_model_output_missing_slots() {
     assert!(
         !report.summary.contains(unstructured),
         "unstructured model output must not be promoted to the final summary"
+    );
+}
+
+#[tokio::test]
+async fn maybe_compact_mid_turn_honors_model_assisted_strategy() {
+    // Regression for #235: the automatic mid-turn path must honor a
+    // configured `ModelAssisted` strategy, not silently emit the
+    // extractive blob the way it did before it routed through
+    // `compact_conversation_with_strategy`.
+    let structured = "## Goal\nbuild a parser\n\n\
+                      ## Progress\n- wrote lexer\n\n\
+                      ## Decisions\n- use tree-sitter\n\n\
+                      ## Next\n- wire grammar tests\n";
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(structured.to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("compaction".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            enabled_mid_turn: true,
+            model_context_window: Some(100_000),
+            threshold_percent: 80,
+            strategy: CompactionStrategy::ModelAssisted,
+            model_assisted_model: Some("test-model".to_string()),
+            model_assisted_timeout_secs: 5,
+            recent_items: 2,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let provider_trait: Arc<dyn LlmProvider> = provider.clone();
+    let redactor = Redactor::default();
+    let report = super::maybe_compact_mid_turn(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &provider_trait,
+        None,
+        &redactor,
+        &config,
+        Some(80_001),
+    )
+    .await
+    .expect("mid-turn compaction should fire over threshold");
+
+    assert_eq!(
+        report.summary.trim(),
+        structured.trim(),
+        "mid-turn summary head must be the model-assisted output, not the extractive blob"
+    );
+    assert_eq!(
+        conversation.first().and_then(|item| match item {
+            LlmInputItem::UserText(text) => Some(text.as_str()),
+            _ => None,
+        }),
+        Some(structured.trim()),
+        "synthetic summary head must carry the model-assisted output"
+    );
+    assert!(
+        !report
+            .summary
+            .contains("Squeezy compacted conversation context"),
+        "model-assisted mid-turn output must replace the extractive summary"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the configured strategy must issue exactly one model-assisted request"
+    );
+}
+
+#[tokio::test]
+async fn maybe_compact_conversation_honors_model_assisted_strategy() {
+    // Regression for #235: the post-turn auto-compaction path must honor a
+    // configured `ModelAssisted` strategy. Before the fix it called the
+    // extractive summarizer directly and ignored `strategy`.
+    let structured = "## Goal\nbuild a parser\n\n\
+                      ## Progress\n- wrote lexer\n\n\
+                      ## Decisions\n- use tree-sitter\n\n\
+                      ## Next\n- wire grammar tests\n";
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(structured.to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("compaction".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            strategy: CompactionStrategy::ModelAssisted,
+            model_assisted_model: Some("test-model".to_string()),
+            model_assisted_timeout_secs: 5,
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let provider_trait: Arc<dyn LlmProvider> = provider.clone();
+    let redactor = Redactor::default();
+    let report = super::maybe_compact_conversation(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &provider_trait,
+        None,
+        &redactor,
+        &config,
+        ContextCompactionTrigger::Auto,
+    )
+    .await
+    .expect("post-turn auto-compaction should fire");
+
+    assert_eq!(
+        report.summary.trim(),
+        structured.trim(),
+        "post-turn summary head must be the model-assisted output, not the extractive blob"
+    );
+    assert!(
+        !report
+            .summary
+            .contains("Squeezy compacted conversation context"),
+        "model-assisted auto output must replace the extractive summary"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the configured strategy must issue exactly one model-assisted request"
     );
 }
 
