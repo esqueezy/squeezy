@@ -2367,7 +2367,7 @@ impl GraphManager {
         // fsync each, which dominates wall-clock cost.
         let mut graph_batch = GraphWriteBatch::new();
         for file_id in &removed_files {
-            self.graph.remove_file(file_id);
+            self.graph.remove_file_data(file_id);
             graph_batch.remove_partition(file_id);
         }
         for file_id in &unsupported_removed_files {
@@ -2405,7 +2405,7 @@ impl GraphManager {
                 }
             }
             self.graph.replace_files(parsed_files);
-        } else if metadata_refresh_needed {
+        } else if metadata_refresh_needed || !removed_files.is_empty() {
             self.graph.rebuild_java_project_facts();
             self.graph.rebuild_dotnet_project_facts();
             self.graph.rebuild_kotlin_project_facts();

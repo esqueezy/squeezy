@@ -1,7 +1,17 @@
 use crate::*;
 
+#[cfg(test)]
+thread_local! {
+    /// Counts `rebuild_semantic_edges` invocations on the current thread so
+    /// tests can assert a refresh re-resolves the whole graph exactly once.
+    pub(crate) static SEMANTIC_REBUILD_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 impl SemanticGraph {
     pub(crate) fn rebuild_semantic_edges(&mut self) {
+        #[cfg(test)]
+        SEMANTIC_REBUILD_COUNT.with(|count| count.set(count.get() + 1));
         self.edges.retain(|edge| {
             edge.kind == EdgeKind::Contains
                 && self.symbols.contains_key(&edge.from)

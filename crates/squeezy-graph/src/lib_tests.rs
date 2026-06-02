@@ -1522,6 +1522,67 @@ fn graph_manager_refresh_replaces_changed_file_only() {
 }
 
 #[test]
+fn graph_manager_refresh_rebuilds_once_for_multiple_removed_files() {
+    let root = temp_root("graph-manager-remove-many");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src").join("keep.rs"), "pub fn keep() {}\n").unwrap();
+    let removed = ["a.rs", "b.rs", "c.rs", "d.rs"];
+    for name in removed {
+        fs::write(
+            root.join("src").join(name),
+            format!("pub fn {} () {{ keep(); }}\n", name.trim_end_matches(".rs")),
+        )
+        .unwrap();
+    }
+
+    let mut manager = GraphManager::open_with_config(
+        &root,
+        RefreshConfig {
+            debounce: Duration::from_millis(0),
+            idle_refresh_interval: Duration::from_millis(0),
+            per_tool_refresh_budget: Duration::from_secs(5),
+        },
+    )
+    .unwrap();
+    for name in removed {
+        assert!(
+            !manager
+                .graph()
+                .find_symbol_by_name(name.trim_end_matches(".rs"))
+                .is_empty()
+        );
+    }
+
+    thread::sleep(Duration::from_millis(2));
+    for name in removed {
+        fs::remove_file(root.join("src").join(name)).unwrap();
+    }
+
+    crate::resolution::SEMANTIC_REBUILD_COUNT.with(|count| count.set(0));
+    let report = manager.refresh_now().unwrap();
+    let rebuilds = crate::resolution::SEMANTIC_REBUILD_COUNT.with(|count| count.get());
+
+    // The whole-graph re-resolution must run once per refresh, not once per
+    // removed file.
+    assert_eq!(
+        rebuilds, 1,
+        "expected a single semantic rebuild per refresh"
+    );
+    assert_eq!(report.removed_files.len(), removed.len());
+    // Final state matches per-file removal: the removed symbols are gone and
+    // the survivor remains.
+    for name in removed {
+        assert!(
+            manager
+                .graph()
+                .find_symbol_by_name(name.trim_end_matches(".rs"))
+                .is_empty()
+        );
+    }
+    assert!(!manager.graph().find_symbol_by_name("keep").is_empty());
+}
+
+#[test]
 fn graph_manager_refresh_converges_for_csharp_changes_and_ignores_unsupported_only() {
     let root = temp_root("graph-manager-csharp-refresh");
     fs::create_dir_all(root.join("src")).unwrap();
