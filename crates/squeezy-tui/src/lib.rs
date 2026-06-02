@@ -1289,6 +1289,20 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             app.task_panel_collapsed = false;
             app.turn_rx = None;
             app.cancel = None;
+            // Subagent records are live state for the session we are leaving:
+            // they are never persisted or rehydrated, so without this reset the
+            // pane keeps the prior session's rows and an active subagent view
+            // would hijack the resumed transcript. Keep `next_synthetic_id`
+            // monotonic across the switch.
+            // Subagent records are live state for the session we are leaving:
+            // they are never persisted or rehydrated, so without this reset the
+            // pane keeps the prior session's rows and an active subagent view
+            // would hijack the resumed transcript. Keep `next_synthetic_id`
+            // monotonic across the switch.
+            app.subagent_pane = SubagentPaneState {
+                next_synthetic_id: app.subagent_pane.next_synthetic_id,
+                ..SubagentPaneState::default()
+            };
             app.status = format!("resumed session {session_id}");
         }
         Err(error) => app.status = format!("resume failed: {error}"),

@@ -11927,6 +11927,61 @@ async fn alt_one_resumes_most_recent_non_active_session() {
 }
 
 #[tokio::test]
+async fn quick_switch_clears_stale_subagent_pane() {
+    // Subagent records belong to the session being left; they are never
+    // persisted or rehydrated. Switching sessions must reset the pane so the
+    // prior session's rows do not linger and an active subagent view does not
+    // hijack the resumed transcript.
+    let root = temp_workspace("quick_switch_subagent");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let store = squeezy_store::SessionStore::open(&config);
+    store
+        .start_session_eager(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .expect("seed peer session");
+
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    // Seed a subagent row in the current session and pin the main view to it.
+    app.note_subagent_started(7, "delegate".to_string(), "Inspect src".to_string());
+    app.subagent_pane.active = ConversationSource::Subagent(7);
+    app.subagent_pane.focused = true;
+    app.subagent_pane.selected = 3;
+    assert!(
+        active_subagent_record(&app).is_some(),
+        "precondition: subagent view is active before the switch",
+    );
+
+    assert!(
+        handle_session_quick_switch(&mut app, &mut agent, 1).await,
+        "Alt+1 should claim the press when a peer session exists",
+    );
+    assert!(
+        app.status.contains("resumed session"),
+        "status should report the resume: {}",
+        app.status,
+    );
+
+    assert!(
+        app.subagent_pane.records.is_empty(),
+        "the prior session's subagent rows must be cleared on switch",
+    );
+    assert_eq!(
+        app.subagent_pane.active,
+        ConversationSource::Main,
+        "active source must fall back to the main conversation",
+    );
+    assert!(!app.subagent_pane.focused, "pane focus must be released");
+    assert_eq!(app.subagent_pane.selected, 0, "pane selection must reset");
+    assert!(
+        active_subagent_record(&app).is_none(),
+        "no stale subagent record may hijack the resumed transcript",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn alt_nine_reports_no_session_when_slot_is_empty() {
     // With only one peer session in the store, Alt+9 has nothing to land
     // on; the handler still claims the keypress (so it doesn't fall
