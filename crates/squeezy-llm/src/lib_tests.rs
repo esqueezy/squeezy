@@ -149,9 +149,9 @@ fn registry_lists_context_limits_for_hosted_defaults() {
     let bedrock = model_info_for("bedrock", squeezy_core::DEFAULT_BEDROCK_MODEL).expect("bedrock");
     assert_eq!(
         squeezy_core::DEFAULT_BEDROCK_MODEL,
-        "anthropic.claude-haiku-4-5-20251001-v1:0"
+        "anthropic.claude-sonnet-4-6"
     );
-    assert_eq!(bedrock.limits.unwrap().context_window_tokens, 200_000);
+    assert_eq!(bedrock.limits.unwrap().context_window_tokens, 1_000_000);
 
     let google = model_info_for("google", squeezy_core::DEFAULT_GOOGLE_MODEL).expect("google");
     assert_eq!(google.limits.unwrap().context_window_tokens, 1_048_576);

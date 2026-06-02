@@ -3516,6 +3516,7 @@ fn small_fast_model_resolves_per_provider_default() {
         small_fast_model_for_provider("bedrock"),
         Some(BEDROCK_SMALL_FAST_MODEL)
     );
+    assert_ne!(DEFAULT_BEDROCK_MODEL, BEDROCK_SMALL_FAST_MODEL);
     assert_eq!(
         small_fast_model_for_provider("azure_openai"),
         Some(AZURE_OPENAI_SMALL_FAST_MODEL)

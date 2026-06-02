@@ -35,7 +35,7 @@ pub const DEFAULT_AZURE_OPENAI_BASE_URL: &str = "";
 pub const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "v1";
 pub const DEFAULT_AZURE_OPENAI_MODEL: &str = DEFAULT_OPENAI_MODEL;
 pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
-pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
+pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-sonnet-4-6";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/api";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
 /// Synthetic model id for the in-process faux provider. The faux
@@ -157,7 +157,7 @@ pub fn resolve_model_alias(provider: &str, alias: &str) -> Option<&'static str> 
         ("openai" | "azure_openai", "best") => Some(DEFAULT_OPENAI_MODEL),
         ("bedrock", "opus" | "best") => Some(DEFAULT_BEDROCK_MODEL),
         ("bedrock", "sonnet") => Some(DEFAULT_BEDROCK_MODEL),
-        ("bedrock", "haiku") => Some(DEFAULT_BEDROCK_MODEL),
+        ("bedrock", "haiku") => Some(BEDROCK_SMALL_FAST_MODEL),
         ("google", "opus" | "best") => Some(DEFAULT_GOOGLE_MODEL),
         ("google", "sonnet") => Some("gemini-2.5-flash"),
         ("google", "haiku") => Some("gemini-2.5-flash-lite"),
