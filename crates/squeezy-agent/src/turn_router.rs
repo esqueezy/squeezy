@@ -309,11 +309,21 @@ fn count_sentences(text: &str) -> usize {
     // bare-comma compound asks as already filtered by COMPOUND_CONNECTORS
     // above so we don't have to teach this function about clause shape.
     let mut sentences = 0usize;
-    let mut iter = trimmed.chars().peekable();
-    while let Some(ch) = iter.next() {
+    let lower = trimmed.to_ascii_lowercase();
+    let mut iter = trimmed.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
         if matches!(ch, '.' | '!' | '?') {
+            let next_is_uppercase = iter
+                .clone()
+                .find(|(_, next)| !next.is_whitespace())
+                .is_some_and(|(_, next)| next.is_ascii_uppercase());
+            if ch == '.' && period_is_abbreviation(&lower, idx) && !next_is_uppercase {
+                continue;
+            }
             match iter.peek() {
-                Some(next) if next.is_whitespace() || next.is_ascii_uppercase() => sentences += 1,
+                Some((_, next)) if next.is_whitespace() || next.is_ascii_uppercase() => {
+                    sentences += 1;
+                }
                 None => sentences += 1,
                 _ => {}
             }
@@ -330,6 +340,17 @@ fn count_sentences(text: &str) -> usize {
         Some('.') | Some('!') | Some('?') => sentences,
         _ => sentences + 1,
     }
+}
+
+fn period_is_abbreviation(lower: &str, period_idx: usize) -> bool {
+    const ABBREVIATIONS: &[&str] = &["e.g.", "i.e.", "etc."];
+    let end = period_idx + 1;
+    ABBREVIATIONS.iter().any(|abbr| {
+        let Some(start) = end.checked_sub(abbr.len()) else {
+            return false;
+        };
+        lower.get(start..end) == Some(*abbr)
+    })
 }
 
 /// True iff `text` contains any low-confidence phrase from the
