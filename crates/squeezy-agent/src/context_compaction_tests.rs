@@ -3,8 +3,9 @@ use squeezy_core::{AppConfig, ContextCompactionState};
 use squeezy_llm::LlmInputItem;
 
 use super::{
-    build_compaction_summary, build_structured_compaction_prompt, estimate_context,
-    is_structured_compaction_summary, strip_media_for_compaction,
+    COMPACTION_DURABLE_LINES_LIMIT, COMPACTION_UNRESOLVED_LINES_LIMIT, build_compaction_summary,
+    build_structured_compaction_prompt, durable_context_lines, estimate_context,
+    is_structured_compaction_summary, strip_media_for_compaction, unresolved_question_lines,
 };
 
 fn function_call(call_id: &str, name: &str, arguments: serde_json::Value) -> LlmInputItem {
@@ -741,5 +742,50 @@ fn estimate_context_counts_content_parts_bytes() {
         "content_parts bytes not billed: with={} without={}",
         with.bytes,
         without.bytes
+    );
+}
+
+#[test]
+fn durable_context_lines_keep_most_recent_when_capped() {
+    // Build more durable items than the cap, each uniquely numbered so the
+    // retained window is unambiguous. The slice is chronological (oldest
+    // first), so the cap must keep the LAST N, not the first N.
+    let total = COMPACTION_DURABLE_LINES_LIMIT + 5;
+    let items: Vec<LlmInputItem> = (0..total)
+        .map(|i| LlmInputItem::UserText(format!("fact {i}")))
+        .collect();
+
+    let lines = durable_context_lines(&items);
+    assert_eq!(lines.len(), COMPACTION_DURABLE_LINES_LIMIT);
+    assert_eq!(
+        lines.first().unwrap(),
+        &format!("- user: fact {}", total - COMPACTION_DURABLE_LINES_LIMIT),
+        "oldest retained line should be the first of the most-recent window"
+    );
+    assert_eq!(
+        lines.last().unwrap(),
+        &format!("- user: fact {}", total - 1),
+        "most recent durable item must survive compaction"
+    );
+}
+
+#[test]
+fn unresolved_question_lines_keep_most_recent_when_capped() {
+    let total = COMPACTION_UNRESOLVED_LINES_LIMIT + 4;
+    let items: Vec<LlmInputItem> = (0..total)
+        .map(|i| LlmInputItem::UserText(format!("question {i}?")))
+        .collect();
+
+    let lines = unresolved_question_lines(&items);
+    assert_eq!(lines.len(), COMPACTION_UNRESOLVED_LINES_LIMIT);
+    assert_eq!(
+        lines.first().unwrap(),
+        &format!("- question {}?", total - COMPACTION_UNRESOLVED_LINES_LIMIT),
+        "oldest retained question should be the first of the most-recent window"
+    );
+    assert_eq!(
+        lines.last().unwrap(),
+        &format!("- question {}?", total - 1),
+        "most recent open question must survive compaction"
     );
 }

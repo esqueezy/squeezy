@@ -1305,7 +1305,7 @@ fn parse_file_lineage_block(summary: &str, tag: &str) -> Vec<String> {
 }
 
 fn durable_context_lines(items: &[LlmInputItem]) -> Vec<String> {
-    items
+    let mut lines = items
         .iter()
         .filter_map(|item| match item {
             LlmInputItem::UserText(text) => {
@@ -1354,12 +1354,20 @@ fn durable_context_lines(items: &[LlmInputItem]) -> Vec<String> {
             // the summary with an opaque placeholder.
             _ => None,
         })
-        .take(COMPACTION_DURABLE_LINES_LIMIT)
-        .collect()
+        .collect::<Vec<_>>();
+    // Keep the most recent matches when the section overflows. `items` is the
+    // dropped slice in chronological order, so dropping the leading overflow
+    // preserves the decisions/tool calls closest to compaction — consistent
+    // with `file_lineage_blocks` and `receipt_summary_lines` recency bias.
+    if lines.len() > COMPACTION_DURABLE_LINES_LIMIT {
+        let excess = lines.len() - COMPACTION_DURABLE_LINES_LIMIT;
+        lines.drain(0..excess);
+    }
+    lines
 }
 
 fn unresolved_question_lines(items: &[LlmInputItem]) -> Vec<String> {
-    items
+    let mut lines = items
         .iter()
         .filter_map(|item| match item {
             LlmInputItem::UserText(text) | LlmInputItem::AssistantText(text) => Some(text),
@@ -1373,8 +1381,14 @@ fn unresolved_question_lines(items: &[LlmInputItem]) -> Vec<String> {
                 compact_text(&collapse_status_text(line), COMPACTION_UNRESOLVED_MAX_CHARS)
             )
         })
-        .take(COMPACTION_UNRESOLVED_LINES_LIMIT)
-        .collect()
+        .collect::<Vec<_>>();
+    // Same recency bias as `durable_context_lines`: keep the open questions
+    // raised closest to compaction rather than the oldest ones.
+    if lines.len() > COMPACTION_UNRESOLVED_LINES_LIMIT {
+        let excess = lines.len() - COMPACTION_UNRESOLVED_LINES_LIMIT;
+        lines.drain(0..excess);
+    }
+    lines
 }
 
 fn receipt_summary_lines(store: Option<&SqueezyStore>) -> Option<Vec<String>> {
