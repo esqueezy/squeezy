@@ -170,6 +170,16 @@ fn heuristic_rejects_compound_then_clauses() {
 }
 
 #[test]
+fn heuristic_does_not_match_compound_connector_inside_words() {
+    let cfg = default_routing_config();
+    assert_eq!(
+        heuristic_slam_dunk("run the command checker", &cfg),
+        Some("run"),
+        "connector words must be token-aware"
+    );
+}
+
+#[test]
 fn heuristic_rejects_ambiguous_scope_targets() {
     let cfg = default_routing_config();
     // "any test" / "any file" markers signal the cheap tier would
