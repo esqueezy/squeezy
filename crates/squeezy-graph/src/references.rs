@@ -1,5 +1,40 @@
 use crate::*;
 
+/// Per-query memoized file reader. The binding pass inspects the bytes
+/// preceding several candidate references, and many candidates share a file.
+/// Reading each file at most once per [`SemanticGraph::references_to_symbol`]
+/// call collapses what was O(references) blocking `read_to_string` calls into
+/// O(distinct files). The cache lives for a single query, so it never serves
+/// stale bytes across queries.
+#[derive(Default)]
+pub(crate) struct SourceCache {
+    files: HashMap<FileId, Option<String>>,
+    reads: usize,
+}
+
+impl SourceCache {
+    /// Return the source text for `file_id`, reading it from disk on first
+    /// access and reusing the cached copy (or cached failure) afterwards.
+    pub(crate) fn source(&mut self, graph: &SemanticGraph, file_id: &FileId) -> Option<&str> {
+        let reads = &mut self.reads;
+        self.files
+            .entry(file_id.clone())
+            .or_insert_with(|| {
+                *reads += 1;
+                let path = &graph.files.get(file_id)?.path;
+                std::fs::read_to_string(path).ok()
+            })
+            .as_deref()
+    }
+
+    /// Number of distinct `read_to_string` attempts made so far. Used by the
+    /// regression test to prove each referenced file is read at most once.
+    #[cfg(test)]
+    pub(crate) fn reads(&self) -> usize {
+        self.reads
+    }
+}
+
 impl SemanticGraph {
     pub(crate) fn edge_hit(&self, edge_index: usize) -> Option<CallEdgeHit> {
         let edge = self.edges.get(edge_index)?.clone();
@@ -92,6 +127,7 @@ impl SemanticGraph {
         &self,
         symbol: &GraphSymbol,
         reference: &ParsedReference,
+        sources: &mut SourceCache,
     ) -> Option<Confidence> {
         if !reference_text_matches_symbol(reference, symbol)
             && !self.reference_alias_matches_symbol(symbol, reference)
@@ -100,16 +136,16 @@ impl SemanticGraph {
             return None;
         }
         if path_starts_with_external_root(&reference.text, self.reference_language(reference))
-            || self.reference_has_external_scope_prefix(reference)
+            || self.reference_has_external_scope_prefix(reference, sources)
         {
             return None;
         }
         if constructor_reference_can_bind_symbol(reference, symbol)
-            && self.reference_has_uppercase_scope_prefix(reference)
+            && self.reference_has_uppercase_scope_prefix(reference, sources)
         {
             return None;
         }
-        if self.reference_is_symbol_declaration(symbol, reference) {
+        if self.reference_is_symbol_declaration(symbol, reference, sources) {
             return None;
         }
         // Workspace-cross-crate qualified reference fallback runs
@@ -145,7 +181,7 @@ impl SemanticGraph {
         {
             return Some(Confidence::ImportResolved);
         }
-        if self.reference_is_impl_method_declaration_for_trait(symbol, reference) {
+        if self.reference_is_impl_method_declaration_for_trait(symbol, reference, sources) {
             return Some(Confidence::Heuristic);
         }
         if self.associated_type_reference_matches_symbol(symbol, reference) {
@@ -1085,6 +1121,7 @@ impl SemanticGraph {
         &self,
         trait_method: &GraphSymbol,
         reference: &ParsedReference,
+        sources: &mut SourceCache,
     ) -> bool {
         let Some(owner) = reference
             .owner_id
@@ -1094,11 +1131,11 @@ impl SemanticGraph {
             return false;
         };
         if !self.impl_method_implements_trait_method(&owner.id, trait_method)
-            || !self.reference_is_symbol_declaration(owner, reference)
+            || !self.reference_is_symbol_declaration(owner, reference, sources)
         {
             return false;
         }
-        !self.symbol_or_ancestors_have_cfg_attribute(owner)
+        !self.symbol_or_ancestors_have_cfg_attribute(owner, sources)
     }
 
     pub(crate) fn associated_type_reference_matches_symbol(
@@ -1190,8 +1227,12 @@ impl SemanticGraph {
             .any(|receiver_path| receiver_path == trait_module_path)
     }
 
-    pub(crate) fn symbol_or_ancestors_have_cfg_attribute(&self, symbol: &GraphSymbol) -> bool {
-        if has_cfg_attribute(symbol) || self.symbol_has_leading_cfg_attribute(symbol) {
+    pub(crate) fn symbol_or_ancestors_have_cfg_attribute(
+        &self,
+        symbol: &GraphSymbol,
+        sources: &mut SourceCache,
+    ) -> bool {
+        if has_cfg_attribute(symbol) || self.symbol_has_leading_cfg_attribute(symbol, sources) {
             return true;
         }
         let mut parent_id = symbol.parent_id.as_ref();
@@ -1199,7 +1240,7 @@ impl SemanticGraph {
             let Some(parent) = self.symbols.get(id) else {
                 break;
             };
-            if has_cfg_attribute(parent) || self.symbol_has_leading_cfg_attribute(parent) {
+            if has_cfg_attribute(parent) || self.symbol_has_leading_cfg_attribute(parent, sources) {
                 return true;
             }
             parent_id = parent.parent_id.as_ref();
@@ -1207,11 +1248,12 @@ impl SemanticGraph {
         false
     }
 
-    pub(crate) fn symbol_has_leading_cfg_attribute(&self, symbol: &GraphSymbol) -> bool {
-        let Some(file) = self.files.get(&symbol.file_id) else {
-            return false;
-        };
-        let Ok(source) = std::fs::read_to_string(&file.path) else {
+    pub(crate) fn symbol_has_leading_cfg_attribute(
+        &self,
+        symbol: &GraphSymbol,
+        sources: &mut SourceCache,
+    ) -> bool {
+        let Some(source) = sources.source(self, &symbol.file_id) else {
             return false;
         };
         let Some(prefix) = source.get(..symbol.span.start_byte as usize) else {
@@ -1257,6 +1299,7 @@ impl SemanticGraph {
         &self,
         symbol: &GraphSymbol,
         reference: &ParsedReference,
+        sources: &mut SourceCache,
     ) -> bool {
         if symbol.file_id != reference.file_id {
             return false;
@@ -1270,10 +1313,7 @@ impl SemanticGraph {
         {
             return false;
         }
-        let Some(file) = self.files.get(&symbol.file_id) else {
-            return false;
-        };
-        let Ok(source) = std::fs::read_to_string(&file.path) else {
+        let Some(source) = sources.source(self, &symbol.file_id) else {
             return false;
         };
         let Some(signature) = source.get(symbol.span.start_byte as usize..signature_end as usize)
@@ -1285,14 +1325,16 @@ impl SemanticGraph {
             .unwrap_or(false)
     }
 
-    pub(crate) fn reference_has_external_scope_prefix(&self, reference: &ParsedReference) -> bool {
+    pub(crate) fn reference_has_external_scope_prefix(
+        &self,
+        reference: &ParsedReference,
+        sources: &mut SourceCache,
+    ) -> bool {
         if reference.text.contains("::") {
             return false;
         }
-        let Some(file) = self.files.get(&reference.file_id) else {
-            return false;
-        };
-        let Ok(source) = std::fs::read_to_string(&file.path) else {
+        let language = self.reference_language(reference);
+        let Some(source) = sources.source(self, &reference.file_id) else {
             return false;
         };
         let Some(prefix) = source.get(..reference.span.start_byte as usize) else {
@@ -1301,18 +1343,18 @@ impl SemanticGraph {
         let Some(scope) = scope_prefix_before(prefix) else {
             return false;
         };
-        !scope.is_empty()
-            && path_starts_with_external_root(scope, self.reference_language(reference))
+        !scope.is_empty() && path_starts_with_external_root(scope, language)
     }
 
-    pub(crate) fn reference_has_uppercase_scope_prefix(&self, reference: &ParsedReference) -> bool {
+    pub(crate) fn reference_has_uppercase_scope_prefix(
+        &self,
+        reference: &ParsedReference,
+        sources: &mut SourceCache,
+    ) -> bool {
         if reference.text.contains("::") {
             return false;
         }
-        let Some(file) = self.files.get(&reference.file_id) else {
-            return false;
-        };
-        let Ok(source) = std::fs::read_to_string(&file.path) else {
+        let Some(source) = sources.source(self, &reference.file_id) else {
             return false;
         };
         let Some(prefix) = source.get(..reference.span.start_byte as usize) else {
@@ -1428,3 +1470,7 @@ fn scope_prefix_before(prefix: &str) -> Option<&str> {
     let scope = prefix[start..].trim_end_matches("::");
     if scope.is_empty() { None } else { Some(scope) }
 }
+
+#[cfg(test)]
+#[path = "references_tests.rs"]
+mod tests;

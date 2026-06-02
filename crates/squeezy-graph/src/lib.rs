@@ -903,6 +903,17 @@ impl SemanticGraph {
     }
 
     pub fn references_to_symbol(&self, symbol_id: &SymbolId) -> Vec<ReferenceHit> {
+        // One source cache per query so the binding pass reads each referenced
+        // file at most once instead of once per candidate reference in it.
+        let mut sources = references::SourceCache::default();
+        self.references_to_symbol_with_cache(symbol_id, &mut sources)
+    }
+
+    pub(crate) fn references_to_symbol_with_cache(
+        &self,
+        symbol_id: &SymbolId,
+        sources: &mut references::SourceCache,
+    ) -> Vec<ReferenceHit> {
         let Some(symbol) = self.symbols.get(symbol_id) else {
             return Vec::new();
         };
@@ -911,7 +922,7 @@ impl SemanticGraph {
             .into_iter()
             .filter_map(|index| self.references.get(index))
             .filter_map(|reference| {
-                self.reference_binding_confidence(symbol, reference)
+                self.reference_binding_confidence(symbol, reference, sources)
                     .map(|confidence| self.reference_hit(reference, confidence))
             })
             .collect::<Vec<_>>();
