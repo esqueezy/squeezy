@@ -657,6 +657,32 @@ pub(crate) fn drain_plan_housekeeping(app: &mut TuiApp) {
     }
 }
 
+/// Drain the in-flight `@`-mention workspace walk. The walk runs in
+/// `spawn_blocking` (kicked off by `refresh_mention_popup`) so the
+/// `ignore`-crate `readdir`/`stat` over up to `MAX_WORKSPACE_FILES`
+/// doesn't gate the composer. When the rebuilt cache lands we install it,
+/// clear the in-flight guard, and re-rank the open popup so the fresh
+/// file list (new untracked files, post-git-op tracked changes) shows on
+/// the same frame.
+pub(crate) fn drain_pending_mention_walk(app: &mut TuiApp) {
+    let Some(mut rx) = app.pending_mention_walk.take() else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(cache) => {
+            app.workspace_file_cache = Some(cache);
+            // Re-rank the active mention against the fresh cache. Cheap
+            // in-memory work; no filesystem walk happens here.
+            input::refresh_mention_popup(app);
+            app.needs_redraw = true;
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+            app.pending_mention_walk = Some(rx);
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+    }
+}
+
 fn edit_recovery_hint(app: &TuiApp) -> &'static str {
     if app.checkpoints_enabled {
         "/diff to inspect changes · /undo to revert this turn"

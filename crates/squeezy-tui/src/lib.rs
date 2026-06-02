@@ -103,7 +103,8 @@ pub mod testing;
 #[cfg(test)]
 pub(crate) use events::apply_mcp_status_update;
 pub(crate) use events::{
-    drain_agent_events, drain_job_events, drain_pending_diff, drain_plan_housekeeping,
+    drain_agent_events, drain_job_events, drain_pending_diff, drain_pending_mention_walk,
+    drain_plan_housekeeping,
 };
 #[cfg(test)]
 pub(crate) use input::set_input;
@@ -788,6 +789,7 @@ async fn run_inner_with_terminal(
             }
         }
         drain_pending_diff(&mut app);
+        drain_pending_mention_walk(&mut app);
 
         // Skip the animation-tick driver while the host terminal is
         // unfocused. Freezing the counter pins the spinner glyph and
@@ -13213,6 +13215,14 @@ pub(crate) struct TuiApp {
     pub(crate) slash_menu_index: usize,
     pub(crate) mention_popup: Option<mention::MentionPopup>,
     pub(crate) workspace_file_cache: Option<mention::WorkspaceFileCache>,
+    /// In-flight `@`-mention workspace walk. The walk lists up to
+    /// `MAX_WORKSPACE_FILES` paths via the `ignore` crate, which is
+    /// tens-to-hundreds of milliseconds of `readdir`/`stat` on a large
+    /// repo. It runs in `spawn_blocking` so the composer stays responsive;
+    /// the rebuilt cache lands here and is drained each frame. `Some`
+    /// doubles as the in-flight guard so a new walk isn't started while
+    /// one is pending.
+    pub(crate) pending_mention_walk: Option<oneshot::Receiver<mention::WorkspaceFileCache>>,
     pub(crate) overlay: Option<overlay::Overlay>,
     /// Per-app generation counter for [`overlay::DialogHandle::open`]. Bumped
     /// on every open so stale handles for replaced dialogs become no-ops.
@@ -13670,6 +13680,7 @@ impl TuiApp {
             slash_menu_index: 0,
             mention_popup: None,
             workspace_file_cache: None,
+            pending_mention_walk: None,
             overlay: None,
             overlay_next_id: 0,
             overlay_active_id: None,

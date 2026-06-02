@@ -1308,6 +1308,44 @@ async fn cancelled_turn_auto_drains_next_queued_prompt() {
 }
 
 #[tokio::test]
+async fn mention_refresh_offloads_walk_and_drain_installs_cache() {
+    let mut app = test_app(SessionMode::Build);
+
+    // Typing an `@`-mention must not synchronously walk the filesystem:
+    // the cache stays empty and a background walk is scheduled instead.
+    input::set_input(&mut app, "@a".to_string());
+    input::refresh_mention_popup(&mut app);
+    assert!(
+        app.workspace_file_cache.is_none(),
+        "refresh must not build the cache inline on the UI thread",
+    );
+    assert!(
+        app.pending_mention_walk.is_some(),
+        "refresh must schedule a background workspace walk",
+    );
+
+    // The drain helper installs the cache delivered over the oneshot and
+    // clears the in-flight guard so a future edit can schedule a new walk.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tx.send(mention::WorkspaceFileCache::from_paths_for_tests(vec![
+        PathBuf::from("alpha.rs"),
+    ]))
+    .expect("send cache");
+    app.pending_mention_walk = Some(rx);
+    drain_pending_mention_walk(&mut app);
+
+    assert!(
+        app.pending_mention_walk.is_none(),
+        "drain must clear the in-flight guard once the walk lands",
+    );
+    let cache = app
+        .workspace_file_cache
+        .as_ref()
+        .expect("drain must install the cache");
+    assert_eq!(cache.files().as_ref(), &vec![PathBuf::from("alpha.rs")]);
+}
+
+#[tokio::test]
 async fn push_warn_emits_single_warn_log_when_no_cancel_card() {
     let mut app = test_app(SessionMode::Build);
     let pushed = app.push_warn("turn cancelled".to_string());
