@@ -2363,3 +2363,91 @@ fn skill_hook_once_self_removes_after_first_run() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[cfg(unix)]
+#[test]
+fn skill_hook_once_retries_after_failed_first_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_workspace("skill_hook_once_retry");
+    let counter = root.join("count");
+    fs::write(&counter, "0").expect("init counter");
+    let marker = root.join("ready");
+    // The hook counts every run, but only succeeds (exit 0) once the
+    // marker file exists; before that it denies the action with exit 1.
+    let script = root.join("hook.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nn=$(cat {0})\necho $((n + 1)) > {0}\n[ -e {1} ]\n",
+            counter.display(),
+            marker.display()
+        ),
+    )
+    .expect("write hook script");
+    let mut perms = fs::metadata(&script).expect("script meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script, perms).expect("chmod hook");
+
+    let spec = SkillHookSpec {
+        command: script.display().to_string(),
+        once: true,
+    };
+    let handler = SkillHookHandler::new(
+        "validator".to_string(),
+        HookEvent::PreToolUse,
+        None,
+        spec,
+        root.clone(),
+    );
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(handler));
+
+    // First dispatch: marker absent, so the hook runs, exits non-zero,
+    // and denies. A failed run must NOT consume the single fire.
+    let first = registry.dispatch(squeezy_hooks::HookPayload::PreToolUse {
+        turn_id: "1".into(),
+        tool_name: "Bash".into(),
+        call_id: "c1".into(),
+    });
+    assert!(
+        first.iter().any(|r| !r.allow),
+        "failed first run should deny"
+    );
+    assert_eq!(
+        fs::read_to_string(&counter).expect("read counter").trim(),
+        "1",
+        "first run should have executed the command once"
+    );
+
+    // Create the marker so the next run would succeed, then re-dispatch:
+    // the hook must run again (not be silently skipped) and now allow.
+    fs::write(&marker, "").expect("write marker");
+    let second = registry.dispatch(squeezy_hooks::HookPayload::PreToolUse {
+        turn_id: "1".into(),
+        tool_name: "Bash".into(),
+        call_id: "c2".into(),
+    });
+    assert!(
+        second.iter().all(|r| r.allow),
+        "successful retry should allow"
+    );
+    assert_eq!(
+        fs::read_to_string(&counter).expect("read counter").trim(),
+        "2",
+        "failed first run must be retried, so the command runs again"
+    );
+
+    // A third dispatch after success must be skipped: the flag is now set.
+    let _ = registry.dispatch(squeezy_hooks::HookPayload::PreToolUse {
+        turn_id: "1".into(),
+        tool_name: "Bash".into(),
+        call_id: "c3".into(),
+    });
+    assert_eq!(
+        fs::read_to_string(&counter).expect("read counter").trim(),
+        "2",
+        "after a successful run the hook self-skips"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
