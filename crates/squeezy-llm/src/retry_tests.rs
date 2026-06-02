@@ -15,6 +15,9 @@ use super::{
     JITTER_FRACTION, RetryPolicy, apply_jitter, backoff, idle_timeout, is_terminal_quota_error,
     jitter_sample, parse_retry_after, send_with_auth_retry, send_with_retry, split_delta_prefix,
     with_stream_retry,
+    JITTER_FRACTION, RetryPolicy, apply_jitter, backoff, capped_backoff, idle_timeout,
+    is_terminal_quota_error, jitter_sample, parse_retry_after, send_with_auth_retry,
+    send_with_retry, skip_delta_prefix, with_stream_retry,
 };
 use crate::credentials::{ApiKeyFuture, ApiKeySource};
 use crate::{LlmEvent, LlmStream, LlmToolCall};
@@ -711,6 +714,33 @@ fn n_retries_produce_n_distinct_delays() {
         "expected {N} distinct retry delays, saw {} ({delays:?})",
         distinct.len(),
     );
+}
+
+#[test]
+fn capped_backoff_never_exceeds_max_retry_delay() {
+    // A small ceiling paired with a large `max_retries` is exactly the
+    // configuration the `max_retry_delay` contract exists to bound: every
+    // inter-retry sleep — including the late attempts whose raw exponential
+    // backoff saturates into hours — must clamp to the policy ceiling, even
+    // after jitter widens the schedule by +JITTER_FRACTION.
+    let policy = RetryPolicy {
+        max_retries: 40,
+        base_delay: Duration::from_millis(200),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_millis(5_000),
+    };
+    for attempt in 0u8..policy.max_retries {
+        for _ in 0..16 {
+            let delay = capped_backoff(policy, attempt);
+            assert!(
+                delay <= policy.max_retry_delay,
+                "attempt {attempt}: capped delay {delay:?} exceeds ceiling {:?}",
+                policy.max_retry_delay,
+            );
+        }
+    }
 }
 
 #[test]

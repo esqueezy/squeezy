@@ -166,14 +166,14 @@ pub async fn send_with_retry(
                 // so a malicious or buggy `Retry-After: 999999` from
                 // the upstream cannot pin the agent for hours.
                 let delay = retry_after
-                    .unwrap_or_else(|| backoff(policy.base_delay, attempt))
-                    .min(policy.max_retry_delay);
+                    .map(|hint| hint.min(policy.max_retry_delay))
+                    .unwrap_or_else(|| capped_backoff(policy, attempt));
                 sleep_or_cancel(cancel, delay).await?;
             }
             Ok(response) => return Ok(response),
             Err(error) if policy.retry_transport && attempt < policy.max_retries => {
                 let _ = error;
-                sleep_or_cancel(cancel, backoff(policy.base_delay, attempt)).await?;
+                sleep_or_cancel(cancel, capped_backoff(policy, attempt)).await?;
             }
             Err(error) => return Err(SqueezyError::ProviderRequest(error.to_string())),
         }
@@ -284,6 +284,15 @@ fn backoff(base: Duration, attempt: u8) -> Duration {
     let factor = 2u32.saturating_pow(u32::from(attempt));
     let scaled = base.saturating_mul(factor);
     apply_jitter(scaled, jitter_sample())
+}
+
+/// Exponential `backoff` clamped to `policy.max_retry_delay` so every
+/// inter-retry sleep honors the documented ceiling. Routing all sleep
+/// sites through this helper keeps a large `max_retries` from parking
+/// the agent for hours on a flaky link, the guarantee `max_retry_delay`
+/// is meant to provide.
+fn capped_backoff(policy: RetryPolicy, attempt: u8) -> Duration {
+    backoff(policy.base_delay, attempt).min(policy.max_retry_delay)
 }
 
 /// Scales `delay` by `(1 + sample * JITTER_FRACTION)` where `sample` is in
@@ -766,7 +775,7 @@ where
                     max = policy.max_retries,
                     "provider stream truncated; reconnecting",
                 );
-                sleep_or_cancel(&cancel, backoff(policy.base_delay, attempt - 1)).await?;
+                sleep_or_cancel(&cancel, capped_backoff(policy, attempt - 1)).await?;
                 continue;
             };
 
@@ -783,7 +792,7 @@ where
                 error = %err,
                 "provider stream error; reconnecting",
             );
-            sleep_or_cancel(&cancel, backoff(policy.base_delay, attempt - 1)).await?;
+            sleep_or_cancel(&cancel, capped_backoff(policy, attempt - 1)).await?;
         }
     };
     Box::pin(stream)
