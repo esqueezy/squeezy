@@ -1079,6 +1079,43 @@ fn resource_updated_notification_evicts_cached_read_within_ttl() {
             .cached_resource_read_for_test("docs", "file:///b.txt")
             .is_some(),
         "an unrelated resource read must stay cached"
+fn resource_read_cache_stays_bounded_and_drops_oldest() {
+    let mut cache: BTreeMap<(String, String), CachedResourceRead> = BTreeMap::new();
+    let overflow = 17usize;
+    let total = RESOURCE_READ_CACHE_CAPACITY + overflow;
+
+    // Insert CAP + N distinct keys, each strictly newer than the last so
+    // `fetched_at` ordering is unambiguous.
+    let base = Instant::now();
+    for i in 0..total {
+        let key = ("srv".to_string(), format!("res://{i}"));
+        insert_resource_read(
+            &mut cache,
+            key,
+            CachedResourceRead {
+                value: json!({ "i": i }),
+                fetched_at: base + Duration::from_millis(i as u64),
+            },
+        );
+        assert!(
+            cache.len() <= RESOURCE_READ_CACHE_CAPACITY,
+            "cache must never exceed capacity (len {} after {} inserts)",
+            cache.len(),
+            i + 1
+        );
+    }
+
+    assert_eq!(cache.len(), RESOURCE_READ_CACHE_CAPACITY);
+    // The oldest `overflow` keys must have been evicted; the newest CAP survive.
+    for i in 0..overflow {
+        assert!(
+            !cache.contains_key(&("srv".to_string(), format!("res://{i}"))),
+            "oldest key res://{i} should have been evicted"
+        );
+    }
+    assert!(
+        cache.contains_key(&("srv".to_string(), format!("res://{}", total - 1))),
+        "newest key must be retained"
     );
 }
 
@@ -1108,4 +1145,25 @@ fn resource_list_changed_notification_evicts_only_that_servers_reads() {
             .is_some(),
         "other servers' cached reads must be untouched"
     );
+fn resource_read_cache_prunes_expired_entries() {
+    let mut cache: BTreeMap<(String, String), CachedResourceRead> = BTreeMap::new();
+    // A long-stale entry whose age exceeds the TTL must be pruned on the next
+    // insert, independent of the capacity cap.
+    cache.insert(
+        ("srv".to_string(), "res://stale".to_string()),
+        CachedResourceRead {
+            value: json!({ "stale": true }),
+            fetched_at: Instant::now() - RESOURCE_READ_CACHE_TTL - Duration::from_secs(1),
+        },
+    );
+    insert_resource_read(
+        &mut cache,
+        ("srv".to_string(), "res://fresh".to_string()),
+        CachedResourceRead {
+            value: json!({ "fresh": true }),
+            fetched_at: Instant::now(),
+        },
+    );
+    assert!(!cache.contains_key(&("srv".to_string(), "res://stale".to_string())));
+    assert!(cache.contains_key(&("srv".to_string(), "res://fresh".to_string())));
 }

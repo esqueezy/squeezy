@@ -67,6 +67,12 @@ const MCP_TOOL_CACHE_SCHEMA_VERSION: u64 = 1;
 const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
 const HASH_SUFFIX_BYTES: usize = 12;
 const RESOURCE_READ_CACHE_TTL: Duration = Duration::from_secs(300);
+/// Cap on retained resource-read cache entries. The registry lives for the
+/// whole session, so without a bound a server (or agent loop) that reads many
+/// distinct URIs would accumulate their full bodies indefinitely. Mirrors the
+/// `MCP_AUDIT_LOG_CAPACITY` defense: prune expired entries, then evict the
+/// oldest, so memory stays bounded by the working set.
+const RESOURCE_READ_CACHE_CAPACITY: usize = 256;
 const MAX_TOOL_SCHEMA_BYTES: usize = 4096;
 
 pub type McpResult<T> = Result<T, McpError>;
@@ -591,7 +597,8 @@ impl McpClientRegistry {
         .await?;
         let result = strip_untrusted_meta(result);
         if let Ok(mut cache) = self.resource_reads.lock() {
-            cache.insert(
+            insert_resource_read(
+                &mut cache,
                 key,
                 CachedResourceRead {
                     value: result.clone(),
@@ -2109,6 +2116,28 @@ fn push_elicitation_audit(
         }
         log.push_back(event);
     }
+}
+
+/// Insert a resource-read entry while keeping the cache bounded. Expired
+/// entries are dropped first (cheap, and keeps the working set roughly
+/// proportional to one TTL window), then — if still at capacity — the oldest
+/// surviving entry by `fetched_at` is evicted so a session that reads many
+/// distinct URIs cannot grow the map without limit.
+fn insert_resource_read(
+    cache: &mut BTreeMap<(String, String), CachedResourceRead>,
+    key: (String, String),
+    entry: CachedResourceRead,
+) {
+    cache.retain(|_, v| v.fetched_at.elapsed() <= RESOURCE_READ_CACHE_TTL);
+    while cache.len() >= RESOURCE_READ_CACHE_CAPACITY
+        && let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, v)| v.fetched_at)
+            .map(|(k, _)| k.clone())
+    {
+        cache.remove(&oldest);
+    }
+    cache.insert(key, entry);
 }
 
 fn elicitation_request_for_ui(
