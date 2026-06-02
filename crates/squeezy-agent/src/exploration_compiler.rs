@@ -511,6 +511,7 @@ fn extract_quoted(input: &str) -> Option<String> {
 }
 
 fn extract_identifier(input: &str) -> Option<String> {
+    let mut type_shaped = None; // 2+ uppercase letters → CamelCase type name
     let mut rust_like = None;
     let mut fallback = None;
     for token in input
@@ -524,13 +525,32 @@ fn extract_identifier(input: &str) -> Option<String> {
         fallback = Some(token);
         if looks_like_rust_symbol(token) {
             rust_like = Some(token);
+            if looks_like_type_name(token) {
+                type_shaped = Some(token);
+            }
         }
     }
     // Prefer tokens that look like Rust identifier paths so prompts like
     // "Who calls Runner::run from main()?" do not pick up `main` as the
-    // symbol just because it appears last. Fall back to the last remaining
-    // token only when nothing identifier-shaped is present.
-    rust_like.or(fallback).map(str::to_string)
+    // symbol just because it appears last. Inside the rust-like bucket,
+    // prefer multi-capital CamelCase type names like
+    // `RequiresMessageQueue` over single-capital English nouns like
+    // `Separate`, which can otherwise win simply because they appear later
+    // in the prompt's output-format instructions.
+    type_shaped.or(rust_like).or(fallback).map(str::to_string)
+}
+
+/// CamelCase-shaped type names — used to prefer `RequiresMessageQueue` over
+/// single-capital tokens like `Separate` when both pass `looks_like_rust_symbol`.
+/// Two or more uppercase letters is enough to distinguish a proper type from
+/// a sentence-initial English noun. Snake-case tokens (have `_`) and
+/// path-shaped tokens (have `::`) already qualify via `looks_like_rust_symbol`
+/// and pass this gate too.
+fn looks_like_type_name(token: &str) -> bool {
+    if token.contains("::") || token.contains('_') {
+        return true;
+    }
+    token.chars().filter(|ch| ch.is_ascii_uppercase()).count() >= 2
 }
 
 fn looks_like_rust_symbol(token: &str) -> bool {

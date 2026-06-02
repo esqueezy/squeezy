@@ -335,6 +335,25 @@ fn file_named_prompt_suppresses_speculative_planner() {
 }
 
 #[test]
+fn multi_cap_type_name_beats_sentence_initial_noun() {
+    // The scala realworld prompt has the actual base trait
+    // `RequiresMessageQueue` mid-prompt and then the noise word
+    // `Separate` near the end ("Output as a compact plain-text list.
+    // Separate classes with a blank line.") — both pass
+    // `looks_like_rust_symbol` (both start with uppercase), but only one
+    // is a real type. Prefer the multi-uppercase CamelCase token so the
+    // planner fires `hierarchy(RequiresMessageQueue)`, not
+    // `hierarchy(Separate)`.
+    let plan = compile_exploration_plan(
+        "find every subclass of RequiresMessageQueue declared in akka-actor. \
+         Output as a list. Separate classes with a blank line.",
+    )
+    .expect("plan");
+    assert_eq!(plan.intent, ExplorationIntent::Hierarchy);
+    assert_eq!(plan.query.as_deref(), Some("RequiresMessageQueue"));
+}
+
+#[test]
 fn hierarchy_intent_bypasses_file_path_gate() {
     // Hierarchy queries fire `hierarchy(<base>)` upfront — the highest
     // value preflight squeezy has, because the alternative is the
