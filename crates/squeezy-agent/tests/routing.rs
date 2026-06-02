@@ -18,7 +18,9 @@ use std::{
 use futures_core::Stream;
 use futures_util::stream;
 use squeezy_agent::{Agent, AgentEvent};
-use squeezy_core::{AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, Result};
+use squeezy_core::{
+    AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, ReasoningEffort, Result,
+};
 use squeezy_llm::{LlmEvent, LlmProvider, LlmRequest, LlmStream};
 use tokio_util::sync::CancellationToken;
 
@@ -212,6 +214,8 @@ async fn llm_judge_cheap_verdict_routes_borderline_prompt() {
             .is_some_and(|key| key.starts_with("routing-judge-v1:")),
         "judge request must carry the prompt-cache key"
     );
+    assert_eq!(requests[0].max_output_tokens, Some(512));
+    assert_eq!(requests[0].reasoning_effort, Some(ReasoningEffort::Low));
 
     let reason = events
         .iter()

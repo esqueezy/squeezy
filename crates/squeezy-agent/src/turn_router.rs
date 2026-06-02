@@ -512,7 +512,7 @@ fn judge_instructions_for(provider_name: &str) -> &'static str {
 }
 
 const JUDGE_TIMEOUT_MS: u64 = 10_000;
-const JUDGE_MAX_OUTPUT_TOKENS: u32 = 80;
+const JUDGE_MAX_OUTPUT_TOKENS: u32 = 512;
 
 async fn run_judge(
     provider: &Arc<dyn LlmProvider>,
