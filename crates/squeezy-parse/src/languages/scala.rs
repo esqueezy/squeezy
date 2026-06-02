@@ -1501,12 +1501,17 @@ fn is_scala_reserved(text: &str) -> bool {
 }
 
 fn dedup_scala_facts(ctx: &mut ExtractContext<'_>) {
-    let mut references: HashSet<(u32, ReferenceKind)> = HashSet::new();
-    ctx.references
-        .retain(|reference| references.insert((reference.span.start_byte, reference.kind)));
-    let mut body_hits: HashSet<(u32, BodyHitKind)> = HashSet::new();
+    let mut references: HashSet<(u32, ReferenceKind, String)> = HashSet::new();
+    ctx.references.retain(|reference| {
+        references.insert((
+            reference.span.start_byte,
+            reference.kind,
+            reference.text.clone(),
+        ))
+    });
+    let mut body_hits: HashSet<(u32, BodyHitKind, String)> = HashSet::new();
     ctx.body_hits
-        .retain(|hit| body_hits.insert((hit.span.start_byte, hit.kind)));
+        .retain(|hit| body_hits.insert((hit.span.start_byte, hit.kind, hit.text.clone())));
 }
 
 fn annotate_companion_objects(ctx: &mut ExtractContext<'_>) {
@@ -1550,3 +1555,7 @@ fn annotate_companion_objects(ctx: &mut ExtractContext<'_>) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "scala_tests.rs"]
+mod tests;
