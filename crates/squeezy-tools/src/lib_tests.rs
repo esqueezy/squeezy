@@ -2731,6 +2731,67 @@ async fn apply_patch_create_and_delete_in_one_call() {
 }
 
 #[tokio::test]
+async fn apply_patch_rejects_search_replace_then_move_on_same_path() {
+    // A `search_replace` plus a `move_file` on the same source in one call is
+    // staged against the original on-disk bytes, so the apply loop would write
+    // the edited source, then move the *un-edited* original to the destination
+    // and delete the source — silently losing the edit while reporting both
+    // ops "applied". The call must be rejected and the file left untouched.
+    let root = temp_workspace("apply_patch_conflict_replace_move");
+    fs::write(root.join("a.rs"), "foo\n").expect("seed a.rs");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_conflict".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [
+                        {
+                            "kind": "search_replace",
+                            "path": "a.rs",
+                            "search": "foo",
+                            "replace": "bar",
+                            "expected_sha256": sha256_hex("foo\n".as_bytes()),
+                        },
+                        {
+                            "kind": "move_file",
+                            "from": "a.rs",
+                            "to": "b.rs",
+                            "expected_sha256": sha256_hex("foo\n".as_bytes()),
+                        }
+                    ]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-conflict".to_string(),
+        )
+        .await;
+
+    assert_eq!(
+        result.status,
+        ToolStatus::Error,
+        "overlapping cross-kind ops must be rejected, not silently clobbered: {:?}",
+        result.content
+    );
+    assert_eq!(result.content["path"], "a.rs");
+    assert_eq!(
+        result.content["conflicting_kinds"],
+        json!(["search_replace", "move_file"])
+    );
+    // Nothing was written: the source survives unchanged and the move
+    // destination was never created.
+    assert_eq!(fs::read_to_string(root.join("a.rs")).unwrap(), "foo\n");
+    assert!(
+        !root.join("b.rs").exists(),
+        "move destination must not exist"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn apply_patch_create_file_rejects_existing_target() {
     let root = temp_workspace("apply_patch_create_existing");
     fs::write(root.join("there.txt"), "stay\n").expect("seed there");

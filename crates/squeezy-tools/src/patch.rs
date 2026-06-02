@@ -23,7 +23,7 @@
 //! neighborhood follows call/reference edges, not directory structure.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs,
     path::Path,
@@ -273,6 +273,51 @@ fn apply_patch_op_path_refs(op: &ApplyPatchOperation) -> (&str, Option<&str>) {
         | ApplyPatchOperation::DeleteFile { path, .. } => (path.as_str(), None),
         ApplyPatchOperation::MoveFile { from, to, .. } => (from.as_str(), Some(to.as_str())),
     }
+}
+
+fn apply_patch_op_kind(op: &ApplyPatchOperation) -> &'static str {
+    match op {
+        ApplyPatchOperation::SearchReplace { .. } => "search_replace",
+        ApplyPatchOperation::CreateFile { .. } => "create_file",
+        ApplyPatchOperation::DeleteFile { .. } => "delete_file",
+        ApplyPatchOperation::MoveFile { .. } => "move_file",
+    }
+}
+
+/// Detect two ops in the same `apply_patch` call that touch the same
+/// workspace-relative path in a way the in-order apply phase would silently
+/// clobber. Each op is staged against the original on-disk content and the
+/// apply loop runs them in order, so e.g. a `search_replace` followed by a
+/// `move_file` on the same source writes the *edited* file, then moves the
+/// *original* bytes and removes the source — losing the edit while reporting
+/// both ops `"applied"`. Repeated `search_replace` ops on one path are the one
+/// safe overlap (their edits accumulate into a single staged file), so they
+/// are exempt; any other multi-touch of a path is rejected up front.
+fn detect_apply_patch_path_conflict(
+    ops: &[ApplyPatchOperation],
+) -> Option<(String, &'static str, &'static str)> {
+    let mut seen: BTreeMap<String, &'static str> = BTreeMap::new();
+    for op in ops {
+        let kind = apply_patch_op_kind(op);
+        let (first, second) = apply_patch_op_path_refs(op);
+        for endpoint in [Some(first), second].into_iter().flatten() {
+            let Some(norm) = normalize_workspace_path_str(endpoint) else {
+                continue;
+            };
+            match seen.get(&norm) {
+                Some(&prior_kind) if prior_kind == "search_replace" && kind == "search_replace" => {
+                    // Repeated search/replace on the same file: edits merge.
+                }
+                Some(&prior_kind) => {
+                    return Some((norm, prior_kind, kind));
+                }
+                None => {
+                    seen.insert(norm, kind);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn append_search_replace_hunk(
@@ -729,6 +774,27 @@ impl ToolRegistry {
             if let Some(second) = second {
                 touched_paths.push(second.to_string());
             }
+        }
+        // Reject batches where two ops of different kinds touch the same path:
+        // each op stages against the original on-disk content, so the in-order
+        // apply phase would silently clobber one with the other (e.g. a
+        // `search_replace` then `move_file` on the same source discards the
+        // edit) while reporting both `"applied"`. Repeated `search_replace`
+        // ops on one path are exempt — their edits accumulate.
+        if let Some((path, first_kind, second_kind)) = detect_apply_patch_path_conflict(&raw_ops) {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({
+                    "error": format!(
+                        "conflicting operations target {path}: {first_kind} and {second_kind} in one apply_patch call would clobber each other; split them into separate calls"
+                    ),
+                    "path": path,
+                    "conflicting_kinds": [first_kind, second_kind],
+                }),
+                ToolCostHint::default(),
+                None,
+            );
         }
         // Jupyter notebooks have JSON cell structure that text search/replace
         // (and full overwrite) will silently corrupt. Redirect the model to
