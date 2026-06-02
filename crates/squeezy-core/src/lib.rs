@@ -55,6 +55,7 @@ pub const AZURE_OPENAI_SMALL_FAST_MODEL: &str = OPENAI_SMALL_FAST_MODEL;
 pub const OPENROUTER_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
 pub const VERCEL_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
 pub const PORTKEY_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
+pub const VERTEX_SMALL_FAST_MODEL: &str = "google/gemini-2.5-flash";
 
 /// Returns the built-in small-fast-model id for `provider`. `provider` is the
 /// canonical short name (`provider_kind`/`LlmProvider::name`). Returns `None`
@@ -71,6 +72,7 @@ pub fn small_fast_model_for_provider(provider: &str) -> Option<&'static str> {
         "openrouter" => Some(OPENROUTER_SMALL_FAST_MODEL),
         "vercel" => Some(VERCEL_SMALL_FAST_MODEL),
         "portkey" => Some(PORTKEY_SMALL_FAST_MODEL),
+        "vertex" => Some(VERTEX_SMALL_FAST_MODEL),
         _ => None,
     }
 }

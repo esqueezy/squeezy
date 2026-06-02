@@ -156,6 +156,13 @@ fn registry_lists_context_limits_for_hosted_defaults() {
     let google = model_info_for("google", squeezy_core::DEFAULT_GOOGLE_MODEL).expect("google");
     assert_eq!(google.limits.unwrap().context_window_tokens, 1_048_576);
 
+    let vertex_flash =
+        model_info_for("vertex", squeezy_core::VERTEX_SMALL_FAST_MODEL).expect("vertex flash");
+    assert_eq!(
+        vertex_flash.limits.unwrap().context_window_tokens,
+        1_048_576
+    );
+
     let ollama = model_info_for("ollama", squeezy_core::DEFAULT_OLLAMA_MODEL).expect("ollama");
     assert!(ollama.limits.is_none());
 }

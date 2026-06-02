@@ -3525,6 +3525,10 @@ fn small_fast_model_resolves_per_provider_default() {
         small_fast_model_for_provider("openrouter"),
         Some(OPENROUTER_SMALL_FAST_MODEL)
     );
+    assert_eq!(
+        small_fast_model_for_provider("vertex"),
+        Some(VERTEX_SMALL_FAST_MODEL)
+    );
     // Ollama serves a single local model; no separate cheap tier.
     assert_eq!(small_fast_model_for_provider("ollama"), None);
     assert_eq!(small_fast_model_for_provider("unknown"), None);
