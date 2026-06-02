@@ -11502,6 +11502,33 @@ fn json_patch_preview_parser_handles_escaped_quotes_in_search() {
 }
 
 #[test]
+fn json_patch_preview_parser_preserves_non_ascii_utf8() {
+    use super::streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
+
+    // A patch whose path/search/replace carry multi-byte UTF-8 must be
+    // surfaced verbatim — `byte as char` would split each sequence into
+    // Latin-1 code points and store mojibake (`café` -> `cafÃ©`).
+    let payload = r#"{"patches":[{"path":"café.rs","search":"naïve","replace":"résumé"}]}"#;
+
+    let mut parser = JsonPatchPreviewParser::new();
+    let events = parser.push_delta(payload);
+
+    let path = events
+        .iter()
+        .find_map(|e| match e {
+            PatchPreviewEvent::Patch { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .expect("patch object should emit a Patch event");
+    assert_eq!(path, "café.rs", "patch path must round-trip non-ASCII");
+
+    let partial = parser.latest_partial();
+    assert_eq!(partial.path.as_deref(), Some("café.rs"));
+    assert_eq!(partial.search.as_deref(), Some("naïve"));
+    assert_eq!(partial.replace.as_deref(), Some("résumé"));
+}
+
+#[test]
 fn streaming_chunks_emit_partial_previews_with_growing_content() {
     use super::streaming_patch::{
         JsonPatchPreviewParser, PatchPartial, PatchPreviewEvent, render_streaming_preview,

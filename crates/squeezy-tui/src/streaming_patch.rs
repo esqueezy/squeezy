@@ -122,8 +122,8 @@ impl JsonPatchPreviewParser {
     /// at structural boundaries.
     pub fn push_delta(&mut self, delta: &str) -> Vec<PatchPreviewEvent> {
         let mut events = Vec::new();
-        for byte in delta.bytes() {
-            self.push_byte(byte, &mut events);
+        for ch in delta.chars() {
+            self.push_char(ch, &mut events);
         }
         events
     }
@@ -157,11 +157,10 @@ impl JsonPatchPreviewParser {
         &self.current_partial
     }
 
-    fn push_byte(&mut self, byte: u8, events: &mut Vec<PatchPreviewEvent>) {
+    fn push_char(&mut self, ch: char, events: &mut Vec<PatchPreviewEvent>) {
         if matches!(self.state, ParserState::Done) {
             return;
         }
-        let ch = byte as char;
         self.buf.push(ch);
         if self.in_string {
             if self.escape {
