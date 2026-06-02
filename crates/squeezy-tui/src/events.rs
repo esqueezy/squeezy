@@ -281,7 +281,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         format!("{agent} subagent capped ({active}/{limit} already running)");
                     app.note_subagent_rejected(
                         agent.clone(),
-                        reason.as_str().to_string(),
+                        reason.as_human().to_string(),
                         limit,
                         active,
                     );

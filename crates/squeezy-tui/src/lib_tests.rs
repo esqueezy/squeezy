@@ -589,6 +589,66 @@ fn rejected_subagent_appears_in_pane_and_is_clearable() {
     assert_eq!(app.subagent_pane.records[0].id, 1);
 }
 
+#[tokio::test]
+async fn rejected_subagent_event_renders_human_reason_not_raw_token() {
+    let mut app = test_app(SessionMode::Build);
+
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::SubagentRejected {
+        turn_id: TurnId::new(1),
+        agent: "delegate".to_string(),
+        reason: squeezy_agent::SubagentRejectionReason::ConcurrencyCap,
+        limit: 3,
+        active: 3,
+    })
+    .await
+    .expect("send rejected");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let rejected = app
+        .subagent_pane
+        .records
+        .iter()
+        .find(|r| matches!(r.lifecycle, SubagentLifecycle::Rejected))
+        .expect("rejected record present");
+    assert!(
+        !rejected.latest.contains("concurrency_cap"),
+        "pane row leaked raw enum token: {}",
+        rejected.latest
+    );
+    assert!(
+        rejected.latest.contains("concurrency cap reached"),
+        "pane row should show human reason: {}",
+        rejected.latest
+    );
+    // The per-subagent transcript line must read the same way, never the
+    // raw token (the machine token survives only in `push_log`).
+    let transcript_text = rejected
+        .transcript
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Log(log) => Some(log.message.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(
+        !transcript_text.contains("concurrency_cap")
+            && transcript_text.contains("concurrency cap reached"),
+        "transcript line should show human reason: {transcript_text}"
+    );
+
+    // The pane row on screen carries the human phrasing, not the token.
+    let output = render_to_string(&app, 120, 18);
+    let pane_row = output
+        .lines()
+        .find(|line| line.contains("delegate #1"))
+        .expect("capped pane row rendered");
+    assert!(!pane_row.contains("concurrency_cap"), "{pane_row}");
+    assert!(pane_row.contains("concurrency cap reached"), "{pane_row}");
+}
+
 #[test]
 fn subagent_row_shows_lifecycle_word_for_accessibility() {
     let mut app = test_app(SessionMode::Build);

@@ -1067,6 +1067,15 @@ impl SubagentRejectionReason {
             Self::ConcurrencyCap => "concurrency_cap",
         }
     }
+
+    /// Human-readable phrasing for the TUI pane row and transcript, as
+    /// opposed to `as_str`'s machine token reserved for logs and
+    /// structured/session-log fields.
+    pub fn as_human(self) -> &'static str {
+        match self {
+            Self::ConcurrencyCap => "concurrency cap reached",
+        }
+    }
 }
 
 impl SubagentRegistry {
