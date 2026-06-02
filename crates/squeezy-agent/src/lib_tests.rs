@@ -22,7 +22,7 @@ use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
     StopReason,
 };
-use squeezy_tools::{ToolCall, ToolStatus, sha256_hex};
+use squeezy_tools::{ToolCall, ToolCostHint, ToolReceipt, ToolStatus, sha256_hex};
 use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
@@ -8513,6 +8513,43 @@ fn large_non_image_attachment_threshold_ignores_images_and_removed_items() {
     assert!(has_large_non_image_attachment(&attachments, 4096));
     assert!(!has_large_non_image_attachment(&attachments, 4097));
     assert!(!has_large_non_image_attachment(&attachments, 0));
+}
+
+#[test]
+fn tool_round_path_collector_counts_distinct_path_like_values() {
+    let calls = vec![ToolCall {
+        call_id: "call-1".to_string(),
+        name: "grep".to_string(),
+        arguments: json!({
+            "paths": ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"],
+        }),
+    }];
+    let result = squeezy_tools::ToolResult {
+        call_id: "call-1".to_string(),
+        tool_name: "grep".to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "matches": [
+                {"path": "src/e.rs"},
+                {"path": "src/f.rs"},
+                {"path": "src/g.rs"},
+                {"path": "src/h.rs"}
+            ]
+        }),
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: String::new(),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    let pending = SeenToolOutputs::default().prepare_results(vec![result]);
+    let mut paths = BTreeSet::new();
+
+    let observed = collect_tool_round_paths(&calls, &pending, 3, &mut paths);
+
+    assert_eq!(observed, 1);
+    assert_eq!(paths.len(), ROUTING_DIVERSITY_DISTINCT_PATHS);
 }
 
 #[test]

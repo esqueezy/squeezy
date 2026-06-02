@@ -5392,6 +5392,8 @@ impl TurnRuntime {
         }
         let mut escalation_state = turn_router::EscalationState::default();
         let mut cheap_provider_error_retry_used = false;
+        let mut routing_diversity_results_seen = 0u64;
+        let mut routing_diversity_paths = BTreeSet::new();
         for round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
                 self.finish_cancelled_turn(
@@ -6305,6 +6307,45 @@ impl TurnRuntime {
                 broker.record_model_result(&pending.result);
             }
             seen_tool_outputs.remember_results(&results);
+            if on_cheap_turn && routing_diversity_results_seen < ROUTING_DIVERSITY_RESULT_WINDOW {
+                let observed = collect_tool_round_paths(
+                    &tool_calls,
+                    &results,
+                    ROUTING_DIVERSITY_RESULT_WINDOW - routing_diversity_results_seen,
+                    &mut routing_diversity_paths,
+                );
+                routing_diversity_results_seen =
+                    routing_diversity_results_seen.saturating_add(observed);
+                if routing_diversity_paths.len() >= ROUTING_DIVERSITY_DISTINCT_PATHS {
+                    let reason = turn_router::EscalationReason::ToolDiversity;
+                    let from_model = current_model.to_string();
+                    current_model = parent_model.clone();
+                    on_cheap_turn = false;
+                    broker.metrics.escalated_to_parent = true;
+                    let sticky_remaining = {
+                        let mut state = self.routing_state.lock().expect("routing state lock");
+                        state
+                            .sticky
+                            .engage(self.config.routing.escalation_sticky_turns);
+                        state.sticky.remaining_turns
+                    };
+                    self.conversation_state
+                        .lock()
+                        .await
+                        .set_routing_sticky_remaining_turns(sticky_remaining);
+                    self.telemetry
+                        .spawn(TelemetryEvent::routing_escalated(reason.as_str()));
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::TurnRouted {
+                            turn_id: self.turn_id,
+                            from: from_model,
+                            to: parent_model_str.clone(),
+                            reason: format!("escalated_{}", reason.as_str()),
+                        })
+                        .await;
+                }
+            }
 
             // Capture each tool result's terminal status alongside its
             // model-visible output so the post-commit `PostTool` hook
@@ -9002,6 +9043,62 @@ fn tool_status_label(status: ToolStatus) -> &'static str {
         ToolStatus::Stale => "stale",
         ToolStatus::Cancelled => "cancelled",
     }
+}
+
+const ROUTING_DIVERSITY_RESULT_WINDOW: u64 = 3;
+const ROUTING_DIVERSITY_DISTINCT_PATHS: usize = 8;
+
+fn collect_tool_round_paths(
+    calls: &[ToolCall],
+    results: &[PendingToolResult],
+    remaining_window: u64,
+    paths: &mut BTreeSet<String>,
+) -> u64 {
+    let mut observed = 0u64;
+    for pending in results {
+        if observed >= remaining_window {
+            break;
+        }
+        if let Some(call) = calls
+            .iter()
+            .find(|call| call.call_id == pending.result.call_id)
+        {
+            collect_path_like_values(&call.arguments, paths);
+        }
+        collect_path_like_values(&pending.result.content, paths);
+        observed += 1;
+    }
+    observed
+}
+
+fn collect_path_like_values(value: &Value, paths: &mut BTreeSet<String>) {
+    match value {
+        Value::String(text) if looks_path_like(text) => {
+            paths.insert(text.to_string());
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_path_like_values(item, paths);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_path_like_values(value, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn looks_path_like(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.len() < 3 || trimmed.contains('\n') {
+        return false;
+    }
+    trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.starts_with('.')
+        || Path::new(trimmed).extension().is_some()
 }
 
 fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> String {

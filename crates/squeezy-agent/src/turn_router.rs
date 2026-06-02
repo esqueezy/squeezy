@@ -51,6 +51,7 @@ pub(crate) enum EscalationReason {
     ErrorThreshold,
     RefusalPhrase,
     ProviderError,
+    ToolDiversity,
 }
 
 impl EscalationReason {
@@ -60,6 +61,7 @@ impl EscalationReason {
             Self::ErrorThreshold => "error_threshold",
             Self::RefusalPhrase => "refusal_phrase",
             Self::ProviderError => "provider_error",
+            Self::ToolDiversity => "tool_diversity",
         }
     }
 }
