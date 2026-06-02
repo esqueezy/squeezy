@@ -1597,6 +1597,7 @@ impl SessionHandle {
                     context_compaction: ContextCompactionState::default(),
                     routing_sticky_remaining_turns: 0,
                     routing_session_disabled: false,
+                    routing_prior_turn_was_hard: false,
                 });
             }
         }
@@ -1619,6 +1620,7 @@ impl SessionHandle {
             context_compaction: ContextCompactionState::default(),
             routing_sticky_remaining_turns: 0,
             routing_session_disabled: false,
+            routing_prior_turn_was_hard: false,
         })
     }
 
@@ -2476,6 +2478,10 @@ pub struct SessionResumeState {
     /// according to config.
     #[serde(default)]
     pub routing_session_disabled: bool,
+    /// Whether the previous persisted turn was hard enough that
+    /// deictic follow-ups should bias back to the parent model.
+    #[serde(default)]
+    pub routing_prior_turn_was_hard: bool,
 }
 
 /// One entry the TUI knows how to push into its transcript on

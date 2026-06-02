@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::Deserialize;
-use squeezy_core::{AppConfig, CostSnapshot, ReasoningEffort, RoutingConfig};
+use squeezy_core::{AppConfig, CostSnapshot, ReasoningEffort, RoutingConfig, SessionMode};
 use squeezy_llm::{CacheRetention, CacheSpec, LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
 use tokio_util::sync::CancellationToken;
 
@@ -397,6 +397,9 @@ pub(crate) struct ClassifyTurnInputs<'a> {
     pub parent_model: &'a str,
     pub config: &'a AppConfig,
     pub has_image_input: bool,
+    pub turn_index: u64,
+    pub prior_turn_was_hard: bool,
+    pub session_mode: SessionMode,
     pub overrides: RoutingOverride,
     pub sticky: bool,
 }
@@ -455,6 +458,14 @@ pub(crate) async fn classify_turn(
 
     if inputs.overrides.force_cheap {
         return ClassifyResult::cheap(CheapReason::UserExplicit, cheap);
+    }
+
+    if inputs.session_mode == SessionMode::Plan {
+        return ClassifyResult::parent();
+    }
+    if inputs.turn_index > 0 && inputs.prior_turn_was_hard && is_deictic_followup(inputs.user_input)
+    {
+        return ClassifyResult::parent();
     }
 
     if inputs.sticky {
@@ -651,6 +662,29 @@ async fn run_judge(
     }
     let verdict = raw.and_then(|text| parse_judge_reply(&text));
     (verdict, cost)
+}
+
+fn is_deictic_followup(user_input: &str) -> bool {
+    let lower = user_input.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    const DEICTIC_MARKERS: &[&str] = &[
+        "same",
+        "keep going",
+        "continue",
+        "now do",
+        "do that",
+        "do the same",
+        "again",
+        "that one",
+        "this one",
+        "like that",
+        "similar",
+    ];
+    DEICTIC_MARKERS
+        .iter()
+        .any(|marker| lower == *marker || lower.starts_with(&format!("{marker} ")))
 }
 
 fn parse_judge_reply(raw: &str) -> Option<bool> {

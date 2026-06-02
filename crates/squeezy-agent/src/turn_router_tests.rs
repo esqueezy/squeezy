@@ -350,6 +350,16 @@ fn parse_judge_reply_rejects_garbage() {
     );
 }
 
+#[test]
+fn deictic_followup_detector_matches_short_followups() {
+    assert!(super::is_deictic_followup(
+        "now do the same for the websocket client"
+    ));
+    assert!(super::is_deictic_followup("keep going"));
+    assert!(super::is_deictic_followup("continue"));
+    assert!(!super::is_deictic_followup("run cargo test"));
+}
+
 // -- Cheap-escalation derived ceiling --------------------------------------
 
 #[test]

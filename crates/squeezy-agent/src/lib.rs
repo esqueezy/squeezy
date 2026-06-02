@@ -196,6 +196,7 @@ struct ConversationState {
     /// Read back into the live router on `Agent::resume`.
     routing_sticky_remaining_turns: u8,
     routing_session_disabled: bool,
+    routing_prior_turn_was_hard: bool,
 }
 
 impl ConversationState {
@@ -216,6 +217,7 @@ impl ConversationState {
             token_calibration: metadata.token_calibration.clone(),
             routing_sticky_remaining_turns: state.routing_sticky_remaining_turns,
             routing_session_disabled: state.routing_session_disabled,
+            routing_prior_turn_was_hard: state.routing_prior_turn_was_hard,
         }
     }
 
@@ -233,6 +235,14 @@ impl ConversationState {
 
     fn set_routing_session_disabled(&mut self, disabled: bool) {
         self.routing_session_disabled = disabled;
+    }
+
+    fn routing_prior_turn_was_hard(&self) -> bool {
+        self.routing_prior_turn_was_hard
+    }
+
+    fn set_routing_prior_turn_was_hard(&mut self, hard: bool) {
+        self.routing_prior_turn_was_hard = hard;
     }
 
     fn to_resume_state(&self) -> SessionResumeState {
@@ -258,6 +268,7 @@ impl ConversationState {
             context_compaction: self.context_compaction.clone(),
             routing_sticky_remaining_turns: self.routing_sticky_remaining_turns,
             routing_session_disabled: self.routing_session_disabled,
+            routing_prior_turn_was_hard: self.routing_prior_turn_was_hard,
         }
     }
 }
@@ -5322,6 +5333,9 @@ impl TurnRuntime {
                 parent_model: &parent_model_str,
                 config: &self.config,
                 has_image_input: !image_items.is_empty(),
+                turn_index: self.turn_id.get(),
+                prior_turn_was_hard: prior_state.routing_prior_turn_was_hard(),
+                session_mode: active_mode,
                 overrides: routing_override,
                 sticky: sticky_active,
             },
@@ -6664,6 +6678,9 @@ impl TurnRuntime {
             state.metrics.merge_turn(metrics);
             state.redactions += metrics.redactions;
             state.token_calibration = token_calibration.clone();
+            state.set_routing_prior_turn_was_hard(
+                metrics.escalated_to_parent || !metrics.routed_to_cheap,
+            );
             if let Some(session) = &self.session_log {
                 let _ = session.write_resume_state(&state.to_resume_state());
                 let calibration_for_metadata = state.token_calibration.clone();

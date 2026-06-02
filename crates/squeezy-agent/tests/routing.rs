@@ -20,7 +20,7 @@ use futures_util::stream;
 use squeezy_agent::{Agent, AgentEvent};
 use squeezy_core::{
     AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, ReasoningEffort, Result,
-    SqueezyError,
+    SessionMode, SqueezyError,
 };
 use squeezy_llm::{LlmEvent, LlmProvider, LlmRequest, LlmStream};
 use tokio_util::sync::CancellationToken;
@@ -195,6 +195,28 @@ async fn cheap_model_override_alias_resolves_before_dispatch() {
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(&*requests[0].model, CHEAP_MODEL);
+}
+
+#[tokio::test]
+async fn plan_mode_turns_stay_on_parent_model() {
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("plan")]));
+    let mut config = config_with_routing();
+    config.session_mode = SessionMode::Plan;
+    let agent = Agent::new(config, provider.clone());
+    let events = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(&*requests[0].model, PARENT_MODEL);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnRouted { .. })),
+        "plan-mode parent bias must not emit cheap-route event"
+    );
 }
 
 #[tokio::test]

@@ -1432,6 +1432,7 @@ fn routing_session_disabled_defaults_false_for_old_resume_state() {
     .expect("old resume json");
 
     assert!(!resume.routing_session_disabled);
+    assert!(!resume.routing_prior_turn_was_hard);
 }
 
 #[test]
