@@ -8462,6 +8462,60 @@ fn attachment_shape_excludes_removed_stored_bytes() {
 }
 
 #[test]
+fn large_non_image_attachment_threshold_ignores_images_and_removed_items() {
+    fn make(
+        id: &str,
+        kind: ContextAttachmentKind,
+        status: ContextAttachmentStatus,
+        bytes: usize,
+    ) -> ContextAttachment {
+        ContextAttachment {
+            id: id.to_string(),
+            source: ContextAttachmentSource::Paste,
+            kind,
+            status,
+            label: id.to_string(),
+            path: None,
+            original_sha256: String::new(),
+            redacted_sha256: None,
+            original_bytes: bytes,
+            stored_bytes: bytes,
+            preview_bytes: 0,
+            redactions: 0,
+            preview: String::new(),
+            truncated: false,
+            image_media_type: None,
+            image_data_base64: None,
+        }
+    }
+
+    let attachments = vec![
+        make(
+            "text",
+            ContextAttachmentKind::Text,
+            ContextAttachmentStatus::Attached,
+            4096,
+        ),
+        make(
+            "image",
+            ContextAttachmentKind::Image,
+            ContextAttachmentStatus::Attached,
+            100_000,
+        ),
+        make(
+            "removed",
+            ContextAttachmentKind::Log,
+            ContextAttachmentStatus::Removed,
+            100_000,
+        ),
+    ];
+
+    assert!(has_large_non_image_attachment(&attachments, 4096));
+    assert!(!has_large_non_image_attachment(&attachments, 4097));
+    assert!(!has_large_non_image_attachment(&attachments, 0));
+}
+
+#[test]
 fn subagent_activity_message_maps_tool_lifecycle_events() {
     let call = ToolCall {
         call_id: "c1".to_string(),

@@ -240,6 +240,7 @@ pub const DEFAULT_ROUTING_AUTO_CHEAP_LLM_JUDGE: bool = true;
 pub const DEFAULT_ROUTING_CHEAP_ESCALATION_ERROR_THRESHOLD: u8 = 2;
 pub const DEFAULT_ROUTING_ESCALATION_STICKY_TURNS: u8 = 3;
 pub const DEFAULT_ROUTING_BYPASS_FOR_IMAGES: bool = true;
+pub const DEFAULT_ROUTING_LARGE_ATTACHMENT_BYPASS_BYTES: u32 = 4_096;
 /// Char-budget gate for the heuristic prefilter. Prompts longer than
 /// this skip the slam-dunk path and fall through to the borderline
 /// judge (or `Parent`). Sized at ~400 tokens of English at 5 chars/tok.
@@ -1329,6 +1330,10 @@ impl AppConfig {
         output.push_str(&format!(
             "bypass_for_images = {}\n",
             self.routing.bypass_for_images
+        ));
+        output.push_str(&format!(
+            "large_attachment_bypass_bytes = {}\n",
+            self.routing.large_attachment_bypass_bytes
         ));
         output.push_str(&format!(
             "heuristic_max_chars = {}\n",
@@ -3294,6 +3299,7 @@ pub struct RoutingConfig {
     pub cheap_escalation_error_threshold: u8,
     pub escalation_sticky_turns: u8,
     pub bypass_for_images: bool,
+    pub large_attachment_bypass_bytes: u32,
     pub heuristic_max_chars: u32,
     pub judge_max_chars: u32,
     /// User-extended heuristic verb whitelist. The built-in whitelist
@@ -3349,6 +3355,11 @@ impl RoutingConfig {
                         .bypass_for_images
                         .unwrap_or(DEFAULT_ROUTING_BYPASS_FOR_IMAGES),
                 ),
+            large_attachment_bypass_bytes: get_var("SQUEEZY_ROUTING_LARGE_ATTACHMENT_BYPASS_BYTES")
+                .as_deref()
+                .and_then(|raw| raw.parse::<u32>().ok())
+                .or(settings.large_attachment_bypass_bytes)
+                .unwrap_or(DEFAULT_ROUTING_LARGE_ATTACHMENT_BYPASS_BYTES),
             heuristic_max_chars: get_var("SQUEEZY_ROUTING_HEURISTIC_MAX_CHARS")
                 .as_deref()
                 .and_then(|raw| raw.parse::<u32>().ok())
@@ -3393,6 +3404,7 @@ pub struct RoutingSettings {
     pub cheap_escalation_error_threshold: Option<u8>,
     pub escalation_sticky_turns: Option<u8>,
     pub bypass_for_images: Option<bool>,
+    pub large_attachment_bypass_bytes: Option<u32>,
     pub heuristic_max_chars: Option<u32>,
     pub judge_max_chars: Option<u32>,
     pub extra_heuristic_verbs: Option<Vec<String>>,
@@ -3409,6 +3421,7 @@ impl RoutingSettings {
                 "cheap_escalation_error_threshold",
                 "escalation_sticky_turns",
                 "bypass_for_images",
+                "large_attachment_bypass_bytes",
                 "heuristic_max_chars",
                 "judge_max_chars",
                 "extra_heuristic_verbs",
@@ -3448,6 +3461,12 @@ impl RoutingSettings {
                 source,
                 &field(path, "bypass_for_images"),
             )?,
+            large_attachment_bypass_bytes: u32_value(
+                table,
+                "large_attachment_bypass_bytes",
+                source,
+                &field(path, "large_attachment_bypass_bytes"),
+            )?,
             heuristic_max_chars: u32_value(
                 table,
                 "heuristic_max_chars",
@@ -3485,6 +3504,10 @@ impl RoutingSettings {
             next.escalation_sticky_turns,
         );
         replace_if_some(&mut self.bypass_for_images, next.bypass_for_images);
+        replace_if_some(
+            &mut self.large_attachment_bypass_bytes,
+            next.large_attachment_bypass_bytes,
+        );
         replace_if_some(&mut self.heuristic_max_chars, next.heuristic_max_chars);
         replace_if_some(&mut self.judge_max_chars, next.judge_max_chars);
         merge_string_lists(&mut self.extra_heuristic_verbs, next.extra_heuristic_verbs);

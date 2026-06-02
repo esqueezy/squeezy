@@ -18,15 +18,16 @@ use futures_util::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use squeezy_core::{
-    AppConfig, ContextAttachment, ContextAttachmentSource, ContextAttachmentStatus,
-    ContextCompactionRecord, ContextCompactionState, ContextCompactionTrigger, ContextEstimate,
-    ContextPin, CostSnapshot, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_OLLAMA_MODEL,
-    PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability, PermissionPolicyMode,
-    PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict,
-    ProviderConfig, Redactor, ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError,
-    StreamRedactor, SubagentConfig, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig,
-    TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
-    context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
+    AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
+    ContextAttachmentStatus, ContextCompactionRecord, ContextCompactionState,
+    ContextCompactionTrigger, ContextEstimate, ContextPin, CostSnapshot,
+    DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_OLLAMA_MODEL, PROJECT_SETTINGS_FILE,
+    PermissionAction, PermissionCapability, PermissionPolicyMode, PermissionRequest,
+    PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict, ProviderConfig,
+    Redactor, ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError, StreamRedactor,
+    SubagentConfig, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig, TranscriptItem, TurnId,
+    TurnMetrics, context_attachment_preview, context_attachment_storage_text,
+    default_settings_path, detect_context_attachment_kind,
 };
 use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
@@ -5333,6 +5334,10 @@ impl TurnRuntime {
                 parent_model: &parent_model_str,
                 config: &self.config,
                 has_image_input: !image_items.is_empty(),
+                has_large_attachment: has_large_non_image_attachment(
+                    &active_attachments,
+                    self.config.routing.large_attachment_bypass_bytes,
+                ),
                 turn_index: self.turn_id.get(),
                 prior_turn_was_hard: prior_state.routing_prior_turn_was_hard(),
                 session_mode: active_mode,
@@ -12665,6 +12670,19 @@ fn image_input_items_for_attachments(attachments: &[ContextAttachment]) -> Vec<L
         });
     }
     items
+}
+
+fn has_large_non_image_attachment(attachments: &[ContextAttachment], threshold: u32) -> bool {
+    if threshold == 0 {
+        return false;
+    }
+    attachments
+        .iter()
+        .filter(|attachment| attachment.is_active())
+        .filter(|attachment| attachment.kind != ContextAttachmentKind::Image)
+        .map(|attachment| attachment.original_bytes as u64)
+        .sum::<u64>()
+        >= u64::from(threshold)
 }
 
 fn format_user_text_with_context(input: &str, attachments: &[ContextAttachment]) -> String {

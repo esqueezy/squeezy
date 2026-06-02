@@ -397,6 +397,7 @@ pub(crate) struct ClassifyTurnInputs<'a> {
     pub parent_model: &'a str,
     pub config: &'a AppConfig,
     pub has_image_input: bool,
+    pub has_large_attachment: bool,
     pub turn_index: u64,
     pub prior_turn_was_hard: bool,
     pub session_mode: SessionMode,
@@ -472,6 +473,9 @@ pub(crate) async fn classify_turn(
         return ClassifyResult::parent();
     }
     if inputs.has_image_input && cfg.bypass_for_images {
+        return ClassifyResult::parent();
+    }
+    if inputs.has_large_attachment {
         return ClassifyResult::parent();
     }
 

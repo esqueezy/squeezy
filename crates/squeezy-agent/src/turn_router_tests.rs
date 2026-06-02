@@ -28,6 +28,7 @@ fn default_routing_config() -> RoutingConfig {
         cheap_escalation_error_threshold: 2,
         escalation_sticky_turns: 3,
         bypass_for_images: true,
+        large_attachment_bypass_bytes: squeezy_core::DEFAULT_ROUTING_LARGE_ATTACHMENT_BYPASS_BYTES,
         heuristic_max_chars: DEFAULT_ROUTING_HEURISTIC_MAX_CHARS,
         judge_max_chars: DEFAULT_ROUTING_JUDGE_MAX_CHARS,
         extra_heuristic_verbs: Vec::new(),
