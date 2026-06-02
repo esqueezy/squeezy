@@ -246,10 +246,11 @@ All other commands still run with network denied. The audit record shows
 `sandbox.network = "allowed_approved"` when network is opened and
 `"denied"` for everything else.
 
-`permissions.mode = "default"` and `permissions.mode = "auto_review"` choose
-this network posture unless `[permissions.shell_sandbox].network` is explicitly
-configured. Set `network = "deny_by_default"` to keep the older fail-closed
-network namespace behavior for every shell command.
+The implicit `permissions.mode = "auto_review"` and explicit
+`permissions.mode = "default"` choose this network posture unless
+`[permissions.shell_sandbox].network` is explicitly configured. Set
+`network = "deny_by_default"` to keep the older fail-closed network namespace
+behavior for every shell command.
 
 `network = "deny_by_default"` keeps the network namespace closed for every
 shell command, including those classified as `network`. The permission policy

@@ -5555,6 +5555,42 @@ fn reasoning_delta_renders_with_dim_italic() {
 }
 
 #[test]
+fn finalized_reasoning_defaults_to_compact_visible_in_compact_transcript() {
+    let mut app = test_app(SessionMode::Build);
+    assert_eq!(app.transcript_default, TranscriptDefault::Compact);
+
+    app.push_reasoning_segment(squeezy_core::ReasoningSnapshot::from_payload(
+        squeezy_core::ReasoningPayload::OpenAi {
+            item_id: "rsn-test".to_string(),
+            summary: vec!["first thought\nsecond thought".to_string()],
+            encrypted_content: None,
+        },
+    ));
+
+    let entry = app.transcript.last().expect("reasoning entry recorded");
+    assert!(
+        entry.collapsed,
+        "finalized reasoning should stay compact by default"
+    );
+    let rendered = lines_to_plain_text(&format_transcript_entry(
+        entry,
+        false,
+        ToolOutputVerbosity::Compact,
+        MessageOutcome::Normal,
+    ));
+    assert!(rendered.contains("▸ reasoning"), "{rendered}");
+    assert!(rendered.contains("first thought"), "{rendered}");
+    assert!(rendered.contains("+1 lines"), "{rendered}");
+    assert!(!rendered.contains("▏ second thought"), "{rendered}");
+
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+    let overlay = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(100)));
+    assert!(overlay.contains("▾ reasoning"), "{overlay}");
+    assert!(overlay.contains("▏ first thought"), "{overlay}");
+    assert!(overlay.contains("▏ second thought"), "{overlay}");
+}
+
+#[test]
 fn approval_prompt_renders_actionable_menu_without_metadata_dump() {
     let request = sample_approval_request();
 

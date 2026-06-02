@@ -30,10 +30,11 @@ Inspect `[permissions]`, `[[permissions.rules]]`, and
 decides whether an operation may start; shell sandboxing is an additional local
 execution boundary for approved shell commands.
 
-With no explicit `[permissions]` overrides, `permissions.mode = "default"`
+With no explicit `[permissions]` overrides, `permissions.mode = "auto_review"`
 allows workspace read/search/edit plus local shell, git, and compiler commands.
-Web, MCP, destructive actions, and outside-workspace file paths still ask. In
-`default` and `auto_review`, the shell sandbox network posture is
+Web, MCP, destructive actions, and outside-workspace file paths still ask, with
+model-backed pre-review for read/search/network/MCP prompts. In `default` and
+`auto_review`, the shell sandbox network posture is
 `network = "allow_when_approved"` unless explicitly configured.
 
 If a shell command fails only under sandboxing, compare the command's file and
