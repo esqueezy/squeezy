@@ -389,3 +389,26 @@ fn user_scope_writes_mode_0600() {
     assert_eq!(mode, 0o600, "user file should be 0o600 (got {:o})", mode);
     let _ = fs::remove_file(&p);
 }
+
+#[cfg(unix)]
+#[test]
+fn repo_scope_writes_mode_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tmp_path("repo-perms");
+    let dir = root.join("projects").join("abc123");
+    let p = dir.join("settings.toml");
+    let edits = vec![SettingsEdit {
+        path: &["model", "api_key"],
+        op: EditOp::SetString("sk-secret".to_string()),
+    }];
+    apply_edits(&SettingsScope::repo(&p), &edits).unwrap();
+    let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "repo file should be 0o600 (got {:o})", mode);
+    let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        dir_mode, 0o700,
+        "repo parent dir should be 0o700 (got {:o})",
+        dir_mode
+    );
+    let _ = fs::remove_dir_all(&root);
+}

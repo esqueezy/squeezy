@@ -17,10 +17,11 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value, value};
 
 use crate::config_schema::SettingsPath;
 
-/// Which file a save targets.
+/// Which file a save targets. Every scope is written `0o600` (and its parent
+/// directory created `0o700`) since any settings file may hold inline secrets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsScopeKind {
-    /// `~/.squeezy/settings.toml`. Mode 0o600 after write.
+    /// `~/.squeezy/settings.toml`.
     User,
     /// `./squeezy.toml` (workspace root).
     Project,
@@ -541,10 +542,11 @@ fn descend_or_create_table<'a>(root: &'a mut Table, parents: &[&str]) -> &'a mut
 }
 
 fn write_atomic(target: &Path, bytes: &[u8], kind: &SettingsScopeKind) -> std::io::Result<()> {
+    let _ = kind;
     if let Some(parent) = target.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent)?;
+        create_dir_all_private(parent)?;
     }
     let tmp = sibling_tempfile(target);
     {
@@ -552,16 +554,33 @@ fn write_atomic(target: &Path, bytes: &[u8], kind: &SettingsScopeKind) -> std::i
         file.write_all(bytes)?;
         file.sync_all()?;
     }
+    // Settings files are per-user config and may hold inline secrets (provider
+    // API keys), so every scope is tightened to owner-only before the rename.
     #[cfg(unix)]
-    if matches!(kind, SettingsScopeKind::User) {
+    {
         use std::os::unix::fs::PermissionsExt;
         let mut perms = fs::metadata(&tmp)?.permissions();
         perms.set_mode(0o600);
         fs::set_permissions(&tmp, perms)?;
     }
-    #[cfg(not(unix))]
-    let _ = kind;
     fs::rename(&tmp, target)
+}
+
+/// Like `fs::create_dir_all` but creates any missing components `0o700` on unix
+/// so the directory chain is not world-traversable.
+fn create_dir_all_private(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
 }
 
 fn sibling_tempfile(target: &Path) -> PathBuf {
