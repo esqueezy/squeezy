@@ -382,6 +382,14 @@ pub struct SemanticGraph {
     children_by_parent: HashMap<SymbolId, Vec<SymbolId>>,
     edges_by_from: HashMap<SymbolId, Vec<usize>>,
     edges_by_to: HashMap<SymbolId, Vec<usize>>,
+    /// Transient from-index restricted to the inheritance edge kinds
+    /// (`UsesTrait` / `Extends` / `Implements`, in that priority order) that
+    /// [`SemanticGraph::walk_inheritance_ancestors`] consults. Built once per
+    /// `rebuild_semantic_edges` right after the type edges are pushed, so the
+    /// PHP ancestor walk does an O(out-degree) lookup per BFS node instead of
+    /// rescanning the whole edge vector. The main `edges_by_from` index is
+    /// stale during the call-resolution phase, hence the dedicated map.
+    ancestor_edges_by_from: HashMap<SymbolId, [Vec<SymbolId>; 3]>,
     /// Indices into [`Self::imports`] grouped by the file that introduced
     /// them. `import_visible_from_symbol` only ever returns true when the
     /// import shares a file with the caller, so resolving an alias or
@@ -480,6 +488,7 @@ impl SemanticGraph {
             children_by_parent: HashMap::new(),
             edges_by_from: HashMap::new(),
             edges_by_to: HashMap::new(),
+            ancestor_edges_by_from: HashMap::new(),
             imports_by_file: HashMap::new(),
             imports_by_alias_target: HashMap::new(),
             wildcard_aliased_imports: Vec::new(),

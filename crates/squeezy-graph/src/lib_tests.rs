@@ -5845,6 +5845,92 @@ class User {
 }
 
 #[test]
+fn graph_resolves_php_trait_and_extends_chain_and_leaves_unresolvable_call_open() {
+    // Guards the ancestor-walk index against the full edge scan it replaced:
+    // a class with both a `use Trait` and an `extends` parent must still walk
+    // trait → extends in priority order, and an unresolvable `$this->` call
+    // must still resolve to nothing. The from-index restricted to the
+    // inheritance edge kinds has to produce the identical resolved edges.
+    let mut parser = LanguageParser::new().unwrap();
+    let trait_file = php_record(
+        "src/App/Loggable.php",
+        "<?php\nnamespace App;\n\ntrait Loggable { public function log(): void {} }\n",
+    );
+    let base_file = php_record(
+        "src/App/BaseService.php",
+        "<?php\nnamespace App;\n\nclass BaseService { public function persist(): void {} }\n",
+    );
+    let class_file = php_record(
+        "src/App/Service.php",
+        r#"<?php
+namespace App;
+
+class Service extends BaseService {
+    use Loggable;
+
+    public function run(): void {
+        $this->log();
+        $this->persist();
+        $this->missing();
+    }
+}
+"#,
+    );
+    let parsed = [trait_file, base_file, class_file.clone()]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let run = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Service::run should be indexed");
+    let log = graph
+        .find_symbol_by_name("log")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Loggable::log should be indexed");
+    let persist = graph
+        .find_symbol_by_name("persist")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("BaseService::persist should be indexed");
+
+    let resolved: Vec<_> = graph
+        .edges()
+        .iter()
+        .filter(|edge| edge.from == run.id && edge.kind == EdgeKind::Calls)
+        .filter_map(|edge| edge.to.clone())
+        .collect();
+    assert!(
+        resolved.contains(&log.id),
+        "$this->log() must resolve to Loggable::log through the UsesTrait ancestor",
+    );
+    assert!(
+        resolved.contains(&persist.id),
+        "$this->persist() must resolve to BaseService::persist through the Extends ancestor",
+    );
+    // The unresolvable `$this->missing()` walks the same ancestors and must
+    // bind to nothing, exactly as the full edge scan did.
+    let missing_resolved = graph.edges().iter().any(|edge| {
+        edge.from == run.id
+            && edge.kind == EdgeKind::Calls
+            && edge.target_text.contains("missing")
+            && edge.to.is_some()
+    });
+    assert!(
+        !missing_resolved,
+        "$this->missing() has no ancestor definition and must stay unresolved",
+    );
+}
+
+#[test]
 fn ruby_top_level_function_emitted_as_function_symbol() {
     let mut parser = LanguageParser::new().unwrap();
     let record = ruby_record(
