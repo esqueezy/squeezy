@@ -419,6 +419,56 @@ async fn force_cheap_override_wins_inside_sticky_window() {
 }
 
 #[tokio::test]
+async fn force_cheap_override_does_not_bypass_plan_mode() {
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("plan")]));
+    let mut config = config_with_routing();
+    config.session_mode = SessionMode::Plan;
+    let agent = Agent::new(config, provider.clone());
+    agent.request_routing_force_cheap();
+    let events = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(&*requests[0].model, PARENT_MODEL);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnRouted { .. })),
+        "plan mode remains a hard parent-model gate"
+    );
+}
+
+#[tokio::test]
+async fn force_cheap_override_does_not_bypass_large_attachment() {
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("parent")]));
+    let mut config = config_with_routing();
+    config.routing.large_attachment_bypass_bytes = 1;
+    let agent = Agent::new(config, provider.clone());
+    agent
+        .attach_pasted_context("large pasted context".to_string())
+        .await
+        .expect("attach context");
+    agent.request_routing_force_cheap();
+    let events = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(&*requests[0].model, PARENT_MODEL);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnRouted { .. })),
+        "large pasted context remains a hard parent-model gate"
+    );
+}
+
+#[tokio::test]
 async fn session_disabled_blocks_implicit_routing() {
     // `set_routing_session_disabled(true)` mirrors the `/router off`
     // command. The slam-dunk prompt is still routed on parent because

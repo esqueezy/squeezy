@@ -465,25 +465,26 @@ pub(crate) async fn classify_turn(
     }
     let cheap: Arc<str> = Arc::from(cheap);
 
-    if inputs.overrides.force_cheap {
-        return ClassifyResult::cheap(CheapReason::UserExplicit, cheap);
-    }
-
     if inputs.session_mode == SessionMode::Plan {
-        return ClassifyResult::parent();
-    }
-    if inputs.turn_index > 0 && inputs.prior_turn_was_hard && is_deictic_followup(inputs.user_input)
-    {
-        return ClassifyResult::parent();
-    }
-
-    if inputs.sticky {
         return ClassifyResult::parent();
     }
     if inputs.has_image_input && cfg.bypass_for_images {
         return ClassifyResult::parent();
     }
     if inputs.has_large_attachment {
+        return ClassifyResult::parent();
+    }
+
+    if inputs.overrides.force_cheap {
+        return ClassifyResult::cheap(CheapReason::UserExplicit, cheap);
+    }
+
+    if inputs.turn_index > 0 && inputs.prior_turn_was_hard && is_deictic_followup(inputs.user_input)
+    {
+        return ClassifyResult::parent();
+    }
+
+    if inputs.sticky {
         return ClassifyResult::parent();
     }
 
