@@ -708,6 +708,11 @@ async fn session_replay_replays_recorded_model_response() {
             log_dir: Some(PathBuf::from(".squeezy/sessions")),
             ..SessionLogConfig::default()
         },
+        context_compaction: ContextCompactionConfig {
+            repo_doc_max_bytes: 0,
+            user_memory_max_bytes: 0,
+            ..ContextCompactionConfig::default()
+        },
         ..AppConfig::default()
     };
     let provider = Arc::new(MockProvider::new(vec![vec![
@@ -1732,6 +1737,10 @@ async fn asks_for_edit_permission_before_write_tool() {
         workspace_root: root.clone(),
         permissions: PermissionPolicy {
             edit: PermissionMode::Ask,
+            ai_reviewer: squeezy_core::AiReviewerConfig {
+                enabled: false,
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..Default::default()
@@ -1794,6 +1803,10 @@ async fn session_approval_installs_in_memory_rule_without_persisting() {
         workspace_root: root.clone(),
         permissions: PermissionPolicy {
             edit: PermissionMode::Ask,
+            ai_reviewer: squeezy_core::AiReviewerConfig {
+                enabled: false,
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..Default::default()
@@ -2084,6 +2097,10 @@ async fn cancelling_turn_unblocks_pending_approval() {
         workspace_root: root.clone(),
         permissions: PermissionPolicy {
             edit: PermissionMode::Ask,
+            ai_reviewer: squeezy_core::AiReviewerConfig {
+                enabled: false,
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..Default::default()
