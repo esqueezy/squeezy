@@ -5812,6 +5812,11 @@ impl TurnRuntime {
                                 estimate_cost(self.provider.name(), &request_model, &cost);
                         }
                         let warning = broker.record_provider_cost(&cost);
+                        if broker.metrics.routed_to_cheap
+                            && request_model.as_ref() != parent_model_str.as_str()
+                        {
+                            merge_cost(&mut broker.metrics.routing_cheap_main_provider, &cost);
+                        }
                         broker.calibration.record_sample(
                             self.provider.name(),
                             request_input_bytes,
@@ -6542,7 +6547,7 @@ impl TurnRuntime {
         metrics.routing_estimated_savings_usd_micros = turn_router::estimate_routing_savings(
             self.provider.name(),
             &self.config.model,
-            &metrics.provider,
+            &metrics.routing_cheap_main_provider,
         );
     }
 

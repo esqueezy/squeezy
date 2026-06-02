@@ -11041,6 +11041,12 @@ pub struct TurnMetrics {
     /// heuristic fired (no judge call) or routing was disabled.
     #[serde(default)]
     pub routing_judge_usd_micros: u64,
+    /// Provider usage from the cheap-tier main turn only. Excludes the
+    /// routing judge and any parent-model work after escalation so
+    /// routing savings can be estimated from the tokens that actually
+    /// benefited from cheap dispatch.
+    #[serde(default)]
+    pub routing_cheap_main_provider: CostSnapshot,
     /// True when the turn's first LLM round dispatched on the cheap
     /// tier rather than the user's configured parent model.
     #[serde(default)]
