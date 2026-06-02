@@ -208,6 +208,20 @@ fn heuristic_rejects_ambiguous_scope_targets() {
     );
 }
 
+#[test]
+fn heuristic_rejects_care_and_effort_cues() {
+    let cfg = default_routing_config();
+    assert_eq!(
+        heuristic_slam_dunk("rename foo to bar carefully", &cfg),
+        None
+    );
+    assert_eq!(heuristic_slam_dunk("run cargo test safely", &cfg), None);
+    assert_eq!(
+        heuristic_slam_dunk("checkout main without breaking local changes", &cfg),
+        None
+    );
+}
+
 // -- True negatives: unknown imperative ------------------------------------
 
 #[test]

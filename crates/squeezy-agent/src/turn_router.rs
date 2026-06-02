@@ -167,6 +167,12 @@ const AMBIGUITY_MARKERS: &[&str] = &[
     "any file",
     "any files",
     "the one that",
+    "carefully",
+    "thoroughly",
+    "safely",
+    "without breaking",
+    "be careful",
+    "make sure not",
 ];
 
 const LEADING_FILLER: &[&str] = &[
