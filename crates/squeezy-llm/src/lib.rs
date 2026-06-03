@@ -117,7 +117,7 @@ pub use registry::{
     MODEL_REGISTRY, ModelCapabilities, ModelInfo, ModelLifecycle, ModelLimits, PROVIDERS,
     RequestTokenEstimate, TokenPricing, TokenizerKind, capabilities_for, estimate_cost,
     estimate_request_context, estimate_request_context_calibrated, model_info_for,
-    models_for_provider, provider_from_config, provider_name,
+    models_for_provider, provider_from_config, provider_honors_output_schema, provider_name,
 };
 pub use xai::XaiProvider;
 

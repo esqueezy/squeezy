@@ -3157,6 +3157,41 @@ fn classifier_verdict_does_not_match_action_inside_reason_text() {
     assert_eq!(verdict.action, PermissionAction::Ask);
 }
 
+/// The shell-classifier schema (M13) must mirror what
+/// `extract_json_action` deserializes: the two permitted `action` values
+/// (`ask`/`deny` — never `allow`) plus a `reason` string. Every
+/// schema-valid document must parse back into the same non-`Allow` verdict.
+#[test]
+fn shell_classifier_output_schema_mirrors_parse_target() {
+    let schema = super::shell_classifier_output_schema();
+    assert!(schema.strict, "shell classifier schema must be strict");
+
+    let action_enum = schema.schema["properties"]["action"]["enum"]
+        .as_array()
+        .expect("action carries an enum");
+    let values: Vec<&str> = action_enum.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(
+        values,
+        vec![
+            PermissionAction::Ask.as_str(),
+            PermissionAction::Deny.as_str()
+        ],
+        "action enum excludes allow by design"
+    );
+    assert_eq!(
+        schema.schema["properties"]["reason"]["type"],
+        json!("string")
+    );
+    assert_eq!(schema.schema["required"], json!(["action", "reason"]));
+    assert_eq!(schema.schema["additionalProperties"], json!(false));
+
+    // Round-trip: every enum value parses back into the matching verdict.
+    let deny = parse_classifier_verdict(r#"{"action":"deny","reason":"x"}"#);
+    assert_eq!(deny.action, PermissionAction::Deny);
+    let ask = parse_classifier_verdict(r#"{"action":"ask","reason":"x"}"#);
+    assert_eq!(ask.action, PermissionAction::Ask);
+}
+
 #[test]
 fn plan_mode_denies_mutating_capabilities_before_policy() {
     for capability in [

@@ -184,3 +184,50 @@ fn record_audit_captures_reason_and_caps_at_ring_size() {
             .all(|entry| entry.verdict == ReviewerAuditVerdict::NoDecision)
     );
 }
+
+/// The reviewer schema (M13) must mirror exactly what
+/// `parse_reviewer_response` deserializes into `ReviewerDecision`: the
+/// `action` enum carries the three canonical `PermissionMode` strings and
+/// `reason` is a string. Any document that validates against the schema
+/// must parse back into the same action — the schema cannot drift from the
+/// parse target without this failing.
+#[test]
+fn reviewer_output_schema_mirrors_reviewer_decision() {
+    let schema = reviewer_output_schema();
+    assert!(schema.strict, "reviewer schema must be strict");
+
+    let props = &schema.schema["properties"];
+    let action_enum = props["action"]["enum"]
+        .as_array()
+        .expect("action carries an enum");
+    let values: Vec<&str> = action_enum.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(
+        values,
+        vec![
+            PermissionAction::Allow.as_str(),
+            PermissionAction::Ask.as_str(),
+            PermissionAction::Deny.as_str(),
+        ],
+        "action enum is the canonical PermissionMode set"
+    );
+    assert_eq!(props["reason"]["type"], "string");
+    assert_eq!(
+        schema.schema["required"],
+        serde_json::json!(["action", "reason"])
+    );
+    assert_eq!(
+        schema.schema["additionalProperties"],
+        serde_json::json!(false)
+    );
+
+    for action in [
+        PermissionAction::Allow,
+        PermissionAction::Ask,
+        PermissionAction::Deny,
+    ] {
+        let doc = serde_json::json!({ "action": action.as_str(), "reason": "ok" }).to_string();
+        let decision = parse_reviewer_response(&doc).expect("schema doc parses");
+        assert_eq!(decision.action, action);
+        assert_eq!(decision.reason, "ok");
+    }
+}

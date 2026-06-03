@@ -32,10 +32,11 @@ use squeezy_core::{
 use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
     CacheRetention, CacheSpec, INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY,
-    INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream,
-    LlmToolCall, LlmToolSpec, ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate,
-    StopReason, capabilities_for, estimate_cost, estimate_request_context_calibrated,
-    fetch_ollama_context_window,
+    INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider,
+    LlmRequest, LlmStream, LlmToolCall, LlmToolSpec, ReasoningPayload, ReasoningSnapshot,
+    RequestTokenEstimate, StopReason, capabilities_for, estimate_cost,
+    estimate_request_context_calibrated, fetch_ollama_context_window,
+    provider_honors_output_schema,
 };
 use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
@@ -12111,6 +12112,8 @@ Command: {command:?}\n\
 Working target: {:?}",
         request.target
     );
+    let output_schema = provider_honors_output_schema(provider.name(), &config.model)
+        .then(shell_classifier_output_schema);
     let llm_request = LlmRequest {
         model: Arc::from(config.model.as_str()),
         instructions: Arc::from(
@@ -12126,7 +12129,7 @@ Working target: {:?}",
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
-        output_schema: None,
+        output_schema,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
         ..LlmRequest::default()
@@ -12186,6 +12189,37 @@ pub(crate) fn parse_classifier_verdict(text: &str) -> PermissionVerdict {
             reason: format!("shell classifier requires approval: {reason_excerpt}"),
             silent: false,
         },
+    }
+}
+
+/// Strict JSON-schema contract mirroring what [`extract_json_action`]
+/// deserializes for the shell classifier: an `action` constrained to the
+/// two values the classifier prompt permits (`ask`/`deny` — `allow` is
+/// disallowed by design) plus a free-text `reason`. Attached only on
+/// providers that forward `output_schema`
+/// ([`provider_honors_output_schema`]) so the cheap classifier model emits
+/// schema-valid JSON instead of fenced/prose-wrapped output that costs a
+/// retry round; providers that drop the schema keep the loose-parse path
+/// (`extract_loose_action`) and behave exactly as before.
+fn shell_classifier_output_schema() -> LlmOutputSchema {
+    LlmOutputSchema {
+        name: "shell_command_verdict".to_string(),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        PermissionAction::Ask.as_str(),
+                        PermissionAction::Deny.as_str(),
+                    ],
+                },
+                "reason": { "type": "string" },
+            },
+            "required": ["action", "reason"],
+            "additionalProperties": false,
+        }),
+        strict: true,
     }
 }
 

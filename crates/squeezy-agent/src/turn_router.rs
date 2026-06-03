@@ -27,7 +27,10 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use squeezy_core::{AppConfig, CostSnapshot, RoutingConfig, SessionMode};
-use squeezy_llm::{CacheRetention, CacheSpec, LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
+use squeezy_llm::{
+    CacheRetention, CacheSpec, LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest,
+    provider_honors_output_schema,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::cheap_model_for;
@@ -398,6 +401,29 @@ struct JudgeReply {
     _reason: String,
 }
 
+/// Strict JSON-schema contract mirroring [`JudgeReply`]: a required
+/// `route` constrained to the two values [`parse_judge_reply`] accepts
+/// plus the `reason` the prompt asks for. Attached to the judge request
+/// only on providers that forward `output_schema`
+/// ([`provider_honors_output_schema`]) so the cheap-tier judge returns a
+/// schema-valid object instead of fenced/prose-wrapped JSON that costs a
+/// retry round — providers that drop the schema keep the loose-parse path.
+fn judge_output_schema() -> LlmOutputSchema {
+    LlmOutputSchema {
+        name: "turn_route".to_string(),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "route": { "type": "string", "enum": ["cheap", "parent"] },
+                "reason": { "type": "string" },
+            },
+            "required": ["route", "reason"],
+            "additionalProperties": false,
+        }),
+        strict: true,
+    }
+}
+
 pub(crate) struct ClassifyTurnInputs<'a> {
     pub user_input: &'a str,
     pub provider: &'a Arc<dyn LlmProvider>,
@@ -640,6 +666,8 @@ async fn run_judge(
         key: None,
         retention: CacheRetention::None,
     };
+    let output_schema =
+        provider_honors_output_schema(provider_name, judge_model).then(judge_output_schema);
     let request = LlmRequest {
         model: judge_model.clone(),
         instructions: Arc::from(judge_instructions_for(provider_name)),
@@ -653,7 +681,7 @@ async fn run_judge(
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
-        output_schema: None,
+        output_schema,
         parallel_tool_calls: None,
         beta_headers: Arc::from(Vec::new()),
         ..LlmRequest::default()
