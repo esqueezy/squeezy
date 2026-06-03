@@ -1788,6 +1788,32 @@ fn debug_log_key_event(key: &KeyEvent) {
     );
 }
 
+/// Move keyboard focus into the subagent pane and highlight the first
+/// subagent, mirroring the empty-composer Down arm. Used both by that arm
+/// and as the terminal fallback of the Down keypath so the pane is
+/// reachable even when the composer holds draft text or a recalled prompt.
+fn focus_subagent_pane_from_composer(app: &mut TuiApp) {
+    if app.subagent_pane.focused || app.subagent_pane.records.is_empty() {
+        return;
+    }
+    app.subagent_pane.focused = true;
+    if app.subagent_pane.selected == 0 {
+        app.subagent_pane.selected = 1;
+    }
+    app.status = "subagent pane focused".to_string();
+}
+
+/// Open the full-screen transcript overlay on the currently-active
+/// conversation. In the default inline terminal mode the committed
+/// transcript lives in terminal scrollback that can't be repainted in
+/// place, so a selected subagent's conversation can only be surfaced by
+/// this overlay (which renders the active conversation source).
+fn open_subagent_transcript_overlay(app: &mut TuiApp) {
+    app.transcript_overlay_scrollbar_cache.set(None);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+    app.status = "subagent conversation (Esc to close)".to_string();
+}
+
 fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if app.subagent_pane.records.is_empty() || !key.modifiers.is_empty() {
         return false;
@@ -1801,11 +1827,7 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Down if app.input.is_empty() => {
-            app.subagent_pane.focused = true;
-            if row_count > 1 && app.subagent_pane.selected == 0 {
-                app.subagent_pane.selected = 1;
-            }
-            app.status = "subagent pane focused".to_string();
+            focus_subagent_pane_from_composer(app);
             true
         }
         KeyCode::Up if app.subagent_pane.focused && app.subagent_pane.selected > 0 => {
@@ -1829,10 +1851,24 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
                     .unwrap_or(ConversationSource::Main)
             };
             app.transcript_scroll_from_bottom = 0;
-            app.status = match app.subagent_pane.active {
-                ConversationSource::Main => "main conversation selected".to_string(),
-                ConversationSource::Subagent(_) => "subagent conversation selected".to_string(),
-            };
+            // In the default inline terminal mode the conversation lives in
+            // scrollback that can't be repainted in place, so a selected
+            // subagent can only be surfaced by the full-screen overlay (which
+            // renders the active conversation source). In alternate-screen
+            // mode the transcript region already re-renders the active
+            // subagent inline, so Enter just commits the selection there.
+            match app.subagent_pane.active {
+                ConversationSource::Subagent(_) if !app.alternate_scroll_enabled => {
+                    app.subagent_pane.focused = false;
+                    open_subagent_transcript_overlay(app);
+                }
+                ConversationSource::Subagent(_) => {
+                    app.status = "subagent conversation selected".to_string();
+                }
+                ConversationSource::Main => {
+                    app.status = "main conversation selected".to_string();
+                }
+            }
             true
         }
         KeyCode::Esc if app.subagent_pane.focused => {
@@ -2215,10 +2251,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 // Same as Up — when there's a next line in the composer
                 // step into it; only when on the last line do we fall
                 // through to history/scroll.
-            } else if should_route_plain_arrow_to_scroll(app) {
+            } else if should_route_plain_arrow_to_scroll(app)
+                && app.transcript_scroll_from_bottom > 0
+            {
                 scroll_transcript_down(app, 3);
-            } else {
-                recall_prompt_history(app, HistoryDirection::Next);
+            } else if !recall_prompt_history(app, HistoryDirection::Next) {
+                // Nothing left to step forward to in the prompt history and
+                // the transcript is already at the bottom: chain Down into
+                // the subagent pane so a non-empty composer (draft text or a
+                // recalled prompt) no longer traps the selector below it.
+                focus_subagent_pane_from_composer(app);
             }
             Ok(false)
         }
@@ -4414,7 +4456,22 @@ fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         KeyCode::Esc => {
             app.transcript_overlay_scrollbar_cache.set(None);
             app.transcript_overlay = None;
-            app.status = "transcript overlay closed".to_string();
+            // When the overlay was surfacing a subagent conversation in
+            // inline mode (opened from the pane via Enter), Esc backs all the
+            // way out to the main conversation in one press, mirroring the
+            // pane's own Esc. In alternate-screen mode the inline subagent
+            // view persists behind the overlay, so leave the selection alone.
+            if !app.alternate_scroll_enabled
+                && matches!(app.subagent_pane.active, ConversationSource::Subagent(_))
+            {
+                app.subagent_pane.focused = false;
+                app.subagent_pane.active = ConversationSource::Main;
+                app.subagent_pane.selected = 0;
+                app.transcript_scroll_from_bottom = 0;
+                app.status = "main conversation selected".to_string();
+            } else {
+                app.status = "transcript overlay closed".to_string();
+            }
             true
         }
         KeyCode::PageUp => {
@@ -14298,17 +14355,40 @@ impl TuiApp {
         self.clamp_subagent_selection();
     }
 
+    /// Reconcile `selected` (a row index) with `active` (a record id) after
+    /// any records mutation. The highlight (`selected`) and the shown
+    /// conversation (`active`) are sourced independently, so a positional
+    /// change — appending, pruning, or clearing finished rows — can shift the
+    /// record `active` points at out from under the raw index. Re-deriving
+    /// `selected` from `active` here keeps the bold highlight on the same row
+    /// as the ● "shown" marker no matter how the vector was edited.
     fn clamp_subagent_selection(&mut self) {
-        let max = self.subagent_pane.records.len();
-        self.subagent_pane.selected = self.subagent_pane.selected.min(max);
-        if let ConversationSource::Subagent(id) = self.subagent_pane.active
-            && !self
-                .subagent_pane
-                .records
-                .iter()
-                .any(|record| record.id == id)
-        {
-            self.subagent_pane.active = ConversationSource::Main;
+        match self.subagent_pane.active {
+            ConversationSource::Subagent(id) => {
+                if let Some(pos) = self
+                    .subagent_pane
+                    .records
+                    .iter()
+                    .position(|record| record.id == id)
+                {
+                    // Row 0 is `main`; record N lives on row N + 1.
+                    self.subagent_pane.selected = pos + 1;
+                } else {
+                    // The shown subagent is gone — fall back to main and just
+                    // bound the stale index.
+                    self.subagent_pane.active = ConversationSource::Main;
+                    self.subagent_pane.selected = self
+                        .subagent_pane
+                        .selected
+                        .min(self.subagent_pane.records.len());
+                }
+            }
+            ConversationSource::Main => {
+                self.subagent_pane.selected = self
+                    .subagent_pane
+                    .selected
+                    .min(self.subagent_pane.records.len());
+            }
         }
     }
 
@@ -14345,12 +14425,10 @@ impl TuiApp {
             self.subagent_pane.focused = false;
             self.subagent_pane.active = ConversationSource::Main;
             self.subagent_pane.selected = 0;
-        } else {
-            self.subagent_pane.selected = self
-                .subagent_pane
-                .selected
-                .min(self.subagent_pane.records.len());
         }
+        // `clamp_subagent_selection` re-derives `selected` from `active` so
+        // the highlight follows the shown conversation through the positional
+        // shift left by dropping the finished rows above it.
         self.clamp_subagent_selection();
         self.status = "cleared finished subagents".to_string();
     }
