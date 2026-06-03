@@ -74,6 +74,10 @@ pub enum DispatchCommand {
     Compact {
         undo: bool,
     },
+    /// `/clear` — drop the live conversation and start a clean slate.
+    /// The outgoing session stays resumable on disk; the next turn
+    /// begins with an empty context window.
+    Clear,
     Diff,
     Tasks,
     Task {
@@ -121,9 +125,6 @@ pub enum DispatchCommand {
     SessionExportHtml {
         id: String,
         path: Option<String>,
-    },
-    SessionCleanup {
-        args: String,
     },
     Checkpoints,
     Checkpoint {
@@ -182,6 +183,7 @@ impl DispatchCommand {
             Self::Attach { .. } => "/attach",
             Self::Attachments => "/attachments",
             Self::Compact { .. } => "/compact",
+            Self::Clear => "/clear",
             Self::Diff => "/diff",
             Self::Tasks => "/tasks",
             Self::Task { .. } => "/task",
@@ -199,7 +201,6 @@ impl DispatchCommand {
             Self::Fork => "/fork",
             Self::SessionExport { .. } => "/session-export",
             Self::SessionExportHtml { .. } => "/session-export-html",
-            Self::SessionCleanup { .. } => "/session-cleanup",
             Self::Checkpoints => "/checkpoints",
             Self::Checkpoint { .. } => "/checkpoint",
             Self::Undo => "/undo",
@@ -276,6 +277,7 @@ impl DispatchCommand {
                     matches!(tokens.next(), Some(token) if token.eq_ignore_ascii_case("undo"));
                 Self::Compact { undo }
             }
+            "/clear" => Self::Clear,
             "/diff" => Self::Diff,
             "/tasks" => Self::Tasks,
             "/task" => Self::Task {
@@ -350,9 +352,6 @@ impl DispatchCommand {
                 let path = tokens.next().map(str::to_string);
                 Self::SessionExportHtml { id, path }
             }
-            "/session-cleanup" => Self::SessionCleanup {
-                args: rest.to_string(),
-            },
             "/checkpoints" => Self::Checkpoints,
             "/checkpoint" => Self::Checkpoint {
                 id: require_id(head, rest, "<checkpoint_id>")?,
@@ -522,8 +521,6 @@ pub enum DispatchOutcome {
         path: String,
         bytes: usize,
     },
-    /// `/session-cleanup` — archived + removed counts.
-    SessionCleanup { archived: usize, removed: usize },
     /// `/attach <path>` — agent-side attach succeeded; `id` is the
     /// attachment id.
     Attached { id: String },

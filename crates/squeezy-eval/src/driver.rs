@@ -1167,9 +1167,6 @@ impl Driver {
                 path,
                 bytes,
             } => format!("session_exported_html:{session_id}:path={path}:bytes={bytes}"),
-            squeezy_agent::DispatchOutcome::SessionCleanup { archived, removed } => {
-                format!("session_cleanup:archived={archived}:removed={removed}")
-            }
             squeezy_agent::DispatchOutcome::Attached { id } => format!("attached:{id}"),
             squeezy_agent::DispatchOutcome::Detached { id } => format!("detached:{id}"),
             squeezy_agent::DispatchOutcome::AttachmentsList { count } => {

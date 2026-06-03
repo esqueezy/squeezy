@@ -8684,12 +8684,7 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
             },
             "session-export-html",
         ),
-        (
-            DispatchCommand::SessionCleanup {
-                args: String::new(),
-            },
-            "session-cleanup",
-        ),
+        (DispatchCommand::Clear, "clear"),
         (DispatchCommand::Pin { target: None }, "pin"),
         (DispatchCommand::Cheap, "cheap"),
         (DispatchCommand::Parent, "parent"),

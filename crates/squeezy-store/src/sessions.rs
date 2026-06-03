@@ -2738,7 +2738,7 @@ impl From<std::io::Error> for ResolveError {
 }
 
 /// Soft-archive vs hard-delete policy for [`SessionStore::cleanup_with`].
-/// The CLI/TUI surfaces this as `/session-cleanup --archive` (default)
+/// The CLI surfaces this as `squeezy sessions cleanup --archive` (default)
 /// vs `--purge`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CleanupMode {

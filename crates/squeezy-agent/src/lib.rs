@@ -41,10 +41,10 @@ use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
 };
 use squeezy_store::{
-    BugReportBundle, BugReportOptions, CleanupMode, CleanupReport, HydratedTranscriptItem,
-    ResumeItem, SessionEvent, SessionEventKind, SessionHandle, SessionMetadata, SessionQuery,
-    SessionRecord, SessionReplayEvent, SessionReplayEventKind, SessionReplayTape,
-    SessionResumeState, SessionStatus, SessionStore, SqueezyStore,
+    BugReportBundle, BugReportOptions, HydratedTranscriptItem, ResumeItem, SessionEvent,
+    SessionEventKind, SessionHandle, SessionMetadata, SessionQuery, SessionRecord,
+    SessionReplayEvent, SessionReplayEventKind, SessionReplayTape, SessionResumeState,
+    SessionStatus, SessionStore, SqueezyStore,
 };
 use squeezy_telemetry::{
     ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback, ReportUpload,
@@ -2295,34 +2295,6 @@ impl Agent {
             .map_err(|error| SqueezyError::Tool(error.to_string()))
     }
 
-    pub fn cleanup_sessions(&self, ids: &[String]) -> squeezy_core::Result<CleanupReport> {
-        self.cleanup_sessions_with(ids, CleanupMode::Archive)
-    }
-
-    /// Like [`Self::cleanup_sessions`] but lets the caller pick between the
-    /// soft-archive default and the hard-delete [`CleanupMode::Purge`]. The
-    /// TUI `/session-cleanup --purge` and CLI `sessions cleanup --purge`
-    /// thread the mode through this entry point.
-    pub fn cleanup_sessions_with(
-        &self,
-        ids: &[String],
-        mode: CleanupMode,
-    ) -> squeezy_core::Result<CleanupReport> {
-        // Refuse to delete the session that this agent is currently writing
-        // to. Removing it under our feet would orphan future event writes and
-        // leave a session that no longer exists on disk but still appears in
-        // `metadata`/`resume_state` until the process exits.
-        let active = self.session_id();
-        if let Some(active_id) = &active
-            && ids.iter().any(|id| id == active_id)
-        {
-            return Err(SqueezyError::Agent(format!(
-                "refusing to clean up the active session {active_id}; finish or exit first"
-            )));
-        }
-        SessionStore::open(&self.config).cleanup_with(ids, active.as_deref(), mode)
-    }
-
     pub fn resume_current(
         &mut self,
         session_id: &str,
@@ -2408,6 +2380,78 @@ impl Agent {
             json!({ "parent_session_id": parent_session_id }),
         ));
         self.session_log = Some(child);
+        Ok(new_session_id)
+    }
+
+    /// Clear the live conversation and start a clean slate, mirroring
+    /// Claude Code's `/clear`.
+    ///
+    /// When a durable session log is attached the outgoing session is
+    /// finalised on disk (latest resume snapshot written, status flipped
+    /// to `Completed`) so the pre-clear conversation stays resumable via
+    /// `/resume`, then a fresh empty session is opened and bound; its id
+    /// is returned as `Some`. When session logging is disabled
+    /// (`new_ephemeral`, or logging failed at startup) only the
+    /// in-memory conversation is wiped and `None` is returned.
+    ///
+    /// Either way the live conversation, transcript, attachments, cost
+    /// and metrics are reset. Cross-session token calibration is
+    /// preserved so the new conversation's token estimator stays warm,
+    /// and the user's `/router off` toggle survives because it is a
+    /// session preference rather than conversation state.
+    pub async fn clear_conversation(&mut self) -> squeezy_core::Result<Option<String>> {
+        // Rotate the durable session first (if any) so a failure to
+        // persist the outgoing conversation aborts before we drop it
+        // from memory.
+        let new_session_id = if let Some(current) = self.session_log.clone() {
+            let (resume_state, cost, metrics, redactions) = {
+                let state = self.conversation_state.lock().await;
+                (
+                    state.to_resume_state(),
+                    state.cost.clone(),
+                    state.metrics.clone(),
+                    state.redactions,
+                )
+            };
+            current.write_resume_state(&resume_state)?;
+            current.finish(SessionStatus::Completed, cost, metrics, redactions)?;
+
+            let store = SessionStore::open(&self.config);
+            let metadata = SessionMetadata::new(&self.config, self.provider.name());
+            let fresh = store.start_session(metadata)?;
+            let new_session_id = fresh.session_id().to_string();
+            let _ = fresh.append_event(SessionEvent::new(
+                "session_started",
+                None,
+                Some("session started (cleared)".to_string()),
+                json!({ "cleared_from": current.session_id() }),
+            ));
+            self.session_log = Some(fresh);
+            Some(new_session_id)
+        } else {
+            None
+        };
+
+        // Wipe the live conversation but carry over the warm token
+        // estimator and the session-wide routing toggle so the next turn
+        // doesn't fall back to provider defaults or silently re-enable a
+        // router the user turned off.
+        {
+            let mut state = self.conversation_state.lock().await;
+            let token_calibration = state.token_calibration.clone();
+            let routing_session_disabled = state.routing_session_disabled();
+            *state = ConversationState {
+                token_calibration,
+                routing_session_disabled,
+                ..ConversationState::default()
+            };
+        }
+        // Drop the per-turn router's sticky window — it tracked the hard
+        // task that is now gone — while leaving the `/router off`
+        // override (mirrored above) in place.
+        if let Ok(mut routing) = self.routing_state.lock() {
+            routing.sticky.remaining_turns = 0;
+        }
         Ok(new_session_id)
     }
 
@@ -2967,7 +3011,7 @@ impl Agent {
                     },
                 }
             }
-            // `/fork`, `/resume`, `/session-export-html`, `/session-cleanup`,
+            // `/fork`, `/clear`, `/resume`, `/session-export-html`,
             // `/pin`, `/checkpoint*`, `/revert-turn` require &mut
             // self or interact with TUI-owned state (transcript selection,
             // vcs background job). The TUI keeps running those
@@ -2975,9 +3019,9 @@ impl Agent {
             // typed entry point via `TuiOnly` so RPC drivers still see the
             // command they invoked.
             cmd @ (DispatchCommand::Fork
+            | DispatchCommand::Clear
             | DispatchCommand::Resume { .. }
             | DispatchCommand::SessionExportHtml { .. }
-            | DispatchCommand::SessionCleanup { .. }
             | DispatchCommand::Pin { .. }
             | DispatchCommand::Checkpoints
             | DispatchCommand::Checkpoint { .. }

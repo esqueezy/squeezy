@@ -133,6 +133,15 @@ fn parse_compact_undo_flag() {
 }
 
 #[test]
+fn parse_clear_takes_no_args() {
+    assert_eq!(parse("/clear").unwrap(), DispatchCommand::Clear);
+    // Trailing tokens are ignored rather than rejected, matching the
+    // other no-arg commands.
+    assert_eq!(parse("/clear everything").unwrap(), DispatchCommand::Clear);
+    assert_eq!(DispatchCommand::Clear.slash_name(), "/clear");
+}
+
+#[test]
 fn parse_diff_keymap_statusline_no_args() {
     assert_eq!(parse("/diff").unwrap(), DispatchCommand::Diff);
     assert_eq!(parse("/keymap").unwrap(), DispatchCommand::Keymap);
@@ -294,12 +303,6 @@ fn parse_session_family() {
         DispatchCommand::SessionExportHtml {
             id: "sess-4".to_string(),
             path: Some("/tmp/x.html".to_string()),
-        }
-    );
-    assert_eq!(
-        parse("/session-cleanup --archive a b").unwrap(),
-        DispatchCommand::SessionCleanup {
-            args: "--archive a b".to_string()
         }
     );
 }

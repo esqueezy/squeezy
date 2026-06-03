@@ -58,7 +58,7 @@ The TUI supports local commands for common work without requiring a model turn:
 - `/attach`, `/attachments`, `/detach`: manage context attachments.
 - `/compact`, `/pin`, `/pins`, `/unpin`: manage context compaction and pins.
 - `/sessions`, `/session <id>`, `/resume <id>`, `/session-export`,
-  `/session-cleanup`: inspect, resume, export, or clean up sessions.
+  `/clear`: inspect, resume, export sessions, or clear the conversation.
 - `/feedback`, `/report`: prepare consented maintainer feedback or bug reports.
 - `/verbosity`, `/tool-verbosity`, `/tasks`: local TUI display and
   background-task controls. (`/jobs` remains a one-release alias for `/tasks`.)

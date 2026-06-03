@@ -165,7 +165,6 @@ impl ToastQueue {
     }
 
     /// Drop every toast. Returns how many were removed.
-    #[allow(dead_code)] // exposed for /clear and shutdown paths
     pub(crate) fn clear(&mut self) -> usize {
         let n = self.items.len();
         self.items.clear();

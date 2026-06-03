@@ -3652,11 +3652,13 @@ fn slash_menu_surfaces_capability_badges_for_world_touching_commands() {
     );
 
     // Switch to a destructive command and confirm its badge appears too.
-    set_input(&mut app, "/session-cleanup".to_string());
+    // `/undo` is checkpoint-gated, so enable checkpoints to surface it.
+    app.checkpoints_enabled = true;
+    set_input(&mut app, "/undo".to_string());
     let rendered = render_to_string(&app, 120, 12);
     assert!(
-        rendered.contains("[destructive]"),
-        "expected /session-cleanup badge in slash menu:\n{rendered}"
+        rendered.contains("[edit|destructive]"),
+        "expected /undo badge in slash menu:\n{rendered}"
     );
 }
 
@@ -4292,6 +4294,60 @@ async fn slash_fork_branches_into_sibling_session_with_same_transcript() {
     assert!(
         announce.contains(&child_id) && announce.contains("/resume"),
         "fork transcript announcement explains the lineage: {announce}",
+    );
+}
+
+#[tokio::test]
+async fn slash_clear_wipes_transcript_and_rotates_to_a_fresh_session() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    app.push_transcript_item(TranscriptItem::user("explain this stack trace"));
+    app.push_transcript_item(TranscriptItem::assistant("here's the rundown"));
+
+    let prior_id = agent.session_id().expect("prior session id");
+    assert!(handle_slash_command(&mut app, &mut agent, "/clear").await);
+
+    let new_id = agent.session_id().expect("new session id");
+    assert_ne!(new_id, prior_id, "clear must rotate to a fresh session id");
+    assert_eq!(app.status, "conversation cleared");
+    // The visible transcript is dropped; only the post-clear confirmation
+    // remains (the slash echo is wiped along with the rest).
+    assert_eq!(
+        app.transcript.len(),
+        1,
+        "clear leaves only the confirmation note",
+    );
+    let announce = last_message_content(&app).expect("clear announcement");
+    assert!(
+        announce.contains(&new_id) && announce.contains("/resume"),
+        "clear note points at the new session and how to recover the old one: {announce}",
+    );
+}
+
+#[tokio::test]
+async fn slash_clear_without_session_log_still_wipes_the_transcript() {
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    app.push_transcript_item(TranscriptItem::user("some earlier prompt"));
+    assert!(
+        agent.session_id().is_none(),
+        "ephemeral agent has no session"
+    );
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/clear").await);
+
+    assert_eq!(app.status, "conversation cleared");
+    assert_eq!(
+        app.transcript.len(),
+        1,
+        "clear still drops the transcript without a durable session",
+    );
+    let announce = last_message_content(&app).expect("clear announcement");
+    assert!(
+        !announce.contains("/resume"),
+        "with no durable session there is nothing to resume: {announce}",
     );
 }
 
@@ -10213,6 +10269,7 @@ fn slash_commands_have_documented_capability_for_every_entry() {
         "/plan",
         "/build",
         "/compact",
+        "/clear",
         "/attach",
         "/pin",
         "/unpin",
@@ -10220,7 +10277,6 @@ fn slash_commands_have_documented_capability_for_every_entry() {
         "/fork",
         "/session-export",
         "/session-export-html",
-        "/session-cleanup",
         "/undo",
         "/revert-turn",
         "/effort",
