@@ -9677,3 +9677,133 @@ fn subagent_activity_message_maps_tool_lifecycle_events() {
         .is_none()
     );
 }
+
+// --- M2: successful-edit extraction for expired-context masking ---------
+
+fn edit_output(call_id: &str) -> (LlmInputItem, String, ToolStatus) {
+    (
+        LlmInputItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: "{}".to_string(),
+            content_parts: None,
+            is_error: false,
+        },
+        "apply_patch".to_string(),
+        ToolStatus::Success,
+    )
+}
+
+#[test]
+fn collect_successful_edits_extracts_search_replace_spans() {
+    let calls = vec![ToolCall {
+        call_id: "e1".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({
+            "patches": [
+                { "path": "foo.rs", "search": "old body one", "replace": "new" },
+                { "path": "bar.rs", "search": "old body two", "replace": "new" },
+            ]
+        }),
+    }];
+    let outputs = vec![edit_output("e1")];
+    let edits = collect_successful_edits(&calls, &outputs);
+    assert_eq!(edits.len(), 2);
+    assert_eq!(edits[0].path, "foo.rs");
+    assert_eq!(edits[0].changed_spans, vec!["old body one".to_string()]);
+    assert!(!edits[0].whole_file);
+    assert_eq!(edits[1].path, "bar.rs");
+    assert_eq!(edits[1].changed_spans, vec!["old body two".to_string()]);
+}
+
+#[test]
+fn collect_successful_edits_skips_errored_and_denied_edits() {
+    let calls = vec![
+        ToolCall {
+            call_id: "ok".to_string(),
+            name: "apply_patch".to_string(),
+            arguments: json!({ "patches": [{ "path": "a.rs", "search": "x", "replace": "y" }] }),
+        },
+        ToolCall {
+            call_id: "err".to_string(),
+            name: "apply_patch".to_string(),
+            arguments: json!({ "patches": [{ "path": "b.rs", "search": "x", "replace": "y" }] }),
+        },
+        ToolCall {
+            call_id: "denied".to_string(),
+            name: "apply_patch".to_string(),
+            arguments: json!({ "patches": [{ "path": "c.rs", "search": "x", "replace": "y" }] }),
+        },
+    ];
+    let mk = |id: &str, status: ToolStatus| {
+        (
+            LlmInputItem::FunctionCallOutput {
+                call_id: id.to_string(),
+                output: "{}".to_string(),
+                content_parts: None,
+                is_error: status != ToolStatus::Success,
+            },
+            "apply_patch".to_string(),
+            status,
+        )
+    };
+    let outputs = vec![
+        mk("ok", ToolStatus::Success),
+        mk("err", ToolStatus::Error),
+        mk("denied", ToolStatus::Denied),
+    ];
+    let edits = collect_successful_edits(&calls, &outputs);
+    assert_eq!(
+        edits.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+        vec!["a.rs"],
+        "only the successful edit's path should be extracted",
+    );
+}
+
+#[test]
+fn collect_successful_edits_marks_write_file_whole_file() {
+    let calls = vec![ToolCall {
+        call_id: "w1".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({ "path": "gen.rs", "contents": "fn x() {}" }),
+    }];
+    let outputs = vec![(
+        LlmInputItem::FunctionCallOutput {
+            call_id: "w1".to_string(),
+            output: "{}".to_string(),
+            content_parts: None,
+            is_error: false,
+        },
+        "write_file".to_string(),
+        ToolStatus::Success,
+    )];
+    let edits = collect_successful_edits(&calls, &outputs);
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].path, "gen.rs");
+    assert!(edits[0].whole_file, "write_file is a full-file overwrite");
+    assert!(edits[0].changed_spans.is_empty());
+}
+
+#[test]
+fn collect_successful_edits_skips_create_delete_move_ops() {
+    // Only `search_replace` operations expose a stale in-file span. A
+    // create/delete/move op has no prior read snapshot to splice.
+    let calls = vec![ToolCall {
+        call_id: "op1".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({
+            "operations": [
+                { "kind": "create_file", "path": "new.rs", "contents": "x" },
+                { "kind": "delete_file", "path": "gone.rs" },
+                { "kind": "search_replace", "path": "edit.rs", "search": "stale span here", "replace": "fresh" },
+            ]
+        }),
+    }];
+    let outputs = vec![edit_output("op1")];
+    let edits = collect_successful_edits(&calls, &outputs);
+    assert_eq!(
+        edits.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+        vec!["edit.rs"],
+        "only the search_replace op contributes a changed span",
+    );
+    assert_eq!(edits[0].changed_spans, vec!["stale span here".to_string()]);
+}

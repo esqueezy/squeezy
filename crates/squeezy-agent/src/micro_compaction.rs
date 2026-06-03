@@ -392,21 +392,20 @@ fn splice_changed_spans(
     let mut replaced = 0usize;
     for span in spans {
         let needle = json_escaped_inner(span);
-        // Skip pathologically short needles: a 1-3 char fragment would
-        // collide with unrelated text and over-mask. The edit machinery
-        // requires non-trivial search anchors, so real edits clear this.
-        if needle.len() < 8 {
-            continue;
-        }
         let stub = format!(
             "{prefix} (expired span) call_id={call_id} name={tool_name} bytes={bytes}]",
             prefix = MICRO_COMPACT_CLEARED_PREFIX,
             bytes = needle.len(),
         );
-        loop {
-            let Some(pos) = result.find(&needle) else {
-                break;
-            };
+        // Only splice when the recovery stub is strictly smaller than the
+        // span it replaces — masking is a *cost* win, and a stub longer
+        // than the changed text would grow the payload and add noise. This
+        // also rules out pathologically short fragments that could collide
+        // with unrelated text: a tiny span can never beat the stub length.
+        if needle.len() <= stub.len() {
+            continue;
+        }
+        while let Some(pos) = result.find(&needle) {
             result.replace_range(pos..pos + needle.len(), &stub);
             replaced += 1;
         }
