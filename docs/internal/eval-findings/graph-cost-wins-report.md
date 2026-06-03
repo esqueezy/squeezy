@@ -217,15 +217,19 @@ directional.
 |---|---|---|---|---|
 | **cpp** (n=8) | 0.0643 → **0.0566** (−12%; ng also −15%) | 100 | 0.0743 | **WIN**; my code cuts both variants |
 | **php** (build-fix, n=3) | graph was *unavailable* → **0.0350**, tax **−19%** | 100 | 0.0426 | **WIN** — graph now earns its keep |
+| **scala** (build-fix, n=3) | graph was *unavailable* → **0.0148**, tax **−75%** | 100 | 0.0401 | **WIN (large)** — graph now earns its keep |
 | java | → 0.136 | 100 | 0.0729 | cost-LOSS, not fixed |
 | python | 0.0144 → 0.0152 | **0** | 0.0210 | recall-LOSS (model fails task) |
 | rust | → 0.041 | **25** | 0.0370 | recall-LOSS |
 
-php is the cleanest demonstration of the **Wave 3b build fix**: with the graph
-finally *available* (it builds in ~4 s now, inside the wait), php-mini with-graph
-is **cheaper than its own no-graph arm** (graph_tax −19%, vs the +13% the CSV
-recorded when the graph was a no-op stub) and below the Codex baseline, at 100%
-recall. The graph went from pure overhead to a net saving.
+php and scala are the cleanest demonstration of the **Wave 3b build fix**: both
+had a 100%-`graph_available=false` arm (the graph never finished building), so
+with-graph was just grep + a per-turn spec tax. With the graph now building in
+seconds and actually *available*, with-graph is **cheaper than its own no-graph
+arm** (php tax −19%, scala −75%) and well below the Codex baseline at 100%
+recall — the graph flips from pure overhead to a large net saving. This is the
+single highest-value result in the branch, and it only shows up once the graph
+is operational.
 
 Three honest findings:
 
