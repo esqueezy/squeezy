@@ -294,6 +294,7 @@ fn kotlin_class_declaration_symbol(
     };
     let body = kotlin_class_body(node);
     let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
     let mut attributes = kotlin_attributes_for_node(node, ctx.source);
@@ -326,6 +327,7 @@ fn kotlin_class_declaration_symbol(
         language_identity: None,
         span,
         body_span,
+        signature_span,
         signature,
         visibility: kotlin_visibility_text(node, ctx.source),
         docs: kotlin_docs_for_node(node, ctx.source),
@@ -347,6 +349,7 @@ fn kotlin_object_declaration_symbol(
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let body = kotlin_class_body(node);
     let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let id = symbol_id(
         &ctx.file,
@@ -374,6 +377,7 @@ fn kotlin_object_declaration_symbol(
         language_identity: None,
         span,
         body_span,
+        signature_span,
         signature,
         visibility: kotlin_visibility_text(node, ctx.source),
         docs: kotlin_docs_for_node(node, ctx.source),
@@ -396,6 +400,7 @@ fn kotlin_companion_object_symbol(
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let body = kotlin_class_body(node);
     let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let id = symbol_id(
         &ctx.file,
@@ -419,6 +424,7 @@ fn kotlin_companion_object_symbol(
         language_identity: None,
         span,
         body_span,
+        signature_span,
         signature,
         visibility: kotlin_visibility_text(node, ctx.source),
         docs: kotlin_docs_for_node(node, ctx.source),
@@ -453,6 +459,7 @@ fn kotlin_function_declaration_symbol(
         .child_by_field_name("body")
         .or_else(|| kotlin_first_child_of_kind(node, "function_body"));
     let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
 
@@ -562,6 +569,7 @@ fn kotlin_function_declaration_symbol(
         language_identity,
         span,
         body_span,
+        signature_span,
         signature,
         visibility: kotlin_visibility_text(node, ctx.source),
         docs: kotlin_docs_for_node(node, ctx.source),
@@ -588,6 +596,7 @@ fn kotlin_secondary_constructor_symbol(
     let span = span_from_node(node);
     let body = kotlin_first_child_of_kind(node, "block");
     let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let id = symbol_id(&ctx.file, Some(&parent.0), SymbolKind::Method, &name, span);
     let mut attributes = kotlin_attributes_for_node(node, ctx.source);
@@ -606,6 +615,7 @@ fn kotlin_secondary_constructor_symbol(
         language_identity: None,
         span,
         body_span,
+        signature_span,
         signature,
         visibility: kotlin_visibility_text(node, ctx.source),
         docs: kotlin_docs_for_node(node, ctx.source),
@@ -655,6 +665,7 @@ fn kotlin_type_alias_symbol(
         language_identity: target,
         span,
         body_span: None,
+        signature_span: None,
         signature,
         visibility: kotlin_visibility_text(node, ctx.source),
         docs: kotlin_docs_for_node(node, ctx.source),
@@ -699,6 +710,7 @@ fn kotlin_enum_entry_symbol(
         language_identity: None,
         span,
         body_span: kotlin_class_body(node).map(span_from_node),
+        signature_span: signature_span_from_nodes(node, kotlin_class_body(node)),
         signature,
         visibility: None,
         docs: kotlin_docs_for_node(node, ctx.source),
@@ -823,6 +835,7 @@ fn kotlin_property_symbols(
                 language_identity: None,
                 span,
                 body_span: None,
+                signature_span: None,
                 signature: signature.clone(),
                 visibility: visibility.clone(),
                 docs: docs.clone(),
@@ -879,6 +892,7 @@ fn kotlin_class_parameter_symbol(
         language_identity: None,
         span,
         body_span: None,
+        signature_span: None,
         signature,
         visibility: kotlin_visibility_text(node, ctx.source),
         docs: kotlin_docs_for_node(node, ctx.source),

@@ -61,6 +61,12 @@ pub struct GraphSymbol {
     pub language_identity: Option<String>,
     pub span: SourceSpan,
     pub body_span: Option<SourceSpan>,
+    /// Mirror of [`ParsedSymbol::signature_span`]: the declaration-header byte
+    /// range (symbol start up to body start). `read_slice` with
+    /// `span_kind=signature` reads this when present so a signature read
+    /// excludes the body, falling back to the full `span` when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_span: Option<SourceSpan>,
     pub signature: String,
     pub visibility: Option<String>,
     pub docs: Vec<String>,
@@ -97,6 +103,7 @@ impl From<ParsedSymbol> for GraphSymbol {
             language_identity: symbol.language_identity,
             span: symbol.span,
             body_span: symbol.body_span,
+            signature_span: symbol.signature_span,
             signature: symbol.signature,
             visibility: symbol.visibility,
             docs: symbol.docs,
@@ -2970,6 +2977,7 @@ fn file_symbol(file: &FileRecord) -> GraphSymbol {
             squeezy_core::SourcePoint::new(0, 0),
         ),
         body_span: None,
+        signature_span: None,
         signature: file.relative_path.clone(),
         visibility: None,
         docs: Vec::new(),

@@ -35,19 +35,24 @@ pub enum RoleModelPolicy {
     Cheap,
 }
 
-// `description` and `reasoning_effort` are part of the static role catalog
-// even though no runtime code reads them yet — they document the role and
-// will drive provider-side request shaping once we expose a configuration
-// surface for it. `#[allow(dead_code)]` keeps the catalog complete without
-// triggering dead-code warnings on the unused fields.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RoleConfig {
+    // `role` and `description` round out the catalog but are read only by
+    // tests (`role`) or not yet at runtime (`description`); runtime lookups
+    // go through the `SubagentRole` map key and `as_str()`. Field-level
+    // `#[allow(dead_code)]` keeps the catalog whole without re-suppressing
+    // dead-code detection on the load-bearing fields below.
+    #[allow(dead_code)]
     pub role: SubagentRole,
+    #[allow(dead_code)]
     pub description: &'static str,
     pub instructions: &'static str,
     pub allowed_tools: &'static [&'static str],
     pub model_policy: RoleModelPolicy,
+    /// Per-role reasoning effort threaded into each spawned subagent's
+    /// request (`run_subagent`), so a Planner reasons hard while Explorer
+    /// and Reviewer stay cheap. Honored only on providers/models that
+    /// advertise `reasoning_effort` capability; ignored elsewhere.
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 

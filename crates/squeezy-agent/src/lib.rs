@@ -91,9 +91,13 @@ use context_compaction::{
 };
 #[cfg(test)]
 use context_compaction::{build_compaction_summary, compact_conversation};
-use cost_broker::{CostBroker, format_cap_reached_reason, llm_request_input_bytes};
+use cost_broker::{
+    CostBroker, format_cap_reached_reason, format_pressure_gate_reason, llm_request_input_bytes,
+};
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
-use micro_compaction::maybe_micro_compact_mid_turn;
+use micro_compaction::{
+    SuccessfulEdit, mask_expired_reads_after_edits, maybe_micro_compact_mid_turn,
+};
 use permission_persist::persist_permission_rule;
 use roles::{RoleModelPolicy, SubagentRole, role_config};
 
@@ -4564,6 +4568,24 @@ fn request_reasoning_effort(
         .map(|_| effort)
 }
 
+/// Effective reasoning effort for a spawned subagent of `kind`.
+///
+/// Catalog roles override the parent's inherited global effort with their
+/// own tuned default (Planner=High, Explorer/Reviewer=Low) so the priciest
+/// reasoning tier is spent only where the plan justifies it; kinds without a
+/// catalog role (Delegate, DocHelp) keep `inherited`. This only sets the
+/// config field — provider/model capability is still gated downstream by
+/// [`request_reasoning_effort`], so a non-reasoning provider drops the field
+/// exactly as it would for the global path.
+fn subagent_role_reasoning_effort(
+    kind: SubagentKind,
+    inherited: Option<squeezy_core::ReasoningEffort>,
+) -> Option<squeezy_core::ReasoningEffort> {
+    kind.role()
+        .and_then(|role| role_config(role).reasoning_effort)
+        .or(inherited)
+}
+
 /// Resolve the `tool_choice` to send on a given round of a turn.
 ///
 /// `"required"` is configured to fix tool-shy models (Qwen via
@@ -5510,6 +5532,36 @@ impl TurnRuntime {
                     .send(AgentEvent::Failed {
                         turn_id: self.turn_id,
                         error: SqueezyError::Agent(format_cap_reached_reason(status)),
+                    })
+                    .await;
+                self.finish_turn(&broker.metrics).await;
+                return Ok(());
+            }
+            // Adaptive pressure governor (gate variant, B6): below the hard
+            // cap but at the pressure threshold, refuse to *start* another
+            // round and surface a clear cost-pressure status instead of
+            // silently degrading per-turn budgets. Only engages when a cap is
+            // configured; the one-shot latch fires it at most once per turn.
+            if let Some(status) = broker.pressure_gate() {
+                self.stamp_routing_savings(&mut broker.metrics);
+                self.publish_terminal_task_state(
+                    TaskStateStatus::Failed,
+                    Some(format_pressure_gate_reason(status)),
+                    &task_title,
+                )
+                .await;
+                self.persist_turn_accounting(
+                    &total_cost,
+                    &broker.metrics,
+                    &broker.calibration,
+                    false,
+                )
+                .await;
+                let _ = self
+                    .tx
+                    .send(AgentEvent::Failed {
+                        turn_id: self.turn_id,
+                        error: SqueezyError::Agent(format_pressure_gate_reason(status)),
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -6592,6 +6644,46 @@ impl TurnRuntime {
                 }
             }
 
+            // Expired-context masking by file-mutation lineage (M2). When
+            // this round landed a successful in-place edit, the earlier
+            // read/grep snapshots of the same file now show pre-edit text
+            // and waste input tokens on every later turn. Splice the
+            // changed spans out of those stale snapshots in place — scoped
+            // to the edit's `search` text so surrounding context survives,
+            // gated on `ToolStatus::Success` so errored/denied edits never
+            // mutate prior reads. Reuses the micro-compaction placeholder
+            // (zero extra model call) and runs unconditionally after edits,
+            // independent of the token-pressure micro/full gates below.
+            let mut expired_context_masked = false;
+            if self.config.context_compaction.micro_compaction_enabled {
+                let edits = collect_successful_edits(&tool_calls, &outputs_with_status);
+                if !edits.is_empty()
+                    && let Some(report) = mask_expired_reads_after_edits(
+                        &mut conversation,
+                        &edits,
+                        self.config.context_compaction.micro_compaction_keep_recent,
+                    )
+                {
+                    expired_context_masked = true;
+                    self.log_event(
+                        "context_expired_masked",
+                        Some(self.turn_id),
+                        Some(format!(
+                            "expired-context masking stubbed {} stale spans across {} reads, freed {} bytes",
+                            report.spans_masked,
+                            report.masked_call_ids.len(),
+                            report.bytes_saved,
+                        )),
+                        json!({
+                            "masked_call_ids": &report.masked_call_ids,
+                            "spans_masked": report.spans_masked,
+                            "bytes_saved": report.bytes_saved,
+                            "phase": "post_edit",
+                        }),
+                    );
+                }
+            }
+
             // Mid-turn compaction (F75): if the provider reported usage
             // crossing the configured fraction of `model_context_window`,
             // shrink the conversation before the next sample. Bumps the
@@ -6669,8 +6761,13 @@ impl TurnRuntime {
             .await;
             // Either tier mutates `conversation`, so the response-id reuse
             // path must invalidate the cached id and resend the full
-            // conversation instead of the per-round outputs.
-            let mid_turn_compacted = mid_turn_report.is_some() || micro_report.is_some();
+            // conversation instead of the per-round outputs. Expired-context
+            // masking rewrites *earlier* outputs in place, so it must force
+            // the same full-resend — otherwise the per-round `outputs` would
+            // carry the verbatim bodies and the provider's server-side state
+            // would diverge from the locally-masked `conversation`.
+            let mid_turn_compacted =
+                mid_turn_report.is_some() || micro_report.is_some() || expired_context_masked;
             if let Some(report) = mid_turn_report {
                 self.dispatch_post_compact(
                     report.record.before.estimated_tokens,
@@ -8293,6 +8390,13 @@ async fn run_subagent(
     config.max_tool_calls_per_turn = config.subagents.max_tool_calls_per_call;
     config.max_tool_bytes_read_per_turn = config.subagents.max_tool_bytes_read_per_call;
     config.max_search_files_per_turn = config.subagents.max_search_files_per_call;
+    // Override the inherited global reasoning effort with the spawned
+    // subagent's role default before the request is built. `run_subagent_rounds`
+    // reads `config.reasoning_effort` through `request_reasoning_effort`, which
+    // still gates on provider/model capability downstream — so on a
+    // non-reasoning provider the field is dropped exactly as the global path
+    // would have dropped it.
+    config.reasoning_effort = subagent_role_reasoning_effort(kind, config.reasoning_effort);
     // Subagent inherits the parent's per-round result-bytes cap directly.
     // The previous `.min(24_000)` halved the budget for a subagent that
     // already had fewer tool calls to spend.
@@ -9318,6 +9422,95 @@ fn tool_status_label(status: ToolStatus) -> &'static str {
         ToolStatus::Denied => "denied",
         ToolStatus::Stale => "stale",
         ToolStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Collect the successful in-place file mutations from a just-committed
+/// tool round so [`mask_expired_reads_after_edits`] can stub the now-stale
+/// earlier reads of those files (cost-reduction idea M2). Only
+/// `ToolStatus::Success` edits are returned — errored, denied, stale, and
+/// cancelled edits leave the trajectory untouched, so the prior reads stay
+/// authoritative.
+///
+/// `search`/`replace` patches expose the changed span directly: the
+/// `search` text is exactly the pre-edit bytes that no longer exist in the
+/// file, so masking is scoped to that span and surrounding context
+/// survives. `create_file`/`delete_file`/`move_file` operations are
+/// skipped — a create has no prior read to expire, and delete/move don't
+/// produce a stale *in-file* snapshot of surviving content. `write_file`
+/// is a full-file overwrite with no sub-span, recorded as `whole_file`.
+fn collect_successful_edits(
+    tool_calls: &[ToolCall],
+    outputs_with_status: &[(LlmInputItem, String, ToolStatus)],
+) -> Vec<SuccessfulEdit> {
+    let mut edits: Vec<SuccessfulEdit> = Vec::new();
+    for (item, tool_name, status) in outputs_with_status {
+        if *status != ToolStatus::Success {
+            continue;
+        }
+        let LlmInputItem::FunctionCallOutput { call_id, .. } = item else {
+            continue;
+        };
+        let Some(call) = tool_calls.iter().find(|call| &call.call_id == call_id) else {
+            continue;
+        };
+        match tool_name.as_str() {
+            "write_file" => {
+                if let Some(path) = call
+                    .arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    edits.push(SuccessfulEdit {
+                        path: path.to_string(),
+                        changed_spans: Vec::new(),
+                        whole_file: true,
+                    });
+                }
+            }
+            "apply_patch" => collect_apply_patch_edits(&call.arguments, &mut edits),
+            _ => {}
+        }
+    }
+    edits
+}
+
+/// Extract `(path, search)` pairs from an `apply_patch` call's
+/// `patches`/`operations` arrays. The `search` string is the changed span
+/// the lineage-masking pass splices out of stale reads.
+fn collect_apply_patch_edits(arguments: &Value, edits: &mut Vec<SuccessfulEdit>) {
+    let push_search_replace = |edits: &mut Vec<SuccessfulEdit>, entry: &Value| {
+        let path = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let search = entry.get("search").and_then(Value::as_str);
+        if let (Some(path), Some(search)) = (path, search)
+            && !search.is_empty()
+        {
+            edits.push(SuccessfulEdit {
+                path: path.to_string(),
+                changed_spans: vec![search.to_string()],
+                whole_file: false,
+            });
+        }
+    };
+    if let Some(patches) = arguments.get("patches").and_then(Value::as_array) {
+        for patch in patches {
+            push_search_replace(edits, patch);
+        }
+    }
+    if let Some(operations) = arguments.get("operations").and_then(Value::as_array) {
+        for op in operations {
+            // Only `search_replace` ops expose a `search` span; create /
+            // delete / move ops are tagged `kind` and skipped here.
+            if op.get("kind").and_then(Value::as_str) == Some("search_replace") {
+                push_search_replace(edits, op);
+            }
+        }
     }
 }
 

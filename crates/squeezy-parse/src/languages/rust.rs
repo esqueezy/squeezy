@@ -138,6 +138,7 @@ pub(crate) fn symbol_from_node(
     let body = node.child_by_field_name("body");
     let span = span_from_node(node);
     let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let visibility = visibility_text(node, ctx.source);
     let id = symbol_id(&ctx.file, parent_symbol.as_ref(), kind, &name, span);
@@ -160,6 +161,7 @@ pub(crate) fn symbol_from_node(
         language_identity: None,
         span,
         body_span,
+        signature_span,
         signature,
         visibility,
         docs: docs_from_attributes(&attributes),
@@ -198,6 +200,7 @@ pub(crate) fn python_symbol_from_node(
     let body = node.child_by_field_name("body");
     let span = span_from_node(node);
     let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
@@ -234,6 +237,7 @@ pub(crate) fn python_symbol_from_node(
         language_identity: None,
         span,
         body_span,
+        signature_span,
         signature,
         visibility: None,
         docs,
@@ -300,6 +304,11 @@ pub(crate) fn js_ts_symbol_from_node(
     let body = js_ts_symbol_body(node, kind);
     let span = span_from_node(node);
     let body_span = body.map(span_from_node);
+    // Only anchor the signature header on a true brace/block `body` child. The
+    // `value`/`right` fallback (arrow functions, expression-bodied members) and
+    // `variable_declarator` symbols start the node at the binding name, so the
+    // header would drop `const`/`let` or the parameter list — leave `None` there.
+    let signature_span = signature_span_from_nodes(node, node.child_by_field_name("body"));
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
     let mut attributes = js_ts_attributes_for_symbol(node, kind, &name, ctx);
@@ -320,6 +329,7 @@ pub(crate) fn js_ts_symbol_from_node(
         language_identity: None,
         span,
         body_span,
+        signature_span,
         signature: signature_text(node, body, ctx.source),
         visibility: js_ts_visibility_text(node, ctx.source),
         docs: js_ts_docs_for_node(node, ctx.source),
@@ -528,6 +538,10 @@ pub(crate) fn js_ts_declare_global_symbol(
                 language_identity: None,
                 span,
                 body_span,
+                // `span` is only the `global` keyword (not the full declaration),
+                // so a header range anchored on it would be inconsistent; the
+                // full-span fallback is already minimal here.
+                signature_span: None,
                 signature: "declare global".to_string(),
                 visibility: None,
                 docs: Vec::new(),
@@ -603,6 +617,7 @@ pub(crate) fn js_ts_using_binding_symbol(
         language_identity: None,
         span,
         body_span: None,
+        signature_span: None,
         signature: node_text(node, ctx.source).unwrap_or_default().to_string(),
         visibility: None,
         docs: Vec::new(),

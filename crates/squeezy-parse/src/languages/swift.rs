@@ -336,6 +336,7 @@ fn swift_symbol_from_node(
     let body = node.child_by_field_name("body");
     let span = span_from_node(node);
     let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
@@ -400,6 +401,7 @@ fn swift_symbol_from_node(
         language_identity: None,
         span,
         body_span,
+        signature_span,
         signature,
         visibility: swift_visibility_text(node, ctx.source),
         docs: swift_docs_for_node(node, ctx.source),
@@ -454,6 +456,7 @@ fn swift_property_symbols_from_node(
             language_identity: language_identity.clone(),
             span,
             body_span: None,
+            signature_span: None,
             signature: signature.clone(),
             visibility: visibility.clone(),
             docs: docs.clone(),
@@ -523,6 +526,7 @@ fn swift_enum_entry_symbols(
             language_identity: None,
             span,
             body_span: None,
+            signature_span: None,
             signature: signature.clone(),
             visibility: visibility.clone(),
             docs: docs.clone(),

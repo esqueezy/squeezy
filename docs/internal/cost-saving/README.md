@@ -17,6 +17,7 @@ Each chapter sits beside this index as a numbered file:
 | [09](09-verbosity-controls.md) | User-controllable verbosity | Output shape | `crates/squeezy-core/src/lib.rs:6469+`, TUI handlers |
 | [10](10-token-accounting.md) | Token accounting & `/context` telemetry | Observability | `crates/squeezy-core/src/lib.rs:9805+`, per-provider extractors, `crates/squeezy-agent/src/lib.rs:510+` |
 | [11](11-cheap-model-fast-path.md) | Cheap-model fast path (per-turn routing) | Request | `crates/squeezy-agent/src/turn_router.rs`, `crates/squeezy-core/src/lib.rs` (`RoutingConfig`) |
+| [12](12-implemented-idea-batch.md) | Implemented idea batch (2026-06): signature_span, shell sidecar, pressure gate, per-role reasoning, expired-context masking | Multiple | `squeezy-parse`, `squeezy-tools`, `squeezy-agent` |
 
 ---
 
@@ -81,7 +82,7 @@ Raw `cargo build` output is 50–500KB of noise. Squeezy ships hand-written shap
 
 ### 05 — Semantic AST-based code retrieval
 
-Tree-sitter parses every supported language (Rust, Python, Go, Java, C/C++/C#, JS/TS/JSX/TSX) into typed AST nodes, but the cost saving comes from the semantic layer built on top. `ParsedSymbol { signature, body_span }` lets `read_slice {span_kind: "signature"}` return a declaration without its body, and `{span_kind: "body"}` does the inverse. `squeezy-graph` cross-links symbols by call, reference, and container hierarchy with trigram prefilters; `squeezy-rank` ladders Exact → CaseInsensitive → SignatureSubstring → TokenBag → Fuzzy and reranks with BM25 (K1=1.2, B=0.75). The model retrieves through this index — `definition_search` for ranked candidates, `symbol_context` for callers + callees + refs as JSON, `repo_map` for hierarchy — instead of dumping whole files. Tree-sitter `edit()` + `changed_ranges()` keeps the index incremental so re-parses touch only changed regions.
+Tree-sitter parses every supported language (Rust, Python, Go, Java, C/C++/C#, JS/TS/JSX/TSX) into typed AST nodes, but the cost saving comes from the semantic layer built on top. `ParsedSymbol { signature_span, body_span }` lets `read_slice {span_kind: "signature"}` return a declaration without its body (the `signature_span` byte range is symbol-start → body-start; see Chapter 12 — it was added in the 2026-06 batch, before which signature reads incorrectly returned the whole body), and `{span_kind: "body"}` does the inverse. `squeezy-graph` cross-links symbols by call, reference, and container hierarchy with trigram prefilters; `squeezy-rank` ladders Exact → CaseInsensitive → SignatureSubstring → TokenBag → Fuzzy and reranks with BM25 (K1=1.2, B=0.75). The model retrieves through this index — `definition_search` for ranked candidates, `symbol_context` for callers + callees + refs as JSON, `repo_map` for hierarchy — instead of dumping whole files. Tree-sitter `edit()` + `changed_ranges()` keeps the index incremental so re-parses touch only changed regions.
 
 ### 06 — Lazy schema loading
 

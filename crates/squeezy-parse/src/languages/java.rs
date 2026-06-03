@@ -156,6 +156,7 @@ pub(crate) fn java_symbol_from_node(
     let body = node.child_by_field_name("body");
     let span = span_from_node(node);
     let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
@@ -191,6 +192,7 @@ pub(crate) fn java_symbol_from_node(
         language_identity: None,
         span,
         body_span,
+        signature_span,
         signature,
         visibility: java_visibility_text(node, ctx.source),
         docs: java_docs_for_node(node, ctx.source),
@@ -250,6 +252,7 @@ pub(crate) fn java_field_symbols_from_node(
             language_identity: None,
             span,
             body_span: None,
+            signature_span: None,
             signature: signature.clone(),
             visibility: visibility.clone(),
             docs: docs.clone(),

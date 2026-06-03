@@ -282,6 +282,7 @@ pub(crate) fn extract_python_field_symbol(
         language_identity: None,
         span,
         body_span: None,
+        signature_span: None,
         signature: raw.trim().to_string(),
         visibility: None,
         docs: Vec::new(),

@@ -254,6 +254,7 @@ fn dart_top_level_symbol_from_node(
     let body = dart_symbol_body(node);
     let span = span_from_node(node);
     let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
@@ -346,6 +347,7 @@ fn dart_top_level_symbol_from_node(
         language_identity,
         span,
         body_span,
+        signature_span,
         signature,
         visibility: dart_visibility_for_name_span(name_span, ctx.source),
         docs: dart_docs_for_node(node, ctx.source),
@@ -506,6 +508,7 @@ fn dart_symbol_from_signature(
 
     let span = span_from_node(decl_node);
     let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(decl_node, body);
     let signature_text_value = signature_text(decl_node, body, ctx.source);
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let id = symbol_id(&ctx.file, parent_id.as_ref(), symbol_kind, &name, span);
@@ -525,6 +528,7 @@ fn dart_symbol_from_signature(
         language_identity: None,
         span,
         body_span,
+        signature_span,
         signature: signature_text_value,
         visibility: None,
         docs: dart_docs_for_node(decl_node, ctx.source),
@@ -582,6 +586,7 @@ fn dart_field_symbol_from_declarator(
         language_identity: None,
         span,
         body_span: None,
+        signature_span: None,
         signature: signature_text(decl_node, None, ctx.source),
         visibility: dart_visibility_for_name_span(span_from_node(name_node), ctx.source),
         docs: dart_docs_for_node(decl_node, ctx.source),
@@ -681,6 +686,7 @@ fn dart_top_level_variable_symbols(
                     language_identity: None,
                     span,
                     body_span: None,
+                    signature_span: None,
                     signature: signature_text(node, None, ctx.source),
                     visibility: dart_visibility_for_name_span(
                         span_from_node(name_node),
@@ -742,6 +748,7 @@ fn dart_extension_type_representation_field(
         language_identity: None,
         span,
         body_span: None,
+        signature_span: None,
         signature: signature_text(representation, None, ctx.source),
         visibility: None,
         docs: Vec::new(),
@@ -790,6 +797,7 @@ fn dart_enum_constant_symbols(
             language_identity: None,
             span,
             body_span: None,
+            signature_span: None,
             signature: signature_text(child, None, ctx.source),
             visibility: None,
             docs: Vec::new(),
