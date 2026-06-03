@@ -255,10 +255,36 @@ Three honest findings:
    n≥8, not n=3** (the same 40×-spread that makes §1's headline verdicts fragile;
    n=3 here was wrong in sign as well as magnitude).
 
-**Pending (high value):** with Wave 3b making php/scala graph build in ~4 s,
-re-measure php/scala/dart on Mini — they should flip from "graph never
-available" to graph-available, the cleanest expected LOSS→WIN. Plus ≥10-rep
-runs for stable verdicts.
+### Full 15-lang Mini tally (my branch, with-graph, n=3, *directional*)
+
+Swept all 15 with the build-fix binary (graph available everywhere), graded,
+compared to the committed Codex baselines:
+
+| verdict | langs |
+|---|---|
+| **WIN (8)** | cpp, dart, js, kotlin, php, ruby, scala, swift |
+| **TIE (1)** | csharp |
+| **LOSS (4)** | go (cost), java (recall 94.4 + cost), python (recall 0), rust (recall 6) |
+| **N/A (2)** | c, ts — no Codex baseline captured |
+
+So **8 WIN / 1 TIE / 4 LOSS of 13 baselined languages** — ~9/13 WIN-or-TIE at
+recall parity. **Two hard caveats, do not over-read this:** (1) it's **n=3**, and
+n=8 already shrank php/scala margins materially, so the near-boundary verdicts
+(csharp TIE, java) are coin-flips; (2) it's **vs drifted baselines** that don't
+reproduce. The clearest signal in the table is that **2 of the 4 losses are
+recall *collapse*** — python 0% and rust 6% vs the CSV's 67%/94% — which is the
+model failing the task under the current `gpt-5.4-mini`, not a cost regression a
+graph/packet change could touch. The trustworthy wins remain the build-fix three
+(php/scala/dart: graph now cheaper than its own no-graph arm, recall 100) and the
+relative cpp −12%. A clean absolute verdict needs a **fresh re-baseline** (the
+`codex` CLI is available; harness at `/tmp/codex-runs/realworld/`).
+
+**Audit confirmation:** a per-language sweep of the remaining resolvers
+(java/kotlin/csharp/go/swift/c-c++/js-ts) found **no further pathology** — Java's
+`this.foo()` and C#/C++'s `base.Foo()` inheritance all route through the same
+`python_method_in_bases` walker the build fix already deduped, and the rest are
+inheritance-free. The build fix is comprehensive (independently re-confirmed
+laravel 233s→6.1s, ~38×, byte-identical graph).
 
 ## 4. The measurement blocker (fully diagnosed, not the product code)
 
