@@ -900,6 +900,33 @@ pub(crate) fn refresh_compiler_facts_spec() -> ToolSpec {
     }
 }
 
+/// Re-home a stray `command` argument on a `verify` call. `verify` takes no
+/// `command` field — that belongs to `shell` — but models routinely pass
+/// `command: "full"` (a `level`) or `command: "workspace"` (a `scope`) by
+/// analogy with `shell`. Move a recognized value onto the field it belongs to
+/// and drop `command`, so the call runs with the intended bound instead of
+/// hard-failing `deny_unknown_fields` and surfacing a retry to the user.
+fn prepare_verify_arguments(raw: &mut Value) -> std::result::Result<(), String> {
+    let Some(obj) = raw.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(command) = obj.remove("command") else {
+        return Ok(());
+    };
+    if let Some(value) = command.as_str() {
+        let value = value.trim().to_ascii_lowercase();
+        let field = match value.as_str() {
+            "quick" | "full" => Some("level"),
+            "diff" | "workspace" => Some("scope"),
+            _ => None,
+        };
+        if let Some(field) = field {
+            obj.entry(field).or_insert(Value::String(value));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn verify_spec() -> ToolSpec {
     ToolSpec {
         name: "verify".to_string(),
@@ -915,7 +942,7 @@ pub(crate) fn verify_spec() -> ToolSpec {
                 "output_mode": {"type": "string", "enum": ["shaped", "raw"], "description": "Return compact shaped output or raw stdout/stderr. Default shaped."}
             }
         })),
-        prepare_arguments: None,
+        prepare_arguments: Some(prepare_verify_arguments),
     }
 }
 

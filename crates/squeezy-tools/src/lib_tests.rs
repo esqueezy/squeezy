@@ -11230,6 +11230,10 @@ fn prepare_arguments_lookup_advertises_only_hooked_tools() {
         "shell should advertise a prepare_arguments hook"
     );
     assert!(
+        registry.prepare_arguments_for("verify").is_some(),
+        "verify should advertise a prepare_arguments hook"
+    );
+    assert!(
         registry.prepare_arguments_for("grep").is_none(),
         "grep does not declare a hook"
     );
@@ -11281,6 +11285,55 @@ fn prepare_arguments_read_file_hook_normalizes_filepath_aliases() {
     let mut args = json!(42);
     hook(&mut args).expect("hook ok");
     assert_eq!(args, json!(42));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn prepare_arguments_verify_hook_rehomes_stray_command() {
+    let root = temp_workspace("prepare_arguments_verify_hook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let hook = registry
+        .prepare_arguments_for("verify")
+        .expect("verify hook");
+
+    // A `level` value passed under `command` (the `shell` field name) is
+    // re-homed onto `level`; `command` is dropped so `deny_unknown_fields`
+    // no longer rejects the call.
+    let mut args = json!({"command": "full"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"level": "full"}));
+
+    // A `scope` value under `command` lands on `scope`.
+    let mut args = json!({"command": "workspace"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"scope": "workspace"}));
+
+    // Case/whitespace are normalized to the snake_case enum value.
+    let mut args = json!({"command": "  QUICK  "});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"level": "quick"}));
+
+    // An explicit field wins; the stray `command` is still dropped.
+    let mut args = json!({"command": "full", "level": "quick"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"level": "quick"}));
+
+    // An unrecognized `command` value is dropped (verify then runs with its
+    // own defaults instead of hard-failing on the unknown field).
+    let mut args = json!({"command": "git status"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({}));
+
+    // Well-formed calls are untouched.
+    let mut args = json!({"scope": "diff", "level": "full"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"scope": "diff", "level": "full"}));
+
+    // Non-object arguments pass through unchanged.
+    let mut args = json!("nope");
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!("nope"));
 
     let _ = fs::remove_dir_all(root);
 }

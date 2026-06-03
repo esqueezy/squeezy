@@ -5001,6 +5001,64 @@ fn read_tool_output_summary_names_saved_tool_without_raw_json() {
 }
 
 #[test]
+fn read_tool_output_folds_spilled_model_output_without_tool_name() {
+    // Regression: spilled tool results are written in the `model_output()`
+    // shape (`{"status":..,"content":..}`), which carries no `tool_name`.
+    // The recognizer must still fold them to a receipt instead of splatting
+    // the raw (minified, single-line) JSON across the scrollback.
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("read_tool_output", "");
+    result.content = serde_json::json!({
+        "handle": "deadbeef",
+        "bytes_returned": 48_800,
+        "total_bytes": 170_800,
+        "truncated": true,
+        "content": "{\"status\":\"success\",\"content\":{\"graph_available\":true,\"hierarchy\":[{\"id\":\"file:build.rs\",\"kind\":\"File\"}]}}"
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 140, 12);
+
+    assert!(output.contains("saved tool output"), "{output}");
+    assert!(
+        output.contains("content saved tool-result JSON (partial; hidden in normal mode)"),
+        "{output}"
+    );
+    // The raw JSON body must not reach the scrollback.
+    assert!(!output.contains("\"hierarchy\""), "{output}");
+    assert!(!output.contains("graph_available"), "{output}");
+}
+
+#[test]
+fn tool_call_label_describes_verify_by_scope_and_level() {
+    // verify takes scope/level, not a `command` field. The label must describe
+    // the verification and never echo a stray `command` value a confused model
+    // might pass (which the tools-side hook re-homes before execution).
+    let call = ToolCall {
+        call_id: "v-1".to_string(),
+        name: "verify".to_string(),
+        arguments: serde_json::json!({"scope": "workspace", "level": "full"}),
+    };
+    assert_eq!(tool_call_label(&call), "workspace/full");
+
+    // Defaults fill in when the fields are omitted.
+    let call = ToolCall {
+        call_id: "v-2".to_string(),
+        name: "verify".to_string(),
+        arguments: serde_json::json!({}),
+    };
+    assert_eq!(tool_call_label(&call), "diff/quick");
+
+    // A stray `command` is never surfaced as the label.
+    let call = ToolCall {
+        call_id: "v-3".to_string(),
+        name: "verify".to_string(),
+        arguments: serde_json::json!({"command": "full"}),
+    };
+    assert_eq!(tool_call_label(&call), "diff/quick");
+}
+
+#[test]
 fn read_tool_output_hides_cargo_json_artifacts_in_normal_mode() {
     let mut app = test_app(SessionMode::Build);
     let mut result = sample_tool_result("read_tool_output", "");

@@ -496,10 +496,15 @@ pub fn human_label_for_call(name: &str, args: &Value) -> String {
             let pat = s("pattern").unwrap_or_else(|| "?".to_string());
             format!("globbing for `{pat}`")
         }
-        "shell" | "verify" => match s("command") {
+        "shell" => match s("command") {
             Some(cmd) => format!("running `{cmd}`"),
             None => format!("running {name}"),
         },
+        "verify" => {
+            let scope = s("scope").unwrap_or_else(|| "diff".to_string());
+            let level = s("level").unwrap_or_else(|| "quick".to_string());
+            format!("verifying {scope}/{level}")
+        }
         "websearch" => match s("query") {
             Some(q) => format!("searching the web for `{q}`"),
             None => "searching the web".to_string(),

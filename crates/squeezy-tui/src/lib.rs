@@ -9216,7 +9216,10 @@ fn read_file_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 
 fn read_tool_output_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let label = saved_tool_output_meta(tool)
-        .map(|meta| format!("expand saved {}", saved_tool_output_label(&meta.tool_name)))
+        .map(|meta| match meta.tool_name.as_deref() {
+            Some(name) => format!("expand saved {}", saved_tool_output_label(name)),
+            None => "expand saved tool output".to_string(),
+        })
         .or_else(|| {
             saved_compiler_output_summary(tool).map(|_| "expand saved compiler output".to_string())
         })
@@ -9654,11 +9657,23 @@ fn tool_call_label_or_name(tool: &ToolTranscript) -> String {
         .unwrap_or_else(|| tool.result.tool_name.clone())
 }
 
+/// Describe a `verify` call by its scope/level — its real arguments — rather
+/// than a `command` field it doesn't have. A model that mistakes `verify` for
+/// `shell` and passes `command: "full"` would otherwise surface that stray
+/// value as the label; the `prepare_verify_arguments` hook re-homes it, and
+/// this reads the structured fields with the tool's own defaults.
+fn verify_call_label(call: &ToolCall) -> String {
+    let scope = string_arg(&call.arguments, "scope").unwrap_or_else(|| "diff".to_string());
+    let level = string_arg(&call.arguments, "level").unwrap_or_else(|| "quick".to_string());
+    format!("{scope}/{level}")
+}
+
 pub(crate) fn tool_call_label(call: &ToolCall) -> String {
     match call.name.as_str() {
-        "shell" | "verify" => string_arg(&call.arguments, "command")
+        "shell" => string_arg(&call.arguments, "command")
             .or_else(|| string_arg(&call.arguments, "description"))
             .unwrap_or_else(|| call.name.clone()),
+        "verify" => verify_call_label(call),
         "decl_search" => {
             let language = string_arg(&call.arguments, "language");
             let kind = string_arg(&call.arguments, "kind").map(|value| kind_label(&value));
@@ -9778,9 +9793,10 @@ pub(crate) fn is_control_tool_name(name: &str) -> bool {
 /// at the colon.
 fn active_tool_args(call: &ToolCall) -> String {
     match call.name.as_str() {
-        "shell" | "verify" => string_arg(&call.arguments, "command")
+        "shell" => string_arg(&call.arguments, "command")
             .or_else(|| string_arg(&call.arguments, "description"))
             .unwrap_or_default(),
+        "verify" => verify_call_label(call),
         "decl_search" => {
             let language = string_arg(&call.arguments, "language");
             let kind = string_arg(&call.arguments, "kind").map(|value| kind_label(&value));
@@ -10591,10 +10607,15 @@ fn expanded_read_tool_output_detail_lines(
         ));
     }
     if let Some(saved) = saved_tool_output_meta(tool) {
+        let label = saved
+            .tool_name
+            .as_deref()
+            .map(saved_tool_output_label)
+            .unwrap_or_else(|| "tool output".to_string());
         lines.push(detail_line(
             false,
             crate::render::theme::quiet(),
-            format!("saved {}", saved_tool_output_label(&saved.tool_name)),
+            format!("saved {label}"),
         ));
         if let Some(result) = saved.parsed {
             let nested = ToolTranscript {
@@ -10670,13 +10691,20 @@ fn expanded_read_tool_output_detail_lines(
         // Ctrl-T. Generic `output_block_lines` stays unbounded so the
         // existing "expand grep → see every match" behaviour is preserved.
         let limit = saved_output_preview_limit(verbosity);
+        let byte_limit = saved_output_line_byte_limit(verbosity);
         if !content.trim().is_empty() {
             lines.push(detail_line(false, crate::render::theme::quiet(), "content"));
             for line in head_tail_lines(&content, limit) {
                 if line.truncated_marker {
                     lines.push(detail_line(false, crate::render::theme::quiet(), line.text));
                 } else {
-                    lines.push(detail_spans_line(styled_output_spans(&line.text)));
+                    // Clamp each line by bytes: spilled payloads are routinely
+                    // minified single-line JSON, which the line-count cap above
+                    // can't bound — one such line would otherwise wrap into
+                    // hundreds of rows. Verbose (the Ctrl-T overlay) is left
+                    // unbounded so the full content stays available.
+                    let text = truncate_bytes(&line.text, byte_limit);
+                    lines.push(detail_spans_line(styled_output_spans(&text)));
                 }
             }
         }
@@ -10692,9 +10720,17 @@ fn saved_output_preview_limit(verbosity: ToolOutputVerbosity) -> usize {
     }
 }
 
+fn saved_output_line_byte_limit(verbosity: ToolOutputVerbosity) -> usize {
+    match verbosity {
+        ToolOutputVerbosity::Compact => TOOL_PREVIEW_COMPACT_BYTES,
+        ToolOutputVerbosity::Normal => TOOL_PREVIEW_NORMAL_BYTES,
+        ToolOutputVerbosity::Verbose => usize::MAX,
+    }
+}
+
 #[derive(Debug)]
 struct SavedToolOutputMeta {
-    tool_name: String,
+    tool_name: Option<String>,
     parsed: Option<ToolResult>,
     partial: bool,
 }
@@ -10703,16 +10739,26 @@ fn saved_tool_output_meta(tool: &ToolTranscript) -> Option<SavedToolOutputMeta> 
     if tool.result.tool_name != "read_tool_output" {
         return None;
     }
+    // Cargo/compiler JSON streams have a dedicated summarizer; yield to it
+    // rather than folding them as a generic saved tool-result.
+    if saved_compiler_output_summary(tool).is_some() {
+        return None;
+    }
     let content = string_arg(&tool.result.content, "content")?;
     let trimmed = content.trim_start();
-    if !trimmed.starts_with('{') {
+    // Spilled tool results are written in the `model_output()` shape
+    // (`{"status":..,"content":..}`), which carries no `tool_name`. Treat any
+    // JSON object/array body as a saved tool-result so it folds to a receipt
+    // instead of splatting raw JSON across the scrollback; the inner tool name
+    // is best-effort and only used to label the receipt.
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
         return None;
     }
     let parsed = serde_json::from_str::<ToolResult>(trimmed).ok();
     let tool_name = parsed
         .as_ref()
         .map(|result| result.tool_name.clone())
-        .or_else(|| json_string_field_prefix(trimmed, "tool_name"))?;
+        .or_else(|| json_string_field_prefix(trimmed, "tool_name"));
     let partial = tool.result.content["truncated"].as_bool().unwrap_or(false) || parsed.is_none();
     Some(SavedToolOutputMeta {
         tool_name,

@@ -141,6 +141,21 @@ const DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER: &str = "{previous}";
 const DELEGATE_CHAIN_MAX_STEPS: usize = 16;
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
+/// Worker-thread stack size for the runtime that drives the agent.
+///
+/// The subagent fan-out (F10's `buffer_unordered` dispatch plus
+/// `Agent::background_tasks` plumbing) compiles to a deep async state
+/// machine that overflows the default tokio worker stack — ~8 MB on
+/// macOS and 1 MB on Windows — aborting the process with
+/// `thread 'tokio-rt-worker' has overflowed its stack`. The
+/// `explore_subagent_*` test already proves a 16 MB stack clears it; the
+/// binaries that host the agent (`squeezy`, `squeezy-eval`) build their
+/// runtime with this size so production matches the verified test.
+///
+/// 16 MB also matches the peer production agent: codex builds its
+/// multi-thread runtime with `thread_stack_size(16 * 1024 * 1024)`
+/// (`codex-rs/arg0/src/lib.rs`, `TOKIO_WORKER_STACK_SIZE_BYTES`).
+pub const RUNTIME_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
 const JOB_SUMMARY_MAX_CHARS: usize = 320;
 const SUBAGENT_SUMMARY_CHARS_PER_TOKEN: usize = 4;
