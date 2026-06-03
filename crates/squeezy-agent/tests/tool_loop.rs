@@ -8,7 +8,7 @@ use std::{
 };
 
 use futures_core::Stream;
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use serde_json::Value;
 use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision};
 use squeezy_core::{
@@ -4059,4 +4059,159 @@ fn write_rust_crate(root: &std::path::Path, source: &str) {
     )
     .expect("write manifest");
     fs::write(root.join("src/lib.rs"), source).expect("write source");
+}
+
+/// Provider that, in a single parent turn, dispatches one slow `delegate`
+/// subagent alongside several parallel-safe parent `read_file` calls. The
+/// subagent's model round sleeps before answering so its completion is
+/// strictly later than the (near-instant) file reads — used to prove the
+/// parent's reads run concurrently with the subagent instead of blocking
+/// behind it.
+struct DelegateAlongsideReadsProvider {
+    subagent_delay: Duration,
+}
+
+impl LlmProvider for DelegateAlongsideReadsProvider {
+    fn name(&self) -> &'static str {
+        "delegate_alongside_reads"
+    }
+
+    fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        let has_delegate_tool = request.tools.iter().any(|tool| tool.name == "delegate");
+        let has_outputs = request
+            .input
+            .iter()
+            .any(|item| matches!(item, LlmInputItem::FunctionCallOutput { .. }));
+
+        if has_delegate_tool && !has_outputs {
+            // Parent turn 1: one delegate + three parallel-safe reads, all in
+            // the same assistant message.
+            let mut events = vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "delegate_slow".to_string(),
+                    name: "delegate".to_string(),
+                    arguments: serde_json::json!({
+                        "prompt": "Summarize the crate",
+                        "scope": "src/",
+                    }),
+                })),
+            ];
+            for index in 0..3 {
+                events.push(Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: format!("parent_read_{index}"),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": format!("file{index}.rs")}),
+                })));
+            }
+            events.push(Ok(LlmEvent::Completed {
+                response_id: Some("parent_tools".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }));
+            return Box::pin(stream::iter(events));
+        }
+
+        if has_delegate_tool && has_outputs {
+            // Parent final turn.
+            return Box::pin(stream::iter(vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ]));
+        }
+
+        // Subagent round: sleep, then answer with no tool calls. The delay
+        // ensures the subagent's `ToolCallCompleted` lands strictly after the
+        // parent reads when the two run concurrently.
+        let delay = self.subagent_delay;
+        let delayed = stream::once(async move {
+            tokio::time::sleep(delay).await;
+            Ok(LlmEvent::Started)
+        })
+        .chain(stream::iter(vec![
+            Ok(LlmEvent::TextDelta("subagent summary".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("delegate_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ]));
+        Box::pin(delayed)
+    }
+}
+
+#[tokio::test]
+async fn parent_reads_run_concurrently_with_delegate_subagent() {
+    // Regression for the dart-haiku timeout: the parent used to `await` the
+    // delegate subagent to completion *before* running its own approved
+    // parallel-safe reads, so independent reads blocked behind the subagent.
+    // With the flush-ordering fix the parent's reads run concurrently with the
+    // delegate, so they complete while the (artificially slow) subagent is
+    // still running — i.e. every read's `ToolCallCompleted` lands before the
+    // delegate's.
+    let root = temp_workspace("parent_reads_concurrent_with_delegate");
+    for index in 0..3 {
+        fs::write(root.join(format!("file{index}.rs")), b"// content\n").expect("write source");
+    }
+    let provider = Arc::new(DelegateAlongsideReadsProvider {
+        subagent_delay: Duration::from_millis(400),
+    });
+    let mut config = config_for(root.clone());
+    config.subagents.max_concurrent = 2;
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("inspect crate".to_string(), CancellationToken::new());
+    let mut delegate_completed_at: Option<Instant> = None;
+    let mut read_completed_at: Vec<Instant> = Vec::new();
+    let mut read_statuses: Vec<String> = Vec::new();
+    let mut delegate_status: Option<String> = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ToolCallCompleted { result, .. } = event {
+            let now = Instant::now();
+            if result.call_id == "delegate_slow" {
+                delegate_completed_at = Some(now);
+                delegate_status = Some(format!("{:?}", result.status));
+            } else if result.call_id.starts_with("parent_read_") {
+                read_completed_at.push(now);
+                read_statuses.push(format!("{:?}", result.status));
+            }
+        }
+    }
+
+    assert_eq!(
+        read_completed_at.len(),
+        3,
+        "all three parent reads must complete; statuses={read_statuses:?}",
+    );
+    assert!(
+        read_statuses.iter().all(|status| status == "Success"),
+        "parent reads must succeed; statuses={read_statuses:?}",
+    );
+    let delegate_at = delegate_completed_at.expect("delegate must complete");
+    assert_eq!(
+        delegate_status.as_deref(),
+        Some("Success"),
+        "delegate must succeed",
+    );
+    // The subagent sleeps 400ms before answering, so if the reads waited
+    // behind it their completions would land at-or-after the delegate's.
+    // Concurrency means every read finishes strictly before the delegate.
+    for (index, read_at) in read_completed_at.iter().enumerate() {
+        assert!(
+            *read_at < delegate_at,
+            "parent read {index} completed at {read_at:?} but the delegate \
+             completed at {delegate_at:?}; reads must not block behind the \
+             subagent",
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
 }

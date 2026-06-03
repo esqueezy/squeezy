@@ -10564,6 +10564,63 @@ async fn execute_tool_calls(
         }
     }
 
+    // Concurrency fast path: when there is a `delegate*` batch *and* the
+    // parent's own approved calls are all parallel-safe reads, run the
+    // subagent dispatch and the parent reads at the same time instead of
+    // blocking the reads behind the subagent. Neither
+    // `dispatch_delegate_batch` nor `dispatch_parallel_reads` borrows the
+    // broker, so they `tokio::join!` safely; the resolved completions are
+    // then folded into the broker serially below, preserving the original
+    // "delegate results, then read results" recording order. The path
+    // requires every approved call to be parallel-safe so we never reorder a
+    // serial (non-parallel-safe) tool relative to the delegate. Per-turn
+    // budget enforcement is preserved by `fold_parallel_read_completions`,
+    // which gates the reads in input order (subagent tool spend accrues to
+    // separate `subagent_*` metrics, so folding the delegate first does not
+    // change the parent's own budget verdict).
+    if !delegate_batch_calls.is_empty()
+        && !context.cancel.is_cancelled()
+        && approved
+            .iter()
+            .all(|(_, call, _)| context.tools.is_parallel_safe(call))
+    {
+        let delegate_calls = std::mem::take(&mut delegate_batch_calls);
+        let read_order: Vec<(usize, ToolCall, u64)> = approved.clone();
+        let (delegate_completions, read_completions) = tokio::join!(
+            dispatch_delegate_batch(&context, delegate_calls),
+            dispatch_parallel_reads(&context, approved),
+        );
+        // Fold the delegate first, then the reads, matching the original
+        // "delegate results, then read results" broker-mutation order. The
+        // reads are folded with the same incremental per-turn budget
+        // enforcement as the non-concurrent path.
+        apply_delegate_completions(
+            &context,
+            broker,
+            &mut results,
+            &mut recorded,
+            delegate_completions,
+        )
+        .await;
+        fold_parallel_read_completions(
+            &context,
+            broker,
+            &mut results,
+            read_order,
+            read_completions,
+        )
+        .await;
+        let mut out = collect_recorded_results(
+            results,
+            recorded,
+            broker,
+            context.config,
+            &context.telemetry,
+        );
+        mark_intra_batch_duplicates(&calls, &mut out, context.tools);
+        return out;
+    }
+
     if !delegate_batch_calls.is_empty() {
         flush_delegate_batch(
             &context,
@@ -10759,6 +10816,26 @@ async fn flush_delegate_batch(
     if calls.is_empty() {
         return;
     }
+    let completions = dispatch_delegate_batch(context, calls).await;
+    apply_delegate_completions(context, broker, results, recorded, completions).await;
+}
+
+/// Fan out a `delegate*` batch and resolve every dispatch concurrently
+/// *without* touching the broker.
+///
+/// Split out of [`flush_delegate_batch`] so the pure-async fan-out can be
+/// `tokio::join!`ed with the parent's own parallel-safe read batch: neither
+/// future borrows `&mut CostBroker`, so they run truly concurrently and the
+/// parent's independent reads no longer block on the subagent. The returned
+/// completions are folded back into the broker afterward by
+/// [`apply_delegate_completions`] so all metric mutations stay serial.
+async fn dispatch_delegate_batch(
+    context: &ToolExecutionContext<'_>,
+    calls: Vec<(usize, ToolCall, SubagentKind)>,
+) -> Vec<(usize, SubagentKind, SubagentDispatchOutcome)> {
+    if calls.is_empty() {
+        return Vec::new();
+    }
 
     // Emit `ToolCallStarted` for each delegate call in input order so the
     // TUI / event subscribers still see the start lines before the model
@@ -10776,7 +10853,7 @@ async fn flush_delegate_batch(
     }
 
     let cap = context.config.subagents.max_concurrent.max(1);
-    let completions = futures_util::stream::iter(calls.into_iter().map(|(index, call, kind)| {
+    futures_util::stream::iter(calls.into_iter().map(|(index, call, kind)| {
         let context = context.clone();
         async move {
             let outcome = Box::pin(run_subagent_dispatch(&context, &call, kind)).await;
@@ -10785,8 +10862,20 @@ async fn flush_delegate_batch(
     }))
     .buffer_unordered(cap)
     .collect::<Vec<_>>()
-    .await;
+    .await
+}
 
+/// Fold resolved delegate completions back into the broker and emit their
+/// `ToolCallCompleted` events. Counterpart to [`dispatch_delegate_batch`];
+/// keeps every broker mutation serial so concurrent fan-out never races on
+/// the shared metrics.
+async fn apply_delegate_completions(
+    context: &ToolExecutionContext<'_>,
+    broker: &mut CostBroker,
+    results: &mut [Option<ToolResult>],
+    recorded: &mut [bool],
+    completions: Vec<(usize, SubagentKind, SubagentDispatchOutcome)>,
+) {
     for (index, kind, outcome) in completions {
         apply_subagent_dispatch(broker, kind, &outcome);
         record_and_emit_progress(broker, &outcome.result, &context.tx, context.turn_id).await;
@@ -10837,53 +10926,96 @@ async fn flush_parallel_batch(
         }
         return;
     }
-    if broker.enforces_result_budgets() {
-        for (index, call, tool_sequence) in calls {
-            if let Some(reason) = broker.deny_reason() {
-                let result = budget_denied_result(&call, reason);
-                emit_tool_telemetry(
-                    context.config,
-                    &context.telemetry,
-                    context.turn_id,
-                    tool_sequence,
-                    &call,
-                    &result,
-                    Duration::ZERO,
-                );
-                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
-                let _ = context
-                    .tx
-                    .send(AgentEvent::ToolCallCompleted {
-                        turn_id: context.turn_id,
-                        result: result.clone(),
-                    })
-                    .await;
-                results[index] = Some(result);
-                continue;
-            }
-            let result = run_one_tool(context.clone(), tool_sequence, call).await;
+    // Run the reads *concurrently* (independent reads must not serialize
+    // behind one another — that one-at-a-time `.await` per read dominated
+    // turn latency), then fold them back with incremental per-turn budget
+    // enforcement. See [`fold_parallel_read_completions`].
+    let order: Vec<(usize, ToolCall, u64)> = calls.clone();
+    let completions = dispatch_parallel_reads(context, calls).await;
+    fold_parallel_read_completions(context, broker, results, order, completions).await;
+}
+
+/// Fold concurrently dispatched parallel-read completions back into the
+/// broker in the *original call order*, enforcing the per-turn byte/file
+/// budget incrementally.
+///
+/// The reads are dispatched concurrently by [`dispatch_parallel_reads`] so
+/// independent reads never serialize behind one another. Folding in input
+/// order preserves the prior budget contract: once an earlier read pushes the
+/// turn past its byte/file limit, every later read is returned to the model as
+/// budget-denied rather than counted. The physical I/O for the dispatched
+/// reads is bounded by the per-turn tool-call reservation gate, so the
+/// guard-rail's purpose (bounding model-visible context + accounting) holds.
+async fn fold_parallel_read_completions(
+    context: &ToolExecutionContext<'_>,
+    broker: &mut CostBroker,
+    results: &mut [Option<ToolResult>],
+    order: Vec<(usize, ToolCall, u64)>,
+    completions: Vec<(usize, ToolResult)>,
+) {
+    let mut executed: std::collections::HashMap<usize, ToolResult> =
+        completions.into_iter().collect();
+    for (index, call, tool_sequence) in order {
+        if broker.enforces_result_budgets()
+            && let Some(reason) = broker.deny_reason()
+        {
+            // The turn crossed its byte/file budget on an earlier read in
+            // this batch. Override this read's *model-visible* result with a
+            // budget denial and drop its actual output so its bytes are not
+            // billed — the per-turn guard-rail is preserved. The read already
+            // emitted its own `ToolCallStarted`/`ToolCallCompleted` via
+            // `run_one_tool` during the concurrent dispatch, so we record the
+            // denial without emitting a second completion event for the same
+            // call.
+            executed.remove(&index);
+            let result = budget_denied_result(&call, reason);
+            emit_tool_telemetry(
+                context.config,
+                &context.telemetry,
+                context.turn_id,
+                tool_sequence,
+                &call,
+                &result,
+                Duration::ZERO,
+            );
             record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             results[index] = Some(result);
+            continue;
         }
-        return;
-    }
-
-    let completions =
-        futures_util::stream::iter(calls.into_iter().map(|(index, call, tool_sequence)| {
-            let context = context.clone();
-            async move {
-                let result = run_one_tool(context, tool_sequence, call).await;
-                (index, result)
-            }
-        }))
-        .buffer_unordered(context.config.max_parallel_tools.max(1))
-        .collect::<Vec<_>>()
-        .await;
-
-    for (index, result) in completions {
+        let result = executed
+            .remove(&index)
+            .unwrap_or_else(|| ToolResult::cancelled(&call));
         record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
         results[index] = Some(result);
     }
+}
+
+/// Fan out a batch of parallel-safe tool calls and resolve them concurrently
+/// *without* touching the broker.
+///
+/// Split out so the fan-out can be `tokio::join!`ed with a `delegate*`
+/// dispatch — the parent's independent reads then progress alongside the
+/// subagent instead of waiting for it. The completions (in arbitrary order)
+/// are folded into the broker by the caller via
+/// [`fold_parallel_read_completions`], which keeps every metric mutation
+/// serial and enforces the per-turn byte/file budget in input order.
+async fn dispatch_parallel_reads(
+    context: &ToolExecutionContext<'_>,
+    calls: Vec<(usize, ToolCall, u64)>,
+) -> Vec<(usize, ToolResult)> {
+    if calls.is_empty() {
+        return Vec::new();
+    }
+    futures_util::stream::iter(calls.into_iter().map(|(index, call, tool_sequence)| {
+        let context = context.clone();
+        async move {
+            let result = run_one_tool(context, tool_sequence, call).await;
+            (index, result)
+        }
+    }))
+    .buffer_unordered(context.config.max_parallel_tools.max(1))
+    .collect::<Vec<_>>()
+    .await
 }
 
 /// Fan out a `HookPayload::PreToolUse` to every registered handler.
