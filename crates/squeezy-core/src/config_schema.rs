@@ -793,7 +793,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_alternate_screen,
                 default_display: "auto",
                 default: || FieldValue::Enum("auto"),
-                help: "Whether to take over the terminal screen on launch.",
+                help: "Whether to use native terminal scrollback (`auto`/`never`) or take over the full alternate screen (`always`).",
                 env_override: None,
                 secret: false,
             },

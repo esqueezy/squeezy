@@ -1296,11 +1296,6 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             // pane keeps the prior session's rows and an active subagent view
             // would hijack the resumed transcript. Keep `next_synthetic_id`
             // monotonic across the switch.
-            // Subagent records are live state for the session we are leaving:
-            // they are never persisted or rehydrated, so without this reset the
-            // pane keeps the prior session's rows and an active subagent view
-            // would hijack the resumed transcript. Keep `next_synthetic_id`
-            // monotonic across the switch.
             app.subagent_pane = SubagentPaneState {
                 next_synthetic_id: app.subagent_pane.next_synthetic_id,
                 ..SubagentPaneState::default()
@@ -1325,6 +1320,16 @@ fn hydrate_transcript_item(app: &mut TuiApp, item: squeezy_store::HydratedTransc
             app.push_transcript_item(item);
         }
         squeezy_store::HydratedTranscriptItem::ToolResult { call, result } => {
+            let mut result = result;
+            if result.get("tool_name").is_none()
+                && let Some(tool) = call.as_ref().map(|call| call.tool.as_str())
+                && let Some(object) = result.as_object_mut()
+            {
+                object.insert(
+                    "tool_name".to_string(),
+                    serde_json::Value::String(tool.to_string()),
+                );
+            }
             let parsed_result: ToolResult = match serde_json::from_value(result) {
                 Ok(result) => result,
                 Err(err) => {
@@ -1810,20 +1815,27 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
                     .map(|record| ConversationSource::Subagent(record.id))
                     .unwrap_or(ConversationSource::Main)
             };
-            app.transcript_scroll_from_bottom = 0;
+            app.subagent_pane.focused = false;
+            set_active_transcript_scroll_from_bottom(app, 0);
             app.status = match app.subagent_pane.active {
                 ConversationSource::Main => "main conversation selected".to_string(),
                 ConversationSource::Subagent(_) => "subagent conversation selected".to_string(),
             };
             true
         }
-        KeyCode::Esc if app.subagent_pane.focused => {
-            app.subagent_pane.focused = false;
-            app.subagent_pane.active = ConversationSource::Main;
-            app.subagent_pane.selected = 0;
-            app.transcript_scroll_from_bottom = 0;
-            app.status = "main conversation selected".to_string();
-            true
+        KeyCode::Esc => {
+            if app.subagent_pane.focused
+                || !matches!(app.subagent_pane.active, ConversationSource::Main)
+            {
+                app.subagent_pane.focused = false;
+                app.subagent_pane.active = ConversationSource::Main;
+                app.subagent_pane.selected = 0;
+                set_active_transcript_scroll_from_bottom(app, 0);
+                app.status = "main conversation selected".to_string();
+                true
+            } else {
+                false
+            }
         }
         KeyCode::Delete | KeyCode::Backspace if app.subagent_pane.focused => {
             app.clear_finished_subagents();
@@ -2106,7 +2118,11 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // A focused subagent pane owns Esc (to close itself); don't let Esc
     // cancel an in-flight turn out from under the user while they're
     // navigating the pane.
-    if key.code == KeyCode::Esc && !app.subagent_pane.focused && request_turn_interrupt(app) {
+    if key.code == KeyCode::Esc
+        && !app.subagent_pane.focused
+        && matches!(app.subagent_pane.active, ConversationSource::Main)
+        && request_turn_interrupt(app)
+    {
         return Ok(false);
     }
 
@@ -2119,6 +2135,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     }
 
     if app.mention_popup.is_some() && handle_mention_popup_key(app, key) {
+        return Ok(false);
+    }
+
+    if should_route_plain_arrow_to_scroll_before_subagent_pane(app, key) {
+        match key.code {
+            KeyCode::Up => scroll_transcript_up(app, 3),
+            KeyCode::Down => scroll_transcript_down(app, 3),
+            _ => {}
+        }
         return Ok(false);
     }
 
@@ -2578,7 +2603,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             if app.input.is_empty() {
-                app.transcript_scroll_from_bottom = u16::MAX;
+                set_active_transcript_scroll_from_bottom(app, u16::MAX);
                 true
             } else {
                 false
@@ -2589,7 +2614,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             if app.input.is_empty() {
-                app.transcript_scroll_from_bottom = 0;
+                set_active_transcript_scroll_from_bottom(app, 0);
                 true
             } else {
                 false
@@ -2631,15 +2656,36 @@ fn dispatch_click_action(app: &mut TuiApp, action: ClickAction) {
 }
 
 fn scroll_transcript_up(app: &mut TuiApp, lines: u16) {
-    app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_add(lines);
+    let scroll = active_transcript_scroll_from_bottom(app).saturating_add(lines);
+    set_active_transcript_scroll_from_bottom(app, scroll);
 }
 
 fn scroll_transcript_down(app: &mut TuiApp, lines: u16) {
-    app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_sub(lines);
+    let scroll = active_transcript_scroll_from_bottom(app).saturating_sub(lines);
+    set_active_transcript_scroll_from_bottom(app, scroll);
 }
 
 fn should_route_plain_arrow_to_scroll(app: &TuiApp) -> bool {
-    app.alternate_scroll_enabled && app.input_history_index.is_none() && !app.transcript.is_empty()
+    app.alternate_scroll_enabled
+        && app.input_history_index.is_none()
+        && !active_transcript_entries(app).is_empty()
+}
+
+fn should_route_plain_arrow_to_scroll_before_subagent_pane(app: &TuiApp, key: KeyEvent) -> bool {
+    if app.subagent_pane.focused
+        || app.input_history_index.is_some()
+        || !app.input.is_empty()
+        || !key.modifiers.is_empty()
+        || !app.alternate_scroll_enabled
+        || active_transcript_entries(app).is_empty()
+    {
+        return false;
+    }
+    match key.code {
+        KeyCode::Up => true,
+        KeyCode::Down => active_transcript_scroll_from_bottom(app) > 0,
+        _ => false,
+    }
 }
 
 fn request_turn_interrupt(app: &mut TuiApp) -> bool {
@@ -6225,8 +6271,11 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_startup_card: bool) {
     let lines = transcript_lines_for_render(app, Some(area.width), include_startup_card);
-    let scroll =
-        transcript_scroll_offset(lines.len(), area.height, app.transcript_scroll_from_bottom);
+    let scroll = transcript_scroll_offset(
+        lines.len(),
+        area.height,
+        active_transcript_scroll_from_bottom(app),
+    );
     let paragraph = Paragraph::new(lines)
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
@@ -6853,10 +6902,34 @@ fn active_subagent_record(app: &TuiApp) -> Option<&SubagentRecord> {
         .find(|record| record.id == id)
 }
 
+fn active_subagent_record_mut(app: &mut TuiApp) -> Option<&mut SubagentRecord> {
+    let ConversationSource::Subagent(id) = app.subagent_pane.active else {
+        return None;
+    };
+    app.subagent_pane
+        .records
+        .iter_mut()
+        .find(|record| record.id == id)
+}
+
 fn active_transcript_entries(app: &TuiApp) -> &[TranscriptEntry] {
     active_subagent_record(app)
         .map(|record| record.transcript.as_slice())
         .unwrap_or(app.transcript.as_slice())
+}
+
+fn active_transcript_scroll_from_bottom(app: &TuiApp) -> u16 {
+    active_subagent_record(app)
+        .map(|record| record.scroll_from_bottom)
+        .unwrap_or(app.transcript_scroll_from_bottom)
+}
+
+fn set_active_transcript_scroll_from_bottom(app: &mut TuiApp, scroll: u16) {
+    if let Some(record) = active_subagent_record_mut(app) {
+        record.scroll_from_bottom = scroll;
+    } else {
+        app.transcript_scroll_from_bottom = scroll;
+    }
 }
 
 fn active_selected_entry(app: &TuiApp) -> Option<usize> {
@@ -8554,6 +8627,9 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
             Span::raw(marker),
             Span::styled(preview, style),
         ])];
+    }
+    if entry.kind == LogKind::Info {
+        return detail_text_lines(selected, crate::render::theme::cyan(), message);
     }
     if entry.kind == LogKind::Warn {
         // `⚠ message` rendering for warnings so the user can spot
@@ -13192,6 +13268,7 @@ struct SubagentRecord {
     prompt: String,
     lifecycle: SubagentLifecycle,
     latest: String,
+    scroll_from_bottom: u16,
     metrics: Option<TurnMetrics>,
     transcript: Vec<TranscriptEntry>,
 }
@@ -14065,6 +14142,16 @@ impl TuiApp {
         self.push_entry(TranscriptEntry::log(id, message, self.transcript_default));
     }
 
+    pub(crate) fn push_info(&mut self, message: String) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::log_with_kind(
+            id,
+            message,
+            LogKind::Info,
+            self.transcript_default,
+        ));
+    }
+
     /// Push a warning log (⚠ prefix). Suppresses the push when
     /// the most recent transcript entry is already a `⚠ Cancelled` / `⚠ Denied`
     /// tool card — the card already communicates the turn-end at a glance,
@@ -14120,6 +14207,7 @@ impl TuiApp {
             record.prompt = prompt;
             record.lifecycle = SubagentLifecycle::Running;
             record.latest = "starting".to_string();
+            record.scroll_from_bottom = 0;
             record.metrics = None;
             record.transcript = transcript;
         } else {
@@ -14129,6 +14217,7 @@ impl TuiApp {
                 prompt,
                 lifecycle: SubagentLifecycle::Running,
                 latest: "starting".to_string(),
+                scroll_from_bottom: 0,
                 metrics: None,
                 transcript,
             });
@@ -14238,6 +14327,7 @@ impl TuiApp {
             prompt: detail.clone(),
             lifecycle: SubagentLifecycle::Rejected,
             latest: compact_text(&detail, 120),
+            scroll_from_bottom: 0,
             metrics: None,
             transcript,
         });
@@ -14609,6 +14699,9 @@ fn system_message_can_collapse(item: &TranscriptItem) -> bool {
 pub(crate) enum LogKind {
     /// Standard log line — rendered with `└` and a status-color marker.
     Normal,
+    /// Non-error operational event with useful payload. Rendered neutral and
+    /// left untruncated so lifecycle details stay inspectable.
+    Info,
     /// Operational chrome (turn-complete markers, compaction notices,
     /// plan-handoff state) — rendered dim/italic with no bullet so it
     /// fades to the periphery instead of looking like a content event.
@@ -14834,7 +14927,7 @@ enum TerminalMode {
 impl From<TuiAlternateScreen> for TerminalMode {
     fn from(value: TuiAlternateScreen) -> Self {
         match value {
-            TuiAlternateScreen::Auto => Self::AlternateScreen,
+            TuiAlternateScreen::Auto => Self::Inline,
             TuiAlternateScreen::Never => Self::Inline,
             TuiAlternateScreen::Always => Self::AlternateScreen,
         }
