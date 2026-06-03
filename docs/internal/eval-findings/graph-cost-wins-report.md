@@ -149,6 +149,18 @@ stranded on `graph_unavailable`/`graph_indexing` for the whole session,
 silently degrading the with-graph arm to grep. **Confirmed:** php/dart/scala
 have `graph_available=false` on 100% of recorded calls.
 
+> **Build-timing caveat (offline, release, measured this session).** With the
+> Wave 3 dart fix, `GraphManager::open` on the real pinned repos completes —
+> **laravel/laravel (php, 2.8k files) in 115 s** and **flutter/flutter (dart,
+> 6.4k files) in 273 s at ~10 GB** — versus dart *never returning* before the
+> fix. So a 30 s wait is enough for small/medium repos but **not** for these
+> large ones: php/scala/dart still need either the `SQUEEZY_GRAPH_READY_WAIT_MS`
+> override (≥300 s, viable inside the eval's 600 s / 1500 s caps), a pre-warmed
+> **persisted** graph (the cold clone rebuilds every rep — `open_with_store`
+> warm-start would make this near-instant), a smaller dart test repo, or the
+> deferred "agent retries on `graph_indexing`" path. Wave 2 is necessary but
+> not sufficient on its own for the three large-repo languages.
+
 ### Wave 3 — Dart exponential ancestor-walk fix · `a3c21ffd` · ✅ unit-tested + offline-validated
 `dart_method_in_ancestors` recursed through every same-named ancestor candidate
 with **no visited-set**, re-expanding shared ancestors on every path. On
@@ -230,6 +242,21 @@ Offline (no API) validation already runnable:
 builds fast (motivating Wave 2).
 
 ---
+
+## 6a. Highest-value structural fix: pre-warm a persisted graph in the eval
+
+The eval clones a fresh workspace per rep and builds the graph **cold every
+time**. Measured cold builds are 115 s (laravel) / 273 s (flutter) — so on the
+large-repo languages the graph is essentially never ready inside any sane
+first-call wait, which is *why* php/scala/dart show `graph_available=false` on
+100% of calls. This is **unrealistic**: in real use squeezy persists the graph
+(`open_with_store`) and warm-starts it; a user pays the build once, not on every
+query. The eval should **pre-build and persist the graph once per pinned repo**
+(or check a warm store into the fixture), so every rep warm-starts in seconds.
+This is harness-only (no agent-token or cost change), makes the graph genuinely
+available on the large-repo languages, and is the single highest-leverage step
+toward a fair with-graph measurement. It composes with Wave 2 (wait) and Wave 3
+(dart must still build without exploding for the one-time warm build to finish).
 
 ## 6. Remaining work (deferred — needs live measurement to tune safely)
 
