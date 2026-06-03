@@ -444,6 +444,8 @@ struct SessionReportArgs {
 
 #[tokio::main]
 async fn main() -> squeezy_core::Result<()> {
+    squeezy_core::startup_trace::init();
+    squeezy_core::startup_trace::mark("main_start");
     squeezy_core::pre_main_hardening(squeezy_core::HardeningConfig::default());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -451,6 +453,7 @@ async fn main() -> squeezy_core::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    squeezy_core::startup_trace::mark("cli_parsed");
     let stdin_is_tty = print_mode::stdin_is_tty();
     let prompt_mode_active = !cli.prompt.is_empty() || !stdin_is_tty;
     if cli.format == PromptFormat::Json && !prompt_mode_active {
@@ -488,6 +491,7 @@ async fn main() -> squeezy_core::Result<()> {
     }
 
     let mut config = config_from_cli(&cli)?;
+    squeezy_core::startup_trace::mark("config_loaded");
 
     if cli.list_providers {
         for provider in PROVIDERS {
@@ -556,11 +560,15 @@ async fn main() -> squeezy_core::Result<()> {
         config = config_from_cli(&cli)?;
     }
 
+    squeezy_core::startup_trace::mark("model_selector_done");
+
     let onboarding = prepare_repo_profile(&mut config);
+    squeezy_core::startup_trace::mark("repo_profile_done");
 
     show_telemetry_notice_once(&config);
     let telemetry = TelemetryClient::from_config(&config);
     telemetry.spawn(TelemetryEvent::app_started(&config));
+    squeezy_core::startup_trace::mark("telemetry_spawned");
 
     // Resolve `--session <prefix>` against the on-disk session store
     // before any downstream code sees it, so the user can pass a short
@@ -615,6 +623,7 @@ async fn main() -> squeezy_core::Result<()> {
     } else {
         None
     };
+    squeezy_core::startup_trace::mark("session_resolved");
     if prompt_mode_active {
         let provider = provider_from_app_config(&config);
         let prompts = print_mode::resolve_prompt_inputs(
@@ -666,8 +675,10 @@ async fn main() -> squeezy_core::Result<()> {
     let resume_session_id = resume_session_id_opt;
     let skip_resume_picker = cli.no_resume_picker || resume_session_id.is_some();
     let mut onboarding = onboarding;
+    squeezy_core::startup_trace::mark("update_banner_done");
     loop {
         let provider = provider_from_app_config(&config);
+        squeezy_core::startup_trace::mark("provider_built");
         let startup_profile = squeezy_tui::StartupProfile {
             onboarding_summary: onboarding.visible_summary.clone(),
             languages: onboarding.language_summary.clone(),

@@ -1539,7 +1539,12 @@ impl Agent {
         let store = SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref())
             .ok()
             .map(Arc::new);
-        if let Some(store) = store.as_deref() {
+        if let Some(store) = store.clone() {
+            // Pruning expired compaction checkpoints is a best-effort GC
+            // write transaction; nothing on the input path depends on it.
+            // Run it on the blocking pool (when a runtime is present) so the
+            // redb write never gates prompt entry. Sync construction
+            // contexts (tests, no current runtime) keep the inline prune.
             let now: u128 = unix_timestamp_millis() as u128;
             let ttl_ms: u128 = (squeezy_store::DEFAULT_COMPACTION_CHECKPOINT_RETENTION_DAYS
                 as u128)
@@ -1548,12 +1553,20 @@ impl Agent {
                 * 60
                 * 1_000;
             let cutoff = now.saturating_sub(ttl_ms);
-            if let Err(err) = store.prune_compaction_checkpoints(cutoff) {
-                tracing::warn!(
-                    target: "squeezy::store",
-                    error = %err,
-                    "failed to prune compaction_checkpoints; old entries may persist",
-                );
+            let prune = move || {
+                if let Err(err) = store.prune_compaction_checkpoints(cutoff) {
+                    tracing::warn!(
+                        target: "squeezy::store",
+                        error = %err,
+                        "failed to prune compaction_checkpoints; old entries may persist",
+                    );
+                }
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn_blocking(prune);
+                }
+                Err(_) => prune(),
             }
         }
         let registry_runtime = ToolRegistryRuntime::new_with_graph_cache_root(
