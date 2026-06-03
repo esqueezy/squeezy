@@ -195,6 +195,7 @@ fn ruby_symbol_from_node(
     let span = span_from_node(node);
     let body = node.child_by_field_name("body");
     let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let id = symbol_id(&ctx.file, parent_id.as_ref(), symbol_kind, &name, span);
@@ -229,6 +230,7 @@ fn ruby_symbol_from_node(
         language_identity: None,
         span,
         body_span,
+        signature_span,
         signature,
         visibility: None,
         docs: Vec::new(),
@@ -357,6 +359,7 @@ fn extract_ruby_assignment_symbol(
                 language_identity: None,
                 span,
                 body_span: None,
+                signature_span: None,
                 signature: raw.to_string(),
                 visibility: None,
                 docs: Vec::new(),
@@ -388,6 +391,7 @@ fn extract_ruby_assignment_symbol(
                 language_identity: None,
                 span,
                 body_span: None,
+                signature_span: None,
                 signature: raw.to_string(),
                 visibility: None,
                 docs: Vec::new(),
@@ -528,6 +532,7 @@ fn extract_ruby_import(
             language_identity: None,
             span,
             body_span: None,
+            signature_span: None,
             signature: raw.to_string(),
             visibility: None,
             docs: Vec::new(),
@@ -669,6 +674,7 @@ fn push_synthetic_attr(
         language_identity: None,
         span,
         body_span: None,
+        signature_span: None,
         signature: raw.to_string(),
         visibility: None,
         docs: Vec::new(),

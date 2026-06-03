@@ -2003,7 +2003,10 @@ fn read_slice_target(
             .get(&SymbolId::new(symbol_id))
             .ok_or_else(|| format!("symbol_id not found: {symbol_id}"))?;
         let span = match args.span_kind.unwrap_or_default() {
-            ReadSliceSpanKind::Signature => symbol.span,
+            // Read only the declaration header when the extractor pinned a real
+            // signature span; fall back to the full node for bodyless symbols
+            // and heuristic extractors that left it `None`.
+            ReadSliceSpanKind::Signature => symbol.signature_span.unwrap_or(symbol.span),
             ReadSliceSpanKind::Body => symbol.body_span.unwrap_or(symbol.span),
         };
         return Ok((

@@ -186,6 +186,7 @@ pub(crate) fn go_function_symbol(
     let body = node.child_by_field_name("body");
     let span = span_from_node(node);
     let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let id = symbol_id(&ctx.file, parent_symbol.as_ref(), kind, &name, span);
     let mut attributes = go_doc_and_semantic_attributes(node, ctx.source);
@@ -204,6 +205,7 @@ pub(crate) fn go_function_symbol(
         language_identity: None,
         span,
         body_span,
+        signature_span,
         signature,
         visibility: go_visibility(node, ctx.source),
         docs: go_docs_for_node(node, ctx.source),
@@ -237,6 +239,12 @@ pub(crate) fn go_type_symbol(
     };
     let span = span_from_node(node);
     let body_span = type_node.map(span_from_node);
+    // Only struct/interface bodies are a brace block whose start is a reliable
+    // header boundary; a bare type-alias RHS (`type MyInt int`) is the aliased
+    // type itself, so chopping at it would drop load-bearing signature text.
+    let signature_span = type_node
+        .filter(|child| matches!(child.kind(), "struct_type" | "interface_type"))
+        .and_then(|child| signature_span_from_nodes(node, Some(child)));
     let signature = node_text(node, ctx.source)
         .unwrap_or_default()
         .trim()
@@ -251,6 +259,7 @@ pub(crate) fn go_type_symbol(
         language_identity: None,
         span,
         body_span,
+        signature_span,
         signature,
         visibility: go_visibility(node, ctx.source),
         docs: go_docs_for_node(node, ctx.source),
@@ -319,6 +328,7 @@ pub(crate) fn go_field_symbols(
                 language_identity: None,
                 span,
                 body_span: None,
+                signature_span: None,
                 signature: node_text(node, ctx.source)
                     .unwrap_or_default()
                     .trim()
@@ -357,6 +367,7 @@ pub(crate) fn extract_go_value_declarations(
                 language_identity: None,
                 span,
                 body_span: None,
+                signature_span: None,
                 signature: node_text(child, ctx.source)
                     .unwrap_or_default()
                     .trim()
