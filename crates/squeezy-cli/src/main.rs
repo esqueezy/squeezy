@@ -110,8 +110,13 @@ struct Cli {
     )]
     no_default: bool,
     #[arg(
+        long = "resume",
+        help = "Open the resume picker to choose a recent session (this project, or Tab for any project) instead of starting fresh"
+    )]
+    resume: bool,
+    #[arg(
         long = "no-resume-picker",
-        help = "Skip the startup picker that offers to resume a recent session for this directory"
+        help = "Force a fresh session even when --resume is passed"
     )]
     no_resume_picker: bool,
     #[arg(
@@ -673,7 +678,10 @@ async fn main() -> squeezy_core::Result<()> {
     // banner, while live update probing remains available through `doctor`.
     let update_banner = update::cached_banner_for_startup();
     let resume_session_id = resume_session_id_opt;
-    let skip_resume_picker = cli.no_resume_picker || resume_session_id.is_some();
+    // The resume picker is opt-in: bare `squeezy` starts a fresh session
+    // immediately. `--resume` brings up the picker; `--continue` / `--session`
+    // resolve a target directly and skip the picker as before.
+    let skip_resume_picker = !cli.resume || cli.no_resume_picker || resume_session_id.is_some();
     let mut onboarding = onboarding;
     squeezy_core::startup_trace::mark("update_banner_done");
     loop {
@@ -1825,7 +1833,9 @@ fn model_selection_state_from_paths(
 }
 
 fn startup_resume_question_available(cli: &Cli, config: &AppConfig) -> bool {
-    if cli.no_resume_picker || cli.session.is_some() || cli.continue_session {
+    // The picker is opt-in, so bare launches never offer a resume question and
+    // never pay the candidate scan; only `--resume` reaches the on-disk lookup.
+    if !cli.resume || cli.no_resume_picker || cli.session.is_some() || cli.continue_session {
         return false;
     }
     squeezy_tui::startup_resume_question_available(config)

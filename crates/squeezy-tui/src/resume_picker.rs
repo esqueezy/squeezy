@@ -28,9 +28,10 @@ use squeezy_store::{
     detect_branches,
 };
 
-/// Maximum number of sessions shown in the overlay. Keep small — the user
-/// is choosing one of "most recent" and a longer list is just noise.
-pub(crate) const MAX_PICKER_ENTRIES: usize = 5;
+/// Maximum number of sessions shown in the overlay, newest-first. The picker
+/// is now opt-in (`--resume`), so the user came here deliberately to find a
+/// session — a fuller page is more useful than a terse five.
+pub(crate) const MAX_PICKER_ENTRIES: usize = 20;
 
 /// Sessions started within this window of `now_ms` are considered for the
 /// resume picker. Older sessions can still be reached via

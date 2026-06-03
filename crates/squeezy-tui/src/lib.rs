@@ -652,7 +652,7 @@ async fn run_inner(
 }
 
 async fn run_inner_with_terminal(
-    config: AppConfig,
+    mut config: AppConfig,
     provider: Arc<dyn LlmProvider>,
     resume_session_id: Option<String>,
     startup: StartupProfile,
@@ -666,6 +666,19 @@ async fn run_inner_with_terminal(
     let resume_session_id =
         match maybe_pick_resume_session(&mut terminal, &config, resume_session_id, &startup)? {
             ResumeStartup::Use(id) => Some(id),
+            ResumeStartup::UseInDir {
+                session_id,
+                workspace_root,
+            } => {
+                // Re-root everything (session store, tools, graph, git) at the
+                // session's own directory so it opens exactly as if launched
+                // there. `set_current_dir` best-effort matches subprocess cwd;
+                // `workspace_root` is the authoritative knob the agent reads.
+                let _ = std::env::set_current_dir(&workspace_root);
+                config.workspace_root = workspace_root;
+                apply_theme_overrides(&config);
+                Some(session_id)
+            }
             ResumeStartup::Fresh => None,
             ResumeStartup::BackToSetup => {
                 return Ok((StartupRunOutcome::BackToSetup, Some(terminal)));
@@ -892,6 +905,13 @@ async fn run_inner_with_terminal(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResumeStartup {
     Use(String),
+    /// Resume a session that belongs to a different directory: re-root the
+    /// workspace at `workspace_root` so the agent, tools, and graph all open
+    /// there, exactly as if `squeezy` had been launched from that directory.
+    UseInDir {
+        session_id: String,
+        workspace_root: PathBuf,
+    },
     Fresh,
     BackToSetup,
     Quit,
@@ -947,11 +967,20 @@ fn maybe_pick_resume_session(
             session_id,
             target_cwd,
         } => {
-            // Silently switching cwd would surprise users juggling sibling
-            // repos; instead exit with the exact recommended invocation in
-            // the exit hint so they can re-run from the target directory.
-            terminal.set_exit_hint(Some(cross_project_resume_hint(&session_id, &target_cwd)));
-            Ok(ResumeStartup::Quit)
+            // The user explicitly picked this session, so open it in place by
+            // re-rooting at its directory. If that directory no longer exists
+            // (repo moved or deleted) fall back to the exit hint rather than
+            // resuming against a missing tree.
+            let workspace_root = PathBuf::from(&target_cwd);
+            if workspace_root.is_dir() {
+                Ok(ResumeStartup::UseInDir {
+                    session_id,
+                    workspace_root,
+                })
+            } else {
+                terminal.set_exit_hint(Some(cross_project_resume_hint(&session_id, &target_cwd)));
+                Ok(ResumeStartup::Quit)
+            }
         }
         resume_picker::ResumeChoice::Back => Ok(ResumeStartup::BackToSetup),
         resume_picker::ResumeChoice::Quit => Ok(ResumeStartup::Quit),

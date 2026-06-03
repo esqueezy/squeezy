@@ -135,10 +135,11 @@ fn merge_candidates_excludes_empty_global_index_entries() {
 fn filter_orders_newest_first_and_caps_at_max() {
     let cwd = PathBuf::from("/work/repo");
     let now = 1_000_000;
-    let sessions: Vec<SessionMetadata> = (0..10)
+    let total = MAX_PICKER_ENTRIES + 5;
+    let sessions: Vec<SessionMetadata> = (0..total)
         .map(|i| {
             meta(
-                &format!("s{i}"),
+                &format!("s{i:02}"),
                 "/work/repo",
                 now - (i as u64 * 1_000),
                 true,
@@ -147,8 +148,12 @@ fn filter_orders_newest_first_and_caps_at_max() {
         .collect();
     let out = filter_candidates(&sessions, &cwd, now);
     assert_eq!(out.len(), MAX_PICKER_ENTRIES);
+    // Newest-first, capped to the most-recent MAX_PICKER_ENTRIES.
     let ids: Vec<&str> = out.iter().map(|s| s.session_id.as_str()).collect();
-    assert_eq!(ids, vec!["s0", "s1", "s2", "s3", "s4"]);
+    let expected: Vec<String> = (0..MAX_PICKER_ENTRIES)
+        .map(|i| format!("s{i:02}"))
+        .collect();
+    assert_eq!(ids, expected);
 }
 
 fn summary(id: &str) -> SessionSummary {
