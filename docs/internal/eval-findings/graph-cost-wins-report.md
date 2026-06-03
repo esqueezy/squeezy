@@ -213,12 +213,19 @@ OpenAI) runs fine**, so all live measurement below is Mini, comparing the
 model/time/scenario). Cached, n=3 unless noted — small samples, read as
 directional.
 
-| lang | main wg→branch wg | recall (branch) | vs Codex base | read |
+| lang | main wg → branch wg | recall | vs Codex base | read |
 |---|---|---|---|---|
-| **cpp** | 0.0646 → **0.0488** (−25%) | 100 | 0.0743 | **WIN** — graph_tax −2%→−46% |
+| **cpp** (n=8) | 0.0643 → **0.0566** (−12%; ng also −15%) | 100 | 0.0743 | **WIN**; my code cuts both variants |
+| **php** (build-fix, n=3) | graph was *unavailable* → **0.0350**, tax **−19%** | 100 | 0.0426 | **WIN** — graph now earns its keep |
 | java | → 0.136 | 100 | 0.0729 | cost-LOSS, not fixed |
 | python | 0.0144 → 0.0152 | **0** | 0.0210 | recall-LOSS (model fails task) |
 | rust | → 0.041 | **25** | 0.0370 | recall-LOSS |
+
+php is the cleanest demonstration of the **Wave 3b build fix**: with the graph
+finally *available* (it builds in ~4 s now, inside the wait), php-mini with-graph
+is **cheaper than its own no-graph arm** (graph_tax −19%, vs the +13% the CSV
+recorded when the graph was a no-op stub) and below the Codex baseline, at 100%
+recall. The graph went from pure overhead to a net saving.
 
 Three honest findings:
 
@@ -230,16 +237,14 @@ Three honest findings:
    format mismatch. Implication: **the committed Mini CSV baselines may not be
    reproducible**, so before/after on the same binary (not vs the CSV) is the
    trustworthy signal. My cost changes are orthogonal to these recall failures.
-3. **The apparent read_slice "no-graph regression" was n=3 noise — a cautionary
-   tale on rep count.** At n=3 the main binary's cpp no-graph looked like $0.066
-   and my branch's $0.090, suggesting the pad inflated exploratory reads. But the
-   **n=8** confirmatory run shows the *main* binary's no-graph cpp is **$0.094**
-   — essentially equal to my branch's $0.090. So the pad does **not** regress
-   no-graph cost; the n=3 gap was sampling variance (the same 40×-spread problem
-   from §1). The pad is recall-neutral as originally claimed, and the with-graph
-   improvement is the real, repeatable signal (main wg n=8 $0.0643; branch n=8
-   pending). **Lesson: trust n≥8, not n=3** — which is also why the headline
-   verdicts in §1 are fragile.
+3. **The apparent read_slice "no-graph regression" was n=3 noise — and at n=8 my
+   code helps *both* variants.** At n=3 the gap looked like wg −24% / ng +36%
+   (pad hurting exploratory reads). The **n=8** confirmatory run (the trustworthy
+   signal) shows my branch cuts cpp **with-graph −12%** ($0.0643→$0.0566) **and
+   no-graph −15%** ($0.0942→$0.0802), recall 100 both — so the pad is a real,
+   recall-neutral saving in both directions, not a trade-off. **Lesson: trust
+   n≥8, not n=3** (the same 40×-spread that makes §1's headline verdicts fragile;
+   n=3 here was wrong in sign as well as magnitude).
 
 **Pending (high value):** with Wave 3b making php/scala graph build in ~4 s,
 re-measure php/scala/dart on Mini — they should flip from "graph never
