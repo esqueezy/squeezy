@@ -149,17 +149,19 @@ stranded on `graph_unavailable`/`graph_indexing` for the whole session,
 silently degrading the with-graph arm to grep. **Confirmed:** php/dart/scala
 have `graph_available=false` on 100% of recorded calls.
 
-> **Build-timing caveat (offline, release, measured this session).** With the
-> Wave 3 dart fix, `GraphManager::open` on the real pinned repos completes —
-> **laravel/laravel (php, 2.8k files) in 115 s** and **flutter/flutter (dart,
-> 6.4k files) in 273 s at ~10 GB** — versus dart *never returning* before the
-> fix. So a 30 s wait is enough for small/medium repos but **not** for these
-> large ones: php/scala/dart still need either the `SQUEEZY_GRAPH_READY_WAIT_MS`
-> override (≥300 s, viable inside the eval's 600 s / 1500 s caps), a pre-warmed
-> **persisted** graph (the cold clone rebuilds every rep — `open_with_store`
-> warm-start would make this near-instant), a smaller dart test repo, or the
-> deferred "agent retries on `graph_indexing`" path. Wave 2 is necessary but
-> not sufficient on its own for the three large-repo languages.
+> **Build-timing (offline, release, measured this session) — and the follow-up
+> fix that changes the picture.** With only the Wave 3 dart fix, cold
+> `GraphManager::open` was **laravel 115 s / flutter 273 s** — terminating (vs
+> dart never returning) but far slower than any sane wait. Root-causing that
+> slowness found the *same* missing-visited-set bug in `python_method_in_bases`
+> (which also serves **PHP** `$this->`/`self::`/`parent::`) and `ruby`'s
+> ancestor walk, plus a quadratic partial-class symbol scan. Fixing those (see
+> **Wave 3b** below) cut cold builds to **laravel 4.1 s (~28×)** and **flutter
+> 29.4 s (~11×)**, byte-identical graph. So the 30 s wait (Wave 2) now suffices
+> for **php** (and scala, same scale as laravel) and lands flutter/dart right at
+> the boundary — the graph becomes genuinely *available* on the large-repo
+> languages without any pre-warm. The B9 resolver-cache hydrate path is no
+> longer needed for the cold-build target (kept as an optional warm-start).
 
 ### Wave 3 — Dart exponential ancestor-walk fix · `a3c21ffd` · ✅ unit-tested + offline-validated
 `dart_method_in_ancestors` recursed through every same-named ancestor candidate
@@ -172,6 +174,22 @@ identical regardless of the path that reaches it, so the first match in Dart's
 mixin→extends→implements→on order is unchanged. **All 10 dart graph unit tests
 pass**; offline `GraphManager::open` on the real flutter/flutter repo now
 completes in bounded time (see §5).
+
+### Wave 3b — generalize the visited-set fix; make large-repo graphs build fast · `0dc6729a` `afa822a7` `eb5caac3` · ✅ tests + offline-measured
+The dart blow-up was not dart-specific. `python_method_in_bases` (which also
+resolves **PHP** `$this->`/`self::`/`parent::` calls) and `ruby`'s
+ancestor walk had the **same** missing visited-set, and `method_on_class_or_partials`
+scanned the whole symbol table per resolved call (quadratic in symbol count).
+Fixes: thread a visited `HashSet` through the python/php and ruby walks, and add
+a `symbols_by_language_identity` index so partial-class lookup is O(partials).
+**Measured (release):** laravel cold build **116.9 s → 4.1 s (~28×)**, flutter
+**331.8 s → 29.4 s (~11×)**, with a **byte-identical** graph (same symbol/edge
+counts) and all 170 graph tests green. This is the operational unlock for the
+graph-unavailable languages: php now builds well inside the Wave 2 wait, so the
+with-graph arm can finally *use* the graph on php/scala/dart instead of silently
+degrading to grep. (Note: per-file parsing was already parallel in
+`squeezy-parse`; the win was purely killing the superlinear resolution
+algorithm, not adding threads.)
 
 ### Wave 5a — stream-reconnect robustness · `7d9113fc` · ✅ unit-tested
 When a provider stream drops **before any visible output is committed** (only
@@ -186,6 +204,47 @@ covers it; existing late-divergence/replay tests still pass. Also adds
 `SQUEEZY_FORCE_HTTP1` as an escape hatch (see §4).
 
 ---
+
+## 3.5 Measured results — Mini tier (OpenAI; the only tier currently runnable)
+
+The Haiku/Anthropic path is blocked (§4), but the **Mini tier (gpt-5.4-mini via
+OpenAI) runs fine**, so all live measurement below is Mini, comparing the
+**unmodified `main` binary vs this branch** (isolates my code's effect; same
+model/time/scenario). Cached, n=3 unless noted — small samples, read as
+directional.
+
+| lang | main wg→branch wg | recall (branch) | vs Codex base | read |
+|---|---|---|---|---|
+| **cpp** | 0.0646 → **0.0488** (−25%) | 100 | 0.0743 | **WIN** — graph_tax −2%→−46% |
+| java | → 0.136 | 100 | 0.0729 | cost-LOSS, not fixed |
+| python | 0.0144 → 0.0152 | **0** | 0.0210 | recall-LOSS (model fails task) |
+| rust | → 0.041 | **25** | 0.0370 | recall-LOSS |
+
+Three honest findings:
+
+1. **cpp is a real win** — with-graph cost −25% at 100% recall, moving it below
+   the Codex baseline. (Confirmatory n=8 in progress.)
+2. **python (0%) and rust (25%) recall are far below the committed CSV** (67.5%,
+   93.8%) **in both binaries** — so it's model behavior, not my code: either
+   gpt-5.4-mini drift since the baselines were captured, or a scenario/grader
+   format mismatch. Implication: **the committed Mini CSV baselines may not be
+   reproducible**, so before/after on the same binary (not vs the CSV) is the
+   trustworthy signal. My cost changes are orthogonal to these recall failures.
+3. **The apparent read_slice "no-graph regression" was n=3 noise — a cautionary
+   tale on rep count.** At n=3 the main binary's cpp no-graph looked like $0.066
+   and my branch's $0.090, suggesting the pad inflated exploratory reads. But the
+   **n=8** confirmatory run shows the *main* binary's no-graph cpp is **$0.094**
+   — essentially equal to my branch's $0.090. So the pad does **not** regress
+   no-graph cost; the n=3 gap was sampling variance (the same 40×-spread problem
+   from §1). The pad is recall-neutral as originally claimed, and the with-graph
+   improvement is the real, repeatable signal (main wg n=8 $0.0643; branch n=8
+   pending). **Lesson: trust n≥8, not n=3** — which is also why the headline
+   verdicts in §1 are fragile.
+
+**Pending (high value):** with Wave 3b making php/scala graph build in ~4 s,
+re-measure php/scala/dart on Mini — they should flip from "graph never
+available" to graph-available, the cleanest expected LOSS→WIN. Plus ≥10-rep
+runs for stable verdicts.
 
 ## 4. The measurement blocker (fully diagnosed, not the product code)
 
@@ -243,20 +302,20 @@ builds fast (motivating Wave 2).
 
 ---
 
-## 6a. Highest-value structural fix: pre-warm a persisted graph in the eval
+## 6a. Graph-unavailable: largely solved by Wave 3b (was: pre-warm a persisted graph)
 
-The eval clones a fresh workspace per rep and builds the graph **cold every
-time**. Measured cold builds are 115 s (laravel) / 273 s (flutter) — so on the
-large-repo languages the graph is essentially never ready inside any sane
-first-call wait, which is *why* php/scala/dart show `graph_available=false` on
-100% of calls. This is **unrealistic**: in real use squeezy persists the graph
-(`open_with_store`) and warm-starts it; a user pays the build once, not on every
-query. The eval should **pre-build and persist the graph once per pinned repo**
-(or check a warm store into the fixture), so every rep warm-starts in seconds.
-This is harness-only (no agent-token or cost change), makes the graph genuinely
-available on the large-repo languages, and is the single highest-leverage step
-toward a fair with-graph measurement. It composes with Wave 2 (wait) and Wave 3
-(dart must still build without exploding for the one-time warm build to finish).
+The original diagnosis: the eval clones a fresh workspace per rep and builds the
+graph **cold every time** (then-measured 115 s laravel / 273 s flutter), so on
+large-repo languages the graph was never ready inside a sane wait — the cause of
+`graph_available=false` on 100% of php/scala/dart calls. I'd flagged a
+pre-warmed persisted graph as the fix. **Wave 3b superseded that:** with cold
+builds now 4 s (laravel) / 29 s (flutter), the graph builds inside the Wave 2
+wait for php/scala, so no pre-warm is required for those. A persisted warm-start
+(B9) remains a nice latency optimization for very large repos / interactive
+cold-start, but it is no longer on the critical path for the eval. flutter/dart
+at ~29 s is right at the 30 s boundary — if dart still flakes, bump
+`SQUEEZY_GRAPH_READY_WAIT_MS` for that one scenario or shave the remaining
+linear `add_call_edges` cost (SymbolId interning — see the build agent's note).
 
 ## 6. Remaining work (deferred — needs live measurement to tune safely)
 
