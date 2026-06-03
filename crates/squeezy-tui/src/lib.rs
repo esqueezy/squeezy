@@ -6071,11 +6071,11 @@ fn working_line(app: &TuiApp) -> Line<'static> {
     } else {
         crate::render::theme::foreground()
     };
-    let spinner_frame = crate::render::spinner::active_style().frame(prompt_elapsed_ms(app));
+    let live_marker = crate::render::spinner::active_style().rail_marker(prompt_elapsed_ms(app));
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
-            format!("{spinner_frame} "),
+            format!("{live_marker} "),
             Style::default()
                 .fg(activity_color)
                 .add_modifier(Modifier::BOLD),

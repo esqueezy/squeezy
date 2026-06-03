@@ -58,6 +58,20 @@ impl SpinnerStyle {
         let idx = ((elapsed_ms / self.interval_ms()) as usize) % frames.len();
         frames[idx]
     }
+
+    /// A single-display-cell live marker for the Quiet Rail gutter, where every
+    /// node marker must be one cell to stay column-aligned. Twinkle and
+    /// scintillate are already one cell; Drift slides across three cells, which
+    /// can't fit a one-cell slot, so on the rail it twinkles (`✦`/`✧`) in place.
+    pub(crate) fn rail_marker(self, elapsed_ms: u64) -> &'static str {
+        match self {
+            Self::Twinkle | Self::Scintillate => self.frame(elapsed_ms),
+            Self::Drift => {
+                const TWINKLE: &[&str] = &["✦", "✧"];
+                TWINKLE[((elapsed_ms / 600) as usize) % TWINKLE.len()]
+            }
+        }
+    }
 }
 
 static ACTIVE_SPINNER: OnceLock<RwLock<SpinnerStyle>> = OnceLock::new();
