@@ -123,11 +123,6 @@ fn main() -> ExitCode {
     // `run.json` was already on disk because of this, prompting the
     // sweep watchdog to SIGKILL them mid-flush.
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        // The agent fan-out this harness drives overflows the default tokio
-        // worker stack; match the verified production size so eval runs don't
-        // abort mid-turn with a stack overflow. See
-        // `squeezy_agent::RUNTIME_STACK_SIZE_BYTES`.
-        .thread_stack_size(squeezy_agent::RUNTIME_STACK_SIZE_BYTES)
         .enable_all()
         .build()
         .expect("build tokio runtime");

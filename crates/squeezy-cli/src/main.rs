@@ -442,22 +442,8 @@ struct SessionReportArgs {
     exclude: Vec<String>,
 }
 
-fn main() -> squeezy_core::Result<()> {
-    // Build the runtime explicitly with a large worker stack instead of
-    // relying on `#[tokio::main]`'s default. The agent's subagent fan-out
-    // compiles to a deep async state machine that overflows the default
-    // tokio worker stack and aborts the process with
-    // `thread 'tokio-rt-worker' has overflowed its stack`; see
-    // `squeezy_agent::RUNTIME_STACK_SIZE_BYTES`.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .thread_stack_size(squeezy_agent::RUNTIME_STACK_SIZE_BYTES)
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
-    runtime.block_on(async_main())
-}
-
-async fn async_main() -> squeezy_core::Result<()> {
+#[tokio::main]
+async fn main() -> squeezy_core::Result<()> {
     squeezy_core::pre_main_hardening(squeezy_core::HardeningConfig::default());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
