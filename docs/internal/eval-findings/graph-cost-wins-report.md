@@ -268,23 +268,27 @@ compared to the committed Codex baselines:
 | **N/A (2)** | c, ts — no Codex baseline captured |
 
 So **8 WIN / 1 TIE / 4 LOSS of 13 baselined languages** — ~9/13 WIN-or-TIE at
-recall parity. **Two hard caveats, do not over-read this:** (1) it's **n=3**, and
-n=8 already shrank php/scala margins materially, so the near-boundary verdicts
-(csharp TIE, java) are coin-flips; (2) it's **vs drifted baselines** that don't
-reproduce. The clearest signal in the table is that **2 of the 4 losses are
-recall *collapse*** — python 0% and rust 6% vs the CSV's 67%/94% — which is the
-model failing the task under the current `gpt-5.4-mini`, not a cost regression a
-graph/packet change could touch. The trustworthy wins remain the build-fix three
-(php/scala/dart: graph now cheaper than its own no-graph arm, recall 100) and the
-relative cpp −12%. A clean absolute verdict needs a **fresh re-baseline** (the
-`codex` CLI is available; harness at `/tmp/codex-runs/realworld/`).
+recall parity. **Caveat — it's n=3** (the near-boundary verdicts csharp/TIE and
+java are coin-flips). **The committed cost baselines DO roughly reproduce** — an
+earlier draft here claimed they had "drifted cheaper," but that was a pricing bug
+on my side ($0.25 vs the real $0.75/Mtok); recomputed at the correct rate, fresh
+codex is ≈-or-higher than the CSV (see the fresh re-baseline below), so the CSV
+is a fair reference and these verdicts are trustworthier than first stated. **2
+of the 4 losses are recall failures** — python 0% and rust 6% — where the model
+produces the wrong answer *shape* (a class→methods enumeration instead of the
+required method→callees call graph); **fresh codex makes the identical mistake**,
+so this is the current `gpt-5.4-mini` failing the task (likely high-variance,
+since the CSV once recorded 67%/94%), not squeezy and not a cost lever. The wins
+hold vs both the CSV and a same-day fresh codex (next section).
 
-### Fresh codex re-baseline (drift-free, same rates) — the trustworthy verdict
+### Fresh codex re-baseline (same rates) — the trustworthy verdict
 
-The committed baselines don't reproduce, so I re-ran **codex `gpt-5.4-mini`
+To remove any doubt about baseline freshness, I re-ran **codex `gpt-5.4-mini`
 fresh** on the same scenarios and compared with **identical squeezy
 pricing** (input $0.75 / output $4.50 / cache-read $0.075 per Mtok) applied to
-codex's own token usage — a same-day, same-tier, apples-to-apples head-to-head:
+codex's own token usage — a same-day, same-tier, apples-to-apples head-to-head.
+(Result: the committed CSV cost baselines roughly reproduce — fresh codex is ≈
+or higher — so the CSV was a fair reference all along.)
 
 | lang | squeezy wg | fresh codex | result |
 |---|---|---|---|
