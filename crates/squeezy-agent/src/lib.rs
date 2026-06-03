@@ -13027,9 +13027,11 @@ fn delegate_advertised_tool() -> AdvertisedTool {
         spec: Arc::new(LlmToolSpec {
             name: DELEGATE_TOOL_NAME.to_string(),
             description: "Delegate open-ended research to an isolated subagent. \
-                          Use only when the user explicitly asks for non-trivial research, code mapping, or refactoring — \
+                          Reserve it for genuinely multi-pass, context-isolating, or cross-cutting work — \
+                          a task spanning several rounds of discovery, or one whose intermediate reading would bloat your context, or one that fans out across unrelated areas. \
                           NOT for greetings, casual replies, or simple questions the parent can answer directly. \
-                          Do NOT delegate enumeration or extraction over a list of files or symbols you ALREADY have (e.g. from a graph/hierarchy result) — read or slice those yourself; the subagent runs the same model and re-reads the same files, so delegating known-target extraction is pure overhead. Delegate only when the set of files to inspect is itself unknown and must be discovered. \
+                          A single-pass enumeration or audit — grep/scan a known set of files or symbols once and report — is NOT multi-pass: do it yourself in-context with grep/read, or via the bounded `explore` tool, rather than firing a whole-task delegate. A cold subagent re-explores from scratch and runs the same model, so on bounded single-pass work it is pure overhead and slower. \
+                          Do NOT delegate enumeration or extraction over a list of files or symbols you ALREADY have (e.g. from a graph/hierarchy result) — read or slice those yourself; the subagent re-reads the same files, so delegating known-target extraction is pure overhead. Delegate only when the set of files to inspect is itself unknown, large, and must be discovered across multiple passes. \
                           `prompt` is required; the parent receives only a structured summary, supporting receipts, and separate spend metrics."
                 .to_string(),
             parameters: json!({

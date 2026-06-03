@@ -347,7 +347,7 @@ pub(crate) fn repo_map_spec() -> ToolSpec {
 pub(crate) fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<TypeName>\"` (pipe-separate to match several bases in one call: `base:A|base:B`), not `base:` in `query`. One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". Do not also call definition_search or symbol_context with the same query in one turn unless this result is ambiguous.".to_string(),
+        description: "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or Dart `with` mixers `mixin:<Type>`; prefix-free `attribute=\"<Type>\"` matches all three at once. Pipe-separate to match several (`base:A|base:B`). Pass as `attribute`, not `base:` in `query`. One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". Do not also call definition_search or symbol_context with the same query in one turn unless this result is ambiguous.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -461,7 +461,7 @@ pub(crate) fn downstream_flow_spec() -> ToolSpec {
 pub(crate) fn hierarchy_spec() -> ToolSpec {
     ToolSpec {
         name: "hierarchy".to_string(),
-        description: "Return graph containment hierarchy (file → module → class → members) for the workspace, a symbol_id, or a declaration query. This is containment, NOT inheritance — for subclasses/implementors use `decl_search` with `attribute=\"base:<TypeName>\"`. For every method/field/variant of one class, call `hierarchy(symbol_id=<class>)` first to enumerate the member set before reading bodies, replacing member-by-member reads or greps.".to_string(),
+        description: "Return graph containment hierarchy (file → module → class → members) for the workspace, a symbol_id, or a declaration query. This is containment, NOT inheritance — for subclasses/implementers/Dart mixers use `decl_search` with `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or `mixin:<Type>` (Dart `with`); prefix-free `attribute=\"<Type>\"` matches all three. For every method/field/variant of one class, call `hierarchy(symbol_id=<class>)` first to enumerate the member set before reading bodies, replacing member-by-member reads or greps.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({

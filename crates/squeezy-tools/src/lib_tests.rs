@@ -11707,7 +11707,17 @@ fn core_tool_prefix_stays_within_byte_baseline() {
     // buys collapsing an N-base enumeration from N serial calls to one,
     // which on a wide hierarchy saves far more tokens (and per-turn budget)
     // than the prose costs — a strongly net-negative token change.
-    const PREFIX_BYTES_BASELINE: usize = 24_700;
+    // 24_700 -> 24_904: deliberate bump for language-aware inheritance
+    // guidance on `decl_search`/`hierarchy` — documenting `iface:<Type>`
+    // (implements), Dart `with` mixers as `mixin:<Type>`, and the
+    // prefix-free `attribute="<Type>"` form that matches base:/iface:/mixin:
+    // at once. The data was already indexed; without these recipes the model
+    // queried only `base:` and missed every Dart mixer, then fell back to a
+    // single-line regex that drops multi-line `with` clauses. The +204 bytes
+    // buys correct one-call retrieval of every extender/implementer/mixer of
+    // a type — net-negative on tokens versus the failed-regex retries it
+    // replaces.
+    const PREFIX_BYTES_BASELINE: usize = 24_904;
 
     // Every first-party spec advertised in the always-core path, paired
     // with the required params the model must still see to call it. Tools
