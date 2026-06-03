@@ -202,7 +202,7 @@ pub(crate) fn diff_context_spec() -> ToolSpec {
 /// back to the lexical tool on its own.
 fn graph_first_preamble(fallback_tool: &str) -> String {
     format!(
-        "Prefer `decl_search`, `reference_search`, or `symbol_context` for bare-name symbol queries in indexed source files — they follow imports and re-exports that regex misses. Use `{fallback_tool}` for literal text or for file types the graph does not index.",
+        "Prefer `decl_search`, `reference_search`, or `symbol_context` for bare-name symbol queries in indexed source — they follow imports and re-exports that regex misses. Use `{fallback_tool}` for literal text or file types the graph does not index.",
     )
 }
 
@@ -210,7 +210,7 @@ pub(crate) fn grep_spec() -> ToolSpec {
     ToolSpec {
         name: "grep".to_string(),
         description: format!(
-            "{preamble} Search text files under a workspace path. Respects .gitignore by default; set include_ignored=true only when ignored files are intentionally needed. Use output_mode=count or files_with_matches for broad exploration before reading content.",
+            "{preamble} Search text files under a workspace path. Respects .gitignore by default; set include_ignored=true only when ignored files are needed. Use output_mode=count or files_with_matches for broad exploration before reading content.",
             preamble = graph_first_preamble("grep"),
         ),
         capability: PermissionCapability::Search,
@@ -242,7 +242,7 @@ pub(crate) fn glob_spec() -> ToolSpec {
     ToolSpec {
         name: "glob".to_string(),
         description: format!(
-            "{preamble} List workspace file paths matching a glob without reading file contents. Respects .gitignore by default; set include_ignored=true only when ignored paths are intentionally needed.",
+            "{preamble} List workspace file paths matching a glob without reading contents. Respects .gitignore by default; set include_ignored=true only when ignored paths are needed.",
             preamble = graph_first_preamble("glob"),
         ),
         capability: PermissionCapability::Search,
@@ -268,7 +268,7 @@ pub(crate) fn read_file_spec() -> ToolSpec {
     ToolSpec {
         name: "read_file".to_string(),
         description: format!(
-            "{preamble} Read a bounded byte slice from one workspace file and return its sha256 receipt. Each line in `content` is prefixed with its 1-based absolute line number followed by a tab (cat -n format); `start_line` carries the same number for the first line so the model never has to count newlines to report a line. Use `read_file` once the graph (or a free-form `grep`) has produced a path and span. When grep has flagged the relevant lines, pass `offset` and `limit` to fetch only that section — reading whole files when you only need one function body burns input tokens for no recall benefit. For symbol-shaped reads where a graph packet already returned a `symbol_id`, `read_slice` with `symbol_id` + `span_kind=body` is strictly cheaper.",
+            "{preamble} Read a bounded byte slice from one workspace file and return its sha256 receipt. Each `content` line is prefixed with its 1-based absolute line number and a tab (cat -n format); `start_line` carries that number for the first line. Pass `offset`/`limit` to fetch only the section grep flagged; reading whole files when you need one body wastes tokens. For a symbol_id from a graph packet, `read_slice` with `span_kind=body` is cheaper.",
             preamble = graph_first_preamble("read_file"),
         ),
         capability: PermissionCapability::Read,
@@ -307,7 +307,7 @@ pub(crate) fn read_tool_output_spec() -> ToolSpec {
     ToolSpec {
         name: "read_tool_output".to_string(),
         description:
-            "Read a bounded byte range from a spilled tool-output. Pass exactly one of `handle` (sha256 minted when a generic tool result overflows the spill threshold) or `path` (per-session spillover tempfile minted by the shell tool when its raw stdout/stderr exceeds the truncation budget)."
+            "Read a bounded byte range from a spilled tool-output. Pass exactly one of `handle` (sha256 minted when a generic tool result overflows the spill threshold) or `path` (per-session shell spillover tempfile minted when raw stdout/stderr exceeds the truncation budget)."
                 .to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
@@ -347,7 +347,7 @@ pub(crate) fn repo_map_spec() -> ToolSpec {
 pub(crate) fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search or count graph-backed declarations by signature/name or filters such as kind, language, path, visibility, and attribute. Use this for broad lists/counts; for a single defining file prefer definition_search. For inheritance queries in class-based languages pass `attribute=\"base:<TypeName>\"`; do not embed `base:` in `query`. One decl_search returns the whole matching declaration set at once — strongly prefer it over multiple greps when you're enumerating \"every X that does Y\". Do not call decl_search plus definition_search or symbol_context with the same query in one turn unless the first result is ambiguous.".to_string(),
+        description: "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance in class-based languages pass `attribute=\"base:<TypeName>\"`, not `base:` in `query`. One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". Do not also call definition_search or symbol_context with the same query in one turn unless this result is ambiguous.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -371,7 +371,7 @@ pub(crate) fn decl_search_spec() -> ToolSpec {
 pub(crate) fn definition_search_spec() -> ToolSpec {
     ToolSpec {
         name: "definition_search".to_string(),
-        description: "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?' or 'name one nearby declaration'. Use before flow tools when a name may be ambiguous, but do not also call decl_search or symbol_context for the same query unless this result is insufficient.".to_string(),
+        description: "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?'. Use before flow tools when a name may be ambiguous; do not also call decl_search or symbol_context for the same query unless this result is insufficient.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -393,7 +393,7 @@ pub(crate) fn definition_search_spec() -> ToolSpec {
 pub(crate) fn reference_search_spec() -> ToolSpec {
     ToolSpec {
         name: "reference_search".to_string(),
-        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when one was returned by a prior graph call. One reference_search returns every callsite at once — strongly prefer it over issuing N greps for the same symbol name.".to_string(),
+        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when a prior graph call returned one. One call returns every callsite — prefer it over N greps for the same symbol name.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -415,7 +415,7 @@ pub(crate) fn reference_search_spec() -> ToolSpec {
 pub(crate) fn upstream_flow_spec() -> ToolSpec {
     ToolSpec {
         name: "upstream_flow".to_string(),
-        description: "Return compact callers (bounded BFS up to max_depth, each packet tagged with `depth`) and direct inbound references for a resolved symbol. Use for questions like 'who calls X?' or 'who calls X within N hops?'.".to_string(),
+        description: "Return compact callers (bounded BFS up to max_depth, each packet tagged with `depth`) and direct inbound references for a resolved symbol. Use for 'who calls X?' or 'who calls X within N hops?'.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -461,7 +461,7 @@ pub(crate) fn downstream_flow_spec() -> ToolSpec {
 pub(crate) fn hierarchy_spec() -> ToolSpec {
     ToolSpec {
         name: "hierarchy".to_string(),
-        description: "Return graph containment hierarchy (file → module → class → members) for the workspace, a symbol_id, or a declaration query. This is containment, NOT inheritance — for subclasses/implementors use `decl_search` with `attribute=\"base:<TypeName>\"`. When the prompt asks about every method (or every field/variant) of one class, call `hierarchy(symbol_id=<class>)` first to fix the member set before reading bodies — one hierarchy call enumerates every member, replacing a sequence of file reads or member-by-member greps.".to_string(),
+        description: "Return graph containment hierarchy (file → module → class → members) for the workspace, a symbol_id, or a declaration query. This is containment, NOT inheritance — for subclasses/implementors use `decl_search` with `attribute=\"base:<TypeName>\"`. For every method/field/variant of one class, call `hierarchy(symbol_id=<class>)` first to enumerate the member set before reading bodies, replacing member-by-member reads or greps.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -483,7 +483,7 @@ pub(crate) fn hierarchy_spec() -> ToolSpec {
 pub(crate) fn read_slice_spec() -> ToolSpec {
     ToolSpec {
         name: "read_slice".to_string(),
-        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Each line in the returned `content` is prefixed with its 1-based absolute line number followed by a tab (cat -n format); the result also carries `start_line` so the model never has to count newlines. Set read_mode=diff to return only changed ranges against a baseline. When a graph packet returns a symbol_id (definition_search, symbol_context, hierarchy, reference_search), `symbol_id=<id>` with `span_kind=body` returns the body span directly.".to_string(),
+        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Each `content` line is prefixed with its 1-based absolute line number and a tab (cat -n format); the result also carries `start_line`. Set read_mode=diff to return only changed ranges against a baseline. For a symbol_id from a graph packet (definition_search, symbol_context, hierarchy, reference_search), `span_kind=body` returns the body span directly.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -492,15 +492,15 @@ pub(crate) fn read_slice_spec() -> ToolSpec {
             "properties": {
                 "path": {"type": "string"},
                 "symbol_id": {"type": "string", "description": "Symbol id from a graph packet. With span_kind=body returns the full body span — preferred over guessing start_line/end_line."},
-                "span_kind": {"type": "string", "enum": ["signature", "body"], "description": "With symbol_id: `signature` returns the declaration line(s); `body` returns the full body span. Default signature."},
+                "span_kind": {"type": "string", "enum": ["signature", "body"], "description": "With symbol_id: `signature` returns the declaration line(s); `body` the full body span. Default signature."},
                 "read_mode": {"type": "string", "enum": ["slice", "diff"], "description": "slice returns the requested exact range; diff returns only changed ranges for the same path or symbol. Default slice."},
-                "diff_baseline": {"type": "string", "enum": ["worktree", "branch_base", "index", "last_receipt"], "description": "Baseline for read_mode=diff. worktree compares against HEAD including staged, unstaged, and untracked changes; branch_base compares against the default-branch merge base; index compares staged changes; last_receipt compares against the most recent model-visible read snapshot for this path and falls back to worktree if unavailable."},
+                "diff_baseline": {"type": "string", "enum": ["worktree", "branch_base", "index", "last_receipt"], "description": "Baseline for read_mode=diff. worktree compares against HEAD (staged, unstaged, untracked); branch_base against the default-branch merge base; index against staged changes; last_receipt against the most recent model-visible read snapshot for this path (falls back to worktree)."},
                 "max_ranges": {"type": "integer", "minimum": 1, "maximum": 100},
                 "start_byte": {"type": "integer", "minimum": 0},
                 "end_byte": {"type": "integer", "minimum": 0},
-                "start_line": {"type": "integer", "minimum": 1, "description": "1-based start line. When the requested window is narrower than ~60 lines it auto-widens symmetrically toward ~80 lines so the enclosing block fits in one fetch."},
+                "start_line": {"type": "integer", "minimum": 1, "description": "1-based start line. Windows narrower than ~60 lines auto-widen symmetrically toward ~80 lines so the enclosing block fits in one fetch."},
                 "end_line": {"type": "integer", "minimum": 1, "description": "1-based end line, inclusive. Pair with start_line; the window auto-widens when too tight."},
-                "context_lines": {"type": "integer", "minimum": 0, "description": "Extra context to add on each side of the line range. Adds on top of the auto-widening default."},
+                "context_lines": {"type": "integer", "minimum": 0, "description": "Extra context on each side of the line range, on top of the auto-widening default."},
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LIMIT},
                 "diff_only": {"type": "boolean"}
@@ -513,7 +513,7 @@ pub(crate) fn read_slice_spec() -> ToolSpec {
 pub(crate) fn symbol_context_spec() -> ToolSpec {
     ToolSpec {
         name: "symbol_context".to_string(),
-        description: "Return compact graph-backed context for symbols matching a declaration query, including callers, callees, references, dirty/diff annotations, and evidence packets. Use when the user asks for relationships, callers, references, or impact. Avoid for simple definition/file lookup already answered by definition_search.".to_string(),
+        description: "Return compact graph-backed context for symbols matching a declaration query: callers, callees, references, dirty/diff annotations, and evidence packets. Use for relationships, callers, references, or impact. Avoid for simple definition/file lookup that definition_search answers.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -535,7 +535,7 @@ pub(crate) fn symbol_context_spec() -> ToolSpec {
 pub(crate) fn list_skills_spec() -> ToolSpec {
     ToolSpec {
         name: "list_skills".to_string(),
-        description: "List locally discovered Squeezy skills by metadata only. Use before load_skill when the task may benefit from specialized instructions. Skill bodies are not included in this listing.".to_string(),
+        description: "List locally discovered Squeezy skills by metadata only (no bodies). Use before load_skill when the task may benefit from specialized instructions.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -550,7 +550,7 @@ pub(crate) fn list_skills_spec() -> ToolSpec {
 pub(crate) fn load_skill_spec() -> ToolSpec {
     ToolSpec {
         name: "load_skill".to_string(),
-        description: "Load one locally discovered skill body into the conversation when the user explicitly requests it or the task matches a listed skill description. Loading a skill only adds instructions and does not change tool permissions.".to_string(),
+        description: "Load one discovered skill body into the conversation when the user requests it or the task matches a listed skill. Loading a skill only adds instructions; it does not change tool permissions.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -568,7 +568,7 @@ pub(crate) fn load_skill_spec() -> ToolSpec {
 pub(crate) fn notes_remember_spec() -> ToolSpec {
     ToolSpec {
         name: "notes_remember".to_string(),
-        description: "Persist a durable note (decision, convention, dead-end, preference) into local storage for retrieval in this or any future session. Use sparingly: text >= 8 chars, capture only facts you would re-derive next session.".to_string(),
+        description: "Persist a durable note (decision, convention, dead-end, preference) to local storage for retrieval in this or any future session. Use sparingly: capture only facts you would re-derive next session.".to_string(),
         capability: PermissionCapability::Read,
         // Writes to the durable notes store; serialize so two remember
         // calls in the same turn cannot interleave at the redb layer.
@@ -591,7 +591,7 @@ pub(crate) fn notes_remember_spec() -> ToolSpec {
 pub(crate) fn notes_recall_spec() -> ToolSpec {
     ToolSpec {
         name: "notes_recall".to_string(),
-        description: "Search persisted notes by free-text query (kind, text, tags, source). Returns up to `limit` recent matches sorted by recency. Use this before re-deriving a decision the previous session already recorded.".to_string(),
+        description: "Search persisted notes by free-text query (kind, text, tags, source). Returns up to `limit` recent matches sorted by recency. Use before re-deriving a decision a previous session recorded.".to_string(),
         capability: PermissionCapability::Read,
         // Pure read of the durable notes store; preserve the prior
         // hardcoded serial behavior so a concurrent `notes_remember`
@@ -613,7 +613,7 @@ pub(crate) fn notes_recall_spec() -> ToolSpec {
 pub(crate) fn observations_spec() -> ToolSpec {
     ToolSpec {
         name: "observations".to_string(),
-        description: "Surface persisted observations (decisions, preferences, conventions, dead-ends, notes) recorded across sessions. Omit `query` to list the most recent; provide it to token-search the redb-backed index. Read-only.".to_string(),
+        description: "Surface persisted observations (decisions, preferences, conventions, dead-ends, notes) recorded across sessions. Omit `query` to list the most recent; provide it to token-search the index. Read-only.".to_string(),
         capability: PermissionCapability::Read,
         // Mirrors the prior hardcoded behavior — kept serial so a
         // companion `notes_remember` in the same turn lands before the
@@ -664,7 +664,7 @@ pub(crate) fn apply_patch_spec() -> ToolSpec {
             "path": {"type": "string", "description": "Workspace-relative path to an existing file."},
             "search": {"type": "string", "description": "Exact current text to replace."},
             "replace": {"type": "string", "description": "Replacement text. Pass an empty string to delete the matched range."},
-            "expected_sha256": {"type": "string", "description": "Optional sha256 of the file as currently on disk (from read_file/read_slice). When omitted, apply_patch checks that the most recent read_file/read_slice snapshot for this path still matches on-disk content; if the model has not read the file yet, the call is refused with a 'call read_file first' hint."},
+            "expected_sha256": {"type": "string", "description": "Optional sha256 of the on-disk file (from read_file/read_slice). When omitted, the latest read_file/read_slice snapshot for this path must still match on-disk content, else the call is refused."},
             "allow_multiple": {"type": "boolean", "description": "When true, replace every occurrence of search. Default false requires exactly one match."},
             "fallback": {"type": "string", "enum": ["unified_diff"], "description": "Optional opt-in fallback when search misses: treat search as a unified-diff body and apply via git apply --3way."}
         },
@@ -687,7 +687,7 @@ pub(crate) fn apply_patch_spec() -> ToolSpec {
         "properties": {
             "kind": {"const": "delete_file"},
             "path": {"type": "string", "description": "Workspace-relative path to delete."},
-            "expected_sha256": {"type": "string", "description": "Optional sha256 of the file as currently on disk. When omitted, the read_file/read_slice snapshot for this path must still match on-disk content."}
+            "expected_sha256": {"type": "string", "description": "Optional sha256 of the on-disk file. When omitted, the read_file/read_slice snapshot for this path must still match on-disk content."}
         },
         "required": ["kind", "path"]
     });
@@ -698,7 +698,7 @@ pub(crate) fn apply_patch_spec() -> ToolSpec {
             "kind": {"const": "move_file"},
             "from": {"type": "string", "description": "Source workspace-relative path."},
             "to": {"type": "string", "description": "Destination workspace-relative path. Must not exist."},
-            "expected_sha256": {"type": "string", "description": "Optional sha256 of the source file as currently on disk. When omitted, the read_file/read_slice snapshot for the source path must still match on-disk content."},
+            "expected_sha256": {"type": "string", "description": "Optional sha256 of the on-disk source file. When omitted, the read_file/read_slice snapshot for the source path must still match on-disk content."},
             "post_replace": {
                 "type": "object",
                 "additionalProperties": false,
@@ -728,7 +728,7 @@ pub(crate) fn apply_patch_spec() -> ToolSpec {
     };
     ToolSpec {
         name: "apply_patch".to_string(),
-        description: "Apply edits to the workspace as a sequence of typed operations (search_replace, create_file, delete_file, move_file). Pass either `patches` (legacy search-replace only) or `operations`, not both. Each op is sha256-gated where applicable and a single checkpoint is recorded per call.".to_string(),
+        description: "Apply edits as a sequence of typed operations (search_replace, create_file, delete_file, move_file). Pass either `patches` (legacy search-replace only) or `operations`, not both. Each op is sha256-gated where applicable; one checkpoint is recorded per call.".to_string(),
         capability: PermissionCapability::Edit,
         parallel_safe: false,
         parameters: tool_schema(json!({
@@ -769,7 +769,7 @@ pub(crate) fn apply_patch_spec() -> ToolSpec {
 pub(crate) fn write_file_spec() -> ToolSpec {
     ToolSpec {
         name: "write_file".to_string(),
-        description: "Replace a workspace file with exact content. For existing files either pass expected_sha256 from read_file or rely on the most recent read_file/read_slice snapshot for the path; write_file refuses when the file has changed since that snapshot. For Jupyter notebooks (.ipynb) use notebook_edit instead so cell structure and outputs are preserved.".to_string(),
+        description: "Replace a workspace file with exact content. For existing files pass expected_sha256 from read_file, or rely on the most recent read_file/read_slice snapshot; write_file refuses if the file changed since that snapshot. For Jupyter notebooks (.ipynb) use notebook_edit instead to preserve cell structure and outputs.".to_string(),
         capability: PermissionCapability::Edit,
         parallel_safe: false,
         parameters: tool_schema(json!({
@@ -778,7 +778,7 @@ pub(crate) fn write_file_spec() -> ToolSpec {
             "properties": {
                 "path": {"type": "string", "description": "Workspace-relative file path."},
                 "content": {"type": "string", "description": "Full replacement file content."},
-                "expected_sha256": {"type": "string", "description": "Optional sha256 of the current file content. When omitted for an existing file, write_file checks that the latest read_file/read_slice snapshot still matches on-disk content."}
+                "expected_sha256": {"type": "string", "description": "Optional sha256 of current file content. When omitted for an existing file, the latest read_file/read_slice snapshot must still match on-disk content."}
             },
             "required": ["path", "content"]
         })),
@@ -789,7 +789,7 @@ pub(crate) fn write_file_spec() -> ToolSpec {
 pub(crate) fn notebook_edit_spec() -> ToolSpec {
     ToolSpec {
         name: "notebook_edit".to_string(),
-        description: "Edit a single cell of a Jupyter notebook (.ipynb). Supports replace/insert/delete on cells located by id or by zero-based `cell-N` index. Code-cell modifications reset execution_count and outputs so the file stays consistent with what the model wrote.".to_string(),
+        description: "Edit a single cell of a Jupyter notebook (.ipynb). Supports replace/insert/delete on cells located by id or zero-based `cell-N` index. Code-cell edits reset execution_count and outputs to stay consistent.".to_string(),
         capability: PermissionCapability::Edit,
         parallel_safe: false,
         parameters: tool_schema(json!({
@@ -886,7 +886,7 @@ fn normalize_string_aliases(raw: &mut Value, canonical: &str, aliases: &[&str]) 
 pub(crate) fn refresh_compiler_facts_spec() -> ToolSpec {
     ToolSpec {
         name: "refresh_compiler_facts".to_string(),
-        description: "Explicitly refresh cached Cargo compiler facts for the Rust workspace. Runs cargo metadata, and optionally cargo check JSON diagnostics, then annotates the semantic graph without making navigation tools invoke cargo.".to_string(),
+        description: "Refresh cached Cargo compiler facts for the Rust workspace. Runs cargo metadata, optionally cargo check JSON diagnostics, then annotates the semantic graph so navigation tools never invoke cargo.".to_string(),
         capability: PermissionCapability::Compiler,
         parallel_safe: false,
         parameters: tool_schema(json!({
@@ -922,7 +922,7 @@ pub(crate) fn verify_spec() -> ToolSpec {
 pub(crate) fn webfetch_spec() -> ToolSpec {
     ToolSpec {
         name: "webfetch".to_string(),
-        description: "Fetch a specific HTTP(S) URL with the host/domain shown in the approval summary. Use only for URLs provided by the user, found in local files, or discovered through websearch. Returns bounded redacted text or HTML with source URL, retrieval time, citations, and cache receipt metadata; redirects to another host are reported for a new approval.".to_string(),
+        description: "Fetch a specific HTTP(S) URL (host shown in the approval summary). Use only for URLs from the user, local files, or websearch. Returns bounded redacted text or HTML with source URL, retrieval time, citations, and cache receipt metadata; cross-host redirects require a new approval.".to_string(),
         capability: PermissionCapability::Network,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -944,7 +944,7 @@ pub(crate) fn webfetch_spec() -> ToolSpec {
 pub(crate) fn websearch_spec() -> ToolSpec {
     ToolSpec {
         name: "websearch".to_string(),
-        description: "Search the web for current or external information using Squeezy's permission-gated Exa search backend. Use for discovery; use webfetch when retrieving a specific URL. Results include redacted quote text, source URLs when present, retrieval time, citations, and cache receipt metadata.".to_string(),
+        description: "Search the web via Squeezy's permission-gated Exa backend. Use for discovery; use webfetch to retrieve a specific URL. Results include redacted quote text, source URLs when present, retrieval time, citations, and cache receipt metadata.".to_string(),
         capability: PermissionCapability::Network,
         parallel_safe: true,
         parameters: tool_schema(json!({

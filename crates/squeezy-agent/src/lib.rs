@@ -12464,10 +12464,9 @@ fn delegate_advertised_tool() -> AdvertisedTool {
         spec: Arc::new(LlmToolSpec {
             name: DELEGATE_TOOL_NAME.to_string(),
             description: "Delegate broad research to an isolated subagent. \
-                          Use only when the user explicitly asks for non-trivial research, code mapping, or refactoring help — \
+                          Use only when the user explicitly asks for non-trivial research, code mapping, or refactoring — \
                           NOT for greetings, casual replies, or simple questions the parent can answer directly. \
-                          The `prompt` field is required; calling without a concrete instruction will be rejected. \
-                          The parent receives only a structured summary, supporting receipts, and separate spend metrics."
+                          `prompt` is required; the parent receives only a structured summary, supporting receipts, and separate spend metrics."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -12475,7 +12474,7 @@ fn delegate_advertised_tool() -> AdvertisedTool {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Required: a concrete natural-language research instruction for the subagent. Must be present and non-empty."
+                        "description": "Required, non-empty: a concrete research instruction for the subagent."
                     },
                     "scope": {
                         "type": ["string", "null"],
@@ -12644,9 +12643,9 @@ fn explore_advertised_tool() -> AdvertisedTool {
         spec: Arc::new(LlmToolSpec {
             name: EXPLORE_TOOL_NAME.to_string(),
             description: "Ask a cheaper read-only exploration subagent to scan the codebase with Squeezy semantic tools. \
-                          Use only when the user asks a non-trivial codebase question — \
+                          Use only for a non-trivial codebase question — \
                           NOT for greetings, chitchat, or questions the parent can answer directly from context. \
-                          The `prompt` field is required and must contain a concrete codebase question."
+                          `prompt` is required and must contain a concrete codebase question."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -12654,7 +12653,7 @@ fn explore_advertised_tool() -> AdvertisedTool {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Required: a concrete codebase question or task context to investigate. Must be present and non-empty."
+                        "description": "Required, non-empty: a concrete codebase question or task context to investigate."
                     },
                     "scope": {
                         "type": ["string", "null"],

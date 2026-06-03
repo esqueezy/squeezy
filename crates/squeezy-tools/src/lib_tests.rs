@@ -11212,3 +11212,85 @@ async fn read_file_dispatch_misspelled_alias_still_fails() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+/// The always-sent core tool prefix (tool name + description + serialized
+/// JSON schema for every first-party spec) is what every request pays for
+/// and what the provider prompt cache hashes. This is a byte-regression
+/// gate for cost-idea G2 ("slim the cached prefix"): the assembled prefix
+/// must stay at or below the recorded baseline, and every tool name plus
+/// each tool's required params must still be present so the model can call
+/// every tool. Trimming a description is fine; dropping a tool or a
+/// required param is not. If an intentional addition raises the size,
+/// re-measure and bump `PREFIX_BYTES_BASELINE` deliberately.
+#[test]
+fn core_tool_prefix_stays_within_byte_baseline() {
+    // Recorded after the G2 prefix-slimming pass. Was 25_852 before the
+    // pass; keep this monotonically non-increasing for cache stability.
+    const PREFIX_BYTES_BASELINE: usize = 24_593;
+
+    // Every first-party spec advertised in the always-core path, paired
+    // with the required params the model must still see to call it. Tools
+    // with no required params carry an empty slice; the presence check
+    // alone guards them.
+    let cases: Vec<(ToolSpec, &[&str])> = vec![
+        (apply_patch_spec(), &[]),
+        (decl_search_spec(), &[]),
+        (definition_search_spec(), &[]),
+        (diff_context_spec(), &[]),
+        (downstream_flow_spec(), &[]),
+        (glob_spec(), &["pattern"]),
+        (grep_spec(), &["pattern"]),
+        (hierarchy_spec(), &[]),
+        (notebook_edit_spec(), &["path", "expected_sha256"]),
+        (plan_patch_spec(), &["objective"]),
+        (read_file_spec(), &["path"]),
+        (read_slice_spec(), &[]),
+        (read_tool_output_spec(), &[]),
+        (reference_search_spec(), &[]),
+        (refresh_compiler_facts_spec(), &[]),
+        (repo_map_spec(), &[]),
+        (write_file_spec(), &["path", "content"]),
+        (symbol_context_spec(), &["query"]),
+        (upstream_flow_spec(), &[]),
+        (verify_spec(), &[]),
+        (shell_spec(), &["command", "description"]),
+        (webfetch_spec(), &["url"]),
+        (websearch_spec(), &["query"]),
+        (list_skills_spec(), &[]),
+        (load_skill_spec(), &["name"]),
+        (notes_remember_spec(), &["kind", "text"]),
+        (notes_recall_spec(), &["query"]),
+        (observations_spec(), &[]),
+    ];
+
+    let mut total = 0usize;
+    for (mut spec, required) in cases {
+        compact_typed_tool_parameters(&mut spec.parameters);
+        let params = serde_json::to_string(&spec.parameters).expect("serialize schema");
+
+        // Every tool keeps a non-empty description so the model knows what
+        // it does; trimming must not empty one out.
+        assert!(
+            !spec.description.trim().is_empty(),
+            "{} lost its description",
+            spec.name
+        );
+        // Every required param must still be declared in the schema so the
+        // model knows the mandatory arguments.
+        for param in required {
+            assert!(
+                params.contains(&format!("\"{param}\"")),
+                "{} schema must still declare required param `{param}`; got {params}",
+                spec.name
+            );
+        }
+
+        total += spec.name.len() + spec.description.len() + params.len();
+    }
+
+    assert!(
+        total <= PREFIX_BYTES_BASELINE,
+        "core tool prefix grew to {total} bytes, above the {PREFIX_BYTES_BASELINE}-byte baseline; \
+         trim descriptions/schemas or bump the baseline deliberately",
+    );
+}
