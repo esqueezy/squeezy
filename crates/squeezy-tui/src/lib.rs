@@ -8715,9 +8715,7 @@ fn role_action(role: &Role) -> (&'static str, Color) {
 
 fn message_content_style(role: &Role) -> Style {
     match role {
-        Role::User => Style::default()
-            .fg(palette::muted_fg())
-            .bg(crate::render::theme::prompt_bg()),
+        Role::User => Style::default().fg(palette::muted_fg()),
         Role::Assistant | Role::System => Style::default(),
     }
 }
