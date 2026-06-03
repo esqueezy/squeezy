@@ -43,3 +43,23 @@ fn every_style_has_frames() {
         assert_eq!(style.frame(0), style.frames()[0]);
     }
 }
+
+#[test]
+fn rail_marker_is_always_one_cell() {
+    // The rail gutter needs a single-cell live marker for every style and
+    // every animation phase (drift's 3-cell slide twinkles in place instead).
+    for style in [
+        SpinnerStyle::Twinkle,
+        SpinnerStyle::Scintillate,
+        SpinnerStyle::Drift,
+    ] {
+        for tick in 0..16u64 {
+            let marker = style.rail_marker(tick * 200);
+            assert_eq!(
+                marker.chars().count(),
+                1,
+                "{style:?} rail marker must be one cell: {marker:?}"
+            );
+        }
+    }
+}
