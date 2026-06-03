@@ -45,8 +45,8 @@ use squeezy_core::{
     AppConfig, ConfigWarning, ContextAttachment, ContextAttachmentKind, ContextCompactionRecord,
     ContextCompactionState, ContextEstimate, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES,
     PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
-    SessionResumePicker, ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot,
-    TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
+    ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig,
+    ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
     TuiSynchronizedOutput, TurnMetrics, context_attachment_storage_text,
     detect_context_attachment_kind, detect_image_mime,
 };
@@ -610,9 +610,6 @@ pub async fn run_with_startup_profile_in_terminal(
 }
 
 pub fn startup_resume_question_available(config: &AppConfig) -> bool {
-    if config.session_resume_picker == SessionResumePicker::Never {
-        return false;
-    }
     // Only a yes/no answer is needed here, so use the summary-only loader:
     // skip the per-candidate event-log reads that `load_candidates` does for
     // branch detection (the picker itself still does them when it renders).
@@ -932,9 +929,6 @@ fn maybe_pick_resume_session(
     if startup.skip_resume_picker {
         return Ok(ResumeStartup::Fresh);
     }
-    if config.session_resume_picker == SessionResumePicker::Never {
-        return Ok(ResumeStartup::Fresh);
-    }
     let candidates = resume_picker::load_candidates(config);
     if candidates.is_empty() {
         return Ok(ResumeStartup::Fresh);
@@ -950,10 +944,7 @@ fn maybe_pick_resume_session(
     )
     .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
     match choice {
-        resume_picker::ResumeChoice::StartFresh { suppress } => {
-            persist_resume_picker_suppression(config, suppress)?;
-            Ok(ResumeStartup::Fresh)
-        }
+        resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
         // `branch_tip` is captured by the picker but not yet wired through
         // the resume flow — the agent restarts at the most recent event in
         // the session log. Branch-aware resume is a follow-up; the
@@ -985,32 +976,6 @@ fn maybe_pick_resume_session(
         resume_picker::ResumeChoice::Back => Ok(ResumeStartup::BackToSetup),
         resume_picker::ResumeChoice::Quit => Ok(ResumeStartup::Quit),
     }
-}
-
-fn persist_resume_picker_suppression(
-    config: &AppConfig,
-    suppress: resume_picker::ResumePickerSuppress,
-) -> Result<()> {
-    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
-
-    if !suppress.project && !suppress.user {
-        return Ok(());
-    }
-    let edit = SettingsEdit {
-        path: &["session", "resume_picker"],
-        op: EditOp::SetString(SessionResumePicker::Never.as_str().to_string()),
-    };
-    if suppress.project {
-        let path = squeezy_core::per_repo_settings_path(&config.workspace_root);
-        apply_edits(&SettingsScope::repo(&path), std::slice::from_ref(&edit))
-            .map_err(|err| SqueezyError::Config(err.to_string()))?;
-    }
-    if suppress.user {
-        let path = squeezy_core::default_settings_path();
-        apply_edits(&SettingsScope::user(&path), &[edit])
-            .map_err(|err| SqueezyError::Config(err.to_string()))?;
-    }
-    Ok(())
 }
 
 /// Format the exit hint printed when the user picks a cross-project

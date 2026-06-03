@@ -32,9 +32,9 @@ use squeezy_store::{
 };
 
 /// Maximum number of sessions shown in the overlay, newest-first. The picker
-/// is now opt-in (`--resume`), so the user came here deliberately to find a
-/// session — a fuller page is more useful than a terse five.
-pub(crate) const MAX_PICKER_ENTRIES: usize = 20;
+/// is opt-in (`--resume`) and scrolls, so the user came here deliberately to
+/// hunt for a session — show a deep list rather than an arbitrarily short one.
+pub(crate) const MAX_PICKER_ENTRIES: usize = 100;
 
 /// Sessions started within this window of `now_ms` are considered for the
 /// resume picker. Older sessions can still be reached via
@@ -175,9 +175,7 @@ impl SessionSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResumeChoice {
-    StartFresh {
-        suppress: ResumePickerSuppress,
-    },
+    StartFresh,
     Resume {
         session_id: String,
         /// When `Some(sequence)`, the user picked a branch tip in a
@@ -186,22 +184,16 @@ pub(crate) enum ResumeChoice {
         /// (the common case), where the resume flow is unchanged.
         branch_tip: Option<u64>,
     },
-    /// Selected session lives outside the current cwd. The TUI exits without
-    /// chdir-ing and surfaces the `squeezy sessions resume <id>` invocation
-    /// the user should run from `target_cwd` — silently relocating the
-    /// process would surprise users juggling sibling repos.
+    /// Selected session lives outside the current cwd. The caller re-roots the
+    /// workspace at `target_cwd` and resumes in place; only if that directory
+    /// is gone does it fall back to surfacing the `squeezy sessions resume
+    /// <id>` invocation to run from there.
     CrossProject {
         session_id: String,
         target_cwd: String,
     },
     Back,
     Quit,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ResumePickerSuppress {
-    pub(crate) project: bool,
-    pub(crate) user: bool,
 }
 
 /// One selectable row in the picker. Linear sessions produce a single
@@ -364,8 +356,6 @@ pub(crate) struct ResumePickerState {
     all_sessions: Vec<SessionSummary>,
     pub(crate) cursor: usize,
     pub(crate) show_all_projects: bool,
-    pub(crate) never_project: bool,
-    pub(crate) never_user: bool,
     setup_progress: Option<(usize, usize)>,
     cwd: PathBuf,
 }
@@ -391,8 +381,6 @@ impl ResumePickerState {
             all_sessions,
             cursor: 0,
             show_all_projects: false,
-            never_project: false,
-            never_user: false,
             setup_progress,
             cwd,
         }
@@ -405,25 +393,13 @@ impl ResumePickerState {
     /// Number of selectable rows in the list — the leading "Start fresh"
     /// row plus every candidate.
     fn row_count(&self) -> usize {
-        self.candidates.len() + 3
+        self.candidates.len() + 1
     }
 
     /// Index of the "Start fresh" row — always 0 so the safe default is
     /// pre-selected when the picker opens.
     pub(crate) const fn start_fresh_index(&self) -> usize {
         0
-    }
-
-    fn project_checkbox_index(&self) -> usize {
-        self.candidates.len() + 1
-    }
-
-    fn user_checkbox_index(&self) -> usize {
-        self.candidates.len() + 2
-    }
-
-    fn cursor_on_checkbox(&self) -> bool {
-        self.cursor == self.project_checkbox_index() || self.cursor == self.user_checkbox_index()
     }
 
     /// Flip the project scope and re-derive `candidates`. The cursor is
@@ -442,12 +418,7 @@ impl ResumePickerState {
 
     fn select_at_cursor(&self) -> Option<ResumeChoice> {
         if self.cursor == self.start_fresh_index() {
-            return Some(ResumeChoice::StartFresh {
-                suppress: self.suppress_choice(),
-            });
-        }
-        if self.cursor_on_checkbox() {
-            return None;
+            return Some(ResumeChoice::StartFresh);
         }
         // candidate rows live at indices 1..=N.
         let entry = self.candidates.get(self.cursor - 1)?;
@@ -463,31 +434,6 @@ impl ResumePickerState {
                 target_cwd: entry.summary.cwd.clone(),
             })
         }
-    }
-
-    fn suppress_choice(&self) -> ResumePickerSuppress {
-        ResumePickerSuppress {
-            project: self.never_project || self.never_user,
-            user: self.never_user,
-        }
-    }
-
-    fn toggle_at_cursor(&mut self) -> bool {
-        if self.cursor == self.project_checkbox_index() {
-            self.never_project = !self.never_project;
-            if !self.never_project {
-                self.never_user = false;
-            }
-            return true;
-        }
-        if self.cursor == self.user_checkbox_index() {
-            self.never_user = !self.never_user;
-            if self.never_user {
-                self.never_project = true;
-            }
-            return true;
-        }
-        false
     }
 
     pub(crate) fn dispatch(&mut self, key: KeyEvent) -> Option<ResumeChoice> {
@@ -514,21 +460,9 @@ impl ResumePickerState {
             (KeyCode::Left, _) | (KeyCode::Backspace, _) if self.can_go_back() => {
                 Some(ResumeChoice::Back)
             }
-            (KeyCode::Char(' '), _) => {
-                self.toggle_at_cursor();
-                None
-            }
-            (KeyCode::Enter, _) => {
-                if self.toggle_at_cursor() {
-                    None
-                } else {
-                    self.select_at_cursor()
-                }
-            }
+            (KeyCode::Enter, _) => self.select_at_cursor(),
             (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
-                Some(ResumeChoice::StartFresh {
-                    suppress: self.suppress_choice(),
-                })
+                Some(ResumeChoice::StartFresh)
             }
             (KeyCode::Char('q'), _) | (KeyCode::Char('Q'), _) => Some(ResumeChoice::Quit),
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(ResumeChoice::Quit),
@@ -633,9 +567,7 @@ pub(crate) fn run_picker<W: io::Write>(
         ResumePickerState::new(all_sessions, cwd)
     };
     if state.candidates.is_empty() {
-        return Ok(ResumeChoice::StartFresh {
-            suppress: ResumePickerSuppress::default(),
-        });
+        return Ok(ResumeChoice::StartFresh);
     }
     loop {
         terminal.draw(|frame| render_picker(frame, &state))?;
@@ -749,7 +681,7 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     // instead of hard-cropping into the scrollbar.
     let list_area = layout[3];
     let visible = list_area.height.max(1) as usize;
-    let total = state.candidates.len() + 3; // Start fresh + candidates + 2 checkboxes
+    let total = state.candidates.len() + 1; // Start fresh + candidates
     let (body_area, scrollbar_area) = if total > visible {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -773,16 +705,6 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
         let cross_project = entry.summary.cwd != cwd_str;
         render_candidate_row(entry, row_idx == state.cursor, cross_project, content_width)
     }));
-    rows.push(render_checkbox_row(
-        "Never ask again for this project",
-        state.never_project || state.never_user,
-        state.cursor == state.project_checkbox_index(),
-    ));
-    rows.push(render_checkbox_row(
-        "Never ask again for this user",
-        state.never_user,
-        state.cursor == state.user_checkbox_index(),
-    ));
 
     let offset = if total <= visible {
         0
@@ -841,15 +763,7 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
             Style::default().fg(crate::render::theme::secondary()),
         ),
         Span::styled(
-            "confirm/toggle  ",
-            Style::default().fg(crate::render::theme::quiet()),
-        ),
-        Span::styled(
-            "Space ",
-            Style::default().fg(crate::render::theme::secondary()),
-        ),
-        Span::styled(
-            "toggle  ",
+            "confirm  ",
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]));
@@ -1031,29 +945,6 @@ fn render_start_fresh_row(active: bool) -> Line<'static> {
         Span::styled("◇ ", label_style),
         Span::styled("Start fresh", label_style),
         Span::styled("    — new conversation", hint_style),
-    ])
-}
-
-fn render_checkbox_row(label: &'static str, checked: bool, active: bool) -> Line<'static> {
-    let (prefix_color, label_style) = if active {
-        (
-            crate::render::theme::accent(),
-            Style::default()
-                .fg(crate::render::theme::secondary())
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        (
-            crate::render::theme::quiet(),
-            Style::default().fg(crate::render::theme::foreground()),
-        )
-    };
-    let prefix = if active { "▸ " } else { "  " };
-    let mark = if checked { "[x] " } else { "[ ] " };
-    Line::from(vec![
-        Span::styled(prefix, Style::default().fg(prefix_color)),
-        Span::styled(mark, Style::default().fg(crate::render::theme::accent())),
-        Span::styled(label, label_style),
     ])
 }
 

@@ -216,11 +216,12 @@ fn picker_scrolls_to_keep_cursor_visible_when_list_overflows() {
     }
     assert_eq!(state.cursor, last_candidate, "cursor on the last candidate");
 
-    // A short terminal can't fit all 20 rows, so the viewport must scroll:
-    // the selected row stays on screen and an early one scrolls off.
+    // A short terminal can't fit the whole list, so the viewport must scroll:
+    // the selected (last) row stays on screen and an early one scrolls off.
+    let last_label = format!("task for s{:02}", state.candidates.len() - 1);
     let text = render_state_to_text(&state, 80, 16);
     assert!(
-        text.contains("task for s19"),
+        text.contains(&last_label),
         "selected row must stay visible:\n{text}"
     );
     assert!(
@@ -269,9 +270,7 @@ fn picker_enter_on_start_fresh_starts_fresh() {
     let mut state = ResumePickerState::new(vec![summary("first")], cwd());
     assert_eq!(
         state.dispatch(press(KeyCode::Enter)),
-        Some(ResumeChoice::StartFresh {
-            suppress: ResumePickerSuppress::default(),
-        })
+        Some(ResumeChoice::StartFresh)
     );
 }
 
@@ -297,9 +296,7 @@ fn picker_esc_starts_fresh() {
     state.dispatch(press(KeyCode::Down)); // cursor on candidate
     assert_eq!(
         state.dispatch(press(KeyCode::Esc)),
-        Some(ResumeChoice::StartFresh {
-            suppress: ResumePickerSuppress::default(),
-        })
+        Some(ResumeChoice::StartFresh)
     );
 }
 
@@ -314,53 +311,16 @@ fn picker_q_quits() {
 
 #[test]
 fn picker_arrow_wraps_through_start_fresh_at_top() {
-    // [start_fresh, candidate, project checkbox, user checkbox] — 4 rows total.
+    // [start_fresh, candidate] — 2 rows total now that the suppression
+    // checkboxes are gone (the picker is opt-in via --resume).
     let mut state = ResumePickerState::new(vec![summary("only")], cwd());
     assert_eq!(state.cursor, 0); // opens on start_fresh
     state.dispatch(press(KeyCode::Down));
     assert_eq!(state.cursor, 1); // candidate
     state.dispatch(press(KeyCode::Down));
-    assert_eq!(state.cursor, 2); // project checkbox
-    state.dispatch(press(KeyCode::Down));
-    assert_eq!(state.cursor, 3); // user checkbox
-    state.dispatch(press(KeyCode::Down));
     assert_eq!(state.cursor, 0); // wraps back to start_fresh
     state.dispatch(press(KeyCode::Up));
-    assert_eq!(state.cursor, 3); // wraps up to last row (user checkbox)
-}
-
-#[test]
-fn user_never_ask_checkbox_implies_project_checkbox() {
-    let mut state = ResumePickerState::new(vec![summary("only")], cwd());
-    state.cursor = state.user_checkbox_index();
-
-    state.dispatch(press(KeyCode::Char(' ')));
-
-    assert!(state.never_user);
-    assert!(state.never_project);
-    state.cursor = state.start_fresh_index();
-    assert_eq!(
-        state.dispatch(press(KeyCode::Enter)),
-        Some(ResumeChoice::StartFresh {
-            suppress: ResumePickerSuppress {
-                project: true,
-                user: true,
-            },
-        })
-    );
-}
-
-#[test]
-fn clearing_project_checkbox_also_clears_user_checkbox() {
-    let mut state = ResumePickerState::new(vec![summary("only")], cwd());
-    state.cursor = state.user_checkbox_index();
-    state.dispatch(press(KeyCode::Char(' ')));
-    state.cursor = state.project_checkbox_index();
-
-    state.dispatch(press(KeyCode::Char(' ')));
-
-    assert!(!state.never_project);
-    assert!(!state.never_user);
+    assert_eq!(state.cursor, 1); // wraps up to the last row (candidate)
 }
 
 #[test]
