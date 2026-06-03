@@ -312,6 +312,29 @@ This upgrades php/scala/cpp from the §"directional, vs drifted baselines" tally
 **verified wins vs a fresh codex baseline**. The remaining mini langs still need
 the same fresh-codex treatment for a fully trustworthy 15-lang count.
 
+**Extended fresh-codex tally (11 languages, same rates, same day) — the headline
+trustworthy verdict:**
+
+| | langs (squeezy cheaper by) |
+|---|---|
+| **WIN (9)** | php (−34%), scala (−45%), cpp (−38%), js (−55%), kotlin (−40%), ruby (−16%), swift (−37%), java (−10%), **dart (−66%)** |
+| **TIE (1)** | go |
+| **LOSS (0)** | — |
+| unscored (2) | python (broken scenario — both fail), csharp (codex run errored) |
+
+So against a **fresh same-day codex baseline at identical pricing, squeezy wins
+9 of 11 re-baselined languages, ties 1, loses 0**, all at recall parity. This is
+*stronger* than the directional CSV tally and removes the drift caveat: **java
+and dart, which looked like a loss / borderline vs the stale CSV, are clear wins
+vs fresh codex** (fresh codex is markedly more expensive there — e.g. dart codex
+$0.195 vs squeezy $0.066), so the wobble was the CSV, not squeezy. Caveats: n=2–3
+(go's TIE is the only near-boundary call); python remains a broken scenario (both
+agents emit the wrong answer shape); csharp's codex run errored and should be
+re-run; rust wasn't re-baselined (its repo is squeezy itself) but its squeezy
+recall (6%) mirrors python's model-failure pattern. The root cause of the wins is
+**Wave 3b** — the graph is now operational on php/scala/dart, and squeezy's
+graph-guided navigation is simply cheaper than codex's read/grep loop.
+
 **Audit confirmation:** a per-language sweep of the remaining resolvers
 (java/kotlin/csharp/go/swift/c-c++/js-ts) found **no further pathology** — Java's
 `this.foo()` and C#/C++'s `base.Foo()` inheritance all route through the same
