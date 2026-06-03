@@ -1,4 +1,4 @@
-use super::{PlanCardData, render_plan_card, render_plan_diff};
+use super::{PlanCardData, line_width, render_plan_card, render_plan_diff};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,7 +35,7 @@ fn render_plan_card_shows_id_path_and_step_count() {
         path,
         parent_plan_id: None,
     };
-    let lines = render_plan_card(&data);
+    let lines = render_plan_card(&data, None);
     assert!(!lines.is_empty());
     let header = line_text(&lines[0]);
     assert!(
@@ -65,7 +65,7 @@ fn render_plan_card_uses_amber_box_not_full_amber_body() {
         parent_plan_id: None,
     };
 
-    let lines = render_plan_card(&data);
+    let lines = render_plan_card(&data, None);
     let top = line_text(&lines[0]);
     let path = line_text(&lines[1]);
     let body = lines
@@ -125,7 +125,10 @@ fn render_plan_card_emits_diff_when_parent_exists() {
         path: child_path,
         parent_plan_id: Some(parent_id.clone()),
     };
-    let rendered: Vec<String> = render_plan_card(&data).iter().map(line_text).collect();
+    let rendered: Vec<String> = render_plan_card(&data, None)
+        .iter()
+        .map(line_text)
+        .collect();
     let joined = rendered.join("\n");
     assert!(
         joined.contains(&format!("diff vs {parent_id}")),
@@ -151,8 +154,43 @@ fn render_plan_card_handles_missing_file_gracefully() {
         path: phantom,
         parent_plan_id: None,
     };
-    let lines = render_plan_card(&data);
+    let lines = render_plan_card(&data, None);
     assert!(line_text(&lines[0]).contains("file missing"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn render_plan_card_clamps_box_to_terminal_width() {
+    let root = fresh_workspace("clamp_width");
+    // One long sentence of ordinary words (~180 chars, no token over 56)
+    // survives markdown rendering unwrapped, so the box used to size
+    // itself to it and overflow an 80-column terminal.
+    let body = "This plan reworks the dispatch layer and the turn router and the cost broker and the subagent catalog so the whole control loop reads consistently end to end across the entire codebase here.\n";
+    assert!(body.trim_end().len() >= 180, "body must be long enough");
+    let (plan_id, path) =
+        proposed_plan::persist_plan(&root, TEST_SESSION, body, &PlanMeta::default())
+            .expect("persist plan");
+    let data = PlanCardData {
+        plan_id,
+        path,
+        parent_plan_id: None,
+    };
+
+    let width = 80u16;
+    let lines = render_plan_card(&data, Some(width));
+    for line in &lines {
+        assert!(
+            line_width(line) <= usize::from(width),
+            "line exceeds terminal width {width}: {:?} ({} cols)",
+            line_text(line),
+            line_width(line)
+        );
+    }
+    // The box must still be a rectangle: top and bottom borders share the
+    // same width.
+    let top = line_width(&lines[0]);
+    let bottom = line_width(lines.last().expect("bottom border"));
+    assert_eq!(top, bottom, "border rows must match width to form a box");
     let _ = std::fs::remove_dir_all(&root);
 }
 

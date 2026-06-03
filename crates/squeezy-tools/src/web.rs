@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
+    net::IpAddr,
     pin::Pin,
     sync::LazyLock,
     time::{Duration, SystemTime},
@@ -300,8 +301,16 @@ impl ToolRegistry {
             }
             let response_sha256 = sha256_hex(&response.body);
             let response_text = String::from_utf8_lossy(&response.body).to_string();
-            let result = parse_mcp_websearch_response(&response_text)
-                .ok_or_else(|| "websearch provider returned no text content".to_string())?;
+            let result = match parse_mcp_websearch_response(&response_text) {
+                Some(result) => result,
+                None => {
+                    let message = parse_mcp_websearch_error(&response_text).map_or_else(
+                        || "websearch provider returned no text content".to_string(),
+                        |message| format!("websearch provider error: {message}"),
+                    );
+                    return Err(message);
+                }
+            };
             Ok::<_, String>((response_text.len(), response_sha256, result))
         };
 
@@ -417,10 +426,11 @@ impl ToolRegistry {
 
         let fetch = async {
             for redirect_count in 0..=MAX_WEB_REDIRECTS {
+                ensure_url_allowed(&url).await?;
                 let response = self.http.get(url.clone(), max_response_bytes).await?;
                 if response.is_redirection() {
                     let next = redirect_url(&url, &response)?;
-                    if next.host_str() != original_url.host_str() {
+                    if next.origin() != original_url.origin() {
                         return Ok(WebFetchOutcome::Redirect {
                             status: response.status,
                             original_url: original_url.to_string(),
@@ -492,7 +502,7 @@ impl ToolRegistry {
                 bytes,
             } => {
                 let raw_len = bytes.len();
-                let decoded = String::from_utf8_lossy(&bytes);
+                let decoded = decode_body(&bytes, &content_type);
                 let rendered = match format {
                     WebFetchFormat::Text if content_type_is_html(&content_type) => {
                         html_to_text(&decoded)
@@ -712,6 +722,42 @@ fn parse_mcp_payload(payload: &str) -> Option<String> {
     (!texts.is_empty()).then_some(texts)
 }
 
+/// Extracts the message from a top-level JSON-RPC `error` object. JSON-RPC
+/// servers conventionally return protocol-level failures (quota, invalid
+/// argument, transient server error) with HTTP 200 and no `result`, so
+/// `parse_mcp_websearch_response` yields `None`; this recovers the actual
+/// `error.message` (prefixed with `error.code` when present) so the failure
+/// reason is not swallowed.
+pub(crate) fn parse_mcp_websearch_error(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.starts_with('{')
+        && let Some(message) = parse_mcp_error_payload(trimmed)
+    {
+        return Some(message);
+    }
+
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .find_map(parse_mcp_error_payload)
+}
+
+fn parse_mcp_error_payload(payload: &str) -> Option<String> {
+    let trimmed = payload.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(trimmed).ok()?;
+    let error = value.get("error")?;
+    let message = error.get("message")?.as_str()?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    match error.get("code").and_then(Value::as_i64) {
+        Some(code) => Some(format!("{message} (code {code})")),
+        None => Some(message.to_string()),
+    }
+}
+
 fn web_fetch_request_sha256(
     requested_url: &str,
     format: &str,
@@ -859,6 +905,62 @@ fn parse_http_url(raw: &str) -> std::result::Result<Url, String> {
     }
 }
 
+/// True for addresses that must never be reached by `webfetch`: loopback,
+/// unspecified, link-local (incl. cloud IMDS `169.254.169.254` and IPv6
+/// `fe80::/10`), and private / unique-local ranges (RFC1918, `fc00::/7`).
+/// This blocks SSRF to internal hosts and instance-metadata endpoints.
+fn ip_is_blocked(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_unspecified() || v4.is_link_local() || v4.is_private()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // Unique-local fc00::/7 (`is_unique_local` is unstable).
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // Link-local fe80::/10.
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // IPv4-mapped (::ffff:a.b.c.d) reuses the IPv4 ruling.
+                || v6.to_ipv4_mapped().map(|m| ip_is_blocked(&IpAddr::V4(m))) == Some(true)
+        }
+    }
+}
+
+/// Rejects `webfetch` targets that resolve to internal addresses. Literal-IP
+/// hosts are checked directly; hostnames (including `localhost`) are resolved
+/// and rejected if *any* resolved address is internal, defeating DNS rebinding.
+/// Re-run on every redirect hop, since the host can change between hops.
+async fn ensure_url_allowed(url: &Url) -> std::result::Result<(), String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+    let blocked = "refusing to fetch internal address (loopback/link-local/private)".to_string();
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if ip_is_blocked(&ip) {
+            Err(blocked)
+        } else {
+            Ok(())
+        };
+    }
+
+    let port = url.port_or_known_default().unwrap_or(0);
+    let mut resolved = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|err| format!("failed to resolve host: {err}"))?
+        .peekable();
+    if resolved.peek().is_none() {
+        return Err("failed to resolve host".to_string());
+    }
+    for addr in resolved {
+        if ip_is_blocked(&addr.ip()) {
+            return Err(blocked);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn web_url_host(raw: &str) -> std::result::Result<String, String> {
     parse_http_url(raw).and_then(|url| {
         url.host_str()
@@ -907,6 +1009,73 @@ fn content_type_is_html(content_type: &str) -> bool {
         .trim()
         .to_ascii_lowercase();
     matches!(mime.as_str(), "text/html" | "application/xhtml+xml")
+}
+
+/// Extract the lowercased `charset` parameter from a `Content-Type` header, if present.
+fn charset_from_content_type(content_type: &str) -> Option<String> {
+    content_type.split(';').skip(1).find_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        if name.trim().eq_ignore_ascii_case("charset") {
+            Some(value.trim().trim_matches('"').to_ascii_lowercase())
+        } else {
+            None
+        }
+    })
+}
+
+/// Decode a response body to text using the charset declared in its `Content-Type`.
+///
+/// Handles the common single-byte legacy encodings (`windows-1252` and
+/// `ISO-8859-1`/Latin-1) whose high bytes are not valid UTF-8 and would
+/// otherwise be replaced with U+FFFD. Falls back to a lossy UTF-8 decode when
+/// the charset is absent, UTF-8, or unrecognized.
+pub(crate) fn decode_body(bytes: &[u8], content_type: &str) -> String {
+    match charset_from_content_type(content_type).as_deref() {
+        Some("windows-1252" | "cp1252") => bytes.iter().map(|&b| windows_1252_char(b)).collect(),
+        Some("iso-8859-1" | "latin1" | "latin-1" | "iso8859-1" | "us-ascii" | "ascii") => {
+            // Latin-1 maps every byte directly to the matching Unicode code point.
+            bytes.iter().map(|&b| b as char).collect()
+        }
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// Map a single windows-1252 byte to its Unicode character.
+///
+/// Identical to Latin-1 except for the `0x80..=0x9F` range, which windows-1252
+/// fills with printable punctuation (e.g. the curly apostrophe `0x92`).
+fn windows_1252_char(byte: u8) -> char {
+    match byte {
+        0x80 => '\u{20AC}', // €
+        0x82 => '\u{201A}', // ‚
+        0x83 => '\u{0192}', // ƒ
+        0x84 => '\u{201E}', // „
+        0x85 => '\u{2026}', // …
+        0x86 => '\u{2020}', // †
+        0x87 => '\u{2021}', // ‡
+        0x88 => '\u{02C6}', // ˆ
+        0x89 => '\u{2030}', // ‰
+        0x8A => '\u{0160}', // Š
+        0x8B => '\u{2039}', // ‹
+        0x8C => '\u{0152}', // Œ
+        0x8E => '\u{017D}', // Ž
+        0x91 => '\u{2018}', // ‘
+        0x92 => '\u{2019}', // ’
+        0x93 => '\u{201C}', // “
+        0x94 => '\u{201D}', // ”
+        0x95 => '\u{2022}', // •
+        0x96 => '\u{2013}', // –
+        0x97 => '\u{2014}', // —
+        0x98 => '\u{02DC}', // ˜
+        0x99 => '\u{2122}', // ™
+        0x9A => '\u{0161}', // š
+        0x9B => '\u{203A}', // ›
+        0x9C => '\u{0153}', // œ
+        0x9E => '\u{017E}', // ž
+        0x9F => '\u{0178}', // Ÿ
+        // 0x81, 0x8D, 0x8F, 0x90, 0x9D are unassigned; fall back to Latin-1.
+        other => other as char,
+    }
 }
 
 pub(crate) fn html_to_text(html: &str) -> String {
@@ -1066,3 +1235,7 @@ enum WebFetchOutcome {
         bytes: Vec<u8>,
     },
 }
+
+#[cfg(test)]
+#[path = "web_tests.rs"]
+mod tests;

@@ -626,6 +626,70 @@ fn routine_events_skip_metadata_writes_but_event_count_stays_accurate() {
 }
 
 #[test]
+fn over_cap_appends_rewrite_metadata_only_once() {
+    let root = temp_root("metadata-truncate-write-amplification");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            // A few bytes: the first substantive event already crosses the
+            // cap, so every later append takes the over-cap branch.
+            max_session_bytes: 4,
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let metadata_path = store.root().join(handle.session_id()).join("metadata.json");
+
+    // Cross the cap once, then flush so the writer thread has flipped
+    // metadata.json to the `Truncated` state on disk.
+    handle
+        .append_event(SessionEvent::new(
+            "tool_call",
+            Some("1".to_string()),
+            Some("tool 0".to_string()),
+            json!({"index": 0}),
+        ))
+        .expect("append over-cap event");
+    handle.flush_events().expect("flush events");
+    let truncated = handle.metadata().expect("read metadata");
+    assert_eq!(truncated.status, SessionStatus::Truncated);
+
+    // Plant a sentinel directly on disk: a `Running` status that the writer
+    // would never produce. The truncation closure only ever writes
+    // `Truncated`, so if a later over-cap append re-runs it, this sentinel
+    // gets clobbered. If the writer short-circuits after recording the
+    // transition once, the sentinel survives. This is a content check rather
+    // than an mtime check because many filesystems have second-granularity
+    // mtimes that a fast test cannot race.
+    let mut sentinel = read_session_metadata(&metadata_path).expect("read metadata");
+    sentinel.status = SessionStatus::Running;
+    write_json(&metadata_path, &sentinel).expect("write sentinel metadata");
+
+    for index in 1..20 {
+        handle
+            .append_event(SessionEvent::new(
+                "tool_call",
+                Some("1".to_string()),
+                Some(format!("tool {index}")),
+                json!({"index": index}),
+            ))
+            .expect("append over-cap event");
+    }
+    handle.flush_events().expect("flush events");
+
+    let after = read_session_metadata(&metadata_path).expect("read metadata after further appends");
+    assert_eq!(
+        after.status,
+        SessionStatus::Running,
+        "over-cap appends must not rewrite metadata.json after truncation is recorded",
+    );
+}
+
+#[test]
 fn session_log_writer_flushes_concurrent_events() {
     let root = temp_root("async-session-log-concurrent");
     let config = AppConfig {
@@ -3494,4 +3558,45 @@ fn replay_resume_state_hydrates_tool_result_cards() {
     assert_eq!(replayed.transcript.len(), 2);
     assert_eq!(replayed.transcript[0].role, squeezy_core::Role::User);
     assert_eq!(replayed.transcript[1].role, squeezy_core::Role::Assistant);
+}
+
+#[test]
+fn write_json_is_atomic_no_stale_tmp_and_preserves_original() {
+    let root = temp_root("write-json-atomic");
+    let path = root.join("metadata.json");
+
+    // Seed a valid file, then a regular rewrite.
+    write_json(&path, &json!({ "k": "first" })).expect("seed write");
+    write_json(&path, &json!({ "k": "second" })).expect("rewrite");
+
+    // The final file deserializes to the latest value...
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read target")).expect("valid json");
+    assert_eq!(value.get("k").and_then(|v| v.as_str()), Some("second"));
+
+    // ...and no temp sibling is left behind on the happy path. The write
+    // routes through a sibling temp + rename rather than truncating the
+    // target in place, so a reader only ever sees a complete file.
+    let leftover: Vec<PathBuf> = fs::read_dir(&root)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".tmp"))
+        })
+        .collect();
+    assert!(leftover.is_empty(), "stale temp file(s) left: {leftover:?}");
+
+    // A pre-existing stale temp sibling (e.g. from a crashed prior write)
+    // does not corrupt or block the next write: the good target survives
+    // and is replaced atomically.
+    let stale_tmp = root.join(format!(".metadata.json.{}.tmp", std::process::id()));
+    fs::write(&stale_tmp, b"{ this is not valid json").expect("seed stale tmp");
+    write_json(&path, &json!({ "k": "third" })).expect("rewrite over stale tmp");
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read target")).expect("valid json");
+    assert_eq!(value.get("k").and_then(|v| v.as_str()), Some("third"));
+
+    let _ = fs::remove_dir_all(&root);
 }

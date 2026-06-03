@@ -2,6 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use squeezy_agent::RequestUserInputResponse;
 use squeezy_core::PermissionCapability;
+use tokio::sync::oneshot;
 
 use crate::{PendingRequestUserInput, TranscriptItem, TuiApp, mention, overlay};
 
@@ -403,14 +404,30 @@ pub(crate) fn refresh_mention_popup(app: &mut TuiApp) {
         app.mention_popup = None;
         return;
     };
+    // Kick off a workspace walk off the UI thread when the cache is
+    // missing or stale, but only when one isn't already in flight. The
+    // popup keeps ranking against the last-known cache (if any) until the
+    // fresh list lands via `drain_pending_mention_walk`, so the composer
+    // never blocks on `readdir`/`stat`.
     let root = std::path::Path::new(&app.directory);
     let needs_build = app
         .workspace_file_cache
         .as_ref()
         .is_none_or(|cache| cache.should_rebuild(root));
-    if needs_build {
-        app.workspace_file_cache = Some(mention::WorkspaceFileCache::build(root));
+    if needs_build && app.pending_mention_walk.is_none() {
+        let root = app.directory.clone();
+        let (tx, rx) = oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(mention::WorkspaceFileCache::build(std::path::Path::new(
+                &root,
+            )));
+        });
+        app.pending_mention_walk = Some(rx);
     }
+    let truncated = app
+        .workspace_file_cache
+        .as_ref()
+        .is_some_and(|cache| cache.is_truncated());
     let (matches, total) = app
         .workspace_file_cache
         .as_ref()
@@ -420,7 +437,9 @@ pub(crate) fn refresh_mention_popup(app: &mut TuiApp) {
         app.mention_popup = None;
         return;
     }
-    app.mention_popup = Some(mention::MentionPopup::from_query(query, matches, total));
+    app.mention_popup = Some(mention::MentionPopup::from_query(
+        query, matches, total, truncated,
+    ));
 }
 
 pub(crate) fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {

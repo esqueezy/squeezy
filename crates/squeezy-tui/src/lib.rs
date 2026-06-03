@@ -103,7 +103,8 @@ pub mod testing;
 #[cfg(test)]
 pub(crate) use events::apply_mcp_status_update;
 pub(crate) use events::{
-    drain_agent_events, drain_job_events, drain_pending_diff, drain_plan_housekeeping,
+    drain_agent_events, drain_job_events, drain_pending_diff, drain_pending_mention_walk,
+    drain_plan_housekeeping,
 };
 #[cfg(test)]
 pub(crate) use input::set_input;
@@ -788,6 +789,7 @@ async fn run_inner_with_terminal(
             }
         }
         drain_pending_diff(&mut app);
+        drain_pending_mention_walk(&mut app);
 
         // Skip the animation-tick driver while the host terminal is
         // unfocused. Freezing the counter pins the spinner glyph and
@@ -1289,6 +1291,20 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             app.task_panel_collapsed = false;
             app.turn_rx = None;
             app.cancel = None;
+            // Subagent records are live state for the session we are leaving:
+            // they are never persisted or rehydrated, so without this reset the
+            // pane keeps the prior session's rows and an active subagent view
+            // would hijack the resumed transcript. Keep `next_synthetic_id`
+            // monotonic across the switch.
+            // Subagent records are live state for the session we are leaving:
+            // they are never persisted or rehydrated, so without this reset the
+            // pane keeps the prior session's rows and an active subagent view
+            // would hijack the resumed transcript. Keep `next_synthetic_id`
+            // monotonic across the switch.
+            app.subagent_pane = SubagentPaneState {
+                next_synthetic_id: app.subagent_pane.next_synthetic_id,
+                ..SubagentPaneState::default()
+            };
             app.status = format!("resumed session {session_id}");
         }
         Err(error) => app.status = format!("resume failed: {error}"),
@@ -1341,17 +1357,31 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
     {
         events.push(event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))?);
     }
-    if let Some(key_event) = take_priority_key_event_for_dispatch(app, &mut events) {
-        return handle_input_event(app, agent, key_event).await;
+    dispatch_input_events(app, agent, events).await
+}
+
+/// Dispatch every event read in a single poll window. Each event already
+/// pulled out of crossterm's queue must be handled here — returning after
+/// the first key would silently drop the already-read tail (held-key
+/// autorepeat, fast typing, paste bursts, and the `Ctrl+X` → `Q` chord
+/// follow-up). The main loop coalesces the resulting state into one redraw.
+async fn dispatch_input_events(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    mut events: Vec<Event>,
+) -> Result<bool> {
+    // While the transcript overlay holds mouse-drag capture, handle a key
+    // ahead of the drag repaint flood, then fall through to drain the rest
+    // of the batch (the key is removed from `events`, so it is not replayed).
+    if let Some(key_event) = take_priority_key_event_for_dispatch(app, &mut events)
+        && handle_input_event(app, agent, key_event).await?
+    {
+        return Ok(true);
     }
     let events = coalesce_input_events_for_dispatch(app, events);
     for input_event in events {
-        let is_key = matches!(input_event, Event::Key(_));
         if handle_input_event(app, agent, input_event).await? {
             return Ok(true);
-        }
-        if is_key {
-            return Ok(false);
         }
     }
     Ok(false)
@@ -6676,7 +6706,7 @@ fn format_transcript_entry_expanded(
             ToolCardSurface::Plain,
         ),
         TranscriptEntryKind::Log(entry) => format_log_entry(entry, false, selected),
-        TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, false),
+        TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, false, width),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, false, selected),
         TranscriptEntryKind::Reasoning(snapshot) => {
             if show_reasoning {
@@ -7204,7 +7234,7 @@ fn format_transcript_entry_with_width(
         TranscriptEntryKind::Log(entry_log) => {
             format_log_entry(entry_log, entry.collapsed, selected)
         }
-        TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, entry.collapsed),
+        TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, entry.collapsed, width),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, entry.collapsed, selected),
         TranscriptEntryKind::Reasoning(snapshot) => {
             if show_reasoning {
@@ -7250,10 +7280,11 @@ fn format_slash_echo_line(data: &SlashEchoData, selected: bool) -> Line<'static>
 fn format_plan_card_entry(
     data: &render::plan_card::PlanCardData,
     collapsed: bool,
+    width: Option<u16>,
 ) -> Vec<Line<'static>> {
     // Collapsed cards show just the header so users can fold a long
     // plan out of view without losing the anchor.
-    let lines = render::plan_card::render_plan_card(data);
+    let lines = render::plan_card::render_plan_card(data, width);
     if collapsed {
         return lines.into_iter().take(1).collect();
     }
@@ -12030,9 +12061,19 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .collect();
     // `(idx/total)` footer. `total` is the pre-truncation candidate
     // count so the user can see when more matches exist beyond the
-    // displayed window (capped at `MAX_MATCHES`).
+    // displayed window (capped at `MAX_MATCHES`). When the workspace walk
+    // itself was capped, append a hint that the candidate set is
+    // incomplete so a missing match isn't read as "no such file".
     let total = popup.total.max(popup.matches.len());
-    let footer = format!("  {}/{}", popup.selected + 1, total);
+    let footer = if popup.truncated {
+        format!(
+            "  {}/{}  (+ more files not shown — refine query)",
+            popup.selected + 1,
+            total
+        )
+    } else {
+        format!("  {}/{}", popup.selected + 1, total)
+    };
     lines.push(Line::from(Span::styled(
         footer,
         Style::default()
@@ -12202,18 +12243,55 @@ fn render_subagent_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     if area.height == 0 {
         return;
     }
-    let all_lines = subagent_pane_lines(app, area.width);
     let visible = usize::from(area.height);
-    let selected = app
+    let record_count = app.subagent_pane.records.len();
+    // The `main` header is pinned to the top; records scroll within the
+    // remaining slots so a high-fanout list overflows without hiding the
+    // header. With room for every record we render the full list.
+    let record_slots = visible.saturating_sub(1);
+    if record_count <= record_slots || record_slots == 0 {
+        frame.render_widget(Paragraph::new(subagent_pane_lines(app, area.width)), area);
+        return;
+    }
+    // Records overflow the window. Slide it so the selected record stays
+    // visible; when nothing record-level is selected (the default while a
+    // turn is in flight and the pane is unfocused), anchor to the newest
+    // records so the live view tracks the current fanout instead of pinning
+    // to the oldest few. `selected == 0` addresses the `main` row.
+    let start = match app.subagent_pane.selected.checked_sub(1) {
+        Some(sel) if sel < record_slots => 0,
+        Some(sel) => (sel + 1 - record_slots).min(record_count - record_slots),
+        None => record_count - record_slots,
+    };
+    let hidden_above = start;
+    let hidden_below = record_count - (start + record_slots);
+    let mut main_row = subagent_main_row(app, area.width);
+    if hidden_above > 0 {
+        main_row.spans.push(Span::styled(
+            format!(" · ↑{hidden_above} more"),
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+    }
+    let mut lines = Vec::with_capacity(record_slots + 1);
+    lines.push(main_row);
+    for (index, record) in app
         .subagent_pane
-        .selected
-        .min(all_lines.len().saturating_sub(1));
-    let offset = selected.saturating_add(1).saturating_sub(visible);
-    let lines = all_lines
-        .into_iter()
-        .skip(offset)
-        .take(visible)
-        .collect::<Vec<_>>();
+        .records
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(record_slots)
+    {
+        lines.push(subagent_record_row(app, index, record, area.width));
+    }
+    if hidden_below > 0
+        && let Some(last) = lines.last_mut()
+    {
+        last.spans.push(Span::styled(
+            format!(" · +{hidden_below} more"),
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+    }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -13184,6 +13262,14 @@ pub(crate) struct TuiApp {
     pub(crate) slash_menu_index: usize,
     pub(crate) mention_popup: Option<mention::MentionPopup>,
     pub(crate) workspace_file_cache: Option<mention::WorkspaceFileCache>,
+    /// In-flight `@`-mention workspace walk. The walk lists up to
+    /// `MAX_WORKSPACE_FILES` paths via the `ignore` crate, which is
+    /// tens-to-hundreds of milliseconds of `readdir`/`stat` on a large
+    /// repo. It runs in `spawn_blocking` so the composer stays responsive;
+    /// the rebuilt cache lands here and is drained each frame. `Some`
+    /// doubles as the in-flight guard so a new walk isn't started while
+    /// one is pending.
+    pub(crate) pending_mention_walk: Option<oneshot::Receiver<mention::WorkspaceFileCache>>,
     pub(crate) overlay: Option<overlay::Overlay>,
     /// Per-app generation counter for [`overlay::DialogHandle::open`]. Bumped
     /// on every open so stale handles for replaced dialogs become no-ops.
@@ -13641,6 +13727,7 @@ impl TuiApp {
             slash_menu_index: 0,
             mention_popup: None,
             workspace_file_cache: None,
+            pending_mention_walk: None,
             overlay: None,
             overlay_next_id: 0,
             overlay_active_id: None,

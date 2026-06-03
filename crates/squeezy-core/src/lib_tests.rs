@@ -1581,6 +1581,15 @@ env_allowlist = ["*_PROXY"]
     let err = try_app_config(
         r#"
 [permissions.shell_sandbox]
+env_allowlist = ["*"]
+"#,
+    )
+    .expect_err("env_allowlist bare * must be rejected");
+    assert!(format!("{err}").contains("env_allowlist"));
+
+    let err = try_app_config(
+        r#"
+[permissions.shell_sandbox]
 sensitive_path_patterns = ["**"]
 "#,
     )
@@ -5008,4 +5017,18 @@ fn shell_escape_applies_inside_provider_headers_map() {
         headers.get("x-dynamic").map(String::as_str),
         Some("dynamic-value")
     );
+}
+
+#[test]
+fn merge_cost_snapshot_aggregates_reasoning_output_tokens() {
+    let mut total = CostSnapshot {
+        reasoning_output_tokens: Some(7),
+        ..CostSnapshot::default()
+    };
+    let next = CostSnapshot {
+        reasoning_output_tokens: Some(11),
+        ..CostSnapshot::default()
+    };
+    merge_cost_snapshot(&mut total, &next);
+    assert_eq!(total.reasoning_output_tokens, Some(18));
 }

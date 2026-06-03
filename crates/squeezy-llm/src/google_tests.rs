@@ -753,9 +753,14 @@ fn check_inline_image_cap_accepts_small_payload() {
 
 #[test]
 fn token_split_pins_visible_vs_thoughts() {
-    // Pins the convention: output_tokens = candidatesTokenCount
-    // (visible), reasoning_output_tokens = thoughtsTokenCount; they
-    // are exclusive and a billed-output cost reporter must sum them.
+    // Pins the cross-provider convention: `output_tokens` is the
+    // inclusive billed-output total (candidatesTokenCount +
+    // thoughtsTokenCount) and `reasoning_output_tokens` is the thoughts
+    // *subset* of it — mirroring `cached_input_tokens` as a subset of
+    // `input_tokens`. `estimate_cost` prices `output_tokens` at the
+    // output rate and never re-adds reasoning, so folding thoughts into
+    // the inclusive total is what bills the thinking pass (an exclusive
+    // split would price thoughts at $0).
     let mut cost = CostSnapshot::default();
     let mut last_finish_reason: Option<String> = None;
     let mut reasoning_buf = GoogleReasoningBuffer::default();
@@ -782,17 +787,20 @@ fn token_split_pins_visible_vs_thoughts() {
     assert_eq!(cost.input_tokens, Some(100));
     assert_eq!(
         cost.output_tokens,
-        Some(40),
-        "output_tokens must equal candidatesTokenCount (visible only)"
+        Some(290),
+        "output_tokens must be the inclusive total (visible + thoughts)"
     );
     assert_eq!(
         cost.reasoning_output_tokens,
         Some(250),
-        "reasoning_output_tokens must equal thoughtsTokenCount"
+        "reasoning_output_tokens must equal thoughtsTokenCount (subset)"
     );
-    // A billed-output reporter sums the two.
-    let billed = cost.output_tokens.unwrap() + cost.reasoning_output_tokens.unwrap();
-    assert_eq!(billed, 290, "billed output = visible + thoughts");
+    // The inclusive billed output already contains the thoughts subset.
+    assert_eq!(
+        cost.output_tokens.unwrap(),
+        290,
+        "billed output = visible + thoughts"
+    );
 }
 
 #[test]
@@ -825,6 +833,49 @@ fn parser_surfaces_prompt_feedback_block_reason_as_error() {
         message.contains("SAFETY"),
         "expected block reason in message, got `{message}`"
     );
+}
+
+#[test]
+fn thinking_tokens_fold_into_billed_output() {
+    // Gemini keeps thinking disjoint in `usageMetadata`
+    // (`totalTokenCount = prompt + candidates + thoughts`). The parser
+    // must fold `thoughtsTokenCount` into `output_tokens` so `estimate_cost`
+    // prices it, while keeping the reasoning subset for the breakdown.
+    let mut cost = CostSnapshot::default();
+    let mut last_finish_reason: Option<String> = None;
+    let mut reasoning_buf = GoogleReasoningBuffer::default();
+    let mut server_model_slot: Option<String> = None;
+    let mut tool_call_counter: usize = 0;
+    let mut response_id_slot: Option<String> = None;
+    parse_google_event(
+        r#"{
+          "candidates":[{"content":{"parts":[{"text":"ok"}]}}],
+          "usageMetadata":{
+            "promptTokenCount":1000,
+            "candidatesTokenCount":500,
+            "thoughtsTokenCount":4000,
+            "totalTokenCount":5500
+          }
+        }"#,
+        &mut cost,
+        &mut last_finish_reason,
+        &mut reasoning_buf,
+        &mut server_model_slot,
+        &mut tool_call_counter,
+        &mut response_id_slot,
+    )
+    .expect("valid event");
+
+    assert_eq!(cost.input_tokens, Some(1000));
+    // Visible (500) + thinking (4000) are both billed at the output rate.
+    assert_eq!(cost.output_tokens, Some(4500));
+    assert_eq!(cost.reasoning_output_tokens, Some(4000));
+
+    // gemini-2.5-pro: input 1_250_000 µ$/Mtok, output 10_000_000 µ$/Mtok.
+    // 1000 input = 1_250 µ$; 4500 output = 45_000 µ$; total 46_250 µ$.
+    let estimated = crate::estimate_cost("google", "gemini-2.5-pro", &cost)
+        .expect("gemini-2.5-pro has pricing");
+    assert_eq!(estimated, 46_250);
 }
 
 #[test]

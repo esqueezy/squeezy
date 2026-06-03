@@ -194,12 +194,15 @@ impl SemanticGraph {
     /// symbol ids in a `HashSet`, so each ancestor is enumerated exactly
     /// once and a cycle terminates the walk for that branch.
     ///
-    /// This consults `self.edges` directly rather than `edges_by_from`
-    /// because [`SemanticGraph::rebuild_semantic_edges`] pushes the new
-    /// type edges (including `UsesTrait`) BEFORE `add_call_edges` runs but
-    /// only refreshes the indexed `edges_by_from` map afterward in
-    /// `rebuild_indexes`. The direct scan keeps the walker correct from
-    /// call-resolution time onward.
+    /// This consults [`Self::ancestor_edges_by_from`] rather than the main
+    /// `edges_by_from` index because [`SemanticGraph::rebuild_semantic_edges`]
+    /// pushes the new type edges (including `UsesTrait`) BEFORE
+    /// `add_call_edges` runs but only refreshes `edges_by_from` afterward in
+    /// `rebuild_indexes`. The dedicated index — built by
+    /// [`Self::build_ancestor_edge_index`] right after the type edges are
+    /// pushed — keeps the walker correct from call-resolution time onward and
+    /// turns each BFS node from an O(total edges) scan into an O(out-degree)
+    /// lookup.
     pub(crate) fn walk_inheritance_ancestors(&self, start: &SymbolId) -> Vec<SymbolId> {
         let mut visited: HashSet<SymbolId> = HashSet::new();
         visited.insert(start.clone());
@@ -207,33 +210,43 @@ impl SemanticGraph {
         let mut queue: VecDeque<SymbolId> = VecDeque::new();
         queue.push_back(start.clone());
         while let Some(current) = queue.pop_front() {
-            // Preserve PHP method-resolution priority without scanning the
-            // full edge list once for every edge kind.
-            let mut by_kind = [Vec::new(), Vec::new(), Vec::new()];
-            for edge in self.edges() {
-                if edge.from != current {
-                    continue;
-                }
-                let Some(kind_index) = ANCESTOR_EDGE_KINDS
-                    .iter()
-                    .position(|kind| *kind == edge.kind)
-                else {
-                    continue;
-                };
-                let Some(target) = &edge.to else {
-                    continue;
-                };
-                by_kind[kind_index].push(target.clone());
-            }
+            // The index already groups targets by edge kind in
+            // `ANCESTOR_EDGE_KINDS` priority, so enqueueing each bucket in
+            // turn preserves PHP method-resolution order.
+            let Some(by_kind) = self.ancestor_edges_by_from.get(&current) else {
+                continue;
+            };
             for targets in by_kind {
                 for target in targets {
                     if visited.insert(target.clone()) {
                         order.push(target.clone());
-                        queue.push_back(target);
+                        queue.push_back(target.clone());
                     }
                 }
             }
         }
         order
+    }
+
+    /// Build the transient [`Self::ancestor_edges_by_from`] index from a single
+    /// O(total edges) pass, grouping each inheritance edge's target by
+    /// `from` symbol and `ANCESTOR_EDGE_KINDS` priority. Called once per
+    /// `rebuild_semantic_edges` after the type edges are pushed so the PHP
+    /// ancestor walk never rescans the whole edge vector.
+    pub(crate) fn build_ancestor_edge_index(&mut self) {
+        let mut index: HashMap<SymbolId, [Vec<SymbolId>; 3]> = HashMap::new();
+        for edge in &self.edges {
+            let Some(kind_index) = ANCESTOR_EDGE_KINDS
+                .iter()
+                .position(|kind| *kind == edge.kind)
+            else {
+                continue;
+            };
+            let Some(target) = &edge.to else {
+                continue;
+            };
+            index.entry(edge.from.clone()).or_default()[kind_index].push(target.clone());
+        }
+        self.ancestor_edges_by_from = index;
     }
 }

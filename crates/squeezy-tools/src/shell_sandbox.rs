@@ -263,6 +263,20 @@ impl ShellSandboxPlan {
         }
         payload
     }
+
+    /// Whether the in-flight `squeezy ask` approval socket can be exported
+    /// into the shell child under this plan's backend.
+    ///
+    /// The `linux-direct-syscalls` backend installs a seccomp filter that
+    /// denies `socket(AF_UNIX, …)` (see [`configure_linux_shell_sandbox`]),
+    /// so a child that runs `squeezy ask` could never `UnixStream::connect`
+    /// to the socket — the connect is `EPERM`-ed before any handshake.
+    /// Advertising `SQUEEZY_ASK_SOCKET` to such a child would promise a
+    /// capability that is guaranteed to fail with a confusing errno; the
+    /// child instead gets the clear "not set" path from `squeezy ask`.
+    pub(crate) fn exports_ask_socket(&self) -> bool {
+        self.backend != "linux-direct-syscalls"
+    }
 }
 
 fn best_effort_fallback_json(record: BestEffortFallback) -> Value {

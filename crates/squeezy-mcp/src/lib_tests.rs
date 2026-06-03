@@ -578,6 +578,7 @@ async fn sse_transport_parses_event_data_lines_and_posts_to_advertised_endpoint(
         pause_state: ElicitationPauseState::default(),
         elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
         elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(256))),
+        resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
     };
     let (auth_header, custom_headers) =
         resolve_http_auth_and_headers("sse-server", &server, |name| match name {
@@ -691,6 +692,7 @@ async fn streamable_http_transport_sends_authorization_bearer_header() {
         elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
         elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         pause_state: ElicitationPauseState::default(),
+        resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
     };
     // The serve call will fail because we hang up after one round trip — that
     // is fine, we only need it to issue the initialize POST so the listener
@@ -892,6 +894,7 @@ fn client_info_advertises_squeezy_identity_and_elicitation_capability() {
         elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
         elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         pause_state: ElicitationPauseState::default(),
+        resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
     };
     let info = ClientHandler::get_info(&handler);
     assert_eq!(info.client_info.name, env!("CARGO_PKG_NAME"));
@@ -992,6 +995,7 @@ async fn server_capabilities_surfaces_experimental_flags_from_initialize_respons
         elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
         elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(256))),
         pause_state: ElicitationPauseState::default(),
+        resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
     };
     let (auth_header, custom_headers) = resolve_http_auth_and_headers("fixture", &server, |_| None);
     let worker =
@@ -1050,4 +1054,123 @@ async fn server_capabilities_surfaces_experimental_flags_from_initialize_respons
             .is_none(),
         "missing server must surface as None, not a default-empty value"
     );
+}
+
+#[test]
+fn resource_updated_notification_evicts_cached_read_within_ttl() {
+    // A fresh read is cached well inside RESOURCE_READ_CACHE_TTL. Without an
+    // eviction path an `on_resource_updated` notification would not drop it, so
+    // the next read would serve the stale value until the TTL lapsed.
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    registry.seed_resource_read_for_test("docs", "file:///a.txt", json!({"contents": "old"}));
+    registry.seed_resource_read_for_test("docs", "file:///b.txt", json!({"contents": "keep"}));
+
+    let handler = registry.client_handler_for_test("docs");
+    handler.evict_resource_read("file:///a.txt");
+
+    assert!(
+        registry
+            .cached_resource_read_for_test("docs", "file:///a.txt")
+            .is_none(),
+        "updated resource must be evicted so the next read re-fetches"
+    );
+    assert!(
+        registry
+            .cached_resource_read_for_test("docs", "file:///b.txt")
+            .is_some(),
+        "an unrelated resource read must stay cached"
+    );
+}
+
+#[test]
+fn resource_read_cache_stays_bounded_and_drops_oldest() {
+    let mut cache: BTreeMap<(String, String), CachedResourceRead> = BTreeMap::new();
+    let overflow = 17usize;
+    let total = RESOURCE_READ_CACHE_CAPACITY + overflow;
+
+    // Insert CAP + N distinct keys, each strictly newer than the last so
+    // `fetched_at` ordering is unambiguous.
+    let base = Instant::now();
+    for i in 0..total {
+        let key = ("srv".to_string(), format!("res://{i}"));
+        insert_resource_read(
+            &mut cache,
+            key,
+            CachedResourceRead {
+                value: json!({ "i": i }),
+                fetched_at: base + Duration::from_millis(i as u64),
+            },
+        );
+        assert!(
+            cache.len() <= RESOURCE_READ_CACHE_CAPACITY,
+            "cache must never exceed capacity (len {} after {} inserts)",
+            cache.len(),
+            i + 1
+        );
+    }
+
+    assert_eq!(cache.len(), RESOURCE_READ_CACHE_CAPACITY);
+    // The oldest `overflow` keys must have been evicted; the newest CAP survive.
+    for i in 0..overflow {
+        assert!(
+            !cache.contains_key(&("srv".to_string(), format!("res://{i}"))),
+            "oldest key res://{i} should have been evicted"
+        );
+    }
+    assert!(
+        cache.contains_key(&("srv".to_string(), format!("res://{}", total - 1))),
+        "newest key must be retained"
+    );
+}
+
+#[test]
+fn resource_list_changed_notification_evicts_only_that_servers_reads() {
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    registry.seed_resource_read_for_test("docs", "file:///a.txt", json!({"contents": "a"}));
+    registry.seed_resource_read_for_test("docs", "file:///b.txt", json!({"contents": "b"}));
+    registry.seed_resource_read_for_test("other", "file:///c.txt", json!({"contents": "c"}));
+
+    registry
+        .client_handler_for_test("docs")
+        .evict_server_resource_reads();
+
+    assert!(
+        registry
+            .cached_resource_read_for_test("docs", "file:///a.txt")
+            .is_none()
+            && registry
+                .cached_resource_read_for_test("docs", "file:///b.txt")
+                .is_none(),
+        "a resource-list change must drop every cached read for that server"
+    );
+    assert!(
+        registry
+            .cached_resource_read_for_test("other", "file:///c.txt")
+            .is_some(),
+        "other servers' cached reads must be untouched"
+    );
+}
+
+#[test]
+fn resource_read_cache_prunes_expired_entries() {
+    let mut cache: BTreeMap<(String, String), CachedResourceRead> = BTreeMap::new();
+    // A long-stale entry whose age exceeds the TTL must be pruned on the next
+    // insert, independent of the capacity cap.
+    cache.insert(
+        ("srv".to_string(), "res://stale".to_string()),
+        CachedResourceRead {
+            value: json!({ "stale": true }),
+            fetched_at: Instant::now() - RESOURCE_READ_CACHE_TTL - Duration::from_secs(1),
+        },
+    );
+    insert_resource_read(
+        &mut cache,
+        ("srv".to_string(), "res://fresh".to_string()),
+        CachedResourceRead {
+            value: json!({ "fresh": true }),
+            fetched_at: Instant::now(),
+        },
+    );
+    assert!(!cache.contains_key(&("srv".to_string(), "res://stale".to_string())));
+    assert!(cache.contains_key(&("srv".to_string(), "res://fresh".to_string())));
 }

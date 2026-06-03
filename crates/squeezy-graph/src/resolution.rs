@@ -1,7 +1,17 @@
 use crate::*;
 
+#[cfg(test)]
+thread_local! {
+    /// Counts `rebuild_semantic_edges` invocations on the current thread so
+    /// tests can assert a refresh re-resolves the whole graph exactly once.
+    pub(crate) static SEMANTIC_REBUILD_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 impl SemanticGraph {
     pub(crate) fn rebuild_semantic_edges(&mut self) {
+        #[cfg(test)]
+        SEMANTIC_REBUILD_COUNT.with(|count| count.set(count.get() + 1));
         self.edges.retain(|edge| {
             edge.kind == EdgeKind::Contains
                 && self.symbols.contains_key(&edge.from)
@@ -20,6 +30,12 @@ impl SemanticGraph {
         self.js_ts_resolver.update_from_files(&self.files);
         self.add_csharp_type_edges();
         self.add_php_type_edges();
+        // The inheritance edges are now final for this rebuild; index them by
+        // `from` so the call-resolution-phase ancestor walk does O(out-degree)
+        // lookups instead of rescanning the whole edge vector per BFS node.
+        // The main `edges_by_from` index is not refreshed until
+        // `rebuild_indexes`, so this dedicated map is what the walker reads.
+        self.build_ancestor_edge_index();
 
         // Move-out, mutate, move-back. Each builder iterates a single
         // field's data while writing edges, and the borrow checker won't

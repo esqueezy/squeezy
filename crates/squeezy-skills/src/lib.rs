@@ -258,7 +258,8 @@ pub struct SkillHookMatcher {
 /// Today only the `command` kind is implemented: it shells out to the
 /// declared `command` line, resolved relative to the skill's `base_dir`
 /// when the path is relative. `once: true` semantics live in the handler
-/// (self-skipped after first run) so the registry stays agnostic.
+/// (self-skipped after the first *successful* run) so the registry stays
+/// agnostic; a failed first run is retried on the next dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillHookSpec {
     pub command: String,
@@ -1473,8 +1474,9 @@ pub struct SkillHookHandler {
     matcher: Option<String>,
     spec: SkillHookSpec,
     base_dir: PathBuf,
-    /// Tracks whether a `once: true` hook has already fired in this
-    /// session. Held behind a `Mutex` so the trait method stays `&self`
+    /// Tracks whether a `once: true` hook has already succeeded in this
+    /// session. Set only after a successful exit so a failed first run is
+    /// retried. Held behind a `Mutex` so the trait method stays `&self`
     /// while still allowing in-place mutation across dispatches.
     fired: Mutex<bool>,
 }
@@ -1514,12 +1516,10 @@ impl HookHandler for SkillHookHandler {
             }
         }
         if self.spec.once
-            && let Ok(mut fired) = self.fired.lock()
+            && let Ok(fired) = self.fired.lock()
+            && *fired
         {
-            if *fired {
-                return HookResult::allow();
-            }
-            *fired = true;
+            return HookResult::allow();
         }
 
         // Resolve the command path against the skill's base_dir when
@@ -1545,7 +1545,16 @@ impl HookHandler for SkillHookHandler {
             .env("SQUEEZY_SKILL_NAME", &self.skill_name)
             .env("SQUEEZY_HOOK_PAYLOAD", payload);
         match command.status() {
-            Ok(status) if status.success() => HookResult::allow(),
+            Ok(status) if status.success() => {
+                // Only mark a `once: true` hook as fired once it has
+                // actually succeeded, so a failed first run can retry.
+                if self.spec.once
+                    && let Ok(mut fired) = self.fired.lock()
+                {
+                    *fired = true;
+                }
+                HookResult::allow()
+            }
             Ok(status) => {
                 warn!(
                     target: "squeezy_skills",

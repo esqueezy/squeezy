@@ -862,3 +862,38 @@ fn empty_resolved_key_round_trips_through_static_api_key() {
     let source = static_api_key_source(resolved.value.clone(), "vllm");
     assert_eq!(source.provider_label(), "vllm");
 }
+
+#[test]
+fn static_api_key_debug_redacts_secret() {
+    // The `ApiKeySource` trait requires `Debug` as a supertrait, so an
+    // `Arc<dyn ApiKeySource>` held by a provider client delegates its
+    // `Debug` to the concrete source. A derived `Debug` over the
+    // plaintext `value` would print the raw key whenever a provider is
+    // `{:?}`-formatted (a future `tracing::debug!(?provider)`, a derived
+    // `Debug` on an embedding struct, a panic message). Match the
+    // redaction `RefreshableToken` and `LMStudioProvider` already apply.
+    let key = StaticApiKey::new("sk-secret", "openai");
+    let rendered = format!("{key:?}");
+    assert!(
+        !rendered.contains("sk-secret"),
+        "Debug must not leak the raw key: {rendered}"
+    );
+    assert!(
+        rendered.contains("<redacted>"),
+        "Debug should mark the value as redacted: {rendered}"
+    );
+    // The label is not a secret and stays visible for log correlation.
+    assert!(
+        rendered.contains("openai"),
+        "Debug should keep the provider label: {rendered}"
+    );
+
+    // The redaction must survive trait-object erasure too, since that's
+    // the shape provider clients actually hold.
+    let source: Arc<dyn ApiKeySource> = key.into_source();
+    let via_dyn = format!("{source:?}");
+    assert!(
+        !via_dyn.contains("sk-secret"),
+        "Debug via Arc<dyn ApiKeySource> must not leak the key: {via_dyn}"
+    );
+}

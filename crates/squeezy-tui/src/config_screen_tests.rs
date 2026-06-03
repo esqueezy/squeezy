@@ -622,6 +622,68 @@ async fn slash_opens_search_and_enter_jumps_to_field() {
 }
 
 #[tokio::test]
+async fn search_enter_lands_on_models_field_past_synthetic_key_row() {
+    // Searching to a Models field at or after the synthetic API-key row must
+    // resolve back to the intended field, not one display row too high.
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+
+    let models_sidx = CONFIG_SECTIONS
+        .iter()
+        .position(|s| s.id == SectionId::Models)
+        .expect("Models section exists");
+    let target_fidx = field_index(SectionId::Models, &["model", "reasoning_effort"]);
+    assert!(
+        target_fidx >= 2,
+        "reasoning_effort should sit at/after the synthetic key row for this test to be meaningful"
+    );
+
+    // Open search and type "reason" so Models → reasoning_effort is matched.
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::empty()),
+    );
+    for ch in ['r', 'e', 'a', 's', 'o', 'n'] {
+        handle_key(
+            &mut state,
+            &mut agent,
+            &mut q,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+        );
+    }
+
+    // Point the cursor at the Models → reasoning_effort match regardless of
+    // its rank among other "reason"-ish matches.
+    let search = state.search.as_mut().expect("search overlay open");
+    search.cursor = search
+        .matches
+        .iter()
+        .position(|&(sidx, fidx, _)| sidx == models_sidx && fidx == target_fidx)
+        .expect("reasoning_effort is among the matches for 'reason'");
+
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+
+    assert_eq!(state.section_index, models_sidx);
+    assert!(
+        !state.on_synthetic_api_key_row(),
+        "Enter must not land on the synthetic API-key row"
+    );
+    let resolved = state.field_at_row(state.field_index).expect("real field");
+    assert_eq!(
+        resolved.toml_path, CONFIG_SECTIONS[models_sidx].fields[target_fidx].toml_path,
+        "focused field should be reasoning_effort, not the row above it"
+    );
+}
+
+#[tokio::test]
 async fn ctrl_r_resets_field_to_default() {
     // Use a field whose schema declares no env_override, so the test stays
     // robust against other tests setting SQUEEZY_* env vars in parallel.
@@ -1407,6 +1469,50 @@ async fn immediate_tier_permission_save_propagates_to_agent() {
         agent.config_snapshot().permissions.read,
         PermissionMode::Allow,
         "permission saves must hot-swap so the next tool call sees the new mode"
+    );
+}
+
+#[test]
+fn granular_permission_read_back_uses_custom_subtable() {
+    use squeezy_core::{
+        TierSource,
+        config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId},
+    };
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Permissions));
+    let perm_edit = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SId::Permissions)
+        .unwrap()
+        .fields
+        .iter()
+        .find(|f| f.label == "edit")
+        .unwrap();
+
+    // The screen writes granular permissions to `[permissions.custom]`;
+    // synthesize a Local tier in that modern shape with `edit = "deny"`.
+    let toml_text = "[permissions]\nmode = \"custom\"\n\n[permissions.custom]\nedit = \"deny\"\n";
+    let tier = TierSource {
+        path: std::path::PathBuf::from("/virtual/local.toml"),
+        doc: toml_text.parse().expect("valid toml"),
+    };
+    state.sources.repo = Some(tier);
+
+    // Read-back on the Local tab must reflect the saved `deny`, not the
+    // stale top-level default `allow`.
+    state.scope = ConfigScope::Local;
+    let (value, _src) = state.displayed_value_and_source(perm_edit);
+    assert_eq!(
+        value,
+        FieldValue::Enum("deny"),
+        "displayed value must read the `[permissions.custom]` write location"
+    );
+
+    // The tier owns the field, so Repo/Local Space-cycle can advance past
+    // the first option instead of perpetually re-applying `allow`.
+    assert_eq!(
+        state.scope_owns_field(perm_edit),
+        Some(true),
+        "scope_owns_field must count the `[permissions.custom]` location"
     );
 }
 

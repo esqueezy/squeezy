@@ -795,10 +795,8 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
             let (path, template) = if scope.user {
                 (default_settings_path(), user_settings_template())
             } else {
-                (
-                    PathBuf::from(PROJECT_SETTINGS_FILE),
-                    project_settings_template(),
-                )
+                let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                (project_init_target(cwd), project_settings_template())
             };
             if path.exists() && !force {
                 return Err(SqueezyError::Config(format!(
@@ -2748,6 +2746,18 @@ fn telemetry_notice_path() -> PathBuf {
                 .map(|home| home.join(".squeezy/telemetry_notice"))
         })
         .unwrap_or_else(|| PathBuf::from(".squeezy/telemetry_notice"))
+}
+
+/// Resolves where `config init --project` writes its template.
+///
+/// Mirrors project-settings discovery so the write target and the
+/// overwrite guard refer to the file that loading would actually pick up:
+/// an existing ancestor `squeezy.toml` when one exists, otherwise
+/// `cwd/squeezy.toml`. This prevents writing a closer file from a
+/// subdirectory that would silently shadow the repo's real project config.
+fn project_init_target(cwd: impl AsRef<Path>) -> PathBuf {
+    let cwd = cwd.as_ref();
+    find_project_settings_path(cwd).unwrap_or_else(|| cwd.join(PROJECT_SETTINGS_FILE))
 }
 
 #[cfg(test)]

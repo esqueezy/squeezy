@@ -473,10 +473,19 @@ pub trait ApiKeySource: Send + Sync + std::fmt::Debug {
 /// settings/env/credentials.json caller flows through — wraps the
 /// resolved string so the provider clients can store a single
 /// `Arc<dyn ApiKeySource>` shape.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StaticApiKey {
     value: String,
     label: String,
+}
+
+impl std::fmt::Debug for StaticApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticApiKey")
+            .field("value", &"<redacted>")
+            .field("label", &self.label)
+            .finish()
+    }
 }
 
 impl StaticApiKey {

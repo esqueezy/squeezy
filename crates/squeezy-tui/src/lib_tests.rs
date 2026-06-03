@@ -255,6 +255,58 @@ fn subagent_pane_renders_below_status_without_hiding_prompt() {
     assert!(pane_line > status_line, "{output}");
 }
 
+fn render_subagent_pane_to_string(app: &TuiApp, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let area = Rect::new(0, 0, width, height);
+            render_subagent_pane(frame, area, app);
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let mut output = String::new();
+    for y in 0..height {
+        for x in 0..width {
+            output.push_str(buffer[(x, y)].symbol());
+        }
+        output.push('\n');
+    }
+    output
+}
+
+#[test]
+fn subagent_pane_overflow_marks_hidden_and_keeps_newest_reachable() {
+    let mut app = test_app(SessionMode::Build);
+    for id in 1..=8 {
+        app.note_subagent_started(id, "delegate".to_string(), format!("task {id}"));
+        app.note_subagent_activity(id, "delegate".to_string(), format!("running tool {id}"));
+    }
+    // Default unfocused state during a turn: nothing record-level selected.
+    assert_eq!(app.subagent_pane.selected, 0);
+    assert!(!app.subagent_pane.focused);
+    assert_eq!(app.subagent_pane.records.len(), 8);
+    // Layout caps the pane at 7 rows (1 header + 6 record slots).
+    assert_eq!(subagent_pane_height(&app), 7);
+
+    let output = render_subagent_pane_to_string(&app, 120, 7);
+    // The header carries an overflow marker for the records scrolled past.
+    assert!(output.contains("main"), "{output}");
+    assert!(
+        output.contains("↑2 more"),
+        "header should mark hidden subagents: {output}"
+    );
+    // The newest subagent (#8, started last) must remain visible; the oldest
+    // two are the ones scrolled out of view.
+    assert!(output.contains("delegate #8"), "{output}");
+    assert!(output.contains("delegate #3"), "{output}");
+    assert!(
+        !output.contains("delegate #1"),
+        "oldest record should be hidden, not the newest: {output}"
+    );
+    assert!(!output.contains("delegate #2"), "{output}");
+}
+
 #[tokio::test]
 async fn subagent_pane_selects_subagent_conversation_and_returns_to_main() {
     let mut agent = test_agent(SessionMode::Build);
@@ -535,6 +587,66 @@ fn rejected_subagent_appears_in_pane_and_is_clearable() {
     app.clear_finished_subagents();
     assert_eq!(app.subagent_pane.records.len(), 1);
     assert_eq!(app.subagent_pane.records[0].id, 1);
+}
+
+#[tokio::test]
+async fn rejected_subagent_event_renders_human_reason_not_raw_token() {
+    let mut app = test_app(SessionMode::Build);
+
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::SubagentRejected {
+        turn_id: TurnId::new(1),
+        agent: "delegate".to_string(),
+        reason: squeezy_agent::SubagentRejectionReason::ConcurrencyCap,
+        limit: 3,
+        active: 3,
+    })
+    .await
+    .expect("send rejected");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let rejected = app
+        .subagent_pane
+        .records
+        .iter()
+        .find(|r| matches!(r.lifecycle, SubagentLifecycle::Rejected))
+        .expect("rejected record present");
+    assert!(
+        !rejected.latest.contains("concurrency_cap"),
+        "pane row leaked raw enum token: {}",
+        rejected.latest
+    );
+    assert!(
+        rejected.latest.contains("concurrency cap reached"),
+        "pane row should show human reason: {}",
+        rejected.latest
+    );
+    // The per-subagent transcript line must read the same way, never the
+    // raw token (the machine token survives only in `push_log`).
+    let transcript_text = rejected
+        .transcript
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Log(log) => Some(log.message.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(
+        !transcript_text.contains("concurrency_cap")
+            && transcript_text.contains("concurrency cap reached"),
+        "transcript line should show human reason: {transcript_text}"
+    );
+
+    // The pane row on screen carries the human phrasing, not the token.
+    let output = render_to_string(&app, 120, 18);
+    let pane_row = output
+        .lines()
+        .find(|line| line.contains("delegate #1"))
+        .expect("capped pane row rendered");
+    assert!(!pane_row.contains("concurrency_cap"), "{pane_row}");
+    assert!(pane_row.contains("concurrency cap reached"), "{pane_row}");
 }
 
 #[test]
@@ -1305,6 +1417,44 @@ async fn cancelled_turn_auto_drains_next_queued_prompt() {
         app.auto_drain_queue,
         "Cancelled with a non-empty queue must set the auto-drain flag",
     );
+}
+
+#[tokio::test]
+async fn mention_refresh_offloads_walk_and_drain_installs_cache() {
+    let mut app = test_app(SessionMode::Build);
+
+    // Typing an `@`-mention must not synchronously walk the filesystem:
+    // the cache stays empty and a background walk is scheduled instead.
+    input::set_input(&mut app, "@a".to_string());
+    input::refresh_mention_popup(&mut app);
+    assert!(
+        app.workspace_file_cache.is_none(),
+        "refresh must not build the cache inline on the UI thread",
+    );
+    assert!(
+        app.pending_mention_walk.is_some(),
+        "refresh must schedule a background workspace walk",
+    );
+
+    // The drain helper installs the cache delivered over the oneshot and
+    // clears the in-flight guard so a future edit can schedule a new walk.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tx.send(mention::WorkspaceFileCache::from_paths_for_tests(vec![
+        PathBuf::from("alpha.rs"),
+    ]))
+    .expect("send cache");
+    app.pending_mention_walk = Some(rx);
+    drain_pending_mention_walk(&mut app);
+
+    assert!(
+        app.pending_mention_walk.is_none(),
+        "drain must clear the in-flight guard once the walk lands",
+    );
+    let cache = app
+        .workspace_file_cache
+        .as_ref()
+        .expect("drain must install the cache");
+    assert_eq!(cache.files().as_ref(), &vec![PathBuf::from("alpha.rs")]);
 }
 
 #[tokio::test]
@@ -9631,6 +9781,58 @@ async fn mention_popup_inserts_path_on_enter() {
     assert_eq!(app.input, "crates/squeezy-graph/src/lib.rs ");
 }
 
+#[test]
+fn mention_popup_footer_warns_when_workspace_walk_truncated() {
+    let mut app = test_app(SessionMode::Build);
+    // A cache flagged truncated stands in for a workspace that exceeded
+    // MAX_WORKSPACE_FILES without paying for a 5000-file walk.
+    app.workspace_file_cache = Some(mention::WorkspaceFileCache::from_truncated_paths_for_tests(
+        vec![PathBuf::from("crates/squeezy-graph/src/lib.rs")],
+    ));
+
+    insert_input_text(&mut app, "@graph");
+    assert!(
+        app.mention_popup
+            .as_ref()
+            .expect("popup should open")
+            .truncated,
+        "popup must carry the truncation flag from the cache"
+    );
+
+    let footer = mention_popup_lines(&app)
+        .last()
+        .expect("footer line")
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        footer.contains("more files not shown"),
+        "footer should warn about truncated candidates, got: {footer:?}"
+    );
+}
+
+#[test]
+fn mention_popup_footer_has_no_hint_when_not_truncated() {
+    let mut app = test_app(SessionMode::Build);
+    app.workspace_file_cache = Some(mention::WorkspaceFileCache::from_paths_for_tests(vec![
+        PathBuf::from("crates/squeezy-graph/src/lib.rs"),
+    ]));
+
+    insert_input_text(&mut app, "@graph");
+    let footer = mention_popup_lines(&app)
+        .last()
+        .expect("footer line")
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        !footer.contains("more files not shown"),
+        "untruncated popup must not show the hint, got: {footer:?}"
+    );
+}
+
 #[tokio::test]
 async fn mention_popup_escapes_on_esc() {
     let mut agent = test_agent(SessionMode::Build);
@@ -10663,6 +10865,56 @@ fn input_batch_prioritizes_key_before_transcript_drag_flood() {
     );
 }
 
+#[tokio::test]
+async fn dispatch_input_events_applies_every_key_in_one_batch() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    let events = vec![
+        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+    ];
+
+    let quit = dispatch_input_events(&mut app, &mut agent, events)
+        .await
+        .expect("dispatch batch");
+
+    assert!(!quit, "typing must not quit");
+    assert_eq!(
+        app.input, "abc",
+        "all three keys read in one poll window must reach the composer",
+    );
+}
+
+#[tokio::test]
+async fn dispatch_input_events_opens_overlay_for_chord_in_one_batch() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    let events = vec![
+        Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+    ];
+
+    dispatch_input_events(&mut app, &mut agent, events)
+        .await
+        .expect("dispatch chord batch");
+
+    assert!(
+        app.pending_chord.is_none(),
+        "chord must clear once the follow-up key is processed",
+    );
+    assert!(
+        app.prompt_queue_overlay.is_some(),
+        "Ctrl+X then Q landing in one poll window must open the queue overlay",
+    );
+    assert!(
+        app.input.is_empty(),
+        "the chord follow-up must not leak into the composer",
+    );
+}
+
 #[test]
 fn input_poll_limit_expands_in_transcript_scrollbar_drag_mode() {
     let mut app = test_app(SessionMode::Build);
@@ -11302,6 +11554,33 @@ fn json_patch_preview_parser_handles_escaped_quotes_in_search() {
 }
 
 #[test]
+fn json_patch_preview_parser_preserves_non_ascii_utf8() {
+    use super::streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
+
+    // A patch whose path/search/replace carry multi-byte UTF-8 must be
+    // surfaced verbatim — `byte as char` would split each sequence into
+    // Latin-1 code points and store mojibake (`café` -> `cafÃ©`).
+    let payload = r#"{"patches":[{"path":"café.rs","search":"naïve","replace":"résumé"}]}"#;
+
+    let mut parser = JsonPatchPreviewParser::new();
+    let events = parser.push_delta(payload);
+
+    let path = events
+        .iter()
+        .find_map(|e| match e {
+            PatchPreviewEvent::Patch { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .expect("patch object should emit a Patch event");
+    assert_eq!(path, "café.rs", "patch path must round-trip non-ASCII");
+
+    let partial = parser.latest_partial();
+    assert_eq!(partial.path.as_deref(), Some("café.rs"));
+    assert_eq!(partial.search.as_deref(), Some("naïve"));
+    assert_eq!(partial.replace.as_deref(), Some("résumé"));
+}
+
+#[test]
 fn streaming_chunks_emit_partial_previews_with_growing_content() {
     use super::streaming_patch::{
         JsonPatchPreviewParser, PatchPartial, PatchPreviewEvent, render_streaming_preview,
@@ -11871,6 +12150,61 @@ async fn alt_one_resumes_most_recent_non_active_session() {
         app.status.contains("resumed session"),
         "status should report the resume: {}",
         app.status,
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn quick_switch_clears_stale_subagent_pane() {
+    // Subagent records belong to the session being left; they are never
+    // persisted or rehydrated. Switching sessions must reset the pane so the
+    // prior session's rows do not linger and an active subagent view does not
+    // hijack the resumed transcript.
+    let root = temp_workspace("quick_switch_subagent");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let store = squeezy_store::SessionStore::open(&config);
+    store
+        .start_session_eager(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .expect("seed peer session");
+
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    // Seed a subagent row in the current session and pin the main view to it.
+    app.note_subagent_started(7, "delegate".to_string(), "Inspect src".to_string());
+    app.subagent_pane.active = ConversationSource::Subagent(7);
+    app.subagent_pane.focused = true;
+    app.subagent_pane.selected = 3;
+    assert!(
+        active_subagent_record(&app).is_some(),
+        "precondition: subagent view is active before the switch",
+    );
+
+    assert!(
+        handle_session_quick_switch(&mut app, &mut agent, 1).await,
+        "Alt+1 should claim the press when a peer session exists",
+    );
+    assert!(
+        app.status.contains("resumed session"),
+        "status should report the resume: {}",
+        app.status,
+    );
+
+    assert!(
+        app.subagent_pane.records.is_empty(),
+        "the prior session's subagent rows must be cleared on switch",
+    );
+    assert_eq!(
+        app.subagent_pane.active,
+        ConversationSource::Main,
+        "active source must fall back to the main conversation",
+    );
+    assert!(!app.subagent_pane.focused, "pane focus must be released");
+    assert_eq!(app.subagent_pane.selected, 0, "pane selection must reset");
+    assert!(
+        active_subagent_record(&app).is_none(),
+        "no stale subagent record may hijack the resumed transcript",
     );
 
     let _ = fs::remove_dir_all(root);

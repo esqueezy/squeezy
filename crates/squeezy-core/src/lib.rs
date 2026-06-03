@@ -6043,6 +6043,13 @@ fn validate_env_allowlist_pattern(pattern: &str, source: &str) -> Result<()> {
              only supports an exact name or a single trailing `*` (e.g. `LC_*`)"
         )));
     }
+    if trimmed == "*" {
+        return Err(SqueezyError::Config(format!(
+            "{source}: permissions.shell_sandbox.env_allowlist pattern {pattern:?} \
+             matches every variable and would preserve the entire host \
+             environment; use an exact name or a non-empty prefix (e.g. `LC_*`)"
+        )));
+    }
     Ok(())
 }
 
@@ -11724,6 +11731,11 @@ fn looks_like_config(label: Option<&str>, text: &str) -> bool {
 pub struct CostSnapshot {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Reasoning portion of `output_tokens`. By cross-provider
+    /// convention this is a *subset* of `output_tokens` (the inclusive
+    /// generated-token total), mirroring `cached_input_tokens` as a
+    /// subset of `input_tokens` — it is a breakdown, not an addend, so
+    /// total-token math must not add it on top of `output_tokens`.
     #[serde(default)]
     pub reasoning_output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
@@ -11982,6 +11994,8 @@ impl TurnMetrics {
 fn merge_cost_snapshot(total: &mut CostSnapshot, next: &CostSnapshot) {
     total.input_tokens = add_optional_u64(total.input_tokens, next.input_tokens);
     total.output_tokens = add_optional_u64(total.output_tokens, next.output_tokens);
+    total.reasoning_output_tokens =
+        add_optional_u64(total.reasoning_output_tokens, next.reasoning_output_tokens);
     total.cached_input_tokens =
         add_optional_u64(total.cached_input_tokens, next.cached_input_tokens);
     total.cache_write_input_tokens = add_optional_u64(

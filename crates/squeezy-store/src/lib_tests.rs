@@ -1,5 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use redb::{Database, TableDefinition};
 use serde_json::json;
 use squeezy_core::AppConfig;
 use squeezy_core::FileId;
@@ -95,6 +97,94 @@ fn compaction_checkpoint_prune_drops_old_only() {
             .is_some(),
         "fresh checkpoint should remain",
     );
+}
+
+/// Stamp `version` into the `state.redb` `meta` table so re-opening hits the
+/// schema-mismatch reset path.
+fn write_schema_version(path: &Path, version: u64) {
+    const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+    let database = Database::create(path).expect("create database");
+    let write = database.begin_write().expect("begin write");
+    {
+        let mut table = write.open_table(META).expect("open meta");
+        let value = serde_json::to_vec(&version).expect("encode version");
+        table
+            .insert("schema_version", value.as_slice())
+            .expect("insert version");
+    }
+    write.commit().expect("commit");
+}
+
+/// Shared buffer that a `tracing_subscriber::fmt` writer drains into so the
+/// test can assert which events the reset path emitted.
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = CapturedLogs;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[test]
+fn schema_mismatch_reset_warns_with_backup_path() {
+    let root = temp_root("schema-mismatch-warns");
+    let state = root.join(".squeezy").join("cache").join("state.redb");
+    std::fs::create_dir_all(state.parent().unwrap()).expect("create cache dir");
+    write_schema_version(&state, 3);
+
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_target(true)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+
+    let store = tracing::subscriber::with_default(subscriber, || {
+        SqueezyStore::open(&root, None).expect("open store")
+    });
+
+    let backup_name = std::fs::read_dir(state.parent().unwrap())
+        .expect("read cache")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.contains("schema-3"))
+        .expect("old schema database should be backed up");
+
+    let captured = logs.contents();
+    assert!(
+        captured.contains("squeezy::store"),
+        "warn must target squeezy::store, got: {captured}"
+    );
+    assert!(
+        captured.contains("schema mismatch"),
+        "warn must describe the schema mismatch, got: {captured}"
+    );
+    assert!(
+        captured.contains(&backup_name),
+        "warn must reference the backup path {backup_name}, got: {captured}"
+    );
+
+    drop(store);
 }
 
 #[test]

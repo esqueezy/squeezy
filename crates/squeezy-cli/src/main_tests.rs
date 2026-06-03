@@ -1226,3 +1226,30 @@ async fn pump_prompts_runs_normal_prompts_unchanged_when_no_bang_bang_present() 
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn project_init_target_resolves_ancestor_then_falls_back_to_cwd() {
+    let root = temp_dir("project-init-target");
+    let canonical_root = fs::canonicalize(&root).expect("canonicalize root");
+
+    // No ancestor squeezy.toml exists yet: writing happens in the cwd itself.
+    let sub = root.join("crates").join("foo");
+    fs::create_dir_all(&sub).expect("mkdir sub");
+    assert_eq!(
+        project_init_target(&sub),
+        sub.join(PROJECT_SETTINGS_FILE),
+        "without an ancestor file, init writes into the current directory",
+    );
+
+    // With a root squeezy.toml, init from a subdirectory must target the
+    // existing ancestor file instead of creating a shadowing closer one.
+    let root_settings = canonical_root.join(PROJECT_SETTINGS_FILE);
+    fs::write(&root_settings, "[session]\nmode = \"plan\"\n").expect("write root settings");
+    assert_eq!(
+        project_init_target(&sub),
+        root_settings,
+        "with an ancestor file, init must target it rather than the subdirectory",
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

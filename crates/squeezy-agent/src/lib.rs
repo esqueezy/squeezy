@@ -99,7 +99,9 @@ use roles::{RoleModelPolicy, SubagentRole, role_config};
 
 pub use ai_reviewer::{ReviewerAuditEntry, ReviewerAuditVerdict};
 pub use context_compaction::ContextCompactionReport;
-pub use cost_broker::{CostCapStatus, format_warn_threshold_notice};
+pub use cost_broker::{
+    CostCapStatus, format_cap_unenforceable_notice, format_warn_threshold_notice,
+};
 pub use export_html::{ExportError, ExportOpts, ExportTheme, export_session_to_html};
 pub use plan_mode::{PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG, strip_proposed_plan_blocks};
 pub use subagent_catalog::{
@@ -127,7 +129,7 @@ const DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER: &str = "{previous}";
 /// Hard cap on the number of steps a single `delegate_chain` call may
 /// declare. Each step burns a full subagent lease + LLM round, so the
 /// chain is intentionally narrower than the parent agent's per-turn tool
-/// budget. Eight steps is enough to thread a non-trivial multi-stage
+/// budget. A modest cap is enough to thread a non-trivial multi-stage
 /// research workflow without letting the model commit the entire turn
 /// budget to one chain.
 const DELEGATE_CHAIN_MAX_STEPS: usize = 16;
@@ -1063,6 +1065,15 @@ impl SubagentRejectionReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ConcurrencyCap => "concurrency_cap",
+        }
+    }
+
+    /// Human-readable phrasing for the TUI pane row and transcript, as
+    /// opposed to `as_str`'s machine token reserved for logs and
+    /// structured/session-log fields.
+    pub fn as_human(self) -> &'static str {
+        match self {
+            Self::ConcurrencyCap => "concurrency cap reached",
         }
     }
 }
@@ -2615,10 +2626,21 @@ impl Agent {
     pub async fn compact_context_manual(
         &self,
     ) -> squeezy_core::Result<Option<ContextCompactionReport>> {
-        let mut state = self.conversation_state.lock().await;
-        let mut conversation = state.conversation.clone();
-        let mut context_compaction = state.context_compaction.clone();
-        let attachments = state.context_attachments.clone();
+        // Clone the inputs and release the async mutex before the
+        // (potentially long-running) model-assisted compaction await.
+        // `compact_conversation_with_strategy` only touches these local
+        // clones, so holding `conversation_state` across its network
+        // round-trip would needlessly block every concurrent reader
+        // (the TUI's per-frame context/cost snapshots) for up to
+        // `model_assisted_timeout_secs`.
+        let (mut conversation, mut context_compaction, attachments) = {
+            let state = self.conversation_state.lock().await;
+            (
+                state.conversation.clone(),
+                state.context_compaction.clone(),
+                state.context_attachments.clone(),
+            )
+        };
         let Some(report) = compact_conversation_with_strategy(
             &mut conversation,
             &mut context_compaction,
@@ -2640,6 +2662,8 @@ impl Agent {
             // surface a graceful "nothing to compact" message.
             return Ok(None);
         };
+        // Re-acquire the mutex to commit the compacted state.
+        let mut state = self.conversation_state.lock().await;
         state.conversation = conversation;
         state.context_compaction = context_compaction;
         state.previous_response_id = None;
@@ -4610,7 +4634,10 @@ fn ingest_agents_md(cwd: &std::path::Path, max_bytes: usize) -> Option<String> {
         if !combined.is_empty() {
             combined.push_str("\n\n");
         }
-        let header_bytes = header.len().min(remaining);
+        let mut header_bytes = header.len().min(remaining);
+        while header_bytes > 0 && !header.is_char_boundary(header_bytes) {
+            header_bytes -= 1;
+        }
         combined.push_str(&header[..header_bytes]);
         remaining = remaining.saturating_sub(header_bytes);
         if remaining == 0 {
@@ -5042,9 +5069,14 @@ impl TurnRuntime {
             &mut context_compaction,
             &active_attachments,
             self.store.as_deref(),
+            &self.provider,
+            self.session_log.as_ref(),
+            &self.redactor,
             &self.config,
             ContextCompactionTrigger::Auto,
-        ) {
+        )
+        .await
+        {
             self.dispatch_post_compact(
                 report.record.before.estimated_tokens,
                 report.record.after.estimated_tokens,
@@ -5374,15 +5406,25 @@ impl TurnRuntime {
         // already sent over the wire. Stamp the same number into
         // `routing_judge_usd_micros` so the audit field shows the
         // judge's share separately from the main turn's request.
-        // `record_provider_cost` may return a warning status; we
-        // discard it here so the routing layer never emits the
-        // session-cap warning event itself — the main turn's later
-        // `record_provider_cost` will fire the warning if applicable.
+        // `record_provider_cost` consumes the one-shot warn latch when the
+        // session crosses `cost_warn_percent`. If the judge's spend is the
+        // call that crosses it, we must emit the warning here: the main
+        // turn's later `record_provider_cost` would see `warn_emitted` and
+        // return `None`, so dropping the status would lose the user-facing
+        // heads-up entirely.
         if judge_cost.estimated_usd_micros.is_some()
             || judge_cost.input_tokens.is_some()
             || judge_cost.output_tokens.is_some()
         {
-            let _ = broker.record_provider_cost(&judge_cost);
+            if let Some(status) = broker.record_provider_cost(&judge_cost) {
+                let _ = self
+                    .tx
+                    .send(AgentEvent::CostWarning {
+                        turn_id: self.turn_id,
+                        status,
+                    })
+                    .await;
+            }
             broker.metrics.routing_judge_usd_micros = judge_cost
                 .estimated_usd_micros
                 .unwrap_or(0)
@@ -5885,6 +5927,16 @@ impl TurnRuntime {
                                 estimate_cost(self.provider.name(), &request_model, &cost);
                         }
                         let warning = broker.record_provider_cost(&cost);
+                        if broker.note_unenforceable_cap_round(&cost) {
+                            let _ = self
+                                .tx
+                                .send(AgentEvent::CostCapUnenforceable {
+                                    turn_id: self.turn_id,
+                                    provider: self.provider.name().to_string(),
+                                    model: request_model.to_string(),
+                                })
+                                .await;
+                        }
                         if broker.metrics.routed_to_cheap
                             && request_model.as_ref() != parent_model_str.as_str()
                         {
@@ -6001,6 +6053,39 @@ impl TurnRuntime {
                         .await;
                     continue;
                 }
+                // Terminal stream error after retries are exhausted (most
+                // realistically a stream idle timeout). Mirror the cancel
+                // paths' partial preservation before propagating: flush the
+                // redactor tail, push the partial assistant text into the
+                // conversation/transcript, and fold the partial spend the
+                // provider already billed. Without this the bytes already
+                // streamed to the TUI are dropped from persisted state and
+                // the session cost under-reports the work. The error is
+                // still returned so `run`'s caller surfaces `Failed`.
+                if let Some(tail) = self
+                    .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                    .await
+                {
+                    self.record_replay_model_text_delta(&tail);
+                }
+                broker.metrics.redactions += assistant_stream.total_redactions();
+                let partial = std::mem::take(&mut assistant_message);
+                self.preserve_partial_assistant_on_cancel(
+                    partial,
+                    &mut conversation,
+                    user_transcript.clone(),
+                    context_compaction.clone(),
+                )
+                .await;
+                self.fold_partial_cancel_cost(
+                    &mut total_cost,
+                    &mut broker,
+                    request_model.as_ref(),
+                    request_input_bytes,
+                    round_output_bytes,
+                )
+                .await;
+                self.stamp_routing_savings(&mut broker.metrics);
                 return Err(error);
             }
 
@@ -6151,50 +6236,49 @@ impl TurnRuntime {
                     self.finish_turn(&broker.metrics).await;
                     return Ok(());
                 }
-                Some(StopReason::PauseTurn) => {
-                    // Anthropic `pause_turn`: the model voluntarily paused
-                    // mid-turn (typically a hosted tool still processing) and
-                    // expects the caller to re-issue with the partial state.
-                    // Full re-issue-with-partial-state handling is deferred —
-                    // wiring it risks an unbounded re-issue loop without a
-                    // dedicated guard. For now, when the pause carried tool
-                    // calls we fall through to the normal tool-execution path
-                    // below (results feed the next round, the closest safe
-                    // approximation of re-issue). When it carried nothing
-                    // actionable we surface an explicit failure rather than
-                    // letting it masquerade as a clean `EndTurn`, so the user
-                    // is not left staring at a silently truncated turn.
-                    // TODO: implement true pause_turn re-issue with a bounded
-                    // retry guard once the partial-state replay path lands.
-                    if tool_calls.is_empty() {
-                        if let Some(tail) = self
-                            .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
-                            .await
-                        {
-                            self.record_replay_model_text_delta(&tail);
-                        }
-                        self.stamp_routing_savings(&mut broker.metrics);
-                        self.publish_terminal_task_state(
-                            TaskStateStatus::Failed,
-                            Some("model paused the turn".to_string()),
-                            &task_title,
-                        )
-                        .await;
-                        let _ = self
-                            .tx
-                            .send(AgentEvent::Failed {
-                                turn_id: self.turn_id,
-                                error: SqueezyError::Agent(
-                                    "model paused the turn (pause_turn) without an actionable continuation; re-issue handling is not yet implemented — retry the turn".to_string(),
-                                ),
-                            })
-                            .await;
-                        self.finish_turn(&broker.metrics).await;
-                        return Ok(());
+                // Anthropic `pause_turn`: the model voluntarily paused
+                // mid-turn (typically a hosted tool still processing) and
+                // expects the caller to re-issue with the partial state.
+                // Full re-issue-with-partial-state handling is deferred —
+                // wiring it risks an unbounded re-issue loop without a
+                // dedicated guard. For now, when the pause carried tool
+                // calls we fall through to the normal tool-execution path
+                // below (results feed the next round, the closest safe
+                // approximation of re-issue). When it carried nothing
+                // actionable we surface an explicit failure rather than
+                // letting it masquerade as a clean `EndTurn`, so the user
+                // is not left staring at a silently truncated turn.
+                // TODO: implement true pause_turn re-issue with a bounded
+                // retry guard once the partial-state replay path lands.
+                Some(StopReason::PauseTurn) if tool_calls.is_empty() => {
+                    if let Some(tail) = self
+                        .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                        .await
+                    {
+                        self.record_replay_model_text_delta(&tail);
                     }
-                    // Tool calls present: fall through to the existing
-                    // tool-execution / re-entry logic below.
+                    self.stamp_routing_savings(&mut broker.metrics);
+                    self.publish_terminal_task_state(
+                        TaskStateStatus::Failed,
+                        Some("model paused the turn".to_string()),
+                        &task_title,
+                    )
+                    .await;
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::Failed {
+                            turn_id: self.turn_id,
+                            error: SqueezyError::Agent(
+                                "model paused the turn (pause_turn) without an actionable continuation; re-issue handling is not yet implemented — retry the turn".to_string(),
+                            ),
+                        })
+                        .await;
+                    self.finish_turn(&broker.metrics).await;
+                    return Ok(());
                 }
+                // `Some(StopReason::PauseTurn)` with tool calls present falls
+                // through (via the `_` arm) to the existing tool-execution /
+                // re-entry logic below.
                 _ => {}
             }
 
@@ -6575,9 +6659,13 @@ impl TurnRuntime {
                 &mut context_compaction,
                 &active_attachments,
                 self.store.as_deref(),
+                &self.provider,
+                self.session_log.as_ref(),
+                &self.redactor,
                 &self.config,
                 full_gate_observed_tokens,
-            );
+            )
+            .await;
             // Either tier mutates `conversation`, so the response-id reuse
             // path must invalidate the cached id and resend the full
             // conversation instead of the per-round outputs.
@@ -9786,7 +9874,10 @@ fn assistant_text_has_unresolved_intent(text: &str) -> bool {
     for intent in INTENT_PATTERNS {
         if let Some(idx) = lower.find(intent) {
             let tail_start = idx + intent.len();
-            let tail_end = (tail_start + 40).min(lower.len());
+            let mut tail_end = (tail_start + 40).min(lower.len());
+            while tail_end > tail_start && !lower.is_char_boundary(tail_end) {
+                tail_end -= 1;
+            }
             let tail = &lower[tail_start..tail_end];
             if ACTION_PATTERNS.iter().any(|action| tail.contains(action)) {
                 return true;
@@ -13619,19 +13710,18 @@ fn resume_item_to_llm_input(item: ResumeItem) -> LlmInputItem {
     }
 }
 
-/// Combined token count from a `CostSnapshot`. Sums `input_tokens`,
-/// `output_tokens`, and `reasoning_output_tokens` when present; falls back
-/// to `None` if the provider reported no usage.
+/// Combined token count from a `CostSnapshot`. Sums `input_tokens` and
+/// `output_tokens` when present; falls back to `None` if the provider
+/// reported no usage. `reasoning_output_tokens` is the subset of
+/// `output_tokens` that was reasoning (see
+/// docs/internal/cost-saving/10-token-accounting.md), so it is already
+/// inside `output_tokens` and must not be added again.
 fn total_tokens_from_cost(cost: &CostSnapshot) -> Option<u64> {
     let mut total: u64 = 0;
     let mut saw_any = false;
-    for value in [
-        cost.input_tokens,
-        cost.output_tokens,
-        cost.reasoning_output_tokens,
-    ]
-    .into_iter()
-    .flatten()
+    for value in [cost.input_tokens, cost.output_tokens]
+        .into_iter()
+        .flatten()
     {
         saw_any = true;
         total = total.saturating_add(value);
@@ -13937,6 +14027,17 @@ pub enum AgentEvent {
     CostWarning {
         turn_id: TurnId,
         status: CostCapStatus,
+    },
+    /// Emitted at most once per turn, the first round where a configured
+    /// `max_session_cost_usd_micros` cap cannot be enforced because the
+    /// active `(provider, model)` has no registry pricing (the per-round
+    /// dollar estimate is `None`, so the running total never advances and
+    /// the cap can never trip). The TUI renders a transcript notice so the
+    /// user knows the guardrail is inert; non-TUI consumers can ignore it.
+    CostCapUnenforceable {
+        turn_id: TurnId,
+        provider: String,
+        model: String,
     },
     /// Emitted at most once per session, the first time the shell tool's OS
     /// sandbox backend silently degrades to the best_effort path (probe

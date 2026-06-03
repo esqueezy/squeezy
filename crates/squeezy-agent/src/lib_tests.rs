@@ -401,6 +401,63 @@ async fn cancel_preserves_partial_assistant_text_in_conversation_state() {
 }
 
 #[tokio::test]
+async fn terminal_stream_error_preserves_partial_assistant_text_in_conversation_state() {
+    // Terminal provider-stream error (retries-exhausted idle timeout): the
+    // model streams a few text deltas, then the stream yields a terminal
+    // `ProviderStream` error instead of `Completed`/`Cancelled`. The turn
+    // ends as `AgentEvent::Failed`, but — exactly like the cancel paths —
+    // the partial assistant text already streamed to the TUI must be
+    // preserved in `conversation_state.conversation`/`transcript` instead
+    // of being silently dropped, so resume keeps what the model produced.
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("partial ".to_string())),
+        Ok(LlmEvent::TextDelta("answer".to_string())),
+        Err(SqueezyError::ProviderStream(
+            "stream idle timeout".to_string(),
+        )),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider);
+
+    let mut rx = agent.start_turn("answer me".to_string(), CancellationToken::new());
+    let mut saw_failed = false;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Failed { error, .. } = event {
+            saw_failed = error.to_string().contains("stream idle timeout");
+        }
+    }
+    assert!(
+        saw_failed,
+        "terminal stream error must still surface AgentEvent::Failed"
+    );
+
+    let state = agent.conversation_state.lock().await;
+    let partial = "partial answer";
+
+    let assistant_in_conversation = state
+        .conversation
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::AssistantText(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assistant_in_conversation,
+        vec![partial],
+        "partial assistant text streamed before a terminal stream error must be pushed onto \
+         `conversation_state.conversation`, not discarded like a hard failure"
+    );
+
+    let assistant = state
+        .transcript
+        .iter()
+        .find(|item| item.role == squeezy_core::Role::Assistant)
+        .expect("transcript must record the partial assistant turn");
+    assert_eq!(assistant.content, partial);
+}
+
+#[tokio::test]
 async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
     let root = temp_workspace("task_state_session");
     let provider = Arc::new(MockProvider::new(vec![
@@ -4048,6 +4105,51 @@ fn ingest_agents_md_truncates_at_byte_cap() {
 }
 
 #[test]
+fn ingest_agents_md_handles_multibyte_header_at_byte_cap() {
+    // Workspace under a directory whose name contains a multibyte char, so the
+    // per-file header (which embeds the full path) holds a `é` (2 bytes). When
+    // the byte budget runs out partway through that header it must not slice
+    // mid-character.
+    let base = temp_workspace("ingest_agents_md_multibyte");
+    let root = base.join("josé");
+    fs::create_dir_all(root.join(".git")).expect("create .git marker");
+    fs::write(root.join("AGENTS.md"), "root rule").expect("write root AGENTS.md");
+    let nested = root.join("crates").join("béta");
+    fs::create_dir_all(&nested).expect("create nested dir");
+    fs::write(nested.join("AGENTS.md"), "nested rule").expect("write nested AGENTS.md");
+
+    // Reproduce the header exactly as the function builds it for the nested
+    // file, then pick a `max_bytes` that lands inside one of its multibyte
+    // chars. The nested file is reached only after the root file consumes some
+    // budget, so size the cap to leave `remaining` inside the nested header.
+    let canonical = fs::canonicalize(&nested).expect("canonicalize");
+    let header = format!("--- {} ---\n", canonical.join("AGENTS.md").display());
+    let mid = header
+        .char_indices()
+        .find(|(_, c)| c.len_utf8() > 1)
+        .map(|(i, _)| i + 1)
+        .expect("multibyte char in header path");
+    assert!(!header.is_char_boundary(mid), "chose a mid-char index");
+
+    // Root header + root body + separator, then `mid` bytes into the nested
+    // header — without the fix the nested header slice panics here.
+    let root_header = format!(
+        "--- {} ---\n",
+        fs::canonicalize(&root)
+            .expect("canonicalize root")
+            .join("AGENTS.md")
+            .display()
+    );
+    // The "\n\n" separator is appended without decrementing `remaining`, so the
+    // budget reaching the nested header is exactly `mid`.
+    let max_bytes = root_header.len() + "root rule".len() + mid;
+
+    let combined = super::ingest_agents_md(&nested, max_bytes).expect("ingest");
+    assert!(combined.contains("root rule"));
+    assert!(combined.ends_with("[truncated]"));
+}
+
+#[test]
 fn ingest_user_memory_reads_from_home_squeezy() {
     let home = temp_workspace("ingest_user_memory");
     fs::create_dir_all(home.join(".squeezy")).expect("mkdir .squeezy");
@@ -4363,70 +4465,101 @@ fn config_with_mid_turn(window: u64, threshold: u8) -> AppConfig {
     }
 }
 
-#[test]
-fn mid_turn_compaction_skips_when_disabled() {
+/// Empty no-model provider for the mid-turn gate tests. The gate either
+/// bails before reaching the model or runs with the default `Extractive`
+/// strategy, so the provider is never streamed.
+fn gate_test_provider() -> Arc<dyn LlmProvider> {
+    Arc::new(MockProvider::new(Vec::new()))
+}
+
+#[tokio::test]
+async fn mid_turn_compaction_skips_when_disabled() {
     let mut config = config_with_mid_turn(100_000, 80);
     config.context_compaction.enabled_mid_turn = false;
     let mut conversation = mid_turn_test_conversation();
     let mut state = ContextCompactionState::default();
+    let provider = gate_test_provider();
+    let redactor = Redactor::default();
     let report = super::maybe_compact_mid_turn(
         &mut conversation,
         &mut state,
         &[],
         None,
+        &provider,
+        None,
+        &redactor,
         &config,
         Some(90_000),
-    );
+    )
+    .await;
     assert!(report.is_none());
 }
 
-#[test]
-fn mid_turn_compaction_skips_without_window() {
+#[tokio::test]
+async fn mid_turn_compaction_skips_without_window() {
     let mut config = config_with_mid_turn(100_000, 80);
     config.context_compaction.model_context_window = None;
     let mut conversation = mid_turn_test_conversation();
     let mut state = ContextCompactionState::default();
+    let provider = gate_test_provider();
+    let redactor = Redactor::default();
     let report = super::maybe_compact_mid_turn(
         &mut conversation,
         &mut state,
         &[],
         None,
+        &provider,
+        None,
+        &redactor,
         &config,
         Some(90_000),
-    );
+    )
+    .await;
     assert!(report.is_none());
 }
 
-#[test]
-fn mid_turn_compaction_skips_below_threshold() {
+#[tokio::test]
+async fn mid_turn_compaction_skips_below_threshold() {
     let config = config_with_mid_turn(100_000, 80);
     let mut conversation = mid_turn_test_conversation();
     let mut state = ContextCompactionState::default();
+    let provider = gate_test_provider();
+    let redactor = Redactor::default();
     let report = super::maybe_compact_mid_turn(
         &mut conversation,
         &mut state,
         &[],
         None,
+        &provider,
+        None,
+        &redactor,
         &config,
         Some(50_000),
-    );
+    )
+    .await;
     assert!(report.is_none());
 }
 
-#[test]
-fn mid_turn_compaction_fires_at_threshold() {
+#[tokio::test]
+async fn mid_turn_compaction_fires_at_threshold() {
     let config = config_with_mid_turn(100_000, 80);
     let mut conversation = mid_turn_test_conversation();
     let original_len = conversation.len();
     let mut state = ContextCompactionState::default();
+    let provider = gate_test_provider();
+    let redactor = Redactor::default();
     let report = super::maybe_compact_mid_turn(
         &mut conversation,
         &mut state,
         &[],
         None,
+        &provider,
+        None,
+        &redactor,
         &config,
         Some(80_001),
     )
+    .await
     .expect("mid-turn compaction should fire");
     assert!(matches!(
         report.record.trigger,
@@ -4535,13 +4668,33 @@ async fn mid_turn_compaction_fires_when_provider_reports_high_usage() {
 
 #[test]
 fn total_tokens_from_cost_sums_present_fields() {
+    // `reasoning_output_tokens` is the subset of `output_tokens` that was
+    // reasoning, so the total is input + output (reasoning is already
+    // inside output and must not be double-counted).
     let cost = CostSnapshot {
         input_tokens: Some(1_000),
         output_tokens: Some(2_000),
         reasoning_output_tokens: Some(500),
         ..CostSnapshot::default()
     };
-    assert_eq!(super::total_tokens_from_cost(&cost), Some(3_500));
+    assert_eq!(super::total_tokens_from_cost(&cost), Some(3_000));
+    // reasoning_output_tokens is a subset of output_tokens, so the
+    // total is input + output only (not input + output + reasoning).
+    assert_eq!(super::total_tokens_from_cost(&cost), Some(3_000));
+}
+
+#[test]
+fn total_tokens_from_cost_excludes_reasoning_subset() {
+    // OpenAI-family usage: output_tokens is the inclusive generated
+    // total and reasoning_output_tokens (2_500) is a subset of it, so
+    // the model actually consumed input + output = 4_000 — not 6_500.
+    let cost = CostSnapshot {
+        input_tokens: Some(1_000),
+        output_tokens: Some(3_000),
+        reasoning_output_tokens: Some(2_500),
+        ..CostSnapshot::default()
+    };
+    assert_eq!(super::total_tokens_from_cost(&cost), Some(4_000));
 }
 
 #[test]
@@ -5803,6 +5956,60 @@ async fn compact_with_strategy_falls_back_to_extractive_when_hanging_provider_ti
     );
 }
 
+#[tokio::test]
+async fn manual_compact_does_not_hold_conversation_lock_across_model_assisted_call() {
+    // `compact_context_manual` runs the (possibly slow) model-assisted
+    // provider round-trip. It must release the `conversation_state`
+    // mutex before that await so concurrent snapshot readers — the TUI's
+    // per-frame context/cost reads — keep making progress. A
+    // `HangingProvider` keeps the model-assisted request in flight for
+    // the full timeout; if the guard were held across the await, the
+    // snapshot read below would block for that entire window instead of
+    // returning at once.
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            strategy: CompactionStrategy::ModelAssisted,
+            model_assisted_model: Some("test-model".to_string()),
+            // Long enough that holding the lock would block the snapshot
+            // far beyond the assertion timeout below.
+            model_assisted_timeout_secs: 30,
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let provider = Arc::new(HangingProvider::new());
+    let agent = Arc::new(Agent::new(config, provider.clone()));
+    agent.conversation_state.lock().await.conversation = mid_turn_test_conversation();
+
+    let compact_agent = agent.clone();
+    let compact = tokio::spawn(async move { compact_agent.compact_context_manual().await });
+
+    // Wait until the model-assisted provider request is actually in
+    // flight (and thus the hanging await is pending).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while provider.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("model-assisted compaction request should be issued");
+
+    // The lock must be free while compaction is in flight: a concurrent
+    // snapshot read returns promptly instead of queueing behind the held
+    // guard for the 30s timeout window.
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        agent.context_estimate_snapshot(),
+    )
+    .await
+    .expect("snapshot read must not block on the in-flight model-assisted compaction");
+
+    compact.abort();
+}
+
 #[test]
 fn compaction_summary_includes_recent_observations() {
     use squeezy_store::{Observation, ObservationKind, SqueezyStore};
@@ -6378,6 +6585,150 @@ async fn compact_with_strategy_falls_back_when_model_output_missing_slots() {
     assert!(
         !report.summary.contains(unstructured),
         "unstructured model output must not be promoted to the final summary"
+    );
+}
+
+#[tokio::test]
+async fn maybe_compact_mid_turn_honors_model_assisted_strategy() {
+    // Regression for #235: the automatic mid-turn path must honor a
+    // configured `ModelAssisted` strategy, not silently emit the
+    // extractive blob the way it did before it routed through
+    // `compact_conversation_with_strategy`.
+    let structured = "## Goal\nbuild a parser\n\n\
+                      ## Progress\n- wrote lexer\n\n\
+                      ## Decisions\n- use tree-sitter\n\n\
+                      ## Next\n- wire grammar tests\n";
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(structured.to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("compaction".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            enabled_mid_turn: true,
+            model_context_window: Some(100_000),
+            threshold_percent: 80,
+            strategy: CompactionStrategy::ModelAssisted,
+            model_assisted_model: Some("test-model".to_string()),
+            model_assisted_timeout_secs: 5,
+            recent_items: 2,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let provider_trait: Arc<dyn LlmProvider> = provider.clone();
+    let redactor = Redactor::default();
+    let report = super::maybe_compact_mid_turn(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &provider_trait,
+        None,
+        &redactor,
+        &config,
+        Some(80_001),
+    )
+    .await
+    .expect("mid-turn compaction should fire over threshold");
+
+    assert_eq!(
+        report.summary.trim(),
+        structured.trim(),
+        "mid-turn summary head must be the model-assisted output, not the extractive blob"
+    );
+    assert_eq!(
+        conversation.first().and_then(|item| match item {
+            LlmInputItem::UserText(text) => Some(text.as_str()),
+            _ => None,
+        }),
+        Some(structured.trim()),
+        "synthetic summary head must carry the model-assisted output"
+    );
+    assert!(
+        !report
+            .summary
+            .contains("Squeezy compacted conversation context"),
+        "model-assisted mid-turn output must replace the extractive summary"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the configured strategy must issue exactly one model-assisted request"
+    );
+}
+
+#[tokio::test]
+async fn maybe_compact_conversation_honors_model_assisted_strategy() {
+    // Regression for #235: the post-turn auto-compaction path must honor a
+    // configured `ModelAssisted` strategy. Before the fix it called the
+    // extractive summarizer directly and ignored `strategy`.
+    let structured = "## Goal\nbuild a parser\n\n\
+                      ## Progress\n- wrote lexer\n\n\
+                      ## Decisions\n- use tree-sitter\n\n\
+                      ## Next\n- wire grammar tests\n";
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(structured.to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("compaction".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            strategy: CompactionStrategy::ModelAssisted,
+            model_assisted_model: Some("test-model".to_string()),
+            model_assisted_timeout_secs: 5,
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let provider_trait: Arc<dyn LlmProvider> = provider.clone();
+    let redactor = Redactor::default();
+    let report = super::maybe_compact_conversation(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &provider_trait,
+        None,
+        &redactor,
+        &config,
+        ContextCompactionTrigger::Auto,
+    )
+    .await
+    .expect("post-turn auto-compaction should fire");
+
+    assert_eq!(
+        report.summary.trim(),
+        structured.trim(),
+        "post-turn summary head must be the model-assisted output, not the extractive blob"
+    );
+    assert!(
+        !report
+            .summary
+            .contains("Squeezy compacted conversation context"),
+        "model-assisted auto output must replace the extractive summary"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the configured strategy must issue exactly one model-assisted request"
     );
 }
 
@@ -7266,6 +7617,77 @@ fn progress_snapshot_returns_none_before_any_calls() {
     assert!(broker.progress_snapshot_if_due(3).is_none());
 }
 
+/// Regression for #259: when the routing LLM-judge's billed spend is the call
+/// that pushes the session across `cost_warn_percent`, the one-shot
+/// `CostWarning` must still surface. The judge fold records the judge cost into
+/// the same broker the main turn uses; dropping the warning status it returns
+/// would latch `warn_emitted` and silently suppress the user-facing notice.
+#[tokio::test]
+async fn routing_judge_spend_crossing_warn_threshold_still_surfaces_cost_warning() {
+    // First popped response = the judge call; its `Completed` cost crosses the
+    // warn threshold (9_000 >= 80% of 10_000) but stays under the cap. Second
+    // popped response = the main turn, billed nothing more.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![Ok(LlmEvent::Completed {
+            response_id: Some("judge".to_string()),
+            cost: CostSnapshot {
+                estimated_usd_micros: Some(9_000),
+                input_tokens: Some(100),
+                output_tokens: Some(10),
+                ..CostSnapshot::default()
+            },
+            stop_reason: None,
+            reasoning_only_stop: false,
+        })],
+        vec![Ok(LlmEvent::Completed {
+            response_id: Some("main".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        })],
+    ]));
+    let config = AppConfig {
+        model: "parent-model".to_string(),
+        // Distinct cheap model so the classifier doesn't short-circuit, and
+        // the judge actually dispatches.
+        small_fast_model: Some("cheap-model".to_string()),
+        routing: squeezy_core::RoutingConfig {
+            auto_cheap: true,
+            auto_cheap_llm_judge: true,
+            ..AppConfig::default().routing
+        },
+        max_session_cost_usd_micros: Some(10_000),
+        cost_warn_percent: 80,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    // A non-slam-dunk, non-deictic prompt so `classify_turn` falls through to
+    // the LLM judge rather than the heuristic.
+    let mut rx = agent.start_turn(
+        "Investigate why the build pipeline keeps failing intermittently".to_string(),
+        CancellationToken::new(),
+    );
+    let mut warnings = Vec::new();
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::CostWarning { status, .. } = event {
+            warnings.push(status);
+        }
+    }
+
+    assert_eq!(
+        warnings.len(),
+        1,
+        "judge-driven threshold crossing must surface exactly one CostWarning"
+    );
+    assert_eq!(warnings[0].cap_usd_micros, 10_000);
+    assert!(
+        warnings[0].spent_usd_micros >= 8_000,
+        "warning must report spend at/above the 80% threshold; got {}",
+        warnings[0].spent_usd_micros
+    );
+}
+
 /// Repro for bd ticket squeezy-xt2o: with a $0.01 cap and a fresh broker the
 /// pre-flight gate must refuse to dispatch a turn whose projected input/output
 /// pricing already exceeds the cap, so the broker trips *before* the over-cap
@@ -8022,6 +8444,14 @@ fn assistant_text_has_unresolved_intent_skips_intent_without_action_verb() {
     assert!(!assistant_text_has_unresolved_intent(
         "Let me think about this. The answer depends on what you mean by X.",
     ));
+}
+
+#[test]
+fn assistant_text_has_unresolved_intent_handles_multibyte_tail() {
+    // A multibyte char straddling the `tail_start + 40` byte offset must not
+    // panic: `é` lands at byte 44/45, exactly the slice end for `"i'll "`.
+    let text = format!("I'll {}é and continue", "x".repeat(39));
+    let _ = assistant_text_has_unresolved_intent(&text);
 }
 
 // F17-dispatch-command-completeness: each typed `DispatchCommand`

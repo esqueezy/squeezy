@@ -1109,15 +1109,21 @@ fn run_session_log_writer(
     let path = dir.join("events.jsonl");
     let mut current_size = fs::metadata(&path).map_or(0, |metadata| metadata.len() as usize);
     let mut terminal_failure: Option<String> = None;
+    let mut truncated = false;
     for command in rx {
         match command {
             SessionLogCmd::Append(append) => {
                 if terminal_failure.is_some() {
                     continue;
                 }
-                if let Err(error) =
-                    write_session_log_append(&store, &dir, &path, &mut current_size, append)
-                {
+                if let Err(error) = write_session_log_append(
+                    &store,
+                    &dir,
+                    &path,
+                    &mut current_size,
+                    &mut truncated,
+                    append,
+                ) {
                     let message = error.to_string();
                     if let Some(writer) = writer.upgrade() {
                         writer.record_failure(&message);
@@ -1148,16 +1154,24 @@ fn write_session_log_append(
     dir: &Path,
     path: &Path,
     current_size: &mut usize,
+    truncated: &mut bool,
     append: SessionLogAppend,
 ) -> Result<()> {
     fs::create_dir_all(dir)?;
     if current_size.saturating_add(append.payload.len()) > store.max_session_bytes {
-        update_metadata_file(dir, |metadata| {
-            metadata.status = SessionStatus::Truncated;
-            metadata.resume_available = false;
-            metadata.resume_unavailable_reason =
-                Some("session exceeded max_session_bytes".to_string());
-        })?;
+        // Record the truncation transition exactly once. `current_size` only
+        // ever grows, so every later append would otherwise re-enter this
+        // branch and rewrite byte-identical metadata.json for the rest of the
+        // session.
+        if !*truncated {
+            update_metadata_file(dir, |metadata| {
+                metadata.status = SessionStatus::Truncated;
+                metadata.resume_available = false;
+                metadata.resume_unavailable_reason =
+                    Some("session exceeded max_session_bytes".to_string());
+            })?;
+            *truncated = true;
+        }
         return Ok(());
     }
     append_payload_with_recovery(path, &append.payload, current_size)?;
@@ -2747,12 +2761,38 @@ fn memory_file_ends_with_newline(path: &Path) -> Result<bool> {
     Ok(buf[0] == b'\n')
 }
 
+/// Serialize `value` to `path` atomically: write to a sibling temp file,
+/// `sync_all`, then `fs::rename` over the target. A reader (and a crash)
+/// therefore only ever observes the previous complete file or the new
+/// complete file, never a truncated/torn one. This matters because
+/// `metadata.json` is rewritten on essentially every turn; a non-atomic
+/// in-place write left a torn metadata file that silently hid an
+/// otherwise-recoverable session from `list()`/`resume()`. Mirrors the
+/// tmp + `sync_all` + `rename` pattern in [`rewrite_global_index`].
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(value).map_err(json_error)?;
-    fs::write(path, bytes)?;
+    // Per-pid temp name so concurrent writers to the same path don't
+    // clobber each other's in-flight temp file before the rename.
+    let tmp = match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => path.with_file_name(format!(".{}.{}.tmp", name, std::process::id())),
+        None => path.with_extension("tmp"),
+    };
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    if let Err(error) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error.into());
+    }
     Ok(())
 }
 

@@ -604,9 +604,8 @@ fn format_rgb(rgb: [u8; 3]) -> String {
 fn render_theme_editor_lines(editor: &ThemeEditor) -> Vec<Line<'static>> {
     match editor {
         ThemeEditor::Name { draft, cursor } => {
-            let _ = cursor;
             vec![
-                Line::from(Span::raw(format!("  {draft}_"))),
+                caret_line(draft, *cursor),
                 Line::from(Span::styled(
                     "Enter to create from the active theme · Esc to cancel",
                     Style::default().fg(crate::render::theme::quiet()),
@@ -618,7 +617,6 @@ fn render_theme_editor_lines(editor: &ThemeEditor) -> Vec<Line<'static>> {
             draft,
             cursor,
         } => {
-            let _ = cursor;
             vec![
                 Line::from(vec![
                     Span::styled(
@@ -630,7 +628,7 @@ fn render_theme_editor_lines(editor: &ThemeEditor) -> Vec<Line<'static>> {
                         Style::default().fg(crate::render::theme::secondary()),
                     ),
                 ]),
-                Line::from(Span::raw(format!("  {draft}_"))),
+                caret_line(draft, *cursor),
                 Line::from(Span::styled(
                     "Enter to rename · Esc to cancel",
                     Style::default().fg(crate::render::theme::quiet()),
@@ -643,7 +641,6 @@ fn render_theme_editor_lines(editor: &ThemeEditor) -> Vec<Line<'static>> {
             draft,
             cursor,
         } => {
-            let _ = cursor;
             vec![
                 Line::from(vec![
                     Span::styled("theme ", Style::default().fg(crate::render::theme::quiet())),
@@ -660,7 +657,7 @@ fn render_theme_editor_lines(editor: &ThemeEditor) -> Vec<Line<'static>> {
                         Style::default().fg(crate::render::theme::secondary()),
                     ),
                 ]),
-                Line::from(Span::raw(format!("  {draft}_"))),
+                caret_line(draft, *cursor),
                 Line::from(Span::styled(
                     "RGB as r,g,b · Enter to commit · Esc to cancel",
                     Style::default().fg(crate::render::theme::quiet()),
@@ -899,6 +896,35 @@ fn render_discard_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScree
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
+/// Render the secret-entry value line with a caret at char-index `cursor`.
+/// `display` is the already-masked-or-revealed string, whose chars stay 1:1
+/// with `draft`, so the draft cursor indexes it directly. The caret reverses
+/// the glyph it sits on, or an accent underscore when parked past the end.
+fn secret_caret_line(display: &str, cursor: usize) -> Line<'static> {
+    let chars: Vec<char> = display.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let before: String = chars[..cursor].iter().collect();
+    let after: String = chars[cursor..].iter().skip(1).collect();
+    let mut spans = vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(before, Style::default().fg(muted_fg())),
+    ];
+    match chars.get(cursor) {
+        Some(c) => spans.push(Span::styled(
+            c.to_string(),
+            Style::default()
+                .fg(muted_fg())
+                .add_modifier(Modifier::REVERSED),
+        )),
+        None => spans.push(Span::styled(
+            "_",
+            Style::default().fg(crate::render::theme::accent()),
+        )),
+    }
+    spans.push(Span::styled(after, Style::default().fg(muted_fg())));
+    Line::from(spans)
+}
+
 fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntryState) {
     let display: String = if entry.reveal {
         // Explicit Ctrl+T toggle — show the full plaintext for verification.
@@ -925,11 +951,7 @@ fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntrySta
             Span::styled(entry.env_var.as_str(), Style::default().fg(muted_fg())),
         ]),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(display, Style::default().fg(muted_fg())),
-            Span::styled("_", Style::default().fg(crate::render::theme::accent())),
-        ]),
+        secret_caret_line(&display, entry.cursor),
         Line::raw(""),
         Line::from(vec![Span::styled(
             "Paste your key. Saved as inline `api_key` in the active scope's settings \
@@ -1521,13 +1543,34 @@ fn scroll_start_for_cursor(total: usize, cursor: usize, visible_rows: usize) -> 
     }
 }
 
+/// Build the spans for a single-line text draft with a visible caret at the
+/// char-index `cursor`. The caret reverses the glyph it sits on; when the
+/// cursor is at the end of the draft it reverses a trailing space so the
+/// insertion point is still drawn. `cursor` is clamped to the draft length to
+/// stay panic-safe against any stale index.
+fn caret_line(draft: &str, cursor: usize) -> Line<'static> {
+    let chars: Vec<char> = draft.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let before: String = chars[..cursor].iter().collect();
+    let at: String = chars
+        .get(cursor)
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| " ".to_string());
+    let after: String = chars[cursor..].iter().skip(1).collect();
+    let caret = Style::default().add_modifier(Modifier::REVERSED);
+    Line::from(vec![
+        Span::raw("  "),
+        Span::raw(before),
+        Span::styled(at, caret),
+        Span::raw(after),
+    ])
+}
+
 fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
     match editor {
         FieldEditor::Text { draft, cursor } | FieldEditor::Duration { draft, cursor } => {
-            let cursor_str = format!("  {draft}");
-            let _ = cursor;
             vec![
-                Line::from(Span::raw(cursor_str)),
+                caret_line(draft, *cursor),
                 Line::from(Span::styled(
                     "Enter to commit · Esc to cancel",
                     Style::default().fg(crate::render::theme::quiet()),
@@ -1546,9 +1589,8 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
             min,
             max,
         } => {
-            let _ = cursor;
             vec![
-                Line::from(Span::raw(format!("  {draft}"))),
+                caret_line(draft, *cursor),
                 Line::from(Span::styled(
                     format!("range: {min}..={max} · Enter to commit · Esc to cancel"),
                     Style::default().fg(crate::render::theme::quiet()),
@@ -1667,9 +1709,8 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
             ]
         }
         FieldEditor::StringList { draft, cursor } => {
-            let _ = cursor;
             vec![
-                Line::from(Span::raw(format!("  {draft}"))),
+                caret_line(draft, *cursor),
                 Line::from(Span::styled(
                     "comma-separated · Enter to commit · Esc to cancel",
                     Style::default().fg(crate::render::theme::quiet()),
@@ -1677,9 +1718,8 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
             ]
         }
         FieldEditor::Path { draft, cursor } => {
-            let _ = cursor;
             vec![
-                Line::from(Span::raw(format!("  {draft}"))),
+                caret_line(draft, *cursor),
                 Line::from(Span::styled(
                     "filesystem path · Enter to commit · Esc to cancel",
                     Style::default().fg(crate::render::theme::quiet()),
@@ -1783,3 +1823,7 @@ fn tier_color(tier: ApplyTier) -> Color {
         ApplyTier::Restart => crate::render::theme::secondary(),
     }
 }
+
+#[cfg(test)]
+#[path = "render_tests.rs"]
+mod tests;

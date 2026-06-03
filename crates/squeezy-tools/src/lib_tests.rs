@@ -2731,6 +2731,67 @@ async fn apply_patch_create_and_delete_in_one_call() {
 }
 
 #[tokio::test]
+async fn apply_patch_rejects_search_replace_then_move_on_same_path() {
+    // A `search_replace` plus a `move_file` on the same source in one call is
+    // staged against the original on-disk bytes, so the apply loop would write
+    // the edited source, then move the *un-edited* original to the destination
+    // and delete the source — silently losing the edit while reporting both
+    // ops "applied". The call must be rejected and the file left untouched.
+    let root = temp_workspace("apply_patch_conflict_replace_move");
+    fs::write(root.join("a.rs"), "foo\n").expect("seed a.rs");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_conflict".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [
+                        {
+                            "kind": "search_replace",
+                            "path": "a.rs",
+                            "search": "foo",
+                            "replace": "bar",
+                            "expected_sha256": sha256_hex("foo\n".as_bytes()),
+                        },
+                        {
+                            "kind": "move_file",
+                            "from": "a.rs",
+                            "to": "b.rs",
+                            "expected_sha256": sha256_hex("foo\n".as_bytes()),
+                        }
+                    ]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-conflict".to_string(),
+        )
+        .await;
+
+    assert_eq!(
+        result.status,
+        ToolStatus::Error,
+        "overlapping cross-kind ops must be rejected, not silently clobbered: {:?}",
+        result.content
+    );
+    assert_eq!(result.content["path"], "a.rs");
+    assert_eq!(
+        result.content["conflicting_kinds"],
+        json!(["search_replace", "move_file"])
+    );
+    // Nothing was written: the source survives unchanged and the move
+    // destination was never created.
+    assert_eq!(fs::read_to_string(root.join("a.rs")).unwrap(), "foo\n");
+    assert!(
+        !root.join("b.rs").exists(),
+        "move destination must not exist"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn apply_patch_create_file_rejects_existing_target() {
     let root = temp_workspace("apply_patch_create_existing");
     fs::write(root.join("there.txt"), "stay\n").expect("seed there");
@@ -2932,6 +2993,54 @@ async fn apply_patch_recovers_from_curly_quote_drift() {
         .cloned()
         .expect("operations preview");
     assert_eq!(operations[0]["fallback"], "quote_normalize");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_quote_fallback_counts_self_overlapping_match_once() {
+    // Issue #274: the quote-normalize fallback counted matches with an
+    // overlapping scan, so a self-overlapping search (`''`) against three
+    // curly apostrophes was seen as two matches and rejected. The exact path
+    // uses non-overlapping `match_indices` semantics; the fallback must agree.
+    // Content `\u{2019}\u{2019}\u{2019}` normalizes to `'''`; `match_indices("''")`
+    // on `'''` is exactly one, so this single edit must apply.
+    let root = temp_workspace("apply_patch_quote_overlap");
+    let initial = "\u{2019}\u{2019}\u{2019}\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_quote_overlap".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "search_replace",
+                        "path": "doc.txt",
+                        "search": "''",
+                        "replace": "X",
+                        "expected_sha256": on_disk_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-quote-overlap".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let applied_delta = result
+        .content
+        .get("applied_delta")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        applied_delta["operations"][0]["fallback"],
+        "quote_normalize"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -4916,6 +5025,57 @@ async fn write_file_changed_content_marks_noop_false_and_writes() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn write_file_replaces_atomically_and_preserves_mode() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // A replace must not truncate-in-place: write_file routes through a
+    // sibling tempfile + rename so a crash leaves the original intact. The
+    // observable signatures are that the file's mode survives the edit and
+    // that the rename swaps in a fresh inode (an in-place `fs::write` would
+    // keep the same inode and could leave a half-written file on crash).
+    let root = temp_workspace("write_file_atomic_mode");
+    let target = root.join("script.sh");
+    fs::write(&target, "before").expect("write sample");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let ino_before = fs::metadata(&target).unwrap().ino();
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "atomic-write".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "script.sh",
+                    "content": "after",
+                    "expected_sha256": sha256_hex(b"before"),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-atomic".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "after");
+
+    let meta = fs::metadata(&target).unwrap();
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o755,
+        "replace must preserve the original file mode"
+    );
+    assert_ne!(
+        ino_before,
+        meta.ino(),
+        "atomic replace must swap a fresh inode in via rename, not truncate in place"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn shell_created_file_is_checkpointed_and_deleted_on_undo() {
     let root = temp_workspace("checkpoint_shell_undo");
@@ -6896,6 +7056,24 @@ fn web_helpers_extract_hosts_and_classify_text_content() {
 }
 
 #[test]
+fn decode_body_honors_declared_charset() {
+    // ISO-8859-1: 0xE9 is `é`, which is not valid standalone UTF-8.
+    assert_eq!(decode_body(&[0xE9], "text/html; charset=ISO-8859-1"), "é");
+    // windows-1252: 0x92 is a curly apostrophe in the C1 range.
+    assert_eq!(
+        decode_body(&[0x92], "text/html; charset=windows-1252"),
+        "\u{2019}"
+    );
+    // No charset declared: high bytes decode lossily as before.
+    assert_eq!(decode_body(&[0xE9], "text/html"), "\u{FFFD}");
+    // Declared UTF-8 round-trips multibyte sequences.
+    assert_eq!(
+        decode_body("café".as_bytes(), "text/plain; charset=utf-8"),
+        "café"
+    );
+}
+
+#[test]
 fn web_cache_receipt_status_marks_stale_entries() {
     let retrieved_at = 1_000_u128;
     let stale_after = web_cache_stale_after_unix_ms(retrieved_at);
@@ -7296,6 +7474,46 @@ async fn websearch_reports_missing_text_content() {
 }
 
 #[tokio::test]
+async fn websearch_surfaces_jsonrpc_error_message() {
+    let root = temp_workspace("websearch_jsonrpc_error");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_post_response(ok_response(
+        "application/json",
+        br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"monthly quota exceeded"}}"#,
+    ));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "websearch".to_string(),
+                arguments: json!({"query": "rust"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    let error = result.content["error"].as_str().expect("error");
+    assert!(
+        error.contains("monthly quota exceeded"),
+        "expected provider error message, got: {error}"
+    );
+    assert!(
+        !error.contains("no text content"),
+        "JSON-RPC error must not be reported as empty content: {error}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn websearch_reports_http_client_errors() {
     let root = temp_workspace("websearch_client_error");
     let http = Arc::new(MockWebHttpClient::default());
@@ -7393,6 +7611,42 @@ async fn webfetch_strips_html_scripts_and_styles() {
     assert_eq!(result.content["cache_receipt"]["status"], "fresh");
     let requests = http.get_requests.lock().expect("get requests");
     assert_eq!(*requests, vec!["https://example.com/docs".to_string()]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn webfetch_refuses_private_ip_target() {
+    let root = temp_workspace("webfetch_ssrf");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(ok_response("text/plain", b"secrets"));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http.clone(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "http://169.254.169.254/latest/meta-data/"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("internal address")
+    );
+    // The SSRF guard must short-circuit before any HTTP request is issued.
+    assert!(http.get_requests.lock().expect("get requests").is_empty());
     let _ = fs::remove_dir_all(root);
 }
 
@@ -7649,6 +7903,43 @@ async fn webfetch_reports_cross_host_redirect_without_following() {
 
     assert_eq!(result.status, ToolStatus::Error);
     assert_eq!(result.content["redirect_url"], "https://example.net/next");
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("redirect to another host")
+    );
+    let requests = http.get_requests.lock().expect("get requests");
+    assert_eq!(*requests, vec!["https://example.com/start".to_string()]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn webfetch_reports_scheme_downgrade_redirect_without_following() {
+    let root = temp_workspace("webfetch_redirect_downgrade");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(redirect_response("http://example.com/next"));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http.clone(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "https://example.com/start"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert_eq!(result.content["redirect_url"], "http://example.com/next");
     assert!(
         result.content["error"]
             .as_str()
@@ -10420,6 +10711,28 @@ fn shell_sandbox_runtime_unavailable_ignores_direct_backend() {
         "",
         false,
     ));
+}
+
+#[test]
+fn linux_seccomp_plan_does_not_export_ask_socket() {
+    // The linux-direct-syscalls seccomp filter denies socket(AF_UNIX, …),
+    // so `squeezy ask` could never connect; the socket must not be exported.
+    let seccomp_plan = fake_sandbox_plan("linux-direct-syscalls", true);
+    assert!(!seccomp_plan.exports_ask_socket());
+
+    // Backends without the AF_UNIX deny still advertise the ask socket.
+    for backend in [
+        "none",
+        "external",
+        "macos-sandbox-exec",
+        "windows-job-object",
+    ] {
+        let plan = fake_sandbox_plan(backend, false);
+        assert!(
+            plan.exports_ask_socket(),
+            "backend {backend} should export the ask socket",
+        );
+    }
 }
 
 #[test]

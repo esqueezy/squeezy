@@ -40,10 +40,15 @@ pub(crate) struct PlanCardData {
 /// composes the styled lines. Returns a single-line fallback ("plan
 /// file missing") when the file has been deleted out from under us so
 /// the transcript never silently empties.
-pub(crate) fn render_plan_card(data: &PlanCardData) -> Vec<Line<'static>> {
+///
+/// `width` is the terminal column count the card will be painted into.
+/// The box is clamped so it never exceeds it; without a clamp a single
+/// long prose line makes the card wider than the viewport and the
+/// `Wrap { trim: false }` paint shatters the border rows.
+pub(crate) fn render_plan_card(data: &PlanCardData, width: Option<u16>) -> Vec<Line<'static>> {
     let body = match proposed_plan::read_plan_body(&data.path) {
         Ok(body) => body,
-        Err(_) => return missing_file_card(data),
+        Err(_) => return missing_file_card(data, width),
     };
     let step_count = crate::count_plan_steps(&body);
     let mut lines = Vec::new();
@@ -62,18 +67,19 @@ pub(crate) fn render_plan_card(data: &PlanCardData) -> Vec<Line<'static>> {
             lines.push(blank_card_line());
         }
     }
-    boxed_card_lines(plan_title(&data.plan_id, step_count), lines)
+    boxed_card_lines(plan_title(&data.plan_id, step_count), lines, width)
 }
 
 /// Card shown when the backing file is missing. Stays in palette so
 /// the transcript layout doesn't jump.
-fn missing_file_card(data: &PlanCardData) -> Vec<Line<'static>> {
+fn missing_file_card(data: &PlanCardData, width: Option<u16>) -> Vec<Line<'static>> {
     boxed_card_lines(
         format!("Plan {} · file missing", data.plan_id),
         vec![Line::from(vec![Span::styled(
             data.path.display().to_string(),
             Style::default().fg(crate::render::theme::red()),
         )])],
+        width,
     )
 }
 
@@ -96,13 +102,34 @@ fn blank_card_line() -> Line<'static> {
     Line::from("")
 }
 
-fn boxed_card_lines(title: String, inner: Vec<Line<'static>>) -> Vec<Line<'static>> {
+/// Minimum inner box width, chosen so short headers don't collapse to a
+/// sliver. The four-column frame (`│ ` + ` │`) is added on top.
+const MIN_INNER_WIDTH: usize = 24;
+/// Columns the box frame itself consumes: a leading `│ ` and trailing
+/// ` │` on every content row. `inner_width + BOX_FRAME_COLS` is the full
+/// painted width, which must stay within the terminal.
+const BOX_FRAME_COLS: usize = 4;
+
+fn boxed_card_lines(
+    title: String,
+    inner: Vec<Line<'static>>,
+    width: Option<u16>,
+) -> Vec<Line<'static>> {
     let title_width = text_width(&title);
     let content_width = inner.iter().map(line_width).max().unwrap_or(0);
-    let inner_width = content_width
+    let mut inner_width = content_width
         .saturating_add(2)
         .max(title_width.saturating_add(3))
-        .max(24);
+        .max(MIN_INNER_WIDTH);
+    // Clamp so the full box (content + frame) fits the viewport; without
+    // this a single long line makes the card wider than the terminal and
+    // `Wrap { trim: false }` splits every border row, shattering the box.
+    if let Some(cols) = width {
+        let max_inner = usize::from(cols).saturating_sub(BOX_FRAME_COLS);
+        if max_inner >= MIN_INNER_WIDTH {
+            inner_width = inner_width.min(max_inner);
+        }
+    }
     let border = Style::default()
         .fg(crate::render::theme::accent())
         .add_modifier(Modifier::BOLD);
@@ -113,14 +140,54 @@ fn boxed_card_lines(title: String, inner: Vec<Line<'static>>) -> Vec<Line<'stati
         Span::styled(title, border),
         Span::styled(format!(" {}╮", "─".repeat(title_fill)), border),
     ]));
+    // Content rows get two columns of inner padding (`│ ` … ` │`), so the
+    // text itself may be at most `inner_width - 2` wide before it would
+    // force the box past `inner_width`.
+    let text_budget = inner_width.saturating_sub(2).max(1);
     for line in inner {
-        lines.push(boxed_content_line(line, inner_width));
+        for row in wrap_line(line, text_budget) {
+            lines.push(boxed_content_line(row, inner_width));
+        }
     }
     lines.push(Line::from(vec![Span::styled(
         format!("╰{}╯", "─".repeat(inner_width)),
         border,
     )]));
     lines
+}
+
+/// Hard-wrap a styled line to at most `width` display columns per row,
+/// splitting on char boundaries and preserving each span's style. A blank
+/// line yields a single empty row so vertical spacing is kept.
+fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if line_width(&line) <= width {
+        return vec![line];
+    }
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut row_spans: Vec<Span<'static>> = Vec::new();
+    let mut row_width = 0usize;
+    for span in line.spans {
+        let style = span.style;
+        let mut chunk = String::new();
+        for ch in span.content.chars() {
+            if row_width >= width {
+                if !chunk.is_empty() {
+                    row_spans.push(Span::styled(std::mem::take(&mut chunk), style));
+                }
+                rows.push(Line::from(std::mem::take(&mut row_spans)));
+                row_width = 0;
+            }
+            chunk.push(ch);
+            row_width += 1;
+        }
+        if !chunk.is_empty() {
+            row_spans.push(Span::styled(chunk, style));
+        }
+    }
+    if !row_spans.is_empty() {
+        rows.push(Line::from(row_spans));
+    }
+    rows
 }
 
 fn boxed_content_line(line: Line<'static>, inner_width: usize) -> Line<'static> {

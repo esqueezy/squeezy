@@ -135,8 +135,8 @@ use truncate::truncate_middle_bytes;
 pub use web::{DEFAULT_PARALLEL_MCP_URL, WebSearchProvider};
 #[cfg(test)]
 pub(crate) use web::{
-    MAX_WEB_REDIRECTS, WebHttpFuture, WebHttpResponse, extract_http_urls, html_to_text,
-    is_textual_content_type, parse_mcp_websearch_response, web_cache_receipt_status,
+    MAX_WEB_REDIRECTS, WebHttpFuture, WebHttpResponse, decode_body, extract_http_urls,
+    html_to_text, is_textual_content_type, parse_mcp_websearch_response, web_cache_receipt_status,
     web_cache_stale_after_unix_ms, web_stable_output_sha256,
 };
 use web::{
@@ -3898,7 +3898,7 @@ impl ToolRegistry {
         {
             return tool_error(call, err);
         }
-        if let Err(err) = fs::write(&path, args.content.as_bytes()) {
+        if let Err(err) = write_atomic(&path, args.content.as_bytes()) {
             return tool_error(call, err);
         }
         self.invalidate_diff_cache();
@@ -4068,7 +4068,7 @@ impl ToolRegistry {
         if buf.last() != Some(&b'\n') {
             buf.push(b'\n');
         }
-        if let Err(err) = fs::write(&path, &buf) {
+        if let Err(err) = write_atomic(&path, &buf) {
             return tool_error(call, err);
         }
         self.invalidate_diff_cache();
@@ -5205,7 +5205,7 @@ impl StagedOp {
                     written.insert(*file_index);
                     return Ok(());
                 }
-                fs::write(&state.path, state.current.as_bytes())?;
+                write_atomic(&state.path, state.current.as_bytes())?;
                 written.insert(*file_index);
                 Ok(())
             }
@@ -5215,7 +5215,7 @@ impl StagedOp {
                 if let Some(parent) = abs_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(abs_path, contents.as_bytes())
+                write_atomic(abs_path, contents.as_bytes())
             }
             StagedOp::DeleteFile { abs_path, .. } => fs::remove_file(abs_path),
             StagedOp::MoveFile {
@@ -5227,7 +5227,7 @@ impl StagedOp {
                 if let Some(parent) = abs_to.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(abs_to, after_contents.as_bytes())?;
+                write_atomic(abs_to, after_contents.as_bytes())?;
                 fs::remove_file(abs_from)?;
                 Ok(())
             }
@@ -5690,6 +5690,64 @@ pub(crate) fn file_len(path: &Path) -> std::result::Result<u64, std::io::Error> 
     Ok(fs::metadata(path)?.len())
 }
 
+/// Write `bytes` to `target` crash-safely: the bytes land in a sibling
+/// tempfile that is `sync_all`'d and then `rename`d onto `target`. A crash in
+/// the write window leaves the original file intact instead of truncated, and
+/// the `rename` is atomic on POSIX. When `target` already exists its file mode
+/// is copied onto the tempfile before the rename so a replace preserves
+/// permissions (e.g. the executable bit on a `0o755` script).
+pub(crate) fn write_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let existing_mode = file_mode(target);
+    let tmp = sibling_tempfile(target);
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    #[cfg(unix)]
+    if let Some(mode) = existing_mode {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = existing_mode;
+    if let Err(err) = fs::rename(&tmp, target) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).ok().map(|meta| meta.mode())
+}
+
+#[cfg(not(unix))]
+fn file_mode(_path: &Path) -> Option<u32> {
+    None
+}
+
+fn sibling_tempfile(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tmp".to_string());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let new_name = format!(".{name}.{}.{nanos}.tmp", std::process::id());
+    match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(new_name),
+        _ => PathBuf::from(new_name),
+    }
+}
+
 pub(crate) fn is_secret_path(path: &Path) -> bool {
     path.components().any(|component| {
         let Some(part) = component.as_os_str().to_str() else {
@@ -5771,7 +5829,11 @@ fn find_with_quote_normalization(content: &str, search: &str) -> Option<(usize, 
         let n_start = scan_from + rel;
         let n_end = n_start + normalized_search.len();
         matches.push((n_start, n_end));
-        scan_from = n_start + 1;
+        // Advance past the whole match so self-overlapping searches (e.g. `''`)
+        // are counted non-overlapping, matching the exact path's
+        // `match_indices` semantics; `normalized_search.is_empty()` is rejected
+        // above, so `n_end > n_start` and this always makes progress.
+        scan_from = n_end;
     }
     if matches.is_empty() {
         return None;
@@ -5918,12 +5980,19 @@ fn find_with_unicode_normalization(content: &str, search: &str) -> Option<(usize
     while let Some(rel) = normalized[scan_from..].find(normalized_search.as_str()) {
         let n_start = scan_from + rel;
         let n_end = n_start + normalized_search.len();
-        scan_from = n_start + 1;
         let orig_start = *byte_map.get(n_start)?;
         let orig_end = *byte_map.get(n_end)?;
         let (verify, _) = unicode_normalize_with_byte_map(&content[orig_start..orig_end]);
         if verify == normalized_search {
             clean.push((orig_start, orig_end));
+            // Clean match: advance past it so self-overlapping searches (e.g.
+            // `--`) are counted non-overlapping like the exact `match_indices`
+            // path. `normalized_search` is non-empty, so `n_end > n_start`.
+            scan_from = n_end;
+        } else {
+            // Rejected candidate (partial-character slice): step by one byte so
+            // a later legitimate, character-aligned match is not skipped.
+            scan_from = n_start + 1;
         }
     }
     if clean.is_empty() {

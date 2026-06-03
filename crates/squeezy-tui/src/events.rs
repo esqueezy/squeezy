@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use squeezy_agent::{
     AgentEvent, JobEvent, JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS,
-    MAX_JOBS_RETAINED, RequestUserInputResponse, format_warn_threshold_notice,
+    MAX_JOBS_RETAINED, RequestUserInputResponse, format_cap_unenforceable_notice,
+    format_warn_threshold_notice,
 };
 use squeezy_core::SessionMode;
 use squeezy_tools::{McpElicitationResponse, McpStatusSnapshot, ToolStatus};
@@ -280,7 +281,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         format!("{agent} subagent capped ({active}/{limit} already running)");
                     app.note_subagent_rejected(
                         agent.clone(),
-                        reason.as_str().to_string(),
+                        reason.as_human().to_string(),
                         limit,
                         active,
                     );
@@ -385,6 +386,12 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::CostWarning { status, .. } => {
                     let notice = format_warn_threshold_notice(status);
+                    app.push_transcript_item(TranscriptItem::system(notice));
+                }
+                AgentEvent::CostCapUnenforceable {
+                    provider, model, ..
+                } => {
+                    let notice = format_cap_unenforceable_notice(&provider, &model);
                     app.push_transcript_item(TranscriptItem::system(notice));
                 }
                 AgentEvent::ShellSandboxBestEffortFallback {
@@ -652,6 +659,32 @@ pub(crate) fn drain_plan_housekeeping(app: &mut TuiApp) {
         }
         Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
             app.plan_housekeeping_rx = Some(rx);
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+    }
+}
+
+/// Drain the in-flight `@`-mention workspace walk. The walk runs in
+/// `spawn_blocking` (kicked off by `refresh_mention_popup`) so the
+/// `ignore`-crate `readdir`/`stat` over up to `MAX_WORKSPACE_FILES`
+/// doesn't gate the composer. When the rebuilt cache lands we install it,
+/// clear the in-flight guard, and re-rank the open popup so the fresh
+/// file list (new untracked files, post-git-op tracked changes) shows on
+/// the same frame.
+pub(crate) fn drain_pending_mention_walk(app: &mut TuiApp) {
+    let Some(mut rx) = app.pending_mention_walk.take() else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(cache) => {
+            app.workspace_file_cache = Some(cache);
+            // Re-rank the active mention against the fresh cache. Cheap
+            // in-memory work; no filesystem walk happens here.
+            input::refresh_mention_popup(app);
+            app.needs_redraw = true;
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+            app.pending_mention_walk = Some(rx);
         }
         Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
     }

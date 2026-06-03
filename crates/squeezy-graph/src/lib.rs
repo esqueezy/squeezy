@@ -382,6 +382,14 @@ pub struct SemanticGraph {
     children_by_parent: HashMap<SymbolId, Vec<SymbolId>>,
     edges_by_from: HashMap<SymbolId, Vec<usize>>,
     edges_by_to: HashMap<SymbolId, Vec<usize>>,
+    /// Transient from-index restricted to the inheritance edge kinds
+    /// (`UsesTrait` / `Extends` / `Implements`, in that priority order) that
+    /// [`SemanticGraph::walk_inheritance_ancestors`] consults. Built once per
+    /// `rebuild_semantic_edges` right after the type edges are pushed, so the
+    /// PHP ancestor walk does an O(out-degree) lookup per BFS node instead of
+    /// rescanning the whole edge vector. The main `edges_by_from` index is
+    /// stale during the call-resolution phase, hence the dedicated map.
+    ancestor_edges_by_from: HashMap<SymbolId, [Vec<SymbolId>; 3]>,
     /// Indices into [`Self::imports`] grouped by the file that introduced
     /// them. `import_visible_from_symbol` only ever returns true when the
     /// import shares a file with the caller, so resolving an alias or
@@ -480,6 +488,7 @@ impl SemanticGraph {
             children_by_parent: HashMap::new(),
             edges_by_from: HashMap::new(),
             edges_by_to: HashMap::new(),
+            ancestor_edges_by_from: HashMap::new(),
             imports_by_file: HashMap::new(),
             imports_by_alias_target: HashMap::new(),
             wildcard_aliased_imports: Vec::new(),
@@ -894,6 +903,17 @@ impl SemanticGraph {
     }
 
     pub fn references_to_symbol(&self, symbol_id: &SymbolId) -> Vec<ReferenceHit> {
+        // One source cache per query so the binding pass reads each referenced
+        // file at most once instead of once per candidate reference in it.
+        let mut sources = references::SourceCache::default();
+        self.references_to_symbol_with_cache(symbol_id, &mut sources)
+    }
+
+    pub(crate) fn references_to_symbol_with_cache(
+        &self,
+        symbol_id: &SymbolId,
+        sources: &mut references::SourceCache,
+    ) -> Vec<ReferenceHit> {
         let Some(symbol) = self.symbols.get(symbol_id) else {
             return Vec::new();
         };
@@ -902,7 +922,7 @@ impl SemanticGraph {
             .into_iter()
             .filter_map(|index| self.references.get(index))
             .filter_map(|reference| {
-                self.reference_binding_confidence(symbol, reference)
+                self.reference_binding_confidence(symbol, reference, sources)
                     .map(|confidence| self.reference_hit(reference, confidence))
             })
             .collect::<Vec<_>>();
@@ -2347,7 +2367,7 @@ impl GraphManager {
         // fsync each, which dominates wall-clock cost.
         let mut graph_batch = GraphWriteBatch::new();
         for file_id in &removed_files {
-            self.graph.remove_file(file_id);
+            self.graph.remove_file_data(file_id);
             graph_batch.remove_partition(file_id);
         }
         for file_id in &unsupported_removed_files {
@@ -2385,7 +2405,7 @@ impl GraphManager {
                 }
             }
             self.graph.replace_files(parsed_files);
-        } else if metadata_refresh_needed {
+        } else if metadata_refresh_needed || !removed_files.is_empty() {
             self.graph.rebuild_java_project_facts();
             self.graph.rebuild_dotnet_project_facts();
             self.graph.rebuild_kotlin_project_facts();
