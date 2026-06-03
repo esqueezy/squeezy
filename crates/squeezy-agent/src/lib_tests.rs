@@ -1548,9 +1548,11 @@ async fn parallel_tool_calls_config_flows_into_dispatched_request() {
             stop_reason: None,
             reasoning_only_stop: false,
         })]]));
-        let mut config = AppConfig::default();
-        config.parallel_tool_calls = parallel;
-        config.batch_tool_calls_hint = hint;
+        let config = AppConfig {
+            parallel_tool_calls: parallel,
+            batch_tool_calls_hint: hint,
+            ..Default::default()
+        };
         let agent = Agent::new(config, provider.clone());
 
         let mut rx = agent.start_turn("hello".to_string(), CancellationToken::new());
