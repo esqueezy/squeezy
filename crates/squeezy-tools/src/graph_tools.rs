@@ -801,10 +801,25 @@ fn symbol_matches_attribute_filter(symbol: &GraphSymbol, attribute: Option<&str>
     let Some(attribute) = attribute.map(str::trim).filter(|value| !value.is_empty()) else {
         return true;
     };
-    symbol
-        .attributes
-        .iter()
-        .any(|value| value.eq_ignore_ascii_case(attribute) || value.contains(attribute))
+    attribute_filter_matches(&symbol.attributes, attribute)
+}
+
+/// Multi-value attribute matching: a `|`-separated filter (e.g.
+/// `base:A|base:B|base:C`) matches if the symbol satisfies ANY alternative.
+/// This lets an "enumerate symbols whose base is one of N" query be a SINGLE
+/// `decl_search` call instead of N — the difference between staying under the
+/// per-turn tool-call budget and starving it on a wide hierarchy. A
+/// single-value filter (no `|`) behaves exactly as the original substring match.
+fn attribute_filter_matches(attributes: &[String], filter: &str) -> bool {
+    filter
+        .split('|')
+        .map(str::trim)
+        .filter(|alternative| !alternative.is_empty())
+        .any(|alternative| {
+            attributes
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(alternative) || value.contains(alternative))
+        })
 }
 
 fn graph_symbol_search(
@@ -3626,6 +3641,41 @@ mod line_window_auto_widen_tests {
             "end_line clamped to file length, got {}",
             span.end.line + 1
         );
+    }
+}
+
+#[cfg(test)]
+mod attribute_filter_tests {
+    use super::attribute_filter_matches;
+
+    #[test]
+    fn single_value_filter_matches_exact_or_substring() {
+        let attrs = vec!["base:Session".to_string(), "decorator:property".to_string()];
+        assert!(attribute_filter_matches(&attrs, "base:Session"));
+        assert!(attribute_filter_matches(&attrs, "Session")); // substring
+        assert!(!attribute_filter_matches(&attrs, "base:AuthBase"));
+    }
+
+    #[test]
+    fn multi_value_filter_matches_any_alternative() {
+        // The python "9 bases" case: one decl_search instead of nine.
+        let session = vec!["base:Session".to_string()];
+        let auth = vec!["base:AuthBase".to_string()];
+        let unrelated = vec!["base:Widget".to_string()];
+        let filter = "base:Session|base:AuthBase|base:CookieJar";
+        assert!(attribute_filter_matches(&session, filter));
+        assert!(attribute_filter_matches(&auth, filter));
+        assert!(!attribute_filter_matches(&unrelated, filter));
+    }
+
+    #[test]
+    fn multi_value_filter_ignores_blank_alternatives_and_whitespace() {
+        let attrs = vec!["base:Session".to_string()];
+        assert!(attribute_filter_matches(
+            &attrs,
+            "base:Session | base:AuthBase"
+        ));
+        assert!(attribute_filter_matches(&attrs, "|base:Session|"));
     }
 }
 
