@@ -85,10 +85,6 @@ fn slash_commands_declare_expected_capabilities() {
         &[PermissionCapability::Edit]
     );
     assert_eq!(
-        find_command("/session-cleanup").capabilities,
-        &[PermissionCapability::Destructive]
-    );
-    assert_eq!(
         find_command("/undo").capabilities,
         &[
             PermissionCapability::Edit,
@@ -190,8 +186,8 @@ fn capability_badges_match_capability_as_str() {
     assert_eq!(cmd.capability_badges(), vec!["git", "read"]);
     let cmd = find_command("/help");
     assert_eq!(cmd.capability_badges(), vec!["net"]);
-    let cmd = find_command("/session-cleanup");
-    assert_eq!(cmd.capability_badges(), vec!["destructive"]);
+    let cmd = find_command("/undo");
+    assert_eq!(cmd.capability_badges(), vec!["edit", "destructive"]);
 }
 
 #[test]

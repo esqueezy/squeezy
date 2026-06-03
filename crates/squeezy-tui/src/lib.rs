@@ -52,7 +52,7 @@ use squeezy_core::{
 };
 use squeezy_llm::{LlmInputItem, LlmProvider};
 use squeezy_skills::PromptTemplateCatalog;
-use squeezy_store::{BugReportBundle, BugReportOptions, CleanupMode, SessionQuery};
+use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
 use squeezy_telemetry::PreparedFeedback;
 use squeezy_tools::{
     McpElicitationKind, McpElicitationRequest, McpElicitationResponse, McpServerStatus,
@@ -3479,6 +3479,39 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             }
             Err(error) => app.status = format!("fork failed: {error}"),
         },
+        DispatchCommand::Clear => match agent.clear_conversation().await {
+            Ok(new_session) => {
+                // Drop the visible transcript and any in-flight render
+                // state so the screen matches the now-empty conversation.
+                // `/clear` is refused mid-turn, so the streaming/cancel
+                // fields are already idle; clearing them is defensive.
+                app.transcript.clear();
+                app.selected_entry = None;
+                app.next_entry_id = 0;
+                app.attachments = agent.context_attachments_snapshot().await;
+                app.pending_assistant.clear();
+                app.pending_reasoning.clear();
+                app.task_state = None;
+                app.task_panel_collapsed = false;
+                app.turn_rx = None;
+                app.cancel = None;
+                app.subagent_pane = SubagentPaneState {
+                    next_synthetic_id: app.subagent_pane.next_synthetic_id,
+                    ..SubagentPaneState::default()
+                };
+                app.toasts.clear();
+                let note = match new_session {
+                    Some(new_id) => format!(
+                        "Conversation cleared. The previous conversation is saved and remains \
+                         resumable via /resume; this is now session {new_id}."
+                    ),
+                    None => "Conversation cleared.".to_string(),
+                };
+                app.status = "conversation cleared".to_string();
+                app.push_transcript_item(TranscriptItem::system(note));
+            }
+            Err(error) => app.status = format!("clear failed: {error}"),
+        },
         DispatchCommand::Resume { id } => switch_to_session(app, agent, &id).await,
         DispatchCommand::SessionExport { id } => match agent.export_session(&id) {
             Ok(value) => {
@@ -3518,37 +3551,6 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 Err(error) => {
                     set_status_notice(app, format!("session export html failed: {error}"))
                 }
-            }
-        }
-        DispatchCommand::SessionCleanup { args } => {
-            // Pull the mode flag out of the args before the id list so
-            // `--archive` / `--purge` can appear anywhere on the line.
-            // `--archive` is the default; `--purge` switches to
-            // hard-delete (live sessions skip the archive tree,
-            // already-archived ids named here are removed immediately).
-            let mut mode = CleanupMode::Archive;
-            let mut ids = Vec::new();
-            for token in args.split_whitespace() {
-                match token {
-                    "--archive" => mode = CleanupMode::Archive,
-                    "--purge" => mode = CleanupMode::Purge,
-                    other => ids.push(other.to_string()),
-                }
-            }
-            match agent.cleanup_sessions_with(&ids, mode) {
-                Ok(report) => {
-                    app.status = format!(
-                        "archived {} removed {}",
-                        report.archived.len(),
-                        report.removed.len()
-                    );
-                    app.push_transcript_item(TranscriptItem::system(format!(
-                        "Session cleanup complete: archived {} session(s), removed {} session(s).",
-                        report.archived.len(),
-                        report.removed.len()
-                    )));
-                }
-                Err(error) => set_status_notice(app, format!("session cleanup failed: {error}")),
             }
         }
         DispatchCommand::Checkpoints => {

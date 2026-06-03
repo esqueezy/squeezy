@@ -186,6 +186,16 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         parameter_hint: None,
         capabilities: &[PermissionCapability::Network],
     },
+    // `/clear` rotates to a fresh session; the prior one stays resumable.
+    // Purely local (in-memory wipe + on-disk session rotation), so no
+    // capability badges, but it must not fire mid-turn.
+    SlashCommand {
+        name: "/clear",
+        description: "clear the conversation and start fresh (prior session stays resumable)",
+        available_during_task: false,
+        parameter_hint: None,
+        capabilities: &[],
+    },
     slash_caps(
         "/diff",
         "show uncommitted changes (tracked + untracked)",
@@ -250,14 +260,6 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "<id> [path]",
         &[PermissionCapability::Read, PermissionCapability::Edit],
     ),
-    // Locked + destructive: archives or purges sessions on disk.
-    SlashCommand {
-        name: "/session-cleanup",
-        description: "soft-archive (default) or --purge old sessions",
-        available_during_task: false,
-        parameter_hint: Some("[--archive|--purge] [<id>...]"),
-        capabilities: &[PermissionCapability::Destructive],
-    },
     slash_caps(
         "/checkpoints",
         "list local checkpoints",

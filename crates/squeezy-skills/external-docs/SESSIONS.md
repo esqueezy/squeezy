@@ -38,8 +38,11 @@ squeezy sessions cleanup
 ```
 
 The TUI also supports `/sessions`, `/session <session_id>`, `/resume
-<session_id>`, `/session-export <session_id>`, `/report [session_id]`, and
-`/session-cleanup`.
+<session_id>`, `/session-export <session_id>`, and `/report [session_id]`.
+Archiving or purging old sessions is a CLI operation (`squeezy sessions
+cleanup`). `/clear` starts a fresh conversation with an empty context
+window: the current conversation is finalized on disk and stays resumable via
+`/resume`, while a new session takes over for subsequent turns.
 Use `/cost` for cumulative session cost and tool accounting. It reports the
 provider token counters Squeezy has received so far, cache counters when the
 provider exposes them, estimated USD from local pricing metadata, tool-call
@@ -98,10 +101,9 @@ finalization so a more informative outcome is never silently overwritten by the
 generic `completed` status emitted on graceful exit. Resuming a session seeds
 the new agent with the original session's cost, metrics, and redaction totals
 so subsequent turns add to the running totals rather than replacing them.
-`squeezy sessions cleanup` and the TUI `/session-cleanup` command soft-archive
-live sessions by default (moved into `archived/<id>/`, recoverable with
-`squeezy sessions unarchive <id>`); pass `--purge` to hard-delete instead.
-Both refuse to delete the currently active session, and the retention sweep
+`squeezy sessions cleanup` soft-archives live sessions by default (moved into
+`archived/<id>/`, recoverable with `squeezy sessions unarchive <id>`); pass
+`--purge` to hard-delete instead. The retention sweep
 skips sessions that are still `running` (only explicit ids can remove a
 Running session, in case it was orphaned by a crash).
 

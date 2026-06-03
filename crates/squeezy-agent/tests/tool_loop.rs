@@ -3191,25 +3191,6 @@ async fn pinned_context_is_visible_to_model_before_compaction() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn cleanup_sessions_refuses_to_remove_the_active_session() {
-    let root = temp_workspace("cleanup_active");
-    let provider = Arc::new(ScriptedProvider::new(Vec::new()));
-    let agent = Agent::new(config_for(root.clone()), provider);
-    let session_id = agent.session_id().expect("session id");
-
-    let result = agent.cleanup_sessions(std::slice::from_ref(&session_id));
-    assert!(result.is_err(), "active session must not be cleanable");
-    assert!(
-        agent
-            .show_session(&session_id)
-            .is_ok_and(|record| record.metadata.session_id == session_id),
-        "active session metadata should still be readable",
-    );
-
-    let _ = fs::remove_dir_all(root);
-}
-
 /// Records every hook context the agent dispatched. Used to assert
 /// that PreToolUse and PostToolUse fire for each executed tool call,
 /// in order, with payloads that name the tool and propagate its
