@@ -31,7 +31,7 @@ use squeezy_core::{
 };
 use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
-    CacheSpec, INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY,
+    CacheRetention, CacheSpec, INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY,
     INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream,
     LlmToolCall, LlmToolSpec, ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate,
     StopReason, capabilities_for, estimate_cost, estimate_request_context_calibrated,
@@ -8618,6 +8618,20 @@ async fn run_subagent_loop(
     }
 }
 
+/// Stable prompt-cache affinity key for a single subagent invocation.
+///
+/// Distinct per `(session, turn)` so two subagents — or the same subagent on a
+/// later turn — never share a key (which would mix unrelated prefixes). All
+/// rounds of one invocation reuse this key so the provider keeps the growing
+/// instructions + tools + history prefix warm across the round loop. Returns
+/// `None` when no session log is attached (in-memory test contexts), in which
+/// case caching falls back to disabled.
+fn subagent_prompt_cache_key(parent: &ToolExecutionContext<'_>) -> Option<String> {
+    parent
+        .session_id_for_plan_mode()
+        .map(|session_id| format!("squeezy::sub::{session_id}::{}", parent.turn_id))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent_rounds(
     parent: &ToolExecutionContext<'_>,
@@ -8640,8 +8654,24 @@ async fn run_subagent_rounds(
     supporting_receipts: &mut Vec<Value>,
     model: String,
 ) -> SubagentExecution {
+    // Subagent rounds re-send the same instructions + tool schemas and a
+    // monotonically growing conversation, so the request prefix is large and
+    // stable across rounds — the prefix-cache sweet spot. Anchor a key that is
+    // constant for this subagent invocation (so all its rounds share a cache
+    // prefix) but distinct per turn/session (so unrelated invocations never
+    // collide). `Short` retention rides the provider 5m window, which covers a
+    // subagent's bounded round loop without paying for a 1h write. The helper
+    // returns `None` on providers without `prompt_caching`, leaving them
+    // unchanged.
+    let subagent_cache_key = subagent_prompt_cache_key(parent);
     for round in 0..config.subagents.max_model_rounds {
         let request_model: Arc<str> = Arc::from(config.model.as_str());
+        let cache = CacheSpec::for_prefix_reuse(
+            parent.provider.name(),
+            &request_model,
+            subagent_cache_key.clone(),
+            CacheRetention::Short,
+        );
         let llm_request = LlmRequest {
             model: Arc::clone(&request_model),
             instructions: Arc::from(instructions),
@@ -8651,7 +8681,7 @@ async fn run_subagent_rounds(
             reasoning_effort: request_reasoning_effort(config, parent.provider.name()),
             previous_response_id: None,
             cache_key: None,
-            cache: CacheSpec::default(),
+            cache,
             tools: Arc::from(tool_specs),
             store: false,
             tool_choice: effective_tool_choice(config.tool_choice.as_deref(), round),
