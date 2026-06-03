@@ -21,9 +21,9 @@ use squeezy_workspace::ExclusionReason;
 
 use crate::{
     DEFAULT_GRAPH_MAX_DEPTH, DEFAULT_GRAPH_MAX_RESULTS, DEFAULT_READ_LIMIT,
-    GRAPH_READ_SLICE_MAX_LINE_SCAN_BYTES, GRAPH_READY_WAIT, MAX_GRAPH_MAX_DEPTH,
-    MAX_GRAPH_MAX_RESULTS, MAX_READ_LIMIT, POLICY_PREFIX_BYTES, ToolCall, ToolCostHint,
-    ToolRegistry, ToolResult, ToolStatus, diff_mode_str, diff_path_set, diff_status_str, file_len,
+    GRAPH_READ_SLICE_MAX_LINE_SCAN_BYTES, MAX_GRAPH_MAX_DEPTH, MAX_GRAPH_MAX_RESULTS,
+    MAX_READ_LIMIT, POLICY_PREFIX_BYTES, ToolCall, ToolCostHint, ToolRegistry, ToolResult,
+    ToolStatus, diff_mode_str, diff_path_set, diff_status_str, file_len, graph_ready_wait,
     is_secret_path, make_result, read_prefix, read_range, sha256_file, tool_arg_error, tool_error,
     workspace_path,
 };
@@ -2250,7 +2250,7 @@ impl ToolRegistry {
     fn execute_graph_tool_blocking(&self, call: &ToolCall) -> ToolResult {
         let mode = graph_tool_diff_mode(call);
         let snapshot = self.diff_snapshot(mode, DiffOptions::default());
-        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(graph_ready_wait());
         let mut graph = match self.graph.lock() {
             Ok(graph) => graph,
             Err(_) => {
@@ -3476,7 +3476,7 @@ impl ToolRegistry {
         max_symbols_per_file: usize,
         max_references: usize,
     ) -> Value {
-        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(graph_ready_wait());
         let mut graph = match self.graph.lock() {
             Ok(graph) => graph,
             Err(_) => return json!({"available": false, "error": "semantic graph lock poisoned"}),
