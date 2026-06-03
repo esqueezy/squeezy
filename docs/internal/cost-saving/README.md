@@ -18,6 +18,7 @@ Each chapter sits beside this index as a numbered file:
 | [10](10-token-accounting.md) | Token accounting & `/context` telemetry | Observability | `crates/squeezy-core/src/lib.rs:9805+`, per-provider extractors, `crates/squeezy-agent/src/lib.rs:510+` |
 | [11](11-cheap-model-fast-path.md) | Cheap-model fast path (per-turn routing) | Request | `crates/squeezy-agent/src/turn_router.rs`, `crates/squeezy-core/src/lib.rs` (`RoutingConfig`) |
 | [12](12-implemented-idea-batch.md) | Implemented idea batch (2026-06): signature_span, shell sidecar, pressure gate, per-role reasoning, expired-context masking | Multiple | `squeezy-parse`, `squeezy-tools`, `squeezy-agent` |
+| [13](13-graph-retrieval-in-practice.md) | Graph retrieval in practice (build cost, streaming robustness, read routing) | Code-context selection | `crates/squeezy-graph`, `crates/squeezy-llm/src/retry.rs`, `crates/squeezy-tools/src/graph_tools.rs` |
 
 ---
 
