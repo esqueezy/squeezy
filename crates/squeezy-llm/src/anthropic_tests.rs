@@ -2083,16 +2083,16 @@ fn stable_anchor_sits_backoff_user_turns_behind_moving_breakpoint() {
     );
 
     // The moving breakpoint is on the last user-role message.
-    let last_user_idx = arr
+    let moving_breakpoint_idx = arr
         .iter()
         .enumerate()
         .rev()
         .find(|(_, m)| m["role"] == "user")
         .map(|(idx, _)| idx)
-        .expect("a user message");
+        .expect("a user-role message");
     assert!(
-        marked.contains(&last_user_idx),
-        "moving breakpoint must mark the latest user message (idx {last_user_idx}): {marked:?}"
+        marked.contains(&moving_breakpoint_idx),
+        "moving breakpoint must mark the latest user-role message: {marked:?}"
     );
 
     // The anchor is on the user message STABLE_ANCHOR_BACKOFF user turns back.
