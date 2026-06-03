@@ -906,15 +906,21 @@ async fn delegate_subagent_uses_parent_model_for_natural_research() {
 }
 
 #[test]
-fn delegate_batch_with_child_tool_fanout_runs_on_default_worker_stack() {
+fn delegate_batch_with_child_tool_fanout_runs_on_production_worker_stack() {
+    // Mirror the production runtime: `squeezy-cli` builds its multi-threaded
+    // Tokio runtime with a 16 MiB worker stack (see
+    // `WORKER_THREAD_STACK_SIZE` in `crates/squeezy-cli/src/main.rs`). The
+    // delegate fan-out (parent tool loop → subagent dispatch → subagent
+    // round loop → child tool fan-out) must complete without overflowing
+    // that stack on any platform.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .thread_stack_size(2 * 1024 * 1024)
+        .thread_stack_size(16 * 1024 * 1024)
         .enable_all()
         .build()
-        .expect("build default-stack test runtime");
+        .expect("build production-stack test runtime");
     runtime.block_on(async {
-        let root = temp_workspace("delegate_batch_default_stack");
+        let root = temp_workspace("delegate_batch_production_stack");
         const TOOL_CALLS: usize = 8;
         const SUBAGENTS: usize = 3;
         for index in 0..TOOL_CALLS {
@@ -928,7 +934,7 @@ fn delegate_batch_with_child_tool_fanout_runs_on_default_worker_stack() {
         let drain = drain_turn(agent.start_turn("fan out".to_string(), CancellationToken::new()));
         tokio::time::timeout(Duration::from_secs(30), drain)
             .await
-            .expect("delegate fanout should finish on a normal worker stack");
+            .expect("delegate fanout should finish on the production worker stack");
 
         let snapshot = agent.session_accounting_snapshot().await;
         assert_eq!(snapshot.metrics.subagent_calls, SUBAGENTS as u64);
