@@ -16,6 +16,16 @@ use crate::is_budget_denied;
 /// every turn the moment a session warms up.
 const PROJECTED_OUTPUT_TOKEN_FALLBACK: u64 = 1024;
 
+/// Percent of the configured session cost cap at which the broker stops
+/// starting *new* provider rounds (the adaptive pressure governor, gate
+/// variant). Chosen below the hard cap so the session lands on a clean
+/// "approaching your cap" boundary instead of overshooting it, and well
+/// above the default `cost_warn_percent` heads-up so the gate fires after
+/// the user has already been warned once. The gate only engages when a cap
+/// is actually configured (`max_session_cost_usd_micros` is `Some`); with no
+/// cap there is no pressure to govern and behaviour is unchanged.
+const PRESSURE_GATE_PERCENT: u8 = 80;
+
 /// Snapshot of session-level cost-cap state delivered with
 /// [`AgentEvent::CostWarning`] and [`AgentEvent::Failed`] when the broker
 /// crosses or reaches the configured cap. All values are USD micros (i.e.
@@ -67,6 +77,12 @@ pub(crate) struct CostBroker {
     /// cannot be enforced for this `(provider, model)` instead of the cap
     /// silently no-op'ing.
     cap_unenforceable_emitted: bool,
+    /// One-shot latch for the adaptive pressure governor (gate variant). Set
+    /// the first time [`CostBroker::pressure_gate`] refuses to start a new
+    /// provider round because spend has reached `PRESSURE_GATE_PERCENT` of the
+    /// cap, so the gate fires at most once per broker rather than re-tripping
+    /// on every subsequent round once over the threshold.
+    pressure_gate_emitted: bool,
     /// Per-token-byte calibration carried through the turn. Seeded from
     /// the session metadata (or the global file) and snapshot back out
     /// after every recorded provider response.
@@ -85,6 +101,7 @@ impl CostBroker {
             cost_warn_percent: config.cost_warn_percent.clamp(1, 100),
             warn_emitted: false,
             cap_unenforceable_emitted: false,
+            pressure_gate_emitted: false,
             calibration: squeezy_llm::TokenCalibration::default(),
         }
     }
@@ -166,6 +183,53 @@ impl CostBroker {
         } else {
             None
         }
+    }
+
+    /// Current session spend as a percent of the configured cost cap, or
+    /// `None` when no cap is set (there is nothing to be a percent *of*).
+    /// Capped at 255 to match [`cap_percent`] so an overshoot can't overflow
+    /// the `u8`. This is the raw pressure signal the gate is built on; exposed
+    /// separately so callers (and tests) can read the headroom without
+    /// triggering the one-shot gate latch.
+    pub(crate) fn pressure_percent(&self) -> Option<u8> {
+        let cap = self.max_session_cost_usd_micros?;
+        Some(cap_percent(self.session_cost_usd_micros, cap))
+    }
+
+    /// Adaptive pressure governor (gate variant): returns `Some(status)` the
+    /// first time the running session spend has reached `PRESSURE_GATE_PERCENT`
+    /// of the configured cap, signalling the caller to *refuse to start the
+    /// next provider round* rather than silently shrinking per-turn budgets.
+    ///
+    /// This is the deliberately low-risk shape of B6: no per-turn budget
+    /// mutation, no silent capability degradation — just a clean stop at a
+    /// named pressure boundary below the hard cap, so the session ends on
+    /// "you're approaching your cap" instead of overshooting it. The latch
+    /// makes it fire at most once per broker; combined with the post-hoc
+    /// `session_cap_reached` and pre-flight `projected_session_cap_overrun`
+    /// hard-cap checks, the gate adds an early, advisory-strength stop.
+    ///
+    /// Returns `None` when:
+    ///   - no cap is configured (no pressure to govern — behaviour unchanged),
+    ///   - spend is still below `PRESSURE_GATE_PERCENT` of the cap,
+    ///   - the gate has already fired once for this broker.
+    pub(crate) fn pressure_gate(&mut self) -> Option<CostCapStatus> {
+        if self.pressure_gate_emitted {
+            return None;
+        }
+        // `pressure_percent` is `None` exactly when no cap is configured, so a
+        // missing percent leaves the gate open and behaviour unchanged.
+        let percent = self.pressure_percent()?;
+        if percent < PRESSURE_GATE_PERCENT {
+            return None;
+        }
+        let cap = self.max_session_cost_usd_micros?;
+        self.pressure_gate_emitted = true;
+        Some(CostCapStatus {
+            spent_usd_micros: self.session_cost_usd_micros,
+            cap_usd_micros: cap,
+            percent,
+        })
     }
 
     /// Pre-flight check: returns `Some(status)` if dispatching another LLM
@@ -384,6 +448,23 @@ fn serialized_json_len<T: Serialize>(value: &T) -> u64 {
 pub(crate) fn format_cap_reached_reason(status: CostCapStatus) -> String {
     format!(
         "session cost cap reached: spent ${:.6} of ${:.6} ({}%). \
+         Run /config to raise `max_session_cost_usd_micros` \
+         (or set SQUEEZY_MAX_SESSION_COST_USD_MICROS), then send the next prompt.",
+        status.spent_usd_micros as f64 / 1_000_000.0,
+        status.cap_usd_micros as f64 / 1_000_000.0,
+        status.percent,
+    )
+}
+
+/// Render the adaptive-pressure-governor gate reason: the session reached the
+/// pressure threshold below the hard cap, so the broker stopped before
+/// starting another provider round. Carries the same next-step guidance as the
+/// cap-reached error (raise the cap to continue) but frames it as a proactive
+/// stop "approaching your cap" rather than a hard overrun.
+pub fn format_pressure_gate_reason(status: CostCapStatus) -> String {
+    format!(
+        "session cost approaching cap: spent ${:.6} of ${:.6} ({}%); \
+         paused before starting another round to avoid overshooting the cap. \
          Run /config to raise `max_session_cost_usd_micros` \
          (or set SQUEEZY_MAX_SESSION_COST_USD_MICROS), then send the next prompt.",
         status.spent_usd_micros as f64 / 1_000_000.0,

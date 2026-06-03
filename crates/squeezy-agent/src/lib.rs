@@ -91,7 +91,9 @@ use context_compaction::{
 };
 #[cfg(test)]
 use context_compaction::{build_compaction_summary, compact_conversation};
-use cost_broker::{CostBroker, format_cap_reached_reason, llm_request_input_bytes};
+use cost_broker::{
+    CostBroker, format_cap_reached_reason, format_pressure_gate_reason, llm_request_input_bytes,
+};
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
 use micro_compaction::maybe_micro_compact_mid_turn;
 use permission_persist::persist_permission_rule;
@@ -5509,6 +5511,36 @@ impl TurnRuntime {
                     .send(AgentEvent::Failed {
                         turn_id: self.turn_id,
                         error: SqueezyError::Agent(format_cap_reached_reason(status)),
+                    })
+                    .await;
+                self.finish_turn(&broker.metrics).await;
+                return Ok(());
+            }
+            // Adaptive pressure governor (gate variant, B6): below the hard
+            // cap but at the pressure threshold, refuse to *start* another
+            // round and surface a clear cost-pressure status instead of
+            // silently degrading per-turn budgets. Only engages when a cap is
+            // configured; the one-shot latch fires it at most once per turn.
+            if let Some(status) = broker.pressure_gate() {
+                self.stamp_routing_savings(&mut broker.metrics);
+                self.publish_terminal_task_state(
+                    TaskStateStatus::Failed,
+                    Some(format_pressure_gate_reason(status)),
+                    &task_title,
+                )
+                .await;
+                self.persist_turn_accounting(
+                    &total_cost,
+                    &broker.metrics,
+                    &broker.calibration,
+                    false,
+                )
+                .await;
+                let _ = self
+                    .tx
+                    .send(AgentEvent::Failed {
+                        turn_id: self.turn_id,
+                        error: SqueezyError::Agent(format_pressure_gate_reason(status)),
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
