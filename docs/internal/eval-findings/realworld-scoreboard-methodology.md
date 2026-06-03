@@ -47,13 +47,19 @@ current grader (the cached `/tmp/cc-baseline-realworld/_results.json` is corrupt
 ground-truth + `cost=0` parser artifacts — so it is NOT used). `$0.000` reps (killed by
 timeout) are excluded as invalid, not counted as wins.
 
-**Current best-of-3: 9/15 WIN** — cpp, csharp, kotlin, php, ruby, rust, scala, swift, ts.
+**Current best-of-3 (recall-enforced): 8/15 WIN** — cpp, kotlin, php, ruby, rust, scala,
+swift, ts. (Win = the *same* rep is both cheaper than CC **and** at recall parity.)
 
 Caveats per row:
 - **Mini 15/15 (vs Codex) is solid and separate** — Mini queries the graph early; wins
   reproduce. There is no Mini-style 15/15 for Haiku yet.
-- **Variance wins:** `csharp` wins on 1 of 3 reps; `ts` cost swings $0.13–$0.29 — both can
-  flip rep-to-rep, so they are best-of-3 wins, not yet reproducible wins.
+- **`csharp` is a LOSS once recall is enforced** — its cheapest rep ($0.175) was only 96.6%
+  (missed one `Read` override); its 100%-recall reps cost more than CC ($0.185 vs $0.182).
+  A cost-only best-of-3 wrongly counted it.
+- **`ts` is a variance win** — 2 of 3 reps hit 20/20 under CC, but rep 3 hard-failed
+  (hallucinated), so it is a best-of-3 win, not yet reproducible.
+- **Recall instability on the losses:** `js` swings 50/100/82%, `java` 94/94/100%, `python`
+  58/75/83%, `dart` 0/0/67% — several losses are recall problems, not just cost.
 - **The 6 losses split into two fixable groups:**
   1. **Delegation cost** — `c, go, js` (and partly `java`) lose only because the parent
      fires a whole-task `delegate` to a cold subagent that re-explores; the parent alone
