@@ -4565,6 +4565,24 @@ fn request_reasoning_effort(
         .map(|_| effort)
 }
 
+/// Effective reasoning effort for a spawned subagent of `kind`.
+///
+/// Catalog roles override the parent's inherited global effort with their
+/// own tuned default (Planner=High, Explorer/Reviewer=Low) so the priciest
+/// reasoning tier is spent only where the plan justifies it; kinds without a
+/// catalog role (Delegate, DocHelp) keep `inherited`. This only sets the
+/// config field — provider/model capability is still gated downstream by
+/// [`request_reasoning_effort`], so a non-reasoning provider drops the field
+/// exactly as it would for the global path.
+fn subagent_role_reasoning_effort(
+    kind: SubagentKind,
+    inherited: Option<squeezy_core::ReasoningEffort>,
+) -> Option<squeezy_core::ReasoningEffort> {
+    kind.role()
+        .and_then(|role| role_config(role).reasoning_effort)
+        .or(inherited)
+}
+
 /// Resolve the `tool_choice` to send on a given round of a turn.
 ///
 /// `"required"` is configured to fix tool-shy models (Qwen via
@@ -8324,6 +8342,13 @@ async fn run_subagent(
     config.max_tool_calls_per_turn = config.subagents.max_tool_calls_per_call;
     config.max_tool_bytes_read_per_turn = config.subagents.max_tool_bytes_read_per_call;
     config.max_search_files_per_turn = config.subagents.max_search_files_per_call;
+    // Override the inherited global reasoning effort with the spawned
+    // subagent's role default before the request is built. `run_subagent_rounds`
+    // reads `config.reasoning_effort` through `request_reasoning_effort`, which
+    // still gates on provider/model capability downstream — so on a
+    // non-reasoning provider the field is dropped exactly as the global path
+    // would have dropped it.
+    config.reasoning_effort = subagent_role_reasoning_effort(kind, config.reasoning_effort);
     // Subagent inherits the parent's per-round result-bytes cap directly.
     // The previous `.min(24_000)` halved the budget for a subagent that
     // already had fewer tool calls to spend.

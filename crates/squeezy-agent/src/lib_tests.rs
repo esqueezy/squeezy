@@ -1417,6 +1417,71 @@ fn provider_capability_gate_controls_native_reasoning_and_verbosity_fields() {
 }
 
 #[test]
+fn subagent_request_carries_per_role_reasoning_effort() {
+    use squeezy_core::ReasoningEffort;
+
+    // The parent's global effort is deliberately *not* the per-role value so
+    // the test proves the override fires rather than passing the inherited
+    // setting straight through. `medium` is also distinct from both High and
+    // Low so neither role's assertion can pass by accident.
+    let mut config = AppConfig {
+        model: squeezy_core::DEFAULT_OPENAI_MODEL.to_string(),
+        reasoning_effort: Some(ReasoningEffort::Medium),
+        ..Default::default()
+    };
+
+    // Helper mirrors the real `run_subagent` wiring: apply the per-role
+    // override to the inherited effort, then resolve the request field the
+    // same way `run_subagent_rounds` builds the `LlmRequest`.
+    let mut effective = |kind: SubagentKind, provider: &str| {
+        config.reasoning_effort =
+            subagent_role_reasoning_effort(kind, Some(ReasoningEffort::Medium));
+        request_reasoning_effort(&config, provider)
+    };
+
+    // Reasoning-capable provider: each catalog role pins its own tier.
+    assert_eq!(
+        effective(SubagentKind::Plan, "openai"),
+        Some(ReasoningEffort::High),
+        "Planner subagent must reason hard"
+    );
+    assert_eq!(
+        effective(SubagentKind::Explore, "openai"),
+        Some(ReasoningEffort::Low),
+        "Explorer subagent must stay cheap"
+    );
+    assert_eq!(
+        effective(SubagentKind::Review, "openai"),
+        Some(ReasoningEffort::Low),
+        "Reviewer subagent must stay cheap"
+    );
+
+    // Kinds without a catalog role keep the parent's inherited global effort.
+    assert_eq!(
+        effective(SubagentKind::Delegate, "openai"),
+        Some(ReasoningEffort::Medium),
+        "Delegate keeps the inherited global effort"
+    );
+
+    // Non-reasoning provider: the role override sets the config field but the
+    // downstream capability gate still drops it — behavior is unchanged from
+    // the global path, for every role.
+    for kind in [
+        SubagentKind::Plan,
+        SubagentKind::Explore,
+        SubagentKind::Review,
+        SubagentKind::Delegate,
+    ] {
+        assert_eq!(
+            effective(kind, "anthropic"),
+            None,
+            "{} on a non-reasoning provider must not force reasoning_effort",
+            kind.as_str()
+        );
+    }
+}
+
+#[test]
 fn instructions_skip_prompt_hint_on_default_and_native_capable_models() {
     use squeezy_core::ResponseVerbosity;
 
