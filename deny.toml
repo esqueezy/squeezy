@@ -42,8 +42,11 @@ allow = []
 # with the 0.16 still pinned by the `ratatui` 0.30 stack and break the
 # `multiple-versions = "deny"` rule above. Revisit when `ratatui-core` moves
 # to `hashbrown` 0.17 (or any later compatible version).
+# Keep `lru` < 0.17 until `ratatui-core` upgrades off `lru` 0.16 and
+# `hashbrown` 0.16; newer `lru` releases would duplicate both crates.
 deny = [
     { crate = "indexmap:>=2.14", reason = "Pulls in hashbrown 0.17 which duplicates the 0.16 pinned by ratatui-core; remove when ratatui-core upgrades hashbrown." },
+    { crate = "lru:>=0.17", reason = "Pulls in hashbrown 0.17 and duplicates the lru 0.16 pinned by ratatui-core; remove when ratatui-core upgrades lru/hashbrown." },
 ]
 skip = [
     # rmcp 1.7 requires reqwest 0.13 for its Streamable HTTP transport;
