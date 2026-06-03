@@ -8928,7 +8928,7 @@ pub fn user_settings_template() -> &'static str {
 # response_verbosity = "normal"  # concise | normal | verbose
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
-# alternate_screen = "auto"     # auto | always | never
+# alternate_screen = "auto"     # auto/never preserve terminal scrollback; always uses fullscreen alternate screen
 # synchronized_output = "auto"  # auto | always | never (DEC 2026 atomic redraw)
 # show_reasoning_usage = true
 # persist_prompt_history = false  # mirror Up/Down prompt history to ~/.squeezy/prompt_history (XDG-compatible)
@@ -9080,7 +9080,7 @@ pub fn project_settings_template() -> &'static str {
 # response_verbosity = "normal"  # concise | normal | verbose
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
-# alternate_screen = "auto"     # auto | always | never
+# alternate_screen = "auto"     # auto/never preserve terminal scrollback; always uses fullscreen alternate screen
 # synchronized_output = "auto"  # auto | always | never (DEC 2026 atomic redraw)
 # show_reasoning_usage = true
 

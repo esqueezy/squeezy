@@ -153,16 +153,16 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
         "missing toggle hint: {status}",
     );
     assert!(
-        status.contains("Up/Down menu"),
+        status.contains("Up/Down menu/history"),
         "missing menu/history hint: {status}"
     );
     assert!(
-        status.contains("Alt+Up/Down history"),
-        "missing prompt history hint: {status}"
+        !status.contains("Alt+Up/Down history"),
+        "inline mode should keep the plain Up/Down prompt-history hint: {status}"
     );
     assert!(
-        status.contains("Wheel/PgUp/PgDn scroll"),
-        "auto mode uses alternate screen scrolling by default: {status}"
+        !status.contains("Wheel/PgUp/PgDn scroll"),
+        "auto mode should preserve native terminal scrollback by default: {status}"
     );
 }
 
@@ -323,6 +323,8 @@ async fn subagent_pane_selects_subagent_conversation_and_returns_to_main() {
     .expect("focus pane");
     assert!(app.subagent_pane.focused);
     assert_eq!(app.subagent_pane.selected, 1);
+    // Highlighting a row previews its conversation live — no Enter required.
+    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(9));
 
     handle_key(
         &mut app,
@@ -330,8 +332,12 @@ async fn subagent_pane_selects_subagent_conversation_and_returns_to_main() {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     )
     .await
-    .expect("select subagent");
+    .expect("commit selection");
     assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(9));
+    assert!(
+        !app.subagent_pane.focused,
+        "Enter should release selector focus so scroll keys target the transcript"
+    );
     let subagent_view = lines_to_plain_text(&transcript_lines_for_render(&app, Some(80), false));
     assert!(
         subagent_view.contains("delegate subagent"),
@@ -348,6 +354,86 @@ async fn subagent_pane_selects_subagent_conversation_and_returns_to_main() {
     .expect("return to main");
     assert_eq!(app.subagent_pane.active, ConversationSource::Main);
     assert!(!app.subagent_pane.focused);
+}
+
+#[tokio::test]
+async fn subagent_pane_does_not_steal_down_scroll_when_main_transcript_is_scrolled() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    config.tui.alternate_screen = TuiAlternateScreen::Always;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
+    app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
+    app.transcript_scroll_from_bottom = 6;
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("scroll down");
+
+    assert_eq!(
+        app.transcript_scroll_from_bottom, 3,
+        "plain Down from terminal wheel translation should keep scrolling the main transcript"
+    );
+    assert!(
+        !app.subagent_pane.focused,
+        "subagent selector must not steal scrollback while the main transcript is scrolled"
+    );
+    assert_eq!(app.subagent_pane.active, ConversationSource::Main);
+    assert_eq!(app.subagent_pane.selected, 0);
+}
+
+#[tokio::test]
+async fn selected_subagent_scroll_does_not_mutate_main_transcript_scroll() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    config.tui.alternate_screen = TuiAlternateScreen::Always;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.note_subagent_started(7, "delegate".to_string(), "Inspect src".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("focus pane");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("select subagent");
+    app.transcript_scroll_from_bottom = 9;
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("scroll subagent");
+
+    assert_eq!(
+        app.transcript_scroll_from_bottom, 9,
+        "subagent transcript scroll must not overwrite main transcript scroll"
+    );
+    let record = app
+        .subagent_pane
+        .records
+        .iter()
+        .find(|record| record.id == 7)
+        .expect("subagent record");
+    assert_eq!(record.scroll_from_bottom, 3);
+    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(7));
+    assert!(
+        !app.subagent_pane.focused,
+        "scroll keys should target the selected subagent transcript, not the selector"
+    );
 }
 
 #[test]
@@ -659,11 +745,93 @@ fn subagent_row_shows_lifecycle_word_for_accessibility() {
         "boom".to_string(),
         TurnMetrics::default(),
     );
-    // Even with the row selected (glyph forced to ⏺), the failed state is
-    // still conveyed as text.
+    // The failed state is conveyed by the leading "failed" word + red colour,
+    // independent of the selection marker (○/●).
     app.subagent_pane.selected = 1;
     let output = render_to_string(&app, 120, 18);
     assert!(output.contains("failed"), "{output}");
+}
+
+#[tokio::test]
+async fn subagent_lifecycle_logs_are_neutral_and_compact() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let prompt_tail = "prompt-tail-visible-after-a-long-subagent-request";
+    let summary_tail = "summary-tail-visible-after-a-long-subagent-result";
+    let long_prompt = format!("{} {prompt_tail}", "analyze module behavior".repeat(18));
+    let long_summary = format!("{} {summary_tail}", "found actionable details".repeat(18));
+
+    tx.send(AgentEvent::SubagentStarted {
+        turn_id: TurnId::new(1),
+        id: 11,
+        agent: "delegate".to_string(),
+        prompt: long_prompt,
+    })
+    .await
+    .expect("send started");
+    tx.send(AgentEvent::SubagentCompleted {
+        turn_id: TurnId::new(1),
+        id: 11,
+        agent: "delegate".to_string(),
+        summary: long_summary,
+        metrics: TurnMetrics {
+            tool_calls: 51,
+            bytes_read: 1_207_538,
+            ..TurnMetrics::default()
+        },
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let lifecycle_logs = app
+        .transcript
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Log(log)
+                if log.message.contains("subagent started")
+                    || log.message.contains("subagent completed") =>
+            {
+                Some(log)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(lifecycle_logs.len(), 2);
+
+    // Neutral (Info/cyan), never an alarming colour.
+    for log in &lifecycle_logs {
+        assert_eq!(log.kind, LogKind::Info);
+        let lines = format_log_entry(log, true, false);
+        assert_eq!(
+            lines
+                .first()
+                .and_then(|line| line.spans.get(1))
+                .and_then(|span| span.style.fg),
+            Some(crate::render::theme::cyan())
+        );
+    }
+
+    // Main transcript: compact one-liners. The long prompt/summary bodies are
+    // folded (not dumped) and the noisy byte counter is gone.
+    let main_view = lines_to_plain_text(&transcript_lines_for_render(&app, Some(120), false));
+    assert!(
+        main_view.contains("subagent completed · 51 tools"),
+        "{main_view}"
+    );
+    assert!(!main_view.contains(summary_tail), "{main_view}");
+    assert!(!main_view.contains(prompt_tail), "{main_view}");
+    assert!(!main_view.contains("bytes="), "{main_view}");
+
+    // The full prompt + summary remain available inside the subagent's own
+    // conversation (open it with Down / Enter).
+    app.subagent_pane.active = ConversationSource::Subagent(11);
+    let subagent_view = lines_to_plain_text(&transcript_lines_for_render(&app, Some(120), false));
+    assert!(subagent_view.contains(prompt_tail), "{subagent_view}");
+    assert!(subagent_view.contains(summary_tail), "{subagent_view}");
 }
 
 #[tokio::test]
@@ -4697,6 +4865,51 @@ fn decl_search_row_summarizes_count_query_without_raw_json() {
 }
 
 #[test]
+fn resume_hydration_backfills_legacy_tool_name_from_call() {
+    let mut app = test_app(SessionMode::Build);
+    let result = sample_tool_result("shell", "ok");
+    let mut legacy_result = serde_json::to_value(result).expect("serialize tool result");
+    legacy_result
+        .as_object_mut()
+        .expect("tool result object")
+        .remove("tool_name");
+
+    hydrate_transcript_item(
+        &mut app,
+        squeezy_store::HydratedTranscriptItem::ToolResult {
+            call: Some(squeezy_store::HydratedToolCall {
+                call_id: "call-1".to_string(),
+                tool: "shell".to_string(),
+                arguments: serde_json::json!({"command": "pwd"}),
+            }),
+            result: legacy_result,
+        },
+    );
+
+    assert!(
+        app.transcript
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                TranscriptEntryKind::Log(log) => Some(log.message.as_str()),
+                _ => None,
+            })
+            .all(|message| !message.contains("malformed tool-result")),
+        "legacy tool result should hydrate without a warning: {:?}",
+        app.transcript
+    );
+    let entry = app.transcript.first().expect("hydrated tool card");
+    let tool = match &entry.kind {
+        TranscriptEntryKind::ToolResult(tool) => tool,
+        other => panic!("expected hydrated tool result, got {other:?}"),
+    };
+    assert_eq!(tool.result.tool_name, "shell");
+    assert_eq!(
+        tool.call.as_ref().map(|call| call.name.as_str()),
+        Some("shell")
+    );
+}
+
+#[test]
 fn tool_rows_summarize_diff_glob_read_and_plan_outputs() {
     let mut app = test_app(SessionMode::Build);
 
@@ -4798,6 +5011,64 @@ fn read_tool_output_summary_names_saved_tool_without_raw_json() {
     );
     assert!(!output.contains("\"tool_name\""), "{output}");
     assert!(!output.contains("\"files\""), "{output}");
+}
+
+#[test]
+fn read_tool_output_folds_spilled_model_output_without_tool_name() {
+    // Regression: spilled tool results are written in the `model_output()`
+    // shape (`{"status":..,"content":..}`), which carries no `tool_name`.
+    // The recognizer must still fold them to a receipt instead of splatting
+    // the raw (minified, single-line) JSON across the scrollback.
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("read_tool_output", "");
+    result.content = serde_json::json!({
+        "handle": "deadbeef",
+        "bytes_returned": 48_800,
+        "total_bytes": 170_800,
+        "truncated": true,
+        "content": "{\"status\":\"success\",\"content\":{\"graph_available\":true,\"hierarchy\":[{\"id\":\"file:build.rs\",\"kind\":\"File\"}]}}"
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 140, 12);
+
+    assert!(output.contains("saved tool output"), "{output}");
+    assert!(
+        output.contains("content saved tool-result JSON (partial; hidden in normal mode)"),
+        "{output}"
+    );
+    // The raw JSON body must not reach the scrollback.
+    assert!(!output.contains("\"hierarchy\""), "{output}");
+    assert!(!output.contains("graph_available"), "{output}");
+}
+
+#[test]
+fn tool_call_label_describes_verify_by_scope_and_level() {
+    // verify takes scope/level, not a `command` field. The label must describe
+    // the verification and never echo a stray `command` value a confused model
+    // might pass (which the tools-side hook re-homes before execution).
+    let call = ToolCall {
+        call_id: "v-1".to_string(),
+        name: "verify".to_string(),
+        arguments: serde_json::json!({"scope": "workspace", "level": "full"}),
+    };
+    assert_eq!(tool_call_label(&call), "workspace/full");
+
+    // Defaults fill in when the fields are omitted.
+    let call = ToolCall {
+        call_id: "v-2".to_string(),
+        name: "verify".to_string(),
+        arguments: serde_json::json!({}),
+    };
+    assert_eq!(tool_call_label(&call), "diff/quick");
+
+    // A stray `command` is never surfaced as the label.
+    let call = ToolCall {
+        call_id: "v-3".to_string(),
+        name: "verify".to_string(),
+        arguments: serde_json::json!({"command": "full"}),
+    };
+    assert_eq!(tool_call_label(&call), "diff/quick");
 }
 
 #[test]
@@ -6035,8 +6306,8 @@ fn render_uses_two_line_status_footer() {
         "{output}"
     );
     assert!(!output.contains("ready"), "{output}");
-    assert!(output.contains("Up/Down menu"), "{output}");
-    assert!(output.contains("Alt+Up/Down history"), "{output}");
+    assert!(output.contains("Up/Down menu/history"), "{output}");
+    assert!(!output.contains("Alt+Up/Down history"), "{output}");
 }
 
 #[test]
@@ -6138,13 +6409,13 @@ fn compact_viewport_hides_attachment_panel_before_prompt_footer() {
 }
 
 #[test]
-fn auto_mode_uses_alternate_screen_to_avoid_inline_cursor_probe() {
+fn auto_mode_uses_inline_scrollback_like_codex() {
     let config = test_config(SessionMode::Build);
 
     assert_eq!(config.tui.alternate_screen, TuiAlternateScreen::Auto);
     assert_eq!(
         TerminalMode::from(config.tui.alternate_screen),
-        TerminalMode::AlternateScreen
+        TerminalMode::Inline
     );
     assert_eq!(
         TerminalMode::from(TuiAlternateScreen::Never),

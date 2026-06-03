@@ -11,11 +11,11 @@ use tokio::sync::broadcast;
 
 use crate::{
     CONTEXT_NUDGE_THRESHOLD_RATIO_PCT, PendingApproval, PendingMcpElicitation, PendingPlanChoice,
-    PendingRequestUserInput, TranscriptItem, TuiApp, TurnVisualState, compact_text,
-    compaction_status_line, context_window_pct, dedupe_assistant_repeated_tool_output,
-    format_approval_status_line, format_error_status, format_mcp_elicitation_status_line,
-    format_mcp_status_snapshot, input, is_control_tool_name, proposed_plan, render,
-    strip_plan_handoff_prefix, tool_call_label, tool_result_status_text,
+    PendingRequestUserInput, TranscriptItem, TuiApp, TurnVisualState, compaction_status_line,
+    context_window_pct, dedupe_assistant_repeated_tool_output, format_approval_status_line,
+    format_error_status, format_mcp_elicitation_status_line, format_mcp_status_snapshot, input,
+    is_control_tool_name, proposed_plan, render, strip_plan_handoff_prefix, tool_call_label,
+    tool_result_status_text,
 };
 
 pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
@@ -223,9 +223,12 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 } => {
                     app.status = format!("{agent} subagent running");
                     app.note_subagent_started(id, agent.clone(), prompt.clone());
-                    app.push_log(format!(
+                    // Keep the main transcript to a one-liner; the full prompt
+                    // is the seed message of the subagent's own conversation
+                    // (open it with Down / Enter to read it untruncated).
+                    app.push_info(format!(
                         "{agent} subagent started: {}",
-                        compact_text(&prompt, 180)
+                        crate::compact_text(&prompt, 140)
                     ));
                 }
                 AgentEvent::SubagentActivity {
@@ -247,11 +250,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         summary.clone(),
                         metrics.clone(),
                     );
-                    app.push_log(format!(
-                        "{agent} subagent completed tools={} bytes={} summary={}",
+                    // One-liner in the main transcript. The full summary is
+                    // stored as the final message of the subagent's own
+                    // conversation (open it with Down / Enter for details).
+                    app.push_info(format!(
+                        "{agent} subagent completed · {} tools · {}",
                         metrics.subagent_tool_calls.max(metrics.tool_calls),
-                        metrics.subagent_bytes_read.max(metrics.bytes_read),
-                        compact_text(&summary, 180)
+                        crate::compact_text(&summary, 140)
                     ));
                 }
                 AgentEvent::SubagentFailed {
@@ -263,11 +268,10 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 } => {
                     app.status = format!("{agent} subagent failed");
                     app.note_subagent_failed(id, agent.clone(), error.clone(), metrics.clone());
-                    app.push_log(format!(
-                        "{agent} subagent failed tools={} bytes={} error={}",
+                    app.push_warn(format!(
+                        "{agent} subagent failed · {} tools · {}",
                         metrics.subagent_tool_calls.max(metrics.tool_calls),
-                        metrics.subagent_bytes_read.max(metrics.bytes_read),
-                        compact_text(&error, 180)
+                        crate::compact_text(&error, 140)
                     ));
                 }
                 AgentEvent::SubagentRejected {
@@ -285,7 +289,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         limit,
                         active,
                     );
-                    app.push_log(format!(
+                    app.push_warn(format!(
                         "{agent} subagent capped reason={} limit={} active={}",
                         reason.as_str(),
                         limit,

@@ -1296,11 +1296,6 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             // pane keeps the prior session's rows and an active subagent view
             // would hijack the resumed transcript. Keep `next_synthetic_id`
             // monotonic across the switch.
-            // Subagent records are live state for the session we are leaving:
-            // they are never persisted or rehydrated, so without this reset the
-            // pane keeps the prior session's rows and an active subagent view
-            // would hijack the resumed transcript. Keep `next_synthetic_id`
-            // monotonic across the switch.
             app.subagent_pane = SubagentPaneState {
                 next_synthetic_id: app.subagent_pane.next_synthetic_id,
                 ..SubagentPaneState::default()
@@ -1325,6 +1320,16 @@ fn hydrate_transcript_item(app: &mut TuiApp, item: squeezy_store::HydratedTransc
             app.push_transcript_item(item);
         }
         squeezy_store::HydratedTranscriptItem::ToolResult { call, result } => {
+            let mut result = result;
+            if result.get("tool_name").is_none()
+                && let Some(tool) = call.as_ref().map(|call| call.tool.as_str())
+                && let Some(object) = result.as_object_mut()
+            {
+                object.insert(
+                    "tool_name".to_string(),
+                    serde_json::Value::String(tool.to_string()),
+                );
+            }
             let parsed_result: ToolResult = match serde_json::from_value(result) {
                 Ok(result) => result,
                 Err(err) => {
@@ -1770,6 +1775,26 @@ fn debug_log_key_event(key: &KeyEvent) {
     );
 }
 
+/// Switch the shown conversation to the currently highlighted pane row and
+/// reset its scroll, so moving the selection previews the conversation live
+/// instead of only committing on Enter.
+fn select_subagent_row(app: &mut TuiApp) {
+    app.subagent_pane.active = if app.subagent_pane.selected == 0 {
+        ConversationSource::Main
+    } else {
+        app.subagent_pane
+            .records
+            .get(app.subagent_pane.selected - 1)
+            .map(|record| ConversationSource::Subagent(record.id))
+            .unwrap_or(ConversationSource::Main)
+    };
+    set_active_transcript_scroll_from_bottom(app, 0);
+    app.status = match app.subagent_pane.active {
+        ConversationSource::Main => "main conversation".to_string(),
+        ConversationSource::Subagent(_) => "subagent conversation".to_string(),
+    };
+}
+
 fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if app.subagent_pane.records.is_empty() || !key.modifiers.is_empty() {
         return false;
@@ -1779,7 +1804,7 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Down if app.subagent_pane.focused => {
             app.subagent_pane.selected = (app.subagent_pane.selected + 1).min(row_count - 1);
-            app.status = "subagent pane selection changed".to_string();
+            select_subagent_row(app);
             true
         }
         KeyCode::Down if app.input.is_empty() => {
@@ -1787,12 +1812,12 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             if row_count > 1 && app.subagent_pane.selected == 0 {
                 app.subagent_pane.selected = 1;
             }
-            app.status = "subagent pane focused".to_string();
+            select_subagent_row(app);
             true
         }
         KeyCode::Up if app.subagent_pane.focused && app.subagent_pane.selected > 0 => {
             app.subagent_pane.selected -= 1;
-            app.status = "subagent pane selection changed".to_string();
+            select_subagent_row(app);
             true
         }
         KeyCode::Up if app.subagent_pane.focused => {
@@ -1801,27 +1826,24 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Enter if app.subagent_pane.focused => {
-            app.subagent_pane.active = if app.subagent_pane.selected == 0 {
-                ConversationSource::Main
-            } else {
-                app.subagent_pane
-                    .records
-                    .get(app.subagent_pane.selected - 1)
-                    .map(|record| ConversationSource::Subagent(record.id))
-                    .unwrap_or(ConversationSource::Main)
-            };
-            app.transcript_scroll_from_bottom = 0;
+            // Selection already previews live (see `select_subagent_row`);
+            // Enter just releases pane focus so the arrow keys scroll the
+            // now-active transcript instead of moving the selector.
+            app.subagent_pane.focused = false;
             app.status = match app.subagent_pane.active {
                 ConversationSource::Main => "main conversation selected".to_string(),
                 ConversationSource::Subagent(_) => "subagent conversation selected".to_string(),
             };
             true
         }
-        KeyCode::Esc if app.subagent_pane.focused => {
+        KeyCode::Esc
+            if app.subagent_pane.focused
+                || !matches!(app.subagent_pane.active, ConversationSource::Main) =>
+        {
             app.subagent_pane.focused = false;
             app.subagent_pane.active = ConversationSource::Main;
             app.subagent_pane.selected = 0;
-            app.transcript_scroll_from_bottom = 0;
+            set_active_transcript_scroll_from_bottom(app, 0);
             app.status = "main conversation selected".to_string();
             true
         }
@@ -2106,7 +2128,11 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // A focused subagent pane owns Esc (to close itself); don't let Esc
     // cancel an in-flight turn out from under the user while they're
     // navigating the pane.
-    if key.code == KeyCode::Esc && !app.subagent_pane.focused && request_turn_interrupt(app) {
+    if key.code == KeyCode::Esc
+        && !app.subagent_pane.focused
+        && matches!(app.subagent_pane.active, ConversationSource::Main)
+        && request_turn_interrupt(app)
+    {
         return Ok(false);
     }
 
@@ -2119,6 +2145,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     }
 
     if app.mention_popup.is_some() && handle_mention_popup_key(app, key) {
+        return Ok(false);
+    }
+
+    if should_route_plain_arrow_to_scroll_before_subagent_pane(app, key) {
+        match key.code {
+            KeyCode::Up => scroll_transcript_up(app, 3),
+            KeyCode::Down => scroll_transcript_down(app, 3),
+            _ => {}
+        }
         return Ok(false);
     }
 
@@ -2578,7 +2613,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             if app.input.is_empty() {
-                app.transcript_scroll_from_bottom = u16::MAX;
+                set_active_transcript_scroll_from_bottom(app, u16::MAX);
                 true
             } else {
                 false
@@ -2589,7 +2624,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             if app.input.is_empty() {
-                app.transcript_scroll_from_bottom = 0;
+                set_active_transcript_scroll_from_bottom(app, 0);
                 true
             } else {
                 false
@@ -2631,15 +2666,36 @@ fn dispatch_click_action(app: &mut TuiApp, action: ClickAction) {
 }
 
 fn scroll_transcript_up(app: &mut TuiApp, lines: u16) {
-    app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_add(lines);
+    let scroll = active_transcript_scroll_from_bottom(app).saturating_add(lines);
+    set_active_transcript_scroll_from_bottom(app, scroll);
 }
 
 fn scroll_transcript_down(app: &mut TuiApp, lines: u16) {
-    app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_sub(lines);
+    let scroll = active_transcript_scroll_from_bottom(app).saturating_sub(lines);
+    set_active_transcript_scroll_from_bottom(app, scroll);
 }
 
 fn should_route_plain_arrow_to_scroll(app: &TuiApp) -> bool {
-    app.alternate_scroll_enabled && app.input_history_index.is_none() && !app.transcript.is_empty()
+    app.alternate_scroll_enabled
+        && app.input_history_index.is_none()
+        && !active_transcript_entries(app).is_empty()
+}
+
+fn should_route_plain_arrow_to_scroll_before_subagent_pane(app: &TuiApp, key: KeyEvent) -> bool {
+    if app.subagent_pane.focused
+        || app.input_history_index.is_some()
+        || !app.input.is_empty()
+        || !key.modifiers.is_empty()
+        || !app.alternate_scroll_enabled
+        || active_transcript_entries(app).is_empty()
+    {
+        return false;
+    }
+    match key.code {
+        KeyCode::Up => true,
+        KeyCode::Down => active_transcript_scroll_from_bottom(app) > 0,
+        _ => false,
+    }
 }
 
 fn request_turn_interrupt(app: &mut TuiApp) -> bool {
@@ -6225,8 +6281,11 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_startup_card: bool) {
     let lines = transcript_lines_for_render(app, Some(area.width), include_startup_card);
-    let scroll =
-        transcript_scroll_offset(lines.len(), area.height, app.transcript_scroll_from_bottom);
+    let scroll = transcript_scroll_offset(
+        lines.len(),
+        area.height,
+        active_transcript_scroll_from_bottom(app),
+    );
     let paragraph = Paragraph::new(lines)
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
@@ -6853,10 +6912,34 @@ fn active_subagent_record(app: &TuiApp) -> Option<&SubagentRecord> {
         .find(|record| record.id == id)
 }
 
+fn active_subagent_record_mut(app: &mut TuiApp) -> Option<&mut SubagentRecord> {
+    let ConversationSource::Subagent(id) = app.subagent_pane.active else {
+        return None;
+    };
+    app.subagent_pane
+        .records
+        .iter_mut()
+        .find(|record| record.id == id)
+}
+
 fn active_transcript_entries(app: &TuiApp) -> &[TranscriptEntry] {
     active_subagent_record(app)
         .map(|record| record.transcript.as_slice())
         .unwrap_or(app.transcript.as_slice())
+}
+
+fn active_transcript_scroll_from_bottom(app: &TuiApp) -> u16 {
+    active_subagent_record(app)
+        .map(|record| record.scroll_from_bottom)
+        .unwrap_or(app.transcript_scroll_from_bottom)
+}
+
+fn set_active_transcript_scroll_from_bottom(app: &mut TuiApp, scroll: u16) {
+    if let Some(record) = active_subagent_record_mut(app) {
+        record.scroll_from_bottom = scroll;
+    } else {
+        app.transcript_scroll_from_bottom = scroll;
+    }
 }
 
 fn active_selected_entry(app: &TuiApp) -> Option<usize> {
@@ -6887,7 +6970,7 @@ fn active_conversation_title(app: &TuiApp) -> Option<Line<'static>> {
     let record = active_subagent_record(app)?;
     Some(Line::from(vec![
         Span::styled(
-            record.lifecycle.glyph(true),
+            "●",
             Style::default()
                 .fg(record.lifecycle.color())
                 .add_modifier(Modifier::BOLD),
@@ -8555,6 +8638,9 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
             Span::styled(preview, style),
         ])];
     }
+    if entry.kind == LogKind::Info {
+        return detail_text_lines(selected, crate::render::theme::cyan(), message);
+    }
     if entry.kind == LogKind::Warn {
         // `⚠ message` rendering for warnings so the user can spot
         // config issues and turn failures at a glance. Newlines are flattened to spaces so
@@ -9140,7 +9226,10 @@ fn read_file_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
 
 fn read_tool_output_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let label = saved_tool_output_meta(tool)
-        .map(|meta| format!("expand saved {}", saved_tool_output_label(&meta.tool_name)))
+        .map(|meta| match meta.tool_name.as_deref() {
+            Some(name) => format!("expand saved {}", saved_tool_output_label(name)),
+            None => "expand saved tool output".to_string(),
+        })
         .or_else(|| {
             saved_compiler_output_summary(tool).map(|_| "expand saved compiler output".to_string())
         })
@@ -9578,11 +9667,23 @@ fn tool_call_label_or_name(tool: &ToolTranscript) -> String {
         .unwrap_or_else(|| tool.result.tool_name.clone())
 }
 
+/// Describe a `verify` call by its scope/level — its real arguments — rather
+/// than a `command` field it doesn't have. A model that mistakes `verify` for
+/// `shell` and passes `command: "full"` would otherwise surface that stray
+/// value as the label; the `prepare_verify_arguments` hook re-homes it, and
+/// this reads the structured fields with the tool's own defaults.
+fn verify_call_label(call: &ToolCall) -> String {
+    let scope = string_arg(&call.arguments, "scope").unwrap_or_else(|| "diff".to_string());
+    let level = string_arg(&call.arguments, "level").unwrap_or_else(|| "quick".to_string());
+    format!("{scope}/{level}")
+}
+
 pub(crate) fn tool_call_label(call: &ToolCall) -> String {
     match call.name.as_str() {
-        "shell" | "verify" => string_arg(&call.arguments, "command")
+        "shell" => string_arg(&call.arguments, "command")
             .or_else(|| string_arg(&call.arguments, "description"))
             .unwrap_or_else(|| call.name.clone()),
+        "verify" => verify_call_label(call),
         "decl_search" => {
             let language = string_arg(&call.arguments, "language");
             let kind = string_arg(&call.arguments, "kind").map(|value| kind_label(&value));
@@ -9702,9 +9803,10 @@ pub(crate) fn is_control_tool_name(name: &str) -> bool {
 /// at the colon.
 fn active_tool_args(call: &ToolCall) -> String {
     match call.name.as_str() {
-        "shell" | "verify" => string_arg(&call.arguments, "command")
+        "shell" => string_arg(&call.arguments, "command")
             .or_else(|| string_arg(&call.arguments, "description"))
             .unwrap_or_default(),
+        "verify" => verify_call_label(call),
         "decl_search" => {
             let language = string_arg(&call.arguments, "language");
             let kind = string_arg(&call.arguments, "kind").map(|value| kind_label(&value));
@@ -10515,10 +10617,15 @@ fn expanded_read_tool_output_detail_lines(
         ));
     }
     if let Some(saved) = saved_tool_output_meta(tool) {
+        let label = saved
+            .tool_name
+            .as_deref()
+            .map(saved_tool_output_label)
+            .unwrap_or_else(|| "tool output".to_string());
         lines.push(detail_line(
             false,
             crate::render::theme::quiet(),
-            format!("saved {}", saved_tool_output_label(&saved.tool_name)),
+            format!("saved {label}"),
         ));
         if let Some(result) = saved.parsed {
             let nested = ToolTranscript {
@@ -10594,13 +10701,20 @@ fn expanded_read_tool_output_detail_lines(
         // Ctrl-T. Generic `output_block_lines` stays unbounded so the
         // existing "expand grep → see every match" behaviour is preserved.
         let limit = saved_output_preview_limit(verbosity);
+        let byte_limit = saved_output_line_byte_limit(verbosity);
         if !content.trim().is_empty() {
             lines.push(detail_line(false, crate::render::theme::quiet(), "content"));
             for line in head_tail_lines(&content, limit) {
                 if line.truncated_marker {
                     lines.push(detail_line(false, crate::render::theme::quiet(), line.text));
                 } else {
-                    lines.push(detail_spans_line(styled_output_spans(&line.text)));
+                    // Clamp each line by bytes: spilled payloads are routinely
+                    // minified single-line JSON, which the line-count cap above
+                    // can't bound — one such line would otherwise wrap into
+                    // hundreds of rows. Verbose (the Ctrl-T overlay) is left
+                    // unbounded so the full content stays available.
+                    let text = truncate_bytes(&line.text, byte_limit);
+                    lines.push(detail_spans_line(styled_output_spans(&text)));
                 }
             }
         }
@@ -10616,9 +10730,17 @@ fn saved_output_preview_limit(verbosity: ToolOutputVerbosity) -> usize {
     }
 }
 
+fn saved_output_line_byte_limit(verbosity: ToolOutputVerbosity) -> usize {
+    match verbosity {
+        ToolOutputVerbosity::Compact => TOOL_PREVIEW_COMPACT_BYTES,
+        ToolOutputVerbosity::Normal => TOOL_PREVIEW_NORMAL_BYTES,
+        ToolOutputVerbosity::Verbose => usize::MAX,
+    }
+}
+
 #[derive(Debug)]
 struct SavedToolOutputMeta {
-    tool_name: String,
+    tool_name: Option<String>,
     parsed: Option<ToolResult>,
     partial: bool,
 }
@@ -10627,16 +10749,26 @@ fn saved_tool_output_meta(tool: &ToolTranscript) -> Option<SavedToolOutputMeta> 
     if tool.result.tool_name != "read_tool_output" {
         return None;
     }
+    // Cargo/compiler JSON streams have a dedicated summarizer; yield to it
+    // rather than folding them as a generic saved tool-result.
+    if saved_compiler_output_summary(tool).is_some() {
+        return None;
+    }
     let content = string_arg(&tool.result.content, "content")?;
     let trimmed = content.trim_start();
-    if !trimmed.starts_with('{') {
+    // Spilled tool results are written in the `model_output()` shape
+    // (`{"status":..,"content":..}`), which carries no `tool_name`. Treat any
+    // JSON object/array body as a saved tool-result so it folds to a receipt
+    // instead of splatting raw JSON across the scrollback; the inner tool name
+    // is best-effort and only used to label the receipt.
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
         return None;
     }
     let parsed = serde_json::from_str::<ToolResult>(trimmed).ok();
     let tool_name = parsed
         .as_ref()
         .map(|result| result.tool_name.clone())
-        .or_else(|| json_string_field_prefix(trimmed, "tool_name"))?;
+        .or_else(|| json_string_field_prefix(trimmed, "tool_name"));
     let partial = tool.result.content["truncated"].as_bool().unwrap_or(false) || parsed.is_none();
     Some(SavedToolOutputMeta {
         tool_name,
@@ -12307,7 +12439,10 @@ fn subagent_pane_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
 fn subagent_main_row(app: &TuiApp, width: u16) -> Line<'static> {
     let selected = app.subagent_pane.selected == 0;
     let active = matches!(app.subagent_pane.active, ConversationSource::Main);
-    let glyph = if selected || active { "⏺" } else { "◯" };
+    // Glyph encodes selection only: ● = the conversation currently shown,
+    // ○ = the others. Run status (for subagent rows) rides on colour + the
+    // leading lifecycle word, so the marker no longer conflates the two.
+    let glyph = if active { "●" } else { "○" };
     let style = if selected {
         Style::default()
             .fg(crate::render::theme::accent())
@@ -12316,7 +12451,7 @@ fn subagent_main_row(app: &TuiApp, width: u16) -> Line<'static> {
         Style::default().fg(crate::render::theme::quiet())
     };
     let hint = if selected && app.subagent_pane.focused {
-        "↑/↓ to select · Enter view"
+        "↑/↓ switch · Enter scroll · Esc back"
     } else if active {
         "active"
     } else {
@@ -12341,7 +12476,9 @@ fn subagent_record_row(
     let row = index + 1;
     let selected = app.subagent_pane.selected == row;
     let active = app.subagent_pane.active == ConversationSource::Subagent(record.id);
-    let glyph = record.lifecycle.glyph(selected || active);
+    // ● = shown conversation, ○ = others (selection). The lifecycle colour
+    // below and the leading lifecycle word carry run status separately.
+    let glyph = if active { "●" } else { "○" };
     let glyph_style = Style::default()
         .fg(record.lifecycle.color())
         .add_modifier(if selected {
@@ -12350,7 +12487,7 @@ fn subagent_record_row(
             Modifier::empty()
         });
     let detail = if selected && app.subagent_pane.focused {
-        "↑/↓ to select · Enter view".to_string()
+        "↑/↓ switch · Enter scroll · Esc back".to_string()
     } else if !record.latest.trim().is_empty() {
         record.latest.clone()
     } else {
@@ -12365,9 +12502,9 @@ fn subagent_record_row(
         ),
         _ => detail,
     };
-    // Lead with the lifecycle word so the state survives a monochrome
-    // terminal and the selected-row glyph (which is always ⏺) can't mask a
-    // failed/running/capped subagent.
+    // Lead with the lifecycle word so run state survives a monochrome
+    // terminal, where the marker only encodes selection (○/●) and colour
+    // carries the failed/running/capped state.
     let detail = format!("{} · {}", record.lifecycle.label(), detail);
     // Disambiguate same-kind rows during parallel fanout (e.g. three
     // "delegate" subagents) with their row ordinal.
@@ -12603,7 +12740,7 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         };
     }
     if app.subagent_pane.focused {
-        return "Up/Down select · Enter view · Del clear done · type/Esc back to prompt"
+        return "Up/Down switch · Enter scroll · Del clear done · type/Esc back to prompt"
             .to_string();
     }
     if let Some(pending) = app.pending_request_user_input.as_ref() {
@@ -13156,16 +13293,6 @@ enum SubagentLifecycle {
 }
 
 impl SubagentLifecycle {
-    fn glyph(self, selected: bool) -> &'static str {
-        match (selected, self) {
-            (true, _) => "⏺",
-            (false, Self::Running) => "◐",
-            (false, Self::Completed) => "●",
-            (false, Self::Failed) => "◯",
-            (false, Self::Rejected) => "⊘",
-        }
-    }
-
     fn label(self) -> &'static str {
         match self {
             Self::Running => "running",
@@ -13192,6 +13319,7 @@ struct SubagentRecord {
     prompt: String,
     lifecycle: SubagentLifecycle,
     latest: String,
+    scroll_from_bottom: u16,
     metrics: Option<TurnMetrics>,
     transcript: Vec<TranscriptEntry>,
 }
@@ -14065,6 +14193,16 @@ impl TuiApp {
         self.push_entry(TranscriptEntry::log(id, message, self.transcript_default));
     }
 
+    pub(crate) fn push_info(&mut self, message: String) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::log_with_kind(
+            id,
+            message,
+            LogKind::Info,
+            self.transcript_default,
+        ));
+    }
+
     /// Push a warning log (⚠ prefix). Suppresses the push when
     /// the most recent transcript entry is already a `⚠ Cancelled` / `⚠ Denied`
     /// tool card — the card already communicates the turn-end at a glance,
@@ -14120,6 +14258,7 @@ impl TuiApp {
             record.prompt = prompt;
             record.lifecycle = SubagentLifecycle::Running;
             record.latest = "starting".to_string();
+            record.scroll_from_bottom = 0;
             record.metrics = None;
             record.transcript = transcript;
         } else {
@@ -14129,6 +14268,7 @@ impl TuiApp {
                 prompt,
                 lifecycle: SubagentLifecycle::Running,
                 latest: "starting".to_string(),
+                scroll_from_bottom: 0,
                 metrics: None,
                 transcript,
             });
@@ -14238,6 +14378,7 @@ impl TuiApp {
             prompt: detail.clone(),
             lifecycle: SubagentLifecycle::Rejected,
             latest: compact_text(&detail, 120),
+            scroll_from_bottom: 0,
             metrics: None,
             transcript,
         });
@@ -14609,6 +14750,9 @@ fn system_message_can_collapse(item: &TranscriptItem) -> bool {
 pub(crate) enum LogKind {
     /// Standard log line — rendered with `└` and a status-color marker.
     Normal,
+    /// Non-error operational event with useful payload. Rendered neutral and
+    /// left untruncated so lifecycle details stay inspectable.
+    Info,
     /// Operational chrome (turn-complete markers, compaction notices,
     /// plan-handoff state) — rendered dim/italic with no bullet so it
     /// fades to the periphery instead of looking like a content event.
@@ -14834,7 +14978,7 @@ enum TerminalMode {
 impl From<TuiAlternateScreen> for TerminalMode {
     fn from(value: TuiAlternateScreen) -> Self {
         match value {
-            TuiAlternateScreen::Auto => Self::AlternateScreen,
+            TuiAlternateScreen::Auto => Self::Inline,
             TuiAlternateScreen::Never => Self::Inline,
             TuiAlternateScreen::Always => Self::AlternateScreen,
         }
