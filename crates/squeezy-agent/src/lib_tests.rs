@@ -1511,6 +1511,65 @@ fn instructions_skip_prompt_hint_on_default_and_native_capable_models() {
     assert!(verbose.contains("Response verbosity: verbose"), "{verbose}");
 }
 
+#[test]
+fn batch_tool_calls_hint_is_off_by_default_and_appends_when_enabled() {
+    let base = "system rules";
+
+    // Default (disabled): the system prompt is byte-for-byte unchanged so
+    // the cache prefix is never disturbed unless the operator opts in.
+    assert_eq!(instructions_with_batch_hint(base, false), base);
+
+    // Enabled: the nudge is appended in a deterministic position and the
+    // base prompt remains a verbatim prefix (cache-stable per session).
+    let hinted = instructions_with_batch_hint(base, true);
+    assert!(hinted.starts_with(base), "{hinted}");
+    assert!(
+        hinted.contains(BATCH_TOOL_CALLS_HINT),
+        "enabled hint must contain the nudge text: {hinted}"
+    );
+    // The nudge steers only read-only lookups and explicitly keeps edits
+    // sequential — the load-bearing safety property for G3.
+    assert!(
+        BATCH_TOOL_CALLS_HINT.contains("read-only") && BATCH_TOOL_CALLS_HINT.contains("sequential"),
+        "nudge must scope to read-only and preserve edit ordering"
+    );
+}
+
+#[tokio::test]
+async fn parallel_tool_calls_config_flows_into_dispatched_request() {
+    // G3 end-to-end: the operator's `[model].parallel_tool_calls` choice and
+    // the batching nudge must reach the wire request the agent dispatches.
+    // The default config leaves both untouched (None / no nudge); an opted-in
+    // config carries `Some(true)` and appends the hint to the system prompt.
+    for (parallel, hint) in [(None, false), (Some(true), true), (Some(false), false)] {
+        let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        })]]));
+        let mut config = AppConfig::default();
+        config.parallel_tool_calls = parallel;
+        config.batch_tool_calls_hint = hint;
+        let agent = Agent::new(config, provider.clone());
+
+        let mut rx = agent.start_turn("hello".to_string(), CancellationToken::new());
+        while rx.recv().await.is_some() {}
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1, "exactly one request per turn");
+        assert_eq!(
+            requests[0].parallel_tool_calls, parallel,
+            "request must carry the configured parallel_tool_calls={parallel:?}"
+        );
+        let carries_hint = requests[0].instructions.contains(BATCH_TOOL_CALLS_HINT);
+        assert_eq!(
+            carries_hint, hint,
+            "system prompt nudge presence must track batch_tool_calls_hint={hint}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn tool_loop_executes_fallback_tool_and_returns_observation() {
     let root = temp_workspace("agent_tool_loop");
@@ -3220,6 +3279,41 @@ fn classifier_verdict_does_not_match_action_inside_reason_text() {
         r#"{"action": "ask", "reason": "if we later wanted to deny we could"}"#,
     );
     assert_eq!(verdict.action, PermissionAction::Ask);
+}
+
+/// The shell-classifier schema (M13) must mirror what
+/// `extract_json_action` deserializes: the two permitted `action` values
+/// (`ask`/`deny` — never `allow`) plus a `reason` string. Every
+/// schema-valid document must parse back into the same non-`Allow` verdict.
+#[test]
+fn shell_classifier_output_schema_mirrors_parse_target() {
+    let schema = super::shell_classifier_output_schema();
+    assert!(schema.strict, "shell classifier schema must be strict");
+
+    let action_enum = schema.schema["properties"]["action"]["enum"]
+        .as_array()
+        .expect("action carries an enum");
+    let values: Vec<&str> = action_enum.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(
+        values,
+        vec![
+            PermissionAction::Ask.as_str(),
+            PermissionAction::Deny.as_str()
+        ],
+        "action enum excludes allow by design"
+    );
+    assert_eq!(
+        schema.schema["properties"]["reason"]["type"],
+        json!("string")
+    );
+    assert_eq!(schema.schema["required"], json!(["action", "reason"]));
+    assert_eq!(schema.schema["additionalProperties"], json!(false));
+
+    // Round-trip: every enum value parses back into the matching verdict.
+    let deny = parse_classifier_verdict(r#"{"action":"deny","reason":"x"}"#);
+    assert_eq!(deny.action, PermissionAction::Deny);
+    let ask = parse_classifier_verdict(r#"{"action":"ask","reason":"x"}"#);
+    assert_eq!(ask.action, PermissionAction::Ask);
 }
 
 #[test]
@@ -7791,6 +7885,235 @@ fn cost_cap_fires_pre_flight_on_first_turn_when_projection_exceeds_cap() {
     // the actual recorded spend, so the operator sees the would-have-been
     // total they were saved from.
     assert!(status.percent >= 100, "percent should reflect overrun");
+}
+
+/// A conversation whose `estimate_context` token estimate is large enough to
+/// trip a small pre-flight round-input ceiling. Distinct user/assistant text so
+/// the bytes are real (not collapsed by SHA-dedup).
+fn round_gate_seed_conversation() -> Vec<LlmInputItem> {
+    let mut items = Vec::new();
+    for n in 0..40 {
+        items.push(LlmInputItem::UserText(format!(
+            "user message {n}: a long line of context with enough bytes that the \
+             token estimate climbs steadily across the whole conversation history",
+        )));
+        items.push(LlmInputItem::AssistantText(format!(
+            "assistant reply {n}: an equally long acknowledgement so the running \
+             estimate stays well above any small per-round input-token ceiling",
+        )));
+    }
+    items
+}
+
+/// G5 pre-flight round-input gate: the estimate the gate compares against the
+/// ceiling must be exactly `estimate_context(...).estimated_tokens` — the gate
+/// reuses the existing estimator rather than carrying its own token model.
+#[test]
+fn round_input_gate_estimate_matches_estimate_context() {
+    let conversation = round_gate_seed_conversation();
+    let estimated = super::estimate_context(&conversation).estimated_tokens;
+    assert!(estimated > 0, "seed conversation must estimate as nonzero");
+
+    // A ceiling one token under the estimate must gate, and the reported
+    // `estimated_input_tokens` must equal the estimator's number verbatim.
+    let status = super::cost_broker::round_input_gate_status(
+        Some(estimated - 1),
+        estimated,
+        "mock",
+        "mock-model",
+        1_024,
+    )
+    .expect("an estimate one over the ceiling must gate");
+    assert_eq!(
+        status.estimated_input_tokens, estimated,
+        "the gate must carry the estimate_context token count unchanged"
+    );
+
+    // A ceiling exactly at the estimate must not gate (inclusive limit).
+    assert!(
+        super::cost_broker::round_input_gate_status(
+            Some(estimated),
+            estimated,
+            "mock",
+            "mock-model",
+            1_024,
+        )
+        .is_none(),
+        "an estimate exactly at the ceiling must not gate"
+    );
+}
+
+/// When `max_round_input_tokens` is set and the assembled round exceeds it, the
+/// agent must compact *first* (emitting `ContextCompacted`) and then proceed to
+/// dispatch the round — not gate the turn — because the forced compaction
+/// brings the conversation back under the ceiling.
+#[tokio::test]
+async fn round_input_gate_compacts_then_proceeds_when_over_limit() {
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("done".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let seed = round_gate_seed_conversation();
+    // Disable the routine auto/mid-turn compaction paths so the *only* thing
+    // that can shrink this conversation is the pre-flight gate's own forced
+    // compaction — the gate calls `compact_conversation_with_strategy`
+    // directly, which runs regardless of `enabled`.
+    let compaction_config = ContextCompactionConfig {
+        enabled: false,
+        enabled_mid_turn: false,
+        // Aggressive: keep only a couple of recent items so the forced
+        // compaction collapses the long history into a short summary.
+        recent_items: 2,
+        // Default Extractive strategy needs no model, so a store-less,
+        // model-less agent can still compact.
+        ..ContextCompactionConfig::default()
+    };
+    // Deterministically measure the floor the forced compaction lands at by
+    // running the same forced compaction on a clone that mirrors the turn's
+    // assembled conversation (seed + the new user item). The ceiling is then
+    // placed strictly between that floor and the seed estimate, so the gate is
+    // guaranteed to fire AND the forced compaction is guaranteed to clear it.
+    let mut probe_conversation = seed.clone();
+    probe_conversation.push(LlmInputItem::UserText("continue".to_string()));
+    let seed_estimate = super::estimate_context(&probe_conversation).estimated_tokens;
+    let probe_config = AppConfig {
+        context_compaction: compaction_config.clone(),
+        ..AppConfig::default()
+    };
+    let mut probe_state = ContextCompactionState::default();
+    super::compact_conversation(
+        &mut probe_conversation,
+        &mut probe_state,
+        &[],
+        None,
+        &probe_config,
+        ContextCompactionTrigger::Auto,
+        true,
+    )
+    .expect("forced compaction must produce a report on the seed conversation");
+    let compacted_floor = super::estimate_context(&probe_conversation).estimated_tokens;
+    assert!(
+        compacted_floor < seed_estimate,
+        "compaction must shrink the seed ({compacted_floor} !< {seed_estimate})"
+    );
+    let ceiling = compacted_floor + (seed_estimate - compacted_floor) / 2;
+    let config = AppConfig {
+        max_round_input_tokens: Some(ceiling),
+        context_compaction: compaction_config,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+    agent.conversation_state.lock().await.conversation = seed;
+
+    let mut rx = agent.start_turn("continue".to_string(), CancellationToken::new());
+    let mut compacted = None;
+    let mut completed = None;
+    let mut failed = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ContextCompacted { report, .. } => compacted = Some(report),
+            AgentEvent::Completed { message, .. } => completed = Some(message.content),
+            AgentEvent::Failed { error, .. } => failed = Some(error.to_string()),
+            _ => {}
+        }
+    }
+
+    assert!(
+        failed.is_none(),
+        "the gate must compact and proceed, not fail the turn; got: {failed:?}"
+    );
+    let report = compacted.expect("the round-input gate must force a compaction");
+    assert!(
+        report.record.after.estimated_tokens < report.record.before.estimated_tokens,
+        "forced compaction must shrink the conversation: {} -> {}",
+        report.record.before.estimated_tokens,
+        report.record.after.estimated_tokens,
+    );
+    assert!(
+        report.record.after.estimated_tokens <= ceiling,
+        "post-compaction estimate ({}) must land at/under the ceiling ({ceiling})",
+        report.record.after.estimated_tokens,
+    );
+    assert_eq!(
+        completed.as_deref(),
+        Some("done"),
+        "the round must dispatch and complete after compaction"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the model must be hit exactly once, after the gate compacted"
+    );
+}
+
+/// Default-off: with `max_round_input_tokens` unset the gate is inert — the
+/// same oversized conversation dispatches without any gate-driven compaction,
+/// proving behaviour is unchanged when the knob is `None`.
+#[tokio::test]
+async fn round_input_gate_noop_when_unset() {
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("done".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let seed = round_gate_seed_conversation();
+    // Compaction fully disabled so the *only* path that could emit
+    // `ContextCompacted` is the (unset) gate; if the gate were active it would
+    // still try to force-compact. With the knob unset, nothing fires.
+    let config = AppConfig {
+        max_round_input_tokens: None,
+        context_compaction: ContextCompactionConfig {
+            enabled: false,
+            enabled_mid_turn: false,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+    agent.conversation_state.lock().await.conversation = seed;
+
+    let mut rx = agent.start_turn("continue".to_string(), CancellationToken::new());
+    let mut compacted = false;
+    let mut completed = None;
+    let mut failed = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ContextCompacted { .. } => compacted = true,
+            AgentEvent::Completed { message, .. } => completed = Some(message.content),
+            AgentEvent::Failed { error, .. } => failed = Some(error.to_string()),
+            _ => {}
+        }
+    }
+
+    assert!(
+        !compacted,
+        "an unset round-input gate must never trigger compaction"
+    );
+    assert!(
+        failed.is_none(),
+        "the turn must not be gated; got: {failed:?}"
+    );
+    assert_eq!(
+        completed.as_deref(),
+        Some("done"),
+        "the oversized round must dispatch unchanged when the gate is off"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the model must be hit once, with no gate interference"
+    );
 }
 
 /// Drives the broker through a scripted spent sequence: after a cheap first

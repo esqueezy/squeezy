@@ -366,6 +366,145 @@ fn parse_judge_reply_rejects_garbage() {
     );
 }
 
+// -- Structured-output contract (M13) --------------------------------------
+
+/// The judge schema must mirror exactly what `JudgeReply` deserializes:
+/// the two `route` values `parse_judge_reply` accepts plus a `reason`
+/// string. A document that validates against the schema must also
+/// deserialize into `JudgeReply` and route correctly, and the schema must
+/// be marked strict so supporting providers enforce it server-side.
+#[test]
+fn judge_output_schema_mirrors_judge_reply() {
+    let schema = super::judge_output_schema();
+    assert!(schema.strict, "judge schema must be strict");
+
+    let props = &schema.schema["properties"];
+    let route_enum = props["route"]["enum"]
+        .as_array()
+        .expect("route carries an enum");
+    let values: Vec<&str> = route_enum.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(
+        values,
+        vec!["cheap", "parent"],
+        "route enum is the parse set"
+    );
+    assert_eq!(props["reason"]["type"], "string");
+    assert_eq!(
+        schema.schema["required"],
+        serde_json::json!(["route", "reason"])
+    );
+    assert_eq!(
+        schema.schema["additionalProperties"],
+        serde_json::json!(false)
+    );
+
+    // A schema-valid document deserializes into the real parse target and
+    // routes to the expected decision — the schema cannot drift from the
+    // struct without this failing.
+    for (route, expect) in [("cheap", Some(true)), ("parent", Some(false))] {
+        let doc = serde_json::json!({ "route": route, "reason": "x" });
+        let reply: super::JudgeReply = serde_json::from_value(doc.clone()).expect("deserializes");
+        assert_eq!(reply.route, route);
+        assert_eq!(super::parse_judge_reply(&doc.to_string()), expect);
+    }
+}
+
+/// Records every request it is handed so a test can inspect the
+/// `output_schema` the judge attaches. Emits a single valid judge reply so
+/// `run_judge` runs to completion.
+struct RecordingProvider {
+    requests: std::sync::Mutex<Vec<squeezy_llm::LlmRequest>>,
+}
+
+impl RecordingProvider {
+    fn new() -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn last_request(&self) -> squeezy_llm::LlmRequest {
+        self.requests
+            .lock()
+            .expect("requests")
+            .last()
+            .cloned()
+            .expect("a request was recorded")
+    }
+}
+
+impl squeezy_llm::LlmProvider for RecordingProvider {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+
+    fn stream_response(
+        &self,
+        request: squeezy_llm::LlmRequest,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> squeezy_llm::LlmStream {
+        self.requests.lock().expect("requests").push(request);
+        let events = vec![
+            Ok(squeezy_llm::LlmEvent::TextDelta(
+                r#"{"route":"cheap","reason":"single op"}"#.to_string(),
+            )),
+            Ok(squeezy_llm::LlmEvent::Completed {
+                cost: CostSnapshot::default(),
+                response_id: None,
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ];
+        Box::pin(futures_util::stream::iter(events))
+    }
+}
+
+/// On a provider that forwards `output_schema` (OpenAI), the judge request
+/// carries the strict `JudgeReply` schema; on a provider that drops it
+/// (Anthropic) the request stays `None` so the loose parser remains the
+/// contract and behavior is unchanged.
+#[tokio::test]
+async fn run_judge_attaches_schema_only_on_supporting_provider() {
+    use std::sync::Arc;
+
+    let recorder = Arc::new(RecordingProvider::new());
+    let provider: Arc<dyn squeezy_llm::LlmProvider> = recorder.clone();
+
+    // Supporting provider: schema present and identical to the builder.
+    let model: Arc<str> = Arc::from("gpt-5.5");
+    let (verdict, _) = super::run_judge(
+        &provider,
+        "openai",
+        &model,
+        "rename foo to bar in src/lib.rs",
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(verdict, Some(true));
+    let req = recorder.last_request();
+    assert_eq!(
+        req.output_schema,
+        Some(super::judge_output_schema()),
+        "openai must carry the judge schema"
+    );
+
+    // Non-supporting provider: no schema, unchanged behavior.
+    let model: Arc<str> = Arc::from("claude-opus-4-7");
+    let _ = super::run_judge(
+        &provider,
+        "anthropic",
+        &model,
+        "rename foo to bar in src/lib.rs",
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    let req = recorder.last_request();
+    assert_eq!(
+        req.output_schema, None,
+        "anthropic drops output_schema; request stays None"
+    );
+}
+
 #[test]
 fn deictic_followup_detector_matches_short_followups() {
     assert!(super::is_deictic_followup(

@@ -31,11 +31,12 @@ use squeezy_core::{
 };
 use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
-    CacheSpec, INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY,
-    INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream,
-    LlmToolCall, LlmToolSpec, ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate,
-    StopReason, capabilities_for, estimate_cost, estimate_request_context_calibrated,
-    fetch_ollama_context_window,
+    CacheRetention, CacheSpec, INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY,
+    INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider,
+    LlmRequest, LlmStream, LlmToolCall, LlmToolSpec, ReasoningPayload, ReasoningSnapshot,
+    RequestTokenEstimate, StopReason, capabilities_for, estimate_cost,
+    estimate_request_context_calibrated, fetch_ollama_context_window,
+    provider_honors_output_schema,
 };
 use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
@@ -92,7 +93,8 @@ use context_compaction::{
 #[cfg(test)]
 use context_compaction::{build_compaction_summary, compact_conversation};
 use cost_broker::{
-    CostBroker, format_cap_reached_reason, format_pressure_gate_reason, llm_request_input_bytes,
+    CostBroker, format_cap_reached_reason, format_pressure_gate_reason,
+    format_round_input_gate_reason, llm_request_input_bytes, round_input_gate_status,
 };
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
 use micro_compaction::{
@@ -2109,6 +2111,8 @@ impl Agent {
             self.config.tui.response_verbosity,
             native_text_verbosity,
         );
+        let raw_instructions =
+            instructions_with_batch_hint(&raw_instructions, self.config.batch_tool_calls_hint);
         let request_instructions = self.redactor.redact(&raw_instructions).text;
         let mut all_tool_specs = core_control_tools(&self.config.subagents, mode);
         all_tool_specs.extend(self.tools.specs().iter().cloned().map(advertised_tool));
@@ -2150,7 +2154,9 @@ impl Agent {
             store,
             tool_choice: self.config.tool_choice.clone(),
             output_schema: None,
-            parallel_tool_calls: None,
+            // Mirror the wire request so context/token accounting reflects
+            // the same `parallel_tool_calls` choice the real request sends.
+            parallel_tool_calls: self.config.parallel_tool_calls,
             beta_headers: std::sync::Arc::from(Vec::new()),
             ..LlmRequest::default()
         }
@@ -4757,6 +4763,25 @@ fn instructions_with_response_verbosity(
     format!("{instructions}\n\n{guidance}")
 }
 
+/// G3 batching nudge appended to the system prompt when
+/// `[model].batch_tool_calls_hint` is enabled. Kept to one sentence so the
+/// added cache-prefix bytes stay negligible. Scoped to *read-only* lookups
+/// so the model is never encouraged to reorder writes/edits, whose
+/// correctness depends on sequencing.
+const BATCH_TOOL_CALLS_HINT: &str = "When several read-only lookups (read_file, grep, definition_search, read_slice) are independent and none depends on another's result, issue them together in a single turn rather than one per turn; keep dependent steps and any file edits sequential.";
+
+/// Append the G3 batching nudge when `enabled`. Off by default, so the
+/// system prompt is byte-for-byte unchanged unless the operator opts in.
+/// When enabled, the hint lands in a deterministic position (immediately
+/// after the verbosity guidance, before the tool index) so the per-session
+/// prefix stays byte-stable across rounds.
+fn instructions_with_batch_hint(instructions: &str, enabled: bool) -> String {
+    if !enabled {
+        return instructions.to_string();
+    }
+    format!("{instructions}\n\n{BATCH_TOOL_CALLS_HINT}")
+}
+
 impl TurnRuntime {
     fn session_prompt_cache_key(&self) -> Option<String> {
         self.session_log
@@ -5011,13 +5036,20 @@ impl TurnRuntime {
             self.config.tui.response_verbosity,
             native_text_verbosity,
         );
+        // G3: optional batching nudge. Off by default (byte-for-byte
+        // unchanged prompt); when enabled it lands in a deterministic
+        // position so the per-session cache prefix stays stable.
+        let batch_hint_instructions = instructions_with_batch_hint(
+            &verbosity_instructions,
+            self.config.batch_tool_calls_hint,
+        );
         // Plan mode is enforced by tool-filtering elsewhere; the overlay
         // here tells the model *why* its toolbox shrank and what the
         // expected output contract (`<proposed_plan>`) looks like.
         let active_mode = load_session_mode(&self.session_mode);
         let session_id_for_plan_mode = self.session_id();
         let mode_instructions = plan_mode::instructions_for_mode(
-            &verbosity_instructions,
+            &batch_hint_instructions,
             active_mode,
             &self.config.workspace_root,
             session_id_for_plan_mode.as_deref(),
@@ -5567,6 +5599,123 @@ impl TurnRuntime {
                 self.finish_turn(&broker.metrics).await;
                 return Ok(());
             }
+            // Pre-flight round-input gate (idea G5). Default-off: when
+            // `max_round_input_tokens` is unset this whole block is a single
+            // `Option` check that returns `None`, so behaviour is unchanged.
+            // When set, estimate the assembled request's input tokens with the
+            // same `estimate_context` the cap check and compaction use; if the
+            // round is over the ceiling, take the cheaper action *first* —
+            // force a mid-turn compaction — and only gate the dispatch if the
+            // round is *still* over. This converts the existing reactive
+            // overflow handling into a proactive one for the round we're about
+            // to pay for.
+            if let Some(initial_gate) = round_input_gate_status(
+                self.config.max_round_input_tokens,
+                estimate_context(&conversation).estimated_tokens,
+                self.provider.name(),
+                &current_model,
+                CostBroker::projected_output_tokens(
+                    self.config.max_output_tokens,
+                    squeezy_llm::model_info_for(self.provider.name(), &current_model)
+                        .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
+                ),
+            ) {
+                self.dispatch_pre_compact(initial_gate.estimated_input_tokens);
+                // Force compaction regardless of the standard compaction
+                // thresholds: the gate's own ceiling is the trigger here, so
+                // `force = true` makes the extractive (and strategy-aware)
+                // pipeline run even when the conversation is below the normal
+                // `min_items` / `estimated_tokens` budgets.
+                let gate_report = compact_conversation_with_strategy(
+                    &mut conversation,
+                    &mut context_compaction,
+                    &active_attachments,
+                    self.store.as_deref(),
+                    &self.provider,
+                    self.session_log.as_ref(),
+                    &self.redactor,
+                    &self.config,
+                    ContextCompactionTrigger::Auto,
+                    true,
+                )
+                .await;
+                if let Some(report) = gate_report {
+                    self.dispatch_post_compact(
+                        report.record.before.estimated_tokens,
+                        report.record.after.estimated_tokens,
+                    );
+                    self.log_event(
+                        "context_compacted",
+                        Some(self.turn_id),
+                        Some(format!(
+                            "round-input gate compacted gen={} {}->{} estimated tokens",
+                            report.record.generation,
+                            report.record.before.estimated_tokens,
+                            report.record.after.estimated_tokens,
+                        )),
+                        json!({
+                            "record": report.record,
+                            "summary": report.summary,
+                            "replacement_id": report.record.replacement_id,
+                            "conversation": report.post_compact,
+                            "phase": "round_input_gate",
+                        }),
+                    );
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::ContextCompacted {
+                            turn_id: self.turn_id,
+                            report,
+                        })
+                        .await;
+                    // Compaction rewrote `conversation`, so the server-side
+                    // response-id reuse path must be invalidated and the full
+                    // (now-smaller) conversation resent rather than only the
+                    // latest user delta — mirrors the mid-turn compaction
+                    // handling after a tool round.
+                    previous_response_id = None;
+                    next_input = conversation.clone();
+                }
+                // Re-estimate after compaction. If the round is still over the
+                // ceiling, gate the dispatch with a clear status instead of
+                // paying for the oversized round.
+                if let Some(status) = round_input_gate_status(
+                    self.config.max_round_input_tokens,
+                    estimate_context(&conversation).estimated_tokens,
+                    self.provider.name(),
+                    &current_model,
+                    CostBroker::projected_output_tokens(
+                        self.config.max_output_tokens,
+                        squeezy_llm::model_info_for(self.provider.name(), &current_model)
+                            .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
+                    ),
+                ) {
+                    let reason = format_round_input_gate_reason(status);
+                    self.stamp_routing_savings(&mut broker.metrics);
+                    self.publish_terminal_task_state(
+                        TaskStateStatus::Failed,
+                        Some(reason.clone()),
+                        &task_title,
+                    )
+                    .await;
+                    self.persist_turn_accounting(
+                        &total_cost,
+                        &broker.metrics,
+                        &broker.calibration,
+                        false,
+                    )
+                    .await;
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::Failed {
+                            turn_id: self.turn_id,
+                            error: SqueezyError::Agent(reason),
+                        })
+                        .await;
+                    self.finish_turn(&broker.metrics).await;
+                    return Ok(());
+                }
+            }
             let active_mode = load_session_mode(&self.session_mode);
             let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();
             let plan_edit_allowed = plan_mode::plan_edit_allowed_in_workspace(
@@ -5657,7 +5806,13 @@ impl TurnRuntime {
                 store: self.config.store_responses,
                 tool_choice: effective_tool_choice(self.config.tool_choice.as_deref(), round),
                 output_schema: None,
-                parallel_tool_calls: None,
+                // G3: forward the operator's `parallel_tool_calls` choice
+                // so the model can batch independent tool calls into one
+                // turn, re-sending the growing prefix on fewer rounds.
+                // `None` (the default) leaves the provider's default —
+                // parallel on OpenAI Responses / Chat-Completions — in
+                // place, so behavior is unchanged unless opted in.
+                parallel_tool_calls: self.config.parallel_tool_calls,
                 beta_headers: std::sync::Arc::from(Vec::new()),
                 ..LlmRequest::default()
             };
@@ -8723,6 +8878,20 @@ async fn run_subagent_loop(
     }
 }
 
+/// Stable prompt-cache affinity key for a single subagent invocation.
+///
+/// Distinct per `(session, turn)` so two subagents — or the same subagent on a
+/// later turn — never share a key (which would mix unrelated prefixes). All
+/// rounds of one invocation reuse this key so the provider keeps the growing
+/// instructions + tools + history prefix warm across the round loop. Returns
+/// `None` when no session log is attached (in-memory test contexts), in which
+/// case caching falls back to disabled.
+fn subagent_prompt_cache_key(parent: &ToolExecutionContext<'_>) -> Option<String> {
+    parent
+        .session_id_for_plan_mode()
+        .map(|session_id| format!("squeezy::sub::{session_id}::{}", parent.turn_id))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent_rounds(
     parent: &ToolExecutionContext<'_>,
@@ -8745,8 +8914,24 @@ async fn run_subagent_rounds(
     supporting_receipts: &mut Vec<Value>,
     model: String,
 ) -> SubagentExecution {
+    // Subagent rounds re-send the same instructions + tool schemas and a
+    // monotonically growing conversation, so the request prefix is large and
+    // stable across rounds — the prefix-cache sweet spot. Anchor a key that is
+    // constant for this subagent invocation (so all its rounds share a cache
+    // prefix) but distinct per turn/session (so unrelated invocations never
+    // collide). `Short` retention rides the provider 5m window, which covers a
+    // subagent's bounded round loop without paying for a 1h write. The helper
+    // returns `None` on providers without `prompt_caching`, leaving them
+    // unchanged.
+    let subagent_cache_key = subagent_prompt_cache_key(parent);
     for round in 0..config.subagents.max_model_rounds {
         let request_model: Arc<str> = Arc::from(config.model.as_str());
+        let cache = CacheSpec::for_prefix_reuse(
+            parent.provider.name(),
+            &request_model,
+            subagent_cache_key.clone(),
+            CacheRetention::Short,
+        );
         let llm_request = LlmRequest {
             model: Arc::clone(&request_model),
             instructions: Arc::from(instructions),
@@ -8756,12 +8941,16 @@ async fn run_subagent_rounds(
             reasoning_effort: request_reasoning_effort(config, parent.provider.name()),
             previous_response_id: None,
             cache_key: None,
-            cache: CacheSpec::default(),
+            cache,
             tools: Arc::from(tool_specs),
             store: false,
             tool_choice: effective_tool_choice(config.tool_choice.as_deref(), round),
             output_schema: None,
-            parallel_tool_calls: None,
+            // G3: subagents run their own multi-round tool loop and
+            // re-bill the prefix each round, so they get the same
+            // operator-controlled batching opt-in. `None` keeps the
+            // provider default.
+            parallel_tool_calls: config.parallel_tool_calls,
             beta_headers: std::sync::Arc::from(Vec::new()),
             ..LlmRequest::default()
         };
@@ -12275,6 +12464,8 @@ Command: {command:?}\n\
 Working target: {:?}",
         request.target
     );
+    let output_schema = provider_honors_output_schema(provider.name(), &config.model)
+        .then(shell_classifier_output_schema);
     let llm_request = LlmRequest {
         model: Arc::from(config.model.as_str()),
         instructions: Arc::from(
@@ -12290,7 +12481,7 @@ Working target: {:?}",
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
-        output_schema: None,
+        output_schema,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
         ..LlmRequest::default()
@@ -12350,6 +12541,37 @@ pub(crate) fn parse_classifier_verdict(text: &str) -> PermissionVerdict {
             reason: format!("shell classifier requires approval: {reason_excerpt}"),
             silent: false,
         },
+    }
+}
+
+/// Strict JSON-schema contract mirroring what [`extract_json_action`]
+/// deserializes for the shell classifier: an `action` constrained to the
+/// two values the classifier prompt permits (`ask`/`deny` — `allow` is
+/// disallowed by design) plus a free-text `reason`. Attached only on
+/// providers that forward `output_schema`
+/// ([`provider_honors_output_schema`]) so the cheap classifier model emits
+/// schema-valid JSON instead of fenced/prose-wrapped output that costs a
+/// retry round; providers that drop the schema keep the loose-parse path
+/// (`extract_loose_action`) and behave exactly as before.
+fn shell_classifier_output_schema() -> LlmOutputSchema {
+    LlmOutputSchema {
+        name: "shell_command_verdict".to_string(),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        PermissionAction::Ask.as_str(),
+                        PermissionAction::Deny.as_str(),
+                    ],
+                },
+                "reason": { "type": "string" },
+            },
+            "required": ["action", "reason"],
+            "additionalProperties": false,
+        }),
+        strict: true,
     }
 }
 
@@ -12658,10 +12880,9 @@ fn delegate_advertised_tool() -> AdvertisedTool {
         spec: Arc::new(LlmToolSpec {
             name: DELEGATE_TOOL_NAME.to_string(),
             description: "Delegate broad research to an isolated subagent. \
-                          Use only when the user explicitly asks for non-trivial research, code mapping, or refactoring help — \
+                          Use only when the user explicitly asks for non-trivial research, code mapping, or refactoring — \
                           NOT for greetings, casual replies, or simple questions the parent can answer directly. \
-                          The `prompt` field is required; calling without a concrete instruction will be rejected. \
-                          The parent receives only a structured summary, supporting receipts, and separate spend metrics."
+                          `prompt` is required; the parent receives only a structured summary, supporting receipts, and separate spend metrics."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -12669,7 +12890,7 @@ fn delegate_advertised_tool() -> AdvertisedTool {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Required: a concrete natural-language research instruction for the subagent. Must be present and non-empty."
+                        "description": "Required, non-empty: a concrete research instruction for the subagent."
                     },
                     "scope": {
                         "type": ["string", "null"],
@@ -12838,9 +13059,9 @@ fn explore_advertised_tool() -> AdvertisedTool {
         spec: Arc::new(LlmToolSpec {
             name: EXPLORE_TOOL_NAME.to_string(),
             description: "Ask a cheaper read-only exploration subagent to scan the codebase with Squeezy semantic tools. \
-                          Use only when the user asks a non-trivial codebase question — \
+                          Use only for a non-trivial codebase question — \
                           NOT for greetings, chitchat, or questions the parent can answer directly from context. \
-                          The `prompt` field is required and must contain a concrete codebase question."
+                          `prompt` is required and must contain a concrete codebase question."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -12848,7 +13069,7 @@ fn explore_advertised_tool() -> AdvertisedTool {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Required: a concrete codebase question or task context to investigate. Must be present and non-empty."
+                        "description": "Required, non-empty: a concrete codebase question or task context to investigate."
                     },
                     "scope": {
                         "type": ["string", "null"],

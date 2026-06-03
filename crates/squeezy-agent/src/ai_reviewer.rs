@@ -11,7 +11,9 @@ use squeezy_core::{
     AppConfig, PermissionAction, PermissionCapability, PermissionRequest, PermissionVerdict, Role,
     TranscriptItem, TurnId,
 };
-use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
+use squeezy_llm::{
+    LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest, provider_honors_output_schema,
+};
 use squeezy_skills::{APPROVAL_POLICY_DOC_PATH, bundled_doc};
 use squeezy_telemetry::{TelemetryClient, TelemetryEvent};
 use tokio_util::sync::CancellationToken;
@@ -159,6 +161,8 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         .clone()
         .or_else(|| input.config.resolved_small_fast_model())
         .unwrap_or_else(|| input.config.model.clone());
+    let output_schema =
+        provider_honors_output_schema(input.provider.name(), &model).then(reviewer_output_schema);
     let request = LlmRequest {
         model: Arc::from(model.as_str()),
         instructions: Arc::from(
@@ -174,7 +178,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
-        output_schema: None,
+        output_schema,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
         ..LlmRequest::default()
@@ -586,6 +590,37 @@ fn approx_tokens(value: &str) -> usize {
 struct ReviewerDecision {
     action: PermissionAction,
     reason: String,
+}
+
+/// Strict JSON-schema contract mirroring [`ReviewerDecision`]: the
+/// `action` enum carries the three canonical values
+/// (`PermissionMode::as_str`) the policy doc instructs the model to emit,
+/// and `reason` matches the free-text field. Attached only on providers
+/// that forward `output_schema` ([`provider_honors_output_schema`]) so the
+/// cheap reviewer model returns a schema-valid object instead of fenced or
+/// prose-wrapped JSON that `parse_reviewer_response` rejects and bills a
+/// retry round on — providers that drop the schema keep the loose path.
+fn reviewer_output_schema() -> LlmOutputSchema {
+    LlmOutputSchema {
+        name: "permission_review".to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        PermissionAction::Allow.as_str(),
+                        PermissionAction::Ask.as_str(),
+                        PermissionAction::Deny.as_str(),
+                    ],
+                },
+                "reason": { "type": "string" },
+            },
+            "required": ["action", "reason"],
+            "additionalProperties": false,
+        }),
+        strict: true,
+    }
 }
 
 fn parse_reviewer_response(text: &str) -> Option<ReviewerDecision> {

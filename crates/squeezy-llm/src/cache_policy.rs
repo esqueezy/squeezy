@@ -92,6 +92,39 @@ impl From<Option<String>> for CacheSpec {
     }
 }
 
+impl CacheSpec {
+    /// Build a capability-gated cache hint for a control-plane / helper
+    /// request family that re-sends a large, stable prefix (system + tools +
+    /// growing history) across calls sharing the same `key`.
+    ///
+    /// Returns the requested `{ key, retention }` only when the destination
+    /// `(provider, model)` reports `prompt_caching` in the registry;
+    /// otherwise returns [`CacheSpec::default`] (retention `None`) so
+    /// non-supporting providers are byte-for-byte unchanged and never see a
+    /// cache directive they would reject. Centralizing the decision here keeps
+    /// every agent call site that opts into caching consistent — they pass the
+    /// *intent* (a stable key + desired retention) and the registry gate is
+    /// applied in one place.
+    ///
+    /// Callers must only supply a `key` that is stable across the requests
+    /// meant to share a cache prefix and unique to that family — never one that
+    /// mixes unrelated content, which would poison the provider-side affinity.
+    pub fn for_prefix_reuse(
+        provider: &str,
+        model: &str,
+        key: Option<String>,
+        retention: CacheRetention,
+    ) -> Self {
+        let supported = capabilities_for(provider, model)
+            .is_some_and(|capabilities| capabilities.prompt_caching);
+        if supported && retention != CacheRetention::None {
+            Self { key, retention }
+        } else {
+            Self::default()
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "cache_policy_tests.rs"]
 mod tests;

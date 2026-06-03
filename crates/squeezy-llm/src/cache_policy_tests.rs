@@ -51,6 +51,60 @@ fn request_with_cache(model: &str, cache: CacheSpec) -> LlmRequest {
 }
 
 #[test]
+fn for_prefix_reuse_passes_through_on_caching_capable_model() {
+    // Claude Haiku reports prompt_caching=true in the registry, so a helper
+    // call site that opts into Short retention with a stable key must get the
+    // requested spec back verbatim.
+    let spec = CacheSpec::for_prefix_reuse(
+        "anthropic",
+        "claude-haiku-4-5-20251001",
+        Some("squeezy::sub::session-1::7".to_string()),
+        CacheRetention::Short,
+    );
+    assert_eq!(spec.retention, CacheRetention::Short);
+    assert_eq!(spec.key.as_deref(), Some("squeezy::sub::session-1::7"));
+}
+
+#[test]
+fn for_prefix_reuse_disables_caching_on_non_capable_provider() {
+    // Ollama models carry prompt_caching=false: the helper must collapse to
+    // the disabled default so no marker is ever synthesized for a local model.
+    let spec = CacheSpec::for_prefix_reuse(
+        "ollama",
+        "qwen3-coder",
+        Some("squeezy::sub::session-1::7".to_string()),
+        CacheRetention::Short,
+    );
+    assert_eq!(spec, CacheSpec::default());
+    assert_eq!(spec.retention, CacheRetention::None);
+    assert!(spec.key.is_none());
+}
+
+#[test]
+fn for_prefix_reuse_honors_none_retention_intent() {
+    // Asking for None retention disables caching even on a capable model.
+    let spec = CacheSpec::for_prefix_reuse(
+        "anthropic",
+        "claude-haiku-4-5-20251001",
+        Some("k".to_string()),
+        CacheRetention::None,
+    );
+    assert_eq!(spec, CacheSpec::default());
+}
+
+#[test]
+fn for_prefix_reuse_disables_caching_on_unknown_model() {
+    // Unknown models resolve to the safe prompt_caching=false fallback.
+    let spec = CacheSpec::for_prefix_reuse(
+        "anthropic",
+        "not-a-real-model",
+        Some("k".to_string()),
+        CacheRetention::Long,
+    );
+    assert_eq!(spec, CacheSpec::default());
+}
+
+#[test]
 fn auto_policy_marks_tools_system_and_latest_user_message() {
     let policy = CachePolicy::AUTO;
     assert!(policy.tools);

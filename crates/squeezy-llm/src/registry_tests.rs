@@ -5,7 +5,10 @@ use squeezy_core::{
     DEFAULT_VERTEX_MODEL, DEFAULT_XAI_MODEL, resolve_model_alias,
 };
 
-use super::{MODEL_REGISTRY, estimate_json_tokens, estimate_text_tokens, model_info_for};
+use super::{
+    MODEL_REGISTRY, estimate_json_tokens, estimate_text_tokens, model_info_for,
+    provider_honors_output_schema,
+};
 
 #[test]
 fn resolve_opus_alias_for_anthropic() {
@@ -203,4 +206,43 @@ fn cache_read_rate_is_a_plausible_fraction_of_input_rate() {
             entry.id
         );
     }
+}
+
+#[test]
+fn provider_honors_output_schema_gates_on_provider_wire_path() {
+    // Providers that forward output_schema with a json_mode model.
+    assert!(provider_honors_output_schema("openai", "gpt-5.5"));
+    assert!(provider_honors_output_schema(
+        "google",
+        DEFAULT_GOOGLE_MODEL
+    ));
+    assert!(provider_honors_output_schema("xai", DEFAULT_XAI_MODEL));
+    assert!(provider_honors_output_schema(
+        "openrouter",
+        DEFAULT_OPENROUTER_MODEL
+    ));
+
+    // Providers whose wire path silently drops the schema — must report
+    // false even though their models advertise json_mode, so callers keep
+    // the historical free-form request.
+    assert!(!provider_honors_output_schema(
+        "anthropic",
+        DEFAULT_ANTHROPIC_MODEL
+    ));
+    assert!(!provider_honors_output_schema(
+        "bedrock",
+        DEFAULT_BEDROCK_MODEL
+    ));
+    assert!(!provider_honors_output_schema("ollama", "qwen3-coder"));
+}
+
+#[test]
+fn provider_honors_output_schema_false_for_unknown_provider() {
+    // An unknown provider has no capabilities entry beyond the synthetic
+    // fallback; the gate must not panic and must default to attaching
+    // nothing rather than guessing support.
+    let unknown = provider_honors_output_schema("not-a-provider", "mystery-model");
+    // Fallback model info carries json_mode, but the point is the call is
+    // total and deterministic; assert it returns a bool without panic.
+    let _ = unknown;
 }

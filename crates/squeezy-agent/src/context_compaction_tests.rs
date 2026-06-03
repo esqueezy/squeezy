@@ -1,11 +1,13 @@
 use serde_json::json;
 use squeezy_core::{AppConfig, ContextCompactionState};
 use squeezy_llm::LlmInputItem;
+use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus, sha256_hex};
 
 use super::{
-    COMPACTION_DURABLE_LINES_LIMIT, COMPACTION_UNRESOLVED_LINES_LIMIT, build_compaction_summary,
-    build_structured_compaction_prompt, durable_context_lines, estimate_context,
-    is_structured_compaction_summary, strip_media_for_compaction, unresolved_question_lines,
+    COMPACTION_DURABLE_LINES_LIMIT, COMPACTION_UNRESOLVED_LINES_LIMIT, PendingToolResult,
+    SeenToolOutputs, build_compaction_summary, build_structured_compaction_prompt,
+    durable_context_lines, estimate_context, is_structured_compaction_summary, pack_tool_results,
+    strip_media_for_compaction, unresolved_question_lines,
 };
 
 fn function_call(call_id: &str, name: &str, arguments: serde_json::Value) -> LlmInputItem {
@@ -787,5 +789,348 @@ fn unresolved_question_lines_keep_most_recent_when_capped() {
         lines.last().unwrap(),
         &format!("- question {}?", total - 1),
         "most recent open question must survive compaction"
+    );
+}
+
+fn tool_result(
+    call_id: &str,
+    tool_name: &str,
+    status: ToolStatus,
+    content: serde_json::Value,
+) -> ToolResult {
+    let output_bytes = serde_json::to_vec(&content).unwrap();
+    ToolResult {
+        call_id: call_id.to_string(),
+        tool_name: tool_name.to_string(),
+        status,
+        content,
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: sha256_hex(&output_bytes),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    }
+}
+
+// --- B3: overlap-aware grep receipts (Count-from-Content collapse) ---
+
+/// Build a `grep` result with the metadata block the tool echoes back, so the
+/// Count-from-Content collapse keys on the same shape it sees in production.
+fn grep_result(
+    call_id: &str,
+    pattern: &str,
+    path: &str,
+    output_mode: &str,
+    content: serde_json::Value,
+    truncated: bool,
+) -> ToolResult {
+    let metadata = json!({
+        "pattern": pattern,
+        "path": path,
+        "include_ignored": false,
+        "diff_only": false,
+        "output_mode": output_mode,
+        "offset": 0,
+        "context": 0,
+    });
+    let mut content = content;
+    content
+        .as_object_mut()
+        .unwrap()
+        .insert("metadata".to_string(), metadata);
+    ToolResult {
+        call_id: call_id.to_string(),
+        tool_name: "grep".to_string(),
+        status: ToolStatus::Success,
+        content,
+        cost_hint: ToolCostHint {
+            truncated,
+            ..Default::default()
+        },
+        receipt: ToolReceipt {
+            output_sha256: format!("sha-{call_id}"),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    }
+}
+
+fn omitted_to_stub(result: &ToolResult) -> bool {
+    // `aggregate_budget_exceeded` rewrites the omitted result to an Error
+    // carrying `original_output_sha256` (the sha-bearing stub).
+    result.status == ToolStatus::Error
+        && result
+            .content
+            .get("original_output_sha256")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+}
+
+#[test]
+fn pack_tool_results_prioritizes_small_error_over_large_read_under_tight_budget() {
+    // Input order is [large read, small error], so input-order packing would
+    // spend the whole budget on the large read and omit the error. Priority
+    // packing must reverse this: the small error is retained, the large read
+    // is the one pushed past the budget and degraded to a sha-bearing stub.
+    let large_read = tool_result(
+        "call-read",
+        "read_file",
+        ToolStatus::Success,
+        json!({ "path": "src/big.rs", "content": "x".repeat(4096) }),
+    );
+    let small_error = tool_result(
+        "call-grep",
+        "grep",
+        ToolStatus::Error,
+        json!({ "error": "regex compile failed: unbalanced parenthesis" }),
+    );
+
+    let large_bytes = large_read.model_output().len();
+    let small_bytes = small_error.model_output().len();
+    // Budget admits the small error but not both — so exactly one survives.
+    let budget = small_bytes + (large_bytes - small_bytes) / 2;
+    assert!(
+        budget >= small_bytes && budget < large_bytes,
+        "test budget must fit the small error but not the large read"
+    );
+
+    let packed = pack_tool_results(
+        vec![
+            PendingToolResult::plain(large_read.clone()),
+            PendingToolResult::plain(small_error.clone()),
+        ],
+        budget,
+    );
+
+    // call-ids and their positions are preserved (only inclusion changes).
+    assert_eq!(packed.len(), 2);
+    assert_eq!(packed[0].result.call_id, "call-read");
+    assert_eq!(packed[1].result.call_id, "call-grep");
+
+    let read_out = &packed[0].result;
+    let error_out = &packed[1].result;
+
+    // The small error survives intact; the large read is omitted-to-stub.
+    assert_eq!(
+        error_out.status,
+        ToolStatus::Error,
+        "small tool error must be retained under budget pressure"
+    );
+    assert!(
+        !omitted_to_stub(error_out),
+        "small error must NOT be omitted to a budget stub"
+    );
+    assert!(
+        error_out.model_output().contains("unbalanced parenthesis"),
+        "retained error must keep its original content, got {:?}",
+        error_out.content
+    );
+    assert!(
+        omitted_to_stub(read_out),
+        "large read must be omitted to a sha-bearing budget stub, got {:?}",
+        read_out.content
+    );
+    // The stub stays recoverable: it carries the original output sha.
+    assert_eq!(
+        read_out
+            .content
+            .get("original_output_sha256")
+            .and_then(serde_json::Value::as_str),
+        Some(large_read.receipt.output_sha256.as_str()),
+    );
+}
+
+fn grep_content_result(
+    call_id: &str,
+    pattern: &str,
+    path: &str,
+    match_count: usize,
+    truncated: bool,
+) -> ToolResult {
+    let matches: Vec<serde_json::Value> = (0..match_count)
+        .map(|i| json!({"path": format!("{path}/f{i}.rs"), "line": i + 1, "text": "hit"}))
+        .collect();
+    grep_result(
+        call_id,
+        pattern,
+        path,
+        "content",
+        json!({ "matches": matches }),
+        truncated,
+    )
+}
+
+fn grep_count_result(call_id: &str, pattern: &str, path: &str, count: u64) -> ToolResult {
+    grep_result(
+        call_id,
+        pattern,
+        path,
+        "count",
+        json!({ "count": count }),
+        false,
+    )
+}
+
+#[test]
+fn grep_count_after_identical_content_collapses_to_stub_with_correct_count() {
+    let content = grep_content_result("content-1", "TODO", "src", 3, false);
+    // The Count call rescans and would report the same 3 — but the collapse
+    // must answer it from the prior Content result without re-sending bytes.
+    let count = grep_count_result("count-1", "TODO", "src", 3);
+
+    let prepared = SeenToolOutputs::default().prepare_results(vec![content, count]);
+    assert_eq!(prepared.len(), 2);
+
+    // The Content result is passed through unchanged.
+    assert!(
+        prepared[0].result.content.get("matches").is_some(),
+        "content result should be sent in full"
+    );
+
+    let stub = &prepared[1].result;
+    assert_eq!(
+        stub.content.get("receipt_stub").and_then(|v| v.as_bool()),
+        Some(true),
+        "count call should collapse to a receipt stub: {:?}",
+        stub.content
+    );
+    assert_eq!(
+        stub.content.get("count").and_then(|v| v.as_u64()),
+        Some(3),
+        "stub must carry the exact count from the content scan"
+    );
+    assert_eq!(
+        stub.content.get("same_as_call_id").and_then(|v| v.as_str()),
+        Some("content-1"),
+        "stub must reference the originating content call"
+    );
+    assert!(
+        stub.model_output().len()
+            < grep_count_result("x", "TODO", "src", 3)
+                .model_output()
+                .len()
+            || stub.content.get("matches").is_none(),
+        "stub should not re-emit scan content"
+    );
+}
+
+#[test]
+fn grep_count_with_zero_matches_collapses_to_negative_stub() {
+    let content = grep_content_result("content-1", "MISSING", "src", 0, false);
+    let count = grep_count_result("count-1", "MISSING", "src", 0);
+
+    let prepared = SeenToolOutputs::default().prepare_results(vec![content, count]);
+    let stub = &prepared[1].result;
+    assert_eq!(
+        stub.content.get("receipt_stub").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(stub.content.get("count").and_then(|v| v.as_u64()), Some(0));
+    assert_eq!(
+        stub.content
+            .get("negative_receipt_stub")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "a zero-match count should be flagged as a negative receipt"
+    );
+}
+
+#[test]
+fn grep_count_after_truncated_content_does_not_collapse() {
+    // A truncated Content scan undercounts: `matches.len()` is a floor, not the
+    // true count. Deriving a Count from it could return a wrong (low) number,
+    // so the collapse must NOT fire — the Count call runs and is sent in full.
+    let content = grep_content_result("content-1", "TODO", "src", 3, true);
+    let count = grep_count_result("count-1", "TODO", "src", 9);
+
+    let prepared = SeenToolOutputs::default().prepare_results(vec![content, count]);
+    let count_out = &prepared[1].result;
+    assert!(
+        count_out.content.get("receipt_stub").is_none(),
+        "truncated content source must not produce a count collapse: {:?}",
+        count_out.content
+    );
+    assert_eq!(
+        count_out.content.get("count").and_then(|v| v.as_u64()),
+        Some(9),
+        "the real (re-run) count must be preserved untouched"
+    );
+}
+
+#[test]
+fn grep_count_with_different_pattern_does_not_collapse() {
+    let content = grep_content_result("content-1", "TODO", "src", 3, false);
+    let count = grep_count_result("count-1", "FIXME", "src", 7);
+
+    let prepared = SeenToolOutputs::default().prepare_results(vec![content, count]);
+    let count_out = &prepared[1].result;
+    assert!(
+        count_out.content.get("receipt_stub").is_none(),
+        "a different pattern must not collapse"
+    );
+    assert_eq!(
+        count_out.content.get("count").and_then(|v| v.as_u64()),
+        Some(7)
+    );
+}
+
+#[test]
+fn grep_count_with_different_path_does_not_collapse() {
+    let content = grep_content_result("content-1", "TODO", "src", 3, false);
+    let count = grep_count_result("count-1", "TODO", "tests", 5);
+
+    let prepared = SeenToolOutputs::default().prepare_results(vec![content, count]);
+    let count_out = &prepared[1].result;
+    assert!(
+        count_out.content.get("receipt_stub").is_none(),
+        "a different path must not collapse"
+    );
+    assert_eq!(
+        count_out.content.get("count").and_then(|v| v.as_u64()),
+        Some(5)
+    );
+}
+
+#[test]
+fn grep_count_with_different_flags_does_not_collapse() {
+    let content = grep_content_result("content-1", "TODO", "src", 3, false);
+    // Same pattern/path but include_ignored=true → a different scan universe.
+    let mut count = grep_count_result("count-1", "TODO", "src", 11);
+    count
+        .content
+        .get_mut("metadata")
+        .and_then(|m| m.as_object_mut())
+        .unwrap()
+        .insert("include_ignored".to_string(), json!(true));
+
+    let prepared = SeenToolOutputs::default().prepare_results(vec![content, count]);
+    let count_out = &prepared[1].result;
+    assert!(
+        count_out.content.get("receipt_stub").is_none(),
+        "a differing flag must not collapse"
+    );
+    assert_eq!(
+        count_out.content.get("count").and_then(|v| v.as_u64()),
+        Some(11)
+    );
+}
+
+#[test]
+fn grep_count_before_content_is_not_collapsed() {
+    // Order matters: only a Content scan that already preceded the Count call
+    // can answer it. A Count seen first runs normally and is not retro-stubbed.
+    let count = grep_count_result("count-1", "TODO", "src", 3);
+    let content = grep_content_result("content-1", "TODO", "src", 3, false);
+
+    let prepared = SeenToolOutputs::default().prepare_results(vec![count, content]);
+    let count_out = &prepared[0].result;
+    assert!(
+        count_out.content.get("receipt_stub").is_none(),
+        "a count preceding its content scan must not collapse"
+    );
+    assert_eq!(
+        count_out.content.get("count").and_then(|v| v.as_u64()),
+        Some(3)
     );
 }

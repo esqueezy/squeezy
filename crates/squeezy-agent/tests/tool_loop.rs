@@ -17,7 +17,9 @@ use squeezy_core::{
     TurnId,
 };
 use squeezy_hooks::{HookContext, HookEvent, HookHandler, HookRegistry, HookResult};
-use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
+use squeezy_llm::{
+    CacheRetention, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+};
 use squeezy_store::SqueezyStore;
 use squeezy_tools::sha256_hex;
 use tokio_util::sync::CancellationToken;
@@ -627,6 +629,158 @@ fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs() {
 
         let _ = fs::remove_dir_all(root);
     });
+}
+
+/// Drive a one-tool explore subagent end-to-end and return the captured
+/// provider requests. `provider_name` selects which registry capability row
+/// the agent looks up; `subagent_model` is the resolved explore model. The
+/// scripted queue mirrors `explore_subagent_uses_cheap_model_*`: parent tool
+/// call → subagent tool round → subagent final brief → parent final.
+fn run_explore_subagent_capturing_requests(
+    workspace: &str,
+    provider_name: &'static str,
+    subagent_model: &str,
+) -> Vec<LlmRequest> {
+    let root = temp_workspace(workspace);
+    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::named(
+        provider_name,
+        vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "explore_call".to_string(),
+                    name: "explore".to_string(),
+                    arguments: serde_json::json!({
+                        "prompt": "Find the needle entrypoint",
+                        "scope": "src.rs",
+                        "thoroughness": "quick"
+                    }),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "sub_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "src.rs"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("sub_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta(
+                    "Brief: src.rs defines fn needle().".to_string(),
+                )),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("sub_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("ready".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ],
+    ));
+    let mut config = config_for(root.clone());
+    config.model = "expensive-main".to_string();
+    config.subagents.explore_model = Some(subagent_model.to_string());
+    let agent = Agent::new(config, provider.clone());
+
+    run_high_stack_test(async move {
+        drain_turn(agent.start_turn("research first".to_string(), CancellationToken::new())).await;
+    });
+
+    let requests = provider.requests();
+    let _ = fs::remove_dir_all(root);
+    requests
+}
+
+#[test]
+fn explore_subagent_request_carries_short_cache_on_caching_capable_provider() {
+    // The subagent round loop re-sends a large stable prefix (instructions +
+    // tools + growing history), so on a provider/model the registry marks
+    // `prompt_caching=true` the request must opt into `Short` retention with a
+    // stable per-invocation affinity key. requests[1]/requests[2] are the two
+    // subagent rounds; both share the same key so the provider keeps the
+    // prefix warm across the loop.
+    let requests = run_explore_subagent_capturing_requests(
+        "explore_subagent_cache_capable",
+        "anthropic",
+        "claude-haiku-4-5-20251001",
+    );
+    assert_eq!(requests.len(), 4);
+    assert_eq!(&*requests[1].model, "claude-haiku-4-5-20251001");
+
+    let round_one = &requests[1].cache;
+    let round_two = &requests[2].cache;
+    assert_eq!(
+        round_one.retention,
+        CacheRetention::Short,
+        "subagent round must opt into Short retention on a caching-capable model"
+    );
+    let key = round_one
+        .key
+        .as_deref()
+        .expect("subagent cache key must be set when a session log is attached");
+    assert!(
+        key.starts_with("squeezy::sub::"),
+        "subagent cache key must use the dedicated sub:: namespace, got {key}"
+    );
+    assert_eq!(
+        round_one.key, round_two.key,
+        "every round of one subagent invocation must share the cache key so the prefix stays warm"
+    );
+    assert_eq!(round_two.retention, CacheRetention::Short);
+}
+
+#[test]
+fn explore_subagent_request_disables_cache_on_non_capable_provider() {
+    // Ollama / local models carry `prompt_caching=false`. The same call site
+    // must leave the cache disabled (retention None, no key) so non-supporting
+    // providers see byte-identical requests to before this change.
+    let requests = run_explore_subagent_capturing_requests(
+        "explore_subagent_cache_noncapable",
+        "ollama",
+        "qwen3-coder",
+    );
+    assert_eq!(requests.len(), 4);
+    assert_eq!(&*requests[1].model, "qwen3-coder");
+    assert_eq!(
+        requests[1].cache.retention,
+        CacheRetention::None,
+        "non-capable provider must not opt into prompt caching"
+    );
+    assert!(
+        requests[1].cache.key.is_none(),
+        "non-capable provider must not carry a cache affinity key"
+    );
+    // The effective retention (which would lift a legacy cache_key to Short)
+    // must also be None — nothing should synthesize a directive downstream.
+    assert_eq!(
+        requests[1].effective_cache_retention(),
+        CacheRetention::None
+    );
 }
 
 #[tokio::test]

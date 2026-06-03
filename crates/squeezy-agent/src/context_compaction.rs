@@ -1448,11 +1448,167 @@ impl SeenToolOutput {
     }
 }
 
+/// Normalized identity of a `grep` query, derived from the `metadata` block
+/// the tool echoes back into its own result. Two grep calls share this key iff
+/// they would scan the same files with the same regex and the same window
+/// (`offset`/`context`), differing only in `output_mode`. The key deliberately
+/// requires a byte-for-byte `pattern` match and exact flag equality: any
+/// normalization ambiguity (regex equivalence, flag aliasing) is treated as a
+/// distinct query so a Count is never derived from a non-identical Content
+/// scan. `context` is part of the key even though it does not change the match
+/// count, keeping the equivalence trivially provable rather than relying on a
+/// subtle invariant.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GrepQueryKey {
+    pattern: String,
+    path: String,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    include_ignored: bool,
+    diff_only: bool,
+    offset: u64,
+    context: u64,
+}
+
+impl GrepQueryKey {
+    /// Reconstruct the query identity from the `metadata` block of a grep
+    /// result. Returns `None` if any load-bearing field is missing or has an
+    /// unexpected type, so an unparseable result is conservatively treated as a
+    /// distinct query (never matched, never indexed).
+    fn from_grep_result(result: &ToolResult) -> Option<Self> {
+        if result.tool_name != "grep" {
+            return None;
+        }
+        let metadata = result.content.get("metadata")?.as_object()?;
+        let string_list = |value: Option<&Value>| -> Option<Vec<String>> {
+            match value {
+                None => Some(Vec::new()),
+                Some(Value::Array(items)) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items {
+                        out.push(item.as_str()?.to_string());
+                    }
+                    // Sort so glob-list ordering differences don't split the
+                    // key; the include/exclude sets are order-independent in
+                    // `build_include_set`.
+                    out.sort();
+                    Some(out)
+                }
+                Some(_) => None,
+            }
+        };
+        Some(Self {
+            pattern: metadata.get("pattern")?.as_str()?.to_string(),
+            path: metadata.get("path")?.as_str()?.to_string(),
+            include: string_list(metadata.get("include"))?,
+            exclude: string_list(metadata.get("exclude"))?,
+            include_ignored: metadata.get("include_ignored")?.as_bool()?,
+            diff_only: metadata.get("diff_only")?.as_bool()?,
+            offset: metadata.get("offset")?.as_u64()?,
+            context: metadata.get("context")?.as_u64()?,
+        })
+    }
+}
+
+/// A non-truncated `grep` Content result remembered so a later Count call for
+/// the identical query can be answered from its match count instead of
+/// re-running + re-sending the scan. Only complete (non-truncated) Content
+/// scans are recorded — a capped scan undercounts, so its `matches.len()` is
+/// not a safe count and is never indexed.
+#[derive(Debug, Clone)]
+struct GrepContentCount {
+    call_id: String,
+    count: u64,
+    stable_output_sha256: String,
+    content_sha256: Option<String>,
+    model_output_bytes: usize,
+    /// `true` when the source Content result was produced in the current round
+    /// (vs. carried over). Mirrors `RoundSeenToolOutput::current_round` so the
+    /// pack stage can drop the stub if its referent is omitted this round.
+    current_round: bool,
+}
+
+/// Identify a grep result's `output_mode` from the metadata it echoes back.
+fn grep_output_mode(result: &ToolResult) -> Option<&str> {
+    result
+        .content
+        .get("metadata")
+        .and_then(|metadata| metadata.get("output_mode"))
+        .and_then(Value::as_str)
+}
+
+/// Number of Content-mode matches actually returned, used as the derived count
+/// for a Count-from-Content collapse. Returns `None` unless the result is an
+/// untruncated grep Content scan whose `matches` array is well-formed — the
+/// HARD invariant that a truncated source never yields a count is enforced
+/// here, not at the call site.
+fn grep_content_match_count(result: &ToolResult) -> Option<u64> {
+    if result.tool_name != "grep" || grep_output_mode(result)? != "content" {
+        return None;
+    }
+    if result.cost_hint.truncated {
+        return None;
+    }
+    let matches = result.content.get("matches")?.as_array()?;
+    Some(matches.len() as u64)
+}
+
+/// Build a receipt stub that answers a `grep` Count call from a prior, identical
+/// Content scan. The derived `count` is the exact number of matches the Content
+/// result returned (safe only because the source was not truncated), and the
+/// stub references the originating call so the model can recover the full
+/// content if needed.
+fn grep_count_from_content_stub(result: ToolResult, source: &GrepContentCount) -> ToolResult {
+    let content = json!({
+        "receipt_stub": true,
+        "negative_receipt_stub": source.count == 0,
+        "message": "count derived from an identical grep content result already sent to the model in this turn",
+        "output_mode": "count",
+        "count": source.count,
+        "same_as_call_id": &source.call_id,
+        "same_as_tool_name": "grep",
+        "original_output_sha256": &source.stable_output_sha256,
+        "original_content_sha256": &source.content_sha256,
+        "original_model_output_bytes": source.model_output_bytes,
+    });
+    let output_bytes = serde_json::to_vec(&content).unwrap_or_default();
+    let mut cost_hint = result.cost_hint;
+    cost_hint.output_bytes = output_bytes.len() as u64;
+    cost_hint.truncated = true;
+
+    ToolResult {
+        call_id: result.call_id,
+        tool_name: result.tool_name,
+        status: result.status,
+        content,
+        cost_hint,
+        receipt: ToolReceipt {
+            output_sha256: sha256_hex(&output_bytes),
+            content_sha256: result.receipt.content_sha256,
+        },
+        spill_model_output: None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PendingToolResult {
     pub(crate) result: ToolResult,
     remember: Option<SeenToolOutput>,
     same_as_current_call_id: Option<String>,
+}
+
+#[cfg(test)]
+impl PendingToolResult {
+    /// Plain (non-deduped) pending result for packing tests: no current-round
+    /// dedup reference and nothing to remember, so packing depends only on
+    /// `result`'s status/size.
+    pub(crate) fn plain(result: ToolResult) -> Self {
+        Self {
+            result,
+            remember: None,
+            same_as_current_call_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1503,9 +1659,15 @@ impl SeenToolOutputs {
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        // Within-round index of non-truncated grep Content scans, used to
+        // answer a later identical Count call from the prior result's match
+        // count. Scoped to the current round (not store-backed): the count and
+        // truncation flag needed for a safe collapse only exist on a result
+        // physically present this round, not in the sha-keyed receipt store.
+        let mut grep_content: BTreeMap<GrepQueryKey, GrepContentCount> = BTreeMap::new();
 
         for result in results {
-            prepared.push(Self::prepare_result(result, &mut seen));
+            prepared.push(Self::prepare_result(result, &mut seen, &mut grep_content));
         }
         prepared
     }
@@ -1513,6 +1675,7 @@ impl SeenToolOutputs {
     fn prepare_result(
         result: ToolResult,
         seen: &mut BTreeMap<(String, String), RoundSeenToolOutput>,
+        grep_content: &mut BTreeMap<GrepQueryKey, GrepContentCount>,
     ) -> PendingToolResult {
         if !is_receipt_stub_candidate(&result) {
             return PendingToolResult {
@@ -1531,7 +1694,41 @@ impl SeenToolOutputs {
             };
         }
 
+        // Count-from-Content collapse (idea B3, Count-only subset): a grep
+        // Count call whose query exactly matches a prior, non-truncated Content
+        // scan is answered from that scan's match count instead of re-running
+        // and re-sending. This sits after the sha-dedup check (a Count output
+        // never shares a sha with a Content output, so the two paths can't
+        // collide) and is intentionally narrow — Content→Content and
+        // Content→narrower-path overlaps are left untouched.
+        if grep_output_mode(&result) == Some("count")
+            && let Some(query_key) = GrepQueryKey::from_grep_result(&result)
+            && let Some(source) = grep_content.get(&query_key)
+        {
+            return PendingToolResult {
+                result: grep_count_from_content_stub(result, source),
+                remember: None,
+                same_as_current_call_id: source.current_round.then(|| source.call_id.clone()),
+            };
+        }
+
         let output = SeenToolOutput::from_result(&result);
+        // Remember this scan for a later Count collapse only when it is a
+        // complete (non-truncated) Content result whose match array is
+        // well-formed — `grep_content_match_count` enforces the
+        // never-derive-from-truncated invariant.
+        if let Some(count) = grep_content_match_count(&result)
+            && let Some(query_key) = GrepQueryKey::from_grep_result(&result)
+        {
+            grep_content.entry(query_key).or_insert(GrepContentCount {
+                call_id: output.call_id.clone(),
+                count,
+                stable_output_sha256: output.stable_output_sha256.clone(),
+                content_sha256: output.content_sha256.clone(),
+                model_output_bytes: output.model_output_bytes,
+                current_round: true,
+            });
+        }
         seen.insert(
             key,
             RoundSeenToolOutput {
@@ -1712,6 +1909,50 @@ fn is_negative_receipt_result(result: &ToolResult) -> bool {
     }
 }
 
+/// Priority tier for [`pack_tool_results`]. Lower sorts earlier, so the
+/// most signal-dense / least-recoverable results are considered for
+/// inclusion before the aggregate budget is spent. Within a tier the
+/// caller breaks ties by ascending model-output size and then original
+/// order, so under budget pressure tiny critical results survive and only
+/// large bulky reads get pushed past the budget (and those already degrade
+/// to sha-bearing stubs, so the bytes remain recoverable).
+fn tool_result_pack_priority(
+    pending: &PendingToolResult,
+    referenced_originals: &BTreeSet<String>,
+) -> u8 {
+    // Originals that another result in this same batch points at via
+    // `same_as_current_call_id` must be packed before that dependent stub,
+    // otherwise the stub is rewritten to an omitted-reference error (the
+    // referent isn't yet in `visible_current_call_ids`). Pin them to the
+    // front so reordering can never break that visibility invariant.
+    if referenced_originals.contains(&pending.result.call_id) {
+        return 0;
+    }
+    // Errors / failures first: usually tiny, never recoverable from a
+    // stub, and a dropped tool error silently strands the model.
+    if pending.result.status != ToolStatus::Success {
+        return 1;
+    }
+    // Receipt-stubs next: already compacted to a few hundred bytes, so
+    // keeping them is near-free and preserves the dedup references.
+    if is_packed_receipt_stub(&pending.result) {
+        return 2;
+    }
+    // Everything else ranks by size below, so small high-signal outputs
+    // land ahead of large bulky reads.
+    3
+}
+
+/// True when `result` is already a compacted receipt stub (cross-round
+/// dedup or negative receipt). These are tiny and cheap to retain.
+fn is_packed_receipt_stub(result: &ToolResult) -> bool {
+    result
+        .content
+        .get("receipt_stub")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 pub(crate) fn pack_tool_results(
     results: Vec<PendingToolResult>,
     budget_bytes: usize,
@@ -1720,11 +1961,32 @@ pub(crate) fn pack_tool_results(
         return results;
     }
 
+    // Consider results for inclusion in signal-priority order before
+    // applying the (unchanged) aggregate budget, so small high-signal
+    // results (errors, receipt stubs, tiny reads) win the budget over large
+    // bulky reads under pressure. The budget accounting, omission, and stub
+    // behavior are identical to input-order packing — and the *returned*
+    // order is restored to input order at the end, since downstream callers
+    // pair results with their `ToolCall`s positionally. The sort is stable
+    // and the size tie-break is deterministic, so identical inputs always
+    // pack identically.
+    let referenced_originals: BTreeSet<String> = results
+        .iter()
+        .filter_map(|pending| pending.same_as_current_call_id.clone())
+        .collect();
+    let mut ordered: Vec<(usize, PendingToolResult)> = results.into_iter().enumerate().collect();
+    ordered.sort_by_key(|(_, pending)| {
+        (
+            tool_result_pack_priority(pending, &referenced_originals),
+            pending.result.model_output().len(),
+        )
+    });
+
     let mut used = 0usize;
     let mut visible_current_call_ids = BTreeSet::new();
-    results
+    let mut packed: Vec<(usize, PendingToolResult)> = ordered
         .into_iter()
-        .map(|mut pending| {
+        .map(|(idx, mut pending)| {
             if pending
                 .same_as_current_call_id
                 .as_ref()
@@ -1741,20 +2003,27 @@ pub(crate) fn pack_tool_results(
                 if pending.remember.is_some() {
                     visible_current_call_ids.insert(pending.result.call_id.clone());
                 }
-                pending
+                (idx, pending)
             } else {
                 let compact = pending
                     .result
                     .aggregate_budget_exceeded(budget_bytes, bytes);
                 used = used.saturating_add(compact.model_output().len());
-                PendingToolResult {
-                    result: compact,
-                    remember: None,
-                    same_as_current_call_id: None,
-                }
+                (
+                    idx,
+                    PendingToolResult {
+                        result: compact,
+                        remember: None,
+                        same_as_current_call_id: None,
+                    },
+                )
             }
         })
-        .collect()
+        .collect();
+
+    // Restore input order: only inclusion decisions depend on priority.
+    packed.sort_by_key(|(idx, _)| *idx);
+    packed.into_iter().map(|(_, pending)| pending).collect()
 }
 
 fn receipt_stub_reference_omitted(result: ToolResult) -> ToolResult {
