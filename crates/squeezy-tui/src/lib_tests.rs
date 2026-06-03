@@ -12838,3 +12838,49 @@ async fn config_and_options_alias_open_the_same_screen() {
         "/config and /options must land on the same starting section"
     );
 }
+
+#[test]
+fn rail_head_spans_are_four_cells() {
+    use rail::RailMarker::*;
+    for marker in [Settled, Queued, Plan, Ok, Fail, Warn, Live("✦".to_string())] {
+        let cells: usize = rail::head_spans(&marker, false)
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert_eq!(cells, 4, "{marker:?} head must be 4 cells wide");
+    }
+}
+
+#[test]
+fn rail_apply_gutter_is_noop_on_empty_block() {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    rail::apply_gutter(&mut lines, rail::RailMarker::Ok, false);
+    assert!(
+        lines.is_empty(),
+        "an empty block must leave no orphan connector"
+    );
+}
+
+#[test]
+fn rail_apply_gutter_heads_first_line_connects_the_rest() {
+    let mut lines = vec![
+        Line::from(vec![Span::raw("  "), Span::raw("header")]),
+        Line::from(vec![Span::raw("  "), Span::raw("body")]),
+    ];
+    rail::apply_gutter(&mut lines, rail::RailMarker::Ok, false);
+    // Header line: ├─ elbow + ✓ marker replace the leading margin.
+    assert_eq!(lines[0].spans[0].content.as_ref(), "├─");
+    assert_eq!(lines[0].spans[1].content.as_ref(), "✓ ");
+    assert_eq!(lines[0].spans[2].content.as_ref(), "header");
+    // Continuation line: dim connector replaces the margin.
+    assert_eq!(lines[1].spans[0].content.as_ref(), "│   ");
+    assert_eq!(lines[1].spans[1].content.as_ref(), "body");
+}
+
+#[test]
+fn rail_apply_gutter_last_node_uses_the_close_elbow() {
+    let mut lines = vec![Line::from(vec![Span::raw("  "), Span::raw("x")])];
+    rail::apply_gutter(&mut lines, rail::RailMarker::Settled, true);
+    assert_eq!(lines[0].spans[0].content.as_ref(), "╰─");
+    assert_eq!(lines[0].spans[1].content.as_ref(), "◦ ");
+}

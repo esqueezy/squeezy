@@ -8800,6 +8800,99 @@ fn detail_line(selected: bool, color: Color, content: impl Into<String>) -> Line
     ])
 }
 
+/// Quiet Rail gutter primitives — the tree-rail prefix (`├─◦`, `╰─` for the
+/// last node, `│` connectors) applied to an entry's already-built lines. Wired
+/// into the live work cell and the transcript in the following rail increments;
+/// until then these are dormant and exercised only by their unit tests.
+#[allow(dead_code)]
+pub(crate) mod rail {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+
+    /// A node's state on the Quiet Rail. The marker is dim chrome except where
+    /// state carries meaning — results, a plan, and the live agent get colour.
+    /// The moon set stays the prompt/header identity and never appears here.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum RailMarker {
+        Settled,
+        Queued,
+        Plan,
+        Ok,
+        Fail,
+        Warn,
+        Live(String),
+    }
+
+    impl RailMarker {
+        fn glyph_and_color(&self) -> (&str, Color) {
+            match self {
+                RailMarker::Settled => ("◦", crate::render::theme::muted()),
+                RailMarker::Queued => ("◌", crate::render::theme::quiet()),
+                RailMarker::Plan => ("◇", crate::render::theme::accent()),
+                RailMarker::Ok => ("✓", crate::render::theme::green()),
+                RailMarker::Fail => ("✖", crate::render::theme::red()),
+                RailMarker::Warn => ("⚠", crate::render::theme::red()),
+                RailMarker::Live(glyph) => (glyph.as_str(), crate::render::theme::accent()),
+            }
+        }
+    }
+
+    /// Dim style for the rail's structural connectors (`│ ├ ╰ ─`).
+    fn chrome_style() -> Style {
+        Style::default().fg(crate::render::theme::quiet())
+    }
+
+    /// The two spans opening a node's header line: the tee/close elbow (dim) and
+    /// the state marker (coloured). Four display cells total, e.g. `├─◦ `, so the
+    /// gutter is column-stable and wrap math stays predictable.
+    pub(crate) fn head_spans(marker: &RailMarker, is_last: bool) -> Vec<Span<'static>> {
+        let elbow = if is_last { "╰─" } else { "├─" };
+        let (glyph, color) = marker.glyph_and_color();
+        vec![
+            Span::styled(elbow.to_string(), chrome_style()),
+            Span::styled(
+                format!("{glyph} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ]
+    }
+
+    /// The body/continuation prefix that keeps a node's wrapped lines aligned
+    /// under its header content: a single dim connector, four cells (`│   `).
+    pub(crate) fn body_span() -> Span<'static> {
+        Span::styled("│   ".to_string(), chrome_style())
+    }
+
+    /// A standalone connector row drawn on the gutter between rail nodes.
+    pub(crate) fn connector_line() -> Line<'static> {
+        Line::from(Span::styled("│".to_string(), chrome_style()))
+    }
+
+    /// Rewrite an entry's already-built lines onto the rail gutter: the first
+    /// line gets the node's tee + marker, every following line gets the dim
+    /// connector. Replaces each line's leading two-cell margin span. No-op on an
+    /// empty block, so a hidden entry (e.g. reasoning off) never leaves an
+    /// orphan connector on the rail.
+    pub(crate) fn apply_gutter(lines: &mut [Line<'static>], marker: RailMarker, is_last: bool) {
+        let Some((first, rest)) = lines.split_first_mut() else {
+            return;
+        };
+        splice_prefix(first, head_spans(&marker, is_last));
+        for line in rest {
+            splice_prefix(line, vec![body_span()]);
+        }
+    }
+
+    /// Replace a line's leading margin span with the rail prefix spans.
+    fn splice_prefix(line: &mut Line<'static>, prefix: Vec<Span<'static>>) {
+        if line.spans.is_empty() {
+            line.spans = prefix;
+        } else {
+            line.spans.splice(0..1, prefix);
+        }
+    }
+}
+
 fn action_text_lines_styled(
     selected: bool,
     label: &'static str,
