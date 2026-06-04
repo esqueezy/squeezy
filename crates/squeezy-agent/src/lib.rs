@@ -3843,6 +3843,7 @@ impl Agent {
                             session_mode: session_mode.clone(),
                             subagents: subagents.clone(),
                             hooks: hooks.clone(),
+                            tx: tx.clone(),
                         },
                     )
                     .await;
@@ -4157,6 +4158,7 @@ struct HelpResolutionDeps {
     session_mode: Arc<AtomicU8>,
     subagents: SubagentRegistry,
     hooks: Option<Arc<HookRegistry>>,
+    tx: mpsc::Sender<AgentEvent>,
 }
 
 /// Scan `body` for inline `docs/external/<name>.md` path citations that the
@@ -4215,7 +4217,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
         config: &deps.config,
         telemetry: deps.telemetry.clone(),
         redactor: deps.redactor.clone(),
-        tx: mpsc::channel(1).0,
+        tx: deps.tx.clone(),
         cancel: deps.cancel.clone(),
         approval_ids: deps.approval_ids.clone(),
         session_rules: deps.session_rules.clone(),
@@ -10284,7 +10286,7 @@ fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> Strin
             format!("{base}\n\nThoroughness: {thoroughness}.")
         }
         SubagentKind::DocHelp => {
-            "You are Squeezy's hidden documentation subagent. Answer the user's Squeezy help question using ONLY the inlined bundled doc corpus and the inlined redacted config snapshot provided in the user prompt. You have no tools and must not request any; the corpus is already in your context. Cite specific bundled doc paths (e.g., `docs/external/PROVIDERS.md`) and relevant config sections (e.g., `[model]`) inline in your answer. If the inlined docs do not cover the question, say so explicitly and point the user to https://squeezyagent.com/docs/ and https://github.com/esqueezy/squeezy rather than guessing. Do not mention internal agent mechanics, do not invent file paths beyond the inlined corpus, and do not ask the user follow-up questions.".to_string()
+            "You are Squeezy's doc-help subagent. Answer the user's Squeezy help question using ONLY the inlined bundled doc corpus and config snapshot in the user prompt. No tools available; the corpus is already in context.\n\nFormat rules:\n- Answer in 100–200 words maximum (concise by default; a follow-up question can get more detail).\n- Use bullet points for step-by-step procedures.\n- Do not dump config TOML unless the question is specifically about configuration values.\n- Cite bundled doc paths inline using the PATH labels (e.g. `docs/external/PROVIDERS.md`).\n- If the inlined corpus does not cover the question, say exactly: \"Not covered in local docs.\" then point to https://squeezyagent.com/docs/ and suggest a related `/help <topic>` if one exists.\n- Do not mention internal agent mechanics, do not invent file paths, do not ask follow-up questions.".to_string()
         }
         SubagentKind::Plan => {
             let base = role_config(SubagentRole::Planner).instructions;
