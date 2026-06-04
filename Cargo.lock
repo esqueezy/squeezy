@@ -3222,6 +3222,7 @@ dependencies = [
  "squeezy-rank",
  "squeezy-skills",
  "squeezy-store",
+ "squeezy-telemetry",
  "squeezy-vcs",
  "squeezy-workspace",
  "tokio",

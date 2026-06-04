@@ -52,7 +52,10 @@ use squeezy_core::{
 use squeezy_llm::{LlmInputItem, LlmProvider};
 use squeezy_skills::PromptTemplateCatalog;
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
-use squeezy_telemetry::PreparedFeedback;
+use squeezy_telemetry::{
+    ConfigApplyTier, ConfigChangeKind, ConfigChangeReport, ConfigScopeKind, PreparedFeedback,
+    SlashAliasKind, SlashArgShape, SlashOutcome, SlashSurface, StartupRoute,
+};
 use squeezy_tools::{
     McpElicitationKind, McpElicitationRequest, McpElicitationResponse, McpServerStatus,
     McpStatusSnapshot, ToolCall, ToolResult, ToolStatus,
@@ -653,6 +656,9 @@ async fn run_inner_with_terminal(
     startup: StartupProfile,
     mut terminal: TerminalGuard,
 ) -> Result<(StartupRunOutcome, Option<TerminalGuard>)> {
+    let startup_started = Instant::now();
+    let direct_resume_requested = resume_session_id.is_some();
+    let picker_route_enabled = !startup.skip_resume_picker && !direct_resume_requested;
     // Apply the persisted theme preference before the first render so the
     // initial paint already reflects the user's choice — without this the
     // first frame uses the auto-detected tone and pops to the override on
@@ -685,7 +691,9 @@ async fn run_inner_with_terminal(
     // workspace, initialise tree-sitter, open redb, and replay
     // `events.jsonl`. The placeholder gives the user immediate feedback
     // instead of a blank viewport for that window.
-    let startup_message = if resume_session_id.is_some() {
+    let resumed_from_startup = resume_session_id.is_some();
+    let first_run_setup_fresh = startup.setup_question_count.is_some();
+    let startup_message = if resumed_from_startup {
         "Resuming session…"
     } else {
         "Starting session…"
@@ -874,6 +882,15 @@ async fn run_inner_with_terminal(
             if !interactive_marked {
                 interactive_marked = true;
                 squeezy_core::startup_trace::mark("interactive_ready");
+                agent.record_startup_ready_telemetry(
+                    startup_route(
+                        direct_resume_requested,
+                        picker_route_enabled,
+                        resumed_from_startup,
+                        first_run_setup_fresh,
+                    ),
+                    startup_started.elapsed(),
+                );
             }
         }
 
@@ -899,6 +916,25 @@ async fn run_inner_with_terminal(
     agent.flush_telemetry().await;
 
     Ok((StartupRunOutcome::Finished, None))
+}
+
+fn startup_route(
+    direct_resume_requested: bool,
+    picker_route_enabled: bool,
+    resumed: bool,
+    first_run_setup: bool,
+) -> StartupRoute {
+    if direct_resume_requested {
+        StartupRoute::DirectResume
+    } else if picker_route_enabled && resumed {
+        StartupRoute::ResumePickerResume
+    } else if picker_route_enabled {
+        StartupRoute::ResumePickerFresh
+    } else if first_run_setup {
+        StartupRoute::FirstRunSetupFresh
+    } else {
+        StartupRoute::Fresh
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2018,6 +2054,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             return Ok(false);
         }
         if app.exit_confirm_armed {
+            close_config_screen(app, agent, "config closed");
             return Ok(true);
         }
         app.exit_confirm_armed = true;
@@ -2027,11 +2064,13 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
 
     // While the config screen is open, route all other keys to it.
     if app.config_screen.is_some() {
-        let state = app.config_screen.as_mut().expect("checked above");
         let mut feedback = config_screen::ConfigFeedback::new();
-        let outcome = config_screen::handle_key(state, agent, &mut feedback, key);
+        let outcome = {
+            let state = app.config_screen.as_mut().expect("checked above");
+            config_screen::handle_key(state, agent, &mut feedback, key)
+        };
         if matches!(outcome, config_screen::KeyOutcome::Close) {
-            app.config_screen = None;
+            close_config_screen(app, agent, "config closed");
         }
         forward_config_feedback(app, feedback);
         return Ok(false);
@@ -2062,6 +2101,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
         && key.modifiers.is_empty()
     {
+        close_config_screen(app, agent, "config closed");
         return Ok(true);
     }
 
@@ -2770,8 +2810,7 @@ fn toggle_config_screen(
     focus: Option<squeezy_core::config_schema::SectionId>,
 ) {
     if app.config_screen.is_some() {
-        app.config_screen = None;
-        app.status = "config closed".to_string();
+        close_config_screen(app, agent, "config closed");
         return;
     }
     // Build the screen from a freshly-merged settings config so it reflects
@@ -2784,6 +2823,54 @@ fn toggle_config_screen(
     let state = config_screen::ConfigScreenState::new(effective, focus);
     app.config_screen = Some(state);
     app.status = "config".to_string();
+}
+
+fn close_config_screen(app: &mut TuiApp, agent: &Agent, status: impl Into<String>) {
+    let Some(mut state) = app.config_screen.take() else {
+        return;
+    };
+    emit_config_screen_telemetry(agent, &mut state);
+    app.status = status.into();
+}
+
+fn emit_config_screen_telemetry(agent: &Agent, state: &mut config_screen::ConfigScreenState) {
+    for change in state.telemetry_changes.drain(..) {
+        agent.record_config_change_telemetry(ConfigChangeReport {
+            scope: telemetry_config_scope(change.scope),
+            section: change.section,
+            field: &change.field,
+            apply_tier: telemetry_config_apply_tier(change.apply_tier),
+            change_kind: telemetry_config_change_kind(change.change_kind),
+            prev_bucket: &change.prev_value,
+            new_bucket: &change.new_value,
+        });
+    }
+}
+
+fn telemetry_config_scope(scope: config_screen::ConfigScope) -> ConfigScopeKind {
+    match scope {
+        config_screen::ConfigScope::User => ConfigScopeKind::User,
+        config_screen::ConfigScope::Repo => ConfigScopeKind::Project,
+        config_screen::ConfigScope::Local => ConfigScopeKind::Local,
+    }
+}
+
+fn telemetry_config_apply_tier(tier: squeezy_core::config_schema::ApplyTier) -> ConfigApplyTier {
+    match tier {
+        squeezy_core::config_schema::ApplyTier::Immediate => ConfigApplyTier::Immediate,
+        squeezy_core::config_schema::ApplyTier::NextPrompt => ConfigApplyTier::NextPrompt,
+        squeezy_core::config_schema::ApplyTier::Restart => ConfigApplyTier::Restart,
+    }
+}
+
+fn telemetry_config_change_kind(
+    kind: config_screen::ConfigTelemetryChangeKind,
+) -> ConfigChangeKind {
+    match kind {
+        config_screen::ConfigTelemetryChangeKind::Set => ConfigChangeKind::Set,
+        config_screen::ConfigTelemetryChangeKind::Unset => ConfigChangeKind::Unset,
+        config_screen::ConfigTelemetryChangeKind::Reset => ConfigChangeKind::Reset,
+    }
 }
 
 fn toggle_status_line_setup(app: &mut TuiApp) {
@@ -2948,6 +3035,15 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
 }
 
 pub(crate) async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
+    handle_slash_command_on_surface(app, agent, input, SlashSurface::TuiComposer).await
+}
+
+async fn handle_slash_command_on_surface(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    input: &str,
+    surface: SlashSurface,
+) -> bool {
     let cmd = match DispatchCommand::parse(input) {
         Ok(cmd) => cmd,
         // Unknown heads fall through to the user-authored prompt
@@ -2957,14 +3053,40 @@ pub(crate) async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, in
         // No match keeps the legacy behaviour: the input is treated as
         // a normal user prompt (echoed as a slash echo upstream by
         // `reject_unknown_slash_command`).
-        Err(DispatchCommandParseError::Unknown { .. }) => {
-            return expand_prompt_template_or_fallthrough(app, agent, input);
+        Err(DispatchCommandParseError::Unknown { command: _ }) => {
+            if expand_prompt_template_or_fallthrough(app, agent, input, surface) {
+                record_slash_command_telemetry(
+                    agent,
+                    "/prompt-template",
+                    surface,
+                    SlashOutcome::TemplateExpanded,
+                    SlashAliasKind::Template,
+                    slash_arg_shape_from_rest(input),
+                );
+                return true;
+            }
+            agent.record_slash_command_telemetry(
+                "unknown",
+                surface,
+                SlashOutcome::Unknown,
+                SlashAliasKind::Unknown,
+                slash_arg_shape_from_rest(input),
+            );
+            return false;
         }
         Err(DispatchCommandParseError::NotASlashCommand)
         | Err(DispatchCommandParseError::Empty) => return false,
         // Required-arg failures preserve the pre-refactor `usage:`
         // strings so the visible affordance is unchanged.
-        Err(DispatchCommandParseError::Usage { hint, .. }) => {
+        Err(DispatchCommandParseError::Usage { command, hint }) => {
+            record_slash_command_telemetry(
+                agent,
+                &command,
+                surface,
+                SlashOutcome::UsageError,
+                slash_alias_kind(&command),
+                SlashArgShape::Present,
+            );
             set_status_with_notice(app, hint.clone(), hint);
             return true;
         }
@@ -2972,10 +3094,20 @@ pub(crate) async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, in
 
     let raw_head = input.split_whitespace().next().unwrap_or_default();
     let slash = cmd.slash_name();
+    let alias_kind = slash_alias_kind(raw_head);
+    let arg_shape = telemetry_tui_slash_arg_shape(&cmd);
     if let Some(spec) = SLASH_COMMANDS.iter().find(|spec| spec.name == slash)
         && !spec.available_during_task
         && turn_in_progress(app)
     {
+        record_slash_command_telemetry(
+            agent,
+            raw_head,
+            surface,
+            SlashOutcome::BlockedDuringTurn,
+            alias_kind,
+            arg_shape,
+        );
         app.status = format!("{slash} unavailable during turn");
         return true;
     }
@@ -2988,8 +3120,141 @@ pub(crate) async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, in
         app.push_slash_command_echo(input);
     }
 
+    record_slash_command_telemetry(
+        agent,
+        raw_head,
+        surface,
+        SlashOutcome::Accepted,
+        alias_kind,
+        arg_shape,
+    );
     apply_dispatch_command(app, agent, cmd).await;
     true
+}
+
+fn record_slash_command_telemetry(
+    agent: &Agent,
+    command: &str,
+    surface: SlashSurface,
+    outcome: SlashOutcome,
+    alias_kind: SlashAliasKind,
+    arg_shape: SlashArgShape,
+) {
+    agent.record_slash_command_telemetry(command, surface, outcome, alias_kind, arg_shape);
+}
+
+fn slash_alias_kind(raw_head: &str) -> SlashAliasKind {
+    match raw_head.trim_start_matches('/') {
+        "options" => SlashAliasKind::CompatOptions,
+        "" => SlashAliasKind::Unknown,
+        _ => SlashAliasKind::Canonical,
+    }
+}
+
+fn slash_arg_shape_from_rest(input: &str) -> SlashArgShape {
+    let Some(head) = input.split_whitespace().next() else {
+        return SlashArgShape::None;
+    };
+    let rest = input.strip_prefix(head).map(str::trim).unwrap_or_default();
+    if rest.is_empty() {
+        SlashArgShape::None
+    } else {
+        SlashArgShape::Present
+    }
+}
+
+fn telemetry_tui_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
+    match cmd {
+        DispatchCommand::Cost
+        | DispatchCommand::Context
+        | DispatchCommand::Reviewer
+        | DispatchCommand::Model
+        | DispatchCommand::Permissions
+        | DispatchCommand::Attachments
+        | DispatchCommand::Clear
+        | DispatchCommand::Diff
+        | DispatchCommand::Tasks
+        | DispatchCommand::Pins
+        | DispatchCommand::Sessions
+        | DispatchCommand::Fork
+        | DispatchCommand::Checkpoints
+        | DispatchCommand::Undo
+        | DispatchCommand::Statusline
+        | DispatchCommand::Keymap
+        | DispatchCommand::Cheap
+        | DispatchCommand::Parent => SlashArgShape::None,
+        DispatchCommand::Attach { .. } => SlashArgShape::Path,
+        DispatchCommand::Plan { prompt } | DispatchCommand::Build { prompt } => {
+            slash_option_shape(prompt.as_ref(), SlashArgShape::FreeText)
+        }
+        DispatchCommand::Help { topic } => {
+            slash_option_shape(topic.as_ref(), SlashArgShape::FreeText)
+        }
+        DispatchCommand::Theme { theme } => {
+            slash_option_shape(theme.as_ref(), SlashArgShape::FixedSubcommand)
+        }
+        DispatchCommand::Spinner { spinner } => {
+            slash_option_shape(spinner.as_ref(), SlashArgShape::FixedSubcommand)
+        }
+        DispatchCommand::Effort { value }
+        | DispatchCommand::Verbosity { value }
+        | DispatchCommand::ToolVerbosity { value }
+        | DispatchCommand::Router { value } => {
+            slash_option_shape(value.as_ref(), SlashArgShape::FixedSubcommand)
+        }
+        DispatchCommand::Config { section } => {
+            slash_option_shape(section.as_ref(), SlashArgShape::FixedSubcommand)
+        }
+        DispatchCommand::Compact { undo } => {
+            if *undo {
+                SlashArgShape::FixedSubcommand
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Plans { args }
+        | DispatchCommand::Feedback { args }
+        | DispatchCommand::Report { args } => {
+            if args.trim().is_empty() {
+                SlashArgShape::None
+            } else {
+                SlashArgShape::FixedSubcommand
+            }
+        }
+        DispatchCommand::Task { .. }
+        | DispatchCommand::TaskCancel { .. }
+        | DispatchCommand::Unpin { .. }
+        | DispatchCommand::Resume { .. }
+        | DispatchCommand::SessionExport { .. }
+        | DispatchCommand::Checkpoint { .. }
+        | DispatchCommand::RevertTurn { .. }
+        | DispatchCommand::Detach { .. } => SlashArgShape::Id,
+        DispatchCommand::Pin { target } => {
+            if target.is_some() {
+                SlashArgShape::Id
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Session { .. }
+        | DispatchCommand::SessionRename { .. }
+        | DispatchCommand::SessionLabel { .. } => SlashArgShape::FixedSubcommand,
+        DispatchCommand::SessionExportHtml { path, .. } => {
+            if path.is_some() {
+                SlashArgShape::Path
+            } else {
+                SlashArgShape::Id
+            }
+        }
+    }
+}
+
+fn slash_option_shape(value: Option<&String>, present: SlashArgShape) -> SlashArgShape {
+    if value.map(|value| !value.trim().is_empty()).unwrap_or(false) {
+        present
+    } else {
+        SlashArgShape::None
+    }
 }
 
 fn set_status_notice(app: &mut TuiApp, message: impl Into<String>) {
@@ -3009,16 +3274,33 @@ async fn handle_inline_slash_command(app: &mut TuiApp, agent: &mut Agent, input:
     };
     let slash = occurrence.command.name;
     if !occurrence.command.available_during_task && turn_in_progress(app) {
+        let arg_shape = match slash {
+            "/attach" => SlashArgShape::Path,
+            "/help" | "/plan" | "/build" => SlashArgShape::FreeText,
+            _ => SlashArgShape::Present,
+        };
+        record_slash_command_telemetry(
+            agent,
+            slash,
+            SlashSurface::TuiInline,
+            SlashOutcome::BlockedDuringTurn,
+            SlashAliasKind::Canonical,
+            arg_shape,
+        );
         app.status = format!("{slash} unavailable during turn");
         return true;
     }
     match slash {
-        "/attach" => handle_inline_attach_command(app, input, occurrence.start, occurrence.end),
+        "/attach" => {
+            handle_inline_attach_command(app, agent, input, occurrence.start, occurrence.end)
+        }
         "/help" | "/plan" | "/build" => {
             let command_input =
                 inline_prompt_command_input(input, occurrence.start, occurrence.end, slash);
             let before_command_input = app.input.clone();
-            if handle_slash_command(app, agent, &command_input).await {
+            if handle_slash_command_on_surface(app, agent, &command_input, SlashSurface::TuiInline)
+                .await
+            {
                 let preserve_input =
                     app.preserve_input_after_slash_command || app.input != before_command_input;
                 app.preserve_input_after_slash_command = false;
@@ -3057,11 +3339,20 @@ fn inline_prompt_command_input(input: &str, start: usize, end: usize, slash: &st
 
 fn handle_inline_attach_command(
     app: &mut TuiApp,
+    agent: &Agent,
     input: &str,
     command_start: usize,
     command_end: usize,
 ) -> bool {
     let Some((path, path_end)) = inline_attach_path(input, command_end) else {
+        record_slash_command_telemetry(
+            agent,
+            "/attach",
+            SlashSurface::TuiInline,
+            SlashOutcome::UsageError,
+            SlashAliasKind::Canonical,
+            SlashArgShape::Path,
+        );
         set_status_notice(app, "usage: /attach <path>");
         return true;
     };
@@ -3070,8 +3361,26 @@ fn handle_inline_attach_command(
     app.input.replace_range(command_start..path_end, "");
     app.input_cursor = command_start;
     match insert_file_prompt_attachment(app, &path) {
-        Ok(status) => app.status = status,
+        Ok(status) => {
+            record_slash_command_telemetry(
+                agent,
+                "/attach",
+                SlashSurface::TuiInline,
+                SlashOutcome::Accepted,
+                SlashAliasKind::Canonical,
+                SlashArgShape::Path,
+            );
+            app.status = status;
+        }
         Err(error) => {
+            record_slash_command_telemetry(
+                agent,
+                "/attach",
+                SlashSurface::TuiInline,
+                SlashOutcome::Error,
+                SlashAliasKind::Canonical,
+                SlashArgShape::Path,
+            );
             app.input = original_input;
             app.input_cursor = original_cursor;
             app.preserve_input_after_slash_command = true;
@@ -3115,7 +3424,12 @@ fn inline_attach_path(input: &str, command_end: usize) -> Option<(String, usize)
 /// Templates take precedence only over the *unknown* slot — built-in
 /// `DispatchCommand` heads (e.g. `/help`, `/diff`) cannot be shadowed
 /// by a same-named template file so muscle memory keeps working.
-fn expand_prompt_template_or_fallthrough(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
+fn expand_prompt_template_or_fallthrough(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    input: &str,
+    _surface: SlashSurface,
+) -> bool {
     let Some(expanded) = app.prompt_templates.expand(input) else {
         return false;
     };

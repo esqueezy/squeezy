@@ -150,9 +150,13 @@ impl TelemetryClient {
         let Some(state) = self.state.clone() else {
             return;
         };
-        tokio::spawn(async move {
-            enqueue_event(state, event).await;
-        });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                enqueue_event(state, event).await;
+            });
+        } else {
+            enqueue_event_without_runtime(&state, event);
+        }
     }
 
     pub async fn record(&self, event: TelemetryEvent) {
@@ -490,6 +494,12 @@ async fn enqueue_event(state: Arc<TelemetryState>, mut event: TelemetryEvent) {
     }
 }
 
+fn enqueue_event_without_runtime(state: &Arc<TelemetryState>, mut event: TelemetryEvent) {
+    stamp_trace_ids(state, &mut event);
+    let mut queue = state.queue.blocking_lock();
+    queue.events.push(event);
+}
+
 #[derive(Debug)]
 enum TelemetryAction {
     Flush(Vec<TelemetryEvent>),
@@ -631,6 +641,80 @@ impl TelemetryEvent {
         }
     }
 
+    pub fn startup_ready(config: &AppConfig, route: StartupRoute, duration: Duration) -> Self {
+        Self {
+            event: TelemetryEventName::StartupReady,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                provider: Some(ProviderKind::from_provider(&config.provider)),
+                model_family: Some(ModelFamily::from_model(&config.provider, &config.model)),
+                duration_ms: Some(duration.as_millis() as u64),
+                startup_route: Some(route),
+                status: Some(OutcomeStatus::Success),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    pub fn session_ended(config: &AppConfig, report: SessionTelemetryReport) -> Self {
+        Self {
+            event: TelemetryEventName::SessionEnded,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                provider: Some(ProviderKind::from_provider(&config.provider)),
+                model_family: Some(ModelFamily::from_model(&config.provider, &config.model)),
+                duration_ms: Some(report.duration_ms),
+                session_status: Some(report.status),
+                turn_count: Some(report.turns),
+                tool_calls: Some(report.tool_calls),
+                tool_successes: Some(report.tool_successes),
+                tool_errors: Some(report.tool_errors),
+                tool_denials: Some(report.tool_denials),
+                tool_cancellations: Some(report.tool_cancellations),
+                budget_denials: Some(report.budget_denials),
+                subagent_calls: Some(report.subagent_calls),
+                subagent_failures: Some(report.subagent_failures),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    pub fn slash_command_used(report: SlashTelemetryReport<'_>) -> Self {
+        Self {
+            event: TelemetryEventName::SlashCommandUsed,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                slash_command: Some(slash_command_token(report.command)),
+                slash_surface: Some(report.surface),
+                slash_outcome: Some(report.outcome),
+                slash_alias_kind: Some(report.alias_kind),
+                slash_arg_shape: Some(report.arg_shape),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    pub fn config_change_committed(report: ConfigChangeReport<'_>) -> Self {
+        Self {
+            event: TelemetryEventName::ConfigChangeCommitted,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                config_scope: Some(report.scope),
+                config_section: Some(report.section.to_string()),
+                config_field: Some(report.field.to_string()),
+                config_apply_tier: Some(report.apply_tier),
+                config_change_kind: Some(report.change_kind),
+                config_prev_bucket: Some(report.prev_bucket.to_string()),
+                config_new_bucket: Some(report.new_bucket.to_string()),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
     pub fn failure_seen(kind: ErrorKind) -> Self {
         Self {
             event: TelemetryEventName::FailureSeen,
@@ -737,6 +821,14 @@ pub enum TelemetryEventName {
     GraphBuildCompleted,
     #[serde(rename = "squeezy_graph_refresh_completed")]
     GraphRefreshCompleted,
+    #[serde(rename = "squeezy_startup_ready")]
+    StartupReady,
+    #[serde(rename = "squeezy_session_ended")]
+    SessionEnded,
+    #[serde(rename = "squeezy_slash_command_used")]
+    SlashCommandUsed,
+    #[serde(rename = "squeezy_config_change_committed")]
+    ConfigChangeCommitted,
     #[serde(rename = "squeezy_failure_seen")]
     FailureSeen,
     /// `approval.best_effort.fallback{tool=shell}` — emitted every time
@@ -839,13 +931,89 @@ pub struct TelemetryProperties {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_denials: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_successes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_errors: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_denials: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_cancellations: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_calls: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_failures: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_kind: Option<RefreshKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_sequence_scope: Option<GraphSequenceScope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<OutcomeStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_status: Option<SessionStatusKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_route: Option<StartupRoute>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<ErrorKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dart_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub java_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub javascript_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jsx_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kotlin_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub php_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ruby_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scala_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swift_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub typescript_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tsx_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_dirs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persisted_files_loaded: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persisted_files_missed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence_rebuilt: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slash_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slash_surface: Option<SlashSurface>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slash_outcome: Option<SlashOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slash_alias_kind: Option<SlashAliasKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slash_arg_shape: Option<SlashArgShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_scope: Option<ConfigScopeKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_section: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_apply_tier: Option<ConfigApplyTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_change_kind: Option<ConfigChangeKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_prev_bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_new_bucket: Option<String>,
     /// SHA-256 of the canonical JSON arguments the model sent into this tool
     /// call. Paired with `output_sha256` and `content_sha256`, lets offline
     /// replay/dedup tooling answer "did we already pay for this exact call?"
@@ -927,14 +1095,31 @@ impl TelemetryProperties {
             csharp_files: Some(report.language_distribution.csharp_files),
             cpp_files: Some(report.language_distribution.cpp_files),
             go_files: Some(report.language_distribution.go_files),
+            dart_files: Some(report.language_distribution.dart_files),
+            java_files: Some(report.language_distribution.java_files),
+            javascript_files: Some(report.language_distribution.javascript_files),
+            jsx_files: Some(report.language_distribution.jsx_files),
+            kotlin_files: Some(report.language_distribution.kotlin_files),
+            php_files: Some(report.language_distribution.php_files),
             python_files: Some(report.language_distribution.python_files),
+            ruby_files: Some(report.language_distribution.ruby_files),
             rust_files: Some(report.language_distribution.rust_files),
+            scala_files: Some(report.language_distribution.scala_files),
+            swift_files: Some(report.language_distribution.swift_files),
+            typescript_files: Some(report.language_distribution.typescript_files),
+            tsx_files: Some(report.language_distribution.tsx_files),
             supported_files: Some(report.language_distribution.supported_files),
             unsupported_files: Some(report.language_distribution.unsupported_files),
             unknown_files: Some(report.language_distribution.unknown_files),
             files_changed: Some(report.files_changed),
             files_parsed: Some(report.files_parsed),
             bytes_parsed: Some(report.bytes_parsed),
+            excluded_files: Some(report.excluded_files),
+            excluded_dirs: Some(report.excluded_dirs),
+            excluded_bytes: Some(report.excluded_bytes),
+            persisted_files_loaded: Some(report.persisted_files_loaded),
+            persisted_files_missed: Some(report.persisted_files_missed),
+            persistence_rebuilt: Some(u64::from(report.persistence_rebuilt)),
             symbols: Some(report.symbols),
             edges: Some(report.edges),
             refresh_kind: Some(report.refresh_kind),
@@ -982,6 +1167,12 @@ pub struct GraphPerfReport {
     pub files_changed: u64,
     pub files_parsed: u64,
     pub bytes_parsed: u64,
+    pub excluded_files: u64,
+    pub excluded_dirs: u64,
+    pub excluded_bytes: u64,
+    pub persisted_files_loaded: u64,
+    pub persisted_files_missed: u64,
+    pub persistence_rebuilt: bool,
     pub symbols: u64,
     pub edges: u64,
     pub language_distribution: LanguageDistribution,
@@ -993,12 +1184,76 @@ pub struct LanguageDistribution {
     pub c_files: u64,
     pub csharp_files: u64,
     pub cpp_files: u64,
+    pub dart_files: u64,
     pub go_files: u64,
+    pub java_files: u64,
+    pub javascript_files: u64,
+    pub jsx_files: u64,
+    pub kotlin_files: u64,
+    pub php_files: u64,
     pub python_files: u64,
+    pub ruby_files: u64,
     pub rust_files: u64,
+    pub scala_files: u64,
+    pub swift_files: u64,
+    pub typescript_files: u64,
+    pub tsx_files: u64,
     pub supported_files: u64,
     pub unsupported_files: u64,
     pub unknown_files: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionTelemetryReport {
+    pub duration_ms: u64,
+    pub status: SessionStatusKind,
+    pub turns: u64,
+    pub tool_calls: u64,
+    pub tool_successes: u64,
+    pub tool_errors: u64,
+    pub tool_denials: u64,
+    pub tool_cancellations: u64,
+    pub budget_denials: u64,
+    pub subagent_calls: u64,
+    pub subagent_failures: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlashTelemetryReport<'a> {
+    pub command: &'a str,
+    pub surface: SlashSurface,
+    pub outcome: SlashOutcome,
+    pub alias_kind: SlashAliasKind,
+    pub arg_shape: SlashArgShape,
+}
+
+impl<'a> SlashTelemetryReport<'a> {
+    pub fn new(
+        command: &'a str,
+        surface: SlashSurface,
+        outcome: SlashOutcome,
+        alias_kind: SlashAliasKind,
+        arg_shape: SlashArgShape,
+    ) -> Self {
+        Self {
+            command,
+            surface,
+            outcome,
+            alias_kind,
+            arg_shape,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigChangeReport<'a> {
+    pub scope: ConfigScopeKind,
+    pub section: &'a str,
+    pub field: &'a str,
+    pub apply_tier: ConfigApplyTier,
+    pub change_kind: ConfigChangeKind,
+    pub prev_bucket: &'a str,
+    pub new_bucket: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1219,6 +1474,96 @@ pub enum OutcomeStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum SessionStatusKind {
+    Running,
+    Archived,
+    Completed,
+    Cancelled,
+    Failed,
+    Truncated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupRoute {
+    Fresh,
+    DirectResume,
+    ResumePickerFresh,
+    ResumePickerResume,
+    FirstRunSetupFresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlashSurface {
+    TuiComposer,
+    TuiInline,
+    AgentRaw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlashOutcome {
+    Accepted,
+    UsageError,
+    BlockedDuringTurn,
+    Unknown,
+    TemplateExpanded,
+    StartedTurn,
+    OpenedOverlay,
+    StartedJob,
+    LocalAction,
+    Skipped,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlashAliasKind {
+    Canonical,
+    CompatOptions,
+    Unknown,
+    Template,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlashArgShape {
+    None,
+    Present,
+    FixedSubcommand,
+    Id,
+    Path,
+    FreeText,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigScopeKind {
+    User,
+    Project,
+    Local,
+    Session,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigApplyTier {
+    Immediate,
+    NextPrompt,
+    Restart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigChangeKind {
+    Set,
+    Unset,
+    Reset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
     Provider,
     Tool,
@@ -1268,6 +1613,26 @@ fn stamp_trace_ids(state: &TelemetryState, event: &mut TelemetryEvent) {
         && let Some(span_id) = guard.as_ref()
     {
         event.properties.span_id = Some(span_id.clone());
+    }
+}
+
+fn slash_command_token(value: &str) -> String {
+    let mut token = String::new();
+    let trimmed = value.trim().trim_start_matches('/');
+    for ch in trimmed.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            token.push(ch);
+        } else {
+            return "unknown".to_string();
+        }
+        if token.len() >= 80 {
+            break;
+        }
+    }
+    if token.is_empty() {
+        "unknown".to_string()
+    } else {
+        token
     }
 }
 

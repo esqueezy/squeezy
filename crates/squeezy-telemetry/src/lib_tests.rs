@@ -493,6 +493,26 @@ async fn disabled_client_does_not_stamp_or_track_spans() {
 }
 
 #[test]
+fn spawn_without_tokio_runtime_buffers_event() {
+    let root = telemetry_temp_root();
+    let config = AppConfig {
+        telemetry: telemetry_config(true, DEFAULT_TELEMETRY_ENDPOINT),
+        ..AppConfig::default()
+    };
+    let client = TelemetryClient::from_config_with_install_path(&config, root.join("install_id"));
+    client.spawn(TelemetryEvent::failure_seen(ErrorKind::Config));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let pending = runtime.block_on(client.pending_events_snapshot());
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].properties.error_kind, Some(ErrorKind::Config));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn graph_event_carries_timing_counts_and_language_distribution() {
     let event = TelemetryEvent::graph_build_completed(GraphPerfReport {
         refresh_kind: RefreshKind::Cold,
@@ -503,15 +523,32 @@ fn graph_event_carries_timing_counts_and_language_distribution() {
         files_changed: 12,
         files_parsed: 8,
         bytes_parsed: 2048,
+        excluded_files: 5,
+        excluded_dirs: 1,
+        excluded_bytes: 512,
+        persisted_files_loaded: 6,
+        persisted_files_missed: 2,
+        persistence_rebuilt: true,
         symbols: 77,
         edges: 42,
         language_distribution: LanguageDistribution {
             c_files: 2,
             csharp_files: 2,
             cpp_files: 3,
+            dart_files: 1,
             go_files: 1,
+            java_files: 1,
+            javascript_files: 2,
+            jsx_files: 1,
+            kotlin_files: 1,
+            php_files: 4,
             python_files: 4,
+            ruby_files: 1,
             rust_files: 8,
+            scala_files: 1,
+            swift_files: 1,
+            typescript_files: 3,
+            tsx_files: 1,
             supported_files: 20,
             unsupported_files: 3,
             unknown_files: 1,
@@ -526,8 +563,112 @@ fn graph_event_carries_timing_counts_and_language_distribution() {
     assert!(text.contains("\"csharp_files\":2"));
     assert!(text.contains("\"cpp_files\":3"));
     assert!(text.contains("\"go_files\":1"));
+    assert!(text.contains("\"php_files\":4"));
+    assert!(text.contains("\"typescript_files\":3"));
+    assert!(text.contains("\"excluded_files\":5"));
+    assert!(text.contains("\"persisted_files_loaded\":6"));
+    assert!(text.contains("\"persistence_rebuilt\":1"));
     assert!(text.contains("\"python_files\":4"));
     assert!(text.contains("\"rust_files\":8"));
     assert!(text.contains("\"unsupported_files\":3"));
     assert!(!text.contains("/Users/"));
+}
+
+#[test]
+fn startup_ready_event_carries_route_and_duration() {
+    let config = AppConfig::default();
+    let event = TelemetryEvent::startup_ready(
+        &config,
+        StartupRoute::ResumePickerResume,
+        Duration::from_millis(321),
+    );
+    let text = serde_json::to_string(&event).unwrap();
+
+    assert!(text.contains("squeezy_startup_ready"));
+    assert!(text.contains("\"startup_route\":\"resume_picker_resume\""));
+    assert!(text.contains("\"duration_ms\":321"));
+    assert!(!text.contains(&config.model));
+}
+
+#[test]
+fn session_ended_event_carries_aggregate_perf_and_failure_counts() {
+    let config = AppConfig::default();
+    let event = TelemetryEvent::session_ended(
+        &config,
+        SessionTelemetryReport {
+            duration_ms: 12_345,
+            status: SessionStatusKind::Completed,
+            turns: 4,
+            tool_calls: 9,
+            tool_successes: 7,
+            tool_errors: 1,
+            tool_denials: 1,
+            tool_cancellations: 0,
+            budget_denials: 2,
+            subagent_calls: 3,
+            subagent_failures: 1,
+        },
+    );
+    let text = serde_json::to_string(&event).unwrap();
+
+    assert!(text.contains("squeezy_session_ended"));
+    assert!(text.contains("\"session_status\":\"completed\""));
+    assert!(text.contains("\"turn_count\":4"));
+    assert!(text.contains("\"tool_errors\":1"));
+    assert!(text.contains("\"subagent_failures\":1"));
+    assert!(!text.contains(&config.model));
+}
+
+#[test]
+fn slash_command_event_uses_command_dimensions_only() {
+    let event = TelemetryEvent::slash_command_used(SlashTelemetryReport::new(
+        "/plan",
+        SlashSurface::TuiComposer,
+        SlashOutcome::Accepted,
+        SlashAliasKind::Canonical,
+        SlashArgShape::FreeText,
+    ));
+    let text = serde_json::to_string(&event).unwrap();
+
+    assert!(text.contains("squeezy_slash_command_used"));
+    assert!(text.contains("\"slash_command\":\"plan\""));
+    assert!(text.contains("\"slash_surface\":\"tui_composer\""));
+    assert!(text.contains("\"slash_arg_shape\":\"free_text\""));
+    assert!(!text.contains("analyze this repo"));
+}
+
+#[test]
+fn slash_command_event_sanitizes_unknown_command_heads() {
+    let event = TelemetryEvent::slash_command_used(SlashTelemetryReport::new(
+        "/Custom/Thing?secret=abc",
+        SlashSurface::TuiComposer,
+        SlashOutcome::Unknown,
+        SlashAliasKind::Unknown,
+        SlashArgShape::Present,
+    ));
+    let text = serde_json::to_string(&event).unwrap();
+
+    assert!(text.contains("\"slash_command\":\"unknown\""));
+    assert!(!text.contains("/Custom/Thing"));
+    assert!(!text.contains("secret"));
+}
+
+#[test]
+fn config_change_event_uses_bucketed_values() {
+    let event = TelemetryEvent::config_change_committed(ConfigChangeReport {
+        scope: ConfigScopeKind::Project,
+        section: "models",
+        field: "model.model",
+        apply_tier: ConfigApplyTier::NextPrompt,
+        change_kind: ConfigChangeKind::Set,
+        prev_bucket: "model_custom",
+        new_bucket: "model_custom",
+    });
+    let text = serde_json::to_string(&event).unwrap();
+
+    assert!(text.contains("squeezy_config_change_committed"));
+    assert!(text.contains("\"config_scope\":\"project\""));
+    assert!(text.contains("\"config_prev_bucket\":\"model_custom\""));
+    assert!(text.contains("\"config_new_bucket\":\"model_custom\""));
+    assert!(!text.contains("gpt-5-codex"));
 }
