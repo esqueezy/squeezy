@@ -649,6 +649,9 @@ impl LlmProvider for AnthropicProvider {
         if let Err(err) = request.ensure_vision_support("anthropic") {
             return Box::pin(futures_util::stream::once(async move { Err(err) }));
         }
+        if let Err(err) = request.reject_unsupported_documents("anthropic") {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let url = format!("{}/messages", self.base_url);

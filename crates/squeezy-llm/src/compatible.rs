@@ -652,6 +652,9 @@ impl LlmProvider for OpenAiCompatibleProvider {
         if let Err(err) = request.ensure_vision_support(self.preset.as_str()) {
             return Box::pin(futures_util::stream::once(async move { Err(err) }));
         }
+        if let Err(err) = request.reject_unsupported_documents(self.preset.as_str()) {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let transport = self.transport;

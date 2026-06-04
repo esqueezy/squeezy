@@ -443,6 +443,9 @@ impl LlmProvider for OllamaProvider {
         if let Err(err) = request.ensure_vision_support("ollama") {
             return Box::pin(futures_util::stream::once(async move { Err(err) }));
         }
+        if let Err(err) = request.reject_unsupported_documents("ollama") {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         if let Some(compat) = &self.compat {
             return compat.stream_response(request, cancel);
         }

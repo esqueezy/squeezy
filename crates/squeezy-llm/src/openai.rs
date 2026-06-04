@@ -583,6 +583,9 @@ impl LlmProvider for OpenAiProvider {
         if let Err(err) = request.ensure_vision_support(self.name) {
             return Box::pin(futures_util::stream::once(async move { Err(err) }));
         }
+        if let Err(err) = request.reject_unsupported_documents(self.name) {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let provider_name = self.name;
