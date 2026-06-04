@@ -14024,7 +14024,7 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         }
         return "Enter accept · N decline · Esc cancel".to_string();
     } else if app.pending_approval.is_some() {
-        return "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Esc cancel"
+        return "Up/Down choose · Enter/Y approve once · A/P always approve repo · N/D deny · Esc cancel"
             .to_string();
     } else if app.pending_feedback.is_some() {
         return "Enter/Y send feedback · Esc/N discard".to_string();
