@@ -636,18 +636,17 @@ fn persist_local_event(state: &TelemetryState, event: &TelemetryEvent) {
         .lock()
         .map(|guard| *guard)
         .unwrap_or(false);
-    if !registered {
-        if store
+    if !registered
+        && store
             .mark_session_started(
                 &state.session_id,
                 &state.trace_id,
                 state.session_started_at_ms,
             )
             .is_ok()
-            && let Ok(mut guard) = state.session_registered.lock()
-        {
-            *guard = true;
-        }
+        && let Ok(mut guard) = state.session_registered.lock()
+    {
+        *guard = true;
     }
     if store.append_event(&state.session_id, event).is_err() {
         return;
