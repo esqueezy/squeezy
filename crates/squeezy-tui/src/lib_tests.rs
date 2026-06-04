@@ -1084,6 +1084,31 @@ fn subagent_row_shows_lifecycle_word_for_accessibility() {
     assert!(output.contains("failed"), "{output}");
 }
 
+#[test]
+fn subagent_marker_fills_on_cursor_and_rings_carry_status() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(2, "explore".to_string(), "look".to_string()); // running
+    let record = app.subagent_pane.records[0].clone();
+
+    // Cursor on the subagent (row 1): its ring fills amber; main empties.
+    app.subagent_pane.selected = 1;
+    let sub = subagent_record_row(&app, 0, &record, 120);
+    assert_eq!(sub.spans[0].content.as_ref(), "●");
+    assert_eq!(sub.spans[0].style.fg, Some(crate::render::theme::accent()));
+    let main = subagent_main_row(&app, 120);
+    assert_eq!(main.spans[0].content.as_ref(), "○");
+
+    // Cursor on main (row 0): main fills amber; the running subagent is an
+    // empty silver ring (status colour, not amber).
+    app.subagent_pane.selected = 0;
+    let main = subagent_main_row(&app, 120);
+    assert_eq!(main.spans[0].content.as_ref(), "●");
+    assert_eq!(main.spans[0].style.fg, Some(crate::render::theme::accent()));
+    let sub = subagent_record_row(&app, 0, &record, 120);
+    assert_eq!(sub.spans[0].content.as_ref(), "○");
+    assert_eq!(sub.spans[0].style.fg, Some(crate::render::theme::muted()));
+}
+
 #[tokio::test]
 async fn subagent_lifecycle_logs_are_distinct_and_compact() {
     let mut app = test_app(SessionMode::Build);

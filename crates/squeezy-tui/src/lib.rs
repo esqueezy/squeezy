@@ -12946,10 +12946,10 @@ fn subagent_pane_focused_hint(app: &TuiApp) -> &'static str {
 fn subagent_main_row(app: &TuiApp, width: u16) -> Line<'static> {
     let selected = app.subagent_pane.selected == 0;
     let active = matches!(app.subagent_pane.active, ConversationSource::Main);
-    // Glyph encodes selection only: ● = the conversation currently shown,
-    // ○ = the others. Run status (for subagent rows) rides on colour + the
-    // leading lifecycle word, so the marker no longer conflates the two.
-    let glyph = if active { "●" } else { "○" };
+    // The filled ● marks the selected (cursor) row in amber + bold; ○ marks
+    // the rest. The currently-shown conversation is called out by the "active"
+    // hint text, not the fill, so the marker tracks where your cursor is.
+    let glyph = if selected { "●" } else { "○" };
     let style = if selected {
         Style::default()
             .fg(crate::render::theme::accent())
@@ -12982,12 +12982,11 @@ fn subagent_record_row(
 ) -> Line<'static> {
     let row = index + 1;
     let selected = app.subagent_pane.selected == row;
-    let active = app.subagent_pane.active == ConversationSource::Subagent(record.id);
-    // ● = shown conversation, ○ = others (selection). The selected row's marker
-    // turns amber + bold to match the `main` row's selection treatment; the
-    // unselected rows keep their lifecycle colour, and the leading lifecycle
-    // word carries run status either way.
-    let glyph = if active { "●" } else { "○" };
+    // The filled ● marks the selected (cursor) row in amber + bold; unselected
+    // rows are a ○ ring tinted by lifecycle (silver running, green done, red
+    // failed). The leading lifecycle word carries run status either way, and
+    // the "active" hint marks the shown conversation.
+    let glyph = if selected { "●" } else { "○" };
     let glyph_style = if selected {
         Style::default()
             .fg(crate::render::theme::accent())
@@ -13834,7 +13833,9 @@ impl SubagentLifecycle {
 
     fn color(self) -> Color {
         match self {
-            Self::Running => crate::render::theme::accent(),
+            // Silver while running — amber is reserved for the selected
+            // (cursor) row, so a running subagent reads as a calm silver ring.
+            Self::Running => crate::render::theme::muted(),
             Self::Completed => crate::render::theme::green(),
             Self::Failed => crate::render::theme::red(),
             Self::Rejected => crate::render::theme::quiet(),
