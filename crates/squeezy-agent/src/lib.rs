@@ -139,16 +139,6 @@ const DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER: &str = "{previous}";
 /// research workflow without letting the model commit the entire turn
 /// budget to one chain.
 const DELEGATE_CHAIN_MAX_STEPS: usize = 16;
-/// Hard runtime cap on whole-task `delegate` fan-out per top-level user
-/// task. On single-turn read-only enumeration audits the parent already
-/// solves the task alone; a second confirmatory `delegate` re-scans the
-/// whole tree and only burns tokens (measured: c spawned 2 overlapping
-/// subagents @ 10.5M subagent input tokens, java up to 3). The first
-/// `delegate` result stands; the parent must finish in-context. `explore`,
-/// `delegate_plan`, `delegate_review`, and `delegate_chain` are
-/// deliberately exempt — they are scoped, different-purpose surfaces, not
-/// the broad whole-task re-scan this gate targets.
-const MAX_DELEGATES_PER_TASK: u64 = 1;
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
@@ -10625,55 +10615,6 @@ async fn execute_tool_calls(
             _ => None,
         };
         if let Some(kind) = delegate_batch_kind {
-            // P1.1 hard whole-task `delegate` gate. Only the broad
-            // whole-task `delegate` surface is capped — `delegate_plan` and
-            // `delegate_review` (kinds Plan/Review) are scoped, different-
-            // purpose helpers and pass through. `delegate.calls` is the
-            // cumulative count across the whole task (the broker spans every
-            // round of the turn); `already_queued_delegates` adds the
-            // `delegate`s queued earlier in THIS same round so a parallel
-            // fan-out of N delegates is also capped to one (measured: a single
-            // round spawning 2-3 overlapping whole-tree re-scans is pure
-            // waste). Once the budget is spent, refuse the extra delegate with
-            // a tool error that tells the model the first subagent's result
-            // stands and to finish in-context — never spawn another.
-            if kind == SubagentKind::Delegate {
-                let already_queued_delegates = delegate_batch_calls
-                    .iter()
-                    .filter(|(_, _, queued_kind)| *queued_kind == SubagentKind::Delegate)
-                    .count() as u64;
-                let prior_delegates =
-                    broker.metrics.subagent_by_kind.delegate.calls + already_queued_delegates;
-                if prior_delegates >= MAX_DELEGATES_PER_TASK {
-                    // Surface as `Denied`, not `Error`: this is an intentional
-                    // policy refusal, not a model mistake. `Error` would also
-                    // trip the repeated-tool-failure loop guard when a parent
-                    // emits several over-budget delegates in one round, which
-                    // would (via P0.2) terminate the whole turn early.
-                    let result = control_tool_result(
-                        call,
-                        ToolStatus::Denied,
-                        json!({
-                            "ok": false,
-                            "error": "delegate budget exhausted for this task",
-                            "delegates_allowed": MAX_DELEGATES_PER_TASK,
-                            "delegates_used": prior_delegates,
-                            "guidance": "A delegate subagent has already run for this task; its result stands. Do not spawn another delegate — finish the task in-context using the result you already have. Use read_file/read_slice/grep/graph tools directly if you need more detail."
-                        }),
-                    );
-                    record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
-                    let _ = context
-                        .tx
-                        .send(AgentEvent::ToolCallCompleted {
-                            turn_id: context.turn_id,
-                            result: result.clone(),
-                        })
-                        .await;
-                    results[index] = Some(result);
-                    recorded[index] = true;
-                    continue;
-                }
-            }
             // Pre-bump the `subagent_calls` counter before the future
             // is spawned so the in-flight tally stays conservative even
             // while several delegates run concurrently. Per-outcome

@@ -1021,21 +1021,13 @@ async fn delegate_subagent_uses_parent_model_for_natural_research() {
 }
 
 #[test]
-fn delegate_with_child_tool_fanout_runs_on_production_worker_stack() {
+fn delegate_batch_with_child_tool_fanout_runs_on_production_worker_stack() {
     // Mirror the production runtime: `squeezy-cli` builds its multi-threaded
     // Tokio runtime with a 16 MiB worker stack (see
     // `WORKER_THREAD_STACK_SIZE` in `crates/squeezy-cli/src/main.rs`). The
-    // delegate path (parent tool loop → subagent dispatch → subagent round
-    // loop → child tool fan-out) must complete without overflowing that stack
-    // on any platform.
-    //
-    // The provider scripts THREE `delegate` calls in ONE parent round, but the
-    // P1.1 whole-task gate (`MAX_DELEGATES_PER_TASK = 1`) caps the task to a
-    // single `delegate` — including a same-round parallel batch, since the
-    // measured waste was exactly 2-3 overlapping whole-tree re-scans. The first
-    // delegate runs (fanning out its 8 child reads — the deep path this test
-    // guards), the other two are refused without spawning. The single deep
-    // fan-out still exercises the worker stack end to end.
+    // delegate fan-out (parent tool loop → subagent dispatch → subagent
+    // round loop → child tool fan-out) must complete without overflowing
+    // that stack on any platform.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_stack_size(16 * 1024 * 1024)
@@ -1045,13 +1037,13 @@ fn delegate_with_child_tool_fanout_runs_on_production_worker_stack() {
     runtime.block_on(async {
         let root = temp_workspace("delegate_batch_production_stack");
         const TOOL_CALLS: usize = 8;
-        const MAX_CONCURRENT: usize = 3;
+        const SUBAGENTS: usize = 3;
         for index in 0..TOOL_CALLS {
             fs::write(root.join(format!("file{index}.rs")), b"// content\n").expect("write source");
         }
         let provider = Arc::new(DelegateFanoutProvider::default());
         let mut config = config_for(root.clone());
-        config.subagents.max_concurrent = MAX_CONCURRENT;
+        config.subagents.max_concurrent = SUBAGENTS;
         let agent = Agent::new(config, provider.clone());
 
         let drain = drain_turn(agent.start_turn("fan out".to_string(), CancellationToken::new()));
@@ -1060,12 +1052,12 @@ fn delegate_with_child_tool_fanout_runs_on_production_worker_stack() {
             .expect("delegate fanout should finish on the production worker stack");
 
         let snapshot = agent.session_accounting_snapshot().await;
-        // Exactly one delegate runs (the gate refuses the other two before they
-        // take a lease, so neither counts as a call or a failure), and it fans
-        // out its full child read batch.
-        assert_eq!(snapshot.metrics.subagent_calls, 1);
+        assert_eq!(snapshot.metrics.subagent_calls, SUBAGENTS as u64);
         assert_eq!(snapshot.metrics.subagent_failures, 0);
-        assert_eq!(snapshot.metrics.subagent_tool_calls, TOOL_CALLS as u64);
+        assert_eq!(
+            snapshot.metrics.subagent_tool_calls,
+            (SUBAGENTS * TOOL_CALLS) as u64
+        );
         assert_eq!(
             provider
                 .requests()
