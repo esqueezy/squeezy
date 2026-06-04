@@ -13455,3 +13455,28 @@ fn denied_and_cancelled_read_as_the_cyan_warn_tier() {
         crate::render::theme::secondary()
     );
 }
+
+#[test]
+fn turn_failure_is_red_error_warning_is_cyan() {
+    // A hard failure reads as a red ✖ error node; a warning stays a cyan ⚠.
+    let err = LogEntry {
+        message: "turn failed: boom".to_string(),
+        kind: LogKind::Error,
+    };
+    let err_lines = format_log_entry(&err, false, false);
+    assert_eq!(err_lines[0].spans[1].content.as_ref(), "✖ ");
+    assert_eq!(
+        err_lines[0].spans[1].style.fg,
+        Some(crate::render::theme::red())
+    );
+    let warn = LogEntry {
+        message: "config ignored".to_string(),
+        kind: LogKind::Warn,
+    };
+    let warn_lines = format_log_entry(&warn, false, false);
+    assert_eq!(warn_lines[0].spans[1].content.as_ref(), "⚠ ");
+    assert_eq!(
+        warn_lines[0].spans[1].style.fg,
+        Some(crate::render::theme::cyan())
+    );
+}

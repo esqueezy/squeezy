@@ -473,7 +473,9 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     }
                     app.status = status;
                     app.turn_visual = TurnVisualState::Failed;
-                    app.push_warn(format!("turn failed: {}", app.status));
+                    // A hard turn failure is the error tier (red ✖), not a cyan
+                    // ⚠ warning — it stands out and keeps its reason visible.
+                    app.push_error(format!("turn failed: {}", app.status));
                     if app.last_turn_had_edits {
                         app.last_turn_had_edits = false;
                     }

@@ -7048,12 +7048,12 @@ fn is_rail_work_node(kind: &TranscriptEntryKind) -> bool {
         TranscriptEntryKind::ToolResult(_)
         | TranscriptEntryKind::PlanCard(_)
         | TranscriptEntryKind::Reasoning(_) => true,
-        // Subagent breadcrumbs, informational notes, and warnings thread on the
-        // rail; operational chrome and plain logs flow off it.
+        // Subagent breadcrumbs, notes, warnings, and errors thread on the rail;
+        // operational chrome and plain logs flow off it.
         TranscriptEntryKind::Log(entry) => {
             matches!(
                 entry.kind,
-                LogKind::Subagent | LogKind::Note | LogKind::Warn
+                LogKind::Subagent | LogKind::Note | LogKind::Warn | LogKind::Error
             )
         }
         _ => false,
@@ -7066,9 +7066,10 @@ fn line_is_blank(line: &Line<'_>) -> bool {
 
 /// The gutter tint that gives a rail node its identity at a glance: plans glow
 /// amber (a decision to read), reasoning runs cool blue (thinking, set apart
-/// from the work), warnings turn cyan (attention without spending amber), and
-/// everything in a subagent's transcript turns magenta so the delegated context
-/// is unmistakable. Plain tool work and notes stay dim.
+/// from the work), warnings turn cyan (attention without spending amber),
+/// errors turn red (a real failure, set apart from a warning), and everything
+/// in a subagent's transcript turns magenta so the delegated context is
+/// unmistakable. Plain tool work and notes stay dim.
 fn rail_chrome(kind: &TranscriptEntryKind, subagent_view: bool) -> Color {
     if subagent_view {
         return crate::render::theme::magenta();
@@ -7081,6 +7082,9 @@ fn rail_chrome(kind: &TranscriptEntryKind, subagent_view: bool) -> Color {
         }
         TranscriptEntryKind::Log(entry) if entry.kind == LogKind::Warn => {
             crate::render::theme::cyan()
+        }
+        TranscriptEntryKind::Log(entry) if entry.kind == LogKind::Error => {
+            crate::render::theme::red()
         }
         _ => rail::dim(),
     }
@@ -8945,6 +8949,23 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
                 "⚠ ",
                 Style::default()
                     .fg(crate::render::theme::cyan())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(preview, Style::default().fg(palette::muted_fg())),
+        ])];
+    }
+    if entry.kind == LogKind::Error {
+        // Hard failure: a red `✖` node, distinct from a cyan `⚠` warning. The
+        // full reason rides on the line (newlines flattened) and the gutter pass
+        // threads it on the rail so a turn failure always shows what broke.
+        let marker = if selected { "> " } else { "  " };
+        let preview = message.replace('\n', " ");
+        return vec![Line::from(vec![
+            Span::raw(marker),
+            Span::styled(
+                "✖ ",
+                Style::default()
+                    .fg(crate::render::theme::red())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(preview, Style::default().fg(palette::muted_fg())),
@@ -14905,6 +14926,19 @@ impl TuiApp {
         true
     }
 
+    /// Push a hard-failure log (red `✖`) — a turn that errored out, distinct
+    /// from a cyan `⚠` warning. The reason rides on the same line and the node
+    /// threads the rail so a failure is never lost in the periphery.
+    pub(crate) fn push_error(&mut self, message: String) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::log_with_kind(
+            id,
+            message,
+            LogKind::Error,
+            self.transcript_default,
+        ));
+    }
+
     /// Append a transcript entry tagged as operational chrome — used for
     /// turn-complete markers, compaction notices, and plan-handoff state
     /// that should fade to the periphery rather than read as content.
@@ -15625,9 +15659,14 @@ pub(crate) enum LogKind {
     /// plan-handoff state) — rendered dim/italic with no bullet so it
     /// fades to the periphery instead of looking like a content event.
     Operational,
-    /// Warning chrome — turn cancellations, turn failures. Rendered with
-    /// a `⚠ ` prefix so the user can spot turn-ending events at a glance.
+    /// Warning chrome — turn cancellations, config issues, recoverable
+    /// problems. Rendered as a cyan `⚠ ` rail node so attention is drawn
+    /// without spending rationed amber.
     Warn,
+    /// Error chrome — a hard turn failure (provider error, aborted turn).
+    /// Rendered as a red `✖ ` rail node, distinct from a cyan `⚠` warning, so a
+    /// real failure stands out and its reason stays visible.
+    Error,
     /// A subagent lifecycle breadcrumb (delegate started / completed).
     /// Rendered as a magenta `◆` rail node so delegated work is
     /// unmistakable in the main flow and threads on the gutter.
