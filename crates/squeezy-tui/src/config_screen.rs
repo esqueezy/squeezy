@@ -100,6 +100,23 @@ impl ConfigFeedback {
 /// `FieldMeta` in `CONFIG_SECTIONS`.
 const SYNTHETIC_KEY_ROW: usize = 2;
 
+/// Number of Auto-review reviewer rows (`reviewer_model`, `reviewer_policy`,
+/// `reviewer_policy_extra`, `reviewer_capabilities`) that follow `mode` in the
+/// Permissions section's field list.
+const PERMISSION_REVIEWER_ROWS: usize = 4;
+
+/// Visible row count for the Permissions section. Rows are a contiguous
+/// prefix of the section's field list — `mode` only for Default/Full Access,
+/// plus the reviewer rows for Auto-review, plus every per-capability row for
+/// Custom. Keeping it a prefix means `field_at_row(row) == fields[row]`.
+fn permissions_visible_rows(mode: PermissionPolicyMode, field_count: usize) -> usize {
+    match mode {
+        PermissionPolicyMode::Custom => field_count,
+        PermissionPolicyMode::AutoReview => 1 + PERMISSION_REVIEWER_ROWS,
+        PermissionPolicyMode::Default | PermissionPolicyMode::FullAccess => 1,
+    }
+}
+
 /// Static row metadata for the synthetic Reset section. Each row deletes
 /// one tier's TOML file. The `Reset` section itself is declared in
 /// `CONFIG_SECTIONS` with an empty `fields` slice — the rendering and
@@ -597,11 +614,7 @@ impl ConfigScreenState {
         match section.id {
             SectionId::Models => section.fields.len() + 1,
             SectionId::Permissions => {
-                if self.effective.permissions.mode == PermissionPolicyMode::Custom {
-                    section.fields.len()
-                } else {
-                    1
-                }
+                permissions_visible_rows(self.effective.permissions.mode, section.fields.len())
             }
             // The Reset section only ever surfaces the action for the active
             // scope tab — resetting another tab's file from here would be
@@ -633,13 +646,9 @@ impl ConfigScreenState {
                 r => section.fields.get(r - 1),
             },
             SectionId::Permissions => {
-                if self.effective.permissions.mode == PermissionPolicyMode::Custom {
-                    section.fields.get(row)
-                } else if row == 0 {
-                    section.fields.first()
-                } else {
-                    None
-                }
+                let visible =
+                    permissions_visible_rows(self.effective.permissions.mode, section.fields.len());
+                (row < visible).then(|| section.fields.get(row)).flatten()
             }
             SectionId::Reset | SectionId::Themes => None,
             _ => section.fields.get(row),

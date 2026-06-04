@@ -1291,3 +1291,151 @@ pub(crate) fn is_read_only_shell_segment(segment: &str) -> bool {
         "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "file" | "stat" | "du" | "grep" | "rg"
     )
 }
+
+/// Extract candidate filesystem write-target path strings from the
+/// destination arguments of common non-destructive file-mutating verbs
+/// (`tee`, `cp`, `mv`, `install`, `dd of=`, `ln`, `sed -i`, `chmod`,
+/// `touch`, `mkdir`).
+///
+/// The verb set deliberately omits destructive verbs (`rm`, `chown`,
+/// `truncate`, `shred`, `mv -f`, …) and output redirects (`>`, `>>`):
+/// those already classify as the `Destructive` capability and gate behind
+/// approval, whereas the verbs here would otherwise be auto-allowed as a
+/// plain `Shell`/`Edit` write under the workspace-write default.
+///
+/// Parsing reuses the tree-sitter-backed [`extract_command_units`] over the
+/// unwrapped segments (so `sh -c "cp x /etc/y"` is inspected on its real
+/// payload). Targets are returned with a leading `~` / `~/` expanded to the
+/// user's home directory so the common `sed -i ~/.bashrc` form resolves
+/// outside the workspace. Unexpanded `$VAR` references are left as-is and
+/// will not be flagged (a known limitation of static analysis; the kernel
+/// sandbox remains the backstop for those).
+pub(crate) fn extract_shell_write_targets(command: &str) -> Vec<String> {
+    let normalized = collapse_whitespace(command);
+    let segments = expand_wrapper_segments(shell_segments(&normalized));
+    let mut targets = Vec::new();
+    for segment in &segments {
+        for unit in extract_command_units(segment) {
+            collect_verb_write_targets(&unit.name, &unit.args, &mut targets);
+        }
+    }
+    targets
+}
+
+fn home_dir() -> Option<String> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| home.to_string_lossy().into_owned())
+}
+
+fn expand_home_prefix(path: &str) -> String {
+    if path == "~" {
+        home_dir().unwrap_or_else(|| path.to_string())
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        match home_dir() {
+            Some(home) => format!("{}/{}", home.trim_end_matches('/'), rest),
+            None => path.to_string(),
+        }
+    } else {
+        path.to_string()
+    }
+}
+
+fn push_write_target(raw: &str, out: &mut Vec<String>) {
+    let raw = raw.trim();
+    // `-` is stdin/stdout for most of these verbs, not a path; `/dev/*`
+    // entries (`/dev/null`, `/dev/stdout`, …) are not real file mutations.
+    if raw.is_empty() || raw == "-" || raw.starts_with("/dev/") {
+        return;
+    }
+    let expanded = expand_home_prefix(raw);
+    if !out.contains(&expanded) {
+        out.push(expanded);
+    }
+}
+
+fn is_shell_flag(token: &str) -> bool {
+    token.starts_with('-') && token != "-"
+}
+
+/// `--target-directory=DIR`, `--target-directory DIR`, `-t DIR`, `-tDIR`.
+fn target_directory_arg(args: &[String]) -> Option<&str> {
+    for (idx, arg) in args.iter().enumerate() {
+        if arg == "-t" || arg == "--target-directory" {
+            return args.get(idx + 1).map(String::as_str);
+        }
+        if let Some(rest) = arg.strip_prefix("--target-directory=") {
+            return Some(rest);
+        }
+        if let Some(rest) = arg.strip_prefix("-t")
+            && !rest.is_empty()
+        {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+fn collect_verb_write_targets(name: &str, args: &[String], out: &mut Vec<String>) {
+    match name {
+        // Every non-flag argument is a write target. `ln` is included with
+        // both operands: an in-workspace symlink whose *target* points
+        // outside (`ln -s /etc/passwd link`) is a sandbox-escape vector, so
+        // the outside target must escalate even though the link name itself
+        // is in-bounds.
+        "tee" | "touch" | "mkdir" | "ln" => {
+            for arg in args {
+                if !is_shell_flag(arg) {
+                    push_write_target(arg, out);
+                }
+            }
+        }
+        // Destination is `--target-directory` if present, else the last
+        // non-flag operand.
+        "cp" | "mv" | "install" => {
+            if let Some(dir) = target_directory_arg(args) {
+                push_write_target(dir, out);
+            } else if let Some(dest) = args.iter().rev().find(|arg| !is_shell_flag(arg)) {
+                push_write_target(dest, out);
+            }
+        }
+        // `dd of=PATH` is the write target (`if=` is the read source).
+        "dd" => {
+            for arg in args {
+                if let Some(path) = arg.strip_prefix("of=") {
+                    push_write_target(path, out);
+                }
+            }
+        }
+        // In-place edit (`-i`/`--in-place`) writes its file operands. When
+        // the script is positional (no `-e`/`-f`) it is the first non-flag
+        // operand, so drop it.
+        "sed" => {
+            let in_place = args
+                .iter()
+                .any(|arg| arg.starts_with("-i") || arg.starts_with("--in-place"));
+            if in_place {
+                let script_via_flag = args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "-e" | "--expression" | "-f" | "--file"));
+                let files: Vec<&String> = args.iter().filter(|arg| !is_shell_flag(arg)).collect();
+                let targets: &[&String] = if script_via_flag || files.len() <= 1 {
+                    &files
+                } else {
+                    &files[1..]
+                };
+                for file in targets {
+                    push_write_target(file, out);
+                }
+            }
+        }
+        // First non-flag operand is the mode; the rest are files.
+        "chmod" => {
+            let files: Vec<&String> = args.iter().filter(|arg| !is_shell_flag(arg)).collect();
+            for file in files.iter().skip(1) {
+                push_write_target(file, out);
+            }
+        }
+        _ => {}
+    }
+}

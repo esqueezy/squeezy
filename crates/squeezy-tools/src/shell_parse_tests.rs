@@ -6,7 +6,7 @@
 
 use super::{
     CommandUnit, Redirect, analyze_shell_command, extract_command_units,
-    shell_segment_has_destructive_redirect,
+    extract_shell_write_targets, shell_segment_has_destructive_redirect,
 };
 use crate::PermissionCapability;
 
@@ -151,4 +151,105 @@ fn command_unit_default_is_empty() {
     assert!(unit.env.is_empty());
     assert!(unit.redirects.is_empty());
     assert!(!unit.has_substitution);
+}
+
+fn test_home() -> String {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .expect("HOME or USERPROFILE set in test env")
+}
+
+#[test]
+fn write_targets_cover_copy_move_install_destination() {
+    assert_eq!(
+        extract_shell_write_targets("cp secret /etc/passwd"),
+        vec!["/etc/passwd".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("mv build.log /var/log/app.log"),
+        vec!["/var/log/app.log".to_string()]
+    );
+    // `--target-directory` is the destination, not the trailing operand.
+    assert_eq!(
+        extract_shell_write_targets("cp -t /etc a.conf b.conf"),
+        vec!["/etc".to_string()]
+    );
+}
+
+#[test]
+fn write_targets_cover_tee_dd_ln_touch_mkdir() {
+    assert_eq!(
+        extract_shell_write_targets("echo x | tee /etc/hosts"),
+        vec!["/etc/hosts".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("dd if=/dev/zero of=/boot/blob"),
+        vec!["/boot/blob".to_string()]
+    );
+    // Both operands are reported so an in-workspace symlink pointing at an
+    // outside target (`/etc/passwd`) still escalates.
+    assert_eq!(
+        extract_shell_write_targets("ln -s /etc/passwd /workspace/link"),
+        vec!["/etc/passwd".to_string(), "/workspace/link".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("touch /etc/cron.d/evil"),
+        vec!["/etc/cron.d/evil".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("mkdir /opt/payload"),
+        vec!["/opt/payload".to_string()]
+    );
+}
+
+#[test]
+fn write_targets_handle_sed_in_place_and_chmod_mode() {
+    // Positional script is dropped; the file operand remains.
+    assert_eq!(
+        extract_shell_write_targets("sed -i 's/a/b/' /etc/hosts"),
+        vec!["/etc/hosts".to_string()]
+    );
+    // The mode (`777`) is not a path; only the file operand is a target.
+    assert_eq!(
+        extract_shell_write_targets("chmod 777 /etc/passwd"),
+        vec!["/etc/passwd".to_string()]
+    );
+}
+
+#[test]
+fn write_targets_expand_home_prefix() {
+    let home = test_home();
+    assert_eq!(
+        extract_shell_write_targets("sed -i 's/a/b/' ~/.bashrc"),
+        vec![format!("{}/.bashrc", home.trim_end_matches('/'))]
+    );
+}
+
+#[test]
+fn write_targets_unwrap_sh_dash_c() {
+    assert_eq!(
+        extract_shell_write_targets("sh -c \"cp loot /etc/loot\""),
+        vec!["/etc/loot".to_string()]
+    );
+}
+
+#[test]
+fn write_targets_ignore_reads_devnull_and_stdin() {
+    // Read-only verbs and `/dev/null` redirects produce no write targets.
+    assert!(extract_shell_write_targets("grep -R foo .").is_empty());
+    assert!(extract_shell_write_targets("cat file | sort").is_empty());
+    assert!(extract_shell_write_targets("ls -la 2>/dev/null").is_empty());
+    // `cp - dest`/`tee -` stream handles are not paths.
+    assert!(extract_shell_write_targets("tee -").is_empty());
+}
+
+#[test]
+fn write_targets_relative_in_workspace_paths_are_still_reported() {
+    // Extraction is path-blind; the caller decides in/out of workspace. A
+    // relative destination is reported verbatim so the resolver can place it
+    // under the workspace root.
+    assert_eq!(
+        extract_shell_write_targets("cp a.txt src/b.txt"),
+        vec!["src/b.txt".to_string()]
+    );
 }

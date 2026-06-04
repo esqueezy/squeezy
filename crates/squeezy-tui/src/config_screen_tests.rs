@@ -1818,3 +1818,33 @@ async fn esc_on_judge_prompt_editor_discards_edits() {
         "Esc must not persist the edit"
     );
 }
+
+#[test]
+fn permissions_visible_rows_reveal_reviewer_under_auto_review() {
+    // Field count for the Permissions section (mode + 2 reviewer + caps).
+    let total = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SectionId::Permissions)
+        .unwrap()
+        .fields
+        .len();
+    // Default / Full Access expose only the mode row.
+    assert_eq!(
+        permissions_visible_rows(PermissionPolicyMode::Default, total),
+        1
+    );
+    assert_eq!(
+        permissions_visible_rows(PermissionPolicyMode::FullAccess, total),
+        1
+    );
+    // Auto-review adds the two reviewer rows.
+    assert_eq!(
+        permissions_visible_rows(PermissionPolicyMode::AutoReview, total),
+        1 + PERMISSION_REVIEWER_ROWS
+    );
+    // Custom exposes every per-capability row.
+    assert_eq!(
+        permissions_visible_rows(PermissionPolicyMode::Custom, total),
+        total
+    );
+}
