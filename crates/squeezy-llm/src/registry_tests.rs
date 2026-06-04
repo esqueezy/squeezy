@@ -259,8 +259,16 @@ fn provider_honors_output_schema_false_for_unknown_provider() {
     // An unknown provider has no capabilities entry beyond the synthetic
     // fallback; the gate must not panic and must default to attaching
     // nothing rather than guessing support.
-    let unknown = provider_honors_output_schema("not-a-provider", "mystery-model");
-    // Fallback model info carries json_mode, but the point is the call is
-    // total and deterministic; assert it returns a bool without panic.
-    let _ = unknown;
+    assert!(!provider_honors_output_schema(
+        "not-a-provider",
+        "mystery-model"
+    ));
+}
+
+#[test]
+fn provider_honors_output_schema_false_for_unknown_model() {
+    assert!(
+        !provider_honors_output_schema("openai", "custom-unlisted-model"),
+        "fallback metadata must not guess strict schema support for unknown models"
+    );
 }

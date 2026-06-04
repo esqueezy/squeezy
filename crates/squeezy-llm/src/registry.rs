@@ -191,11 +191,13 @@ fn model_info_from_raw(raw: RawModelInfo) -> ModelInfo {
 
 fn fallback_model_info(provider: &'static str, model: &'static str) -> ModelInfo {
     let tokenizer = fallback_tokenizer(provider, model);
+    let mut capabilities = ModelCapabilities::TEXT_TOOLS;
+    capabilities.json_mode = false;
     ModelInfo {
         provider,
         id: model,
         profile: ModelProfile::Balanced,
-        capabilities: ModelCapabilities::TEXT_TOOLS,
+        capabilities,
         pricing: None,
         limits: Some(ModelLimits {
             context_window_tokens: 272_000,
