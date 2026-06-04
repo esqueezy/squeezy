@@ -115,9 +115,11 @@ telemetry.
 
 The Squeezy binary never contains the PostHog project token. Clients send to a
 Cloudflare Worker proxy; the Worker reads `POSTHOG_PROJECT_TOKEN` from a
-Cloudflare secret, validates a strict schema, rejects unknown fields, and then
-forwards sanitized events to PostHog. Worker source lives in
-`infra/telemetry-worker/` and is written in TypeScript.
+Cloudflare secret, validates a strict batch envelope, accepts only `squeezy_*`
+product event names, and forwards bounded safe property values to PostHog.
+Unsafe product properties such as raw text, paths, URLs, arrays, and arbitrary
+nested objects are dropped. Worker source lives in `infra/telemetry-worker/`
+and is written in TypeScript.
 
 Because the endpoint is public, abuse protection belongs at the Worker and
 Cloudflare layer: request size limits, strict validation, WAF/rate limits, and

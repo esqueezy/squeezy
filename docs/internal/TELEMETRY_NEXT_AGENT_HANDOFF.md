@@ -13,8 +13,11 @@ This branch migrates high-frequency product telemetry into one bounded
   failure, routing, and config tokens.
 - The telemetry client buffers safely when called from sync code without a
   Tokio runtime.
-- The Worker allowlist accepts the summary event and validates bounded count
-  maps while dropping unknown/raw properties.
+- The Worker accepts product event names that match `squeezy_*`, then forwards
+  only bounded safe properties: non-negative counters, booleans, token strings,
+  and small count maps. This keeps the Worker forward-compatible with future
+  summary fields without forwarding raw text, paths, URLs, arrays, or arbitrary
+  nested objects.
 
 ## One-Event Summary Direction
 

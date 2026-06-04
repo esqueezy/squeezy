@@ -61,20 +61,9 @@ test("product telemetry accepts current trace and routing properties", async () 
             },
           },
           {
-            event: "approval_best_effort_fallback",
-            timestamp_ms: Date.now(),
-            event_sequence: 3,
-            properties: {
-              tool_name: "shell",
-              tool_family: "shell",
-              sandbox_backend: "macos-sandbox-exec",
-              trace_id: "d".repeat(32),
-            },
-          },
-          {
             event: "squeezy_config_change_committed",
             timestamp_ms: Date.now(),
-            event_sequence: 4,
+            event_sequence: 3,
             properties: {
               config_scope: "project",
               config_section: "models",
@@ -89,7 +78,7 @@ test("product telemetry accepts current trace and routing properties", async () 
           {
             event: "squeezy_startup_ready",
             timestamp_ms: Date.now(),
-            event_sequence: 5,
+            event_sequence: 4,
             properties: {
               startup_route: "resume_picker_resume",
               duration_ms: 987,
@@ -99,7 +88,7 @@ test("product telemetry accepts current trace and routing properties", async () 
           {
             event: "squeezy_slash_command_used",
             timestamp_ms: Date.now(),
-            event_sequence: 6,
+            event_sequence: 5,
             properties: {
               slash_command: "plan",
               slash_surface: "tui_composer",
@@ -111,7 +100,7 @@ test("product telemetry accepts current trace and routing properties", async () 
           {
             event: "squeezy_session_ended",
             timestamp_ms: Date.now(),
-            event_sequence: 7,
+            event_sequence: 6,
             properties: {
               session_status: "completed",
               duration_ms: 1234,
@@ -136,18 +125,17 @@ test("product telemetry accepts current trace and routing properties", async () 
   expect(batch.batch.map((event) => event.event)).toEqual([
     "squeezy_tool_completed",
     "squeezy_routing_routed",
-    "approval_best_effort_fallback",
     "squeezy_config_change_committed",
     "squeezy_startup_ready",
     "squeezy_slash_command_used",
     "squeezy_session_ended",
   ]);
   expect(batch.batch[0].properties.trace_id).toBe("d".repeat(32));
-  expect(batch.batch[3].properties.config_new_bucket).toBe("model_custom");
-  expect(batch.batch[3].properties.local_path).toBeUndefined();
-  expect(batch.batch[4].properties.startup_route).toBe("resume_picker_resume");
-  expect(batch.batch[5].properties.slash_command).toBe("plan");
-  expect(batch.batch[6].properties.session_status).toBe("completed");
+  expect(batch.batch[2].properties.config_new_bucket).toBe("model_custom");
+  expect(batch.batch[2].properties.local_path).toBeUndefined();
+  expect(batch.batch[3].properties.startup_route).toBe("resume_picker_resume");
+  expect(batch.batch[4].properties.slash_command).toBe("plan");
+  expect(batch.batch[5].properties.session_status).toBe("completed");
 });
 
 test("product telemetry accepts durable session summary fields", async () => {
@@ -212,7 +200,7 @@ test("product telemetry accepts durable session summary fields", async () => {
   expect(batch.batch[0].properties.prompt).toBeUndefined();
 });
 
-test("product telemetry drops unknown or malformed optional properties", async () => {
+test("product telemetry forwards future safe properties and drops unsafe values", async () => {
   const forwarded: unknown[] = [];
   globalThis.fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
     forwarded.push(JSON.parse(String(init?.body)));
@@ -241,7 +229,14 @@ test("product telemetry drops unknown or malformed optional properties", async (
               tool_status: "future_status",
               trace_id: "not-a-trace",
               local_path: "/Users/example/project",
+              prompt: "must not forward",
               future_counter: 123,
+              future_flag: true,
+              future_token: "new_metric:v2",
+              future_counts: { new_metric: 2, "another.key": 1 },
+              bad_array: [1],
+              bad_object: { raw: "text value" },
+              "bad-key": 1,
             },
           },
         ],
@@ -256,10 +251,52 @@ test("product telemetry drops unknown or malformed optional properties", async (
   expect(batch.batch[0].event).toBe("squeezy_future_counter");
   expect(batch.batch[0].properties.provider).toBe("open_ai");
   expect(batch.batch[0].properties.model_family).toBe("gpt");
-  expect(batch.batch[0].properties.tool_status).toBeUndefined();
-  expect(batch.batch[0].properties.trace_id).toBeUndefined();
+  expect(batch.batch[0].properties.tool_status).toBe("future_status");
+  expect(batch.batch[0].properties.trace_id).toBe("not-a-trace");
   expect(batch.batch[0].properties.local_path).toBeUndefined();
-  expect(batch.batch[0].properties.future_counter).toBeUndefined();
+  expect(batch.batch[0].properties.prompt).toBeUndefined();
+  expect(batch.batch[0].properties.future_counter).toBe(123);
+  expect(batch.batch[0].properties.future_flag).toBe(true);
+  expect(batch.batch[0].properties.future_token).toBe("new_metric:v2");
+  expect(batch.batch[0].properties.future_counts).toEqual({ new_metric: 2, "another.key": 1 });
+  expect(batch.batch[0].properties.bad_array).toBeUndefined();
+  expect(batch.batch[0].properties.bad_object).toBeUndefined();
+  expect(batch.batch[0].properties["bad-key"]).toBeUndefined();
+});
+
+test("product telemetry rejects legacy non-squeezy event names", async () => {
+  let called = false;
+  globalThis.fetch = async () => {
+    called = true;
+    return new Response(null, { status: 200 });
+  };
+
+  const response = await worker.fetch(
+    new Request("https://telemetry.example/v1/batch", {
+      method: "POST",
+      body: JSON.stringify({
+        schema_version: 1,
+        user_id: "11111111-1111-4111-8111-111111111111",
+        install_id: "11111111-1111-4111-8111-111111111111",
+        session_id: "22222222-2222-4222-8222-222222222222",
+        app_version: "0.1.0",
+        os: "macos",
+        arch: "aarch64",
+        events: [
+          {
+            event: "approval_best_effort_fallback",
+            timestamp_ms: Date.now(),
+            event_sequence: 1,
+            properties: { tool_name: "shell" },
+          },
+        ],
+      }),
+    }),
+    env(),
+  );
+
+  expect(response.status).toBe(400);
+  expect(called).toBe(false);
 });
 
 test("site telemetry accepts page view and forwards sanitized properties", async () => {
