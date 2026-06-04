@@ -4503,7 +4503,7 @@ async fn slash_help_lists_topics() {
         transcript_message_contents(&app).contains(&"/help"),
         "user prompt should remain in the transcript"
     );
-    assert!(content.contains("Supported topics"), "{content}");
+    assert!(content.contains("Available `/help` topics"), "{content}");
     assert!(content.contains("`providers`"), "{content}");
 }
 
