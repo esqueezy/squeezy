@@ -1,7 +1,7 @@
 //! Full-page config UI invoked via `/config` or F11.
 //!
-//! Layout: two scope tabs (User / Project) on top, a section sidebar on the
-//! left, a field editor on the right, and a footer hint row at the bottom.
+//! Layout: three scope tabs (User / Repo / Local) on top, a section sidebar on
+//! the left, a field editor on the right, and a footer hint row at the bottom.
 //! Saves write the corresponding TOML file via `squeezy_core::settings_writer`
 //! and apply changes by tier: `Immediate` → `agent.replace_config(...)`;
 //! `NextPrompt` → `agent.arm_config_swap(...)`; `Restart` → notification only.
