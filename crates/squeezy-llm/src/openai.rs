@@ -34,6 +34,9 @@ pub struct OpenAiProvider {
     api_version: Option<String>,
     auth_mode: OpenAiAuthMode,
     extra_headers: BTreeMap<String, String>,
+    organization: Option<String>,
+    project: Option<String>,
+    service_tier: Option<String>,
     /// Logical model id → Azure-deployment name. Populated only from
     /// [`AzureOpenAiConfig::deployment_name_map`]; every other constructor
     /// leaves this empty so the model id passes through verbatim.
@@ -61,6 +64,9 @@ impl std::fmt::Debug for OpenAiProvider {
                 "extra_headers",
                 &format_args!("<{} headers>", self.extra_headers.len()),
             )
+            .field("organization", &self.organization)
+            .field("project", &self.project)
+            .field("service_tier", &self.service_tier)
             .field("deployment_name_map", &self.deployment_name_map)
             .field("transport", &self.transport)
             .finish()
@@ -71,13 +77,17 @@ impl OpenAiProvider {
     pub fn from_config(config: &OpenAiConfig) -> Result<Self> {
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
-        Ok(Self::with_api_key_source(
+        let mut provider = Self::with_api_key_source(
             "openai",
             static_api_key_source(api_key, "openai"),
             config.base_url.trim_end_matches('/').to_string(),
             None,
             config.transport,
-        ))
+        );
+        provider.organization = config.organization.clone();
+        provider.project = config.project.clone();
+        provider.service_tier = config.service_tier.clone();
+        Ok(provider)
     }
 
     pub fn from_azure_config(config: &AzureOpenAiConfig) -> Result<Self> {
@@ -121,6 +131,9 @@ impl OpenAiProvider {
             Some(config.api_version.clone()),
             auth_mode,
             config.extra_headers.clone(),
+            None,
+            None,
+            None,
             config.transport,
         );
         provider.deployment_name_map = config.deployment_name_map.clone();
@@ -181,6 +194,9 @@ impl OpenAiProvider {
             api_version,
             OpenAiAuthMode::Bearer,
             BTreeMap::new(),
+            None,
+            None,
+            None,
             transport,
         )
     }
@@ -192,6 +208,9 @@ impl OpenAiProvider {
         api_version: Option<String>,
         auth_mode: OpenAiAuthMode,
         extra_headers: BTreeMap<String, String>,
+        organization: Option<String>,
+        project: Option<String>,
+        service_tier: Option<String>,
         transport: ProviderTransportConfig,
     ) -> Self {
         Self {
@@ -202,6 +221,9 @@ impl OpenAiProvider {
             api_version,
             auth_mode,
             extra_headers,
+            organization,
+            project,
+            service_tier,
             deployment_name_map: BTreeMap::new(),
             transport,
         }
@@ -218,6 +240,25 @@ impl OpenAiProvider {
     /// their on-disk shape, so we do not lowercase here.
     pub(crate) fn resolve_deployment_name<'a>(&'a self, model: &'a str) -> &'a str {
         resolve_deployment_name(&self.deployment_name_map, model)
+    }
+
+    fn apply_openai_metadata_headers(
+        &self,
+        mut builder: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        if let Some(value) = self.organization.as_deref() {
+            builder = builder.header("OpenAI-Organization", value);
+        }
+        if let Some(value) = self.project.as_deref() {
+            builder = builder.header("OpenAI-Project", value);
+        }
+        builder
+    }
+
+    fn apply_service_tier(&self, body: &mut Value) {
+        if let Some(service_tier) = self.service_tier.as_deref() {
+            body["service_tier"] = json!(service_tier);
+        }
     }
 
     pub(crate) fn request_body(request: &LlmRequest, provider_name: &str) -> Value {
@@ -572,9 +613,11 @@ impl LlmProvider for OpenAiProvider {
         if deployment != request.model.as_ref() {
             body["model"] = json!(deployment);
         }
+        self.apply_service_tier(&mut body);
         let affinity_headers = Self::affinity_headers(&request);
         let auth_mode = self.auth_mode;
         let extra_headers = self.extra_headers.clone();
+        let provider = self.clone();
 
         Box::pin(try_stream! {
             let response = send_with_auth_retry(
@@ -588,6 +631,7 @@ impl LlmProvider for OpenAiProvider {
                         OpenAiAuthMode::Bearer => builder.bearer_auth(key),
                         OpenAiAuthMode::HeadersOnly => builder,
                     };
+                    let builder = provider.apply_openai_metadata_headers(builder);
                     // Cache-affinity headers (only emitted when the
                     // request carries a cache key) keep multi-turn
                     // sessions pinned to the backend that warmed the

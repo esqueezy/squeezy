@@ -55,6 +55,64 @@ fn request_body_uses_responses_streaming_shape() {
 }
 
 #[test]
+fn openai_config_forwards_org_project_and_service_tier() {
+    let config = squeezy_core::OpenAiConfig {
+        api_key_env: "OPENAI_TEST_KEY_ENV_DOES_NOT_NEED_TO_EXIST".to_string(),
+        api_key: Some("test-key".to_string()),
+        base_url: "https://api.openai.com/v1".to_string(),
+        organization: Some("org_test".to_string()),
+        project: Some("proj_test".to_string()),
+        service_tier: Some("priority".to_string()),
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    };
+
+    let provider = OpenAiProvider::from_config(&config).expect("provider build");
+
+    assert_eq!(provider.organization.as_deref(), Some("org_test"));
+    assert_eq!(provider.project.as_deref(), Some("proj_test"));
+    assert_eq!(provider.service_tier.as_deref(), Some("priority"));
+}
+
+#[test]
+fn openai_metadata_lands_on_wire_headers_and_body() {
+    let config = squeezy_core::OpenAiConfig {
+        api_key_env: "OPENAI_TEST_KEY_ENV_DOES_NOT_NEED_TO_EXIST".to_string(),
+        api_key: Some("test-key".to_string()),
+        base_url: "https://api.openai.com/v1".to_string(),
+        organization: Some("org_test".to_string()),
+        project: Some("proj_test".to_string()),
+        service_tier: Some("flex".to_string()),
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    };
+    let provider = OpenAiProvider::from_config(&config).expect("provider build");
+
+    let request = provider
+        .apply_openai_metadata_headers(
+            reqwest::Client::new().post("https://api.openai.com/v1/responses"),
+        )
+        .build()
+        .expect("request builds");
+    assert_eq!(
+        request
+            .headers()
+            .get("OpenAI-Organization")
+            .and_then(|value| value.to_str().ok()),
+        Some("org_test"),
+    );
+    assert_eq!(
+        request
+            .headers()
+            .get("OpenAI-Project")
+            .and_then(|value| value.to_str().ok()),
+        Some("proj_test"),
+    );
+
+    let mut body = json!({});
+    provider.apply_service_tier(&mut body);
+    assert_eq!(body["service_tier"], "flex");
+}
+
+#[test]
 fn request_body_forwards_tool_choice_when_tools_empty() {
     // M-03: a Responses replay continuation re-attaches tools via
     // `previous_response_id`; the caller still needs to set
