@@ -1218,7 +1218,7 @@ pub fn answer_slash_command(topic: &str) -> Option<HelpAnswer> {
         entry.name, entry.what, entry.syntax
     );
     for example in entry.examples {
-        let _ = write!(body, "- {example}\n");
+        let _ = writeln!(body, "- {example}");
     }
     if !entry.available_during_turn {
         body.push_str("\n**Note:** Cannot run while a turn is in progress.\n");
@@ -1337,7 +1337,7 @@ fn top_topics_for_text(input: &str, n: usize) -> Vec<&'static TopicDefinition> {
             scored.push((score, topic));
         }
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
     scored.into_iter().take(n).map(|(_, topic)| topic).collect()
 }
 
@@ -1526,9 +1526,8 @@ pub fn relevant_docs_for_input(input: &str) -> Vec<BundledDoc> {
     // so the "/help" alias on the skills topic does not spuriously match every /help query.
     let explicit = parse_help_command(trimmed).filter(|t| !t.is_empty());
     let topic = explicit
-        .as_deref()
         .and_then(find_topic)
-        .or_else(|| best_topic_for_text(explicit.as_deref().unwrap_or(trimmed)));
+        .or_else(|| best_topic_for_text(explicit.unwrap_or(trimmed)));
 
     let Some(topic) = topic else {
         return bundled_docs();
