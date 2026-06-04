@@ -4,8 +4,13 @@ const MAX_FEEDBACK_BODY_BYTES = 32 * 1024;
 const MAX_FEEDBACK_MESSAGE_BYTES = 16 * 1024;
 const MAX_REPORT_BYTES = 2 * 1024 * 1024;
 const MAX_EVENTS = 50;
+const MAX_PRODUCT_PROPERTIES = 128;
+const MAX_COUNT_MAP_ENTRIES = 16;
 const SCHEMA_VERSION = 1;
 const DEFAULT_POSTHOG_HOST = "https://eu.i.posthog.com";
+const PRODUCT_EVENT_RE = /^squeezy_[a-z0-9_]{1,96}$/;
+const SAFE_TOKEN_RE = /^[A-Za-z0-9._+:-]+$/;
+const SAFE_PROPERTY_KEY_RE = /^[A-Za-z0-9_]{1,80}$/;
 
 const TEXT_ENCODER = new TextEncoder();
 function utf8ByteLength(text: string): number {
@@ -37,22 +42,6 @@ interface R2Bucket {
   ): Promise<unknown>;
 }
 
-const EVENT_NAMES = new Set([
-  "squeezy_app_started",
-  "squeezy_turn_completed",
-  "squeezy_tool_completed",
-  "squeezy_graph_build_completed",
-  "squeezy_graph_refresh_completed",
-  "squeezy_startup_ready",
-  "squeezy_session_ended",
-  "squeezy_slash_command_used",
-  "squeezy_config_change_committed",
-  "squeezy_failure_seen",
-  "approval_best_effort_fallback",
-  "ai_reviewer_allow_downgrade",
-  "squeezy_routing_routed",
-  "squeezy_routing_escalated",
-]);
 const SITE_EVENT_NAMES = new Set([
   "squeezy_site_page_view",
   "squeezy_site_cta_clicked",
@@ -61,172 +50,6 @@ const SITE_EVENT_NAMES = new Set([
 const FEEDBACK_SOURCES = new Set(["cli", "tui"]);
 const SITE_REFERRER_KINDS = new Set(["none", "internal", "search", "social", "external"]);
 const SITE_TARGET_KINDS = new Set(["internal", "github", "release", "docs", "install", "other"]);
-
-const PROVIDERS = new Set([
-  "open_ai",
-  "anthropic",
-  "google",
-  "azure_open_ai",
-  "bedrock",
-  "ollama",
-  "open_router",
-  "vercel",
-  "port_key",
-  "groq",
-  "x_ai",
-  "deep_seek",
-  "vertex",
-  "mistral",
-  "together",
-  "fireworks",
-  "cerebras",
-  "deep_infra",
-  "baseten",
-  "lmstudio",
-  "vllm",
-  "llamacpp",
-  "cloudflare_workers_ai",
-  "cloudflare_ai_gateway",
-  "open_ai_compatible",
-  "open_ai_codex",
-  "faux",
-]);
-const MODEL_FAMILIES = new Set(["gpt", "claude", "gemini", "bedrock", "ollama", "other"]);
-const TOOL_NAMES = new Set([
-  "glob",
-  "grep",
-  "read_file",
-  "read_tool_output",
-  "write_file",
-  "shell",
-  "webfetch",
-  "websearch",
-  "graph",
-  "ast",
-  "other",
-]);
-const TOOL_FAMILIES = new Set(["search", "read", "write", "shell", "web", "graph", "ast", "other"]);
-const TOOL_STATUSES = new Set(["success", "error", "denied", "stale", "cancelled"]);
-const REFRESH_KINDS = new Set(["cold", "incremental"]);
-const GRAPH_SEQUENCE_SCOPES = new Set(["one_shot", "repeated"]);
-const OUTCOME_STATUSES = new Set(["success", "error", "cancelled", "skipped"]);
-const ERROR_KINDS = new Set(["provider", "tool", "permission", "budget", "graph", "io", "config", "unknown"]);
-const SESSION_STATUSES = new Set(["running", "archived", "completed", "cancelled", "failed", "truncated"]);
-const STARTUP_ROUTES = new Set([
-  "fresh",
-  "direct_resume",
-  "resume_picker_fresh",
-  "resume_picker_resume",
-  "first_run_setup_fresh",
-]);
-const SLASH_SURFACES = new Set(["tui_composer", "tui_inline", "agent_raw"]);
-const SLASH_OUTCOMES = new Set([
-  "accepted",
-  "usage_error",
-  "blocked_during_turn",
-  "unknown",
-  "template_expanded",
-  "started_turn",
-  "opened_overlay",
-  "started_job",
-  "local_action",
-  "skipped",
-  "error",
-]);
-const SLASH_ALIAS_KINDS = new Set(["canonical", "compat_options", "unknown", "template"]);
-const SLASH_ARG_SHAPES = new Set(["none", "present", "fixed_subcommand", "id", "path", "free_text"]);
-const CONFIG_SCOPES = new Set(["user", "project", "local", "session"]);
-const CONFIG_APPLY_TIERS = new Set(["immediate", "next_prompt", "restart"]);
-const CONFIG_CHANGE_KINDS = new Set(["set", "unset", "reset"]);
-
-type PropertySchema = "u64" | "hex64" | "hex32" | "hex16" | "token" | Set<string>;
-
-const PROPERTY_SCHEMAS: Record<string, PropertySchema> = {
-  turn_index: "u64",
-  tool_sequence: "u64",
-  provider: PROVIDERS,
-  model_family: MODEL_FAMILIES,
-  tool_name: TOOL_NAMES,
-  tool_family: TOOL_FAMILIES,
-  tool_status: TOOL_STATUSES,
-  duration_ms: "u64",
-  tool_calls: "u64",
-  files_scanned: "u64",
-  c_files: "u64",
-  csharp_files: "u64",
-  cpp_files: "u64",
-  dart_files: "u64",
-  go_files: "u64",
-  java_files: "u64",
-  javascript_files: "u64",
-  jsx_files: "u64",
-  kotlin_files: "u64",
-  php_files: "u64",
-  python_files: "u64",
-  ruby_files: "u64",
-  rust_files: "u64",
-  scala_files: "u64",
-  swift_files: "u64",
-  typescript_files: "u64",
-  tsx_files: "u64",
-  supported_files: "u64",
-  unsupported_files: "u64",
-  unknown_files: "u64",
-  files_changed: "u64",
-  files_parsed: "u64",
-  bytes_read: "u64",
-  bytes_parsed: "u64",
-  output_bytes: "u64",
-  matches_returned: "u64",
-  symbols: "u64",
-  edges: "u64",
-  input_tokens: "u64",
-  output_tokens: "u64",
-  cached_tokens: "u64",
-  estimated_usd_micros: "u64",
-  receipt_stub_hits: "u64",
-  negative_receipt_hits: "u64",
-  budget_denials: "u64",
-  turn_count: "u64",
-  tool_successes: "u64",
-  tool_errors: "u64",
-  tool_denials: "u64",
-  tool_cancellations: "u64",
-  subagent_calls: "u64",
-  subagent_failures: "u64",
-  excluded_files: "u64",
-  excluded_dirs: "u64",
-  excluded_bytes: "u64",
-  persisted_files_loaded: "u64",
-  persisted_files_missed: "u64",
-  persistence_rebuilt: "u64",
-  refresh_kind: REFRESH_KINDS,
-  graph_sequence_scope: GRAPH_SEQUENCE_SCOPES,
-  status: OUTCOME_STATUSES,
-  session_status: SESSION_STATUSES,
-  startup_route: STARTUP_ROUTES,
-  error_kind: ERROR_KINDS,
-  slash_command: "token",
-  slash_surface: SLASH_SURFACES,
-  slash_outcome: SLASH_OUTCOMES,
-  slash_alias_kind: SLASH_ALIAS_KINDS,
-  slash_arg_shape: SLASH_ARG_SHAPES,
-  config_scope: CONFIG_SCOPES,
-  config_section: "token",
-  config_field: "token",
-  config_apply_tier: CONFIG_APPLY_TIERS,
-  config_change_kind: CONFIG_CHANGE_KINDS,
-  config_prev_bucket: "token",
-  config_new_bucket: "token",
-  args_sha256: "hex64",
-  output_sha256: "hex64",
-  content_sha256: "hex64",
-  sandbox_backend: "token",
-  permission_capability: "token",
-  routing_reason: "token",
-  trace_id: "hex32",
-  span_id: "hex16",
-};
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -659,40 +482,48 @@ function sanitizeEvent(event: JsonObject): SanitizedTelemetryEvent {
 }
 
 function isProductEventName(value: unknown): value is string {
-  if (typeof value !== "string") {
-    return false;
-  }
-  return EVENT_NAMES.has(value) || /^squeezy_[a-z0-9_]{1,96}$/.test(value);
+  return typeof value === "string" && PRODUCT_EVENT_RE.test(value);
 }
 
 function sanitizeProperties(properties: JsonObject): JsonObject {
   assertPlainObject(properties, "properties");
   const sanitized: JsonObject = {};
   for (const [key, value] of Object.entries(properties)) {
-    const schema = PROPERTY_SCHEMAS[key];
-    if (!schema) {
+    if (Object.keys(sanitized).length >= MAX_PRODUCT_PROPERTIES) {
+      break;
+    }
+    if (!SAFE_PROPERTY_KEY_RE.test(key)) {
       continue;
     }
-    try {
-      if (schema === "u64") {
-        assertU64(value, key);
-      } else if (schema === "hex64") {
-        assertHex(value, key, 64);
-      } else if (schema === "hex32") {
-        assertHex(value, key, 32);
-      } else if (schema === "hex16") {
-        assertHex(value, key, 16);
-      } else if (schema === "token") {
-        assertString(value, key, 1, 128);
-      } else if (typeof value !== "string" || !schema.has(value)) {
-        throw new Error(`invalid enum value for ${key}`);
-      }
-    } catch {
+    const safe = sanitizePropertyValue(value, key);
+    if (safe === undefined) {
       continue;
     }
-    sanitized[key] = value;
+    sanitized[key] = safe;
   }
   return sanitized;
+}
+
+function sanitizePropertyValue(value: unknown, label: string): unknown {
+  try {
+    if (Number.isSafeInteger(value) && (value as number) >= 0) {
+      return value;
+    }
+    if (typeof value === "boolean") {
+      return value;
+    }
+    if (typeof value === "string") {
+      assertString(value, label, 1, 128);
+      return value;
+    }
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      assertCountMap(value, label);
+      return value;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }
 
 function assertKeys(object: JsonObject, label: string, allowed: string[]): void {
@@ -714,14 +545,8 @@ function assertString(value: unknown, label: string, min: number, max: number): 
   if (typeof value !== "string" || value.length < min || value.length > max) {
     throw new Error(`${label} must be a bounded string`);
   }
-  if (!/^[A-Za-z0-9._+:-]+$/.test(value)) {
+  if (!SAFE_TOKEN_RE.test(value)) {
     throw new Error(`${label} has invalid characters`);
-  }
-}
-
-function assertHex(value: unknown, label: string, length: number): void {
-  if (typeof value !== "string" || value.length !== length || !/^[0-9a-f]+$/.test(value)) {
-    throw new Error(`${label} must be ${length} lowercase hex chars`);
   }
 }
 
@@ -773,6 +598,24 @@ function assertUuid(value: unknown, label: string): void {
 function assertU64(value: unknown, label: string): void {
   if (!Number.isSafeInteger(value) || (value as number) < 0) {
     throw new Error(`${label} must be a safe non-negative integer`);
+  }
+}
+
+function assertBoolean(value: unknown, label: string): void {
+  if (typeof value !== "boolean") {
+    throw new Error(`${label} must be a boolean`);
+  }
+}
+
+function assertCountMap(value: unknown, label: string): void {
+  assertPlainObject(value, label);
+  const entries = Object.entries(value);
+  if (entries.length === 0 || entries.length > MAX_COUNT_MAP_ENTRIES) {
+    throw new Error(`${label} must be a bounded count map`);
+  }
+  for (const [key, count] of entries) {
+    assertString(key, `${label}.key`, 1, 128);
+    assertU64(count, `${label}.${key}`);
   }
 }
 

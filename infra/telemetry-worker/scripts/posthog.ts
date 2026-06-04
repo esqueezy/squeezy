@@ -44,10 +44,7 @@ SELECT
   uniq(distinct_id) AS distinct_ids,
   max(timestamp) AS latest
 FROM events
-WHERE (
-    startsWith(event, 'squeezy_')
-    OR event IN ('approval_best_effort_fallback', 'ai_reviewer_allow_downgrade')
-  )
+WHERE startsWith(event, 'squeezy_')
   AND timestamp > now() - INTERVAL 30 DAY
 GROUP BY event
 ORDER BY latest DESC
@@ -64,10 +61,7 @@ SELECT
   event,
   count() AS events
 FROM events
-WHERE (
-    startsWith(event, 'squeezy_')
-    OR event IN ('approval_best_effort_fallback', 'ai_reviewer_allow_downgrade')
-  )
+WHERE startsWith(event, 'squeezy_')
   AND timestamp > now() - INTERVAL 30 DAY
 GROUP BY day, event
 ORDER BY day ASC, event ASC
@@ -84,10 +78,7 @@ SELECT
   distinct_id,
   properties
 FROM events
-WHERE (
-    startsWith(event, 'squeezy_')
-    OR event IN ('approval_best_effort_fallback', 'ai_reviewer_allow_downgrade')
-  )
+WHERE startsWith(event, 'squeezy_')
   AND timestamp > now() - INTERVAL 24 HOUR
 ORDER BY timestamp DESC
 LIMIT 200
@@ -96,13 +87,14 @@ LIMIT 200
   {
     dashboard: "product",
     name: "Squeezy DAU",
-    description: "Daily anonymous unique users from app startup events.",
+    description: "Daily anonymous unique users from completed session summaries.",
     query: `
 SELECT
   toDate(timestamp) AS day,
-  uniq(properties.user_id) AS users
+  uniq(properties.user_id) AS users,
+  count() AS sessions
 FROM events
-WHERE event = 'squeezy_app_started'
+WHERE event = 'squeezy_session_summary'
   AND timestamp > now() - INTERVAL 30 DAY
 GROUP BY day
 ORDER BY day ASC
@@ -118,7 +110,7 @@ SELECT
   count() AS events,
   uniq(properties.user_id) AS users
 FROM events
-WHERE event = 'squeezy_app_started'
+WHERE event = 'squeezy_session_summary'
   AND timestamp > now() - INTERVAL 30 DAY
 GROUP BY app_version
 ORDER BY events DESC
@@ -171,7 +163,7 @@ SELECT
   count() AS events,
   uniq(properties.user_id) AS users
 FROM events
-WHERE event = 'squeezy_app_started'
+WHERE event = 'squeezy_session_summary'
   AND timestamp > now() - INTERVAL 30 DAY
 GROUP BY platform
 ORDER BY users DESC
@@ -179,26 +171,27 @@ ORDER BY users DESC
   },
   {
     dashboard: "reliability",
-    name: "Squeezy Tool Calls By Status",
-    description: "First-party tool-call volume by tool and outcome.",
+    name: "Squeezy Tool Outcomes",
+    description: "First-party tool-call outcome counters from session summaries.",
     query: `
 SELECT
-  properties.tool_name AS tool_name,
-  properties.tool_status AS status,
-  count() AS calls,
-  avg(toUInt64OrZero(toString(properties.duration_ms))) AS avg_duration_ms
+  toDate(timestamp) AS day,
+  sum(toUInt64OrZero(toString(properties.tool_calls))) AS tool_calls,
+  sum(toUInt64OrZero(toString(properties.tool_successes))) AS successes,
+  sum(toUInt64OrZero(toString(properties.tool_errors))) AS errors,
+  sum(toUInt64OrZero(toString(properties.tool_denials))) AS denials,
+  sum(toUInt64OrZero(toString(properties.tool_cancellations))) AS cancellations
 FROM events
-WHERE event = 'squeezy_tool_completed'
+WHERE event = 'squeezy_session_summary'
   AND timestamp > now() - INTERVAL 30 DAY
-GROUP BY tool_name, status
-ORDER BY calls DESC
-LIMIT 50
+GROUP BY day
+ORDER BY day ASC
 `.trim(),
   },
   {
     dashboard: "product",
-    name: "Squeezy Turn Cost And Tokens",
-    description: "Turn-level token and estimated cost counters.",
+    name: "Squeezy Session Cost And Tokens",
+    description: "Session-level token and estimated cost counters.",
     query: `
 SELECT
   toDate(timestamp) AS day,
@@ -207,7 +200,7 @@ SELECT
   sum(toUInt64OrZero(toString(properties.cached_tokens))) AS cached_tokens,
   sum(toUInt64OrZero(toString(properties.estimated_usd_micros))) / 1000000 AS estimated_usd
 FROM events
-WHERE event = 'squeezy_turn_completed'
+WHERE event = 'squeezy_session_summary'
   AND timestamp > now() - INTERVAL 30 DAY
 GROUP BY day
 ORDER BY day ASC
@@ -216,16 +209,18 @@ ORDER BY day ASC
   {
     dashboard: "reliability",
     name: "Squeezy Failures",
-    description: "Coarse anonymous failure kinds.",
+    description: "Coarse failure and subagent counters from session summaries.",
     query: `
 SELECT
-  properties.error_kind AS error_kind,
-  count() AS failures
+  toDate(timestamp) AS day,
+  sum(toUInt64OrZero(toString(properties.failure_count))) AS failures,
+  sum(toUInt64OrZero(toString(properties.subagent_failures))) AS subagent_failures,
+  sum(toUInt64OrZero(toString(properties.budget_denials))) AS budget_denials
 FROM events
-WHERE event = 'squeezy_failure_seen'
+WHERE event = 'squeezy_session_summary'
   AND timestamp > now() - INTERVAL 30 DAY
-GROUP BY error_kind
-ORDER BY failures DESC
+GROUP BY day
+ORDER BY day ASC
 `.trim(),
   },
   {
@@ -267,74 +262,71 @@ ORDER BY day ASC, source ASC
   {
     dashboard: "reliability",
     name: "Squeezy Graph Build Performance",
-    description: "AST/graph build and refresh performance counters.",
+    description: "AST/graph build and refresh counters from session summaries.",
     query: `
 SELECT
-  event,
-  properties.status AS status,
-  count() AS events,
-  avg(toUInt64OrZero(toString(properties.duration_ms))) AS avg_duration_ms,
+  toDate(timestamp) AS day,
+  sum(toUInt64OrZero(toString(properties.graph_build_count))) AS graph_builds,
+  sum(toUInt64OrZero(toString(properties.graph_refresh_count))) AS graph_refreshes,
   sum(toUInt64OrZero(toString(properties.supported_files))) AS supported_files,
   sum(toUInt64OrZero(toString(properties.unsupported_files))) AS unsupported_files,
-  sum(toUInt64OrZero(toString(properties.rust_files))) AS rust_files
+  sum(toUInt64OrZero(toString(properties.symbols))) AS symbols,
+  sum(toUInt64OrZero(toString(properties.edges))) AS edges
 FROM events
-WHERE event IN ('squeezy_graph_build_completed', 'squeezy_graph_refresh_completed')
+WHERE event = 'squeezy_session_summary'
   AND timestamp > now() - INTERVAL 30 DAY
-GROUP BY event, status
-ORDER BY events DESC
+GROUP BY day
+ORDER BY day ASC
 `.trim(),
   },
   {
     dashboard: "reliability",
     name: "Squeezy Routing Decisions",
-    description: "Cheap-route and escalation counters by reason.",
+    description: "Cheap-route and escalation counters from session summaries.",
     query: `
 SELECT
-  event,
-  properties.routing_reason AS reason,
-  count() AS events,
+  toDate(timestamp) AS day,
+  sum(toUInt64OrZero(toString(properties.routing_routed_count))) AS routed,
+  sum(toUInt64OrZero(toString(properties.routing_escalated_count))) AS escalated,
   uniq(properties.user_id) AS users
 FROM events
-WHERE event IN ('squeezy_routing_routed', 'squeezy_routing_escalated')
+WHERE event = 'squeezy_session_summary'
   AND timestamp > now() - INTERVAL 30 DAY
-GROUP BY event, reason
-ORDER BY events DESC
-LIMIT 50
+GROUP BY day
+ORDER BY day ASC
 `.trim(),
   },
   {
     dashboard: "reliability",
-    name: "Squeezy Sandbox Fallbacks",
-    description: "Best-effort shell sandbox fallback counters by backend.",
+    name: "Squeezy Session Status",
+    description: "Completed, failed, truncated, and abnormal session status counters.",
     query: `
 SELECT
-  properties.sandbox_backend AS backend,
-  count() AS events,
-  uniq(properties.user_id) AS users,
-  max(timestamp) AS latest
+  properties.session_status AS status,
+  properties.abnormal_exit AS abnormal_exit,
+  count() AS sessions,
+  uniq(properties.user_id) AS users
 FROM events
-WHERE event = 'approval_best_effort_fallback'
+WHERE event = 'squeezy_session_summary'
   AND timestamp > now() - INTERVAL 30 DAY
-GROUP BY backend
-ORDER BY events DESC
-LIMIT 50
+GROUP BY status, abnormal_exit
+ORDER BY sessions DESC
 `.trim(),
   },
   {
     dashboard: "reliability",
-    name: "Squeezy Reviewer Allow Downgrades",
-    description: "AI-reviewer allow decisions downgraded by capability allowlist.",
+    name: "Squeezy Startup Routes",
+    description: "Startup route distribution from session summaries.",
     query: `
 SELECT
-  properties.permission_capability AS capability,
-  count() AS events,
-  uniq(properties.user_id) AS users,
-  max(timestamp) AS latest
+  properties.startup_route AS startup_route,
+  count() AS sessions,
+  uniq(properties.user_id) AS users
 FROM events
-WHERE event = 'ai_reviewer_allow_downgrade'
+WHERE event = 'squeezy_session_summary'
   AND timestamp > now() - INTERVAL 30 DAY
-GROUP BY capability
-ORDER BY events DESC
+GROUP BY startup_route
+ORDER BY sessions DESC
 LIMIT 50
 `.trim(),
   },
@@ -403,41 +395,44 @@ async function smokeWorker(): Promise<void> {
     arch: "arm64",
     events: [
       {
-        event: "squeezy_app_started",
+        event: "squeezy_session_summary",
         timestamp_ms: now,
         event_sequence: 1,
         properties: {
-          provider: "open_ai",
-          model_family: "gpt",
-        },
-      },
-      {
-        event: "squeezy_tool_completed",
-        timestamp_ms: now + 1,
-        event_sequence: 2,
-        properties: {
-          turn_index: 1,
-          tool_sequence: 1,
-          tool_name: "grep",
-          tool_family: "search",
-          tool_status: "success",
-          duration_ms: 12,
-          files_scanned: 3,
-          bytes_read: 128,
-          output_bytes: 64,
-          matches_returned: 2,
-        },
-      },
-      {
-        event: "squeezy_turn_completed",
-        timestamp_ms: now + 2,
-        event_sequence: 3,
-        properties: {
-          turn_index: 1,
-          provider: "open_ai",
-          model_family: "gpt",
-          status: "success",
+          summary_id: crypto.randomUUID(),
+          trace_id: "0".repeat(32),
+          started_at_ms: now - 2500,
+          ended_at_ms: now,
+          source_records: 9,
+          dropped_buckets: 0,
+          abnormal_exit: false,
+          telemetry_truncated: false,
+          session_status: "completed",
+          startup_route: "fresh",
+          duration_ms: 2500,
+          turn_count: 1,
           tool_calls: 1,
+          tool_successes: 1,
+          tool_errors: 0,
+          tool_denials: 0,
+          tool_cancellations: 0,
+          graph_build_count: 1,
+          graph_refresh_count: 0,
+          slash_command_count: 1,
+          config_change_count: 0,
+          failure_count: 1,
+          routing_routed_count: 1,
+          routing_escalated_count: 0,
+          subagent_calls: 0,
+          subagent_failures: 0,
+          provider: "open_ai",
+          model_family: "gpt",
+          files_scanned: 3,
+          files_parsed: 3,
+          supported_files: 3,
+          unsupported_files: 0,
+          symbols: 12,
+          edges: 20,
           input_tokens: 100,
           output_tokens: 20,
           cached_tokens: 10,
@@ -445,14 +440,14 @@ async function smokeWorker(): Promise<void> {
           receipt_stub_hits: 0,
           negative_receipt_hits: 0,
           budget_denials: 0,
-        },
-      },
-      {
-        event: "squeezy_failure_seen",
-        timestamp_ms: now + 3,
-        event_sequence: 4,
-        properties: {
-          error_kind: "unknown",
+          bytes_read: 128,
+          output_bytes: 64,
+          matches_returned: 2,
+          tool_counts: { grep: 1 },
+          slash_counts: { plan: 1 },
+          failure_counts: { unknown: 1 },
+          routing_counts: { "routed:smoke": 1 },
+          config_counts: { "model.model": 1 },
         },
       },
     ],
@@ -502,14 +497,15 @@ async function verifyPosthog(): Promise<void> {
       kind: "HogQLQuery",
       query: `
 SELECT
+  timestamp,
   event,
-  count() AS events,
-  max(timestamp) AS latest
+  distinct_id,
+  properties
 FROM events
-WHERE event LIKE 'squeezy_%'
+WHERE event = 'squeezy_session_summary'
   AND timestamp > now() - INTERVAL 1 HOUR
-GROUP BY event
-ORDER BY event ASC
+ORDER BY timestamp DESC
+LIMIT 20
 /* smoke ${Date.now()} */
 `.trim(),
     },
