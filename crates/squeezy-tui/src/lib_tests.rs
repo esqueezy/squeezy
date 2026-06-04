@@ -13279,3 +13279,70 @@ fn rail_chrome_lights_special_nodes() {
     assert!(is_rail_work_node(&subagent));
     assert!(!is_rail_work_node(&plain));
 }
+
+/// Fixture: a full turn (reasoning → tool → subagent breadcrumbs → a failed
+/// tool → answer) rendered on the inline Quiet Rail. Guards the combined
+/// look — every work node threads the rail, the failure's stderr is not
+/// duplicated, and the answer leaves the rail set off by a blank line.
+#[test]
+fn rail_gallery_renders_a_full_turn() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user(
+        "Refactor the auth module and run the workspace tests",
+    ));
+    app.push_reasoning_segment(squeezy_core::ReasoningSnapshot::from_payload(
+        squeezy_core::ReasoningPayload::OpenAi {
+            item_id: "rsn-1".to_string(),
+            summary: vec!["Plan: read auth.rs, delegate an audit, then run the tests.".to_string()],
+            encrypted_content: None,
+        },
+    ));
+    app.push_tool_result(sample_tool_result(
+        "grep",
+        "src/auth.rs:12: fn login(\nsrc/auth.rs:40: fn logout(",
+    ));
+    app.push_subagent_note("delegate subagent started: Audit auth.rs".to_string());
+    app.push_subagent_note(
+        "delegate subagent completed · 5 tools · Found 2 issues: missing rate-limit, weak password hash"
+            .to_string(),
+    );
+    let mut failed = sample_tool_result("shell", "");
+    failed.status = ToolStatus::Error;
+    failed.content = serde_json::json!({
+        "command": "cargo test --workspace",
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": "error[E0308]: mismatched types\n  --> src/auth.rs:12:5\n   |\n12 |     login(user)\n   |     ^^^^^ expected String, found &str",
+    });
+    app.push_tool_result(failed);
+    app.push_transcript_item(TranscriptItem::assistant(
+        "Found 2 auth issues; the test failure is a type mismatch in login().",
+    ));
+    app.finalize_settles_for_test();
+
+    let len = app.transcript.len();
+    let scrollback = lines_to_plain_text(&inline_history_lines_for_flush(&app, 96, true, 0, len));
+
+    // Every work node threads the rail.
+    assert!(scrollback.contains("├─▸ reasoning · Plan:"), "{scrollback}");
+    assert!(
+        scrollback.contains("├─◆ delegate subagent started"),
+        "{scrollback}"
+    );
+    assert!(
+        scrollback.contains("├─◆ delegate subagent completed · 5 tools"),
+        "{scrollback}"
+    );
+    assert!(scrollback.contains("├─✖ Failed cargo test"), "{scrollback}");
+    // The auto-expanded stderr renders exactly once (no duplication).
+    assert_eq!(
+        scrollback.matches("expected String, found &str").count(),
+        1,
+        "{scrollback}"
+    );
+    // The answer leaves the rail (no gutter) and is set off by a blank line.
+    assert!(
+        scrollback.contains("exit 1\n\n  ● Found 2 auth issues"),
+        "{scrollback}"
+    );
+}
