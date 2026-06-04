@@ -290,16 +290,43 @@ enumeration. Prioritized:
   inherited-method call resolution). TODO: same for C (`c_family.rs`) and Go (`go.rs`) if pursued.
 - **GAP 2 (LANDED):** grep→graph augment dropped all-but-last supertype in `extends (A|B|C)`. Now
   enumerates all (`file_ops.rs` `InheritanceGrep.base_name` → `base_names: Vec`). Unit-tested.
-- **GAP 3:** augment doesn't know Ruby `include`/`prepend` mixin idiom (ruby's 30-grep storm).
-  Blocked on whether the graph indexes Ruby `include` (no Ruby extractor surfaced — verify first).
-- **GAP 4:** model under-uses the graph even when available; and per-member read-storm on
-  enumerate-and-classify — a higher-level "enumerate members + return bodies" retrieval would
-  collapse decl_search + N read_slice into 1 call.
+- **GAP 3 (LANDED):** Ruby DID index `include` but as `mixin:include:<T>`, which the augment's
+  `mixin:<T>` query can't substring-match. Now emits BOTH `mixin:<T>` (queryable) and the tagged
+  form (`squeezy-parse/languages/ruby.rs`), and `include`/`prepend` added to the augment's
+  `INHERITANCE_OPS` (`file_ops.rs`) so `include Sidekiq::Component` greps fire. Unit-tested.
+- **GAP 4(a) (LANDED):** added a steer to `DEFAULT_INSTRUCTIONS` (`squeezy-core/src/lib.rs`):
+  when a graph result gives a symbol_id, read its body with `read_slice(symbol_id, span_kind=body)`
+  not whole-file `read_file`; for enumerate-then-inspect tasks, enumerate once via
+  hierarchy/decl_search/reference_search then read only resolved spans. Targets the residual ts
+  variance (a run reverting to the read-file storm) + java's read-storm. NOTE: global-prompt change
+  → measure for regressions on already-winning langs.
+- **GAP 4(b) (DEFERRED):** batch `read_slice(symbol_ids=[...])`. The agent confirmed the model
+  already batches read_slice within ONE turn, so a batch tool saves only per-call args/reasoning
+  (modest) for non-trivial risk in the security-sensitive read path. Designed; deferred unless
+  measurement shows the steer (4a) is insufficient.
+- **#6 (chain-trace depth cap):** subsumed — the graph BFS is already capped (MAX_GRAPH_MAX_DEPTH=8);
+  the `deep_chain_expansion` finding is a heuristic for ≥4 read_slice/grep in a turn, addressed by
+  the GAP 4(a) steer, not a new hard cap.
 
 After A3 lands: re-measure FIX langs head-to-head; FIX-by-ratio + h2h-WIN = a kept graph-attributable
 win. THEN iterate A2 tasks/repos for the rest (go/python/js likely need a larger same-lang repo).
 
-### RESULT — GAP 1 moved `ts` from a clear LOSS to a (variance-bound) WIN
+### RESULT (round 2) — honest n=5 head-to-heads after GAP 1/2/3/4
+- **ruby (mini): TIE → WIN.** GAP 3 flipped it: $0.061 vs codex $0.079 = **0.76, 100% recall** (n=5).
+  Mechanism: the augment now fires on `include Sidekiq::Component` and `decl_search mixin:Component`
+  resolves the mixers, so the model's grep-storm collapsed 48 → ~20 tool calls. Clean graph win.
+- **ts (haiku): LOSS narrowed but NOT flipped.** At n=5: $0.209 vs CC $0.185 = **1.13** (was 1.26;
+  100% recall). My earlier n=3 "WIN 0.62" was VARIANCE — corrected. GAP 1 is a real capability win
+  (TS inheritance now graph-queryable, tighter reads on good runs) but ts is too high-variance to be
+  a reliable win at n=5. Honest: GAP 1 helped, did not clinch ts.
+- **java (mini): still a marginal LOSS, now on RECALL.** Cost IMPROVED (0.79× vs old 0.96×) but the
+  aggressive GAP 4(a) steer ("read only resolved spans, don't whole-file read per item") dropped
+  recall 100% → 94.4% (17/18) — the "cheaper because it did less" trap the plan forbids. => SOFTENED
+  GAP 4(a) to just "graph id → prefer read_slice over read_file" (recall-neutral); re-validating.
+- LESSON: a global-prompt steer that trades thoroughness for cost violates "cheaper AT EQUAL recall".
+  Measure recall, not just cost, before shipping any steer.
+
+### RESULT (round 1) — GAP 1 moved `ts` from a clear LOSS to a (variance-bound) WIN
 - Pre-GAP1 (clean binary): ts h2h LOSS 1.26 (sqz $0.243 vs CC $0.193); with-graph did 25 whole-file
   `read_file`s + 0 inheritance queries because `decl_search base:` returned nothing for TS.
 - Post-GAP1: with-graph dropped to ~$0.15–0.18 median (samples span $0.094–$0.237 — HIGH variance);
