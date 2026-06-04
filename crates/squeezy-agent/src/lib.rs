@@ -1914,6 +1914,30 @@ impl Agent {
         }
         let skills_changed = next.skills != self.config.skills;
         let workspace_changed = next.workspace_root != self.config.workspace_root;
+        // Hot-reload MCP servers when the diff touches `[mcp.servers]`.
+        // The tool *runtime* (the rest of `ToolRegistry`) still requires
+        // a full restart, but a server-map drift is exactly what the
+        // `/mcp` config page and the settings watcher need to propagate
+        // without losing the running session. We spawn into the tracked
+        // `JoinSet` so `Agent::shutdown` can wait for the registry to
+        // settle before dropping the redb store.
+        if next.mcp_servers != self.config.mcp_servers {
+            let tools = self.tools.clone();
+            let servers = next.mcp_servers.clone();
+            let task = async move {
+                let _ = tools
+                    .replace_mcp_servers(servers, CancellationToken::new())
+                    .await;
+            };
+            match self.background_tasks.lock() {
+                Ok(mut tasks) => {
+                    tasks.spawn(task);
+                }
+                Err(poison) => {
+                    poison.into_inner().spawn(task);
+                }
+            }
+        }
         self.config = next;
         if skills_changed || workspace_changed {
             self.rebuild_skills_catalog();
@@ -2138,6 +2162,64 @@ impl Agent {
     /// can issue `mcp__*` tool calls without racing the background task.
     pub async fn refresh_mcp_tools(&self) -> squeezy_tools::McpRefreshOutcome {
         self.tools.refresh_mcp_tools(CancellationToken::new()).await
+    }
+
+    /// Toggle an MCP server's `enabled` flag without restarting the
+    /// agent. Returns the same refresh outcome `refresh_mcp_tools`
+    /// produces so the caller (the `/mcp` config page, eval driver)
+    /// can pull the new per-server status.
+    pub async fn set_mcp_server_enabled(
+        &mut self,
+        server_name: &str,
+        enabled: bool,
+    ) -> squeezy_tools::McpResult<squeezy_tools::McpRefreshOutcome> {
+        let outcome = self
+            .tools
+            .set_mcp_server_enabled(server_name, enabled, CancellationToken::new())
+            .await?;
+        // Keep `self.config.mcp_servers` aligned with the registry so
+        // the next config snapshot reflects the toggle without going
+        // back to disk.
+        if let Some(server) = self.config.mcp_servers.get_mut(server_name) {
+            server.enabled = enabled;
+        }
+        Ok(outcome)
+    }
+
+    /// Restart an MCP server in place: tear down its live session and
+    /// re-run discovery.
+    pub async fn restart_mcp_server(
+        &self,
+        server_name: &str,
+    ) -> squeezy_tools::McpResult<squeezy_tools::McpRefreshOutcome> {
+        self.tools
+            .restart_mcp_server(server_name, CancellationToken::new())
+            .await
+    }
+
+    /// Replace the entire MCP server map without restarting the
+    /// agent. Used for add/remove flows from the `/mcp` config page
+    /// and to honour external `settings.toml` edits picked up by the
+    /// settings watcher.
+    pub async fn replace_mcp_servers(
+        &mut self,
+        servers: std::collections::BTreeMap<String, squeezy_core::McpServerConfig>,
+    ) -> squeezy_tools::McpRefreshOutcome {
+        self.config.mcp_servers = servers.clone();
+        self.tools
+            .replace_mcp_servers(servers, CancellationToken::new())
+            .await
+    }
+
+    /// Snapshot of the registry's live server map. Mirrors
+    /// `AppConfig.mcp_servers` but reads from the registry directly so
+    /// callers see post-`replace_mcp_servers` state.
+    pub fn mcp_servers(&self) -> std::collections::BTreeMap<String, squeezy_core::McpServerConfig> {
+        self.tools.mcp_servers()
+    }
+
+    pub fn mcp_status_snapshot(&self) -> squeezy_tools::McpStatusSnapshot {
+        self.tools.mcp_status_snapshot()
     }
 
     /// Drain every background task the agent spawned (currently just the
@@ -3293,6 +3375,7 @@ impl Agent {
             | DispatchCommand::RevertTurn { .. }
             | DispatchCommand::Help { .. }
             | DispatchCommand::Config { .. }
+            | DispatchCommand::Mcp
             | DispatchCommand::Model
             | DispatchCommand::Plans { .. }
             | DispatchCommand::Feedback { .. }
@@ -12584,6 +12667,7 @@ fn telemetry_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         DispatchCommand::Cost
         | DispatchCommand::Context
         | DispatchCommand::Reviewer
+        | DispatchCommand::Mcp
         | DispatchCommand::Model
         | DispatchCommand::Permissions
         | DispatchCommand::Attachments

@@ -74,6 +74,7 @@ mod history;
 mod input;
 mod keymap;
 mod keymap_config;
+mod mcp_settings_edit;
 mod mention;
 mod notification;
 mod overlay;
@@ -895,6 +896,17 @@ async fn run_inner_with_terminal(
             apply_external_settings_reload(&mut app, &mut agent);
             app.needs_redraw = true;
         }
+        // While `/mcp` is open, refresh the cached registry view each
+        // animation tick so background discovery results (status row
+        // flipping ready/failed) appear without requiring a key press.
+        if app.config_screen.is_some()
+            && app.animation_tick.is_multiple_of(settings_poll_every)
+            && let Some(state) = app.config_screen.as_ref()
+            && state.current_section().id == squeezy_core::config_schema::SectionId::McpServers
+        {
+            refresh_mcp_screen_state(&mut app, &agent);
+            app.needs_redraw = true;
+        }
         // Refresh the language-summary status item from the graph at
         // the same cadence as the settings poll. The agent call is
         // cheap when the file watcher hasn't queued changes (graph
@@ -1267,6 +1279,163 @@ async fn apply_plan_choice(
 /// Read errors are surfaced as a notification but do not interrupt the
 /// session — the most common cause is mid-write (the editor truncating the
 /// file before re-writing) and the next poll will see the finished file.
+/// Drain MCP actions staged by the `/mcp` config page key handlers
+/// and dispatch them through the agent. Each action is async because
+/// it reaches into the registry to (re)open sessions and run
+/// discovery; the page handler stages them on the screen state so
+/// the per-key code stays sync.
+async fn drain_mcp_actions(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    feedback: &mut config_screen::ConfigFeedback,
+) {
+    let actions: Vec<config_screen::McpAction> = match app.config_screen.as_mut() {
+        Some(state) => std::mem::take(&mut state.mcp_pending_actions),
+        None => return,
+    };
+    for action in actions {
+        apply_mcp_action(app, agent, feedback, action).await;
+    }
+    // After every batch, refresh the cached snapshot so the next
+    // render reflects the live registry/status — even partial
+    // failures should surface the new state.
+    refresh_mcp_screen_state(app, agent);
+}
+
+async fn apply_mcp_action(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    feedback: &mut config_screen::ConfigFeedback,
+    action: config_screen::McpAction,
+) {
+    use config_screen::{McpAction, Severity};
+    match action {
+        McpAction::Toggle {
+            server,
+            enabled,
+            persist,
+        } => {
+            if persist && let Err(err) = persist_mcp_toggle(app, &server, enabled) {
+                feedback.push(format!("mcp toggle persist failed: {err}"), Severity::Error);
+            }
+            match agent.set_mcp_server_enabled(&server, enabled).await {
+                Ok(_) => {}
+                Err(err) => {
+                    feedback.push(format!("mcp toggle failed: {err}"), Severity::Error);
+                }
+            }
+        }
+        McpAction::Restart { server } => match agent.restart_mcp_server(&server).await {
+            Ok(_) => {}
+            Err(err) => {
+                feedback.push(format!("mcp restart failed: {err}"), Severity::Error);
+            }
+        },
+        McpAction::Add {
+            name,
+            server,
+            persist,
+        } => {
+            if persist && let Err(err) = persist_mcp_add(app, &name, &server) {
+                feedback.push(format!("mcp add persist failed: {err}"), Severity::Error);
+            }
+            let mut next = agent.mcp_servers();
+            next.insert(name.clone(), *server);
+            agent.replace_mcp_servers(next).await;
+        }
+        McpAction::Remove { name, persist } => {
+            if persist && let Err(err) = persist_mcp_remove(app, &name) {
+                feedback.push(format!("mcp remove persist failed: {err}"), Severity::Error);
+            }
+            let mut next = agent.mcp_servers();
+            next.remove(&name);
+            agent.replace_mcp_servers(next).await;
+        }
+    }
+}
+
+/// Refresh the `/mcp` page's cached server map and status snapshot
+/// from the live agent. Called after every MCP action and once per
+/// animation tick so the page reflects in-flight discovery.
+fn refresh_mcp_screen_state(app: &mut TuiApp, agent: &Agent) {
+    if let Some(state) = app.config_screen.as_mut() {
+        state.mcp_servers = agent.mcp_servers();
+        state.mcp_status = agent.mcp_status_snapshot();
+    }
+}
+
+/// Persist a single server's `enabled` toggle to the active config
+/// scope's TOML. Mirrors `squeezy mcp enable/disable` so a CLI run
+/// later sees the same file.
+fn persist_mcp_toggle(app: &TuiApp, name: &str, enabled: bool) -> std::io::Result<()> {
+    let state = match app.config_screen.as_ref() {
+        Some(state) => state,
+        None => return Ok(()),
+    };
+    let path = config_screen::tier_path(state, state.scope);
+    mcp_settings_edit::mcp_settings_edit(&path, |servers| {
+        let entry = servers
+            .entry(name)
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        if let Some(table) = entry.as_table_mut() {
+            table.insert(
+                "enabled",
+                toml_edit::Item::Value(toml_edit::Value::from(enabled)),
+            );
+        }
+        Ok(())
+    })
+}
+
+fn persist_mcp_add(
+    app: &TuiApp,
+    name: &str,
+    server: &squeezy_core::McpServerConfig,
+) -> std::io::Result<()> {
+    let state = match app.config_screen.as_ref() {
+        Some(state) => state,
+        None => return Ok(()),
+    };
+    let path = config_screen::tier_path(state, state.scope);
+    mcp_settings_edit::mcp_settings_edit(&path, |servers| {
+        let mut table = toml_edit::Table::new();
+        table.insert(
+            "enabled",
+            toml_edit::Item::Value(toml_edit::Value::from(server.enabled)),
+        );
+        table.insert(
+            "transport",
+            toml_edit::Item::Value(toml_edit::Value::from(server.transport.as_str())),
+        );
+        if let Some(command) = &server.command {
+            table.insert(
+                "command",
+                toml_edit::Item::Value(toml_edit::Value::from(command.as_str())),
+            );
+        }
+        if let Some(url) = &server.url {
+            table.insert(
+                "url",
+                toml_edit::Item::Value(toml_edit::Value::from(url.as_str())),
+            );
+        }
+        servers.insert(name, toml_edit::Item::Table(table));
+        Ok(())
+    })
+}
+
+fn persist_mcp_remove(app: &TuiApp, name: &str) -> std::io::Result<()> {
+    let state = match app.config_screen.as_ref() {
+        Some(state) => state,
+        None => return Ok(()),
+    };
+    let path = config_screen::tier_path(state, state.scope);
+    mcp_settings_edit::mcp_settings_edit(&path, |servers| {
+        servers.remove(name);
+        Ok(())
+    })
+}
+
 fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     let new_cfg = match AppConfig::from_env_and_settings() {
         Ok(cfg) => cfg,
@@ -2116,6 +2285,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             let state = app.config_screen.as_mut().expect("checked above");
             config_screen::handle_key(state, agent, &mut feedback, key)
         };
+        // Drain any MCP actions staged by `/mcp` key bindings before
+        // the next draw so the user sees status updates immediately
+        // rather than waiting for the next animation tick.
+        drain_mcp_actions(app, agent, &mut feedback).await;
         if matches!(outcome, config_screen::KeyOutcome::Close) {
             close_config_screen(app, agent, "config closed");
         }
@@ -2849,7 +3022,12 @@ fn toggle_config_screen(
     // if the reload fails.
     let effective = squeezy_core::AppConfig::from_env_and_settings()
         .unwrap_or_else(|_| agent.config_snapshot());
-    let state = config_screen::ConfigScreenState::new(effective, focus);
+    let mut state = config_screen::ConfigScreenState::new(effective, focus);
+    // Seed the cached registry view from the live agent so the
+    // McpServers section reflects in-flight enable/disable from the
+    // moment it opens.
+    state.mcp_servers = agent.mcp_servers();
+    state.mcp_status = agent.mcp_status_snapshot();
     app.config_screen = Some(state);
     app.status = "config".to_string();
 }
@@ -3057,7 +3235,9 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
         return false;
     }
     match command {
-        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/help" => false,
+        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/mcp" | "/help" => {
+            false
+        }
         "/verbosity" | "/tool-verbosity" => !rest.trim().is_empty(),
         _ => true,
     }
@@ -3197,6 +3377,7 @@ fn telemetry_tui_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         DispatchCommand::Cost
         | DispatchCommand::Context
         | DispatchCommand::Reviewer
+        | DispatchCommand::Mcp
         | DispatchCommand::Model
         | DispatchCommand::Permissions
         | DispatchCommand::Attachments
@@ -3500,6 +3681,13 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 ));
             }
             toggle_config_screen(app, agent, id);
+        }
+        DispatchCommand::Mcp => {
+            toggle_config_screen(
+                app,
+                agent,
+                Some(squeezy_core::config_schema::SectionId::McpServers),
+            );
         }
         DispatchCommand::Statusline => toggle_status_line_setup(app),
         DispatchCommand::Plan { prompt } => {
