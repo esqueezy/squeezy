@@ -1846,6 +1846,77 @@ fn duplicate_trigger_across_skills_skips_auto_activation() {
 }
 
 #[test]
+fn skill_scan_dirs_includes_ancestor_project_roots() {
+    // Layout:
+    //   /root/.git            ← git root, stops the ancestor walk
+    //   /root/.squeezy/skills/ ← ancestor project root
+    //   /root/packages/foo/   ← workspace_root (launch dir)
+    let root = temp_workspace("skills_scan_ancestor");
+    let git_dir = root.join(".git");
+    fs::create_dir_all(&git_dir).expect("create .git");
+    let ancestor_skills = root.join(".squeezy/skills");
+    fs::create_dir_all(&ancestor_skills).expect("create ancestor skills");
+    let ws_root = root.join("packages/foo");
+    fs::create_dir_all(&ws_root).expect("create workspace dir");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let dirs = super::skill_scan_dirs(&ws_root, &config);
+
+    // The ancestor's `.squeezy/skills` dir should be in the scan list.
+    let has_ancestor = dirs.iter().any(|d| d == &ancestor_skills);
+    assert!(
+        has_ancestor,
+        "skill_scan_dirs must include ancestor project skill roots; got: {dirs:?}"
+    );
+}
+
+#[test]
+fn validate_skill_dirs_includes_ancestor_malformed_skill() {
+    // Same monorepo layout, but with a malformed SKILL.md in the ancestor root.
+    let root = temp_workspace("skills_validate_ancestor_malformed");
+    let git_dir = root.join(".git");
+    fs::create_dir_all(&git_dir).expect("create .git");
+    let bad_dir = root.join(".squeezy/skills/bad-ancestor");
+    fs::create_dir_all(&bad_dir).expect("mkdir bad-ancestor");
+    fs::write(bad_dir.join("SKILL.md"), "this is not valid frontmatter").expect("write bad skill");
+    let ws_root = root.join("packages/foo");
+    fs::create_dir_all(&ws_root).expect("create workspace");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let results = super::validate_skill_dirs(&ws_root, &config);
+    assert!(
+        !results.is_empty(),
+        "validate must find the ancestor skill even though it is malformed"
+    );
+    let bad = results
+        .iter()
+        .find(|r| {
+            r.path
+                .to_str()
+                .map(|s| s.contains("bad-ancestor"))
+                .unwrap_or(false)
+        })
+        .expect("bad-ancestor result must be present");
+    assert!(
+        bad.outcome.is_err(),
+        "malformed ancestor skill must produce an error: {:?}",
+        bad.outcome
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn validate_skill_dirs_catches_malformed_files_that_discovery_drops() {
     let root = temp_workspace("skills_validate_dirs_malformed");
     // Good skill — discovery and validate both see it.

@@ -1611,29 +1611,51 @@ pub struct SkillValidationResult {
     pub outcome: std::result::Result<(), String>,
 }
 
+/// Return every skill *root directory* that [`SkillCatalog::discover`] will
+/// scan for a given `(workspace_root, config)` pair, in the same order
+/// `discover` uses. This includes:
+///
+/// - User-level roots (`compat_user_dir`, `user_dir`).
+/// - `extra_roots` from config.
+/// - The current workspace's project roots (`.agents/skills`,
+///   `.squeezy/skills`).
+/// - **All ancestor project roots** up to the git root (monorepo support) —
+///   the same directories scanned by `ancestor_project_roots`.
+///
+/// [`validate_skill_dirs`] calls this so its scan is always identical to what
+/// runtime discovery will load.
+pub fn skill_scan_dirs(workspace_root: &Path, config: &squeezy_core::SkillsConfig) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    dirs.push(config.compat_user_dir.clone());
+    dirs.push(config.user_dir.clone());
+    dirs.extend(config.extra_roots.iter().cloned());
+    dirs.push(workspace_root.join(COMPAT_PROJECT_SKILLS_DIR));
+    dirs.push(workspace_root.join(PROJECT_SKILLS_DIR));
+    // Monorepo ancestor walk — mirrors discover's ancestor_project_roots loop.
+    for ancestor in ancestor_project_roots(workspace_root) {
+        dirs.push(ancestor.join(COMPAT_PROJECT_SKILLS_DIR));
+        dirs.push(ancestor.join(PROJECT_SKILLS_DIR));
+    }
+    dirs
+}
+
 /// Walk every configured skill root from `config` (the same roots that
-/// `SkillCatalog::discover` uses) and attempt to parse each `SKILL.md`.
+/// [`SkillCatalog::discover`] uses, including ancestor project roots for
+/// monorepo launches from subdirectories) and attempt to parse each
+/// `SKILL.md`.
 ///
 /// Unlike discovery, this function records parse failures rather than
 /// silently skipping them, so `squeezy skills validate` can surface the
 /// errors that discovery drops. Non-existent roots and directories without
-/// a `SKILL.md` are skipped without an error, mirroring discovery
-/// behaviour.
+/// a `SKILL.md` are skipped without an error, mirroring discovery behaviour.
 pub fn validate_skill_dirs(
     workspace_root: &Path,
     config: &squeezy_core::SkillsConfig,
 ) -> Vec<SkillValidationResult> {
-    let mut roots: Vec<&Path> = vec![&config.compat_user_dir, &config.user_dir];
-    let project_compat = workspace_root.join(COMPAT_PROJECT_SKILLS_DIR);
-    let project_native = workspace_root.join(PROJECT_SKILLS_DIR);
-    roots.push(&project_compat);
-    roots.push(&project_native);
-    let extra: Vec<&Path> = config.extra_roots.iter().map(|p| p.as_path()).collect();
-    roots.extend_from_slice(&extra);
-
+    let scan_dirs = skill_scan_dirs(workspace_root, config);
     let mut results = Vec::new();
-    for root in roots {
-        let entries = match fs::read_dir(root) {
+    for dir in &scan_dirs {
+        let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => continue,
