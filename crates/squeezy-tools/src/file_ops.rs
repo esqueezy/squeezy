@@ -14,14 +14,15 @@ use squeezy_vcs::{DiffMode, DiffOptions};
 use squeezy_workspace::ExclusionReason;
 use tokio_util::sync::CancellationToken;
 
+use crate::graph_tools::{graph_symbol_search, symbol_kind_label};
 use crate::{
     DEFAULT_MAX_BYTES_PER_FILE, DEFAULT_MAX_FILES, DEFAULT_READ_LIMIT, MAX_READ_LIMIT,
     POLICY_PREFIX_BYTES, ToolCall, ToolCostHint, ToolOutputReplayKey, ToolOutputReplayServed,
     ToolOutputReplaySource, ToolRegistry, ToolResult, ToolStatus, build_include_set,
     build_required_glob, diff_path_set, file_len, graph_ready_wait, is_secret_path, make_result,
-    read_prefix, read_range, sha256_file, tool_arg_error, tool_error, truncate_text, workspace_path,
+    read_prefix, read_range, sha256_file, tool_arg_error, tool_error, truncate_text,
+    workspace_path,
 };
-use crate::graph_tools::{graph_symbol_search, symbol_kind_label};
 
 pub(crate) const DEFAULT_MAX_MATCHES: usize = 250;
 pub(crate) const DEFAULT_OUTPUT_BYTE_CAP: usize = 48_000;
@@ -888,9 +889,7 @@ impl ToolRegistry {
                 // declarations by supertype, and only in content mode (not
                 // diff-scoped). Fails soft — graph unavailable / refresh error
                 // / no graph match leaves `matches` untouched.
-                if !diff_only
-                    && let Some(detected) = detect_inheritance_grep(&args.pattern)
-                {
+                if !diff_only && let Some(detected) = detect_inheritance_grep(&args.pattern) {
                     self.augment_inheritance_grep(&detected, &matches, &mut object)
                         .await;
                 }
@@ -959,9 +958,10 @@ impl ToolRegistry {
         // not be double-reported.
         let mut grep_hits: BTreeSet<(String, u64)> = BTreeSet::new();
         for m in grep_matches {
-            if let (Some(path), Some(line)) =
-                (m.get("path").and_then(Value::as_str), m.get("line").and_then(Value::as_u64))
-            {
+            if let (Some(path), Some(line)) = (
+                m.get("path").and_then(Value::as_str),
+                m.get("line").and_then(Value::as_u64),
+            ) {
                 grep_hits.insert((path.to_string(), line));
             }
         }
@@ -1058,60 +1058,51 @@ impl ToolRegistry {
             _ => None,
         };
 
-        let symbols = graph_symbol_search(
-            graph,
-            None,
-            kind,
-            None,
-            None,
-            None,
-            Some(&attribute),
-        );
+        let symbols = graph_symbol_search(graph, None, kind, None, None, None, Some(&attribute));
 
         let truncated = symbols.len() > GRAPH_AUGMENT_CAP;
         let mut matched_attributes = BTreeSet::new();
-        let declarations = symbols
-            .iter()
-            .take(GRAPH_AUGMENT_CAP)
-            .map(|symbol| {
-                // Provenance: which attribute prefix actually matched. Mirror
-                // the `|`-alternation matching `graph_symbol_search` used.
-                for prefix in ["base", "mixin", "iface"] {
-                    let needle = format!("{prefix}:{base}");
-                    if symbol
+        let declarations =
+            symbols
+                .iter()
+                .take(GRAPH_AUGMENT_CAP)
+                .map(|symbol| {
+                    // Provenance: which attribute prefix actually matched. Mirror
+                    // the `|`-alternation matching `graph_symbol_search` used.
+                    for prefix in ["base", "mixin", "iface"] {
+                        let needle = format!("{prefix}:{base}");
+                        if symbol.attributes.iter().any(|attr| {
+                            attr.eq_ignore_ascii_case(&needle) || attr.contains(&needle)
+                        }) {
+                            matched_attributes.insert(needle);
+                        }
+                    }
+                    let matched_for_symbol = symbol
                         .attributes
                         .iter()
-                        .any(|attr| attr.eq_ignore_ascii_case(&needle) || attr.contains(&needle))
-                    {
-                        matched_attributes.insert(needle);
-                    }
-                }
-                let matched_for_symbol = symbol
-                    .attributes
-                    .iter()
-                    .find(|attr| {
-                        ["base", "mixin", "iface"]
-                            .iter()
-                            .any(|p| attr.eq_ignore_ascii_case(&format!("{p}:{base}")))
-                            || ["base", "mixin", "iface"]
+                        .find(|attr| {
+                            ["base", "mixin", "iface"]
                                 .iter()
-                                .any(|p| attr.contains(&format!("{p}:{base}")))
+                                .any(|p| attr.eq_ignore_ascii_case(&format!("{p}:{base}")))
+                                || ["base", "mixin", "iface"]
+                                    .iter()
+                                    .any(|p| attr.contains(&format!("{p}:{base}")))
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| format!("base:{base}"));
+                    json!({
+                        "path": symbol.file_id.0,
+                        // span lines are 0-based internally; the grep `matches`
+                        // and read_slice are 1-based, so convert for parity.
+                        "line": symbol.span.start.line.saturating_add(1),
+                        "name": symbol.name,
+                        "kind": symbol_kind_label(symbol.kind),
+                        "symbol_id": symbol.id.0,
+                        "source": "semantic_graph",
+                        "matched_attribute": matched_for_symbol,
                     })
-                    .cloned()
-                    .unwrap_or_else(|| format!("base:{base}"));
-                json!({
-                    "path": symbol.file_id.0,
-                    // span lines are 0-based internally; the grep `matches`
-                    // and read_slice are 1-based, so convert for parity.
-                    "line": symbol.span.start.line.saturating_add(1),
-                    "name": symbol.name,
-                    "kind": symbol_kind_label(symbol.kind),
-                    "symbol_id": symbol.id.0,
-                    "source": "semantic_graph",
-                    "matched_attribute": matched_for_symbol,
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>();
 
         Some(GraphAugment {
             declarations,

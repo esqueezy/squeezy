@@ -3072,9 +3072,7 @@ impl ToolRegistry {
         {
             let prior = snaps
                 .iter()
-                .filter(|snap| {
-                    matches!(snap.tool_name.as_str(), "read_file" | "read_slice")
-                })
+                .filter(|snap| matches!(snap.tool_name.as_str(), "read_file" | "read_slice"))
                 .filter(|snap| snap.content_sha256.as_deref() == Some(content_sha256.as_str()))
                 .filter(|snap| {
                     snap.start_byte <= offset as u64 && snap.end_byte >= projected_end as u64

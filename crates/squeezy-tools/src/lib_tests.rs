@@ -12081,11 +12081,7 @@ async fn grep_augments_wrapped_dart_mixin() {
     .expect("write dart");
     let registry = ToolRegistry::new(&root).expect("registry");
 
-    let content = run_grep(
-        &registry,
-        r"class \w+.*\bwith\b.*WidgetsBindingObserver",
-    )
-    .await;
+    let content = run_grep(&registry, r"class \w+.*\bwith\b.*WidgetsBindingObserver").await;
 
     // grep itself misses the wrapped declaration.
     let matches = content["matches"].as_array().expect("matches");
@@ -12107,7 +12103,8 @@ async fn grep_augments_wrapped_dart_mixin() {
         "expected HomeState with mixin:WidgetsBindingObserver, got {decls:?}"
     );
     assert_eq!(
-        content["graph_hint"]["tool"], json!("decl_search"),
+        content["graph_hint"]["tool"],
+        json!("decl_search"),
         "{}",
         content["graph_hint"]
     );
