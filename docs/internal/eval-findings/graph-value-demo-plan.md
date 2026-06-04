@@ -299,16 +299,19 @@ enumeration. Prioritized:
 After A3 lands: re-measure FIX langs head-to-head; FIX-by-ratio + h2h-WIN = a kept graph-attributable
 win. THEN iterate A2 tasks/repos for the rest (go/python/js likely need a larger same-lang repo).
 
-### RESULT — GAP 1 flipped `ts` from LOSS to a graph-attributable WIN
+### RESULT — GAP 1 moved `ts` from a clear LOSS to a (variance-bound) WIN
 - Pre-GAP1 (clean binary): ts h2h LOSS 1.26 (sqz $0.243 vs CC $0.193); with-graph did 25 whole-file
   `read_file`s + 0 inheritance queries because `decl_search base:` returned nothing for TS.
-- Post-GAP1: ts h2h **WIN 0.62** (sqz $0.152 vs CC $0.244, n=3, 100% recall). With-graph median
-  dropped ~$0.24 → ~$0.115 (4 runs: .104/.094/.164/.126). Cheaper runs now use tight `read_slice`
-  (graph-provided symbol ids) over whole-file `read_file` (e.g. $0.094 = 19 read_slice + 2 read_file).
-  Even vs the more-stable pre-fix CC baseline ($0.193), sqz $0.115 wins at 0.6x. Graph-attribution
-  (no-graph-check ng/wg) re-measuring; with-graph ~$0.115 vs A1 no-graph $0.288 ≈ 2.5x (was 1.27).
-- Caveat: high variance remains (one run reverted to the 23-read_file storm) — that residual is
-  GAP 4 (model must RELIABLY use the now-working graph). Escalate to n=5 for the final board.
+- Post-GAP1: with-graph dropped to ~$0.15–0.18 median (samples span $0.094–$0.237 — HIGH variance);
+  the cheaper runs now use tight `read_slice` (graph symbol ids) over whole-file `read_file`
+  (e.g. $0.094 = 19 read_slice + 2 read_file). One h2h n=3 read **WIN 0.62** (sqz $0.152 vs CC
+  $0.244) but that CC sample was high ($0.244 vs the stable $0.193); against ~$0.21 CC, sqz ~$0.16
+  is ~25% cheaper = a real but modest win. Graph-attribution no-graph-check (clean n=3):
+  **ng/wg = 1.31** (wg $0.177 / ng $0.232), so the graph is provably doing the work, but the margin
+  is modest and n=3 verdicts are unreliable — ESCALATE to n=5+ for the board.
+- HONEST: GAP 1 is a correct, deterministically-tested CAPABILITY win (TS/JS inheritance is now
+  graph-queryable); the benchmark flip is real but variance-bound, and the residual variance (a run
+  still reverting to the 23-read_file storm) is GAP 4 (model must RELIABLY use the now-working graph).
 - java/ruby unaffected by GAP 1 (they already had `base:` attributes; their loss is the read-storm
   = GAP 4, and Ruby `include` augment = GAP 3). C/Go have no class inheritance → GAP 1 N/A there.
 
