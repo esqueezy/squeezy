@@ -7813,8 +7813,8 @@ async fn routing_judge_spend_crossing_warn_threshold_still_surfaces_cost_warning
         // the judge actually dispatches.
         small_fast_model: Some("cheap-model".to_string()),
         routing: squeezy_core::RoutingConfig {
-            auto_cheap: true,
-            auto_cheap_llm_judge: true,
+            enabled: true,
+            llm_judge: true,
             ..AppConfig::default().routing
         },
         max_session_cost_usd_micros: Some(10_000),

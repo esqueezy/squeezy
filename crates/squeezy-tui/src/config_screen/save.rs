@@ -512,6 +512,41 @@ fn finish_theme_save(
     agent.replace_config(state.effective.clone());
 }
 
+/// The per-provider routing fields use a `["providers", "*", "<key>"]`
+/// placeholder `toml_path`; the `"*"` is substituted with the active provider
+/// at write time. Returns the `<key>` (`reroute_model`, `judge_model`, …).
+fn provider_routing_field_key(field: &FieldMeta) -> Option<&'static str> {
+    match field.toml_path {
+        ["providers", "*", key] => Some(key),
+        _ => None,
+    }
+}
+
+/// Canonical slug of the active provider (the `[providers.<name>]` key).
+fn active_provider_section(state: &ConfigScreenState) -> String {
+    super::active_provider_slug(&state.effective)
+}
+
+/// Build a `[providers.<active>].<key>` write. Empty values clear the override
+/// (so the field falls back to the global / built-in default).
+fn provider_routing_edit(provider: &str, key: &'static str, value: &FieldValue) -> SettingsEdit {
+    let child_op = match value {
+        FieldValue::String(s) if !s.trim().is_empty() => EditOp::SetString(s.clone()),
+        FieldValue::StringList(items) if !items.is_empty() => {
+            EditOp::SetArrayOfStrings(items.clone())
+        }
+        _ => EditOp::Unset,
+    };
+    SettingsEdit {
+        path: &[],
+        op: EditOp::SetTableEntry {
+            table_path: &["providers"],
+            key: provider.to_string(),
+            fields: vec![(key, child_op)],
+        },
+    }
+}
+
 pub(crate) fn save_field(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
@@ -562,7 +597,13 @@ fn save_field_inner(
         .undo_stack
         .push((target_path.clone(), pre_write_bytes));
 
-    let mut edits: Vec<SettingsEdit> = vec![field_edit(field, &value)];
+    let mut edits: Vec<SettingsEdit> = vec![match provider_routing_field_key(field) {
+        // Per-provider routing fields (`[providers.*].<key>`) write to the
+        // ACTIVE provider's table via a runtime-keyed table entry — the static
+        // `toml_path` can't carry the dynamic provider name.
+        Some(key) => provider_routing_edit(&active_provider_section(state), key, &value),
+        None => field_edit(field, &value),
+    }];
     if is_permission_detail_field(field) {
         edits.push(SettingsEdit {
             path: &["permissions", "mode"],
@@ -662,12 +703,12 @@ fn apply_by_tier(
                     Ok(Ok(p)) => Some(p),
                     Ok(Err(err)) => {
                         let label = provider_variant_label(&state.effective.provider);
+                        // The save itself succeeded; the provider just isn't
+                        // usable yet (usually a missing API key). That's
+                        // informational, not an error — keep it neutral chrome.
                         notifications.push(
-                            format!(
-                                "saved to {} but the new provider failed to build: {err}",
-                                path_str
-                            ),
-                            NotifySeverity::Error,
+                            format!("saved to {path_str} — {label} isn't active yet: {err}"),
+                            NotifySeverity::Info,
                         );
                         Some(Arc::new(squeezy_llm::UnavailableProvider::new(
                             label,
@@ -678,11 +719,8 @@ fn apply_by_tier(
                     Err(_) => {
                         let label = provider_variant_label(&state.effective.provider);
                         notifications.push(
-                            format!(
-                                "saved to {} but the provider builder thread panicked",
-                                path_str
-                            ),
-                            NotifySeverity::Error,
+                            format!("saved to {path_str} — couldn't activate {label}"),
+                            NotifySeverity::Info,
                         );
                         Some(Arc::new(squeezy_llm::UnavailableProvider::new(
                             label,

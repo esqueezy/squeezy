@@ -1608,3 +1608,213 @@ fn local_tab_stays_visible_when_repo_subtitle_is_long() {
         "all three tab labels should fit on a 140-col row; got:\n{header}"
     );
 }
+
+#[test]
+fn routing_section_shows_resolved_per_provider_defaults() {
+    // Regression: the Routing rows rendered "—" because the render path
+    // (`displayed_value_and_source`) fell through to the empty schema default
+    // for the provider Info row and the `["providers","*",…]` fields instead of
+    // resolving them against the active provider. With AppConfig::default()
+    // (openai, nothing customized) the rows must show the built-in defaults.
+    use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldKind, SectionId as SId};
+    unsafe {
+        std::env::remove_var("SQUEEZY_SMALL_FAST_MODEL");
+        std::env::remove_var("SQUEEZY_ROUTING_JUDGE_MODEL");
+    }
+    let state = temp_config_state(Some(SId::Routing));
+    let section = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SId::Routing)
+        .expect("routing section exists");
+    for field in section.fields {
+        let (value, _src) = state.displayed_value_and_source(field);
+        let shown = value.as_display();
+        match field.toml_path {
+            // The provider banner and the cheap/judge model + prompt resolve to
+            // a concrete built-in value — never the "—" placeholder.
+            ["routing", "_provider_info"]
+            | ["providers", "*", "cheap_model"]
+            | ["providers", "*", "judge_model"]
+            | ["providers", "*", "judge_prompt"] => {
+                assert_ne!(
+                    shown, "—",
+                    "Routing field {:?} must show a resolved default, got '—'",
+                    field.toml_path
+                );
+                assert!(
+                    !shown.is_empty(),
+                    "Routing field {:?} empty",
+                    field.toml_path
+                );
+            }
+            // Resolves to the per-provider default reroute filter (a real regex
+            // with a negative lookahead skipping cheap tiers) — never blank, and
+            // exactly what the router applies.
+            ["providers", "*", "expensive_models"] => {
+                assert_ne!(shown, "—", "default reroute filter should not be blank");
+                assert!(
+                    shown.contains("(?!"),
+                    "default reroute filter should be a negative-lookahead regex, got {shown}"
+                );
+            }
+            _ => {}
+        }
+        // The provider banner is the only Info row; it must be non-editable.
+        if field.toml_path == ["routing", "_provider_info"] {
+            assert!(matches!(field.kind, FieldKind::Info));
+        }
+    }
+}
+
+#[test]
+fn routing_pane_renders_default_filter_and_pinned_banner() {
+    // The default reroute filter (a negative-lookahead regex skipping cheap
+    // tiers) shows verbatim, the banner carries the pinned-provider note, and an
+    // explicit empty filter renders as the friendly "any".
+    use squeezy_core::config_schema::SectionId as SId;
+    unsafe {
+        std::env::remove_var("SQUEEZY_SMALL_FAST_MODEL");
+        std::env::remove_var("SQUEEZY_ROUTING_JUDGE_MODEL");
+        std::env::remove_var("SQUEEZY_ROUTING_EXPENSIVE_MODELS");
+    }
+    let mut state = temp_config_state(Some(SId::Routing));
+    let rendered = render_screen_to_text(&state, 120, 24);
+    assert!(
+        rendered.contains("(?!"),
+        "default reroute filter should show a negative-lookahead regex, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("pinned"),
+        "provider banner should carry the pinned note, got:\n{rendered}"
+    );
+
+    // An explicit empty filter ("reroute any") renders as "any".
+    let slug = active_provider_slug(&state.effective);
+    state
+        .effective
+        .providers
+        .entry(slug)
+        .or_default()
+        .expensive_models = Some(String::new());
+    let rendered2 = render_screen_to_text(&state, 120, 24);
+    assert!(
+        rendered2.contains("any"),
+        "explicit empty filter should render as 'any', got:\n{rendered2}"
+    );
+}
+
+#[test]
+fn prompt_editor_editing_and_line_navigation() {
+    use super::PromptEditorState;
+    let mut ed = PromptEditorState::new(String::new());
+    for c in "ab".chars() {
+        ed.insert_char(c);
+    }
+    ed.insert_char('\n');
+    for c in "cd".chars() {
+        ed.insert_char(c);
+    }
+    assert_eq!(ed.draft, "ab\ncd");
+    // Cursor sits after 'd' (byte 5). Up lands on the first line, same column.
+    ed.up();
+    assert_eq!(ed.cursor, 2);
+    ed.home();
+    assert_eq!(ed.cursor, 0);
+    ed.end();
+    assert_eq!(ed.cursor, 2);
+    ed.down();
+    assert_eq!(ed.cursor, 5);
+    ed.backspace();
+    assert_eq!(ed.draft, "ab\nc");
+    ed.left();
+    ed.delete();
+    assert_eq!(ed.draft, "ab\n");
+}
+
+#[tokio::test]
+async fn enter_on_judge_prompt_opens_full_editor_then_ctrl_s_saves() {
+    use squeezy_core::config_schema::SectionId as SId;
+    let mut state = temp_config_state(Some(SId::Routing));
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    state.field_index = field_index(SId::Routing, &["providers", "*", "judge_prompt"]);
+
+    // Enter opens the full-screen editor pre-filled with the resolved built-in
+    // prompt — NOT the inline single-line editor.
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    let ed = state.prompt_editor.as_ref().expect("full editor open");
+    assert!(
+        !ed.draft.is_empty(),
+        "editor seeds with the built-in judge prompt"
+    );
+    assert!(
+        state.editor.is_none(),
+        "multiline fields must not use the inline editor"
+    );
+
+    // Append a marker and save with Ctrl+S.
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('!'), KeyModifiers::empty()),
+    );
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+    );
+    assert!(state.prompt_editor.is_none(), "Ctrl+S closes the editor");
+    let provider = active_provider_slug(&state.effective);
+    let saved = state
+        .effective
+        .providers
+        .get(&provider)
+        .and_then(|p| p.judge_prompt.clone())
+        .expect("custom judge prompt stored as a per-provider override");
+    assert!(saved.ends_with('!'));
+}
+
+#[tokio::test]
+async fn esc_on_judge_prompt_editor_discards_edits() {
+    use squeezy_core::config_schema::SectionId as SId;
+    let mut state = temp_config_state(Some(SId::Routing));
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    state.field_index = field_index(SId::Routing, &["providers", "*", "judge_prompt"]);
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('!'), KeyModifiers::empty()),
+    );
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+    );
+    assert!(state.prompt_editor.is_none(), "Esc closes the editor");
+    let provider = active_provider_slug(&state.effective);
+    assert!(
+        state
+            .effective
+            .providers
+            .get(&provider)
+            .and_then(|p| p.judge_prompt.clone())
+            .is_none(),
+        "Esc must not persist the edit"
+    );
+}

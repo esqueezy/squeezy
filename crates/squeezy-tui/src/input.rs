@@ -304,7 +304,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     slash("/parent", "force next turn onto the parent model"),
     slash_args(
         "/router",
-        "toggle session-wide auto-routing to the cheap tier",
+        "open routing config (or on|off to toggle session-wide auto-routing)",
         true,
         "[on|off]",
     ),

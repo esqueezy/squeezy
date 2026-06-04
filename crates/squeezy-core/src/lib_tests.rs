@@ -246,6 +246,189 @@ compaction_max_summary_bytes = 4096
 }
 
 #[test]
+fn per_provider_routing_settings_parse_and_stay_per_provider() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "openai"
+
+[routing]
+heuristic = false
+follow_up_max_chars = 40
+
+[providers.openai]
+cheap_model = "gpt-5.4-nano"
+judge_model = "gpt-5.4-mini"
+expensive_models = "gpt-5|codex"
+
+[providers.anthropic]
+cheap_model = "claude-haiku-4-5"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    // Global toggles land on RoutingConfig.
+    assert!(!config.routing.heuristic);
+    assert_eq!(config.routing.follow_up_max_chars, 40);
+
+    // Per-provider routing is retained per provider and never crosses over.
+    let openai = config.providers.get("openai").expect("openai entry");
+    assert_eq!(openai.judge_model.as_deref(), Some("gpt-5.4-mini"));
+    assert_eq!(openai.expensive_models.as_deref(), Some("gpt-5|codex"));
+    assert_eq!(
+        config
+            .providers
+            .get("anthropic")
+            .and_then(|p| p.cheap_model.as_deref()),
+        Some("claude-haiku-4-5")
+    );
+    // Anthropic carries no judge override — it inherits its own default later.
+    assert!(
+        config
+            .providers
+            .get("anthropic")
+            .and_then(|p| p.judge_model.as_deref())
+            .is_none()
+    );
+
+    // Inspect output is still valid TOML.
+    SettingsFile::from_toml_str(&config.inspect_redacted(), "round-trip")
+        .expect("inspect output parses back");
+}
+
+#[test]
+fn routing_config_fields_display_resolved_defaults_not_blanks() {
+    // On OpenAI with no per-provider overrides, the Routing /config fields show
+    // the resolved values in effect (not empty) — the provider banner, the
+    // built-in cheap and judge models (both the mini tier), and the built-in
+    // judge prompt.
+    let settings =
+        SettingsFile::from_toml_str("[model]\nprovider = \"openai\"\n", "test").expect("parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    let routing = crate::config_schema::CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == crate::config_schema::SectionId::Routing)
+        .expect("routing section");
+    let display = |label: &str| -> String {
+        let f = routing
+            .fields
+            .iter()
+            .find(|f| f.label == label)
+            .unwrap_or_else(|| panic!("field {label}"));
+        (f.get)(&config).as_display()
+    };
+
+    assert!(
+        display("provider").contains("openai"),
+        "{}",
+        display("provider")
+    );
+    assert_eq!(display("cheap_model"), "gpt-5.4-mini");
+    assert_eq!(display("judge_model"), "gpt-5.4-mini");
+    assert!(
+        display("judge_prompt")
+            .to_lowercase()
+            .contains("routing classifier"),
+        "judge_prompt should show the built-in prompt in effect"
+    );
+}
+
+#[test]
+fn reroute_filter_negates_and_defaults_reflect_reality() {
+    use crate::{default_reroute_filter, parent_is_reroute_eligible};
+
+    // openai/azure: flagships reroute, the mini/nano tiers are skipped.
+    let openai = default_reroute_filter("openai");
+    assert!(parent_is_reroute_eligible("gpt-5.5", openai));
+    assert!(parent_is_reroute_eligible("gpt-5.4-codex", openai));
+    assert!(!parent_is_reroute_eligible("gpt-5.4-mini", openai));
+    assert!(!parent_is_reroute_eligible("gpt-5.4-nano", openai));
+
+    // anthropic: opus AND sonnet reroute (the dropped-opus regression), haiku
+    // is skipped — including the bedrock-prefixed id, proving name-based scales.
+    let anthropic = default_reroute_filter("anthropic");
+    assert!(parent_is_reroute_eligible("claude-opus-4-6", anthropic));
+    assert!(parent_is_reroute_eligible("claude-sonnet-4-6", anthropic));
+    assert!(!parent_is_reroute_eligible(
+        "claude-haiku-4-5-20251001",
+        anthropic
+    ));
+    let bedrock = default_reroute_filter("bedrock");
+    assert!(parent_is_reroute_eligible(
+        "anthropic.claude-opus-4-6-v1:0",
+        bedrock
+    ));
+    assert!(!parent_is_reroute_eligible(
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+        bedrock
+    ));
+
+    // google/vertex: pro reroutes, flash and flash-lite are skipped.
+    let google = default_reroute_filter("google");
+    assert!(parent_is_reroute_eligible("gemini-2.5-pro", google));
+    assert!(!parent_is_reroute_eligible("gemini-2.5-flash", google));
+    assert!(!parent_is_reroute_eligible("gemini-2.5-flash-lite", google));
+
+    // A positive regex restricts to matches; a negative lookahead excludes;
+    // empty = reroute any. Plain standard regexes (lookaround supported).
+    assert!(parent_is_reroute_eligible("claude-opus-4-6", "opus|sonnet"));
+    assert!(!parent_is_reroute_eligible(
+        "claude-haiku-4-5",
+        "opus|sonnet"
+    ));
+    assert!(!parent_is_reroute_eligible(
+        "gpt-5.4-codex",
+        "^(?!.*codex).*"
+    ));
+    assert!(parent_is_reroute_eligible("gpt-5.5", "^(?!.*codex).*"));
+    assert!(parent_is_reroute_eligible("anything", ""));
+
+    // The "ge[mini]" trap: a gateway serving gemini-pro must NOT be excluded by
+    // the generic "-mini" tier filter, while the real cheap tiers still are.
+    let gateway = default_reroute_filter("openrouter");
+    assert!(parent_is_reroute_eligible("google/gemini-2.5-pro", gateway));
+    assert!(!parent_is_reroute_eligible(
+        "google/gemini-2.5-flash",
+        gateway
+    ));
+    assert!(!parent_is_reroute_eligible("openai/gpt-5.4-mini", gateway));
+    assert!(!parent_is_reroute_eligible(
+        "anthropic/claude-haiku-4-5",
+        gateway
+    ));
+    assert!(parent_is_reroute_eligible(
+        "anthropic/claude-opus-4-6",
+        gateway
+    ));
+}
+
+#[test]
+fn resolved_reroute_filter_precedence() {
+    use crate::{ProviderSettings, default_reroute_filter, resolved_reroute_filter};
+    let mut cfg = AppConfig::default();
+    // No override + empty global → built-in per-provider default.
+    assert_eq!(
+        resolved_reroute_filter(&cfg, "openai"),
+        default_reroute_filter("openai")
+    );
+    // Non-empty global overrides the built-in default.
+    cfg.routing.expensive_models = "gpt-5".to_string();
+    assert_eq!(resolved_reroute_filter(&cfg, "openai"), "gpt-5");
+    // A per-provider override wins, including an explicit empty string.
+    cfg.providers.insert(
+        "openai".to_string(),
+        ProviderSettings {
+            expensive_models: Some(String::new()),
+            ..Default::default()
+        },
+    );
+    assert!(resolved_reroute_filter(&cfg, "openai").is_empty());
+}
+
+#[test]
 fn subagent_config_defaults_match_parent_per_turn_caps() {
     // The cost broker — not these per-call caps — is the load-bearing
     // safeguard on runaway subagent cost. Keeping subagent defaults at
