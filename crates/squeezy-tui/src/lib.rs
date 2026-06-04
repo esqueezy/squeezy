@@ -8292,7 +8292,7 @@ fn format_user_prompt_entry(
 
     let bottom = Line::from(vec![
         Span::raw(INDENT.to_string()),
-        Span::styled(format!("╰─◖{}╯", "─".repeat(max_text_width)), amber),
+        Span::styled(format!("╰☾{}╯", "─".repeat(max_text_width)), amber),
     ]);
     lines.push(bottom);
     // Thread the gutter out of the coin: a `│` connector (same column as the
@@ -9066,10 +9066,10 @@ pub(crate) mod rail {
         crate::render::theme::quiet()
     }
 
-    /// Two-cell left indent so the rail gutter lands in the same column as the
-    /// prompt-echo coin's `╰─` (both at column 2), letting the turn thread as
-    /// one continuous gutter from the coin down through the work nodes.
-    const INDENT: &str = "  ";
+    /// Three-cell left indent so the rail gutter lands in the same column as
+    /// the prompt-echo coin's crescent `☾` (column 3), letting the turn thread
+    /// as one continuous gutter straight out of the crescent.
+    const INDENT: &str = "   ";
 
     /// The spans opening a node's header line: the two-cell indent, the
     /// tee/close elbow (dim), and the state marker (coloured), e.g. `  ├─◦ `,

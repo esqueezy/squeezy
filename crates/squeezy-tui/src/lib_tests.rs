@@ -7246,7 +7246,7 @@ fn submitted_prompt_renders_bubble_around_text() {
     assert_eq!(lines.len(), 3, "{lines:?}");
     assert!(content.starts_with("  "), "{content}");
     assert!(content.ends_with("find getFoo"), "{content}");
-    assert!(bottom.starts_with("  ╰─◖"), "{bottom}");
+    assert!(bottom.starts_with("  ╰☾"), "{bottom}");
     assert!(bottom.ends_with('╯'), "{bottom}");
     // The prompt threads a gutter connector down into the turn.
     let connector = lines
@@ -7256,7 +7256,7 @@ fn submitted_prompt_renders_bubble_around_text() {
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    assert_eq!(connector, "  │");
+    assert_eq!(connector, "   │");
 }
 
 #[test]
@@ -7287,8 +7287,8 @@ fn submitted_prompt_preserves_empty_lines() {
     assert_eq!(rendered[1].trim(), "");
     assert!(rendered[2].contains("three"), "{rendered:?}");
     assert_eq!(rendered[3].trim(), "");
-    assert!(rendered[4].starts_with("  ╰─◖"), "{rendered:?}");
-    assert_eq!(rendered[5], "  │");
+    assert!(rendered[4].starts_with("  ╰☾"), "{rendered:?}");
+    assert_eq!(rendered[5], "   │");
 }
 
 #[test]
@@ -13221,7 +13221,7 @@ async fn config_and_options_alias_open_the_same_screen() {
 }
 
 #[test]
-fn rail_head_spans_are_six_cells() {
+fn rail_head_spans_are_seven_cells() {
     use rail::RailMarker::*;
     for marker in [Settled, Queued, Plan, Ok, Fail, Warn, Live("✦".to_string())] {
         let cells: usize = rail::head_spans(&marker, false)
@@ -13229,8 +13229,8 @@ fn rail_head_spans_are_six_cells() {
             .map(|s| s.content.chars().count())
             .sum();
         assert_eq!(
-            cells, 6,
-            "{marker:?} head must be 6 cells (indent + elbow + marker)"
+            cells, 7,
+            "{marker:?} head must be 7 cells (indent + elbow + marker)"
         );
     }
 }
@@ -13253,12 +13253,12 @@ fn rail_apply_gutter_heads_first_line_connects_the_rest() {
     ];
     rail::apply_gutter(&mut lines, rail::RailMarker::Ok, false);
     // Header line: indent + ├─ elbow + ✓ marker replace the leading margin.
-    assert_eq!(lines[0].spans[0].content.as_ref(), "  ");
+    assert_eq!(lines[0].spans[0].content.as_ref(), "   ");
     assert_eq!(lines[0].spans[1].content.as_ref(), "├─");
     assert_eq!(lines[0].spans[2].content.as_ref(), "✓ ");
     assert_eq!(lines[0].spans[3].content.as_ref(), "header");
     // Continuation line: indent + dim connector replaces the margin.
-    assert_eq!(lines[1].spans[0].content.as_ref(), "  │   ");
+    assert_eq!(lines[1].spans[0].content.as_ref(), "   │   ");
     assert_eq!(lines[1].spans[1].content.as_ref(), "body");
 }
 
@@ -13266,7 +13266,7 @@ fn rail_apply_gutter_heads_first_line_connects_the_rest() {
 fn rail_apply_gutter_last_node_uses_the_close_elbow() {
     let mut lines = vec![Line::from(vec![Span::raw("  "), Span::raw("x")])];
     rail::apply_gutter(&mut lines, rail::RailMarker::Settled, true);
-    assert_eq!(lines[0].spans[0].content.as_ref(), "  ");
+    assert_eq!(lines[0].spans[0].content.as_ref(), "   ");
     assert_eq!(lines[0].spans[1].content.as_ref(), "╰─");
     assert_eq!(lines[0].spans[2].content.as_ref(), "◦ ");
 }
@@ -13356,7 +13356,7 @@ fn rail_gallery_renders_a_full_turn() {
     // The gutter threads into the answer: a `│` connector then the `☽` answer
     // (its crescent sits in the gutter column).
     assert!(
-        scrollback.contains("exit 1\n  │\n  ☽ Found 2 auth issues"),
+        scrollback.contains("exit 1\n   │\n  ☽ Found 2 auth issues"),
         "{scrollback}"
     );
 }
