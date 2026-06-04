@@ -10287,7 +10287,11 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
             .clone()
             .map(|model| resolve_model_alias_owned(provider, model))
             .unwrap_or_else(|| cheap_model_for(provider, config).unwrap_or(parent_model.clone())),
-        (SubagentKind::DocHelp, _) => parent_model,
+        // Use the cheap tier when one is known; fall back to the parent model so
+        // DocHelp still works in test configs that have no provider configured.
+        (SubagentKind::DocHelp, _) => cheap_model_for(provider, config)
+            .filter(|m| !m.is_empty())
+            .unwrap_or(parent_model),
         (_, RoleModelPolicy::Parent) => parent_model,
         (_, RoleModelPolicy::Cheap) => cheap_model_for(provider, config).unwrap_or(parent_model),
     }
