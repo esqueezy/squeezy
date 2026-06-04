@@ -13576,7 +13576,7 @@ fn subagent_pane_summary_row(app: &TuiApp, width: u16) -> Line<'static> {
     let total = records.len();
 
     let (glyph, glyph_color) = if failed > 0 {
-        ("✗", crate::render::theme::red())
+        ("✖", crate::render::theme::red())
     } else if done > 0 {
         ("✓", crate::render::theme::green())
     } else {
