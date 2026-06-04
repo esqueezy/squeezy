@@ -2210,6 +2210,66 @@ export const RunnerView = (props: RunnerProps) => <Runner />;
 }
 
 #[test]
+fn js_ts_class_heritage_emits_base_and_iface_attributes() {
+    // `extends` -> base:, `implements` -> iface:, so `decl_search attribute=base:X`
+    // and the grep→graph augment can enumerate TS/JS subtypes without a read storm.
+    let source = r#"
+export class Admin extends User implements Auditable, Serializable {}
+
+// Generic params and generic bases must not confuse the keyword scan:
+// `<T extends Constraint>` and `Base<T>` resolve to the head identifier `Base`.
+export class Repo<T extends Entity> extends Base<T> implements Lifecycle<T> {}
+
+// `implements` targets must not leak into the base list.
+class Service extends ns.Core implements Closeable {}
+
+interface Named extends ServiceInfo, Other {}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = ts_record("src/heritage.ts", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let attrs = |name: &str| -> Vec<String> {
+        parsed
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap_or_else(|| panic!("missing symbol {name}"))
+            .attributes
+            .clone()
+    };
+    let has = |name: &str, attr: &str| attrs(name).iter().any(|a| a == attr);
+
+    assert!(
+        has("Admin", "base:User"),
+        "Admin attrs: {:?}",
+        attrs("Admin")
+    );
+    assert!(has("Admin", "iface:Auditable"));
+    assert!(has("Admin", "iface:Serializable"));
+    assert!(
+        !has("Admin", "base:Auditable"),
+        "implements must not be base:"
+    );
+
+    // generic base head only; constraint `Entity` must NOT become a base.
+    assert!(has("Repo", "base:Base"), "Repo attrs: {:?}", attrs("Repo"));
+    assert!(has("Repo", "iface:Lifecycle"));
+    assert!(
+        !has("Repo", "base:Entity"),
+        "generic constraint leaked as base"
+    );
+
+    // member-expression base resolves to its last segment.
+    assert!(has("Service", "base:Core"));
+    assert!(has("Service", "iface:Closeable"));
+
+    // interface extends -> base: (possibly several).
+    assert!(has("Named", "base:ServiceInfo"));
+    assert!(has("Named", "base:Other"));
+}
+
+#[test]
 fn parser_keeps_js_ts_const_and_function_symbol_scope_precise() {
     let source = r#"
 const options = values.map((value) => value.name);

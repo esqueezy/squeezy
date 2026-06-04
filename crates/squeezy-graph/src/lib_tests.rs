@@ -7663,6 +7663,62 @@ internal class TraceJsonReader : JsonReader, IJsonLineInfo
 }
 
 #[test]
+fn graph_records_js_ts_class_heritage_as_base_and_iface_attributes() {
+    // The JS/TS extractor records inheritance as queryable `base:`/`iface:`
+    // attributes (not only type-reference edges), and the graph build carries
+    // them through — so `decl_search(attribute="base:User")` and the grep→graph
+    // augment can enumerate TS/JS subtypes (the capability TS/JS previously
+    // lacked, which forced the model into grep+read_file storms).
+    let mut parser = LanguageParser::new().unwrap();
+    let app = ts_record(
+        "src/app.ts",
+        r#"export class User {}
+export interface Auditable {}
+export class Admin extends User implements Auditable {}
+export class Repo<T extends Entity> extends Base<T> implements Lifecycle<T> {}
+"#,
+    );
+    let parsed = parser.parse_record(&app).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let admin = graph
+        .find_symbol_by_name("Admin")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("Admin class symbol");
+    assert!(
+        admin.attributes.iter().any(|attr| attr == "base:User"),
+        "Admin should carry base:User, got {:?}",
+        admin.attributes,
+    );
+    assert!(
+        admin
+            .attributes
+            .iter()
+            .any(|attr| attr == "iface:Auditable"),
+        "Admin should carry iface:Auditable, got {:?}",
+        admin.attributes,
+    );
+
+    let repo = graph
+        .find_symbol_by_name("Repo")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("Repo class symbol");
+    // Generic base head only; the `<T extends Entity>` constraint must not leak
+    // into the base list, and the generic argument `Base<T>` resolves to `Base`.
+    assert!(
+        repo.attributes.iter().any(|attr| attr == "base:Base"),
+        "Repo should carry base:Base, got {:?}",
+        repo.attributes,
+    );
+    assert!(
+        !repo.attributes.iter().any(|attr| attr == "base:Entity"),
+        "generic constraint Entity must not be recorded as a base",
+    );
+}
+
+#[test]
 fn dart_import_show_decomposes_into_named_imports() {
     let mut parser = LanguageParser::new().unwrap();
     let main = dart_record(
