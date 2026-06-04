@@ -236,6 +236,11 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 } => {
                     app.note_subagent_activity(id, agent, message);
                 }
+                AgentEvent::SubagentToolResult {
+                    id, agent, result, ..
+                } => {
+                    app.note_subagent_tool_result(id, agent, result);
+                }
                 AgentEvent::SubagentCompleted {
                     id,
                     agent,

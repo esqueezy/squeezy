@@ -15144,7 +15144,7 @@ impl TuiApp {
             TranscriptEntry::log_with_kind(
                 start_entry_id,
                 format!("{agent} subagent started"),
-                LogKind::Operational,
+                LogKind::Note,
                 self.transcript_default,
             ),
         ];
@@ -15192,6 +15192,46 @@ impl TuiApp {
             // Keep the seed prompt + "started" log (the first two entries);
             // drop the oldest activity beyond the cap so a long-running
             // subagent's stored transcript stays bounded.
+            const MAX_SUBAGENT_TRANSCRIPT: usize = 256;
+            if record.transcript.len() > MAX_SUBAGENT_TRANSCRIPT {
+                let overflow = record.transcript.len() - MAX_SUBAGENT_TRANSCRIPT;
+                record.transcript.drain(2..2 + overflow);
+            }
+        }
+    }
+
+    /// Record a subagent's completed tool call as a real `ToolResult` rail node
+    /// in its transcript, so the subagent view renders `├─✔ Ran X` cards
+    /// (folded by default, body unfolded by Ctrl-T) exactly like the main
+    /// conversation — not the flat off-rail lifecycle line it used to show.
+    pub(crate) fn note_subagent_tool_result(
+        &mut self,
+        id: SubagentId,
+        agent: String,
+        result: ToolResult,
+    ) {
+        if tool_result_hidden_by_default(&result) {
+            return;
+        }
+        let latest = compact_text(&tool_result_status_text(&result), 120);
+        let entry_id = self.next_id();
+        let entry = TranscriptEntry::tool_result(entry_id, result, None, self.transcript_default);
+        if let Some(record) = self.subagent_pane.records.iter_mut().find(|r| r.id == id) {
+            record.agent = agent;
+            record.latest = latest;
+            // Fold an immediately-repeated identical call into the prior card,
+            // mirroring the main transcript's coalescing.
+            if record
+                .transcript
+                .last_mut()
+                .is_some_and(|last| coalesce_tool_transcript_entry(last, &entry))
+            {
+                return;
+            }
+            record.transcript.push(entry);
+            // Keep the seed prompt + "started" log (the first two entries); drop
+            // the oldest cards beyond the cap so the stored transcript stays
+            // bounded.
             const MAX_SUBAGENT_TRANSCRIPT: usize = 256;
             if record.transcript.len() > MAX_SUBAGENT_TRANSCRIPT {
                 let overflow = record.transcript.len() - MAX_SUBAGENT_TRANSCRIPT;

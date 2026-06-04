@@ -13608,3 +13608,32 @@ async fn ctrl_t_expands_then_closes_a_collapsed_overlay() {
     .expect("handle key");
     assert!(app.transcript_overlay.is_none());
 }
+
+#[test]
+fn subagent_view_renders_tool_results_as_rail_cards() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(
+        7,
+        "explore".to_string(),
+        "Discover the codebase".to_string(),
+    );
+    app.note_subagent_tool_result(
+        7,
+        "explore".to_string(),
+        sample_tool_result("repo_map", "crate a\ncrate b"),
+    );
+    app.note_subagent_tool_result(
+        7,
+        "explore".to_string(),
+        sample_tool_result("glob", "a.rs\nb.rs"),
+    );
+    app.subagent_pane.active = ConversationSource::Subagent(7);
+    let view = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(70), false));
+    // The subagent's tools thread the rail as ├─✔ cards, not the flat off-rail
+    // `completed X` lifecycle line they used to render as.
+    assert!(view.contains("├─✔ Explored repo map"), "{view}");
+    assert!(view.contains("├─✔ Explored list files"), "{view}");
+    assert!(!view.contains("completed repo_map"), "{view}");
+    // The lifecycle breadcrumb threads the rail too (a ◦ note).
+    assert!(view.contains("├─◦ explore subagent started"), "{view}");
+}
