@@ -25,8 +25,7 @@ use crate::{
     DEFAULT_TUI_THEME_NAME, DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode,
     PermissionPolicyMode, ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode,
     SessionResumePicker, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault,
-    TuiAlternateScreen, TuiSynchronizedOutput, normalize_tui_spinner_name,
-    normalize_tui_theme_name,
+    TuiSynchronizedOutput, normalize_tui_spinner_name, normalize_tui_theme_name,
 };
 
 /// When a save takes effect.
@@ -383,7 +382,6 @@ pub const STATUS_VERBOSITY_OPTIONS: &[&str] = &["compact", "verbose"];
 pub const RESPONSE_VERBOSITY_OPTIONS: &[&str] = &["concise", "normal", "verbose"];
 pub const TOOL_OUTPUT_VERBOSITY_OPTIONS: &[&str] = &["compact", "normal", "verbose"];
 pub const TRANSCRIPT_DEFAULT_OPTIONS: &[&str] = &["compact", "expanded"];
-pub const ALTERNATE_SCREEN_OPTIONS: &[&str] = &["auto", "never", "always"];
 pub const SYNCHRONIZED_OUTPUT_OPTIONS: &[&str] = &["auto", "always", "never"];
 pub const PERMISSION_POLICY_MODE_OPTIONS: &[&str] =
     &["default", "auto_review", "full_access", "custom"];
@@ -780,21 +778,6 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default_display: "false",
                 default: || FieldValue::Bool(false),
                 help: "Mirror the prompt-recall ring (Up/Down at the composer) to `~/.squeezy/prompt_history` so prior prompts survive across sessions.",
-                env_override: None,
-                secret: false,
-            },
-            FieldMeta {
-                label: "alternate_screen",
-                toml_path: &["tui", "alternate_screen"],
-                kind: FieldKind::Enum {
-                    options: ALTERNATE_SCREEN_OPTIONS,
-                },
-                tier: ApplyTier::Restart,
-                get: get_alternate_screen,
-                set: set_alternate_screen,
-                default_display: "auto",
-                default: || FieldValue::Enum("auto"),
-                help: "Whether to use native terminal scrollback (`auto`/`never`) or take over the full alternate screen (`always`).",
                 env_override: None,
                 secret: false,
             },
@@ -2106,23 +2089,6 @@ fn set_persist_prompt_history(cfg: &mut AppConfig, value: FieldValue) -> Result<
         }
         _ => Err("expects bool"),
     }
-}
-
-fn get_alternate_screen(cfg: &AppConfig) -> FieldValue {
-    FieldValue::Enum(cfg.tui.alternate_screen.as_str())
-}
-fn set_alternate_screen(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
-    let s = match value {
-        FieldValue::Enum(s) => s,
-        _ => return Err("expects enum"),
-    };
-    cfg.tui.alternate_screen = match s {
-        "auto" => TuiAlternateScreen::Auto,
-        "never" => TuiAlternateScreen::Never,
-        "always" => TuiAlternateScreen::Always,
-        _ => return Err("invalid alternate_screen"),
-    };
-    Ok(())
 }
 
 fn get_synchronized_output(cfg: &AppConfig) -> FieldValue {

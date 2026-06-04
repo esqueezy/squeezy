@@ -1904,10 +1904,6 @@ impl AppConfig {
             toml_string(self.tui.transcript_default.as_str())
         ));
         output.push_str(&format!(
-            "alternate_screen = {}\n",
-            toml_string(self.tui.alternate_screen.as_str())
-        ));
-        output.push_str(&format!(
             "synchronized_output = {}\n",
             toml_string(self.tui.synchronized_output.as_str())
         ));
@@ -8118,24 +8114,6 @@ impl TranscriptDefault {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TuiAlternateScreen {
-    Auto,
-    Never,
-    Always,
-}
-
-impl TuiAlternateScreen {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Never => "never",
-            Self::Always => "always",
-        }
-    }
-}
-
 /// Controls whether the TUI wraps each frame draw in DEC mode 2026
 /// (Begin/End Synchronized Update). Capable terminals (kitty, WezTerm,
 /// Ghostty, iTerm2, Alacritty) flip the entire frame atomically, which
@@ -8331,7 +8309,6 @@ pub struct TuiConfig {
     pub response_verbosity: ResponseVerbosity,
     pub tool_output_verbosity: ToolOutputVerbosity,
     pub transcript_default: TranscriptDefault,
-    pub alternate_screen: TuiAlternateScreen,
     /// DEC 2026 synchronized-output policy. `Auto` flips on for known
     /// capable terminals; `Always` forces it on; `Never` disables it.
     /// See [`TuiSynchronizedOutput`] for the capability heuristic.
@@ -8393,9 +8370,6 @@ impl TuiConfig {
             transcript_default: settings
                 .transcript_default
                 .unwrap_or(TranscriptDefault::Compact),
-            alternate_screen: settings
-                .alternate_screen
-                .unwrap_or(TuiAlternateScreen::Auto),
             synchronized_output: settings
                 .synchronized_output
                 .unwrap_or(TuiSynchronizedOutput::Auto),
@@ -8433,7 +8407,6 @@ pub struct TuiSettings {
     pub response_verbosity: Option<ResponseVerbosity>,
     pub tool_output_verbosity: Option<ToolOutputVerbosity>,
     pub transcript_default: Option<TranscriptDefault>,
-    pub alternate_screen: Option<TuiAlternateScreen>,
     pub synchronized_output: Option<TuiSynchronizedOutput>,
     pub show_reasoning_usage: Option<bool>,
     pub coalesce_tool_runs: Option<bool>,
@@ -8458,7 +8431,6 @@ impl TuiSettings {
                 "response_verbosity",
                 "tool_output_verbosity",
                 "transcript_default",
-                "alternate_screen",
                 "synchronized_output",
                 "show_reasoning_usage",
                 "coalesce_tool_runs",
@@ -8500,12 +8472,6 @@ impl TuiSettings {
                 "transcript_default",
                 source,
                 &field(path, "transcript_default"),
-            )?,
-            alternate_screen: tui_alternate_screen_value(
-                table,
-                "alternate_screen",
-                source,
-                &field(path, "alternate_screen"),
             )?,
             synchronized_output: tui_synchronized_output_value(
                 table,
@@ -8568,7 +8534,6 @@ impl TuiSettings {
         replace_if_some(&mut self.response_verbosity, next.response_verbosity);
         replace_if_some(&mut self.tool_output_verbosity, next.tool_output_verbosity);
         replace_if_some(&mut self.transcript_default, next.transcript_default);
-        replace_if_some(&mut self.alternate_screen, next.alternate_screen);
         replace_if_some(&mut self.synchronized_output, next.synchronized_output);
         replace_if_some(&mut self.show_reasoning_usage, next.show_reasoning_usage);
         replace_if_some(&mut self.status_line, next.status_line);
@@ -8952,7 +8917,6 @@ pub fn user_settings_template() -> &'static str {
 # response_verbosity = "normal"  # concise | normal | verbose
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
-# alternate_screen = "auto"     # auto/never preserve terminal scrollback; always uses fullscreen alternate screen
 # synchronized_output = "auto"  # auto | always | never (DEC 2026 atomic redraw)
 # show_reasoning_usage = true
 # persist_prompt_history = false  # mirror Up/Down prompt history to ~/.squeezy/prompt_history (XDG-compatible)
@@ -9104,7 +9068,6 @@ pub fn project_settings_template() -> &'static str {
 # response_verbosity = "normal"  # concise | normal | verbose
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
-# alternate_screen = "auto"     # auto/never preserve terminal scrollback; always uses fullscreen alternate screen
 # synchronized_output = "auto"  # auto | always | never (DEC 2026 atomic redraw)
 # show_reasoning_usage = true
 
@@ -10939,25 +10902,6 @@ fn shell_diff_inline_value(
         "folded" => Ok(Some(ShellDiffInline::Folded)),
         _ => Err(SqueezyError::Config(format!(
             "{source}: {path}: invalid shell diff inline {value:?}; expected full or folded"
-        ))),
-    }
-}
-
-fn tui_alternate_screen_value(
-    table: &toml::value::Table,
-    key: &str,
-    source: &str,
-    path: &str,
-) -> Result<Option<TuiAlternateScreen>> {
-    let Some(value) = string_value(table, key, source, path)? else {
-        return Ok(None);
-    };
-    match value.trim().to_ascii_lowercase().as_str() {
-        "auto" => Ok(Some(TuiAlternateScreen::Auto)),
-        "never" => Ok(Some(TuiAlternateScreen::Never)),
-        "always" => Ok(Some(TuiAlternateScreen::Always)),
-        _ => Err(SqueezyError::Config(format!(
-            "{source}: {path}: invalid TUI alternate screen {value:?}; expected auto, never, or always"
         ))),
     }
 }

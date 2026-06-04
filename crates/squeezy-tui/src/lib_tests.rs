@@ -11,7 +11,7 @@ use squeezy_core::{
     ContextAttachmentStatus, ContextEstimate, CostSnapshot, PermissionCapability, PermissionMode,
     PermissionPolicy, PermissionRequest, PermissionRisk, PermissionScope, SessionMode,
     StatusVerbosity, TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus,
-    TaskVerificationState, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen, TuiConfig,
+    TaskVerificationState, ToolOutputVerbosity, TranscriptDefault, TuiConfig,
     TuiSynchronizedOutput, TurnId, TurnMetrics,
 };
 use squeezy_llm::UnavailableProvider;
@@ -308,67 +308,11 @@ fn subagent_pane_overflow_marks_hidden_and_keeps_newest_reachable() {
 }
 
 #[tokio::test]
-async fn subagent_pane_selects_subagent_conversation_and_returns_to_main() {
-    let mut agent = test_agent(SessionMode::Build);
-    // Live preview-on-highlight is an alternate-screen behavior (the transcript
-    // region re-renders in place). In inline mode highlighting only moves the
-    // selector and the conversation is opened via the overlay on Enter — see
-    // `enter_opens_full_screen_subagent_overlay_in_inline_mode`.
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
-    app.note_subagent_activity(9, "delegate".to_string(), "running grep".to_string());
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-    )
-    .await
-    .expect("focus pane");
-    assert!(app.subagent_pane.focused);
-    assert_eq!(app.subagent_pane.selected, 1);
-    // Highlighting a row previews its conversation live — no Enter required.
-    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(9));
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    )
-    .await
-    .expect("commit selection");
-    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(9));
-    assert!(
-        !app.subagent_pane.focused,
-        "Enter should release selector focus so scroll keys target the transcript"
-    );
-    let subagent_view = lines_to_plain_text(&transcript_lines_for_render(&app, Some(80), false));
-    assert!(
-        subagent_view.contains("delegate subagent"),
-        "{subagent_view}"
-    );
-    assert!(subagent_view.contains("running grep"), "{subagent_view}");
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-    )
-    .await
-    .expect("return to main");
-    assert_eq!(app.subagent_pane.active, ConversationSource::Main);
-    assert!(!app.subagent_pane.focused);
-}
-
-#[tokio::test]
 async fn inline_down_midsentence_focuses_subagent_pane() {
     // Down with a half-typed single-line draft (cursor mid-line) must reach the
     // pane in inline mode — it used to require an empty composer.
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    assert!(!app.alternate_scroll_enabled, "default is inline");
     app.note_subagent_started(9, "delegate".to_string(), "x".to_string());
     app.input = "hello world".to_string();
     app.input_cursor = 5;
@@ -431,86 +375,6 @@ async fn inline_down_in_history_steps_forward_not_into_pane() {
     assert!(
         !app.subagent_pane.focused,
         "Down mid-history must not focus the pane"
-    );
-}
-
-#[tokio::test]
-async fn subagent_pane_does_not_steal_down_scroll_when_main_transcript_is_scrolled() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
-    app.transcript_scroll_from_bottom = 6;
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-    )
-    .await
-    .expect("scroll down");
-
-    assert_eq!(
-        app.transcript_scroll_from_bottom, 3,
-        "plain Down from terminal wheel translation should keep scrolling the main transcript"
-    );
-    assert!(
-        !app.subagent_pane.focused,
-        "subagent selector must not steal scrollback while the main transcript is scrolled"
-    );
-    assert_eq!(app.subagent_pane.active, ConversationSource::Main);
-    assert_eq!(app.subagent_pane.selected, 0);
-}
-
-#[tokio::test]
-async fn selected_subagent_scroll_does_not_mutate_main_transcript_scroll() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.note_subagent_started(7, "delegate".to_string(), "Inspect src".to_string());
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-    )
-    .await
-    .expect("focus pane");
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    )
-    .await
-    .expect("select subagent");
-    app.transcript_scroll_from_bottom = 9;
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-    )
-    .await
-    .expect("scroll subagent");
-
-    assert_eq!(
-        app.transcript_scroll_from_bottom, 9,
-        "subagent transcript scroll must not overwrite main transcript scroll"
-    );
-    let record = app
-        .subagent_pane
-        .records
-        .iter()
-        .find(|record| record.id == 7)
-        .expect("subagent record");
-    assert_eq!(record.scroll_from_bottom, 3);
-    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(7));
-    assert!(
-        !app.subagent_pane.focused,
-        "scroll keys should target the selected subagent transcript, not the selector"
     );
 }
 
@@ -763,17 +627,12 @@ fn subagent_pane_summary_reports_failures() {
 
 #[tokio::test]
 async fn enter_opens_full_screen_subagent_overlay_in_inline_mode() {
-    // The default terminal mode is inline (alternate_screen = auto), where the
-    // conversation lives in scrollback that can't be repainted. Enter on a
-    // selected subagent must therefore open the full-screen overlay so the
-    // subagent's conversation is actually visible — the original bug was that
-    // selecting did nothing in this mode.
+    // The conversation lives in terminal scrollback that can't be repainted, so
+    // Enter on a selected subagent must open the full-screen overlay for the
+    // subagent's conversation to be visible — the original bug was that
+    // selecting did nothing.
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    assert!(
-        !app.alternate_scroll_enabled,
-        "default test config must be inline mode for this scenario"
-    );
     app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
     app.note_subagent_activity(9, "delegate".to_string(), "running grep".to_string());
 
@@ -1798,10 +1657,8 @@ async fn begin_frame_clickables_clears_registry() {
 #[tokio::test]
 async fn wheel_scroll_works_in_inline_mode() {
     let mut app = test_app(SessionMode::Build);
-    // Inline mode → alternate_scroll_enabled is false. Pre-fix this
-    // dropped wheel events entirely. After the fix, wheel scrolls the
+    // Inline mode used to drop wheel events entirely; the wheel must scroll the
     // transcript regardless.
-    app.alternate_scroll_enabled = false;
     app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
     assert_eq!(app.transcript_scroll_from_bottom, 0);
     handle_mouse(
@@ -1815,7 +1672,7 @@ async fn wheel_scroll_works_in_inline_mode() {
     );
     assert_eq!(
         app.transcript_scroll_from_bottom, 3,
-        "wheel must scroll transcript even when alternate_scroll_enabled is false",
+        "wheel must scroll the transcript in inline mode",
     );
     handle_mouse(
         &mut app,
@@ -3759,8 +3616,7 @@ fn keyboard_enhancement_flags_enable_modified_key_reporting() {
 #[tokio::test]
 async fn prompt_history_uses_plain_up_down_when_prompt_is_empty() {
     let mut agent = test_agent(SessionMode::Build);
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Never;
+    let config = test_config(SessionMode::Build);
     let mut app = test_app_with_config(&config, SessionMode::Build);
     push_input_history(&mut app, "first prompt".to_string());
     push_input_history(&mut app, "second prompt".to_string());
@@ -3803,128 +3659,6 @@ async fn prompt_history_uses_plain_up_down_when_prompt_is_empty() {
     assert!(app.input.is_empty());
 }
 
-#[tokio::test]
-async fn alternate_screen_arrows_scroll_transcript_when_prompt_is_empty() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    push_input_history(&mut app, "first prompt".to_string());
-    push_input_history(&mut app, "second prompt".to_string());
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-    )
-    .await
-    .expect("scroll up");
-
-    assert!(app.input.is_empty());
-    assert_eq!(app.transcript_scroll_from_bottom, 3);
-    assert!(app.input_history_index.is_none());
-}
-
-#[tokio::test]
-async fn alternate_screen_alt_arrows_recall_history_when_prompt_is_empty() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    push_input_history(&mut app, "first prompt".to_string());
-    push_input_history(&mut app, "second prompt".to_string());
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
-    )
-    .await
-    .expect("history up");
-
-    assert_eq!(app.input, "second prompt");
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
-}
-
-#[tokio::test]
-async fn alternate_screen_arrows_scroll_transcript_when_draft_is_not_empty() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    set_input(&mut app, "hi".to_string());
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    push_input_history(&mut app, "previous prompt".to_string());
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-    )
-    .await
-    .expect("scroll up");
-
-    assert_eq!(app.input, "hi");
-    assert_eq!(app.transcript_scroll_from_bottom, 3);
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-    )
-    .await
-    .expect("scroll down");
-
-    assert_eq!(app.input, "hi");
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
-
-    // ALT+Up recalls prompt history even with a draft present; the draft is
-    // stashed and restored when stepping back down past the newest entry.
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
-    )
-    .await
-    .expect("history up recalls and stashes draft");
-
-    assert_eq!(app.input, "previous prompt");
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
-    )
-    .await
-    .expect("history down restores draft");
-
-    assert_eq!(app.input, "hi");
-}
-
-#[tokio::test]
-async fn alternate_screen_arrows_keep_scrolling_when_transcript_is_already_scrolled() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    push_input_history(&mut app, "previous prompt".to_string());
-    app.transcript_scroll_from_bottom = 3;
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-    )
-    .await
-    .expect("scroll down");
-
-    assert!(app.input.is_empty());
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
-}
-
 #[test]
 fn default_mouse_wheel_scrolls_transcript_without_touching_input_or_history() {
     // Wheel events scroll the transcript in BOTH inline and alt-screen
@@ -3948,41 +3682,6 @@ fn default_mouse_wheel_scrolls_transcript_without_touching_input_or_history() {
     assert_eq!(app.transcript_scroll_from_bottom, 3);
     assert!(app.input.is_empty());
     assert!(app.input_history_index.is_none());
-}
-
-#[test]
-fn explicit_alternate_screen_mouse_wheel_scrolls_transcript_without_prompt_history() {
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    push_input_history(&mut app, "previous prompt".to_string());
-
-    handle_mouse(
-        &mut app,
-        crossterm::event::MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        },
-    );
-
-    assert_eq!(app.transcript_scroll_from_bottom, 3);
-    assert!(app.input.is_empty());
-
-    handle_mouse(
-        &mut app,
-        crossterm::event::MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        },
-    );
-
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
-    assert!(app.input.is_empty());
 }
 
 #[tokio::test]
@@ -6871,25 +6570,6 @@ fn compact_viewport_hides_attachment_panel_before_prompt_footer() {
     assert!(output.contains('┃'), "{output}");
     assert!(output.contains("Enter send"), "{output}");
     assert!(!output.contains("att-0001"), "{output}");
-}
-
-#[test]
-fn auto_mode_uses_inline_scrollback_like_codex() {
-    let config = test_config(SessionMode::Build);
-
-    assert_eq!(config.tui.alternate_screen, TuiAlternateScreen::Auto);
-    assert_eq!(
-        TerminalMode::from(config.tui.alternate_screen),
-        TerminalMode::Inline
-    );
-    assert_eq!(
-        TerminalMode::from(TuiAlternateScreen::Never),
-        TerminalMode::Inline
-    );
-    assert_eq!(
-        TerminalMode::from(TuiAlternateScreen::Always),
-        TerminalMode::AlternateScreen
-    );
 }
 
 #[test]

@@ -46,9 +46,8 @@ use squeezy_core::{
     ContextCompactionState, ContextEstimate, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES,
     PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
     ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig,
-    ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
-    TuiSynchronizedOutput, TurnMetrics, context_attachment_storage_text,
-    detect_context_attachment_kind, detect_image_mime,
+    ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiSynchronizedOutput, TurnMetrics,
+    context_attachment_storage_text, detect_context_attachment_kind, detect_image_mime,
 };
 use squeezy_llm::{LlmInputItem, LlmProvider};
 use squeezy_skills::PromptTemplateCatalog;
@@ -542,7 +541,7 @@ pub struct StartupRunResult {
 
 pub fn enter_startup_terminal(config: &AppConfig) -> Result<StartupTerminal> {
     apply_theme_overrides(config);
-    let guard = TerminalGuard::enter(config.tui.alternate_screen, config.tui.synchronized_output)?;
+    let guard = TerminalGuard::enter(config.tui.synchronized_output)?;
     Ok(StartupTerminal { guard })
 }
 
@@ -641,8 +640,7 @@ async fn run_inner(
     startup: StartupProfile,
 ) -> Result<StartupRunOutcome> {
     apply_theme_overrides(&config);
-    let terminal =
-        TerminalGuard::enter(config.tui.alternate_screen, config.tui.synchronized_output)?;
+    let terminal = TerminalGuard::enter(config.tui.synchronized_output)?;
     let (outcome, _) =
         run_inner_with_terminal(config, provider, resume_session_id, startup, terminal).await?;
     Ok(outcome)
@@ -1549,11 +1547,9 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         dispatch_click_action(app, action);
         return true;
     }
-    // Wheel scroll always scrolls the transcript. The previous
-    // `alternate_scroll_enabled` gate dropped wheel events in
-    // inline-viewport mode (where the terminal's native
-    // wheel-to-arrow translation is disabled), which left the user
-    // with no way to scroll at all once mouse capture was on.
+    // Wheel scroll always scrolls the transcript — the inline viewport
+    // disables the terminal's native wheel-to-arrow translation, so without
+    // this the user would have no way to scroll once mouse capture was on.
     // Compare the *active* conversation's scroll (subagent records carry
     // their own offset), not always main's, so wheeling a selected subagent
     // transcript still reports the change and triggers a redraw.
@@ -1835,14 +1831,14 @@ fn select_subagent_row(app: &mut TuiApp) {
 /// surfaced by the full-screen overlay on Enter. This keeps keyboard scrolling
 /// pointed at the main/terminal conversation while you browse the pane.
 fn highlight_selected_subagent_row(app: &mut TuiApp) {
-    if app.alternate_scroll_enabled {
-        select_subagent_row(app);
-    } else {
-        app.status = match selected_conversation_source(app) {
-            ConversationSource::Main => "main conversation".to_string(),
-            ConversationSource::Subagent(_) => "subagent pane".to_string(),
-        };
-    }
+    // Inline mode: the conversation lives in terminal scrollback the pane
+    // can't repaint, so highlighting only previews the selection in the
+    // status line — a subagent is surfaced by the full-screen overlay on
+    // Enter, never by hijacking the shown conversation here.
+    app.status = match selected_conversation_source(app) {
+        ConversationSource::Main => "main conversation".to_string(),
+        ConversationSource::Subagent(_) => "subagent pane".to_string(),
+    };
 }
 
 /// Move keyboard focus into the subagent pane and preview the first
@@ -1902,18 +1898,12 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             // highlighting leaves `active` on main until now).
             select_subagent_row(app);
             app.subagent_pane.focused = false;
-            // In alternate-screen mode the transcript region re-renders the
-            // active subagent in place, so Enter just releases the selector
-            // and the arrow keys scroll that transcript. In the default
-            // inline mode the conversation lives in scrollback that can't be
-            // repainted, so open the full-screen overlay (which honours the
-            // active source) to actually surface the subagent's transcript.
+            // The conversation lives in scrollback that can't be repainted, so
+            // open the full-screen overlay (which honours the active source) to
+            // surface the selected subagent's transcript.
             match app.subagent_pane.active {
-                ConversationSource::Subagent(_) if !app.alternate_scroll_enabled => {
-                    open_subagent_transcript_overlay(app);
-                }
                 ConversationSource::Subagent(_) => {
-                    app.status = "subagent conversation selected".to_string();
+                    open_subagent_transcript_overlay(app);
                 }
                 ConversationSource::Main => {
                     app.status = "main conversation selected".to_string();
@@ -2215,15 +2205,6 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
-    if should_route_plain_arrow_to_scroll_before_subagent_pane(app, key) {
-        match key.code {
-            KeyCode::Up => scroll_transcript_up(app, 3),
-            KeyCode::Down => scroll_transcript_down(app, 3),
-            _ => {}
-        }
-        return Ok(false);
-    }
-
     if handle_subagent_pane_key(app, key) {
         return Ok(false);
     }
@@ -2278,10 +2259,8 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 recall_prompt_history(app, HistoryDirection::Previous);
             } else if move_input_cursor_up(app) {
                 // Multi-line input: step the cursor up one line. Falls
-                // through to history/scroll when the cursor is already on
-                // the first line so the single-line behaviour is intact.
-            } else if should_route_plain_arrow_to_scroll(app) {
-                scroll_transcript_up(app, 3);
+                // through to history when the cursor is already on the
+                // first line so the single-line behaviour is intact.
             } else {
                 recall_prompt_history(app, HistoryDirection::Previous);
             }
@@ -2298,11 +2277,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             } else if move_input_cursor_down(app) {
                 // Same as Up — when there's a next line in the composer
                 // step into it; only when on the last line do we fall
-                // through to history/scroll.
-            } else if should_route_plain_arrow_to_scroll(app)
-                && active_transcript_scroll_from_bottom(app) > 0
-            {
-                scroll_transcript_down(app, 3);
+                // through to history.
             } else if !recall_prompt_history(app, HistoryDirection::Next) {
                 // Nothing left to step forward to in the prompt history and
                 // the transcript is already at the bottom: chain Down into
@@ -2746,29 +2721,6 @@ fn scroll_transcript_up(app: &mut TuiApp, lines: u16) {
 fn scroll_transcript_down(app: &mut TuiApp, lines: u16) {
     let scroll = active_transcript_scroll_from_bottom(app).saturating_sub(lines);
     set_active_transcript_scroll_from_bottom(app, scroll);
-}
-
-fn should_route_plain_arrow_to_scroll(app: &TuiApp) -> bool {
-    app.alternate_scroll_enabled
-        && app.input_history_index.is_none()
-        && !active_transcript_entries(app).is_empty()
-}
-
-fn should_route_plain_arrow_to_scroll_before_subagent_pane(app: &TuiApp, key: KeyEvent) -> bool {
-    if app.subagent_pane.focused
-        || app.input_history_index.is_some()
-        || !app.input.is_empty()
-        || !key.modifiers.is_empty()
-        || !app.alternate_scroll_enabled
-        || active_transcript_entries(app).is_empty()
-    {
-        return false;
-    }
-    match key.code {
-        KeyCode::Up => true,
-        KeyCode::Down => active_transcript_scroll_from_bottom(app) > 0,
-        _ => false,
-    }
 }
 
 fn request_turn_interrupt(app: &mut TuiApp) -> bool {
@@ -4576,14 +4528,10 @@ fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         KeyCode::Esc => {
             app.transcript_overlay_scrollbar_cache.set(None);
             app.transcript_overlay = None;
-            // When the overlay was surfacing a subagent conversation in
-            // inline mode (opened from the pane via Enter), Esc backs all the
-            // way out to the main conversation in one press, mirroring the
-            // pane's own Esc. In alternate-screen mode the inline subagent
-            // view persists behind the overlay, so leave the selection alone.
-            if !app.alternate_scroll_enabled
-                && matches!(app.subagent_pane.active, ConversationSource::Subagent(_))
-            {
+            // When the overlay was surfacing a subagent conversation (opened
+            // from the pane via Enter), Esc backs all the way out to the main
+            // conversation in one press, mirroring the pane's own Esc.
+            if matches!(app.subagent_pane.active, ConversationSource::Subagent(_)) {
                 app.subagent_pane.focused = false;
                 app.subagent_pane.active = ConversationSource::Main;
                 app.subagent_pane.selected = 0;
@@ -12933,14 +12881,10 @@ fn subagent_pane_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
 }
 
 /// Hint shown on the focused/selected pane row. `Enter` opens the
-/// full-screen overlay in inline mode (the only way to read a subagent
-/// there) but scrolls the in-place transcript in alternate-screen mode.
-fn subagent_pane_focused_hint(app: &TuiApp) -> &'static str {
-    if app.alternate_scroll_enabled {
-        "↑/↓ switch · Enter scroll · Esc back"
-    } else {
-        "↑/↓ switch · Enter open · Esc back"
-    }
+/// full-screen overlay — the only way to read a subagent's transcript when
+/// the conversation lives in terminal scrollback.
+fn subagent_pane_focused_hint(_app: &TuiApp) -> &'static str {
+    "↑/↓ switch · Enter open · Esc back"
 }
 
 fn subagent_main_row(app: &TuiApp, width: u16) -> Line<'static> {
@@ -13294,13 +13238,9 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         // recovery affordance before the regular hint set.
         return "Ctrl-R restore last prompt · Enter send · Ctrl+J newline · /help".to_string();
     }
-    let mut base = if app.alternate_scroll_enabled {
-        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-T full transcript · /help"
-            .to_string()
-    } else {
+    let mut base =
         "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-T full transcript · /help"
-            .to_string()
-    };
+            .to_string();
     if app.context_compaction_threshold > 0
         && context_window_pct(
             app.context_estimate.estimated_tokens,
@@ -13946,7 +13886,6 @@ pub(crate) struct TuiApp {
     pub(crate) transcript_overlay_scrollbar_cache:
         std::cell::Cell<Option<TranscriptOverlayScrollbarCache>>,
     pub(crate) transcript_overlay_render_cache: std::cell::RefCell<TranscriptOverlayRenderCache>,
-    pub(crate) alternate_scroll_enabled: bool,
     pub(crate) attachments: Vec<ContextAttachment>,
     pub(crate) context_compaction: ContextCompactionState,
     /// Token threshold above which auto-compaction triggers. Captured at
@@ -14402,8 +14341,6 @@ impl TuiApp {
             transcript_overlay_render_cache: std::cell::RefCell::new(
                 TranscriptOverlayRenderCache::default(),
             ),
-            alternate_scroll_enabled: TerminalMode::from(config.tui.alternate_screen)
-                == TerminalMode::AlternateScreen,
             attachments: Vec::new(),
             context_compaction: ContextCompactionState::default(),
             context_compaction_threshold: config.context_compaction.estimated_tokens,
@@ -15705,28 +15642,10 @@ fn exit_hint(session_id: Option<&str>) -> Option<String> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalMode {
-    Inline,
-    AlternateScreen,
-}
-
-impl From<TuiAlternateScreen> for TerminalMode {
-    fn from(value: TuiAlternateScreen) -> Self {
-        match value {
-            TuiAlternateScreen::Auto => Self::Inline,
-            TuiAlternateScreen::Never => Self::Inline,
-            TuiAlternateScreen::Always => Self::AlternateScreen,
-        }
-    }
-}
-
 struct TerminalGuard {
-    /// `Option` so we can drop and rebuild the ratatui `Terminal`
-    /// Primary terminal in the user-configured mode. For inline
-    /// mode this is a `Viewport::Inline(N)` terminal pinned to the
-    /// bottom N rows of the main buffer; for alt-screen mode it's
-    /// a fullscreen terminal. Always `Some` after `enter`.
+    /// `Option` so we can drop and rebuild the ratatui `Terminal`.
+    /// Inline `Viewport::Inline(N)` terminal pinned to the bottom N
+    /// rows of the main buffer. Always `Some` after `enter`.
     terminal: Option<Terminal<CrosstermBackend<TerminalWriter>>>,
     /// Secondary fullscreen terminal used only when the configured
     /// mode is inline and the transcript overlay is open. Built
@@ -15738,14 +15657,8 @@ struct TerminalGuard {
     /// Terminal construction (the bug that ghosted the pre-overlay
     /// viewport above the new one on overlay close).
     overlay_terminal: Option<Terminal<CrosstermBackend<TerminalWriter>>>,
-    /// User-configured mode (`Inline` or `AlternateScreen`). Stays
-    /// constant for the session — overlay-screen swaps only flip
-    /// `overlay_screen_active`, not `mode`.
-    mode: TerminalMode,
-    /// True while the inline guard is currently routing draws to
-    /// the alt-screen overlay terminal. Always `false` when
-    /// `mode == AlternateScreen` (that mode is already fullscreen —
-    /// no swap needed).
+    /// True while the inline guard is currently routing draws to the
+    /// alt-screen overlay terminal (the transcript overlay is open).
     overlay_screen_active: bool,
     /// True after we have applied the transcript overlay's mouse policy
     /// to the terminal. Needed because the overlay temporarily overrides
@@ -15787,11 +15700,7 @@ impl TerminalGuard {
 }
 
 impl TerminalGuard {
-    fn enter(
-        alternate_screen: TuiAlternateScreen,
-        synchronized_output: TuiSynchronizedOutput,
-    ) -> Result<Self> {
-        let mode = TerminalMode::from(alternate_screen);
+    fn enter(synchronized_output: TuiSynchronizedOutput) -> Result<Self> {
         let synchronized_output = resolve_synchronized_output(synchronized_output);
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         // Wrap stdout in the env-gated debug-tap writer so every
@@ -15815,55 +15724,34 @@ impl TerminalGuard {
         let mouse_capture = std::env::var_os("SQUEEZY_MOUSE_CAPTURE")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false);
-        match mode {
-            TerminalMode::Inline => {
-                execute!(
-                    writer,
-                    Print(CLEAR_SCROLLBACK_AND_VISIBLE),
-                    Print(DISABLE_MOUSE_MODES),
-                    DisableAlternateScroll,
-                    EnableBracketedPaste,
-                    EnableFocusChange
-                )
+        // Inline viewport: the TUI pins itself to the bottom rows and flushes
+        // finished output up into the terminal's own scrollback. Full-screen
+        // surfaces (the transcript overlay, config screen) are transient
+        // alt-screen swaps, handled by `sync_overlay_screen`.
+        execute!(
+            writer,
+            Print(CLEAR_SCROLLBACK_AND_VISIBLE),
+            Print(DISABLE_MOUSE_MODES),
+            DisableAlternateScroll,
+            EnableBracketedPaste,
+            EnableFocusChange
+        )
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        if mouse_capture {
+            execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-                if mouse_capture {
-                    execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))
-                        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-                }
-            }
-            TerminalMode::AlternateScreen => {
-                execute!(
-                    writer,
-                    EnterAlternateScreen,
-                    Print(DISABLE_MOUSE_MODES),
-                    EnableAlternateScroll,
-                    Clear(ClearType::All),
-                    MoveTo(0, 0),
-                    EnableBracketedPaste,
-                    EnableFocusChange
-                )
-                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-                if mouse_capture {
-                    execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))
-                        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-                }
-            }
         }
         let backend = CrosstermBackend::new(writer);
-        let terminal = match mode {
-            TerminalMode::Inline => Terminal::with_options(
-                backend,
-                TerminalOptions {
-                    viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
-                },
-            ),
-            TerminalMode::AlternateScreen => Terminal::new(backend),
-        }
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+            },
+        )
         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         Ok(Self {
             terminal: Some(terminal),
             overlay_terminal: None,
-            mode,
             overlay_screen_active: false,
             overlay_mouse_override_active: false,
             overlay_mouse_capture: false,
@@ -15945,8 +15833,7 @@ impl TerminalGuard {
         // over scrollback). Alt-screen mode OR overlay-screen swap =
         // `render` (fullscreen draw, with the overlay branch picking
         // the right widget).
-        let use_fullscreen_render =
-            self.mode == TerminalMode::AlternateScreen || self.overlay_screen_active;
+        let use_fullscreen_render = self.overlay_screen_active;
         if !use_fullscreen_render {
             self.flush_history(app)?;
         }
@@ -16012,9 +15899,6 @@ impl TerminalGuard {
     ///   then build a fresh `Viewport::Inline` `Terminal` to resume
     ///   painting the bottom-anchored TUI viewport.
     fn sync_overlay_screen(&mut self, want_overlay_full: bool) -> Result<()> {
-        if self.mode != TerminalMode::Inline {
-            return Ok(());
-        }
         match (self.overlay_screen_active, want_overlay_full) {
             (false, true) => self.enter_overlay_screen(),
             (true, false) => self.leave_overlay_screen(),
@@ -16155,7 +16039,7 @@ impl TerminalGuard {
     /// scroll to pull up. Alternate-screen mode handles resize cleanly via
     /// the terminal itself, so the work is inline-only.
     fn wipe_inline_viewport_for_resize(&mut self) -> Result<()> {
-        if self.mode != TerminalMode::Inline || self.overlay_screen_active {
+        if self.overlay_screen_active {
             return Ok(());
         }
         let viewport_top = self.term().get_frame().area().y;
@@ -16172,7 +16056,7 @@ impl TerminalGuard {
     }
 
     fn flush_history(&mut self, app: &TuiApp) -> Result<()> {
-        if self.mode != TerminalMode::Inline || self.overlay_screen_active {
+        if self.overlay_screen_active {
             return Ok(());
         }
         let width = self
@@ -16225,38 +16109,18 @@ impl Drop for TerminalGuard {
         let Some(terminal) = self.terminal.as_mut() else {
             return;
         };
-        match self.mode {
-            TerminalMode::Inline => {
-                let _ = execute!(
-                    terminal.backend_mut(),
-                    PopKeyboardEnhancementFlags,
-                    Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
-                    DisableModifyOtherKeys,
-                    DisableBracketedPaste,
-                    DisableFocusChange,
-                    DisableAlternateScroll,
-                    Print(DISABLE_MOUSE_MODES),
-                    Print("\x1b]0;\x07"),
-                    Print(CLEAR_SCROLLBACK_AND_VISIBLE)
-                );
-            }
-            TerminalMode::AlternateScreen => {
-                let _ = execute!(
-                    terminal.backend_mut(),
-                    PopKeyboardEnhancementFlags,
-                    Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
-                    DisableModifyOtherKeys,
-                    DisableBracketedPaste,
-                    DisableFocusChange,
-                    DisableAlternateScroll,
-                    Print(DISABLE_MOUSE_MODES),
-                    Print("\x1b]0;\x07"),
-                    Clear(ClearType::All),
-                    MoveTo(0, 0),
-                    LeaveAlternateScreen
-                );
-            }
-        }
+        let _ = execute!(
+            terminal.backend_mut(),
+            PopKeyboardEnhancementFlags,
+            Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
+            DisableModifyOtherKeys,
+            DisableBracketedPaste,
+            DisableFocusChange,
+            DisableAlternateScroll,
+            Print(DISABLE_MOUSE_MODES),
+            Print("\x1b]0;\x07"),
+            Print(CLEAR_SCROLLBACK_AND_VISIBLE)
+        );
         let _ = terminal.show_cursor();
         if let Some(hint) = &self.exit_hint {
             let _ = writeln!(terminal.backend_mut(), "{hint}");
