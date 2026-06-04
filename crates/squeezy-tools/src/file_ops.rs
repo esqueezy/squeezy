@@ -14,7 +14,9 @@ use squeezy_vcs::{DiffMode, DiffOptions};
 use squeezy_workspace::ExclusionReason;
 use tokio_util::sync::CancellationToken;
 
-use crate::graph_tools::{graph_symbol_search, symbol_kind_label};
+use crate::graph_tools::{
+    TRANSITIVE_CLOSURE_CAP, graph_transitive_subtype_closure, symbol_kind_label,
+};
 use crate::{
     DEFAULT_MAX_BYTES_PER_FILE, DEFAULT_MAX_FILES, DEFAULT_READ_LIMIT, MAX_READ_LIMIT,
     POLICY_PREFIX_BYTES, ToolCall, ToolCostHint, ToolOutputReplayKey, ToolOutputReplayServed,
@@ -1077,7 +1079,21 @@ impl ToolRegistry {
             _ => None,
         };
 
-        let symbols = graph_symbol_search(graph, None, kind, None, None, None, Some(&attribute));
+        // The augment promises to "find every subtype", so walk the full
+        // TRANSITIVE subtype closure rather than only the direct subtypes the
+        // single-pass attribute filter surfaces: a `class C extends B` whose `B
+        // extends A` records `base:B` (not `base:A`), so a one-shot
+        // `base:A|...` query would miss C. Seed the closure from each named
+        // supertype; the bound below keeps it to `GRAPH_AUGMENT_CAP`.
+        let symbols = graph_transitive_subtype_closure(
+            graph,
+            kind,
+            None,
+            None,
+            None,
+            &detected.base_names,
+            TRANSITIVE_CLOSURE_CAP,
+        );
 
         let truncated = symbols.len() > GRAPH_AUGMENT_CAP;
         let mut matched_attributes = BTreeSet::new();

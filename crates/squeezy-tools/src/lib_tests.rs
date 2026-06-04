@@ -9093,6 +9093,110 @@ class Foo {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Collect the declaration names from a `decl_search` result's packets.
+fn decl_search_packet_names(content: &Value) -> Vec<String> {
+    content["packets"]
+        .as_array()
+        .map(|packets| {
+            packets
+                .iter()
+                .filter_map(|p| p["symbol"]["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn decl_search_transitive_returns_full_subtype_closure() {
+    // A 3-level C# hierarchy: A <- B <- C. The graph only records each class's
+    // DIRECT base (`B` carries `base:A`, `C` carries `base:B`, not `base:A`),
+    // so a one-shot `attribute="base:A"` query surfaces only B. With
+    // `transitive=true` the closure must walk B -> C and return BOTH.
+    let root = temp_workspace("decl_search_transitive_closure");
+    fs::write(
+        root.join("Hierarchy.cs"),
+        r#"
+namespace App;
+
+public class A { }
+public class B : A { }
+public class C : B { }
+"#,
+    )
+    .expect("write csharp source");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Sanity: the non-transitive search returns ONLY the direct subtype B.
+    let direct = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_direct".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({ "attribute": "base:A" }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(direct.status, ToolStatus::Success, "{:?}", direct.content);
+    let direct_names = decl_search_packet_names(&direct.content);
+    assert_eq!(
+        direct_names,
+        vec!["B".to_string()],
+        "direct (transitive absent) decl_search must return only the immediate subtype: {:?}",
+        direct.content
+    );
+
+    // transitive=false behaves identically to omitting it.
+    let explicit_false = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_false".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({ "attribute": "base:A", "transitive": false }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        explicit_false.status,
+        ToolStatus::Success,
+        "{:?}",
+        explicit_false.content
+    );
+    assert_eq!(
+        decl_search_packet_names(&explicit_false.content),
+        vec!["B".to_string()],
+        "transitive=false must match the omitted-flag behaviour: {:?}",
+        explicit_false.content
+    );
+
+    // transitive=true walks the whole subtype tree: BOTH B and C.
+    let transitive = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_transitive".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({ "attribute": "base:A", "transitive": true }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        transitive.status,
+        ToolStatus::Success,
+        "{:?}",
+        transitive.content
+    );
+    let transitive_names = decl_search_packet_names(&transitive.content);
+    assert!(
+        transitive_names.contains(&"B".to_string()) && transitive_names.contains(&"C".to_string()),
+        "transitive=true must return the full subtype closure (B and C), got {transitive_names:?}: {:?}",
+        transitive.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn decl_search_rejects_empty_unfiltered_query() {
     let root = temp_workspace("decl_search_empty_unfiltered");
@@ -11976,7 +12080,13 @@ fn core_tool_prefix_stays_within_byte_baseline() {
     // buys correct one-call retrieval of every extender/implementer/mixer of
     // a type — net-negative on tokens versus the failed-regex retries it
     // replaces.
-    const PREFIX_BYTES_BASELINE: usize = 24_904;
+    // 24_904 -> 25_230: deliberate bump for `decl_search transitive=true`. The
+    // graph only records each type's DIRECT base, so a one-shot `base:A` query
+    // returns only immediate subtypes; the +326 bytes (description sentence +
+    // the `transitive` boolean schema property) buys one-call retrieval of the
+    // whole transitive subtype closure, replacing the N follow-up `decl_search`
+    // calls a model would otherwise issue to walk a deep hierarchy by hand.
+    const PREFIX_BYTES_BASELINE: usize = 25_230;
 
     // Every first-party spec advertised in the always-core path, paired
     // with the required params the model must still see to call it. Tools

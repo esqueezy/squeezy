@@ -55,6 +55,7 @@ struct DeclSearchArgs {
     language: Option<String>,
     visibility: Option<String>,
     attribute: Option<String>,
+    transitive: Option<bool>,
     max_results: Option<usize>,
     offset: Option<usize>,
 }
@@ -979,6 +980,109 @@ pub(crate) fn graph_symbol_search(
             .then(left.span.start_byte.cmp(&right.span.start_byte))
     });
     symbols
+}
+
+/// Cap on the number of symbols a transitive subtype closure may return.
+/// Keeps a deep or wide hierarchy from producing an unbounded payload; the
+/// seen-names set guarantees termination, this guarantees a bounded size.
+pub(crate) const TRANSITIVE_CLOSURE_CAP: usize = 200;
+
+/// Inheritance-attribute prefixes the transitive closure understands. A seed
+/// `attribute` value carrying any of these enumerates subtypes by name.
+const INHERITANCE_PREFIXES: [&str; 3] = ["base:", "mixin:", "iface:"];
+
+/// True when `attribute` carries at least one inheritance prefix
+/// (`base:`/`mixin:`/`iface:`), i.e. the filter names a supertype to enumerate
+/// subtypes of. Only then does a transitive closure make sense.
+fn attribute_has_inheritance_prefix(attribute: &str) -> bool {
+    attribute
+        .split('|')
+        .map(str::trim)
+        .any(|alt| INHERITANCE_PREFIXES.iter().any(|p| alt.starts_with(p)))
+}
+
+/// Parse the seed supertype name(s) out of an inheritance `attribute` filter.
+/// Each `prefix:Name` alternative contributes `Name`; prefix-free or empty
+/// alternatives are skipped. De-duplicates while preserving first-seen order.
+fn seed_type_names(attribute: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    for alt in attribute.split('|').map(str::trim) {
+        for prefix in INHERITANCE_PREFIXES {
+            if let Some(name) = alt.strip_prefix(prefix) {
+                let name = name.trim();
+                if !name.is_empty() && seen.insert(name.to_string()) {
+                    names.push(name.to_string());
+                }
+                break;
+            }
+        }
+    }
+    names
+}
+
+/// Transitive subtype closure for an inheritance `attribute` filter.
+///
+/// `decl_search`/grep's direct-attribute filter only ever surfaces the
+/// *immediate* subtypes of a base (`class B extends A` records `base:A` on
+/// `B`, but `class C extends B` records `base:B`, not `base:A`). This walks the
+/// hierarchy by name: starting from each seed supertype, it repeatedly runs the
+/// existing direct-attribute search (`base:N|mixin:N|iface:N`) and enqueues
+/// every newly discovered subtype's name, so an `attribute="base:A"` query
+/// returns A's whole subtype tree (B, C, ...), not just B.
+///
+/// Termination/cycle safety comes from a seen-names set (each type name is
+/// expanded at most once); size is bounded by [`TRANSITIVE_CLOSURE_CAP`]. The
+/// `kind`/`path`/`language`/`visibility` scopes are threaded through unchanged
+/// so the closure respects the same filters the seed query did.
+pub(crate) fn graph_transitive_subtype_closure(
+    graph: &squeezy_graph::SemanticGraph,
+    kind: Option<&str>,
+    path: Option<&str>,
+    language: Option<&str>,
+    visibility: Option<&str>,
+    seed_names: &[String],
+    cap: usize,
+) -> Vec<GraphSymbol> {
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    for name in seed_names {
+        if seen_names.insert(name.clone()) {
+            queue.push_back(name.clone());
+        }
+    }
+
+    let mut seen_ids: HashSet<SymbolId> = HashSet::new();
+    let mut results: Vec<GraphSymbol> = Vec::new();
+
+    while let Some(name) = queue.pop_front() {
+        let attribute = format!("base:{name}|mixin:{name}|iface:{name}");
+        let matches = graph_symbol_search(
+            graph,
+            None,
+            kind,
+            path,
+            language,
+            visibility,
+            Some(&attribute),
+        );
+        for symbol in matches {
+            if results.len() >= cap {
+                return results;
+            }
+            // A symbol genuinely new to the closure (by id) is a result; if its
+            // own name has not been expanded yet, enqueue it so its subtypes are
+            // discovered too — this is what makes the closure transitive.
+            if seen_ids.insert(symbol.id.clone()) {
+                if seen_names.insert(symbol.name.clone()) {
+                    queue.push_back(symbol.name.clone());
+                }
+                results.push(symbol);
+            }
+        }
+    }
+
+    results
 }
 
 /// Resolve a dotted-or-double-coloned query like `PQueue.add` or
@@ -2519,15 +2623,37 @@ impl ToolRegistry {
         }
         let max_results = graph_limit(args.max_results);
         let offset = args.offset.unwrap_or(0);
-        let symbols = graph_symbol_search(
-            graph,
-            args.query.as_deref(),
-            args.kind.as_deref(),
-            args.path.as_deref(),
-            args.language.as_deref(),
-            args.visibility.as_deref(),
-            args.attribute.as_deref(),
-        );
+        // Transitive subtype closure: when the caller asks for `transitive=true`
+        // AND the attribute names a supertype (`base:`/`mixin:`/`iface:`), walk
+        // the whole subtype tree by name instead of returning only the direct
+        // subtypes the single-pass attribute filter surfaces. Any other shape
+        // (no transitive flag, or a non-inheritance attribute) is unchanged.
+        let transitive_seed = args.transitive.unwrap_or(false).then(|| {
+            args.attribute
+                .as_deref()
+                .filter(|attr| attribute_has_inheritance_prefix(attr))
+                .map(seed_type_names)
+        });
+        let symbols = match transitive_seed {
+            Some(Some(seed_names)) if !seed_names.is_empty() => graph_transitive_subtype_closure(
+                graph,
+                args.kind.as_deref(),
+                args.path.as_deref(),
+                args.language.as_deref(),
+                args.visibility.as_deref(),
+                &seed_names,
+                TRANSITIVE_CLOSURE_CAP,
+            ),
+            _ => graph_symbol_search(
+                graph,
+                args.query.as_deref(),
+                args.kind.as_deref(),
+                args.path.as_deref(),
+                args.language.as_deref(),
+                args.visibility.as_deref(),
+                args.attribute.as_deref(),
+            ),
+        };
         let truncated = symbols.len().saturating_sub(offset) > max_results;
         let selected = symbols
             .iter()
@@ -3825,6 +3951,42 @@ mod attribute_filter_tests {
             "base:Session | base:AuthBase"
         ));
         assert!(attribute_filter_matches(&attrs, "|base:Session|"));
+    }
+}
+
+#[cfg(test)]
+mod transitive_seed_tests {
+    use super::{attribute_has_inheritance_prefix, seed_type_names};
+
+    #[test]
+    fn detects_each_inheritance_prefix() {
+        assert!(attribute_has_inheritance_prefix("base:A"));
+        assert!(attribute_has_inheritance_prefix("iface:Comparable"));
+        assert!(attribute_has_inheritance_prefix("mixin:Observer"));
+        // Any alternative with a prefix qualifies.
+        assert!(attribute_has_inheritance_prefix("decorator:x|base:A"));
+        // Prefix-free / non-inheritance filters do not.
+        assert!(!attribute_has_inheritance_prefix("A"));
+        assert!(!attribute_has_inheritance_prefix("decorator:property"));
+    }
+
+    #[test]
+    fn parses_seed_names_from_each_prefix() {
+        assert_eq!(
+            seed_type_names("base:A|mixin:M|iface:I"),
+            vec!["A".to_string(), "M".to_string(), "I".to_string()],
+        );
+    }
+
+    #[test]
+    fn seed_names_dedup_trim_and_skip_prefix_free() {
+        // Whitespace is trimmed, duplicates collapse (first-seen order), and a
+        // prefix-free alternative contributes no seed.
+        assert_eq!(
+            seed_type_names(" base:A | base:A | Plain | iface:B "),
+            vec!["A".to_string(), "B".to_string()],
+        );
+        assert!(seed_type_names("Plain").is_empty());
     }
 }
 
