@@ -2234,12 +2234,18 @@ fn should_run_startup_model_selector(cli: &Cli, config: &AppConfig) -> squeezy_c
     }
     if cli.provider.is_some()
         || cli.model.is_some()
-        || env::var_os("SQUEEZY_PROVIDER").is_some()
-        || env::var_os("SQUEEZY_MODEL").is_some()
+        || env_var_is_nonempty("SQUEEZY_PROVIDER")
+        || env_var_is_nonempty("SQUEEZY_MODEL")
     {
         return Ok(false);
     }
     Ok(!current_model_selection_state(&config.workspace_root)?.configured())
+}
+
+fn env_var_is_nonempty(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn current_model_selection_state(
@@ -2510,7 +2516,7 @@ fn compatible_provider_choice(
             curated.push(discovered_model_label(model));
         }
     }
-    let configured = env::var_os(&api_key_env).is_some();
+    let configured = env_var_is_nonempty(&api_key_env);
     if configured && needs_refresh {
         spawn_background_refresh(
             preset.as_str().to_string(),
@@ -2606,7 +2612,7 @@ fn hosted_provider_choice(
     api_key_env: String,
     base_url: Option<String>,
 ) -> ProviderChoice {
-    let configured = env::var_os(&api_key_env).is_some();
+    let configured = env_var_is_nonempty(&api_key_env);
     ProviderChoice {
         provider,
         label: format!("{label} ({})", credential_label(&api_key_env, configured)),
