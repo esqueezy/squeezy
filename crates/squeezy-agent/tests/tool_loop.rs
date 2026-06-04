@@ -746,6 +746,120 @@ fn delegate_subagent_stops_on_round_input_ceiling_with_best_effort() {
     });
 }
 
+/// The anti-redundant-delegation gate refuses a whole-task `delegate` once the
+/// parent has already explored heavily in-context (>= 8 tool calls), and does
+/// NOT spawn a cold subagent that would re-read the same files. Recall-safe:
+/// the refusal is `Denied`, the parent keeps its context, and the turn finishes
+/// normally.
+#[test]
+fn redundant_delegate_refused_after_heavy_parent_exploration() {
+    run_high_stack_test(async {
+        let root = temp_workspace("redundant_delegate_gate");
+        fs::write(root.join("src.rs"), "fn marker() {}\n".repeat(40)).expect("write source");
+
+        // Parent round 0: eight greps -> crosses the `tool_calls >= 8` trigger.
+        let mut round0 = vec![Ok(LlmEvent::Started)];
+        for index in 0..8 {
+            round0.push(Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: format!("grep_{index}"),
+                name: "grep".to_string(),
+                arguments: serde_json::json!({"pattern": "marker"}),
+            })));
+        }
+        round0.push(Ok(LlmEvent::Completed {
+            response_id: Some("parent_explore".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }));
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            round0,
+            // Round 1: parent now fires a whole-task delegate -> must be refused.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "del_redundant".to_string(),
+                    name: "delegate".to_string(),
+                    arguments: serde_json::json!({"prompt": "now go do the whole audit"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_delegate".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            // Round 2: parent sees the Denied delegate result and finishes.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("answered in-context".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
+        drain_turn(agent.start_turn("audit the tree".to_string(), CancellationToken::new())).await;
+
+        // No subagent ran — the cold re-exploration was avoided entirely.
+        let snapshot = agent.session_accounting_snapshot().await;
+        assert_eq!(
+            snapshot.metrics.subagent_calls, 0,
+            "redundant delegate must be refused without spawning a subagent"
+        );
+
+        // The refusal reaches the parent as a Denied result with guidance.
+        let requests = provider.requests();
+        let parent_outputs = function_outputs(requests.last().expect("a final parent request"));
+        let delegate_output = parent_outputs
+            .iter()
+            .find(|(call_id, _)| *call_id == "del_redundant")
+            .map(|(_, value)| value)
+            .expect("delegate output must reach the parent");
+        let content = &delegate_output["content"];
+        assert_eq!(content["ok"], false, "refused delegate: {content}");
+        assert!(
+            content["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("redundant"),
+            "refusal must explain itself: {content}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    });
+}
+
+/// Mid-turn compaction is dormant unless `model_context_window` is set; it was
+/// only ever set from explicit config, so it never fired. The agent now derives
+/// it from the model registry at construction, which is what arms compaction on
+/// long single-turn tool storms. (Explicit config still wins.)
+#[test]
+fn context_window_auto_derived_from_model_registry() {
+    run_high_stack_test(async {
+        let root = temp_workspace("ctx_window_derive");
+        let provider = Arc::new(ScriptedProvider::named("openai", vec![]));
+        let mut config = config_for(root.clone());
+        config.model = "gpt-5.4-mini".to_string();
+        assert!(
+            config.context_compaction.model_context_window.is_none(),
+            "precondition: operator did not pin a window"
+        );
+        let agent = Agent::new(config, provider);
+        assert_eq!(
+            agent.config().context_compaction.model_context_window,
+            Some(400_000),
+            "window must be auto-derived from the model registry to arm compaction"
+        );
+        let _ = fs::remove_dir_all(root);
+    });
+}
+
 /// Drive a one-tool explore subagent end-to-end and return the captured
 /// provider requests. `provider_name` selects which registry capability row
 /// the agent looks up; `subagent_model` is the resolved explore model. The
