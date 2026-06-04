@@ -379,6 +379,13 @@ pub struct SkillCatalog {
     skills: BTreeMap<String, SkillEntry>,
     cache: Mutex<BTreeMap<String, LoadedSkill>>,
     ambiguous_names: BTreeSet<String>,
+    /// Normalized triggers that appear in more than one distinct
+    /// skill. A trigger that fires for an ambiguous phrase used to
+    /// activate every matching skill at once, which silently inflated
+    /// the active-skill budget. Activation now skips auto-trigger
+    /// matches against entries in this set; users disambiguate with
+    /// `/skill <name>` or `load_skill`.
+    ambiguous_triggers: BTreeSet<String>,
     implicit_by_scripts_dir: BTreeMap<PathBuf, String>,
     implicit_by_doc_path: BTreeMap<PathBuf, String>,
     active_budget_chars: usize,
@@ -399,6 +406,7 @@ impl Default for SkillCatalog {
             skills: BTreeMap::new(),
             cache: Mutex::new(BTreeMap::new()),
             ambiguous_names: BTreeSet::new(),
+            ambiguous_triggers: BTreeSet::new(),
             implicit_by_scripts_dir: BTreeMap::new(),
             implicit_by_doc_path: BTreeMap::new(),
             active_budget_chars: defaults.active_budget_effective_chars(),
@@ -467,7 +475,7 @@ impl SkillCatalog {
             }
         }
         catalog.apply_config_rules(workspace_root, &config.config);
-        catalog.warn_trigger_collisions();
+        catalog.collect_trigger_collisions();
         catalog.rebuild_implicit_indexes();
         catalog
     }
@@ -548,11 +556,17 @@ impl SkillCatalog {
             if entry.summary.disabled || self.ambiguous_names.contains(&entry.summary.name) {
                 continue;
             }
-            if entry
-                .triggers
-                .iter()
-                .any(|trigger| input_matches_trigger(&lowered, trigger))
-            {
+            // Skip any trigger that collides across skills (same
+            // normalized phrase declared by two or more distinct
+            // skills). Loading every match silently bloated the
+            // active-skill budget. Auto-activation requires a unique
+            // trigger; users disambiguate with `/skill <name>` or
+            // `load_skill`.
+            if entry.triggers.iter().any(|trigger| {
+                let normalized = trigger.trim().to_ascii_lowercase();
+                !self.ambiguous_triggers.contains(&normalized)
+                    && input_matches_trigger(&lowered, trigger)
+            }) {
                 candidates.push((entry.summary.name.clone(), SkillActivationKind::Trigger));
             }
         }
@@ -618,6 +632,13 @@ impl SkillCatalog {
 
     pub fn ambiguous_names(&self) -> &BTreeSet<String> {
         &self.ambiguous_names
+    }
+
+    /// Normalized triggers declared by more than one distinct skill.
+    /// Auto-trigger activation skips these so the parent turn does
+    /// not silently load multiple skills for the same input phrase.
+    pub fn ambiguous_triggers(&self) -> &BTreeSet<String> {
+        &self.ambiguous_triggers
     }
 
     /// Register `hooks:` declared in every non-disabled discovered
@@ -884,7 +905,7 @@ impl SkillCatalog {
         }
     }
 
-    fn warn_trigger_collisions(&self) {
+    fn collect_trigger_collisions(&mut self) {
         let mut by_trigger: BTreeMap<String, Vec<&str>> = BTreeMap::new();
         for entry in self.skills.values() {
             for trigger in &entry.triggers {
@@ -898,6 +919,7 @@ impl SkillCatalog {
                     .push(entry.summary.name.as_str());
             }
         }
+        let mut collisions: BTreeSet<String> = BTreeSet::new();
         for (trigger, mut names) in by_trigger {
             if names.len() < 2 {
                 continue;
@@ -911,9 +933,11 @@ impl SkillCatalog {
                 target: "squeezy_skills",
                 trigger = %trigger,
                 skills = ?names,
-                "duplicate skill trigger across skills; activation will load every match"
+                "duplicate skill trigger across skills; auto-activation requires explicit selection"
             );
+            collisions.insert(trigger);
         }
+        self.ambiguous_triggers = collisions;
     }
 
     fn apply_config_rules(&mut self, workspace_root: &Path, rules: &[SkillConfigEntry]) {
@@ -981,6 +1005,7 @@ impl Clone for SkillCatalog {
             skills: self.skills.clone(),
             cache: Mutex::new(cache),
             ambiguous_names: self.ambiguous_names.clone(),
+            ambiguous_triggers: self.ambiguous_triggers.clone(),
             implicit_by_scripts_dir: self.implicit_by_scripts_dir.clone(),
             implicit_by_doc_path: self.implicit_by_doc_path.clone(),
             active_budget_chars: self.active_budget_chars,

@@ -1719,6 +1719,57 @@ fn cross_precedence_name_collision_emits_load_time_warning() {
 }
 
 #[test]
+fn duplicate_trigger_across_skills_skips_auto_activation() {
+    let root = temp_workspace("skills_trigger_collision_skip");
+    write_skill(
+        &root.join(".squeezy/skills/alpha"),
+        "alpha",
+        "Alpha skill",
+        &["graph"],
+    );
+    write_skill(
+        &root.join(".squeezy/skills/beta"),
+        "beta",
+        "Beta skill",
+        &["graph"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+
+    assert!(
+        catalog.ambiguous_triggers().contains("graph"),
+        "discovery must mark a cross-skill duplicate trigger as ambiguous"
+    );
+
+    let activation = catalog
+        .activate_for_input("please inspect the graph")
+        .expect("activate");
+    assert!(
+        activation.skills.is_empty(),
+        "ambiguous trigger must not auto-activate either skill, got {:?}",
+        activation
+            .skills
+            .iter()
+            .map(|s| &s.summary.name)
+            .collect::<Vec<_>>()
+    );
+
+    // Explicit `/skill <name>` still selects the requested skill.
+    let explicit = catalog
+        .activate_for_input("/skill alpha use the graph")
+        .expect("activate explicit");
+    assert_eq!(explicit.skills.len(), 1);
+    assert_eq!(explicit.skills[0].summary.name, "alpha");
+    assert_eq!(explicit.task_input, "use the graph");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn duplicate_trigger_across_skills_emits_load_time_warning() {
     let root = temp_workspace("skills_warn_trigger_collision");
     write_skill(
