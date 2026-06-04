@@ -3182,6 +3182,15 @@ fn tool_loop_guard_stops_repeated_identical_failures() {
 }
 
 #[test]
+fn non_success_tool_statuses_are_model_errors() {
+    assert!(!tool_status_is_model_error(ToolStatus::Success));
+    assert!(tool_status_is_model_error(ToolStatus::Error));
+    assert!(tool_status_is_model_error(ToolStatus::Denied));
+    assert!(tool_status_is_model_error(ToolStatus::Stale));
+    assert!(tool_status_is_model_error(ToolStatus::Cancelled));
+}
+
+#[test]
 fn tool_loop_guard_distinguishes_shell_failures_by_command() {
     let make_shell = |call_id: &str, command: &str| {
         let call = ToolCall {

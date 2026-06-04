@@ -5899,7 +5899,7 @@ impl TurnRuntime {
                         call_id: pending.result.call_id,
                         output,
                         content_parts: None,
-                        is_error: false,
+                        is_error: tool_status_is_model_error(pending.result.status),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -7339,7 +7339,7 @@ impl TurnRuntime {
                         call_id: pending.result.call_id,
                         output,
                         content_parts: None,
-                        is_error: false,
+                        is_error: tool_status_is_model_error(status),
                     };
                     (item, tool_name, status)
                 })
@@ -9901,7 +9901,7 @@ async fn run_subagent_rounds(
                 call_id: pending.result.call_id,
                 output,
                 content_parts: None,
-                is_error: false,
+                is_error: tool_status_is_model_error(pending.result.status),
             }
         }));
     }
@@ -10836,6 +10836,10 @@ fn redact_task_state(mut snapshot: TaskStateSnapshot, redactor: &Redactor) -> Ta
         .map(|value| redactor.redact(&value).text)
         .collect();
     snapshot.normalized()
+}
+
+fn tool_status_is_model_error(status: ToolStatus) -> bool {
+    !matches!(status, ToolStatus::Success)
 }
 
 fn control_tool_result(call: &ToolCall, status: ToolStatus, content: Value) -> ToolResult {
