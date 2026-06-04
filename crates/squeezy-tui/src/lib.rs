@@ -6775,11 +6775,11 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
                 rail_chrome(&entry.kind, subagent_view),
             );
         } else {
-            // Leaving the rail (an answer, diff, …) after a work run: a blank
-            // line settles the gap so the conclusion isn't cramped against the
-            // last `│` gutter row.
+            // Leaving the rail (the answer, a diff, …) after a work run: a `│`
+            // connector threads the gutter down into the conclusion, whose own
+            // marker sits in the gutter column.
             if prev_work {
-                lines.push(Line::from(""));
+                lines.push(rail::connector_line(rail::dim()));
             }
             lines.append(&mut block);
             prev_work = false;
@@ -7206,11 +7206,11 @@ fn transcript_lines_for_render(
                 rail_chrome(&item.kind, subagent_view),
             );
         } else {
-            // Leaving the rail (an answer, diff, …) after a work run: a blank
-            // line settles the gap so the conclusion isn't cramped against the
-            // last `│` gutter row.
+            // Leaving the rail (the answer, a diff, …) after a work run: a `│`
+            // connector threads the gutter down into the conclusion, whose own
+            // marker sits in the gutter column.
             if prev_work {
-                lines.push(Line::from(""));
+                lines.push(rail::connector_line(rail::dim()));
             }
             lines.append(&mut block);
             prev_work = false;
@@ -8295,7 +8295,9 @@ fn format_user_prompt_entry(
         Span::styled(format!("╰─◖{}╯", "─".repeat(max_text_width)), amber),
     ]);
     lines.push(bottom);
-    lines.push(Line::from(""));
+    // Thread the gutter out of the coin: a `│` connector (same column as the
+    // coin's `╰─`) leads down into the turn's first rail node / the answer.
+    lines.push(rail::connector_line(rail::dim()));
     lines
 }
 
@@ -9064,13 +9066,19 @@ pub(crate) mod rail {
         crate::render::theme::quiet()
     }
 
-    /// The two spans opening a node's header line: the tee/close elbow (dim) and
-    /// the state marker (coloured). Four display cells total, e.g. `├─◦ `, so the
-    /// gutter is column-stable and wrap math stays predictable.
+    /// Two-cell left indent so the rail gutter lands in the same column as the
+    /// prompt-echo coin's `╰─` (both at column 2), letting the turn thread as
+    /// one continuous gutter from the coin down through the work nodes.
+    const INDENT: &str = "  ";
+
+    /// The spans opening a node's header line: the two-cell indent, the
+    /// tee/close elbow (dim), and the state marker (coloured), e.g. `  ├─◦ `,
+    /// so the gutter is column-stable and wrap math stays predictable.
     pub(crate) fn head_spans(marker: &RailMarker, is_last: bool) -> Vec<Span<'static>> {
         let elbow = if is_last { "╰─" } else { "├─" };
         let (glyph, color) = marker.glyph_and_color();
         vec![
+            Span::raw(INDENT.to_string()),
             Span::styled(elbow.to_string(), chrome_style(dim())),
             Span::styled(
                 format!("{glyph} "),
@@ -9080,14 +9088,14 @@ pub(crate) mod rail {
     }
 
     /// The body/continuation prefix that keeps a node's wrapped lines aligned
-    /// under its header content: a single connector, four cells (`│   `).
+    /// under its header content: the indent plus a single connector (`  │   `).
     pub(crate) fn body_span(chrome: Color) -> Span<'static> {
-        Span::styled("│   ".to_string(), chrome_style(chrome))
+        Span::styled(format!("{INDENT}│   "), chrome_style(chrome))
     }
 
     /// A standalone connector row drawn on the gutter between rail nodes.
     pub(crate) fn connector_line(chrome: Color) -> Line<'static> {
-        Line::from(Span::styled("│".to_string(), chrome_style(chrome)))
+        Line::from(Span::styled(format!("{INDENT}│"), chrome_style(chrome)))
     }
 
     /// Replace a line's leading two-cell margin with just the tree elbow
@@ -9099,18 +9107,20 @@ pub(crate) mod rail {
     }
 
     pub(crate) fn set_elbow(line: &mut Line<'static>, is_last: bool, chrome: Color) {
+        let indent = Span::raw(INDENT.to_string());
         let elbow = Span::styled(
             if is_last { "╰─" } else { "├─" }.to_string(),
             chrome_style(chrome),
         );
-        // Replace a leading two-cell margin where one exists (tool/live rows),
-        // otherwise prepend (reasoning rows embed their own marker, no margin).
+        // Land the indent + elbow at the gutter column. A leading content
+        // margin (tool/live rows) is consumed by the indent; reasoning rows
+        // embed their own marker and have no margin, so we just prepend.
         if line.spans.first().is_some_and(is_margin_span) {
-            line.spans.splice(0..1, vec![elbow]);
+            line.spans.splice(0..1, vec![indent, elbow]);
         } else if line.spans.is_empty() {
-            line.spans.push(elbow);
+            line.spans = vec![indent, elbow];
         } else {
-            line.spans.insert(0, elbow);
+            line.spans.splice(0..0, vec![indent, elbow]);
         }
     }
 
@@ -16286,11 +16296,11 @@ fn inline_history_lines_for_flush(
                 rail_chrome(&item.kind, false),
             );
         } else {
-            // Leaving the rail (an answer, diff, …) after a work run: a blank
-            // line settles the gap so the conclusion isn't cramped against the
-            // last `│` gutter row.
+            // Leaving the rail (the answer, a diff, …) after a work run: a `│`
+            // connector threads the gutter down into the conclusion, whose own
+            // marker sits in the gutter column.
             if prev_work {
-                lines.push(Line::from(""));
+                lines.push(rail::connector_line(rail::dim()));
             }
             lines.append(&mut block);
             prev_work = false;

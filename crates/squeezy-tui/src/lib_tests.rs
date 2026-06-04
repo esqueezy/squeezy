@@ -7248,7 +7248,15 @@ fn submitted_prompt_renders_bubble_around_text() {
     assert!(content.ends_with("find getFoo"), "{content}");
     assert!(bottom.starts_with("  ╰─◖"), "{bottom}");
     assert!(bottom.ends_with('╯'), "{bottom}");
-    assert_eq!(lines.last().expect("separator").spans.len(), 0);
+    // The prompt threads a gutter connector down into the turn.
+    let connector = lines
+        .last()
+        .expect("connector")
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert_eq!(connector, "  │");
 }
 
 #[test]
@@ -7273,14 +7281,14 @@ fn submitted_prompt_preserves_empty_lines() {
         })
         .collect::<Vec<_>>();
 
-    // Open bubble: 4 content rows ("one", "", "three", "") + bottom edge + separator.
+    // Open bubble: 4 content rows ("one", "", "three", "") + bottom edge + connector.
     assert_eq!(lines.len(), 6);
     assert!(rendered[0].contains("one"), "{rendered:?}");
     assert_eq!(rendered[1].trim(), "");
     assert!(rendered[2].contains("three"), "{rendered:?}");
     assert_eq!(rendered[3].trim(), "");
     assert!(rendered[4].starts_with("  ╰─◖"), "{rendered:?}");
-    assert_eq!(rendered[5], "");
+    assert_eq!(rendered[5], "  │");
 }
 
 #[test]
@@ -13213,14 +13221,17 @@ async fn config_and_options_alias_open_the_same_screen() {
 }
 
 #[test]
-fn rail_head_spans_are_four_cells() {
+fn rail_head_spans_are_six_cells() {
     use rail::RailMarker::*;
     for marker in [Settled, Queued, Plan, Ok, Fail, Warn, Live("✦".to_string())] {
         let cells: usize = rail::head_spans(&marker, false)
             .iter()
             .map(|s| s.content.chars().count())
             .sum();
-        assert_eq!(cells, 4, "{marker:?} head must be 4 cells wide");
+        assert_eq!(
+            cells, 6,
+            "{marker:?} head must be 6 cells (indent + elbow + marker)"
+        );
     }
 }
 
@@ -13241,12 +13252,13 @@ fn rail_apply_gutter_heads_first_line_connects_the_rest() {
         Line::from(vec![Span::raw("  "), Span::raw("body")]),
     ];
     rail::apply_gutter(&mut lines, rail::RailMarker::Ok, false);
-    // Header line: ├─ elbow + ✓ marker replace the leading margin.
-    assert_eq!(lines[0].spans[0].content.as_ref(), "├─");
-    assert_eq!(lines[0].spans[1].content.as_ref(), "✓ ");
-    assert_eq!(lines[0].spans[2].content.as_ref(), "header");
-    // Continuation line: dim connector replaces the margin.
-    assert_eq!(lines[1].spans[0].content.as_ref(), "│   ");
+    // Header line: indent + ├─ elbow + ✓ marker replace the leading margin.
+    assert_eq!(lines[0].spans[0].content.as_ref(), "  ");
+    assert_eq!(lines[0].spans[1].content.as_ref(), "├─");
+    assert_eq!(lines[0].spans[2].content.as_ref(), "✓ ");
+    assert_eq!(lines[0].spans[3].content.as_ref(), "header");
+    // Continuation line: indent + dim connector replaces the margin.
+    assert_eq!(lines[1].spans[0].content.as_ref(), "  │   ");
     assert_eq!(lines[1].spans[1].content.as_ref(), "body");
 }
 
@@ -13254,8 +13266,9 @@ fn rail_apply_gutter_heads_first_line_connects_the_rest() {
 fn rail_apply_gutter_last_node_uses_the_close_elbow() {
     let mut lines = vec![Line::from(vec![Span::raw("  "), Span::raw("x")])];
     rail::apply_gutter(&mut lines, rail::RailMarker::Settled, true);
-    assert_eq!(lines[0].spans[0].content.as_ref(), "╰─");
-    assert_eq!(lines[0].spans[1].content.as_ref(), "◦ ");
+    assert_eq!(lines[0].spans[0].content.as_ref(), "  ");
+    assert_eq!(lines[0].spans[1].content.as_ref(), "╰─");
+    assert_eq!(lines[0].spans[2].content.as_ref(), "◦ ");
 }
 
 #[test]
@@ -13340,9 +13353,10 @@ fn rail_gallery_renders_a_full_turn() {
         1,
         "{scrollback}"
     );
-    // The answer leaves the rail (no gutter) and is set off by a blank line.
+    // The gutter threads into the answer: a `│` connector then the `●` answer
+    // (its bullet sits in the gutter column).
     assert!(
-        scrollback.contains("exit 1\n\n  ● Found 2 auth issues"),
+        scrollback.contains("exit 1\n  │\n  ● Found 2 auth issues"),
         "{scrollback}"
     );
 }
