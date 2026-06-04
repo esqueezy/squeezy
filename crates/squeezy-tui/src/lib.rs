@@ -7048,10 +7048,13 @@ fn is_rail_work_node(kind: &TranscriptEntryKind) -> bool {
         TranscriptEntryKind::ToolResult(_)
         | TranscriptEntryKind::PlanCard(_)
         | TranscriptEntryKind::Reasoning(_) => true,
-        // Subagent breadcrumbs and informational notes thread on the rail;
-        // operational chrome and plain logs flow off it.
+        // Subagent breadcrumbs, informational notes, and warnings thread on the
+        // rail; operational chrome and plain logs flow off it.
         TranscriptEntryKind::Log(entry) => {
-            matches!(entry.kind, LogKind::Subagent | LogKind::Note)
+            matches!(
+                entry.kind,
+                LogKind::Subagent | LogKind::Note | LogKind::Warn
+            )
         }
         _ => false,
     }
@@ -7063,8 +7066,9 @@ fn line_is_blank(line: &Line<'_>) -> bool {
 
 /// The gutter tint that gives a rail node its identity at a glance: plans glow
 /// amber (a decision to read), reasoning runs cool blue (thinking, set apart
-/// from the work), and everything in a subagent's transcript turns magenta so
-/// the delegated context is unmistakable. Plain tool work stays dim.
+/// from the work), warnings turn cyan (attention without spending amber), and
+/// everything in a subagent's transcript turns magenta so the delegated context
+/// is unmistakable. Plain tool work and notes stay dim.
 fn rail_chrome(kind: &TranscriptEntryKind, subagent_view: bool) -> Color {
     if subagent_view {
         return crate::render::theme::magenta();
@@ -7074,6 +7078,9 @@ fn rail_chrome(kind: &TranscriptEntryKind, subagent_view: bool) -> Color {
         TranscriptEntryKind::Reasoning(_) => crate::render::theme::blue(),
         TranscriptEntryKind::Log(entry) if entry.kind == LogKind::Subagent => {
             crate::render::theme::magenta()
+        }
+        TranscriptEntryKind::Log(entry) if entry.kind == LogKind::Warn => {
+            crate::render::theme::cyan()
         }
         _ => rail::dim(),
     }
@@ -8924,12 +8931,12 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
         ])];
     }
     if entry.kind == LogKind::Warn {
-        // `⚠ message` rendering for warnings so the user can spot
-        // config issues and turn failures at a glance. Newlines are flattened to spaces so
-        // the whole error reads as one bullet, and the transcript
-        // paragraph's `Wrap { trim: false }` line-wraps anything long —
-        // errors from providers can be hundreds of characters and need to
-        // stay fully visible rather than being cut off with `…`.
+        // `⚠ message` rendering for warnings so the user can spot config issues
+        // and turn failures at a glance. Cyan — the one cool hue not otherwise on
+        // the rail — keeps amber rationed while still drawing the eye. Newlines
+        // are flattened to spaces so the whole warning reads as one node, and the
+        // gutter pass turns the leading margin into `├─`/`╰─` so it threads the
+        // rail. Long provider warnings stay fully visible (wrap, not truncate).
         let marker = if selected { "> " } else { "  " };
         let preview = message.replace('\n', " ");
         return vec![Line::from(vec![
@@ -8937,7 +8944,7 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
             Span::styled(
                 "⚠ ",
                 Style::default()
-                    .fg(crate::render::theme::secondary())
+                    .fg(crate::render::theme::cyan())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(preview, Style::default().fg(palette::muted_fg())),
@@ -9079,7 +9086,7 @@ pub(crate) mod rail {
                 RailMarker::Plan => ("◇", crate::render::theme::accent()),
                 RailMarker::Ok => ("✓", crate::render::theme::green()),
                 RailMarker::Fail => ("✖", crate::render::theme::red()),
-                RailMarker::Warn => ("⚠", crate::render::theme::red()),
+                RailMarker::Warn => ("⚠", crate::render::theme::cyan()),
                 RailMarker::Live(glyph) => (glyph.as_str(), crate::render::theme::accent()),
             }
         }

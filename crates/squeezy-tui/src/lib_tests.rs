@@ -13404,3 +13404,35 @@ fn routing_note_threads_the_rail_as_a_dim_dot() {
     );
     assert!(!scrollback.contains("• Noted"), "{scrollback}");
 }
+
+#[test]
+fn warning_threads_the_rail_as_a_warn_node() {
+    let mut app = test_app(SessionMode::Build);
+    app.turn_visual = TurnVisualState::Succeeded;
+    app.push_transcript_item(TranscriptItem::user("hey"));
+    app.push_warn("config key `foo` ignored (unknown)".to_string());
+    app.push_transcript_item(TranscriptItem::assistant("Done."));
+    app.finalize_settles_for_test();
+    let len = app.transcript.len();
+    let scrollback = lines_to_plain_text(&inline_history_lines_for_flush(&app, 70, false, 0, len));
+    // A warning threads the gutter (├─⚠) instead of floating off-rail.
+    assert!(
+        scrollback.contains("├─⚠ config key `foo` ignored (unknown)"),
+        "{scrollback}"
+    );
+}
+
+#[test]
+fn warn_log_marker_is_cyan_not_amber() {
+    // warn = cyan (frees rationed amber); the ⚠ never reuses the plan-amber
+    // family that secondary() belongs to.
+    let entry = LogEntry {
+        message: "x".to_string(),
+        kind: LogKind::Warn,
+    };
+    let lines = format_log_entry(&entry, false, false);
+    let glyph = &lines[0].spans[1];
+    assert_eq!(glyph.content.as_ref(), "⚠ ");
+    assert_eq!(glyph.style.fg, Some(crate::render::theme::cyan()));
+    assert_ne!(glyph.style.fg, Some(crate::render::theme::secondary()));
+}
