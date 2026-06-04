@@ -1321,13 +1321,14 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
 }
 
 /// Drain the config screen's accumulated feedback into the durable
-/// transcript. Errors and warnings render as `⚠` warning lines; info and
-/// success notes render as dim operational chrome.
+/// transcript. Errors render as red `✖` failure lines; warnings render as
+/// cyan `⚠` lines; info and success notes render as dim operational chrome.
 fn forward_config_feedback(app: &mut TuiApp, mut feedback: config_screen::ConfigFeedback) {
     use config_screen::Severity;
     for entry in feedback.drain() {
         match entry.severity {
-            Severity::Error | Severity::Warn => {
+            Severity::Error => app.push_error(entry.message),
+            Severity::Warn => {
                 app.push_warn(entry.message);
             }
             Severity::Info | Severity::Success => app.push_status(entry.message),
