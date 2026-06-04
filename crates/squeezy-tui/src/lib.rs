@@ -133,9 +133,9 @@ const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
 const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
 /// Default tool-card cap for model-initiated tool calls. Aggressive on
-/// purpose — the structured detail is one keystroke (Ctrl-E / Ctrl-T)
-/// away, and a 5-line preview keeps the transcript readable even when
-/// the model fires off long commands.
+/// purpose — the structured detail is one keystroke (Ctrl-T) away, and a
+/// 5-line preview keeps the transcript readable even when the model fires
+/// off long commands.
 const TOOL_CALL_MAX_LINES: usize = 5;
 /// Larger cap for `!`-shell calls the user typed directly (those carry
 /// `direct_user_shell: true` in their arguments, set by
@@ -2197,9 +2197,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
-    // (Old `Ctrl+E` readline line-end is gone — that key now toggles
-    // expand-all unconditionally via the keymap. Use `End` /
-    // `Cmd+Right` for cursor-to-line-end.)
+    // `Ctrl+E` was removed; use `End` / `Cmd+Right` for cursor-to-line-end.
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
         delete_to_line_end(app);
@@ -16147,8 +16145,7 @@ impl TranscriptEntry {
         Self {
             id,
             kind: TranscriptEntryKind::Diff(Box::new(data)),
-            // `/diff` is never truncated by default. The user can still
-            // Ctrl-E to fold the body if it's huge.
+            // `/diff` is never truncated by default.
             collapsed: false,
             revision: 0,
             settle: None,
