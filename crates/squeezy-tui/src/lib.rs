@@ -12015,10 +12015,12 @@ impl TurnVisualState {
 }
 
 fn turn_coin_span(app: &TuiApp) -> Span<'static> {
-    // Static full moon marking the assistant's reply — never input-driven and
-    // never timer-animated; the working-line star carries any motion.
+    // A crescent moon marking the assistant's reply — softer than a full disc
+    // and on-theme with the prompt's moon bullets. Static (never input-driven
+    // or timer-animated; the working-line star carries motion), and tinted by
+    // outcome: green when the turn succeeded, red when it failed.
     Span::styled(
-        "●",
+        "☽",
         Style::default()
             .fg(app.turn_visual.color(app.animation_tick))
             .add_modifier(Modifier::BOLD),
@@ -12026,7 +12028,9 @@ fn turn_coin_span(app: &TuiApp) -> Span<'static> {
 }
 
 fn assistant_static_span(color: Color) -> Span<'static> {
-    Span::styled("●", Style::default().fg(color).add_modifier(Modifier::BOLD))
+    // Crescent moon marking a settled assistant reply (scrollback / overlay);
+    // the colour carries the turn outcome. Mirrors `turn_coin_span`.
+    Span::styled("☽", Style::default().fg(color).add_modifier(Modifier::BOLD))
 }
 
 fn prompt_coin_span(app: &TuiApp) -> Span<'static> {

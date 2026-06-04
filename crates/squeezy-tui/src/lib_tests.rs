@@ -6511,7 +6511,7 @@ fn render_keeps_header_when_transcript_has_content() {
     // provider:model moved out of the banner into the live status line;
     // see `render_uses_two_line_status_footer` for the reason.
     assert!(output.contains("hello"), "{output}");
-    assert!(output.contains("● answer"), "{output}");
+    assert!(output.contains("☽ answer"), "{output}");
     assert!(!output.contains("Answered"), "{output}");
 }
 
@@ -6697,7 +6697,7 @@ fn inline_history_flush_contains_startup_and_new_transcript() {
 
     assert!(rendered.contains("Squeezy v0.1.0"), "{rendered}");
     assert!(rendered.contains("find getFoo"), "{rendered}");
-    assert!(rendered.contains("● No definition found."), "{rendered}");
+    assert!(rendered.contains("☽ No definition found."), "{rendered}");
 
     let next = inline_history_lines_for_flush(&app, 100, false, len, len);
     assert!(next.is_empty());
@@ -6895,7 +6895,7 @@ fn assistant_marker_uses_answer_color() {
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
 
-    assert_eq!(lines[0].spans[1].content.as_ref(), "●");
+    assert_eq!(lines[0].spans[1].content.as_ref(), "☽");
     assert_eq!(
         lines[0].spans[1].style.fg,
         Some(crate::render::theme::green())
@@ -6920,7 +6920,7 @@ fn failed_assistant_marker_uses_error_color() {
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Failed);
 
-    assert_eq!(lines[0].spans[1].content.as_ref(), "●");
+    assert_eq!(lines[0].spans[1].content.as_ref(), "☽");
     assert_eq!(
         lines[0].spans[1].style.fg,
         Some(crate::render::theme::red())
@@ -7028,7 +7028,7 @@ fn pending_assistant_uses_static_moon_marker() {
 
     // The assistant reply marker is a static full moon (never timer-animated
     // or input-driven); the working-line star carries the motion instead.
-    assert_eq!(lines[0].spans[1].content.as_ref(), "●");
+    assert_eq!(lines[0].spans[1].content.as_ref(), "☽");
     assert_eq!(
         lines[0].spans[1].style.fg,
         Some(app.turn_visual.color(app.animation_tick))
@@ -7052,7 +7052,7 @@ fn completed_task_panel_is_hidden_after_answer() {
 
     let output = render_to_string(&app, 120, 18);
 
-    assert!(output.contains("● Because."), "{output}");
+    assert!(output.contains("☽ Because."), "{output}");
     assert!(!output.contains("Answered"), "{output}");
     assert!(
         !output.contains("• Done"),
@@ -13353,10 +13353,10 @@ fn rail_gallery_renders_a_full_turn() {
         1,
         "{scrollback}"
     );
-    // The gutter threads into the answer: a `│` connector then the `●` answer
-    // (its bullet sits in the gutter column).
+    // The gutter threads into the answer: a `│` connector then the `☽` answer
+    // (its crescent sits in the gutter column).
     assert!(
-        scrollback.contains("exit 1\n  │\n  ● Found 2 auth issues"),
+        scrollback.contains("exit 1\n  │\n  ☽ Found 2 auth issues"),
         "{scrollback}"
     );
 }
