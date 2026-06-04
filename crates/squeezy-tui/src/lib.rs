@@ -6775,6 +6775,12 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
                 rail_chrome(&entry.kind, subagent_view),
             );
         } else {
+            // Leaving the rail (an answer, diff, …) after a work run: a blank
+            // line settles the gap so the conclusion isn't cramped against the
+            // last `│` gutter row.
+            if prev_work {
+                lines.push(Line::from(""));
+            }
             lines.append(&mut block);
             prev_work = false;
         }
@@ -7200,6 +7206,12 @@ fn transcript_lines_for_render(
                 rail_chrome(&item.kind, subagent_view),
             );
         } else {
+            // Leaving the rail (an answer, diff, …) after a work run: a blank
+            // line settles the gap so the conclusion isn't cramped against the
+            // last `│` gutter row.
+            if prev_work {
+                lines.push(Line::from(""));
+            }
             lines.append(&mut block);
             prev_work = false;
         }
@@ -16274,6 +16286,12 @@ fn inline_history_lines_for_flush(
                 rail_chrome(&item.kind, false),
             );
         } else {
+            // Leaving the rail (an answer, diff, …) after a work run: a blank
+            // line settles the gap so the conclusion isn't cramped against the
+            // last `│` gutter row.
+            if prev_work {
+                lines.push(Line::from(""));
+            }
             lines.append(&mut block);
             prev_work = false;
         }
