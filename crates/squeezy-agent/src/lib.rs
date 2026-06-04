@@ -1917,6 +1917,13 @@ impl Agent {
         self.config = next;
         if skills_changed || workspace_changed {
             self.rebuild_skills_catalog();
+            // A catalog rebuild must also rebuild the hook registry: the old
+            // registry could still reference handlers for skills that were
+            // disabled, removed, or had their hooks edited, and
+            // `hooks_enabled` might have been toggled. Leaving `self.hooks`
+            // stale would let old `PreToolUse`/`PostToolUse` shell-outs keep
+            // firing against the user's stated intent.
+            self.rebuild_hooks_registry();
         }
     }
 
@@ -1940,6 +1947,41 @@ impl Agent {
             json!({ "skills_count": count }),
         );
         count
+    }
+
+    /// Rebuild the hook registry from the current `config.skills` state.
+    ///
+    /// Called by `replace_config`/`drain_pending_swap` whenever the skills
+    /// config or workspace root changes. This enforces the trust boundary
+    /// declared by the `[skills] hooks_enabled` gate: if the flag was
+    /// toggled off, individual skills were disabled, or hook commands were
+    /// edited, the stale handlers in the old registry must not keep firing.
+    /// A fresh registry is built from the current catalog snapshot and
+    /// installed atomically; the old registry is discarded.
+    pub fn rebuild_hooks_registry(&mut self) {
+        if !self.config.skills.hooks_enabled {
+            // Gate is now off — clear any previously installed registry
+            // so existing handlers stop dispatching immediately.
+            self.hooks = None;
+            return;
+        }
+        let mut registry = squeezy_hooks::HookRegistry::new();
+        let installed = self.tools.register_skill_hooks(&mut registry);
+        self.hooks = if installed == 0 {
+            None
+        } else {
+            log_session_event(
+                self.session_log.as_ref(),
+                &self.redactor,
+                "skills_hooks_rebuilt",
+                None,
+                Some(format!(
+                    "{installed} skill hook handler(s) re-registered after settings reload"
+                )),
+                json!({ "installed": installed }),
+            );
+            Some(Arc::new(registry))
+        };
     }
 
     /// Replace the LLM client. The in-flight turn (if any) holds a clone of
@@ -1973,6 +2015,7 @@ impl Agent {
         }
         if skills_changed || workspace_changed {
             self.rebuild_skills_catalog();
+            self.rebuild_hooks_registry();
         }
         Some(swap)
     }

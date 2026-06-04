@@ -1846,6 +1846,74 @@ fn duplicate_trigger_across_skills_skips_auto_activation() {
 }
 
 #[test]
+fn validate_skill_dirs_catches_malformed_files_that_discovery_drops() {
+    let root = temp_workspace("skills_validate_dirs_malformed");
+    // Good skill — discovery and validate both see it.
+    let good_dir = root.join(".squeezy/skills/good-skill");
+    fs::create_dir_all(&good_dir).expect("mkdir good");
+    fs::write(
+        good_dir.join("SKILL.md"),
+        "---\nname: good-skill\ndescription: \"works\"\n---\n# Good\n",
+    )
+    .expect("write good");
+    // Malformed skill — discovery silently drops it; validate must report it.
+    let bad_dir = root.join(".squeezy/skills/bad-skill");
+    fs::create_dir_all(&bad_dir).expect("mkdir bad");
+    fs::write(bad_dir.join("SKILL.md"), "not frontmatter at all").expect("write bad");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    // Discovery should only produce the good skill.
+    let catalog = SkillCatalog::discover(&root, &config);
+    assert_eq!(
+        catalog.summaries().len(),
+        1,
+        "discovery must drop the bad skill"
+    );
+
+    // validate_skill_dirs must report both.
+    let results = super::validate_skill_dirs(&root, &config);
+    assert_eq!(
+        results.len(),
+        2,
+        "validator must include both SKILL.md files"
+    );
+    let bad_result = results
+        .iter()
+        .find(|r| {
+            r.path
+                .to_str()
+                .map(|s| s.contains("bad-skill"))
+                .unwrap_or(false)
+        })
+        .expect("bad-skill result must be present");
+    assert!(
+        bad_result.outcome.is_err(),
+        "malformed SKILL.md must produce an error result: {:?}",
+        bad_result.outcome
+    );
+    let good_result = results
+        .iter()
+        .find(|r| {
+            r.path
+                .to_str()
+                .map(|s| s.contains("good-skill"))
+                .unwrap_or(false)
+        })
+        .expect("good-skill result must be present");
+    assert!(
+        good_result.outcome.is_ok(),
+        "well-formed SKILL.md must produce an ok result"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn duplicate_trigger_across_skills_emits_load_time_warning() {
     let root = temp_workspace("skills_warn_trigger_collision");
     write_skill(

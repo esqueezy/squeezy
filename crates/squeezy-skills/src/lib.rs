@@ -1596,6 +1596,80 @@ pub fn validate_skill_md(content: &str) -> std::result::Result<String, String> {
     Ok(metadata.name)
 }
 
+/// Outcome of validating a single `SKILL.md` file found in a skill root.
+#[derive(Debug, Clone)]
+pub struct SkillValidationResult {
+    /// Path to the `SKILL.md` file.
+    pub path: PathBuf,
+    /// Skill name from frontmatter, or the raw string that failed naming rules.
+    /// `None` when the file could not be read or the frontmatter had no
+    /// parseable `name:` field.
+    pub name: Option<String>,
+    /// `Ok(())` when the file parsed cleanly and the name is valid;
+    /// `Err(reason)` with a human-readable description of the first issue
+    /// found.
+    pub outcome: std::result::Result<(), String>,
+}
+
+/// Walk every configured skill root from `config` (the same roots that
+/// `SkillCatalog::discover` uses) and attempt to parse each `SKILL.md`.
+///
+/// Unlike discovery, this function records parse failures rather than
+/// silently skipping them, so `squeezy skills validate` can surface the
+/// errors that discovery drops. Non-existent roots and directories without
+/// a `SKILL.md` are skipped without an error, mirroring discovery
+/// behaviour.
+pub fn validate_skill_dirs(
+    workspace_root: &Path,
+    config: &squeezy_core::SkillsConfig,
+) -> Vec<SkillValidationResult> {
+    let mut roots: Vec<&Path> = vec![&config.compat_user_dir, &config.user_dir];
+    let project_compat = workspace_root.join(COMPAT_PROJECT_SKILLS_DIR);
+    let project_native = workspace_root.join(PROJECT_SKILLS_DIR);
+    roots.push(&project_compat);
+    roots.push(&project_native);
+    let extra: Vec<&Path> = config.extra_roots.iter().map(|p| p.as_path()).collect();
+    roots.extend_from_slice(&extra);
+
+    let mut results = Vec::new();
+    for root in roots {
+        let entries = match fs::read_dir(root) {
+            Ok(e) => e,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let skill_path = path.join(SKILL_FILE);
+            if !skill_path.exists() {
+                continue;
+            }
+            let content = match fs::read_to_string(&skill_path) {
+                Ok(c) => c,
+                Err(err) => {
+                    results.push(SkillValidationResult {
+                        path: skill_path,
+                        name: None,
+                        outcome: Err(format!("could not read file: {err}")),
+                    });
+                    continue;
+                }
+            };
+            let outcome = validate_skill_md(&content).map(|_| ());
+            let name = parse_skill_file(&content).ok().map(|(meta, _)| meta.name);
+            results.push(SkillValidationResult {
+                path: skill_path,
+                name,
+                outcome,
+            });
+        }
+    }
+    results
+}
+
 pub(crate) fn parse_skill_manifest(content: &str) -> std::result::Result<SkillManifest, String> {
     toml::from_str::<SkillManifest>(content).map_err(|error| error.to_string())
 }

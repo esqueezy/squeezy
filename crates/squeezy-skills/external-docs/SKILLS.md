@@ -99,7 +99,7 @@ If two discovered skills with the same name have the same precedence, Squeezy lo
 
 ## Fork-mode skills
 
-A skill that declares `context: fork` in its frontmatter is surfaced in a separate `<fork_skills>` system block rather than inlined into `<active_skills>`. The model is told to invoke `delegate` (or another subagent) with the skill body as the task instructions, so the fork-mode body never pollutes the parent turn's context. Inline-mode (the default) is unchanged.
+A skill that declares `context: fork` in its frontmatter is surfaced in a separate `<fork_skills>` system block rather than merged into `<active_skills>`. The block includes the full skill body with an instruction telling the model to dispatch it as a focused `delegate` subagent task rather than executing the body as direct guidance for the parent turn. The body is still present in the parent system prompt inside `<fork_skills>`; it is structurally separated and accompanied by an explicit instruction not to act on it inline. Inline-mode (the default) is unchanged.
 
 ## `tool_deps` enforcement
 

@@ -2647,6 +2647,79 @@ fn agent_skill_hooks_register_when_enabled() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn replace_config_clears_hooks_when_hooks_enabled_toggled_off() {
+    let root = temp_workspace("agent_skill_hooks_toggle_off");
+    let skill_dir = root.join(".agents/skills/validator");
+    fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: validator\ndescription: \"d\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# validator\n",
+    )
+    .expect("write skill");
+
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let mut config = config_with_skill_dirs(&root);
+    config.skills.hooks_enabled = true;
+    let mut agent = Agent::new(config.clone(), provider);
+
+    assert!(
+        agent.hooks().is_some(),
+        "hooks must be installed when hooks_enabled=true"
+    );
+
+    // Simulate hot-reload that disables the gate.
+    let mut next = config;
+    next.skills.hooks_enabled = false;
+    // Trigger the skills_changed path by tweaking another skills field.
+    next.skills.inline = true;
+    agent.replace_config(next);
+
+    assert!(
+        agent.hooks().is_none(),
+        "hooks must be cleared when hooks_enabled flipped to false via replace_config"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn replace_config_rebuilds_hooks_when_hooks_remain_enabled() {
+    let root = temp_workspace("agent_skill_hooks_rebuild");
+    let skill_dir = root.join(".agents/skills/validator");
+    fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: validator\ndescription: \"d\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# validator\n",
+    )
+    .expect("write skill");
+
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let mut config = config_with_skill_dirs(&root);
+    config.skills.hooks_enabled = true;
+    let mut agent = Agent::new(config.clone(), provider);
+
+    let old_hook_count = agent.hooks().map(|r| r.len()).unwrap_or(0);
+    assert_eq!(old_hook_count, 1);
+
+    // Disable the skill via a config rule while hooks_enabled stays true.
+    let mut next = config;
+    next.skills.config.push(squeezy_core::SkillConfigEntry {
+        name: Some("validator".to_string()),
+        path: None,
+        enabled: false,
+    });
+    agent.replace_config(next);
+
+    // After the skill is disabled the hook should vanish.
+    assert!(
+        agent.hooks().is_none(),
+        "disabling the skill via [[skills.config]] must clear its hook handlers"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn known_help_topic_short_circuits_without_provider_request() {
     let provider = Arc::new(MockProvider::new(Vec::new()));

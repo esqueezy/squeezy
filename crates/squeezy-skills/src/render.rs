@@ -337,13 +337,12 @@ fn wrap_blocks(blocks: &[String]) -> Option<String> {
 /// Render fork-mode skills (skills whose frontmatter declares
 /// `context: fork`) as a separate `<fork_skills>` system block.
 ///
-/// Fork-mode skills are intentionally not inlined into
-/// `<active_skills>` — their bodies are meant to drive a focused
-/// subagent invocation rather than the parent turn. The block carries
-/// the same metadata shape as the active-skill stub but includes the
-/// full body and an `<instruction>` telling the model to spin a
-/// `delegate` subagent with the body as task instructions instead of
-/// executing the skill inline. Returns `None` when there are no
+/// Fork-mode skills are kept out of `<active_skills>` so the model can
+/// tell them apart from inline skills. Their bodies ARE still present in
+/// the parent system prompt inside the `<fork_skills>` wrapper; the
+/// block carries an `<instruction>` telling the model to treat the body
+/// as input for a `delegate` subagent call rather than executing it
+/// directly in the parent turn. Returns `None` when there are no
 /// fork-mode skills or `budget_chars == 0`.
 pub fn render_fork_skills(
     skills: &[LoadedSkill],

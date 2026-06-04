@@ -917,6 +917,13 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
                 let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 (project_init_target(cwd), project_settings_template())
             };
+            // Validate flag compatibility before any filesystem writes so a
+            // bad combination never overwrites an existing file.
+            if *with_bundled_skills && !scope.user {
+                return Err(SqueezyError::Config(
+                    "--with-bundled-skills is only supported under --user".to_string(),
+                ));
+            }
             if path.exists() && !*force {
                 return Err(SqueezyError::Config(format!(
                     "{} already exists; pass --force to overwrite",
@@ -931,11 +938,7 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
             fs::write(&path, template)?;
             println!("wrote {}", path.display());
             if *with_bundled_skills {
-                if !scope.user {
-                    return Err(SqueezyError::Config(
-                        "--with-bundled-skills is only supported under --user".to_string(),
-                    ));
-                }
+                // scope.user is already verified above.
                 let config = config_from_cli(cli)?;
                 let target = &config.skills.user_dir;
                 let written = squeezy_skills::install_bundled_skills(target).map_err(|err| {
@@ -1259,44 +1262,53 @@ fn skills_set_enabled(
 
 fn skills_validate(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
     let config = config_from_cli(cli)?;
+    // Walk every configured skill root directly rather than iterating
+    // catalog.summaries(). Discovery silently drops malformed SKILL.md
+    // files (parse errors, invalid names) with a tracing warn; validate
+    // must surface those failures, so it scans the filesystem itself.
+    let raw_results = squeezy_skills::validate_skill_dirs(&config.workspace_root, &config.skills);
+    // Build the catalog separately for ambiguous-name detection.
     let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
-    let summaries = catalog.summaries();
+
     let mut diagnostics: Vec<serde_json::Value> = Vec::new();
     let mut ok = 0usize;
     let mut errored = 0usize;
     let mut ambiguous = 0usize;
-    for summary in &summaries {
+    for result in &raw_results {
         let mut issues: Vec<String> = Vec::new();
-        if catalog.ambiguous_names().contains(&summary.name) {
+        if let Err(err) = &result.outcome {
+            issues.push(err.clone());
+        }
+        // Also flag ambiguous names for skills that parsed successfully.
+        if let Some(name) = &result.name
+            && catalog.ambiguous_names().contains(name)
+        {
             ambiguous += 1;
             issues.push(
                 "duplicate name at same precedence; auto-trigger activation skipped".to_string(),
             );
-        }
-        match fs::read_to_string(&summary.location) {
-            Ok(content) => match squeezy_skills::validate_skill_md(&content) {
-                Ok(_) => {}
-                Err(err) => {
-                    issues.push(format!("frontmatter invalid: {err}"));
-                }
-            },
-            Err(err) => {
-                issues.push(format!("could not read SKILL.md: {err}"));
-            }
         }
         if issues.is_empty() {
             ok += 1;
         } else {
             errored += 1;
         }
+        let display_name = result.name.as_deref().unwrap_or(
+            result
+                .path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("?"),
+        );
         diagnostics.push(serde_json::json!({
-            "name": summary.name,
-            "location": summary.location,
-            "source": summary.source.as_str(),
-            "disabled": summary.disabled,
+            "name": result.name,
+            "location": result.path,
             "issues": issues,
+            "display_name": display_name,
         }));
     }
+    let total = raw_results.len();
     if json {
         println!(
             "{}",
@@ -1306,14 +1318,17 @@ fn skills_validate(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
                     "ok": ok,
                     "errored": errored,
                     "ambiguous": ambiguous,
-                    "total": summaries.len(),
+                    "total": total,
                 },
             }))
             .unwrap_or_default()
         );
     } else {
         for entry in &diagnostics {
-            let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let name = entry
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             let issues = entry
                 .get("issues")
                 .and_then(|v| v.as_array())
@@ -1334,10 +1349,7 @@ fn skills_validate(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
         }
         println!(
             "{} ok, {} error(s), {} ambiguous, {} total",
-            ok,
-            errored,
-            ambiguous,
-            summaries.len()
+            ok, errored, ambiguous, total
         );
     }
     if errored > 0 || ambiguous > 0 {
