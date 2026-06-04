@@ -18,8 +18,11 @@
 use std::path::Path;
 
 /// Run an in-place edit of `[mcp.servers]` in the TOML file at
-/// `path`. Creates parent directories and the file if missing so
-/// adding the first server at the Repo or Local tier "just works".
+/// `path`. Creates parent directories `0o700` and the file `0o600`
+/// via the hardened atomic writer in `squeezy-core` so the first
+/// write at the Repo or Local tier "just works" without exposing
+/// inline secrets (provider API keys, MCP env / HTTP headers) to
+/// the umask-derived default mode.
 pub(crate) fn mcp_settings_edit(
     path: &Path,
     edit: impl FnOnce(&mut toml_edit::Table) -> std::io::Result<()>,
@@ -54,10 +57,7 @@ pub(crate) fn mcp_settings_edit(
             )
         })?;
     edit(servers)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, doc.to_string())
+    squeezy_core::settings_writer::write_settings_atomic(path, doc.to_string().as_bytes())
 }
 
 /// Serialize an [`squeezy_core::McpServerConfig`] to a
@@ -176,6 +176,80 @@ pub(crate) fn mcp_server_table(server: &squeezy_core::McpServerConfig) -> toml_e
         table.insert(
             "env_http_headers",
             toml_edit::Item::Value(toml_edit::Value::InlineTable(headers)),
+        );
+    }
+    // Always serialize `[mcp.servers.<name>.permissions]` when the
+    // running config carries any default policy or rules. Forgetting
+    // this is load-bearing: a normal persisted toggle would otherwise
+    // overwrite the on-disk server table with a fresh body that
+    // lacks the user's `[mcp.servers.<name>.permissions]` block,
+    // silently dropping MCP guardrails (allow/ask/deny defaults and
+    // per-tool rules) the user explicitly set.
+    if server.permissions.default.is_some() || !server.permissions.rules.is_empty() {
+        table.insert(
+            "permissions",
+            toml_edit::Item::Table(mcp_permissions_table(&server.permissions)),
+        );
+    }
+    table
+}
+
+/// Serialize an [`squeezy_core::McpPermissionConfig`] into a
+/// `[mcp.servers.<name>.permissions]` sub-table with a `default`
+/// leaf and an `[[..rules]]` array of tables. Each rule round-trips
+/// through `McpPermissionConfig::from_table` — target stays
+/// server-qualified, action / source / reason / silent are emitted
+/// in the same shape the loader accepts. `default_source` is
+/// runtime-only (`#[serde(skip)]`) and intentionally omitted.
+fn mcp_permissions_table(perms: &squeezy_core::McpPermissionConfig) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    if let Some(default) = perms.default {
+        table.insert(
+            "default",
+            toml_edit::Item::Value(toml_edit::Value::from(default.as_str())),
+        );
+    }
+    if !perms.rules.is_empty() {
+        let mut rules = toml_edit::ArrayOfTables::new();
+        for rule in &perms.rules {
+            rules.push(mcp_permission_rule_table(rule));
+        }
+        table.insert("rules", toml_edit::Item::ArrayOfTables(rules));
+    }
+    table
+}
+
+fn mcp_permission_rule_table(rule: &squeezy_core::PermissionRule) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    table.insert(
+        "target",
+        toml_edit::Item::Value(toml_edit::Value::from(rule.target.as_str())),
+    );
+    table.insert(
+        "action",
+        toml_edit::Item::Value(toml_edit::Value::from(rule.action.as_str())),
+    );
+    // Only persist the `source` and `reason` keys when the in-memory
+    // values diverge from the loader's defaults. `Project` is the
+    // implicit source for unannotated rules in `from_table`; emitting
+    // it unconditionally would noisily promote runtime defaults into
+    // the file the user maintains by hand.
+    if rule.source != squeezy_core::PermissionRuleSource::Project {
+        table.insert(
+            "source",
+            toml_edit::Item::Value(toml_edit::Value::from(rule.source.as_str())),
+        );
+    }
+    if let Some(reason) = &rule.reason {
+        table.insert(
+            "reason",
+            toml_edit::Item::Value(toml_edit::Value::from(reason.as_str())),
+        );
+    }
+    if rule.silent {
+        table.insert(
+            "silent",
+            toml_edit::Item::Value(toml_edit::Value::from(true)),
         );
     }
     table

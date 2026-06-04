@@ -1327,11 +1327,18 @@ fn handle_mcp_browse_key(
     let is_add_row = state.field_index == add_row;
     let server_at_focus = state.mcp_server_at_row(state.field_index);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // Treat both `'A'` and `shift+a` as the shifted variant. Some
+    // terminals deliver shift+letter as `Char('A')` with `SHIFT`
+    // set, others as `Char('A')` with no modifier, and a few as
+    // `Char('a')` with `SHIFT`. We accept all three so the
+    // documented session-only modifier never silently no-ops.
+    let session_only_add = matches!(key.code, KeyCode::Char('A')) || shift;
     match (key.code, key.modifiers) {
-        // Open the "add server" overlay (default key: lower-case `a`).
-        (KeyCode::Char('a'), KeyModifiers::NONE) | (KeyCode::Char('a'), KeyModifiers::SHIFT) => {
+        // Open the "add server" overlay. Lower-case `a` persists by
+        // default; upper-case `A` (or shift+a) flips to session-only.
+        (KeyCode::Char('a'), _) | (KeyCode::Char('A'), _) => {
             state.mcp_add = Some(McpAddForm {
-                session_only: shift,
+                session_only: session_only_add,
                 ..McpAddForm::default()
             });
             Some(KeyOutcome::KeepOpen)

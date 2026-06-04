@@ -186,6 +186,180 @@ fn mcp_server_table_preserves_http_identity() {
     assert_eq!(bearer, Some("DOCS_BEARER"));
 }
 
+/// `mcp_server_table` must round-trip the server's
+/// `[mcp.servers.<name>.permissions]` block so a normal persisted
+/// toggle does not silently strip the user's MCP guardrails
+/// (`default` policy + per-tool rules).
+#[test]
+fn mcp_server_table_preserves_permissions_block() {
+    use squeezy_core::{
+        McpPermissionConfig, McpServerConfig, McpTransport, PermissionAction, PermissionMode,
+        PermissionRule, PermissionRuleSource,
+    };
+
+    let permissions = McpPermissionConfig {
+        default: Some(PermissionMode::Ask),
+        rules: vec![
+            PermissionRule::new(
+                "mcp",
+                "docs/query:*".to_string(),
+                PermissionAction::Allow,
+                PermissionRuleSource::User,
+                Some("low-risk reads".to_string()),
+            ),
+            PermissionRule::new(
+                "mcp",
+                "docs/exec:*".to_string(),
+                PermissionAction::Deny,
+                PermissionRuleSource::Project,
+                None,
+            )
+            .with_silent(true),
+        ],
+        ..McpPermissionConfig::default()
+    };
+
+    let server = McpServerConfig {
+        enabled: true,
+        transport: McpTransport::Stdio,
+        command: Some("docs-mcp".to_string()),
+        args: Vec::new(),
+        url: None,
+        timeout_ms: None,
+        discovery_timeout_ms: None,
+        tool_call_timeout_ms: None,
+        enabled_tools: None,
+        disabled_tools: Vec::new(),
+        env: BTreeMap::new(),
+        permissions,
+        bearer_token_env_var: None,
+        http_headers: BTreeMap::new(),
+        env_http_headers: BTreeMap::new(),
+    };
+
+    let table = mcp_server_table(&server);
+    let perms = table
+        .get("permissions")
+        .and_then(|i| i.as_table())
+        .expect("permissions sub-table must be present");
+    let default = perms
+        .get("default")
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_str());
+    assert_eq!(default, Some("ask"));
+
+    let rules = perms
+        .get("rules")
+        .and_then(|i| i.as_array_of_tables())
+        .expect("rules array of tables must be present");
+    assert_eq!(rules.len(), 2);
+
+    let first = rules.get(0).unwrap();
+    assert_eq!(
+        first
+            .get("target")
+            .and_then(|v| v.as_value())
+            .and_then(|v| v.as_str()),
+        Some("docs/query:*")
+    );
+    assert_eq!(
+        first
+            .get("action")
+            .and_then(|v| v.as_value())
+            .and_then(|v| v.as_str()),
+        Some("allow")
+    );
+    // Source `User` differs from the project-default loader assumption,
+    // so it must be emitted explicitly.
+    assert_eq!(
+        first
+            .get("source")
+            .and_then(|v| v.as_value())
+            .and_then(|v| v.as_str()),
+        Some("user")
+    );
+    assert_eq!(
+        first
+            .get("reason")
+            .and_then(|v| v.as_value())
+            .and_then(|v| v.as_str()),
+        Some("low-risk reads")
+    );
+    assert!(
+        first.get("silent").is_none(),
+        "silent must be omitted unless the rule sets it"
+    );
+
+    let second = rules.get(1).unwrap();
+    assert_eq!(
+        second
+            .get("silent")
+            .and_then(|v| v.as_value())
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "silent = true must be persisted on Deny rules"
+    );
+    assert!(
+        second.get("source").is_none(),
+        "default source (`project`) is implicit in the loader so we omit it"
+    );
+}
+
+/// `mcp_settings_edit` must write through the hardened atomic
+/// writer so freshly created tier files land with `0o600` on
+/// Unix. The MCP settings block can hold inline secrets (env
+/// values, HTTP headers, bearer-token env-var names) so an
+/// umask-derived `0o644` would expose them to anyone in the user's
+/// group.
+#[cfg(unix)]
+#[test]
+fn mcp_settings_edit_writes_files_with_owner_only_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_temp_dir("chmod");
+    let path = dir.join("settings.toml");
+    mcp_settings_edit(&path, |servers| {
+        servers.insert(
+            "docs",
+            toml_edit::Item::Table(mcp_server_table(&fixture_stdio_server("docs"))),
+        );
+        Ok(())
+    })
+    .expect("edit succeeds");
+    let mode = fs::metadata(&path)
+        .expect("file exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "new MCP settings files must be owner-only; got {mode:o}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Construct a minimal stdio server fixture so the chmod test
+/// doesn't depend on `mcp_server_table_preserves_http_identity`'s
+/// HTTP-shaped fixture.
+fn fixture_stdio_server(name: &str) -> squeezy_core::McpServerConfig {
+    squeezy_core::McpServerConfig {
+        enabled: true,
+        transport: squeezy_core::McpTransport::Stdio,
+        command: Some(format!("{name}-mcp")),
+        args: Vec::new(),
+        url: None,
+        timeout_ms: None,
+        discovery_timeout_ms: None,
+        tool_call_timeout_ms: None,
+        enabled_tools: None,
+        disabled_tools: Vec::new(),
+        env: BTreeMap::new(),
+        permissions: squeezy_core::McpPermissionConfig::default(),
+        bearer_token_env_var: None,
+        http_headers: BTreeMap::new(),
+        env_http_headers: BTreeMap::new(),
+    }
+}
+
 /// `tier_defines_mcp_server` is the read-only sniff that lets
 /// `persist_mcp_remove` flag inherited definitions after a scoped
 /// remove. It must accept settings files that don't have an
