@@ -339,7 +339,9 @@ fn mcp_settings_edit_writes_files_with_owner_only_permissions() {
 
 /// Construct a minimal stdio server fixture so the chmod test
 /// doesn't depend on `mcp_server_table_preserves_http_identity`'s
-/// HTTP-shaped fixture.
+/// HTTP-shaped fixture. Gated alongside the test itself so the
+/// non-Unix build doesn't trip `dead_code` on the unused helper.
+#[cfg(unix)]
 fn fixture_stdio_server(name: &str) -> squeezy_core::McpServerConfig {
     squeezy_core::McpServerConfig {
         enabled: true,
