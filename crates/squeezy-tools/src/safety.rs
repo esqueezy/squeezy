@@ -5,7 +5,7 @@ use squeezy_core::ShellSandboxConfig;
 use crate::shell::shell_command_references_sensitive_path;
 use crate::shell_parse::{
     expand_wrapper_segments, is_destructive_shell_segment, is_read_only_shell_segment,
-    shell_segments,
+    path_has_unresolved_var, shell_segments,
 };
 
 /// Pre-AI structural classifier for shell commands. Runs unconditionally
@@ -227,10 +227,10 @@ pub(crate) fn path_escapes_permission_writable_roots(
     workspace_root: &Path,
     shell_sandbox: &ShellSandboxConfig,
 ) -> bool {
-    // An unresolved shell variable (`$VAR` left after env expansion) means we
-    // cannot prove the target stays in the workspace — escalate rather than
-    // silently allow it.
-    if raw.contains('$') {
+    // An unresolved shell variable (`$VAR`/`${VAR}`/`%VAR%` left after env
+    // expansion) means we cannot prove the target stays in the workspace —
+    // escalate rather than silently allow it.
+    if path_has_unresolved_var(raw) {
         return true;
     }
     let normalized = normalize_candidate(raw, workspace_root);

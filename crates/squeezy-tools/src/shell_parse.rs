@@ -1339,6 +1339,34 @@ fn expand_env_vars(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
+        // cmd-style `%VAR%`. Resolved vars are substituted; an unresolved one
+        // is left literal so `path_has_unresolved_var` escalates it.
+        if c == '%' {
+            let mut name = String::new();
+            while let Some(&nc) = chars.peek() {
+                if nc.is_ascii_alphanumeric() || nc == '_' {
+                    name.push(nc);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if !name.is_empty() && chars.peek() == Some(&'%') {
+                chars.next();
+                match std::env::var(&name) {
+                    Ok(val) => out.push_str(&val),
+                    Err(_) => {
+                        out.push('%');
+                        out.push_str(&name);
+                        out.push('%');
+                    }
+                }
+            } else {
+                out.push('%');
+                out.push_str(&name);
+            }
+            continue;
+        }
         if c != '$' {
             out.push(c);
             continue;
@@ -1392,9 +1420,40 @@ fn expand_env_vars(input: &str) -> String {
     out
 }
 
-/// Expand `~`/`~/` and `$VAR`/`${VAR}` in a shell path so targets like
-/// `~/.bashrc` and `$HOME/x` resolve to their real (out-of-workspace)
-/// locations instead of looking like in-workspace relative paths.
+/// True when `path` still contains an unresolved shell variable after
+/// expansion (a literal `$VAR`/`${VAR}` or cmd-style `%VAR%`). Such a target
+/// cannot be proven to stay in the workspace, so callers escalate it.
+pub(crate) fn path_has_unresolved_var(path: &str) -> bool {
+    if path.contains('$') {
+        return true;
+    }
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            continue;
+        }
+        let mut len = 0usize;
+        let mut closed = false;
+        while let Some(&nc) = chars.peek() {
+            if nc.is_ascii_alphanumeric() || nc == '_' {
+                len += 1;
+                chars.next();
+            } else {
+                closed = nc == '%';
+                break;
+            }
+        }
+        if len > 0 && closed {
+            return true;
+        }
+    }
+    false
+}
+
+/// Expand `~`/`~/`, `$VAR`/`${VAR}`, and cmd-style `%VAR%` in a shell path so
+/// targets like `~/.bashrc`, `$HOME/x`, and `%USERPROFILE%\x` resolve to their
+/// real (out-of-workspace) locations instead of looking like in-workspace
+/// relative paths.
 fn expand_path_vars(path: &str) -> String {
     let tilde_expanded = if path == "~" {
         home_dir().unwrap_or_else(|| path.to_string())
@@ -1502,6 +1561,107 @@ fn collect_verb_write_targets(name: &str, args: &[String], out: &mut Vec<String>
             let files: Vec<&String> = args.iter().filter(|arg| !is_shell_flag(arg)).collect();
             for file in files.iter().skip(1) {
                 push_write_target(file, out);
+            }
+        }
+        _ => collect_windows_write_targets(name, args, out),
+    }
+}
+
+/// A cmd.exe switch like `/Y`, `/S`, `/MIR`, `/LOG:file` — distinct from a
+/// POSIX path that merely begins with `/` (those contain a path separator, so
+/// they are not all alphanumeric).
+fn is_cmd_flag(token: &str) -> bool {
+    token.starts_with('/')
+        && token.len() >= 2
+        && token[1..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == ':')
+}
+
+/// Value of a PowerShell named parameter (`-Destination dst` / `-Path:dst`,
+/// case-insensitive).
+fn powershell_named_value<'a>(args: &'a [String], names: &[&str]) -> Option<&'a str> {
+    for (idx, arg) in args.iter().enumerate() {
+        if let Some((flag, inline)) = arg.split_once(':')
+            && names.iter().any(|n| flag.eq_ignore_ascii_case(n))
+            && !inline.is_empty()
+        {
+            return Some(inline);
+        }
+        if names.iter().any(|n| arg.eq_ignore_ascii_case(n)) {
+            return args.get(idx + 1).map(String::as_str);
+        }
+    }
+    None
+}
+
+/// PowerShell positional operands: tokens that are neither a `-Parameter` nor
+/// the value immediately following a bare `-Parameter`.
+fn powershell_positionals(args: &[String]) -> Vec<&str> {
+    let mut positionals = Vec::new();
+    let mut skip_value = false;
+    for arg in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if arg.starts_with('-') {
+            // A bare `-Param` (no inline `:value`) consumes the next token.
+            skip_value = !arg.contains(':');
+            continue;
+        }
+        positionals.push(arg.as_str());
+    }
+    positionals
+}
+
+/// Windows file-mutating verbs (cmd.exe + PowerShell). The tree-sitter-bash
+/// parser still tokenises these into a name + args, so we can extract their
+/// write targets even though their flag/parameter syntax differs from POSIX.
+fn collect_windows_write_targets(name: &str, args: &[String], out: &mut Vec<String>) {
+    let lowered = name.to_ascii_lowercase();
+    let verb = lowered.strip_suffix(".exe").unwrap_or(&lowered);
+    match verb {
+        // cmd: `copy SRC DEST`, `move SRC DEST`, `xcopy SRC DEST [/flags]` —
+        // destination is the last non-switch operand.
+        "copy" | "move" | "xcopy" => {
+            if let Some(dest) = args.iter().rev().find(|arg| !is_cmd_flag(arg)) {
+                push_write_target(dest, out);
+            }
+        }
+        // `robocopy SOURCE DEST [files] [options]` — the written dir is the
+        // second positional.
+        "robocopy" => {
+            let positional: Vec<&String> = args.iter().filter(|arg| !is_cmd_flag(arg)).collect();
+            if let Some(dest) = positional.get(1) {
+                push_write_target(dest, out);
+            }
+        }
+        // `md DIR` (cmd alias for mkdir).
+        "md" => {
+            for arg in args {
+                if !is_cmd_flag(arg) {
+                    push_write_target(arg, out);
+                }
+            }
+        }
+        // PowerShell copy/move: `-Destination` (or the last positional).
+        "copy-item" | "move-item" => {
+            if let Some(dest) = powershell_named_value(args, &["-destination", "-dest"]) {
+                push_write_target(dest, out);
+            } else if let Some(dest) = powershell_positionals(args).last() {
+                push_write_target(dest, out);
+            }
+        }
+        // PowerShell file writers: `-Path`/`-FilePath`/`-LiteralPath` (or the
+        // first positional).
+        "set-content" | "add-content" | "out-file" | "new-item" => {
+            if let Some(target) =
+                powershell_named_value(args, &["-path", "-filepath", "-literalpath"])
+            {
+                push_write_target(target, out);
+            } else if let Some(target) = powershell_positionals(args).first() {
+                push_write_target(target, out);
             }
         }
         _ => {}

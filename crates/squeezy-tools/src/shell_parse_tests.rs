@@ -273,3 +273,67 @@ fn write_targets_expand_env_vars() {
         vec!["$SQZ_DEFINITELY_UNSET_VAR/x".to_string()]
     );
 }
+
+#[test]
+fn write_targets_cover_windows_verbs() {
+    // cmd copy/move/xcopy: destination is the last non-switch operand
+    // (forward-slash + quoted forms keep the bash tokenizer unambiguous).
+    assert_eq!(
+        extract_shell_write_targets("copy secret \"C:/Windows/evil.txt\""),
+        vec!["C:/Windows/evil.txt".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("xcopy src \"D:/out\" /E /I"),
+        vec!["D:/out".to_string()]
+    );
+    // robocopy: destination is the 2nd positional.
+    assert_eq!(
+        extract_shell_write_targets("robocopy src \"//server/share\" /MIR"),
+        vec!["//server/share".to_string()]
+    );
+    // md = cmd mkdir alias.
+    assert_eq!(
+        extract_shell_write_targets("md \"E:/payload\""),
+        vec!["E:/payload".to_string()]
+    );
+    // PowerShell named destination + file writers.
+    assert_eq!(
+        extract_shell_write_targets("Copy-Item secret -Destination \"C:/Windows/x\""),
+        vec!["C:/Windows/x".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("Set-Content -Path \"C:/hosts\" -Value y"),
+        vec!["C:/hosts".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("Out-File \"C:/log.txt\""),
+        vec!["C:/log.txt".to_string()]
+    );
+}
+
+#[test]
+fn write_targets_expand_percent_vars() {
+    let home = test_home();
+    let home = home.trim_end_matches('/');
+    // %HOME% is set in the test env; resolves like cmd's %USERPROFILE%.
+    assert_eq!(
+        extract_shell_write_targets("copy secret \"%HOME%/evil.txt\""),
+        vec![format!("{home}/evil.txt")]
+    );
+    // An unset %VAR% stays literal so the escape check escalates on it.
+    assert_eq!(
+        extract_shell_write_targets("copy secret \"%SQZ_UNSET_VAR%/x\""),
+        vec!["%SQZ_UNSET_VAR%/x".to_string()]
+    );
+}
+
+#[test]
+fn write_targets_preserve_unquoted_backslash_windows_path() {
+    // The bash tokenizer preserves an unquoted backslash drive path verbatim,
+    // so on a Windows build std::path resolves `C:\...` as an absolute
+    // (drive-prefixed) path and the workspace-escape check flags it.
+    assert_eq!(
+        extract_shell_write_targets("copy secret C:\\Windows\\evil.txt"),
+        vec!["C:\\Windows\\evil.txt".to_string()]
+    );
+}
