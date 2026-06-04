@@ -1719,6 +1719,33 @@ fn cross_precedence_name_collision_emits_load_time_warning() {
 }
 
 #[test]
+fn unmet_tool_deps_flags_missing_builtin_and_mcp() {
+    let deps = vec![
+        "shell".to_string(),
+        "websearch".to_string(),
+        "mcp:exa".to_string(),
+        "mcp:parallel".to_string(),
+        "  ".to_string(),
+    ];
+    let available_tools: BTreeSet<String> = ["shell".to_string()].into_iter().collect();
+    let available_mcp: BTreeSet<String> = ["exa".to_string()].into_iter().collect();
+    let missing = super::unmet_tool_deps(&deps, &available_tools, &available_mcp);
+    assert_eq!(
+        missing,
+        vec!["websearch".to_string(), "mcp:parallel".to_string()]
+    );
+}
+
+#[test]
+fn unmet_tool_deps_empty_when_all_satisfied() {
+    let deps = vec!["shell".to_string(), "mcp:exa".to_string()];
+    let available_tools: BTreeSet<String> = ["shell".to_string()].into_iter().collect();
+    let available_mcp: BTreeSet<String> = ["exa".to_string()].into_iter().collect();
+    let missing = super::unmet_tool_deps(&deps, &available_tools, &available_mcp);
+    assert!(missing.is_empty());
+}
+
+#[test]
 fn duplicate_trigger_across_skills_skips_auto_activation() {
     let root = temp_workspace("skills_trigger_collision_skip");
     write_skill(

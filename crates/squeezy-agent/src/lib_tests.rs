@@ -2490,6 +2490,60 @@ async fn fork_mode_skills_render_in_fork_block_not_active_block() {
 }
 
 #[tokio::test]
+async fn skill_manifest_missing_tool_deps_emit_warning_block() {
+    let root = temp_workspace("agent_skill_tool_deps");
+    let skill_dir = root.join(".agents/skills/needs-things");
+    fs::create_dir_all(&skill_dir).expect("mkdir");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: needs-things\ndescription: \"depends on absent tools\"\ntriggers:\n  - needs things\n---\n# body\n",
+    )
+    .expect("write skill md");
+    fs::write(
+        skill_dir.join("skill.toml"),
+        "tool_deps = [\"mcp:nonexistent\", \"definitely_not_a_tool\"]\n",
+    )
+    .expect("write manifest");
+
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
+    let mut rx = agent.start_turn(
+        "needs things now please".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("captured request");
+    assert!(
+        request.instructions.contains("<skill_warnings>"),
+        "missing skill_warnings block: {}",
+        request.instructions
+    );
+    assert!(
+        request.instructions.contains("needs-things"),
+        "warning block must name the skill: {}",
+        request.instructions
+    );
+    assert!(
+        request.instructions.contains("mcp:nonexistent")
+            && request.instructions.contains("definitely_not_a_tool"),
+        "warning block must list each missing dep: {}",
+        request.instructions
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn replace_config_rediscovers_skill_catalog() {
     let root = temp_workspace("agent_skill_reload");
     let provider = Arc::new(MockProvider::new(vec![vec![

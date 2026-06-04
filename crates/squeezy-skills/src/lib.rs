@@ -1469,7 +1469,7 @@ fn skill_path_matches(selector: &Path, entry: &SkillEntry) -> bool {
     selector == location || selector == base_dir
 }
 
-pub(crate) fn xml_escape(value: &str) -> String {
+pub fn xml_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
@@ -1522,6 +1522,34 @@ fn load_manifest(base_dir: &Path) -> Option<SkillManifest> {
             None
         }
     }
+}
+
+/// Inspect a `manifest.tool_deps` list and return the subset that is
+/// not satisfied by the runtime's available tools and MCP servers.
+///
+/// A dep starting with `mcp:<server>` matches an MCP server name in
+/// `available_mcp_servers`. Any other dep is treated as a built-in
+/// tool name and matched against `available_tools`. Comparison is
+/// case-sensitive to mirror the lookup the tool registry performs.
+pub fn unmet_tool_deps(
+    deps: &[String],
+    available_tools: &BTreeSet<String>,
+    available_mcp_servers: &BTreeSet<String>,
+) -> Vec<String> {
+    deps.iter()
+        .filter(|dep| {
+            let trimmed = dep.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            if let Some(server) = trimmed.strip_prefix("mcp:") {
+                !available_mcp_servers.contains(server.trim())
+            } else {
+                !available_tools.contains(trimmed)
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 /// Parse `SKILL.md` content and report whether it satisfies the

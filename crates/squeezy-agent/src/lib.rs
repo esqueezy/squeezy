@@ -5358,13 +5358,45 @@ impl TurnRuntime {
             });
         let active_block = self.tools.format_active_skills(&inline_skills);
         let fork_block = self.tools.format_fork_skills(&fork_skills);
-        let base_instructions = match (active_block, fork_block) {
-            (Some(active), Some(fork)) => {
+        // `manifest.tool_deps` declared by an activated skill must
+        // match an advertised tool name (or `mcp:<server>` for a
+        // ready MCP). When a dep is missing the skill body would
+        // happily reference it anyway, so surface a structured
+        // refusal note in the system prompt before the LLM call.
+        let mut all_active_skills = inline_skills.clone();
+        all_active_skills.extend(fork_skills.iter().cloned());
+        let missing_deps = self.tools.audit_skill_tool_deps(&all_active_skills);
+        let dep_warnings = if missing_deps.is_empty() {
+            None
+        } else {
+            for (skill, missing) in &missing_deps {
+                tracing::warn!(
+                    target: "squeezy_skills",
+                    skill = %skill,
+                    missing = ?missing,
+                    "skill manifest declares tool_deps that are not available in this session"
+                );
+            }
+            Some(format_skill_tool_dep_warnings(&missing_deps))
+        };
+        let base_instructions = match (active_block, fork_block, dep_warnings) {
+            (Some(active), Some(fork), Some(warn)) => format!(
+                "{}\n\n{}\n\n{}\n\n{}",
+                self.config.instructions, active, fork, warn
+            ),
+            (Some(active), Some(fork), None) => {
                 format!("{}\n\n{}\n\n{}", self.config.instructions, active, fork)
             }
-            (Some(active), None) => format!("{}\n\n{}", self.config.instructions, active),
-            (None, Some(fork)) => format!("{}\n\n{}", self.config.instructions, fork),
-            (None, None) => self.config.instructions.clone(),
+            (Some(active), None, Some(warn)) => {
+                format!("{}\n\n{}\n\n{}", self.config.instructions, active, warn)
+            }
+            (Some(active), None, None) => format!("{}\n\n{}", self.config.instructions, active),
+            (None, Some(fork), Some(warn)) => {
+                format!("{}\n\n{}\n\n{}", self.config.instructions, fork, warn)
+            }
+            (None, Some(fork), None) => format!("{}\n\n{}", self.config.instructions, fork),
+            (None, None, Some(warn)) => format!("{}\n\n{}", self.config.instructions, warn),
+            (None, None, None) => self.config.instructions.clone(),
         };
         let native_text_verbosity = capabilities_for(self.provider.name(), &self.config.model)
             .is_some_and(|capabilities| capabilities.text_verbosity);
@@ -10347,6 +10379,33 @@ fn looks_path_like(text: &str, allow_bare_file: bool) -> bool {
         return true;
     }
     false
+}
+
+/// Render a `<skill_warnings>` block listing each activated skill
+/// whose `manifest.tool_deps` declares a tool or MCP server that is
+/// not available in the current registry. The block tells the model
+/// to refuse the skill rather than invent fallbacks, mirroring the
+/// "be explicit about missing dependencies" guidance already embedded
+/// in the active-skills prompt block.
+fn format_skill_tool_dep_warnings(
+    missing: &std::collections::BTreeMap<String, Vec<String>>,
+) -> String {
+    let mut body = String::from(
+        "<skill_warnings>\nOne or more activated skills declare tool dependencies that are not available in this session. Refuse to follow the dependent skill's instructions rather than improvising substitutes.\n",
+    );
+    for (skill, deps) in missing {
+        let deps_xml = deps
+            .iter()
+            .map(|dep| format!("<dep>{}</dep>", squeezy_skills::xml_escape(dep)))
+            .collect::<Vec<_>>()
+            .join("");
+        body.push_str(&format!(
+            "<skill name=\"{}\">\n<missing_tool_deps>{deps_xml}</missing_tool_deps>\n</skill>\n",
+            squeezy_skills::xml_escape(skill),
+        ));
+    }
+    body.push_str("</skill_warnings>");
+    body
 }
 
 fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> String {

@@ -2646,6 +2646,47 @@ impl ToolRegistry {
         self.skills_snapshot().register_hooks(registry)
     }
 
+    /// For each loaded skill that declares `manifest.tool_deps`,
+    /// return the deps that are not satisfied by the current registry
+    /// (built-in tool name or `mcp:<server>`). Skills with no manifest
+    /// or no declared deps are omitted from the result so the agent
+    /// can iterate the map and emit a warning per skill only when
+    /// there is something to say.
+    pub fn audit_skill_tool_deps(
+        &self,
+        skills: &[LoadedSkill],
+    ) -> std::collections::BTreeMap<String, Vec<String>> {
+        let available_tools: std::collections::BTreeSet<String> =
+            self.specs().iter().map(|spec| spec.name.clone()).collect();
+        let available_mcp_servers: std::collections::BTreeSet<String> = self
+            .mcp_status_snapshot()
+            .per_server
+            .into_iter()
+            .filter_map(|(name, status)| match status {
+                squeezy_mcp::McpServerStatus::Ready { .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+        let mut out = std::collections::BTreeMap::new();
+        for skill in skills {
+            let Some(manifest) = skill.summary.manifest.as_ref() else {
+                continue;
+            };
+            if manifest.tool_deps.is_empty() {
+                continue;
+            }
+            let missing = squeezy_skills::unmet_tool_deps(
+                &manifest.tool_deps,
+                &available_tools,
+                &available_mcp_servers,
+            );
+            if !missing.is_empty() {
+                out.insert(skill.summary.name.clone(), missing);
+            }
+        }
+        out
+    }
+
     /// Rebuild the in-memory skill catalog from `skills_config`,
     /// rediscovering every skill root under `workspace_root` and
     /// reapplying `[[skills.config]]` enable/disable rules. Returns the
