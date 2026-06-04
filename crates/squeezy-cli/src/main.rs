@@ -447,8 +447,27 @@ struct SessionReportArgs {
     exclude: Vec<String>,
 }
 
-#[tokio::main]
-async fn main() -> squeezy_core::Result<()> {
+/// Worker-thread stack for the multi-threaded runtime.
+///
+/// The delegate/subagent path nests several `Box::pin`ned async layers
+/// (parent tool loop → subagent dispatch → subagent round loop → child
+/// tool fan-out), and when a batch fans out across subagents these poll
+/// trees stack up on a single worker thread. Tokio's 2 MiB default
+/// overflows that combined depth on Windows (smaller default guard
+/// pages), so we provision a generous worker stack. 16 MiB matches the
+/// worker-stack size Codex provisions for the same agent workload.
+const WORKER_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+fn main() -> squeezy_core::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_THREAD_STACK_SIZE)
+        .build()
+        .map_err(|err| SqueezyError::Config(format!("failed to build async runtime: {err}")))?
+        .block_on(run())
+}
+
+async fn run() -> squeezy_core::Result<()> {
     squeezy_core::startup_trace::init();
     squeezy_core::startup_trace::mark("main_start");
     squeezy_core::pre_main_hardening(squeezy_core::HardeningConfig::default());

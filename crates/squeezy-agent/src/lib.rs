@@ -31,11 +31,12 @@ use squeezy_core::{
 };
 use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
-    CacheSpec, INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY,
-    INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream,
-    LlmToolCall, LlmToolSpec, ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate,
-    StopReason, capabilities_for, estimate_cost, estimate_request_context_calibrated,
-    fetch_ollama_context_window,
+    CacheRetention, CacheSpec, INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY,
+    INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider,
+    LlmRequest, LlmStream, LlmToolCall, LlmToolSpec, ReasoningPayload, ReasoningSnapshot,
+    RequestTokenEstimate, StopReason, capabilities_for, estimate_cost,
+    estimate_request_context_calibrated, fetch_ollama_context_window,
+    provider_honors_output_schema,
 };
 use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
@@ -91,9 +92,14 @@ use context_compaction::{
 };
 #[cfg(test)]
 use context_compaction::{build_compaction_summary, compact_conversation};
-use cost_broker::{CostBroker, format_cap_reached_reason, llm_request_input_bytes};
+use cost_broker::{
+    CostBroker, format_cap_reached_reason, format_pressure_gate_reason,
+    format_round_input_gate_reason, llm_request_input_bytes, round_input_gate_status,
+};
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
-use micro_compaction::maybe_micro_compact_mid_turn;
+use micro_compaction::{
+    SuccessfulEdit, mask_expired_reads_after_edits, maybe_micro_compact_mid_turn,
+};
 use permission_persist::persist_permission_rule;
 use roles::{RoleModelPolicy, SubagentRole, role_config};
 
@@ -133,6 +139,19 @@ const DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER: &str = "{previous}";
 /// research workflow without letting the model commit the entire turn
 /// budget to one chain.
 const DELEGATE_CHAIN_MAX_STEPS: usize = 16;
+/// Anti-redundant-delegation gate. A whole-task `delegate` is refused once the
+/// parent has ALREADY pulled substantial context for the task in-context,
+/// because the cold subagent starts with an empty conversation + empty
+/// read-dedup store and re-reads the very files the parent already holds — pure
+/// double-work (measured: a parent that grep/read-storms 20+ calls then
+/// delegates pays the subagent to re-derive the same findings). Keyed on the
+/// parent's own exploration magnitude (turn-spanning, parent-only metrics), NOT
+/// on a delegate count: a context-isolating delegate fired *before* the parent
+/// explores has both counters near zero and is intentionally exempt. Only the
+/// broad `Delegate` kind is gated; scoped `delegate_plan`/`delegate_review`
+/// pass through.
+const REDUNDANT_DELEGATE_EXPLORE_CALLS: u64 = 8;
+const REDUNDANT_DELEGATE_READ_BYTES: u64 = 32_768;
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
@@ -1508,6 +1527,24 @@ impl Agent {
         conversation_state: ConversationState,
         replay: Option<Arc<ReplayRuntime>>,
     ) -> Self {
+        // Arm context compaction by default. The mid-turn micro-compaction
+        // tier (and the full tier) early-returns when
+        // `context_compaction.model_context_window` is `None`, and that field
+        // is only ever populated from explicit config — it was never derived
+        // from the model registry, so in practice compaction *never fired*.
+        // A long single-turn tool storm then re-sends its whole growing
+        // transcript to the provider every round (quadratic in tool calls;
+        // billed as cache-write on Anthropic). Derive the window from the
+        // model's own registered context size so compaction can do its job.
+        // Explicit config (`squeezy.toml` / `SQUEEZY_CONTEXT_MODEL_CONTEXT_WINDOW`)
+        // still wins via the `is_none()` guard.
+        if config.context_compaction.model_context_window.is_none()
+            && let Some(window) = squeezy_llm::model_info_for(provider.name(), &config.model)
+                .and_then(|info| info.limits)
+                .map(|limits| limits.context_window_tokens)
+        {
+            config.context_compaction.model_context_window = Some(window);
+        }
         let output_config = ToolOutputConfig {
             spill_threshold_bytes: config.tool_spill_threshold_bytes,
             preview_bytes: config.tool_preview_bytes,
@@ -2120,6 +2157,8 @@ impl Agent {
             self.config.tui.response_verbosity,
             native_text_verbosity,
         );
+        let raw_instructions =
+            instructions_with_batch_hint(&raw_instructions, self.config.batch_tool_calls_hint);
         let request_instructions = self.redactor.redact(&raw_instructions).text;
         let mut all_tool_specs = core_control_tools(&self.config.subagents, mode);
         all_tool_specs.extend(self.tools.specs().iter().cloned().map(advertised_tool));
@@ -2150,6 +2189,7 @@ impl Agent {
             },
             cache_key: None,
             cache: self.session_prompt_cache_key().into(),
+            disable_prompt_cache: self.config.disable_prompt_cache,
             tools: Arc::from(request_tool_specs(
                 &all_tool_specs,
                 mode,
@@ -2160,7 +2200,9 @@ impl Agent {
             store,
             tool_choice: self.config.tool_choice.clone(),
             output_schema: None,
-            parallel_tool_calls: None,
+            // Mirror the wire request so context/token accounting reflects
+            // the same `parallel_tool_calls` choice the real request sends.
+            parallel_tool_calls: self.config.parallel_tool_calls,
             beta_headers: std::sync::Arc::from(Vec::new()),
             ..LlmRequest::default()
         }
@@ -4622,6 +4664,24 @@ fn request_reasoning_effort(
         .map(|_| effort)
 }
 
+/// Effective reasoning effort for a spawned subagent of `kind`.
+///
+/// Catalog roles override the parent's inherited global effort with their
+/// own tuned default (Planner=High, Explorer/Reviewer=Low) so the priciest
+/// reasoning tier is spent only where the plan justifies it; kinds without a
+/// catalog role (Delegate, DocHelp) keep `inherited`. This only sets the
+/// config field — provider/model capability is still gated downstream by
+/// [`request_reasoning_effort`], so a non-reasoning provider drops the field
+/// exactly as it would for the global path.
+fn subagent_role_reasoning_effort(
+    kind: SubagentKind,
+    inherited: Option<squeezy_core::ReasoningEffort>,
+) -> Option<squeezy_core::ReasoningEffort> {
+    kind.role()
+        .and_then(|role| role_config(role).reasoning_effort)
+        .or(inherited)
+}
+
 /// Resolve the `tool_choice` to send on a given round of a turn.
 ///
 /// `"required"` is configured to fix tool-shy models (Qwen via
@@ -4791,6 +4851,25 @@ fn instructions_with_response_verbosity(
         ResponseVerbosity::Normal => unreachable!("handled above"),
     };
     format!("{instructions}\n\n{guidance}")
+}
+
+/// G3 batching nudge appended to the system prompt when
+/// `[model].batch_tool_calls_hint` is enabled. Kept to one sentence so the
+/// added cache-prefix bytes stay negligible. Scoped to *read-only* lookups
+/// so the model is never encouraged to reorder writes/edits, whose
+/// correctness depends on sequencing.
+const BATCH_TOOL_CALLS_HINT: &str = "When several read-only lookups (read_file, grep, definition_search, read_slice) are independent and none depends on another's result, issue them together in a single turn rather than one per turn; keep dependent steps and any file edits sequential.";
+
+/// Append the G3 batching nudge when `enabled`. Off by default, so the
+/// system prompt is byte-for-byte unchanged unless the operator opts in.
+/// When enabled, the hint lands in a deterministic position (immediately
+/// after the verbosity guidance, before the tool index) so the per-session
+/// prefix stays byte-stable across rounds.
+fn instructions_with_batch_hint(instructions: &str, enabled: bool) -> String {
+    if !enabled {
+        return instructions.to_string();
+    }
+    format!("{instructions}\n\n{BATCH_TOOL_CALLS_HINT}")
 }
 
 impl TurnRuntime {
@@ -5047,13 +5126,20 @@ impl TurnRuntime {
             self.config.tui.response_verbosity,
             native_text_verbosity,
         );
+        // G3: optional batching nudge. Off by default (byte-for-byte
+        // unchanged prompt); when enabled it lands in a deterministic
+        // position so the per-session cache prefix stays stable.
+        let batch_hint_instructions = instructions_with_batch_hint(
+            &verbosity_instructions,
+            self.config.batch_tool_calls_hint,
+        );
         // Plan mode is enforced by tool-filtering elsewhere; the overlay
         // here tells the model *why* its toolbox shrank and what the
         // expected output contract (`<proposed_plan>`) looks like.
         let active_mode = load_session_mode(&self.session_mode);
         let session_id_for_plan_mode = self.session_id();
         let mode_instructions = plan_mode::instructions_for_mode(
-            &verbosity_instructions,
+            &batch_hint_instructions,
             active_mode,
             &self.config.workspace_root,
             session_id_for_plan_mode.as_deref(),
@@ -5573,6 +5659,153 @@ impl TurnRuntime {
                 self.finish_turn(&broker.metrics).await;
                 return Ok(());
             }
+            // Adaptive pressure governor (gate variant, B6): below the hard
+            // cap but at the pressure threshold, refuse to *start* another
+            // round and surface a clear cost-pressure status instead of
+            // silently degrading per-turn budgets. Only engages when a cap is
+            // configured; the one-shot latch fires it at most once per turn.
+            if let Some(status) = broker.pressure_gate() {
+                self.stamp_routing_savings(&mut broker.metrics);
+                self.publish_terminal_task_state(
+                    TaskStateStatus::Failed,
+                    Some(format_pressure_gate_reason(status)),
+                    &task_title,
+                )
+                .await;
+                self.persist_turn_accounting(
+                    &total_cost,
+                    &broker.metrics,
+                    &broker.calibration,
+                    false,
+                )
+                .await;
+                let _ = self
+                    .tx
+                    .send(AgentEvent::Failed {
+                        turn_id: self.turn_id,
+                        error: SqueezyError::Agent(format_pressure_gate_reason(status)),
+                    })
+                    .await;
+                self.finish_turn(&broker.metrics).await;
+                return Ok(());
+            }
+            // Pre-flight round-input gate (idea G5). Default-off: when
+            // `max_round_input_tokens` is unset this whole block is a single
+            // `Option` check that returns `None`, so behaviour is unchanged.
+            // When set, estimate the assembled request's input tokens with the
+            // same `estimate_context` the cap check and compaction use; if the
+            // round is over the ceiling, take the cheaper action *first* —
+            // force a mid-turn compaction — and only gate the dispatch if the
+            // round is *still* over. This converts the existing reactive
+            // overflow handling into a proactive one for the round we're about
+            // to pay for.
+            if let Some(initial_gate) = round_input_gate_status(
+                self.config.max_round_input_tokens,
+                estimate_context(&conversation).estimated_tokens,
+                self.provider.name(),
+                &current_model,
+                CostBroker::projected_output_tokens(
+                    self.config.max_output_tokens,
+                    squeezy_llm::model_info_for(self.provider.name(), &current_model)
+                        .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
+                ),
+            ) {
+                self.dispatch_pre_compact(initial_gate.estimated_input_tokens);
+                // Force compaction regardless of the standard compaction
+                // thresholds: the gate's own ceiling is the trigger here, so
+                // `force = true` makes the extractive (and strategy-aware)
+                // pipeline run even when the conversation is below the normal
+                // `min_items` / `estimated_tokens` budgets.
+                let gate_report = compact_conversation_with_strategy(
+                    &mut conversation,
+                    &mut context_compaction,
+                    &active_attachments,
+                    self.store.as_deref(),
+                    &self.provider,
+                    self.session_log.as_ref(),
+                    &self.redactor,
+                    &self.config,
+                    ContextCompactionTrigger::Auto,
+                    true,
+                )
+                .await;
+                if let Some(report) = gate_report {
+                    self.dispatch_post_compact(
+                        report.record.before.estimated_tokens,
+                        report.record.after.estimated_tokens,
+                    );
+                    self.log_event(
+                        "context_compacted",
+                        Some(self.turn_id),
+                        Some(format!(
+                            "round-input gate compacted gen={} {}->{} estimated tokens",
+                            report.record.generation,
+                            report.record.before.estimated_tokens,
+                            report.record.after.estimated_tokens,
+                        )),
+                        json!({
+                            "record": report.record,
+                            "summary": report.summary,
+                            "replacement_id": report.record.replacement_id,
+                            "conversation": report.post_compact,
+                            "phase": "round_input_gate",
+                        }),
+                    );
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::ContextCompacted {
+                            turn_id: self.turn_id,
+                            report,
+                        })
+                        .await;
+                    // Compaction rewrote `conversation`, so the server-side
+                    // response-id reuse path must be invalidated and the full
+                    // (now-smaller) conversation resent rather than only the
+                    // latest user delta — mirrors the mid-turn compaction
+                    // handling after a tool round.
+                    previous_response_id = None;
+                    next_input = conversation.clone();
+                }
+                // Re-estimate after compaction. If the round is still over the
+                // ceiling, gate the dispatch with a clear status instead of
+                // paying for the oversized round.
+                if let Some(status) = round_input_gate_status(
+                    self.config.max_round_input_tokens,
+                    estimate_context(&conversation).estimated_tokens,
+                    self.provider.name(),
+                    &current_model,
+                    CostBroker::projected_output_tokens(
+                        self.config.max_output_tokens,
+                        squeezy_llm::model_info_for(self.provider.name(), &current_model)
+                            .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
+                    ),
+                ) {
+                    let reason = format_round_input_gate_reason(status);
+                    self.stamp_routing_savings(&mut broker.metrics);
+                    self.publish_terminal_task_state(
+                        TaskStateStatus::Failed,
+                        Some(reason.clone()),
+                        &task_title,
+                    )
+                    .await;
+                    self.persist_turn_accounting(
+                        &total_cost,
+                        &broker.metrics,
+                        &broker.calibration,
+                        false,
+                    )
+                    .await;
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::Failed {
+                            turn_id: self.turn_id,
+                            error: SqueezyError::Agent(reason),
+                        })
+                        .await;
+                    self.finish_turn(&broker.metrics).await;
+                    return Ok(());
+                }
+            }
             let active_mode = load_session_mode(&self.session_mode);
             let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();
             let plan_edit_allowed = plan_mode::plan_edit_allowed_in_workspace(
@@ -5663,7 +5896,13 @@ impl TurnRuntime {
                 store: self.config.store_responses,
                 tool_choice: effective_tool_choice(self.config.tool_choice.as_deref(), round),
                 output_schema: None,
-                parallel_tool_calls: None,
+                // G3: forward the operator's `parallel_tool_calls` choice
+                // so the model can batch independent tool calls into one
+                // turn, re-sending the growing prefix on fewer rounds.
+                // `None` (the default) leaves the provider's default —
+                // parallel on OpenAI Responses / Chat-Completions — in
+                // place, so behavior is unchanged unless opted in.
+                parallel_tool_calls: self.config.parallel_tool_calls,
                 beta_headers: std::sync::Arc::from(Vec::new()),
                 ..LlmRequest::default()
             };
@@ -6542,7 +6781,35 @@ impl TurnRuntime {
             }
             last_tool_round_summary = tool_round_failure_summary(&results);
             if let Some(reason) = loop_guard.observe_round(&tool_calls, &results) {
-                return Err(SqueezyError::Agent(reason));
+                // P0.2 fail-soft: the loop guard tripped (repeated identical
+                // tool failure, or control-only rounds). Rather than returning
+                // an error that surfaces as a zero-character answer, finalize
+                // with whatever the model has already produced this turn plus
+                // the stop reason. Flush the in-flight assistant stream so the
+                // current round's preamble is included.
+                if let Some(tail) = self
+                    .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                    .await
+                {
+                    self.record_replay_model_text_delta(&tail);
+                }
+                broker.metrics.redactions += assistant_stream.total_redactions();
+                let assistant_text = std::mem::take(&mut assistant_message);
+                self.finish_soft_completion(
+                    reason,
+                    assistant_text,
+                    &mut conversation,
+                    response_id.clone(),
+                    user_transcript.clone(),
+                    total_cost,
+                    &mut broker.metrics,
+                    context_compaction.clone(),
+                    broker.calibration.clone(),
+                    stop_reason.clone(),
+                    &task_title,
+                )
+                .await;
+                return Ok(());
             }
             let implicit_instructions_added = self.append_implicit_skill_instructions(
                 &results,
@@ -6650,6 +6917,46 @@ impl TurnRuntime {
                 }
             }
 
+            // Expired-context masking by file-mutation lineage (M2). When
+            // this round landed a successful in-place edit, the earlier
+            // read/grep snapshots of the same file now show pre-edit text
+            // and waste input tokens on every later turn. Splice the
+            // changed spans out of those stale snapshots in place — scoped
+            // to the edit's `search` text so surrounding context survives,
+            // gated on `ToolStatus::Success` so errored/denied edits never
+            // mutate prior reads. Reuses the micro-compaction placeholder
+            // (zero extra model call) and runs unconditionally after edits,
+            // independent of the token-pressure micro/full gates below.
+            let mut expired_context_masked = false;
+            if self.config.context_compaction.micro_compaction_enabled {
+                let edits = collect_successful_edits(&tool_calls, &outputs_with_status);
+                if !edits.is_empty()
+                    && let Some(report) = mask_expired_reads_after_edits(
+                        &mut conversation,
+                        &edits,
+                        self.config.context_compaction.micro_compaction_keep_recent,
+                    )
+                {
+                    expired_context_masked = true;
+                    self.log_event(
+                        "context_expired_masked",
+                        Some(self.turn_id),
+                        Some(format!(
+                            "expired-context masking stubbed {} stale spans across {} reads, freed {} bytes",
+                            report.spans_masked,
+                            report.masked_call_ids.len(),
+                            report.bytes_saved,
+                        )),
+                        json!({
+                            "masked_call_ids": &report.masked_call_ids,
+                            "spans_masked": report.spans_masked,
+                            "bytes_saved": report.bytes_saved,
+                            "phase": "post_edit",
+                        }),
+                    );
+                }
+            }
+
             // Mid-turn compaction (F75): if the provider reported usage
             // crossing the configured fraction of `model_context_window`,
             // shrink the conversation before the next sample. Bumps the
@@ -6727,8 +7034,13 @@ impl TurnRuntime {
             .await;
             // Either tier mutates `conversation`, so the response-id reuse
             // path must invalidate the cached id and resend the full
-            // conversation instead of the per-round outputs.
-            let mid_turn_compacted = mid_turn_report.is_some() || micro_report.is_some();
+            // conversation instead of the per-round outputs. Expired-context
+            // masking rewrites *earlier* outputs in place, so it must force
+            // the same full-resend — otherwise the per-round `outputs` would
+            // carry the verbatim bodies and the provider's server-side state
+            // would diverge from the locally-masked `conversation`.
+            let mid_turn_compacted =
+                mid_turn_report.is_some() || micro_report.is_some() || expired_context_masked;
             if let Some(report) = mid_turn_report {
                 self.dispatch_post_compact(
                     report.record.before.estimated_tokens,
@@ -6777,12 +7089,37 @@ impl TurnRuntime {
             }
         }
 
+        // P0.2 fail-soft: exhausting the tool-round budget used to return an
+        // error (zero-character answer). Finalize with the best-effort text
+        // gathered across the turn instead, noting the round-budget stop.
         let suffix = last_tool_round_summary
             .map(|summary| format!(" · {summary}"))
             .unwrap_or_default();
-        Err(SqueezyError::Agent(format!(
-            "stopped after {MAX_TOOL_ROUNDS} tool rounds{suffix}"
-        )))
+        if let Some(tail) = self
+            .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+            .await
+        {
+            self.record_replay_model_text_delta(&tail);
+        }
+        broker.metrics.redactions += assistant_stream.total_redactions();
+        let assistant_text = std::mem::take(&mut assistant_message);
+        self.finish_soft_completion(
+            format!("stopped after {MAX_TOOL_ROUNDS} tool rounds{suffix}"),
+            assistant_text,
+            &mut conversation,
+            previous_response_id.clone(),
+            user_transcript.clone(),
+            total_cost,
+            &mut broker.metrics,
+            context_compaction.clone(),
+            broker.calibration.clone(),
+            // No per-round stop_reason at budget exhaustion — that variable is
+            // loop-scoped and the turn ended by hitting MAX_TOOL_ROUNDS.
+            None,
+            &task_title,
+        )
+        .await;
+        Ok(())
     }
 
     fn append_implicit_skill_instructions(
@@ -7084,6 +7421,96 @@ impl TurnRuntime {
                 metrics: metrics.clone(),
             })
             .await;
+    }
+
+    /// Fail soft instead of emitting a zero-character answer.
+    ///
+    /// The repeated-tool-failure guard and the round-budget exhaustion path
+    /// used to `return Err(SqueezyError::Agent(reason))`, which surfaces as
+    /// `AgentEvent::Failed` and drops every byte the model already produced —
+    /// the realworld haiku eval measured whole turns landing at 0 visible
+    /// characters this way. This finalizes with the best-effort assistant
+    /// text gathered so far (the running preamble plus a short note stating
+    /// why the turn stopped) and emits the normal `Completed` event so the
+    /// user/eval receives the partial answer rather than nothing.
+    ///
+    /// `assistant_text` is whatever was flushed from the in-flight stream at
+    /// the abort site; it may be empty, in which case only the stop note is
+    /// returned. This mirrors the success completion path (conversation push,
+    /// `persist_turn_state`, `Completed`) so resume/transcript state stays
+    /// consistent.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_soft_completion(
+        &self,
+        stop_note: String,
+        assistant_text: String,
+        conversation: &mut Vec<LlmInputItem>,
+        response_id: Option<String>,
+        user_transcript: TranscriptItem,
+        total_cost: CostSnapshot,
+        metrics: &mut TurnMetrics,
+        context_compaction: ContextCompactionState,
+        token_calibration: squeezy_llm::TokenCalibration,
+        stop_reason: Option<StopReason>,
+        task_title: &str,
+    ) {
+        // Compose the visible answer: the model's own text first (if any),
+        // then a one-line note explaining the early finish. When the model
+        // produced no text the note stands alone so the answer is never empty.
+        let trimmed = assistant_text.trim_end();
+        let answer = if trimmed.is_empty() {
+            stop_note.clone()
+        } else {
+            format!("{trimmed}\n\n_(stopped early: {stop_note})_")
+        };
+        if !assistant_text.is_empty() {
+            conversation.push(redact_input_item(
+                LlmInputItem::AssistantText(assistant_text.clone()),
+                &self.redactor,
+            ));
+        }
+        let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(&answer));
+        self.stamp_routing_savings(metrics);
+        // Surface the partial-finish as Completed, not Failed: the user got
+        // an answer, just an abbreviated one.
+        self.publish_terminal_task_state(
+            TaskStateStatus::Completed,
+            Some(stop_note.clone()),
+            task_title,
+        )
+        .await;
+        self.log_event(
+            "soft_completion",
+            Some(self.turn_id),
+            Some(stop_note.clone()),
+            json!({ "reason": stop_note, "assistant_chars": answer.len() }),
+        );
+        self.persist_turn_state(TurnPersistInput {
+            conversation,
+            response_id,
+            user: user_transcript,
+            assistant: message.clone(),
+            cost: &total_cost,
+            metrics,
+            context_compaction,
+            token_calibration,
+        })
+        .await;
+        let context_estimate = estimate_context(conversation);
+        let _ = self
+            .tx
+            .send(AgentEvent::Completed {
+                turn_id: self.turn_id,
+                message,
+                response_id: None,
+                cost: total_cost,
+                metrics: metrics.clone(),
+                context_estimate,
+                stop_reason,
+                reasoning_only_stop: false,
+            })
+            .await;
+        self.finish_turn(metrics).await;
     }
 
     /// Mirror the success path's conversation/transcript push for a turn
@@ -8351,6 +8778,13 @@ async fn run_subagent(
     config.max_tool_calls_per_turn = config.subagents.max_tool_calls_per_call;
     config.max_tool_bytes_read_per_turn = config.subagents.max_tool_bytes_read_per_call;
     config.max_search_files_per_turn = config.subagents.max_search_files_per_call;
+    // Override the inherited global reasoning effort with the spawned
+    // subagent's role default before the request is built. `run_subagent_rounds`
+    // reads `config.reasoning_effort` through `request_reasoning_effort`, which
+    // still gates on provider/model capability downstream — so on a
+    // non-reasoning provider the field is dropped exactly as the global path
+    // would have dropped it.
+    config.reasoning_effort = subagent_role_reasoning_effort(kind, config.reasoning_effort);
     // Subagent inherits the parent's per-round result-bytes cap directly.
     // The previous `.min(24_000)` halved the budget for a subagent that
     // already had fewer tool calls to spend.
@@ -8677,6 +9111,20 @@ async fn run_subagent_loop(
     }
 }
 
+/// Stable prompt-cache affinity key for a single subagent invocation.
+///
+/// Distinct per `(session, turn)` so two subagents — or the same subagent on a
+/// later turn — never share a key (which would mix unrelated prefixes). All
+/// rounds of one invocation reuse this key so the provider keeps the growing
+/// instructions + tools + history prefix warm across the round loop. Returns
+/// `None` when no session log is attached (in-memory test contexts), in which
+/// case caching falls back to disabled.
+fn subagent_prompt_cache_key(parent: &ToolExecutionContext<'_>) -> Option<String> {
+    parent
+        .session_id_for_plan_mode()
+        .map(|session_id| format!("squeezy::sub::{session_id}::{}", parent.turn_id))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent_rounds(
     parent: &ToolExecutionContext<'_>,
@@ -8699,8 +9147,69 @@ async fn run_subagent_rounds(
     supporting_receipts: &mut Vec<Value>,
     model: String,
 ) -> SubagentExecution {
+    // Subagent rounds re-send the same instructions + tool schemas and a
+    // monotonically growing conversation, so the request prefix is large and
+    // stable across rounds — the prefix-cache sweet spot. Anchor a key that is
+    // constant for this subagent invocation (so all its rounds share a cache
+    // prefix) but distinct per turn/session (so unrelated invocations never
+    // collide). `Short` retention rides the provider 5m window, which covers a
+    // subagent's bounded round loop without paying for a 1h write. The helper
+    // returns `None` on providers without `prompt_caching`, leaving them
+    // unchanged.
+    let subagent_cache_key = subagent_prompt_cache_key(parent);
     for round in 0..config.subagents.max_model_rounds {
         let request_model: Arc<str> = Arc::from(config.model.as_str());
+        // P1.3 fail-soft subagent input-token guard. Reuses the EXISTING
+        // `max_round_input_tokens` ceiling (the same pre-flight gate the
+        // parent loop applies) instead of inventing a new cap. When the
+        // ceiling is unset (`None`, the default) `round_input_gate_status`
+        // short-circuits and this is a no-op, so default behaviour is
+        // unchanged. When a scenario/eval sets the ceiling, a subagent whose
+        // assembled request would exceed it STOPS here and returns the
+        // best-effort answer it has already gathered rather than running its
+        // round loop out to millions of input tokens (measured: 1.2M–10.5M
+        // input tokens on tasks the parent solves in ~1M). This bounds the
+        // documented runaway without touching the otherwise-unbounded
+        // `subagents.*` caps in squeezy-core.
+        if round > 0
+            && let Some(status) = round_input_gate_status(
+                config.max_round_input_tokens,
+                estimate_context(conversation).estimated_tokens,
+                parent.provider.name(),
+                &request_model,
+                CostBroker::projected_output_tokens(
+                    config.max_output_tokens,
+                    squeezy_llm::model_info_for(parent.provider.name(), &request_model)
+                        .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
+                ),
+            )
+        {
+            let chunk = assistant_stream.finish();
+            if !chunk.text.is_empty() {
+                assistant_message.push_str(&chunk.text);
+            }
+            broker.metrics.redactions += assistant_stream.total_redactions();
+            tracing::debug!(
+                target: "squeezy_agent::subagent_input_gate",
+                round,
+                estimated_input_tokens = status.estimated_input_tokens,
+                limit_tokens = status.limit_tokens,
+                "subagent stopped on round-input ceiling; returning best-effort result",
+            );
+            return successful_subagent_execution(
+                std::mem::take(assistant_message),
+                broker.metrics.clone(),
+                std::mem::take(supporting_receipts),
+                model,
+                config,
+            );
+        }
+        let cache = CacheSpec::for_prefix_reuse(
+            parent.provider.name(),
+            &request_model,
+            subagent_cache_key.clone(),
+            CacheRetention::Short,
+        );
         let llm_request = LlmRequest {
             model: Arc::clone(&request_model),
             instructions: Arc::from(instructions),
@@ -8710,12 +9219,16 @@ async fn run_subagent_rounds(
             reasoning_effort: request_reasoning_effort(config, parent.provider.name()),
             previous_response_id: None,
             cache_key: None,
-            cache: CacheSpec::default(),
+            cache,
             tools: Arc::from(tool_specs),
             store: false,
             tool_choice: effective_tool_choice(config.tool_choice.as_deref(), round),
             output_schema: None,
-            parallel_tool_calls: None,
+            // G3: subagents run their own multi-round tool loop and
+            // re-bill the prefix each round, so they get the same
+            // operator-controlled batching opt-in. `None` keeps the
+            // provider default.
+            parallel_tool_calls: config.parallel_tool_calls,
             beta_headers: std::sync::Arc::from(Vec::new()),
             ..LlmRequest::default()
         };
@@ -9376,6 +9889,95 @@ fn tool_status_label(status: ToolStatus) -> &'static str {
         ToolStatus::Denied => "denied",
         ToolStatus::Stale => "stale",
         ToolStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Collect the successful in-place file mutations from a just-committed
+/// tool round so [`mask_expired_reads_after_edits`] can stub the now-stale
+/// earlier reads of those files (cost-reduction idea M2). Only
+/// `ToolStatus::Success` edits are returned — errored, denied, stale, and
+/// cancelled edits leave the trajectory untouched, so the prior reads stay
+/// authoritative.
+///
+/// `search`/`replace` patches expose the changed span directly: the
+/// `search` text is exactly the pre-edit bytes that no longer exist in the
+/// file, so masking is scoped to that span and surrounding context
+/// survives. `create_file`/`delete_file`/`move_file` operations are
+/// skipped — a create has no prior read to expire, and delete/move don't
+/// produce a stale *in-file* snapshot of surviving content. `write_file`
+/// is a full-file overwrite with no sub-span, recorded as `whole_file`.
+fn collect_successful_edits(
+    tool_calls: &[ToolCall],
+    outputs_with_status: &[(LlmInputItem, String, ToolStatus)],
+) -> Vec<SuccessfulEdit> {
+    let mut edits: Vec<SuccessfulEdit> = Vec::new();
+    for (item, tool_name, status) in outputs_with_status {
+        if *status != ToolStatus::Success {
+            continue;
+        }
+        let LlmInputItem::FunctionCallOutput { call_id, .. } = item else {
+            continue;
+        };
+        let Some(call) = tool_calls.iter().find(|call| &call.call_id == call_id) else {
+            continue;
+        };
+        match tool_name.as_str() {
+            "write_file" => {
+                if let Some(path) = call
+                    .arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    edits.push(SuccessfulEdit {
+                        path: path.to_string(),
+                        changed_spans: Vec::new(),
+                        whole_file: true,
+                    });
+                }
+            }
+            "apply_patch" => collect_apply_patch_edits(&call.arguments, &mut edits),
+            _ => {}
+        }
+    }
+    edits
+}
+
+/// Extract `(path, search)` pairs from an `apply_patch` call's
+/// `patches`/`operations` arrays. The `search` string is the changed span
+/// the lineage-masking pass splices out of stale reads.
+fn collect_apply_patch_edits(arguments: &Value, edits: &mut Vec<SuccessfulEdit>) {
+    let push_search_replace = |edits: &mut Vec<SuccessfulEdit>, entry: &Value| {
+        let path = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let search = entry.get("search").and_then(Value::as_str);
+        if let (Some(path), Some(search)) = (path, search)
+            && !search.is_empty()
+        {
+            edits.push(SuccessfulEdit {
+                path: path.to_string(),
+                changed_spans: vec![search.to_string()],
+                whole_file: false,
+            });
+        }
+    };
+    if let Some(patches) = arguments.get("patches").and_then(Value::as_array) {
+        for patch in patches {
+            push_search_replace(edits, patch);
+        }
+    }
+    if let Some(operations) = arguments.get("operations").and_then(Value::as_array) {
+        for op in operations {
+            // Only `search_replace` ops expose a `search` span; create /
+            // delete / move ops are tagged `kind` and skipped here.
+            if op.get("kind").and_then(Value::as_str) == Some("search_replace") {
+                push_search_replace(edits, op);
+            }
+        }
     }
 }
 
@@ -10088,6 +10690,41 @@ async fn execute_tool_calls(
             _ => None,
         };
         if let Some(kind) = delegate_batch_kind {
+            // Anti-redundant-delegation gate (see the const docs above). Refuse a
+            // whole-task `delegate` when the parent has already gathered
+            // substantial context this task — a cold subagent would re-read the
+            // same files for pure overhead. Recall-safe: `Denied` removes no
+            // information (the parent already holds the context that tripped the
+            // gate and keeps every read/grep/graph tool), and `Denied` is ignored
+            // by the repeated-failure loop guard so it cannot abort the turn. An
+            // early/context-isolating delegate (counters near zero) is exempt.
+            if kind == SubagentKind::Delegate
+                && (broker.metrics.bytes_read >= REDUNDANT_DELEGATE_READ_BYTES
+                    || broker.metrics.tool_calls >= REDUNDANT_DELEGATE_EXPLORE_CALLS)
+            {
+                let result = control_tool_result(
+                    call,
+                    ToolStatus::Denied,
+                    json!({
+                        "ok": false,
+                        "error": "delegate is redundant: substantial context for this task is already gathered in-context",
+                        "parent_tool_calls": broker.metrics.tool_calls,
+                        "parent_bytes_read": broker.metrics.bytes_read,
+                        "guidance": "You have already read/searched substantial relevant context in this task. A delegate subagent starts cold and re-reads the same files — pure overhead. Finish in-context using what you have; use read_file/read_slice/grep and the graph tools directly for any remaining detail."
+                    }),
+                );
+                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
+                let _ = context
+                    .tx
+                    .send(AgentEvent::ToolCallCompleted {
+                        turn_id: context.turn_id,
+                        result: result.clone(),
+                    })
+                    .await;
+                results[index] = Some(result);
+                recorded[index] = true;
+                continue;
+            }
             // Pre-bump the `subagent_calls` counter before the future
             // is spawned so the in-flight tally stays conservative even
             // while several delegates run concurrently. Per-outcome
@@ -10238,6 +10875,63 @@ async fn execute_tool_calls(
                 );
             }
         }
+    }
+
+    // Concurrency fast path: when there is a `delegate*` batch *and* the
+    // parent's own approved calls are all parallel-safe reads, run the
+    // subagent dispatch and the parent reads at the same time instead of
+    // blocking the reads behind the subagent. Neither
+    // `dispatch_delegate_batch` nor `dispatch_parallel_reads` borrows the
+    // broker, so they `tokio::join!` safely; the resolved completions are
+    // then folded into the broker serially below, preserving the original
+    // "delegate results, then read results" recording order. The path
+    // requires every approved call to be parallel-safe so we never reorder a
+    // serial (non-parallel-safe) tool relative to the delegate. Per-turn
+    // budget enforcement is preserved by `fold_parallel_read_completions`,
+    // which gates the reads in input order (subagent tool spend accrues to
+    // separate `subagent_*` metrics, so folding the delegate first does not
+    // change the parent's own budget verdict).
+    if !delegate_batch_calls.is_empty()
+        && !context.cancel.is_cancelled()
+        && approved
+            .iter()
+            .all(|(_, call, _)| context.tools.is_parallel_safe(call))
+    {
+        let delegate_calls = std::mem::take(&mut delegate_batch_calls);
+        let read_order: Vec<(usize, ToolCall, u64)> = approved.clone();
+        let (delegate_completions, read_completions) = tokio::join!(
+            dispatch_delegate_batch(&context, delegate_calls),
+            dispatch_parallel_reads(&context, approved),
+        );
+        // Fold the delegate first, then the reads, matching the original
+        // "delegate results, then read results" broker-mutation order. The
+        // reads are folded with the same incremental per-turn budget
+        // enforcement as the non-concurrent path.
+        apply_delegate_completions(
+            &context,
+            broker,
+            &mut results,
+            &mut recorded,
+            delegate_completions,
+        )
+        .await;
+        fold_parallel_read_completions(
+            &context,
+            broker,
+            &mut results,
+            read_order,
+            read_completions,
+        )
+        .await;
+        let mut out = collect_recorded_results(
+            results,
+            recorded,
+            broker,
+            context.config,
+            &context.telemetry,
+        );
+        mark_intra_batch_duplicates(&calls, &mut out, context.tools);
+        return out;
     }
 
     if !delegate_batch_calls.is_empty() {
@@ -10435,6 +11129,26 @@ async fn flush_delegate_batch(
     if calls.is_empty() {
         return;
     }
+    let completions = dispatch_delegate_batch(context, calls).await;
+    apply_delegate_completions(context, broker, results, recorded, completions).await;
+}
+
+/// Fan out a `delegate*` batch and resolve every dispatch concurrently
+/// *without* touching the broker.
+///
+/// Split out of [`flush_delegate_batch`] so the pure-async fan-out can be
+/// `tokio::join!`ed with the parent's own parallel-safe read batch: neither
+/// future borrows `&mut CostBroker`, so they run truly concurrently and the
+/// parent's independent reads no longer block on the subagent. The returned
+/// completions are folded back into the broker afterward by
+/// [`apply_delegate_completions`] so all metric mutations stay serial.
+async fn dispatch_delegate_batch(
+    context: &ToolExecutionContext<'_>,
+    calls: Vec<(usize, ToolCall, SubagentKind)>,
+) -> Vec<(usize, SubagentKind, SubagentDispatchOutcome)> {
+    if calls.is_empty() {
+        return Vec::new();
+    }
 
     // Emit `ToolCallStarted` for each delegate call in input order so the
     // TUI / event subscribers still see the start lines before the model
@@ -10452,7 +11166,7 @@ async fn flush_delegate_batch(
     }
 
     let cap = context.config.subagents.max_concurrent.max(1);
-    let completions = futures_util::stream::iter(calls.into_iter().map(|(index, call, kind)| {
+    futures_util::stream::iter(calls.into_iter().map(|(index, call, kind)| {
         let context = context.clone();
         async move {
             let outcome = Box::pin(run_subagent_dispatch(&context, &call, kind)).await;
@@ -10461,8 +11175,20 @@ async fn flush_delegate_batch(
     }))
     .buffer_unordered(cap)
     .collect::<Vec<_>>()
-    .await;
+    .await
+}
 
+/// Fold resolved delegate completions back into the broker and emit their
+/// `ToolCallCompleted` events. Counterpart to [`dispatch_delegate_batch`];
+/// keeps every broker mutation serial so concurrent fan-out never races on
+/// the shared metrics.
+async fn apply_delegate_completions(
+    context: &ToolExecutionContext<'_>,
+    broker: &mut CostBroker,
+    results: &mut [Option<ToolResult>],
+    recorded: &mut [bool],
+    completions: Vec<(usize, SubagentKind, SubagentDispatchOutcome)>,
+) {
     for (index, kind, outcome) in completions {
         apply_subagent_dispatch(broker, kind, &outcome);
         record_and_emit_progress(broker, &outcome.result, &context.tx, context.turn_id).await;
@@ -10513,53 +11239,96 @@ async fn flush_parallel_batch(
         }
         return;
     }
-    if broker.enforces_result_budgets() {
-        for (index, call, tool_sequence) in calls {
-            if let Some(reason) = broker.deny_reason() {
-                let result = budget_denied_result(&call, reason);
-                emit_tool_telemetry(
-                    context.config,
-                    &context.telemetry,
-                    context.turn_id,
-                    tool_sequence,
-                    &call,
-                    &result,
-                    Duration::ZERO,
-                );
-                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
-                let _ = context
-                    .tx
-                    .send(AgentEvent::ToolCallCompleted {
-                        turn_id: context.turn_id,
-                        result: result.clone(),
-                    })
-                    .await;
-                results[index] = Some(result);
-                continue;
-            }
-            let result = run_one_tool(context.clone(), tool_sequence, call).await;
+    // Run the reads *concurrently* (independent reads must not serialize
+    // behind one another — that one-at-a-time `.await` per read dominated
+    // turn latency), then fold them back with incremental per-turn budget
+    // enforcement. See [`fold_parallel_read_completions`].
+    let order: Vec<(usize, ToolCall, u64)> = calls.clone();
+    let completions = dispatch_parallel_reads(context, calls).await;
+    fold_parallel_read_completions(context, broker, results, order, completions).await;
+}
+
+/// Fold concurrently dispatched parallel-read completions back into the
+/// broker in the *original call order*, enforcing the per-turn byte/file
+/// budget incrementally.
+///
+/// The reads are dispatched concurrently by [`dispatch_parallel_reads`] so
+/// independent reads never serialize behind one another. Folding in input
+/// order preserves the prior budget contract: once an earlier read pushes the
+/// turn past its byte/file limit, every later read is returned to the model as
+/// budget-denied rather than counted. The physical I/O for the dispatched
+/// reads is bounded by the per-turn tool-call reservation gate, so the
+/// guard-rail's purpose (bounding model-visible context + accounting) holds.
+async fn fold_parallel_read_completions(
+    context: &ToolExecutionContext<'_>,
+    broker: &mut CostBroker,
+    results: &mut [Option<ToolResult>],
+    order: Vec<(usize, ToolCall, u64)>,
+    completions: Vec<(usize, ToolResult)>,
+) {
+    let mut executed: std::collections::HashMap<usize, ToolResult> =
+        completions.into_iter().collect();
+    for (index, call, tool_sequence) in order {
+        if broker.enforces_result_budgets()
+            && let Some(reason) = broker.deny_reason()
+        {
+            // The turn crossed its byte/file budget on an earlier read in
+            // this batch. Override this read's *model-visible* result with a
+            // budget denial and drop its actual output so its bytes are not
+            // billed — the per-turn guard-rail is preserved. The read already
+            // emitted its own `ToolCallStarted`/`ToolCallCompleted` via
+            // `run_one_tool` during the concurrent dispatch, so we record the
+            // denial without emitting a second completion event for the same
+            // call.
+            executed.remove(&index);
+            let result = budget_denied_result(&call, reason);
+            emit_tool_telemetry(
+                context.config,
+                &context.telemetry,
+                context.turn_id,
+                tool_sequence,
+                &call,
+                &result,
+                Duration::ZERO,
+            );
             record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             results[index] = Some(result);
+            continue;
         }
-        return;
-    }
-
-    let completions =
-        futures_util::stream::iter(calls.into_iter().map(|(index, call, tool_sequence)| {
-            let context = context.clone();
-            async move {
-                let result = run_one_tool(context, tool_sequence, call).await;
-                (index, result)
-            }
-        }))
-        .buffer_unordered(context.config.max_parallel_tools.max(1))
-        .collect::<Vec<_>>()
-        .await;
-
-    for (index, result) in completions {
+        let result = executed
+            .remove(&index)
+            .unwrap_or_else(|| ToolResult::cancelled(&call));
         record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
         results[index] = Some(result);
     }
+}
+
+/// Fan out a batch of parallel-safe tool calls and resolve them concurrently
+/// *without* touching the broker.
+///
+/// Split out so the fan-out can be `tokio::join!`ed with a `delegate*`
+/// dispatch — the parent's independent reads then progress alongside the
+/// subagent instead of waiting for it. The completions (in arbitrary order)
+/// are folded into the broker by the caller via
+/// [`fold_parallel_read_completions`], which keeps every metric mutation
+/// serial and enforces the per-turn byte/file budget in input order.
+async fn dispatch_parallel_reads(
+    context: &ToolExecutionContext<'_>,
+    calls: Vec<(usize, ToolCall, u64)>,
+) -> Vec<(usize, ToolResult)> {
+    if calls.is_empty() {
+        return Vec::new();
+    }
+    futures_util::stream::iter(calls.into_iter().map(|(index, call, tool_sequence)| {
+        let context = context.clone();
+        async move {
+            let result = run_one_tool(context, tool_sequence, call).await;
+            (index, result)
+        }
+    }))
+    .buffer_unordered(context.config.max_parallel_tools.max(1))
+    .collect::<Vec<_>>()
+    .await
 }
 
 /// Fan out a `HookPayload::PreToolUse` to every registered handler.
@@ -12140,6 +12909,8 @@ Command: {command:?}\n\
 Working target: {:?}",
         request.target
     );
+    let output_schema = provider_honors_output_schema(provider.name(), &config.model)
+        .then(shell_classifier_output_schema);
     let llm_request = LlmRequest {
         model: Arc::from(config.model.as_str()),
         instructions: Arc::from(
@@ -12155,7 +12926,7 @@ Working target: {:?}",
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
-        output_schema: None,
+        output_schema,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
         ..LlmRequest::default()
@@ -12215,6 +12986,37 @@ pub(crate) fn parse_classifier_verdict(text: &str) -> PermissionVerdict {
             reason: format!("shell classifier requires approval: {reason_excerpt}"),
             silent: false,
         },
+    }
+}
+
+/// Strict JSON-schema contract mirroring what [`extract_json_action`]
+/// deserializes for the shell classifier: an `action` constrained to the
+/// two values the classifier prompt permits (`ask`/`deny` — `allow` is
+/// disallowed by design) plus a free-text `reason`. Attached only on
+/// providers that forward `output_schema`
+/// ([`provider_honors_output_schema`]) so the cheap classifier model emits
+/// schema-valid JSON instead of fenced/prose-wrapped output that costs a
+/// retry round; providers that drop the schema keep the loose-parse path
+/// (`extract_loose_action`) and behave exactly as before.
+fn shell_classifier_output_schema() -> LlmOutputSchema {
+    LlmOutputSchema {
+        name: "shell_command_verdict".to_string(),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        PermissionAction::Ask.as_str(),
+                        PermissionAction::Deny.as_str(),
+                    ],
+                },
+                "reason": { "type": "string" },
+            },
+            "required": ["action", "reason"],
+            "additionalProperties": false,
+        }),
+        strict: true,
     }
 }
 
@@ -12522,11 +13324,13 @@ fn delegate_advertised_tool() -> AdvertisedTool {
         capability: PermissionCapability::Read,
         spec: Arc::new(LlmToolSpec {
             name: DELEGATE_TOOL_NAME.to_string(),
-            description: "Delegate broad research to an isolated subagent. \
-                          Use only when the user explicitly asks for non-trivial research, code mapping, or refactoring help — \
+            description: "Delegate open-ended research to an isolated subagent. \
+                          Reserve it for genuinely multi-pass, context-isolating, or cross-cutting work — \
+                          a task spanning several rounds of discovery, or one whose intermediate reading would bloat your context, or one that fans out across unrelated areas. \
                           NOT for greetings, casual replies, or simple questions the parent can answer directly. \
-                          The `prompt` field is required; calling without a concrete instruction will be rejected. \
-                          The parent receives only a structured summary, supporting receipts, and separate spend metrics."
+                          A single-pass enumeration or audit — grep/scan a known set of files or symbols once and report — is NOT multi-pass: do it yourself in-context with grep/read, or via the bounded `explore` tool, rather than firing a whole-task delegate. A cold subagent re-explores from scratch and runs the same model, so on bounded single-pass work it is pure overhead and slower. \
+                          Do NOT delegate enumeration or extraction over a list of files or symbols you ALREADY have (e.g. from a graph/hierarchy result) — read or slice those yourself; the subagent re-reads the same files, so delegating known-target extraction is pure overhead. Delegate only when the set of files to inspect is itself unknown, large, and must be discovered across multiple passes. \
+                          `prompt` is required; the parent receives only a structured summary, supporting receipts, and separate spend metrics."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -12534,7 +13338,7 @@ fn delegate_advertised_tool() -> AdvertisedTool {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Required: a concrete natural-language research instruction for the subagent. Must be present and non-empty."
+                        "description": "Required, non-empty: a concrete research instruction for the subagent."
                     },
                     "scope": {
                         "type": ["string", "null"],
@@ -12703,9 +13507,9 @@ fn explore_advertised_tool() -> AdvertisedTool {
         spec: Arc::new(LlmToolSpec {
             name: EXPLORE_TOOL_NAME.to_string(),
             description: "Ask a cheaper read-only exploration subagent to scan the codebase with Squeezy semantic tools. \
-                          Use only when the user asks a non-trivial codebase question — \
+                          Use only for a non-trivial codebase question — \
                           NOT for greetings, chitchat, or questions the parent can answer directly from context. \
-                          The `prompt` field is required and must contain a concrete codebase question."
+                          `prompt` is required and must contain a concrete codebase question."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -12713,7 +13517,7 @@ fn explore_advertised_tool() -> AdvertisedTool {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Required: a concrete codebase question or task context to investigate. Must be present and non-empty."
+                        "description": "Required, non-empty: a concrete codebase question or task context to investigate."
                     },
                     "scope": {
                         "type": ["string", "null"],

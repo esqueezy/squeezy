@@ -61,6 +61,12 @@ pub struct GraphSymbol {
     pub language_identity: Option<String>,
     pub span: SourceSpan,
     pub body_span: Option<SourceSpan>,
+    /// Mirror of [`ParsedSymbol::signature_span`]: the declaration-header byte
+    /// range (symbol start up to body start). `read_slice` with
+    /// `span_kind=signature` reads this when present so a signature read
+    /// excludes the body, falling back to the full `span` when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_span: Option<SourceSpan>,
     pub signature: String,
     pub visibility: Option<String>,
     pub docs: Vec<String>,
@@ -97,6 +103,7 @@ impl From<ParsedSymbol> for GraphSymbol {
             language_identity: symbol.language_identity,
             span: symbol.span,
             body_span: symbol.body_span,
+            signature_span: symbol.signature_span,
             signature: symbol.signature,
             visibility: symbol.visibility,
             docs: symbol.docs,
@@ -425,6 +432,15 @@ pub struct SemanticGraph {
     /// resolver phase consumes it so the per-language flip does not need
     /// a one-time backfill.
     resolver_slots: cross_file::ResolverSlots,
+    /// Class-like symbols grouped by `language_identity`, the key languages
+    /// use to stitch a single logical type split across declarations (Rust
+    /// `impl` blocks, C# `partial` classes, Dart `part` files). Only symbols
+    /// whose `language_identity` is set and whose kind is class-like are
+    /// indexed. [`Self::method_on_class_or_partials`] reads this to enumerate
+    /// a class's partials in O(partials) instead of scanning every symbol in
+    /// the workspace per resolved call — the dominant cost of the cold build
+    /// on large repos, where it turned call resolution quadratic in symbols.
+    symbols_by_language_identity: HashMap<String, Vec<SymbolId>>,
 }
 
 #[derive(Debug, Clone)]
@@ -499,6 +515,7 @@ impl SemanticGraph {
             arity_index: HashMap::new(),
             importers_by_file: HashMap::new(),
             resolver_slots: cross_file::ResolverSlots::new(),
+            symbols_by_language_identity: HashMap::new(),
         }
     }
 
@@ -1474,6 +1491,7 @@ impl SemanticGraph {
         self.children_by_parent.clear();
         self.edges_by_from.clear();
         self.edges_by_to.clear();
+        self.symbols_by_language_identity.clear();
         self.rebuild_import_indexes();
 
         self.symbols_by_name.reserve(self.symbols.len());
@@ -1489,6 +1507,14 @@ impl SemanticGraph {
                 .entry(symbol.name.clone())
                 .or_default()
                 .push(symbol.id.clone());
+            if let Some(identity) = &symbol.language_identity
+                && is_class_like_kind(symbol.kind)
+            {
+                self.symbols_by_language_identity
+                    .entry(identity.clone())
+                    .or_default()
+                    .push(symbol.id.clone());
+            }
             let lower = symbol.signature.to_lowercase();
             for trigram in unique_trigrams(&lower) {
                 self.signature_trigram_index
@@ -1582,6 +1608,7 @@ impl SemanticGraph {
         self.symbols_by_name.clear();
         self.children_by_parent.clear();
         self.arity_index.clear();
+        self.symbols_by_language_identity.clear();
         self.rebuild_import_indexes();
 
         self.symbols_by_name.reserve(self.symbols.len());
@@ -1598,6 +1625,14 @@ impl SemanticGraph {
                     (symbol.file_id.clone(), symbol.name.clone(), arity),
                     symbol.id.clone(),
                 );
+            }
+            if let Some(identity) = &symbol.language_identity
+                && is_class_like_kind(symbol.kind)
+            {
+                self.symbols_by_language_identity
+                    .entry(identity.clone())
+                    .or_default()
+                    .push(symbol.id.clone());
             }
         }
 
@@ -2937,6 +2972,7 @@ fn file_symbol(file: &FileRecord) -> GraphSymbol {
             squeezy_core::SourcePoint::new(0, 0),
         ),
         body_span: None,
+        signature_span: None,
         signature: file.relative_path.clone(),
         visibility: None,
         docs: Vec::new(),

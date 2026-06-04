@@ -193,6 +193,11 @@ pub struct SqueezyOverlay {
     pub tool_choice: Option<String>,
     pub mode: Option<String>,
     pub permission_mode: Option<String>,
+    /// Override `AppConfig.batch_tool_calls_hint` — when true, the system
+    /// prompt nudges the model to issue independent read-only lookups in a
+    /// single parallel batch rather than one per turn. Used to A/B whether
+    /// batching reduces a tier's round-trip-driven cost.
+    pub batch_tool_calls_hint: Option<bool>,
     pub instructions: Option<String>,
     /// Override `AppConfig.cache.root`. Relative paths stay workspace-relative,
     /// which lets fixtures carry a cache directory without using ignored

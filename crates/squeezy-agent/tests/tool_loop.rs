@@ -8,7 +8,7 @@ use std::{
 };
 
 use futures_core::Stream;
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use serde_json::Value;
 use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision};
 use squeezy_core::{
@@ -17,7 +17,9 @@ use squeezy_core::{
     TurnId,
 };
 use squeezy_hooks::{HookContext, HookEvent, HookHandler, HookRegistry, HookResult};
-use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
+use squeezy_llm::{
+    CacheRetention, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+};
 use squeezy_store::{GraphStore, SqueezyStore};
 use squeezy_tools::sha256_hex;
 use tokio_util::sync::CancellationToken;
@@ -629,6 +631,387 @@ fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs() {
     });
 }
 
+/// P1.3: a `delegate` subagent that crosses the configured
+/// `max_round_input_tokens` ceiling on a later round must STOP and return
+/// the best-effort answer it already gathered (fail-soft, Success — not a
+/// timeout or error), rather than running its loop out to millions of input
+/// tokens. The ceiling is set high enough that the parent's tiny
+/// conversation never trips it, but the subagent's round-1 conversation —
+/// which carries a large file read — does.
+#[test]
+fn delegate_subagent_stops_on_round_input_ceiling_with_best_effort() {
+    run_high_stack_test(async {
+        let root = temp_workspace("delegate_input_ceiling");
+        // A file with many matching lines so the subagent's round-0 `grep`
+        // returns a sizeable result. After the (preview-bounded) result lands
+        // in the subagent conversation, its round-1 request clears the 1k
+        // ceiling, while the parent's tiny conversation (user msg + the capped
+        // delegate summary) stays under it — isolating the gate to the
+        // subagent.
+        let needles = "fn needle_marker() {} // matchable line\n".repeat(400);
+        fs::write(root.join("src.rs"), needles).expect("write source");
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            // Parent round 0: spawn the delegate.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "del_runaway".to_string(),
+                    name: "delegate".to_string(),
+                    arguments: serde_json::json!({"prompt": "scan the tree"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            // Subagent round 0: emit the best-effort marker text + a grep that
+            // returns many matches, so the round-1 conversation crosses the
+            // ceiling.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("partial subagent findings".to_string())),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "sub_grep".to_string(),
+                    name: "grep".to_string(),
+                    arguments: serde_json::json!({"pattern": "needle_marker"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("sub_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            // The subagent's round 1 must be gated before it ever reaches the
+            // provider. The next response served therefore goes to the PARENT
+            // (its post-delegate round), which finishes the turn. If the gate
+            // failed to fire, the subagent would consume this response and the
+            // parent would instead see an empty stream, failing the asserts.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("parent done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+
+        let mut config = config_for(root.clone());
+        config.max_round_input_tokens = Some(1000);
+        let agent = Agent::new(config, provider.clone());
+
+        drain_turn(agent.start_turn("audit the tree".to_string(), CancellationToken::new())).await;
+
+        let requests = provider.requests();
+        // Exactly three provider hits: parent round 0, subagent round 0,
+        // parent post-delegate round. A fourth would mean the subagent ran a
+        // second (un-gated) round.
+        assert_eq!(
+            requests.len(),
+            3,
+            "subagent must be gated before its second round (got {} requests)",
+            requests.len()
+        );
+
+        // The parent's final request carries the delegate result. It must be
+        // a normal Success completion (status "completed", not "timed_out")
+        // whose best-effort summary preserves the pre-gate findings.
+        let parent_outputs = function_outputs(&requests[2]);
+        let delegate_output = parent_outputs
+            .iter()
+            .find(|(call_id, _)| *call_id == "del_runaway")
+            .map(|(_, value)| value)
+            .expect("parent final request must carry the delegate output");
+        let content = &delegate_output["content"];
+        assert_eq!(content["ok"], true, "subagent must fail soft: {content}");
+        assert_eq!(
+            content["status"], "completed",
+            "gated subagent must report a normal completion, not a timeout: {content}"
+        );
+        assert!(
+            content["summary"]
+                .as_str()
+                .expect("summary string")
+                .contains("partial subagent findings"),
+            "best-effort summary must carry the pre-gate findings: {content}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    });
+}
+
+/// The anti-redundant-delegation gate refuses a whole-task `delegate` once the
+/// parent has already explored heavily in-context (>= 8 tool calls), and does
+/// NOT spawn a cold subagent that would re-read the same files. Recall-safe:
+/// the refusal is `Denied`, the parent keeps its context, and the turn finishes
+/// normally.
+#[test]
+fn redundant_delegate_refused_after_heavy_parent_exploration() {
+    run_high_stack_test(async {
+        let root = temp_workspace("redundant_delegate_gate");
+        fs::write(root.join("src.rs"), "fn marker() {}\n".repeat(40)).expect("write source");
+
+        // Parent round 0: eight greps -> crosses the `tool_calls >= 8` trigger.
+        let mut round0 = vec![Ok(LlmEvent::Started)];
+        for index in 0..8 {
+            round0.push(Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: format!("grep_{index}"),
+                name: "grep".to_string(),
+                arguments: serde_json::json!({"pattern": "marker"}),
+            })));
+        }
+        round0.push(Ok(LlmEvent::Completed {
+            response_id: Some("parent_explore".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }));
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            round0,
+            // Round 1: parent now fires a whole-task delegate -> must be refused.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "del_redundant".to_string(),
+                    name: "delegate".to_string(),
+                    arguments: serde_json::json!({"prompt": "now go do the whole audit"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_delegate".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            // Round 2: parent sees the Denied delegate result and finishes.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("answered in-context".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
+        drain_turn(agent.start_turn("audit the tree".to_string(), CancellationToken::new())).await;
+
+        // No subagent ran — the cold re-exploration was avoided entirely.
+        let snapshot = agent.session_accounting_snapshot().await;
+        assert_eq!(
+            snapshot.metrics.subagent_calls, 0,
+            "redundant delegate must be refused without spawning a subagent"
+        );
+
+        // The refusal reaches the parent as a Denied result with guidance.
+        let requests = provider.requests();
+        let parent_outputs = function_outputs(requests.last().expect("a final parent request"));
+        let delegate_output = parent_outputs
+            .iter()
+            .find(|(call_id, _)| *call_id == "del_redundant")
+            .map(|(_, value)| value)
+            .expect("delegate output must reach the parent");
+        let content = &delegate_output["content"];
+        assert_eq!(content["ok"], false, "refused delegate: {content}");
+        assert!(
+            content["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("redundant"),
+            "refusal must explain itself: {content}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    });
+}
+
+/// Mid-turn compaction is dormant unless `model_context_window` is set; it was
+/// only ever set from explicit config, so it never fired. The agent now derives
+/// it from the model registry at construction, which is what arms compaction on
+/// long single-turn tool storms. (Explicit config still wins.)
+#[test]
+fn context_window_auto_derived_from_model_registry() {
+    run_high_stack_test(async {
+        let root = temp_workspace("ctx_window_derive");
+        let provider = Arc::new(ScriptedProvider::named("openai", vec![]));
+        let mut config = config_for(root.clone());
+        config.model = "gpt-5.4-mini".to_string();
+        assert!(
+            config.context_compaction.model_context_window.is_none(),
+            "precondition: operator did not pin a window"
+        );
+        let agent = Agent::new(config, provider);
+        assert_eq!(
+            agent.config().context_compaction.model_context_window,
+            Some(400_000),
+            "window must be auto-derived from the model registry to arm compaction"
+        );
+        let _ = fs::remove_dir_all(root);
+    });
+}
+
+/// Drive a one-tool explore subagent end-to-end and return the captured
+/// provider requests. `provider_name` selects which registry capability row
+/// the agent looks up; `subagent_model` is the resolved explore model. The
+/// scripted queue mirrors `explore_subagent_uses_cheap_model_*`: parent tool
+/// call → subagent tool round → subagent final brief → parent final.
+fn run_explore_subagent_capturing_requests(
+    workspace: &str,
+    provider_name: &'static str,
+    subagent_model: &str,
+) -> Vec<LlmRequest> {
+    let root = temp_workspace(workspace);
+    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::named(
+        provider_name,
+        vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "explore_call".to_string(),
+                    name: "explore".to_string(),
+                    arguments: serde_json::json!({
+                        "prompt": "Find the needle entrypoint",
+                        "scope": "src.rs",
+                        "thoroughness": "quick"
+                    }),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "sub_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "src.rs"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("sub_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta(
+                    "Brief: src.rs defines fn needle().".to_string(),
+                )),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("sub_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("ready".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ],
+    ));
+    let mut config = config_for(root.clone());
+    config.model = "expensive-main".to_string();
+    config.subagents.explore_model = Some(subagent_model.to_string());
+    let agent = Agent::new(config, provider.clone());
+
+    run_high_stack_test(async move {
+        drain_turn(agent.start_turn("research first".to_string(), CancellationToken::new())).await;
+    });
+
+    let requests = provider.requests();
+    let _ = fs::remove_dir_all(root);
+    requests
+}
+
+#[test]
+fn explore_subagent_request_carries_short_cache_on_caching_capable_provider() {
+    // The subagent round loop re-sends a large stable prefix (instructions +
+    // tools + growing history), so on a provider/model the registry marks
+    // `prompt_caching=true` the request must opt into `Short` retention with a
+    // stable per-invocation affinity key. requests[1]/requests[2] are the two
+    // subagent rounds; both share the same key so the provider keeps the
+    // prefix warm across the loop.
+    let requests = run_explore_subagent_capturing_requests(
+        "explore_subagent_cache_capable",
+        "anthropic",
+        "claude-haiku-4-5-20251001",
+    );
+    assert_eq!(requests.len(), 4);
+    assert_eq!(&*requests[1].model, "claude-haiku-4-5-20251001");
+
+    let round_one = &requests[1].cache;
+    let round_two = &requests[2].cache;
+    assert_eq!(
+        round_one.retention,
+        CacheRetention::Short,
+        "subagent round must opt into Short retention on a caching-capable model"
+    );
+    let key = round_one
+        .key
+        .as_deref()
+        .expect("subagent cache key must be set when a session log is attached");
+    assert!(
+        key.starts_with("squeezy::sub::"),
+        "subagent cache key must use the dedicated sub:: namespace, got {key}"
+    );
+    assert_eq!(
+        round_one.key, round_two.key,
+        "every round of one subagent invocation must share the cache key so the prefix stays warm"
+    );
+    assert_eq!(round_two.retention, CacheRetention::Short);
+}
+
+#[test]
+fn explore_subagent_request_disables_cache_on_non_capable_provider() {
+    // Ollama / local models carry `prompt_caching=false`. The same call site
+    // must leave the cache disabled (retention None, no key) so non-supporting
+    // providers see byte-identical requests to before this change.
+    let requests = run_explore_subagent_capturing_requests(
+        "explore_subagent_cache_noncapable",
+        "ollama",
+        "qwen3-coder",
+    );
+    assert_eq!(requests.len(), 4);
+    assert_eq!(&*requests[1].model, "qwen3-coder");
+    assert_eq!(
+        requests[1].cache.retention,
+        CacheRetention::None,
+        "non-capable provider must not opt into prompt caching"
+    );
+    assert!(
+        requests[1].cache.key.is_none(),
+        "non-capable provider must not carry a cache affinity key"
+    );
+    // The effective retention (which would lift a legacy cache_key to Short)
+    // must also be None — nothing should synthesize a directive downstream.
+    assert_eq!(
+        requests[1].effective_cache_retention(),
+        CacheRetention::None
+    );
+}
+
 #[tokio::test]
 async fn disabled_explore_subagent_returns_structured_failure_without_child_requests() {
     let root = temp_workspace("explore_subagent_disabled");
@@ -752,15 +1135,21 @@ async fn delegate_subagent_uses_parent_model_for_natural_research() {
 }
 
 #[test]
-fn delegate_batch_with_child_tool_fanout_runs_on_default_worker_stack() {
+fn delegate_batch_with_child_tool_fanout_runs_on_production_worker_stack() {
+    // Mirror the production runtime: `squeezy-cli` builds its multi-threaded
+    // Tokio runtime with a 16 MiB worker stack (see
+    // `WORKER_THREAD_STACK_SIZE` in `crates/squeezy-cli/src/main.rs`). The
+    // delegate fan-out (parent tool loop → subagent dispatch → subagent
+    // round loop → child tool fan-out) must complete without overflowing
+    // that stack on any platform.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .thread_stack_size(2 * 1024 * 1024)
+        .thread_stack_size(16 * 1024 * 1024)
         .enable_all()
         .build()
-        .expect("build default-stack test runtime");
+        .expect("build production-stack test runtime");
     runtime.block_on(async {
-        let root = temp_workspace("delegate_batch_default_stack");
+        let root = temp_workspace("delegate_batch_production_stack");
         const TOOL_CALLS: usize = 8;
         const SUBAGENTS: usize = 3;
         for index in 0..TOOL_CALLS {
@@ -774,7 +1163,7 @@ fn delegate_batch_with_child_tool_fanout_runs_on_default_worker_stack() {
         let drain = drain_turn(agent.start_turn("fan out".to_string(), CancellationToken::new()));
         tokio::time::timeout(Duration::from_secs(30), drain)
             .await
-            .expect("delegate fanout should finish on a normal worker stack");
+            .expect("delegate fanout should finish on the production worker stack");
 
         let snapshot = agent.session_accounting_snapshot().await;
         assert_eq!(snapshot.metrics.subagent_calls, SUBAGENTS as u64);
@@ -3907,4 +4296,159 @@ fn write_rust_crate(root: &std::path::Path, source: &str) {
     )
     .expect("write manifest");
     fs::write(root.join("src/lib.rs"), source).expect("write source");
+}
+
+/// Provider that, in a single parent turn, dispatches one slow `delegate`
+/// subagent alongside several parallel-safe parent `read_file` calls. The
+/// subagent's model round sleeps before answering so its completion is
+/// strictly later than the (near-instant) file reads — used to prove the
+/// parent's reads run concurrently with the subagent instead of blocking
+/// behind it.
+struct DelegateAlongsideReadsProvider {
+    subagent_delay: Duration,
+}
+
+impl LlmProvider for DelegateAlongsideReadsProvider {
+    fn name(&self) -> &'static str {
+        "delegate_alongside_reads"
+    }
+
+    fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        let has_delegate_tool = request.tools.iter().any(|tool| tool.name == "delegate");
+        let has_outputs = request
+            .input
+            .iter()
+            .any(|item| matches!(item, LlmInputItem::FunctionCallOutput { .. }));
+
+        if has_delegate_tool && !has_outputs {
+            // Parent turn 1: one delegate + three parallel-safe reads, all in
+            // the same assistant message.
+            let mut events = vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "delegate_slow".to_string(),
+                    name: "delegate".to_string(),
+                    arguments: serde_json::json!({
+                        "prompt": "Summarize the crate",
+                        "scope": "src/",
+                    }),
+                })),
+            ];
+            for index in 0..3 {
+                events.push(Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: format!("parent_read_{index}"),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": format!("file{index}.rs")}),
+                })));
+            }
+            events.push(Ok(LlmEvent::Completed {
+                response_id: Some("parent_tools".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }));
+            return Box::pin(stream::iter(events));
+        }
+
+        if has_delegate_tool && has_outputs {
+            // Parent final turn.
+            return Box::pin(stream::iter(vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ]));
+        }
+
+        // Subagent round: sleep, then answer with no tool calls. The delay
+        // ensures the subagent's `ToolCallCompleted` lands strictly after the
+        // parent reads when the two run concurrently.
+        let delay = self.subagent_delay;
+        let delayed = stream::once(async move {
+            tokio::time::sleep(delay).await;
+            Ok(LlmEvent::Started)
+        })
+        .chain(stream::iter(vec![
+            Ok(LlmEvent::TextDelta("subagent summary".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("delegate_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ]));
+        Box::pin(delayed)
+    }
+}
+
+#[tokio::test]
+async fn parent_reads_run_concurrently_with_delegate_subagent() {
+    // Regression for the dart-haiku timeout: the parent used to `await` the
+    // delegate subagent to completion *before* running its own approved
+    // parallel-safe reads, so independent reads blocked behind the subagent.
+    // With the flush-ordering fix the parent's reads run concurrently with the
+    // delegate, so they complete while the (artificially slow) subagent is
+    // still running — i.e. every read's `ToolCallCompleted` lands before the
+    // delegate's.
+    let root = temp_workspace("parent_reads_concurrent_with_delegate");
+    for index in 0..3 {
+        fs::write(root.join(format!("file{index}.rs")), b"// content\n").expect("write source");
+    }
+    let provider = Arc::new(DelegateAlongsideReadsProvider {
+        subagent_delay: Duration::from_millis(400),
+    });
+    let mut config = config_for(root.clone());
+    config.subagents.max_concurrent = 2;
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("inspect crate".to_string(), CancellationToken::new());
+    let mut delegate_completed_at: Option<Instant> = None;
+    let mut read_completed_at: Vec<Instant> = Vec::new();
+    let mut read_statuses: Vec<String> = Vec::new();
+    let mut delegate_status: Option<String> = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ToolCallCompleted { result, .. } = event {
+            let now = Instant::now();
+            if result.call_id == "delegate_slow" {
+                delegate_completed_at = Some(now);
+                delegate_status = Some(format!("{:?}", result.status));
+            } else if result.call_id.starts_with("parent_read_") {
+                read_completed_at.push(now);
+                read_statuses.push(format!("{:?}", result.status));
+            }
+        }
+    }
+
+    assert_eq!(
+        read_completed_at.len(),
+        3,
+        "all three parent reads must complete; statuses={read_statuses:?}",
+    );
+    assert!(
+        read_statuses.iter().all(|status| status == "Success"),
+        "parent reads must succeed; statuses={read_statuses:?}",
+    );
+    let delegate_at = delegate_completed_at.expect("delegate must complete");
+    assert_eq!(
+        delegate_status.as_deref(),
+        Some("Success"),
+        "delegate must succeed",
+    );
+    // The subagent sleeps 400ms before answering, so if the reads waited
+    // behind it their completions would land at-or-after the delegate's.
+    // Concurrency means every read finishes strictly before the delegate.
+    for (index, read_at) in read_completed_at.iter().enumerate() {
+        assert!(
+            *read_at < delegate_at,
+            "parent read {index} completed at {read_at:?} but the delegate \
+             completed at {delegate_at:?}; reads must not block behind the \
+             subagent",
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
 }

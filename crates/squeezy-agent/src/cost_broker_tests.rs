@@ -160,6 +160,282 @@ fn cap_unenforceable_notice_names_provider_model_and_setting() {
 }
 
 #[test]
+fn pressure_percent_is_none_without_cap_and_tracks_spend_with_cap() {
+    // No cap configured: there is nothing to be a percent of.
+    let mut no_cap = CostBroker::new(&AppConfig::default());
+    no_cap.session_cost_usd_micros = 50_000;
+    assert_eq!(
+        no_cap.pressure_percent(),
+        None,
+        "pressure has no meaning without a configured cap"
+    );
+
+    // Cap configured: pressure is spent/cap as a clamped percent.
+    let mut broker = CostBroker::new(&config_with_cap(10_000));
+    assert_eq!(
+        broker.pressure_percent(),
+        Some(0),
+        "a fresh broker under a cap is at 0% pressure"
+    );
+    broker.session_cost_usd_micros = 5_000;
+    assert_eq!(broker.pressure_percent(), Some(50));
+    broker.session_cost_usd_micros = 7_999;
+    assert_eq!(broker.pressure_percent(), Some(79));
+    broker.session_cost_usd_micros = 8_000;
+    assert_eq!(broker.pressure_percent(), Some(80));
+    // Overshoot past the cap stays a valid percent (clamped, no overflow).
+    broker.session_cost_usd_micros = 30_000;
+    assert_eq!(broker.pressure_percent(), Some(255));
+}
+
+#[test]
+fn pressure_gate_engages_at_threshold_when_cap_set() {
+    let mut broker = CostBroker::new(&config_with_cap(10_000));
+    // Just under 80%: no gate.
+    broker.session_cost_usd_micros = 7_999;
+    assert!(
+        broker.pressure_gate().is_none(),
+        "below the pressure threshold the gate must stay open"
+    );
+    // At exactly 80%: gate engages and reports the pressure status.
+    broker.session_cost_usd_micros = 8_000;
+    let status = broker
+        .pressure_gate()
+        .expect("gate must engage at the pressure threshold");
+    assert_eq!(status.spent_usd_micros, 8_000);
+    assert_eq!(status.cap_usd_micros, 10_000);
+    assert_eq!(status.percent, 80);
+}
+
+#[test]
+fn pressure_gate_engages_above_threshold_and_is_one_shot() {
+    let mut broker = CostBroker::new(&config_with_cap(10_000));
+    // Well above the threshold (but the hard cap is a separate check): gate fires.
+    broker.session_cost_usd_micros = 9_500;
+    assert!(
+        broker.pressure_gate().is_some(),
+        "the gate engages once spend is at or past the pressure threshold"
+    );
+    // One-shot latch: it does not re-fire on subsequent rounds even as spend climbs.
+    broker.session_cost_usd_micros = 9_900;
+    assert!(
+        broker.pressure_gate().is_none(),
+        "the pressure gate is one-shot per broker"
+    );
+}
+
+#[test]
+fn round_input_gate_off_when_limit_unset() {
+    // Default-off: with `max_round_input_tokens == None` the gate returns
+    // `None` no matter how large the estimate, so the round dispatches
+    // unchanged.
+    let status = round_input_gate_status(
+        None,
+        10_000_000,
+        "anthropic",
+        squeezy_core::DEFAULT_ANTHROPIC_MODEL,
+        4_096,
+    );
+    assert!(status.is_none(), "an unset limit must never gate a round");
+}
+
+#[test]
+fn round_input_gate_passes_when_under_or_at_limit() {
+    // At or under the ceiling the gate stays quiet (the estimate is the
+    // *projected* size, and the limit is inclusive).
+    assert!(
+        round_input_gate_status(
+            Some(1_000),
+            999,
+            "anthropic",
+            squeezy_core::DEFAULT_ANTHROPIC_MODEL,
+            4_096,
+        )
+        .is_none(),
+        "an under-limit estimate must not gate"
+    );
+    assert!(
+        round_input_gate_status(
+            Some(1_000),
+            1_000,
+            "anthropic",
+            squeezy_core::DEFAULT_ANTHROPIC_MODEL,
+            4_096,
+        )
+        .is_none(),
+        "an estimate exactly at the limit must not gate"
+    );
+}
+
+#[test]
+fn round_input_gate_fires_with_priced_round_when_over_limit() {
+    // Over the ceiling the gate fires and, because the model has registry
+    // pricing, carries a non-zero dollar projection computed with the same
+    // `estimate_cost` the session-cost cap uses.
+    let status = round_input_gate_status(
+        Some(1_000),
+        50_000,
+        "anthropic",
+        squeezy_core::DEFAULT_ANTHROPIC_MODEL,
+        4_096,
+    )
+    .expect("an over-limit estimate must gate");
+    assert_eq!(status.estimated_input_tokens, 50_000);
+    assert_eq!(status.limit_tokens, 1_000);
+    let priced = status
+        .estimated_usd_micros
+        .expect("a priced model must yield a dollar projection");
+    assert!(priced > 0, "the projected round must cost something");
+    // The dollar figure must match a direct `estimate_cost` on the same
+    // projection so the gate doesn't carry an independent cost model.
+    let direct = estimate_cost(
+        "anthropic",
+        squeezy_core::DEFAULT_ANTHROPIC_MODEL,
+        &CostSnapshot {
+            input_tokens: Some(50_000),
+            output_tokens: Some(4_096),
+            ..Default::default()
+        },
+    )
+    .expect("priced model");
+    assert_eq!(
+        priced, direct,
+        "gate dollar figure must equal estimate_cost"
+    );
+}
+
+#[test]
+fn pressure_gate_never_engages_without_cap() {
+    let mut broker = CostBroker::new(&AppConfig::default());
+    // Arbitrary large spend: with no cap there is no pressure to govern.
+    broker.session_cost_usd_micros = 1_000_000_000;
+    assert!(
+        broker.pressure_gate().is_none(),
+        "with no configured cap the pressure gate must never engage"
+    );
+    assert!(
+        broker.pressure_gate().is_none(),
+        "repeat call with no cap also stays open"
+    );
+}
+
+#[test]
+fn round_input_gate_fires_unpriced_when_model_unknown() {
+    // Over the ceiling on a model with no registry pricing: the token gate
+    // still fires (so an oversized round is still caught) but the dollar
+    // field is `None` rather than a fabricated number.
+    let status = round_input_gate_status(
+        Some(1_000),
+        50_000,
+        "no-such-provider",
+        "no-such-model",
+        4_096,
+    )
+    .expect("the token gate fires regardless of pricing");
+    assert_eq!(status.estimated_input_tokens, 50_000);
+    assert!(
+        status.estimated_usd_micros.is_none(),
+        "an unpriced model must not invent a dollar figure"
+    );
+}
+
+#[test]
+fn pressure_gate_does_not_engage_below_threshold() {
+    let mut broker = CostBroker::new(&config_with_cap(10_000));
+    broker.session_cost_usd_micros = 5_000;
+    assert!(
+        broker.pressure_gate().is_none(),
+        "at 50% pressure the gate stays open and behaviour is unchanged"
+    );
+    assert_eq!(
+        broker.pressure_percent(),
+        Some(50),
+        "reading pressure must not arm the gate latch"
+    );
+    // Crossing the threshold afterwards still fires (latch was not consumed below threshold).
+    broker.session_cost_usd_micros = 8_500;
+    assert!(
+        broker.pressure_gate().is_some(),
+        "a sub-threshold gate check must not consume the one-shot latch"
+    );
+}
+
+#[test]
+fn pressure_gate_reason_states_spend_cap_percent_and_next_step() {
+    let status = CostCapStatus {
+        spent_usd_micros: 8_000,
+        cap_usd_micros: 10_000,
+        percent: 80,
+    };
+    let msg = format_pressure_gate_reason(status);
+    assert!(
+        msg.contains("approaching cap"),
+        "reason must frame this as a proactive pressure stop; got: {msg}"
+    );
+    assert!(
+        msg.contains("$0.008000"),
+        "reason must cite the spent amount; got: {msg}"
+    );
+    assert!(
+        msg.contains("$0.010000"),
+        "reason must cite the cap amount; got: {msg}"
+    );
+    assert!(
+        msg.contains("(80%)"),
+        "reason must cite the percent; got: {msg}"
+    );
+    assert!(
+        msg.contains("/config"),
+        "reason must reference /config; got: {msg}"
+    );
+    assert!(
+        msg.contains("max_session_cost_usd_micros"),
+        "reason must name the setting; got: {msg}"
+    );
+}
+
+#[test]
+fn round_input_gate_reason_states_overage_cost_and_setting() {
+    let status = RoundInputGateStatus {
+        estimated_input_tokens: 50_000,
+        limit_tokens: 1_000,
+        estimated_usd_micros: Some(123_456),
+    };
+    let msg = format_round_input_gate_reason(status);
+    assert!(
+        msg.contains("50000") && msg.contains("1000"),
+        "message must cite estimate and ceiling; got: {msg}"
+    );
+    assert!(
+        msg.contains("$0.1235"),
+        "message must quote the projected round cost; got: {msg}"
+    );
+    assert!(
+        msg.contains("max_round_input_tokens"),
+        "message must name the setting; got: {msg}"
+    );
+    assert!(
+        msg.contains("SQUEEZY_MAX_ROUND_INPUT_TOKENS"),
+        "message must cite the env override; got: {msg}"
+    );
+
+    // Unpriced rounds omit the dollar clause but keep the gate guidance.
+    let unpriced = format_round_input_gate_reason(RoundInputGateStatus {
+        estimated_input_tokens: 50_000,
+        limit_tokens: 1_000,
+        estimated_usd_micros: None,
+    });
+    assert!(
+        !unpriced.contains('$'),
+        "an unpriced gate must not quote a dollar figure; got: {unpriced}"
+    );
+    assert!(
+        unpriced.contains("max_round_input_tokens"),
+        "an unpriced gate still names the setting; got: {unpriced}"
+    );
+}
+
+#[test]
 fn budget_denied_result_counts_once_across_accounting_paths() {
     let mut broker = CostBroker::new(&AppConfig::default());
     let result = ToolResult {

@@ -457,6 +457,21 @@ pub struct AppConfig {
     /// smaller MoEs). Configured via `[model].tool_choice` in TOML or
     /// `SQUEEZY_TOOL_CHOICE` env var.
     pub tool_choice: Option<String>,
+    /// Forwarded to the provider as `parallel_tool_calls` on the main
+    /// agent (and subagent) request. `None` (the default) omits the
+    /// field, leaving the provider's default — *parallel* for OpenAI
+    /// Responses / Chat-Completions — in place, so the model is already
+    /// free to batch independent tool calls without re-sending the
+    /// growing prefix on extra rounds. `Some(true)` forwards an explicit
+    /// opt-in; `Some(false)` forces serial tool calls. Configured via
+    /// `[model].parallel_tool_calls` or `SQUEEZY_PARALLEL_TOOL_CALLS`.
+    pub parallel_tool_calls: Option<bool>,
+    /// When `true`, append a short system-prompt nudge encouraging the
+    /// model to batch independent read-only lookups into one assistant
+    /// turn. `false` (the default) leaves the prompt byte-for-byte
+    /// unchanged. Configured via `[model].batch_tool_calls_hint` or
+    /// `SQUEEZY_BATCH_TOOL_CALLS_HINT`.
+    pub batch_tool_calls_hint: bool,
     pub stream_idle_timeout: Duration,
     pub tick_rate: Duration,
     pub workspace_root: PathBuf,
@@ -486,6 +501,20 @@ pub struct AppConfig {
     pub max_search_files_per_turn: u64,
     pub max_session_cost_usd_micros: Option<u64>,
     pub cost_warn_percent: u8,
+    /// Suppress all prompt caching for this session (env
+    /// `SQUEEZY_DISABLE_PROMPT_CACHE`). Threads into every `LlmRequest` so
+    /// each turn is billed at full input price with no cache_control markers
+    /// and an OpenAI cache-busting nonce — used for deterministic,
+    /// cache-independent cost comparisons.
+    pub disable_prompt_cache: bool,
+    /// Optional pre-flight ceiling on the estimated input tokens of a single
+    /// LLM round. `None` (the default) disables the gate entirely, leaving
+    /// every round dispatched exactly as before. When set, the agent
+    /// estimates the assembled request's input tokens before sending; if the
+    /// estimate exceeds this value it first attempts mid-turn compaction and,
+    /// if the round is still over, gates the dispatch with a clear status
+    /// instead of paying for an oversized round.
+    pub max_round_input_tokens: Option<u64>,
     pub routing: RoutingConfig,
     pub telemetry: TelemetryConfig,
     pub feedback: FeedbackConfig,
@@ -905,6 +934,13 @@ impl AppConfig {
             .map(|raw| raw.trim().to_string())
             .filter(|value| !value.is_empty())
             .or(model_settings.tool_choice.clone());
+        // Tri-state: env override wins; otherwise fall back to the TOML
+        // `[model]` value; `None` leaves the provider default in place.
+        let parallel_tool_calls = parse_tristate_bool(get_var("SQUEEZY_PARALLEL_TOOL_CALLS"))
+            .or(model_settings.parallel_tool_calls);
+        let batch_tool_calls_hint = parse_tristate_bool(get_var("SQUEEZY_BATCH_TOOL_CALLS_HINT"))
+            .or(model_settings.batch_tool_calls_hint)
+            .unwrap_or(false);
         let provider_timeout_keys = provider_settings_keys(&provider);
         let stream_idle_timeout_ms = parse_u64(
             get_var("SQUEEZY_STREAM_IDLE_TIMEOUT_MS")
@@ -1017,6 +1053,14 @@ impl AppConfig {
             .filter(|value| (1..=100).contains(value))
             .or(budgets.cost_warn_percent)
             .unwrap_or(DEFAULT_COST_WARN_PERCENT);
+        let disable_prompt_cache = get_var("SQUEEZY_DISABLE_PROMPT_CACHE")
+            .as_deref()
+            .map(parse_enabled_bool)
+            .unwrap_or(false);
+        let max_round_input_tokens = get_var("SQUEEZY_MAX_ROUND_INPUT_TOKENS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .or(budgets.max_round_input_tokens);
         let routing = RoutingConfig::from_settings_and_env(
             settings.routing.unwrap_or_default(),
             &mut get_var,
@@ -1107,6 +1151,8 @@ impl AppConfig {
             instructions: DEFAULT_INSTRUCTIONS.to_string(),
             max_output_tokens,
             tool_choice,
+            parallel_tool_calls,
+            batch_tool_calls_hint,
             stream_idle_timeout: Duration::from_millis(stream_idle_timeout_ms),
             tick_rate: Duration::from_millis(tui.tick_rate_ms),
             workspace_root,
@@ -1133,6 +1179,8 @@ impl AppConfig {
             max_search_files_per_turn,
             max_session_cost_usd_micros,
             cost_warn_percent,
+            disable_prompt_cache,
+            max_round_input_tokens,
             routing,
             telemetry,
             feedback,
@@ -1244,6 +1292,20 @@ impl AppConfig {
                 "# max_output_tokens = unset  # no Squeezy cap; provider/model limit applies\n",
             );
         }
+        match self.parallel_tool_calls {
+            Some(value) => {
+                output.push_str(&format!("parallel_tool_calls = {value}\n"));
+            }
+            None => {
+                output.push_str(
+                    "# parallel_tool_calls = unset  # provider default (parallel on OpenAI)\n",
+                );
+            }
+        }
+        output.push_str(&format!(
+            "batch_tool_calls_hint = {}\n",
+            self.batch_tool_calls_hint
+        ));
         output.push_str(&format!(
             "stream_idle_timeout_ms = {}\n",
             self.stream_idle_timeout.as_millis()
@@ -1431,10 +1493,14 @@ impl AppConfig {
         } else {
             output.push_str("# max_session_cost_usd_micros = unset\n");
         }
-        output.push_str(&format!(
-            "cost_warn_percent = {}\n\n",
-            self.cost_warn_percent
-        ));
+        output.push_str(&format!("cost_warn_percent = {}\n", self.cost_warn_percent));
+        if let Some(max_round_input_tokens) = self.max_round_input_tokens {
+            output.push_str(&format!(
+                "max_round_input_tokens = {max_round_input_tokens}\n\n"
+            ));
+        } else {
+            output.push_str("# max_round_input_tokens = unset\n\n");
+        }
 
         output.push_str("[routing]\n");
         output.push_str(&format!("auto_cheap = {}\n", self.routing.auto_cheap));
@@ -3606,6 +3672,25 @@ pub struct ModelSettings {
     /// and finish with `stop` without calling any tool. Other accepted
     /// values: `"auto"`, `"none"`.
     pub tool_choice: Option<String>,
+    /// Forwarded to the provider as `parallel_tool_calls` on the main
+    /// agent (and subagent) request whenever tools are advertised.
+    /// `None` (the default) omits the field, leaving the provider's own
+    /// default in place — which is *parallel* for OpenAI Responses /
+    /// Chat-Completions, so the common path already lets the model batch
+    /// independent tool calls. Set to `true` to forward an explicit
+    /// opt-in (useful on aggregator routes whose default is unknown), or
+    /// `false` to force serial tool calls. Configured via
+    /// `[model].parallel_tool_calls` in TOML or
+    /// `SQUEEZY_PARALLEL_TOOL_CALLS`.
+    pub parallel_tool_calls: Option<bool>,
+    /// When `true`, append a short system-prompt nudge encouraging the
+    /// model to batch independent read-only lookups (read_file / grep /
+    /// definition_search) into a single assistant turn so the growing
+    /// prompt prefix is re-sent on fewer round-trips. `None`/`false` (the
+    /// default) leaves the prompt byte-for-byte unchanged. Configured via
+    /// `[model].batch_tool_calls_hint` in TOML or
+    /// `SQUEEZY_BATCH_TOOL_CALLS_HINT`.
+    pub batch_tool_calls_hint: Option<bool>,
 }
 
 impl ModelSettings {
@@ -3623,6 +3708,8 @@ impl ModelSettings {
                 "store_responses",
                 "selection_version",
                 "tool_choice",
+                "parallel_tool_calls",
+                "batch_tool_calls_hint",
             ],
             source,
             path,
@@ -3683,6 +3770,18 @@ impl ModelSettings {
                 source,
                 &field(path, "tool_choice"),
             )?,
+            parallel_tool_calls: bool_value(
+                table,
+                "parallel_tool_calls",
+                source,
+                &field(path, "parallel_tool_calls"),
+            )?,
+            batch_tool_calls_hint: bool_value(
+                table,
+                "batch_tool_calls_hint",
+                source,
+                &field(path, "batch_tool_calls_hint"),
+            )?,
         })
     }
 
@@ -3700,6 +3799,8 @@ impl ModelSettings {
         replace_if_some(&mut self.store_responses, next.store_responses);
         replace_if_some(&mut self.selection_version, next.selection_version);
         replace_if_some(&mut self.tool_choice, next.tool_choice);
+        replace_if_some(&mut self.parallel_tool_calls, next.parallel_tool_calls);
+        replace_if_some(&mut self.batch_tool_calls_hint, next.batch_tool_calls_hint);
     }
 }
 
@@ -3738,6 +3839,7 @@ pub struct BudgetSettings {
     pub max_search_files_per_turn: Option<u64>,
     pub max_session_cost_usd_micros: Option<u64>,
     pub cost_warn_percent: Option<u8>,
+    pub max_round_input_tokens: Option<u64>,
 }
 
 impl BudgetSettings {
@@ -3755,6 +3857,7 @@ impl BudgetSettings {
                 "max_search_files_per_turn",
                 "max_session_cost_usd_micros",
                 "cost_warn_percent",
+                "max_round_input_tokens",
             ],
             source,
             path,
@@ -3820,6 +3923,12 @@ impl BudgetSettings {
                 source,
                 &field(path, "cost_warn_percent"),
             )?,
+            max_round_input_tokens: u64_value(
+                table,
+                "max_round_input_tokens",
+                source,
+                &field(path, "max_round_input_tokens"),
+            )?,
         })
     }
 
@@ -3855,6 +3964,10 @@ impl BudgetSettings {
             next.max_session_cost_usd_micros,
         );
         replace_if_some(&mut self.cost_warn_percent, next.cost_warn_percent);
+        replace_if_some(
+            &mut self.max_round_input_tokens,
+            next.max_round_input_tokens,
+        );
     }
 }
 
@@ -6775,6 +6888,20 @@ fn parse_disabled_bool(value: Option<&str>) -> bool {
     )
 }
 
+/// Tri-state bool parse for env overrides of `Option<bool>` settings.
+/// Recognized truthy / falsy spellings map to `Some(true)` / `Some(false)`;
+/// an empty or unset value yields `None` so the caller can fall back to the
+/// TOML setting (which itself defaults to "leave the provider default").
+fn parse_tristate_bool(value: Option<String>) -> Option<bool> {
+    let raw = value?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => None,
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
 fn parse_usize(value: Option<String>, default: usize) -> usize {
     value
         .and_then(|value| value.parse::<usize>().ok())
@@ -8802,7 +8929,7 @@ pub fn user_settings_template() -> &'static str {
 # response_verbosity = "normal"  # concise | normal | verbose
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
-# alternate_screen = "auto"     # auto | always | never
+# alternate_screen = "auto"     # auto/never preserve terminal scrollback; always uses fullscreen alternate screen
 # synchronized_output = "auto"  # auto | always | never (DEC 2026 atomic redraw)
 # show_reasoning_usage = true
 # persist_prompt_history = false  # mirror Up/Down prompt history to ~/.squeezy/prompt_history (XDG-compatible)
@@ -8832,6 +8959,7 @@ pub fn project_settings_template() -> &'static str {
 # max_tool_result_bytes_per_round = 50000
 # max_session_cost_usd_micros = 5000000
 # cost_warn_percent = 85
+# max_round_input_tokens = 200000  # pre-flight per-round input-token ceiling; unset = off (compact-first, then gate)
 
 [agent]
 # exploration_compiler = true  # graph-first planner for common navigation prompts
@@ -8953,7 +9081,7 @@ pub fn project_settings_template() -> &'static str {
 # response_verbosity = "normal"  # concise | normal | verbose
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
-# alternate_screen = "auto"     # auto | always | never
+# alternate_screen = "auto"     # auto/never preserve terminal scrollback; always uses fullscreen alternate screen
 # synchronized_output = "auto"  # auto | always | never (DEC 2026 atomic redraw)
 # show_reasoning_usage = true
 

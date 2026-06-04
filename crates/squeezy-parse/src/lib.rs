@@ -72,6 +72,15 @@ pub struct ParsedSymbol {
     pub language_identity: Option<String>,
     pub span: SourceSpan,
     pub body_span: Option<SourceSpan>,
+    /// Byte range from the symbol's start up to (but excluding) where its body
+    /// begins — i.e. the declaration header alone. Populated only by extractors
+    /// that have a real body node to anchor the boundary against; `None` for
+    /// bodyless symbols (declarations, fields, abstract methods) and heuristic
+    /// extractors that can't locate the body start reliably. `read_slice` with
+    /// `span_kind=signature` reads this range when present so a signature read
+    /// excludes the body; it falls back to the full `span` when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_span: Option<SourceSpan>,
     pub signature: String,
     pub visibility: Option<String>,
     pub docs: Vec<String>,
@@ -1081,6 +1090,27 @@ fn span_from_node(node: Node<'_>) -> SourceSpan {
             node.end_position().column as u32,
         ),
     )
+}
+
+/// Byte range covering a symbol's declaration header: from the symbol node's
+/// start up to where its `body` begins. Returns `None` when there is no body
+/// node (the caller has no reliable boundary, so signature reads fall back to
+/// the full span). The end point is the body's start position, so the header
+/// excludes the opening brace / `do` / `:`-indented block that follows.
+fn signature_span_from_nodes(node: Node<'_>, body: Option<Node<'_>>) -> Option<SourceSpan> {
+    let body = body?;
+    Some(SourceSpan::new(
+        node.start_byte() as u32,
+        body.start_byte() as u32,
+        SourcePoint::new(
+            node.start_position().row as u32,
+            node.start_position().column as u32,
+        ),
+        SourcePoint::new(
+            body.start_position().row as u32,
+            body.start_position().column as u32,
+        ),
+    ))
 }
 
 fn span_from_range(range: tree_sitter::Range) -> SourceSpan {

@@ -160,15 +160,28 @@ pub(crate) const MAX_SHELL_OUTPUT_BYTE_CAP: usize = 128_000;
 const DIFF_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 /// Upper bound a graph tool waits for the deferred
 /// `GraphManager::open_with_store` background task to finish before it
-/// falls back to `graph_unavailable_result`. Tuned to be short enough
-/// that a slow cold-open on a large monorepo (akka/akka, ~4.7k files)
-/// doesn't strand every graph tool call behind a multi-second wait —
-/// once the bg task finishes the condvar fires and subsequent calls
-/// return instantly, so the model only pays this wait on the very first
-/// graph tool of a session. Most projects open in well under this
-/// window; slow-opening ones surface `graph_indexing` quickly and the
-/// model falls back to grep without burning a wall-time budget waiting.
-pub(crate) const GRAPH_READY_WAIT: Duration = Duration::from_secs(5);
+/// falls back to `graph_unavailable_result`. The condvar fires the instant
+/// the background open completes, so the model only ever pays this wait on
+/// the very first graph tool call of a session and small/medium projects
+/// pay almost none of it. The bound is generous on purpose: a too-short
+/// wait silently strands a large cold monorepo (e.g. laravel ~2.8k files,
+/// akka ~4.7k) on `graph_unavailable`/`graph_indexing` for the whole
+/// session and degrades it to grep — which is both less accurate and often
+/// more expensive — even though the index becomes ready a second or two
+/// later. Buying correct navigation for the cost of one bounded first-call
+/// wait is the better trade. Override with `SQUEEZY_GRAPH_READY_WAIT_MS`
+/// for unusually large or unusually latency-sensitive workspaces.
+pub(crate) fn graph_ready_wait() -> Duration {
+    use std::sync::OnceLock;
+    static WAIT: OnceLock<Duration> = OnceLock::new();
+    *WAIT.get_or_init(|| {
+        std::env::var("SQUEEZY_GRAPH_READY_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(30))
+    })
+}
 pub(crate) const POLICY_PREFIX_BYTES: usize = 4096;
 pub(crate) const DEFAULT_GRAPH_MAX_RESULTS: usize = 50;
 pub(crate) const MAX_GRAPH_MAX_RESULTS: usize = 100;
@@ -492,10 +505,15 @@ pub fn human_label_for_call(name: &str, args: &Value) -> String {
             let pat = s("pattern").unwrap_or_else(|| "?".to_string());
             format!("globbing for `{pat}`")
         }
-        "shell" | "verify" => match s("command") {
+        "shell" => match s("command") {
             Some(cmd) => format!("running `{cmd}`"),
             None => format!("running {name}"),
         },
+        "verify" => {
+            let scope = s("scope").unwrap_or_else(|| "diff".to_string());
+            let level = s("level").unwrap_or_else(|| "quick".to_string());
+            format!("verifying {scope}/{level}")
+        }
         "websearch" => match s("query") {
             Some(q) => format!("searching the web for `{q}`"),
             None => "searching the web".to_string(),
@@ -573,7 +591,21 @@ impl ToolCostHint {
     pub fn confidence_distribution_from_packets(packets: &[Value]) -> BTreeMap<String, u32> {
         let mut map: BTreeMap<String, u32> = BTreeMap::new();
         for packet in packets {
-            let Some(label) = packet.get("confidence").and_then(Value::as_str) else {
+            // Packets no longer mirror confidence at the top level; it now lives
+            // in the body field that re-encodes the span (symbol/edge/reference).
+            // Try the top-level field first for back-compat with older captured
+            // packets, then fall back to each body field.
+            let label = packet
+                .get("confidence")
+                .and_then(Value::as_str)
+                .or_else(|| packet.pointer("/symbol/confidence").and_then(Value::as_str))
+                .or_else(|| packet.pointer("/edge/confidence").and_then(Value::as_str))
+                .or_else(|| {
+                    packet
+                        .pointer("/reference/confidence")
+                        .and_then(Value::as_str)
+                });
+            let Some(label) = label else {
                 continue;
             };
             if let Some(c) = confidence_from_label(label) {
@@ -2959,7 +2991,7 @@ impl ToolRegistry {
             captured_unix_millis: unix_millis(),
         };
 
-        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(graph_ready_wait());
         let report = {
             let mut graph = match self.graph.lock() {
                 Ok(graph) => graph,
@@ -3783,6 +3815,43 @@ impl ToolRegistry {
         let shell_result = self
             .execute_shell_capped(&shell_call, cancel, VERIFY_SHELL_TIMEOUT_MS, group_id, None)
             .await;
+        // Distinguish "the build environment couldn't start" (dependency
+        // fetch/auth, missing pinned revision, unavailable toolchain) from
+        // "your code failed checks". The former is not a code-quality signal,
+        // so report it as a benign no-op rather than a red failure.
+        let exit_code = shell_result
+            .content
+            .get("exit_code")
+            .and_then(Value::as_i64);
+        let failed = !matches!(shell_result.status, ToolStatus::Success)
+            || exit_code.is_some_and(|code| code != 0);
+        if failed {
+            let stderr = shell_result.content["stderr"].as_str().unwrap_or("");
+            let stdout = shell_result.content["stdout"].as_str().unwrap_or("");
+            let combined = format!("{stderr}\n{stdout}");
+            if let Some(reason) = cargo_setup_failure_reason(&combined) {
+                let excerpt: String = combined.trim().chars().take(600).collect();
+                return make_result(
+                    call,
+                    ToolStatus::Success,
+                    json!({
+                        "scope": verify_scope_str(scope),
+                        "level": verify_level_str(level),
+                        "changed_files": changed_paths,
+                        "command": plan.command,
+                        "not_run": true,
+                        "setup_failure": true,
+                        "reason": format!(
+                            "verify could not run: {reason}. This is a build-environment issue, \
+                             not a code defect — review statically and skip local verification."
+                        ),
+                        "details": excerpt,
+                    }),
+                    shell_result.cost_hint,
+                    None,
+                );
+            }
+        }
         let mut content = shell_result.content;
         if let Some(object) = content.as_object_mut() {
             object.insert("scope".to_string(), json!(verify_scope_str(scope)));
@@ -5259,6 +5328,44 @@ impl StagedOp {
             }
         }
     }
+}
+
+/// Detect cargo/rustup failures that mean "the build environment could not
+/// even start" — dependency resolution, a private-repo fetch/auth failure, a
+/// missing pinned git revision, or an unavailable toolchain — as opposed to
+/// "your code failed checks". These strings are emitted before any
+/// compilation, so matching them never masks a real code defect, and lets
+/// `verify` report a benign "did not run" instead of a red failure the model
+/// might waste a turn trying to "fix".
+fn cargo_setup_failure_reason(output: &str) -> Option<&'static str> {
+    const DEPENDENCY_SIGNATURES: &[&str] = &[
+        "failed to load source for dependency",
+        "as a dependency of package",
+        "failed to select a version for",
+        "no matching package named",
+        "failed to fetch into:",
+        "failed to download",
+        "spurious network error",
+        "failed to authenticate",
+        "failed to acquire username/password",
+        "could not read Username",
+    ];
+    const TOOLCHAIN_SIGNATURES: &[&str] = &[
+        "error: rustup could not",
+        "no override and no default toolchain set",
+        "can't find crate for `core`",
+        "can't find crate for `std`",
+    ];
+    if DEPENDENCY_SIGNATURES.iter().any(|sig| output.contains(sig)) {
+        return Some(
+            "cargo could not resolve or fetch dependencies (network access, private-repo \
+             authentication, or a missing pinned revision)",
+        );
+    }
+    if TOOLCHAIN_SIGNATURES.iter().any(|sig| output.contains(sig)) {
+        return Some("the Rust toolchain or a required component is unavailable");
+    }
+    None
 }
 
 fn verify_scope_str(scope: VerifyScope) -> &'static str {

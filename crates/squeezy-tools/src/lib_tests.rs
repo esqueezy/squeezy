@@ -1536,6 +1536,236 @@ async fn read_file_does_not_dedup_when_window_differs() {
 }
 
 #[tokio::test]
+async fn grep_returns_resident_receipt_when_file_already_read_in_full() {
+    let root = temp_workspace("grep_resident_receipt");
+    let body = "alpha fox\nbeta\nalpha bird\n";
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    // A full-file read_file snapshot, stored in the model-facing
+    // line-numbered render that `prefix_lines_with_numbers` produces.
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex(body.as_bytes())),
+            start_byte: 0,
+            end_byte: body.len() as u64,
+            content: "1\talpha fox\n2\tbeta\n3\talpha bird\n".to_string(),
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "grep_call".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "alpha", "path": "sample.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let metadata = result.content["metadata"]
+        .as_object()
+        .expect("metadata object");
+    assert_eq!(metadata["receipt_stub"], true);
+    assert_eq!(metadata["dedup"], true);
+    assert_eq!(metadata["resident_read"], true);
+    assert_eq!(metadata["same_as_call_id"], "prior_read");
+    assert_eq!(metadata["same_as_tool_name"], "read_file");
+
+    let matches = result.content["matches"].as_array().expect("matches array");
+    assert_eq!(matches.len(), 2);
+    // Matched line numbers come from the embedded gutter, and the emitted
+    // text is the source line WITHOUT the "{N}\t" gutter — never the full
+    // file source.
+    assert_eq!(matches[0]["line"], 1);
+    assert_eq!(matches[0]["text"], "alpha fox");
+    assert_eq!(matches[1]["line"], 3);
+    assert_eq!(matches[1]["text"], "alpha bird");
+    // The receipt must not re-emit the full file content.
+    assert!(result.content.get("content").is_none());
+    let serialized = serde_json::to_string(&result.content).expect("serialize");
+    assert!(
+        !serialized.contains("beta"),
+        "non-matching line leaked into the receipt: {serialized}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_resident_receipt_matches_equal_disk_grep() {
+    let root = temp_workspace("grep_resident_equals_disk");
+    let body = "alpha fox\nbeta\nalpha bird\n";
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+
+    // Ground truth: a normal disk grep with no resident snapshot.
+    let disk_registry = ToolRegistry::new(&root).expect("registry");
+    let disk = disk_registry
+        .execute(
+            ToolCall {
+                call_id: "disk_grep".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "alpha", "path": "sample.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    let disk_matches = disk.content["matches"].as_array().expect("disk matches");
+
+    // Resident path: same file, same regex, served from the snapshot.
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex(body.as_bytes())),
+            start_byte: 0,
+            end_byte: body.len() as u64,
+            content: "1\talpha fox\n2\tbeta\n3\talpha bird\n".to_string(),
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+    let resident = registry
+        .execute(
+            ToolCall {
+                call_id: "resident_grep".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "alpha", "path": "sample.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    let resident_matches = resident.content["matches"]
+        .as_array()
+        .expect("resident matches");
+
+    assert_eq!(disk_matches.len(), resident_matches.len());
+    for (disk_match, resident_match) in disk_matches.iter().zip(resident_matches.iter()) {
+        assert_eq!(disk_match["line"], resident_match["line"]);
+        assert_eq!(disk_match["text"], resident_match["text"]);
+        assert_eq!(disk_match["path"], resident_match["path"]);
+    }
+    // Disk grep must NOT carry the resident-receipt markers; the resident
+    // path must.
+    assert!(disk.content["metadata"].get("resident_read").is_none());
+    assert_eq!(resident.content["metadata"]["resident_read"], true);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_falls_through_to_disk_when_snapshot_missing_stale_or_partial() {
+    let body = "alpha fox\nbeta\nalpha bird\n";
+
+    // (1) No snapshot at all -> normal disk grep, no resident markers.
+    let root = temp_workspace("grep_resident_missing");
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    let registry = registry_with_state_store(&root, store);
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "grep_missing".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "alpha", "path": "sample.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.content["metadata"].get("resident_read").is_none());
+    assert_eq!(result.content["matches"].as_array().unwrap().len(), 2);
+    let _ = fs::remove_dir_all(root);
+
+    // (2) Stale SHA (file changed since the read) -> fall through to disk.
+    let root = temp_workspace("grep_resident_stale");
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            // Hash of some OTHER content -> SHA mismatch.
+            content_sha256: Some(sha256_hex("alpha fox\nbeta\ngamma\n".as_bytes())),
+            start_byte: 0,
+            end_byte: body.len() as u64,
+            content: "1\talpha fox\n2\tbeta\n3\tgamma\n".to_string(),
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "grep_stale".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "alpha", "path": "sample.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.content["metadata"].get("resident_read").is_none());
+    // Disk grep sees the real file: "alpha bird" on line 3, not "gamma".
+    let matches = result.content["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 2);
+    assert_eq!(matches[1]["text"], "alpha bird");
+    let _ = fs::remove_dir_all(root);
+
+    // (3) Partial-span snapshot (covers only the first line) -> fall through.
+    let root = temp_workspace("grep_resident_partial");
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex(body.as_bytes())),
+            start_byte: 0,
+            // Only the first line of the file is covered.
+            end_byte: 10,
+            content: "1\talpha fox\n".to_string(),
+            model_output_bytes: 64,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "grep_partial".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "alpha", "path": "sample.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.content["metadata"].get("resident_read").is_none());
+    // Disk grep finds BOTH matches, proving we did not stop at the
+    // partial snapshot's single covered line.
+    assert_eq!(result.content["matches"].as_array().unwrap().len(), 2);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn diff_context_reports_changed_file_and_dirty_symbol() {
     let root = temp_workspace("diff_context");
     write_rust_crate(
@@ -1732,6 +1962,169 @@ async fn read_slice_diff_last_receipt_returns_stub_when_file_is_unchanged() {
             .is_empty()
     );
     assert_uniform_evidence_packet(&result.content["packets"][0]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_suppresses_resident_read_when_prior_window_encloses_unchanged_file() {
+    // FIX B: a prior read whose byte window ENCLOSES this request, taken from an
+    // unchanged file (SHA match), means the model already has these bytes in
+    // context. Suppress the re-read with a receipt stub naming the prior call.
+    let root = temp_workspace("read_slice_resident_dedup");
+    let body = "alpha\nbeta\ngamma\n";
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_slice".to_string(),
+            call_id: "prior_full_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex(body.as_bytes())),
+            // Encloses the requested [0, 5) window below.
+            start_byte: 0,
+            end_byte: body.len() as u64,
+            content: body.to_string(),
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "slice".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "offset": 0,
+                    "limit": 5
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["receipt_stub"], true);
+    assert_eq!(result.content["dedup"], true);
+    assert_eq!(result.content["resident_read"], true);
+    assert_eq!(result.content["unchanged"], true);
+    assert_eq!(result.content["bytes_returned"], 0);
+    assert_eq!(result.content["same_as_call_id"], "prior_full_read");
+    assert_eq!(result.content["same_as_tool_name"], "read_slice");
+    assert!(
+        result.content.get("content").is_none(),
+        "stub must not re-serialize content: {}",
+        result.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_does_not_suppress_when_prior_window_does_not_enclose_request() {
+    // Recall safety: a prior read that only covers a SUBSET of the requested
+    // window does not give the model the missing bytes, so the read must run.
+    let root = temp_workspace("read_slice_resident_no_enclose");
+    let body = "alpha\nbeta\ngamma\n";
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_slice".to_string(),
+            call_id: "prior_partial_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex(body.as_bytes())),
+            // Only [0, 5) — does NOT enclose the requested [0, 16).
+            start_byte: 0,
+            end_byte: 5,
+            content: "alpha".to_string(),
+            model_output_bytes: 64,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "slice".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "offset": 0,
+                    "limit": 16
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(
+        result.content.get("receipt_stub").is_none(),
+        "non-enclosing prior read must not suppress the request: {}",
+        result.content
+    );
+    assert!(
+        result.content["content"].as_str().is_some(),
+        "real read must return content: {}",
+        result.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_does_not_suppress_when_file_changed_since_prior_read() {
+    // Recall safety: if the file changed since the prior read (SHA mismatch),
+    // the resident bytes are stale, so the read must run.
+    let root = temp_workspace("read_slice_resident_changed");
+    fs::write(root.join("sample.txt"), "alpha\nbeta\ngamma\n").expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_slice".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            // SHA of an older, different file body.
+            content_sha256: Some(sha256_hex("OLD CONTENT".as_bytes())),
+            start_byte: 0,
+            end_byte: 64,
+            content: "OLD CONTENT".to_string(),
+            model_output_bytes: 64,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "slice".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "offset": 0,
+                    "limit": 5
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(
+        result.content.get("receipt_stub").is_none(),
+        "a changed file must not suppress the request: {}",
+        result.content
+    );
+    assert!(result.content["content"].as_str().is_some());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2101,6 +2494,37 @@ fn diff_verify_command_uses_nested_manifest_when_root_has_no_cargo() {
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cargo_setup_failure_reason_separates_environment_from_code_failures() {
+    // The exact failure shape that keeps surfacing: a private git dependency
+    // cargo can't fetch/authenticate, with a pinned revision that is gone.
+    let dep_failure = "Updating git repository `https://github.com/SonarSource/semsitter.git`\n\
+         error: failed to get `udg-gen` as a dependency of package `sonar-context-augmentation`\n\
+         Caused by:\n  failed to load source for dependency `udg-gen`\n\
+         Caused by:\n  revision 0a910a90 not found\n\
+         Caused by:\n  failed to authenticate when downloading repository\n";
+    assert!(cargo_setup_failure_reason(dep_failure).is_some());
+
+    // A missing toolchain/std is also an environment failure.
+    assert!(cargo_setup_failure_reason("can't find crate for `core`").is_some());
+
+    // Genuine code-quality failures must NOT be masked as setup failures.
+    assert!(
+        cargo_setup_failure_reason(
+            "error[E0425]: cannot find value `x`\n\
+             error: could not compile `foo` (lib) due to 1 previous error"
+        )
+        .is_none()
+    );
+    assert!(
+        cargo_setup_failure_reason(
+            "test tests::it_works ... FAILED\nassertion `left == right` failed"
+        )
+        .is_none()
+    );
+    assert!(cargo_setup_failure_reason("").is_none());
 }
 
 #[tokio::test]
@@ -6567,6 +6991,166 @@ async fn shell_truncation_spills_full_output_to_tempfile_and_round_trips_via_rea
 }
 
 #[tokio::test]
+async fn shell_over_cap_streams_raw_sidecar_recoverable_via_read_tool_output() {
+    let root = temp_workspace("shell_raw_sidecar_recovery");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    // 200000 bytes of `x\n` capped at 4096: the live result keeps 4096 bytes,
+    // the capped spillover mirrors only those, but the raw sidecar must hold
+    // the FULL pre-cap stream — the bytes the hard cap would otherwise lose.
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_rawsidecar".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "yes x | head -c 200000",
+                    "output_byte_cap": 4096,
+                    "description": "exercise raw sidecar"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["truncated"], true);
+
+    let raw_spill = result
+        .content
+        .get("raw_spillover")
+        .expect("over-cap shell result must carry a raw_spillover pointer");
+    let raw_path = raw_spill["path"].as_str().expect("raw_spillover.path");
+    let raw_bytes = raw_spill["bytes"].as_u64().expect("raw_spillover.bytes");
+    assert!(
+        raw_path.ends_with("-raw.txt"),
+        "raw sidecar must use the {{call_id}}-raw suffix: {raw_path:?}",
+    );
+
+    // The raw sidecar is a strict superset of the capped spillover.
+    let capped = result
+        .content
+        .get("spillover")
+        .expect("capped spillover still present");
+    let capped_bytes = capped["bytes"].as_u64().expect("spillover.bytes");
+    assert!(
+        raw_bytes > capped_bytes,
+        "raw sidecar ({raw_bytes}) must hold more than the capped spillover ({capped_bytes})",
+    );
+    // `yes x | head -c 200000` emits exactly 200000 bytes on stdout.
+    assert_eq!(
+        raw_bytes, 200_000,
+        "raw sidecar must hold the full pre-cap output"
+    );
+
+    // The footer points the model at the full pre-cap recovery path.
+    let shaped_stdout = result.content["stdout"].as_str().expect("stdout");
+    assert!(
+        shaped_stdout.contains(&format!("full pre-cap output: {raw_path}"))
+            && shaped_stdout.contains("read_tool_output"),
+        "footer must name the raw sidecar recovery path: {shaped_stdout:?}",
+    );
+
+    // The path lives under the spillover session dir.
+    let tmp_base = std::env::temp_dir().join("squeezy-spillover");
+    let tmp_canon = tmp_base.canonicalize().expect("canonical tempdir base");
+    let raw_canon = PathBuf::from(raw_path)
+        .canonicalize()
+        .expect("canonical raw sidecar path");
+    assert!(
+        raw_canon.starts_with(&tmp_canon),
+        "raw sidecar {raw_path:?} must live under {tmp_base:?}",
+    );
+
+    // Model-initiated recovery: read_tool_output { path } can reach the bytes
+    // the hard cap dropped. Read a window past the live cap (offset 50000,
+    // well beyond the 4096-byte cap) and under the 25KB tool-spill threshold
+    // so the bytes return inline; `total_bytes` proves the full output is
+    // reachable.
+    const WINDOW: usize = 8_000;
+    let offset = 50_000usize;
+    let fetched = registry
+        .execute(
+            ToolCall {
+                call_id: "call_read_rawsidecar".to_string(),
+                name: "read_tool_output".to_string(),
+                arguments: json!({
+                    "path": raw_path,
+                    "offset": offset,
+                    "limit": WINDOW,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(fetched.status, ToolStatus::Success);
+    assert_eq!(
+        fetched.content["total_bytes"], raw_bytes,
+        "recovery must see the full pre-cap byte count",
+    );
+    let content = fetched.content["content"].as_str().expect("content");
+    let on_disk = fs::read(raw_path).expect("raw sidecar readable");
+    assert_eq!(
+        content.as_bytes(),
+        &on_disk[offset..offset + WINDOW],
+        "read_tool_output must return the dropped-by-cap window byte-for-byte",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_under_cap_writes_no_raw_sidecar() {
+    let root = temp_workspace("shell_no_raw_sidecar_under_cap");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_under_cap".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf 'small output that fits\\n'",
+                    "description": "under-cap output writes no raw sidecar"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["truncated"], false);
+    assert!(
+        result.content.get("raw_spillover").is_none(),
+        "under-cap output must not produce a raw sidecar: {:?}",
+        result.content,
+    );
+
+    // No `-raw.txt` file may exist anywhere under the spillover tree.
+    let spill_base = std::env::temp_dir().join("squeezy-spillover");
+    if spill_base.exists() {
+        let mut stack = vec![spill_base];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    assert!(
+                        !name.ends_with("-raw.txt") || !name.starts_with("call_under_cap"),
+                        "under-cap run must leave no raw sidecar: {path:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn shell_truncation_records_spillover_path_under_session_dir_for_raw_output_mode() {
     let root = temp_workspace("shell_truncation_raw_mode_spill");
     let registry = registry_with_shell_sandbox_off(&root);
@@ -8906,9 +9490,11 @@ def make_aliased():
 
     let mut expected: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
     for packet in packets {
-        let label = packet["confidence"]
+        // Confidence now lives in the `reference` body (the top-level mirror was
+        // dropped to cut duplicate tokens), so read it from there.
+        let label = packet["reference"]["confidence"]
             .as_str()
-            .expect("packet must carry a confidence label")
+            .expect("reference packet must carry a confidence label")
             .to_string();
         *expected.entry(label).or_insert(0) += 1;
     }
@@ -9594,15 +10180,39 @@ fn match_paths(result: &ToolResult) -> Vec<String> {
 }
 
 fn assert_uniform_evidence_packet(packet: &Value) {
-    // After the wire-payload trim, graph packets keep only the spans + the
-    // confidence id. `claim`, `freshness`, `provenance`, `cost_hint`, and
-    // `next_action` are dropped from every packet to cut tokens per result;
-    // the same signals still flow to telemetry via the typed graph events.
-    for key in ["spans", "confidence"] {
+    // After the packet-slimming trim, the top-level `spans`/`confidence` mirror
+    // is dropped for packets that carry a body field (symbol/reference/edge):
+    // the body already re-encodes the same span(s) + confidence, so duplicating
+    // them at the top level was pure token overhead. Only the two bare-packet
+    // shapes (read_slice diff packets and the unresolved hierarchy-node
+    // fallback) — which have no body field — still carry a minimal top-level
+    // `spans` + `confidence`, because that is the only path+span the model has.
+    //
+    // Invariant asserted here: a packet either (a) carries a body field
+    // (symbol/reference/edge) that bears a `confidence`, with NO top-level
+    // `spans`/`confidence`, or (b) is a bare packet that carries top-level
+    // `spans` + `confidence` and no body field.
+    let body_field = ["symbol", "reference", "edge"]
+        .into_iter()
+        .find(|key| packet.get(key).is_some());
+    if let Some(field) = body_field {
         assert!(
-            packet.get(key).is_some(),
-            "missing evidence key {key}: {packet}"
+            packet[field].get("confidence").is_some(),
+            "body field `{field}` must carry confidence: {packet}"
         );
+        for absent in ["spans", "confidence"] {
+            assert!(
+                packet.get(absent).is_none(),
+                "body-bearing evidence packet must not mirror `{absent}` at the top level: {packet}"
+            );
+        }
+    } else {
+        for key in ["spans", "confidence"] {
+            assert!(
+                packet.get(key).is_some(),
+                "bare evidence packet missing key {key}: {packet}"
+            );
+        }
     }
     for trimmed in [
         "claim",
@@ -10346,6 +10956,7 @@ fn shell_best_effort_falls_back_when_sandbox_dies_without_output() {
         stdout_truncated: false,
         stderr_bytes: Vec::new(),
         stderr_truncated: false,
+        raw_spillover: None,
     };
 
     let reason =
@@ -10497,6 +11108,7 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
         stdout_truncated: false,
         stderr_bytes: b"sandbox_apply: Operation not permitted".to_vec(),
         stderr_truncated: false,
+        raw_spillover: None,
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run)
@@ -11068,6 +11680,10 @@ fn prepare_arguments_lookup_advertises_only_hooked_tools() {
         "shell should advertise a prepare_arguments hook"
     );
     assert!(
+        registry.prepare_arguments_for("verify").is_some(),
+        "verify should advertise a prepare_arguments hook"
+    );
+    assert!(
         registry.prepare_arguments_for("grep").is_none(),
         "grep does not declare a hook"
     );
@@ -11119,6 +11735,55 @@ fn prepare_arguments_read_file_hook_normalizes_filepath_aliases() {
     let mut args = json!(42);
     hook(&mut args).expect("hook ok");
     assert_eq!(args, json!(42));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn prepare_arguments_verify_hook_rehomes_stray_command() {
+    let root = temp_workspace("prepare_arguments_verify_hook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let hook = registry
+        .prepare_arguments_for("verify")
+        .expect("verify hook");
+
+    // A `level` value passed under `command` (the `shell` field name) is
+    // re-homed onto `level`; `command` is dropped so `deny_unknown_fields`
+    // no longer rejects the call.
+    let mut args = json!({"command": "full"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"level": "full"}));
+
+    // A `scope` value under `command` lands on `scope`.
+    let mut args = json!({"command": "workspace"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"scope": "workspace"}));
+
+    // Case/whitespace are normalized to the snake_case enum value.
+    let mut args = json!({"command": "  QUICK  "});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"level": "quick"}));
+
+    // An explicit field wins; the stray `command` is still dropped.
+    let mut args = json!({"command": "full", "level": "quick"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"level": "quick"}));
+
+    // An unrecognized `command` value is dropped (verify then runs with its
+    // own defaults instead of hard-failing on the unknown field).
+    let mut args = json!({"command": "git status"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({}));
+
+    // Well-formed calls are untouched.
+    let mut args = json!({"scope": "diff", "level": "full"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"scope": "diff", "level": "full"}));
+
+    // Non-object arguments pass through unchanged.
+    let mut args = json!("nope");
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!("nope"));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -11211,4 +11876,471 @@ async fn read_file_dispatch_misspelled_alias_still_fails() {
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_accepts_start_line_end_line_aliases() {
+    // P0.1: Haiku frequently addresses `read_file` with the `read_slice`
+    // line-window vocabulary (`start_line`/`end_line`). Before this fix the
+    // `deny_unknown_fields` schema hard-rejected the call, the model retried
+    // identically, and the repeated-failure abort path emitted a zero-char
+    // answer. The aliases must now resolve to the correct byte window.
+    let root = temp_workspace("read_file_line_alias");
+    let body = "line one\nline two\nline three\nline four\nline five\n";
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "line_alias".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "start_line": 2, "end_line": 4}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(
+        result.status,
+        ToolStatus::Success,
+        "start_line/end_line must not trip deny_unknown_fields: {:?}",
+        result.content
+    );
+    assert_eq!(result.content["start_line"], 2);
+    let content = result.content["content"].as_str().expect("content string");
+    // cat -n format, absolute line numbers, lines 2..=4 inclusive (the
+    // closing newline of line 4 is part of the byte window).
+    assert_eq!(content, "2\tline two\n3\tline three\n4\tline four\n");
+    assert!(
+        !content.contains("line one") && !content.contains("line five"),
+        "window must not bleed past the requested line range: {content}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_start_line_only_reads_to_end_of_file() {
+    // `start_line` without `end_line` reads from that line through EOF, the
+    // same open-ended semantics `read_slice` offers.
+    let root = temp_workspace("read_file_start_line_only");
+    let body = "alpha\nbeta\ngamma\n";
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "start_only".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "start_line": 2}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["start_line"], 2);
+    let content = result.content["content"].as_str().expect("content string");
+    assert_eq!(content, "2\tbeta\n3\tgamma\n");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// The always-sent core tool prefix (tool name + description + serialized
+/// JSON schema for every first-party spec) is what every request pays for
+/// and what the provider prompt cache hashes. This is a byte-regression
+/// gate for cost-idea G2 ("slim the cached prefix"): the assembled prefix
+/// must stay at or below the recorded baseline, and every tool name plus
+/// each tool's required params must still be present so the model can call
+/// every tool. Trimming a description is fine; dropping a tool or a
+/// required param is not. If an intentional addition raises the size,
+/// re-measure and bump `PREFIX_BYTES_BASELINE` deliberately.
+#[test]
+fn core_tool_prefix_stays_within_byte_baseline() {
+    // Recorded after the G2 prefix-slimming pass. Was 25_852 before the
+    // pass; keep this monotonically non-increasing for cache stability.
+    // 24_593 -> 24_700: deliberate bump for the multi-value `decl_search`
+    // attribute filter guidance (`base:A|base:B`). The +43 bytes of prefix
+    // buys collapsing an N-base enumeration from N serial calls to one,
+    // which on a wide hierarchy saves far more tokens (and per-turn budget)
+    // than the prose costs — a strongly net-negative token change.
+    // 24_700 -> 24_904: deliberate bump for language-aware inheritance
+    // guidance on `decl_search`/`hierarchy` — documenting `iface:<Type>`
+    // (implements), Dart `with` mixers as `mixin:<Type>`, and the
+    // prefix-free `attribute="<Type>"` form that matches base:/iface:/mixin:
+    // at once. The data was already indexed; without these recipes the model
+    // queried only `base:` and missed every Dart mixer, then fell back to a
+    // single-line regex that drops multi-line `with` clauses. The +204 bytes
+    // buys correct one-call retrieval of every extender/implementer/mixer of
+    // a type — net-negative on tokens versus the failed-regex retries it
+    // replaces.
+    const PREFIX_BYTES_BASELINE: usize = 24_904;
+
+    // Every first-party spec advertised in the always-core path, paired
+    // with the required params the model must still see to call it. Tools
+    // with no required params carry an empty slice; the presence check
+    // alone guards them.
+    let cases: Vec<(ToolSpec, &[&str])> = vec![
+        (apply_patch_spec(), &[]),
+        (decl_search_spec(), &[]),
+        (definition_search_spec(), &[]),
+        (diff_context_spec(), &[]),
+        (downstream_flow_spec(), &[]),
+        (glob_spec(), &["pattern"]),
+        (grep_spec(), &["pattern"]),
+        (hierarchy_spec(), &[]),
+        (notebook_edit_spec(), &["path", "expected_sha256"]),
+        (plan_patch_spec(), &["objective"]),
+        (read_file_spec(), &["path"]),
+        (read_slice_spec(), &[]),
+        (read_tool_output_spec(), &[]),
+        (reference_search_spec(), &[]),
+        (refresh_compiler_facts_spec(), &[]),
+        (repo_map_spec(), &[]),
+        (write_file_spec(), &["path", "content"]),
+        (symbol_context_spec(), &["query"]),
+        (upstream_flow_spec(), &[]),
+        (verify_spec(), &[]),
+        (shell_spec(), &["command", "description"]),
+        (webfetch_spec(), &["url"]),
+        (websearch_spec(), &["query"]),
+        (list_skills_spec(), &[]),
+        (load_skill_spec(), &["name"]),
+        (notes_remember_spec(), &["kind", "text"]),
+        (notes_recall_spec(), &["query"]),
+        (observations_spec(), &[]),
+    ];
+
+    let mut total = 0usize;
+    for (mut spec, required) in cases {
+        compact_typed_tool_parameters(&mut spec.parameters);
+        let params = serde_json::to_string(&spec.parameters).expect("serialize schema");
+
+        // Every tool keeps a non-empty description so the model knows what
+        // it does; trimming must not empty one out.
+        assert!(
+            !spec.description.trim().is_empty(),
+            "{} lost its description",
+            spec.name
+        );
+        // Every required param must still be declared in the schema so the
+        // model knows the mandatory arguments.
+        for param in required {
+            assert!(
+                params.contains(&format!("\"{param}\"")),
+                "{} schema must still declare required param `{param}`; got {params}",
+                spec.name
+            );
+        }
+
+        total += spec.name.len() + spec.description.len() + params.len();
+    }
+
+    assert!(
+        total <= PREFIX_BYTES_BASELINE,
+        "core tool prefix grew to {total} bytes, above the {PREFIX_BYTES_BASELINE}-byte baseline; \
+         trim descriptions/schemas or bump the baseline deliberately",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Inheritance-enumeration grep augmentation (recall-safe, additive only).
+// ---------------------------------------------------------------------------
+
+use crate::file_ops::detect_inheritance_grep;
+
+/// Run a content-mode grep and return its `content` value.
+async fn run_grep(registry: &ToolRegistry, pattern: &str) -> Value {
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "grep_aug".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": pattern}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    result.content
+}
+
+#[tokio::test]
+async fn grep_augments_wrapped_dart_mixin() {
+    // The `with WidgetsBindingObserver` clause is on a CONTINUATION line, so
+    // a line-oriented grep for `class \w+.*\bwith\b.*WidgetsBindingObserver`
+    // cannot match it — but the semantic graph (tree-sitter, span-based)
+    // records it as `mixin:WidgetsBindingObserver`.
+    let root = temp_workspace("grep_aug_dart_mixin");
+    fs::write(
+        root.join("home.dart"),
+        "class HomeState extends State<Home>\n    with WidgetsBindingObserver {\n  void f() {}\n}\n",
+    )
+    .expect("write dart");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let content = run_grep(&registry, r"class \w+.*\bwith\b.*WidgetsBindingObserver").await;
+
+    // grep itself misses the wrapped declaration.
+    let matches = content["matches"].as_array().expect("matches");
+    assert!(
+        matches.is_empty(),
+        "line grep should miss the continuation-line mixin: {matches:?}"
+    );
+
+    // ...but the graph augmentation surfaces it.
+    let decls = content["graph_declarations"]
+        .as_array()
+        .expect("graph_declarations present");
+    assert!(
+        decls.iter().any(|d| {
+            d["name"] == json!("HomeState")
+                && d["matched_attribute"] == json!("mixin:WidgetsBindingObserver")
+                && d["source"] == json!("semantic_graph")
+        }),
+        "expected HomeState with mixin:WidgetsBindingObserver, got {decls:?}"
+    );
+    assert_eq!(
+        content["graph_hint"]["tool"],
+        json!("decl_search"),
+        "{}",
+        content["graph_hint"]
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_augments_nested_java_extends() {
+    // A nested static class whose `extends TypeAdapter<Foo>` clause WRAPS onto
+    // a continuation line — the recall gap: a line-oriented grep tying the
+    // class name to `extends TypeAdapter` on one line cannot see it, but the
+    // graph records `base:TypeAdapter` regardless of nesting depth or line
+    // wrapping.
+    let root = temp_workspace("grep_aug_java_nested");
+    fs::write(
+        root.join("Outer.java"),
+        "class Outer {\n  static class Adapter\n      extends TypeAdapter<Foo> {\n    void f() {}\n  }\n}\n",
+    )
+    .expect("write java");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Grep that ties the class declaration to its supertype on one line —
+    // this misses the wrapped clause, the exact recall gap the graph fills.
+    let content = run_grep(&registry, r"class \w+ extends TypeAdapter").await;
+
+    let matches = content["matches"].as_array().expect("matches");
+    assert!(
+        matches.is_empty(),
+        "line grep should miss the continuation-line extends: {matches:?}"
+    );
+
+    let decls = content["graph_declarations"]
+        .as_array()
+        .expect("graph_declarations present");
+    assert!(
+        decls.iter().any(|d| {
+            d["name"] == json!("Adapter") && d["matched_attribute"] == json!("base:TypeAdapter")
+        }),
+        "expected nested Adapter with base:TypeAdapter, got {decls:?}"
+    );
+    assert_eq!(content["graph_hint"]["tool"], json!("decl_search"));
+    assert_eq!(
+        content["graph_hint"]["arguments"]["attribute"],
+        json!("base:TypeAdapter|mixin:TypeAdapter|iface:TypeAdapter")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_inheritance_no_double_count() {
+    // A single-line `extends Base` IS matched by the line grep, so it must
+    // NOT be duplicated into graph_declarations (de-dup by path+line).
+    let root = temp_workspace("grep_aug_no_double");
+    fs::write(
+        root.join("A.java"),
+        "class Child extends Base {\n  void f() {}\n}\n",
+    )
+    .expect("write java");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let content = run_grep(&registry, "class \\w+ extends Base").await;
+
+    let matches = content["matches"].as_array().expect("matches");
+    assert!(
+        matches.iter().any(|m| m["line"] == json!(1)),
+        "grep should match the single-line declaration: {matches:?}"
+    );
+
+    // The declaration grep already found is absent from graph_declarations.
+    if let Some(decls) = content.get("graph_declarations").and_then(Value::as_array) {
+        assert!(
+            !decls.iter().any(|d| d["name"] == json!("Child")),
+            "single-line extends already in matches must not be re-listed: {decls:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_ordinary_text_not_augmented() {
+    // Ordinary prose greps must never trigger graph augmentation.
+    let root = temp_workspace("grep_aug_ordinary");
+    fs::write(
+        root.join("notes.txt"),
+        "class action plan for the project\nworking with the team daily\n",
+    )
+    .expect("write notes");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    for pattern in ["class action plan", "with the team"] {
+        let content = run_grep(&registry, pattern).await;
+        assert!(
+            content.get("graph_declarations").is_none(),
+            "`{pattern}` must not produce graph_declarations: {content}"
+        );
+        assert!(
+            content.get("graph_hint").is_none(),
+            "`{pattern}` must not produce graph_hint: {content}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_matches_unchanged_when_augmented() {
+    // The `matches` array must be byte-identical whether or not augmentation
+    // fires. We compare an augmentation-TRIGGERING grep against a baseline
+    // grep whose pattern matches the EXACT same line(s) but provably cannot
+    // trigger detection (`Child extends` has an `extends` operator but no
+    // capitalized supertype after it, so `detect_inheritance_grep` returns
+    // None). Both run over identical content, so their `matches` must be equal
+    // — proving the augmentation path never filtered, reordered, or mutated
+    // the model's matches.
+    let root = temp_workspace("grep_aug_matches_unchanged");
+    fs::write(
+        root.join("A.java"),
+        "class Child extends Base {\n  void f() {}\n}\n",
+    )
+    .expect("write java");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Sanity: the baseline pattern truly does NOT trigger augmentation.
+    assert!(
+        detect_inheritance_grep("Child extends").is_none(),
+        "baseline pattern must not be detected as inheritance enumeration"
+    );
+
+    let augmented = run_grep(&registry, "class \\w+ extends Base").await;
+    let baseline = run_grep(&registry, "Child extends").await;
+
+    // The baseline run produced no augmentation...
+    assert!(baseline.get("graph_declarations").is_none());
+    assert!(baseline.get("graph_hint").is_none());
+
+    // ...and yet the `matches` arrays are byte-identical: a single-line
+    // `extends Base` is matched by BOTH patterns and de-duped out of
+    // graph_declarations, so the augmenting run's matches equal the baseline's.
+    assert_eq!(
+        augmented["matches"], baseline["matches"],
+        "augmentation must never filter/reorder/mutate matches"
+    );
+    assert_eq!(
+        augmented["matches"].as_array().map(|m| m.len()),
+        Some(1),
+        "expected the single-line declaration to be matched: {augmented}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_cpp_inheritance_emits_reference_hint() {
+    // C++ records inheritance as references, not `base:` attributes, so the
+    // attribute search returns empty. We must NOT claim completeness — emit
+    // only a reference_search hint and augment nothing.
+    let root = temp_workspace("grep_aug_cpp");
+    fs::write(
+        root.join("derived.cpp"),
+        "class Derived : public Base {\npublic:\n  void f();\n};\n",
+    )
+    .expect("write cpp");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let content = run_grep(&registry, "class \\w+ : public Base").await;
+
+    assert!(
+        content.get("graph_declarations").is_none(),
+        "C++ must not claim completeness via graph_declarations: {content}"
+    );
+    let hint = content
+        .get("graph_hint")
+        .expect("graph_hint present for c++ fallback");
+    assert_eq!(hint["tool"], json!("reference_search"), "{hint}");
+    assert_eq!(hint["arguments"]["query"], json!("Base"), "{hint}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn detect_inheritance_grep_positives() {
+    // Dart wrapped-mixin pattern.
+    let dart = detect_inheritance_grep(r"class \w+.*\bwith\b.*WidgetsBindingObserver")
+        .expect("dart mixin pattern qualifies");
+    assert_eq!(dart.base_name, "WidgetsBindingObserver");
+    assert_eq!(dart.decl_kw, "class");
+
+    // Java nested extends pattern: an explicit `extends <Capitalized>`
+    // operator anchors a concrete supertype, so it qualifies even with no
+    // decl keyword (the graph `kind` scope defaults to `class`).
+    let java = detect_inheritance_grep("extends TypeAdapter").expect("extends Foo qualifies");
+    assert_eq!(java.base_name, "TypeAdapter");
+    assert_eq!(java.decl_kw, "class");
+
+    let java2 = detect_inheritance_grep("class \\w+ extends TypeAdapter")
+        .expect("class + extends qualifies");
+    assert_eq!(java2.base_name, "TypeAdapter");
+    assert_eq!(java2.decl_kw, "class");
+
+    let impls = detect_inheritance_grep("interface Foo implements Comparable")
+        .expect("implements qualifies");
+    assert_eq!(impls.base_name, "Comparable");
+    assert_eq!(impls.decl_kw, "interface");
+}
+
+#[test]
+fn detect_inheritance_grep_negatives() {
+    // No supertype literal -> no augmentation.
+    assert!(detect_inheritance_grep("class names").is_none());
+    // `extends_helper` is one identifier token, not an `extends` operator.
+    assert!(detect_inheritance_grep("extends_helper").is_none());
+    // Bare `class \w+` has a keyword but no inheritance signal / supertype.
+    assert!(detect_inheritance_grep(r"class \w+").is_none());
+    // Prose.
+    assert!(detect_inheritance_grep("with the team").is_none());
+    assert!(detect_inheritance_grep("class action plan").is_none());
+    // Diagnostic prose containing the word class but no supertype.
+    assert!(detect_inheritance_grep("error: class missing").is_none());
+}
+
+#[test]
+fn detect_inheritance_grep_extraction() {
+    // Generic args stripped.
+    let g = detect_inheritance_grep("class X extends TypeAdapter<T>").expect("qualifies");
+    assert_eq!(g.base_name, "TypeAdapter");
+
+    // Python `class X(Base):` — supertype is the Capitalized name in the
+    // first parenthesized group.
+    let py = detect_inheritance_grep("class X(Base):").expect("python qualifies");
+    assert_eq!(py.base_name, "Base");
+
+    // `: Base`-style (Rust/Kotlin/C#) inheritance punctuation.
+    let colon = detect_inheritance_grep("struct Foo : Bar").expect("colon qualifies");
+    assert_eq!(colon.base_name, "Bar");
+    assert_eq!(colon.decl_kw, "struct");
 }

@@ -317,6 +317,28 @@ pub fn capabilities_for(provider: &str, model: &str) -> Option<ModelCapabilities
     model_info_for(provider, model).map(|entry| entry.capabilities)
 }
 
+/// Providers whose wire path does NOT forward [`LlmRequest::output_schema`]
+/// to the server: Anthropic and Bedrock have no structured-output field on
+/// their request bodies, and Ollama's native chat route drops it. Every
+/// other provider — the OpenAI Responses family (`openai`, `openai_codex`,
+/// `azure_openai`), Google (`responseSchema`), xAI, and the OpenAI-compatible
+/// presets (`response_format`) — emits the schema. Callers that attach a
+/// strict schema must skip it for these so the model is asked for the same
+/// free-form output it gets today and the loose parser stays the contract.
+const OUTPUT_SCHEMA_OBLIVIOUS_PROVIDERS: &[&str] = &["anthropic", "bedrock", "ollama"];
+
+/// True when `provider`/`model` honors a strict JSON [`LlmRequest::output_schema`]
+/// on the wire — i.e. the provider forwards the schema AND the model advertises
+/// JSON-mode support. Returns `false` (preserving the historical free-form
+/// request) for providers that silently drop the schema or models without
+/// JSON support, so attaching a schema is always a safe no-op there.
+pub fn provider_honors_output_schema(provider: &str, model: &str) -> bool {
+    if OUTPUT_SCHEMA_OBLIVIOUS_PROVIDERS.contains(&provider) {
+        return false;
+    }
+    capabilities_for(provider, model).is_some_and(|caps| caps.json_mode)
+}
+
 pub fn estimate_request_context(
     provider: &str,
     model: &str,

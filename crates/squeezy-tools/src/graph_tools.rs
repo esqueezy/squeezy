@@ -21,9 +21,9 @@ use squeezy_workspace::ExclusionReason;
 
 use crate::{
     DEFAULT_GRAPH_MAX_DEPTH, DEFAULT_GRAPH_MAX_RESULTS, DEFAULT_READ_LIMIT,
-    GRAPH_READ_SLICE_MAX_LINE_SCAN_BYTES, GRAPH_READY_WAIT, MAX_GRAPH_MAX_DEPTH,
-    MAX_GRAPH_MAX_RESULTS, MAX_READ_LIMIT, POLICY_PREFIX_BYTES, ToolCall, ToolCostHint,
-    ToolRegistry, ToolResult, ToolStatus, diff_mode_str, diff_path_set, diff_status_str, file_len,
+    GRAPH_READ_SLICE_MAX_LINE_SCAN_BYTES, MAX_GRAPH_MAX_DEPTH, MAX_GRAPH_MAX_RESULTS,
+    MAX_READ_LIMIT, POLICY_PREFIX_BYTES, ToolCall, ToolCostHint, ToolRegistry, ToolResult,
+    ToolStatus, diff_mode_str, diff_path_set, diff_status_str, file_len, graph_ready_wait,
     is_secret_path, make_result, read_prefix, read_range, sha256_file, tool_arg_error, tool_error,
     workspace_path,
 };
@@ -258,7 +258,7 @@ fn read_diff_packet(
     cost_hint: ToolCostHint,
     next_action_kind: DiffNextActionKind,
 ) -> Value {
-    evidence_packet(
+    let mut packet = evidence_packet(
         claim,
         vec![span_for_path_json(path, span)],
         confidence,
@@ -266,7 +266,18 @@ fn read_diff_packet(
         provenance.to_vec(),
         cost_hint,
         read_diff_next_action(path, next_action_kind),
-    )
+    );
+    // Bare packet (no symbol/reference/edge body), so keep a minimal
+    // spans + confidence here — the diff `ranges` sibling carries content but
+    // is not part of the packet, and this is the only path+span the model has.
+    if let Some(object) = packet.as_object_mut() {
+        object.insert(
+            "spans".to_string(),
+            json!(vec![span_for_path_json(path, span)]),
+        );
+        object.insert("confidence".to_string(), json!(confidence.id()));
+    }
+    packet
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,6 +480,72 @@ pub(crate) fn window_line_offset(
     }
     Ok(newlines)
 }
+
+/// Translate a 1-based, inclusive `[start_line, end_line]` request into the
+/// byte `(offset, limit)` window that `read_file` (which is byte-addressed)
+/// expects. `start_line` defaults to 1 and `end_line` defaults to the end of
+/// file. Streams the file in 8 KiB chunks so large files do not have to be
+/// slurped into memory. `end_line` is clamped to be at least `start_line`.
+///
+/// Returns `(byte_offset_of_start_line, byte_len_through_end_line)`. When
+/// `end_line` is omitted the limit covers the rest of the file from
+/// `start_line`. A `start_line` past EOF yields an offset at EOF with a zero
+/// limit (the handler then returns an empty—but successful—slice rather than
+/// erroring).
+pub(crate) fn byte_window_for_line_range(
+    path: &Path,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+) -> std::result::Result<(usize, usize), std::io::Error> {
+    use std::io::{BufReader, Read};
+    let start_line = start_line.unwrap_or(1).max(1);
+    let end_line = end_line.map(|end| end.max(start_line));
+
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut buf = [0u8; 8192];
+
+    // 1-based line we are currently inside; advances on every '\n'.
+    let mut current_line: u32 = 1;
+    let mut byte_pos: usize = 0;
+    let mut start_offset: Option<usize> = None;
+    // Byte position just past the last newline that closes `end_line`.
+    let mut end_offset: Option<usize> = None;
+
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        for &byte in &buf[..read] {
+            if start_offset.is_none() && current_line == start_line {
+                start_offset = Some(byte_pos);
+            }
+            byte_pos += 1;
+            if byte == b'\n' {
+                if let Some(end_line) = end_line
+                    && current_line == end_line
+                    && end_offset.is_none()
+                {
+                    end_offset = Some(byte_pos);
+                }
+                current_line = current_line.saturating_add(1);
+            }
+        }
+        if start_offset.is_some() && end_offset.is_some() {
+            break;
+        }
+    }
+
+    // `start_line` may begin exactly at EOF (file ends with a newline and the
+    // request points one past the last line) — settle on the EOF position.
+    let start = start_offset.unwrap_or(byte_pos);
+    // No closing newline for `end_line` (last line unterminated, or end_line
+    // beyond EOF): read through the end of file.
+    let end = end_offset.unwrap_or(byte_pos).max(start);
+    Ok((start, end - start))
+}
+
 fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> bool {
     let Some(filter) = filter else {
         return true;
@@ -801,13 +878,28 @@ fn symbol_matches_attribute_filter(symbol: &GraphSymbol, attribute: Option<&str>
     let Some(attribute) = attribute.map(str::trim).filter(|value| !value.is_empty()) else {
         return true;
     };
-    symbol
-        .attributes
-        .iter()
-        .any(|value| value.eq_ignore_ascii_case(attribute) || value.contains(attribute))
+    attribute_filter_matches(&symbol.attributes, attribute)
 }
 
-fn graph_symbol_search(
+/// Multi-value attribute matching: a `|`-separated filter (e.g.
+/// `base:A|base:B|base:C`) matches if the symbol satisfies ANY alternative.
+/// This lets an "enumerate symbols whose base is one of N" query be a SINGLE
+/// `decl_search` call instead of N — the difference between staying under the
+/// per-turn tool-call budget and starving it on a wide hierarchy. A
+/// single-value filter (no `|`) behaves exactly as the original substring match.
+fn attribute_filter_matches(attributes: &[String], filter: &str) -> bool {
+    filter
+        .split('|')
+        .map(str::trim)
+        .filter(|alternative| !alternative.is_empty())
+        .any(|alternative| {
+            attributes
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(alternative) || value.contains(alternative))
+        })
+}
+
+pub(crate) fn graph_symbol_search(
     graph: &squeezy_graph::SemanticGraph,
     query: Option<&str>,
     kind: Option<&str>,
@@ -1028,7 +1120,7 @@ fn parse_symbol_kind(value: &str) -> Option<SymbolKind> {
     }
 }
 
-fn symbol_kind_label(kind: SymbolKind) -> &'static str {
+pub(crate) fn symbol_kind_label(kind: SymbolKind) -> &'static str {
     match kind {
         SymbolKind::Class => "class",
         SymbolKind::Crate => "crate",
@@ -1165,17 +1257,20 @@ fn graph_status_for_language(language: LanguageKind) -> &'static str {
 // the typed graph events rather than the tool result JSON.
 fn evidence_packet(
     _claim: impl Into<String>,
-    spans: Vec<Value>,
-    confidence: Confidence,
+    _spans: Vec<Value>,
+    _confidence: Confidence,
     _freshness: Freshness,
     _provenance: Vec<Provenance>,
     _cost_hint: ToolCostHint,
     _next_action: Value,
 ) -> Value {
-    json!({
-        "spans": spans,
-        "confidence": confidence.id(),
-    })
+    // The top-level `spans`/`confidence` mirror was an exact duplicate of the
+    // data each caller already re-encodes in its body field (symbol/reference/
+    // edge/hierarchy), so it is dropped here. The two callers that emit a bare
+    // packet with no body field — `read_diff_packet` and the
+    // `hierarchy_node_packet` fallback — add a minimal `spans`/`confidence`
+    // back themselves so the model still has the path+span+confidence it needs.
+    json!({})
 }
 
 fn provenance_json(provenance: Provenance) -> Value {
@@ -1206,8 +1301,11 @@ fn symbol_packet(
         },
         next_action,
     );
+    // The top-level `tool` mirror duplicates context the caller already knows
+    // (the tool name is the call that produced this packet); the `symbol` body
+    // identifies the symbol. Dropped to save tokens.
+    let _ = tool;
     if let Some(object) = packet.as_object_mut() {
-        object.insert("tool".to_string(), json!(tool));
         object.insert("symbol".to_string(), symbol_json(graph, symbol));
     }
     packet
@@ -1243,52 +1341,47 @@ fn symbol_context_packet(
         }),
     );
     if let Some(object) = packet.as_object_mut() {
-        object.insert(
-            "references".to_string(),
-            json!(
-                graph
-                    .references_to_symbol(&symbol.id)
-                    .into_iter()
-                    .take(max_references)
-                    .map(reference_json)
-                    .collect::<Vec<_>>()
-            ),
-        );
-        object.insert(
-            "callers".to_string(),
-            json!(
-                graph
-                    .callers(&symbol.id)
-                    .into_iter()
-                    .take(max_references)
-                    .filter_map(|hit| hit.caller)
-                    .map(|caller| symbol_summary_json(&caller))
-                    .collect::<Vec<_>>()
-            ),
-        );
-        object.insert(
-            "callees".to_string(),
-            json!(
-                graph
-                    .callees(&symbol.id)
-                    .into_iter()
-                    .take(max_references)
-                    .filter_map(|hit| hit.callee)
-                    .map(|callee| symbol_summary_json(&callee))
-                    .collect::<Vec<_>>()
-            ),
-        );
-        object.insert(
-            "diagnostics".to_string(),
-            json!(
-                graph
-                    .cargo_diagnostics_for_symbol(symbol)
-                    .into_iter()
-                    .take(max_references)
-                    .map(|hit| cargo_diagnostic_hit_json(&hit))
-                    .collect::<Vec<_>>()
-            ),
-        );
+        // Insert each collection only when non-empty: the common case (a symbol
+        // with no callers/callees/references/diagnostics) used to ship four
+        // empty arrays per packet, paying tokens for nothing.
+        let references = graph
+            .references_to_symbol(&symbol.id)
+            .into_iter()
+            .take(max_references)
+            .map(reference_json)
+            .collect::<Vec<_>>();
+        if !references.is_empty() {
+            object.insert("references".to_string(), json!(references));
+        }
+        let callers = graph
+            .callers(&symbol.id)
+            .into_iter()
+            .take(max_references)
+            .filter_map(|hit| hit.caller)
+            .map(|caller| symbol_summary_json(&caller))
+            .collect::<Vec<_>>();
+        if !callers.is_empty() {
+            object.insert("callers".to_string(), json!(callers));
+        }
+        let callees = graph
+            .callees(&symbol.id)
+            .into_iter()
+            .take(max_references)
+            .filter_map(|hit| hit.callee)
+            .map(|callee| symbol_summary_json(&callee))
+            .collect::<Vec<_>>();
+        if !callees.is_empty() {
+            object.insert("callees".to_string(), json!(callees));
+        }
+        let diagnostics = graph
+            .cargo_diagnostics_for_symbol(symbol)
+            .into_iter()
+            .take(max_references)
+            .map(|hit| cargo_diagnostic_hit_json(&hit))
+            .collect::<Vec<_>>();
+        if !diagnostics.is_empty() {
+            object.insert("diagnostics".to_string(), json!(diagnostics));
+        }
     }
     packet
 }
@@ -1428,8 +1521,10 @@ fn call_edge_packet(
         },
         next_action,
     );
+    // The top-level `tool` mirror duplicates the call context; the `edge` body
+    // already identifies the edge. Dropped to save tokens.
+    let _ = tool;
     if let Some(object) = packet.as_object_mut() {
-        object.insert("tool".to_string(), json!(tool));
         object.insert("edge".to_string(), edge_json(&hit.edge));
         object.insert(
             "caller".to_string(),
@@ -1667,7 +1762,7 @@ fn hierarchy_node_packet(
     if let Some(symbol) = graph.symbols.get(&node.id) {
         return symbol_packet(graph, symbol, tool, symbol_next_action(symbol));
     }
-    evidence_packet(
+    let mut packet = evidence_packet(
         format!("{:?} `{}` appears in hierarchy", node.kind, node.name),
         vec![span_for_path_json(&node.name, Some(node.span))],
         Confidence::ExactSyntax,
@@ -1685,7 +1780,21 @@ fn hierarchy_node_packet(
             "arguments": {"symbol_id": node.id.0},
             "reason": "expand this hierarchy node"
         }),
-    )
+    );
+    // Fallback bare packet (the node has no resolved symbol body), so keep a
+    // minimal spans + confidence — this is the only path+span the model has
+    // for an unresolved hierarchy node.
+    if let Some(object) = packet.as_object_mut() {
+        object.insert(
+            "spans".to_string(),
+            json!(vec![span_for_path_json(&node.name, Some(node.span))]),
+        );
+        object.insert(
+            "confidence".to_string(),
+            json!(Confidence::ExactSyntax.id()),
+        );
+    }
+    packet
 }
 
 pub(crate) fn symbol_json(graph: &squeezy_graph::SemanticGraph, symbol: &GraphSymbol) -> Value {
@@ -2003,7 +2112,10 @@ fn read_slice_target(
             .get(&SymbolId::new(symbol_id))
             .ok_or_else(|| format!("symbol_id not found: {symbol_id}"))?;
         let span = match args.span_kind.unwrap_or_default() {
-            ReadSliceSpanKind::Signature => symbol.span,
+            // Read only the declaration header when the extractor pinned a real
+            // signature span; fall back to the full node for bodyless symbols
+            // and heuristic extractors that left it `None`.
+            ReadSliceSpanKind::Signature => symbol.signature_span.unwrap_or(symbol.span),
             ReadSliceSpanKind::Body => symbol.body_span.unwrap_or(symbol.span),
         };
         return Ok((
@@ -2105,16 +2217,22 @@ fn read_slice_byte_window(
 }
 
 /// Targeted total span (in lines) the read_slice line-range mode auto-widens
-/// toward when the caller passes a tight window. Picked to comfortably contain
-/// a typical Rust `impl Trait for Foo { fn name() … }` block (~10 lines) plus
-/// enough surrounding context that a single fetch covers the enclosing
-/// function/impl in most languages — without forcing a second read when the
-/// model only knew the method's body span.
-const READ_SLICE_AUTO_WIDEN_TARGET_LINES: u32 = 80;
+/// toward when the caller passes a tight window. Sized to cover a typical
+/// function/method body plus a few lines of surrounding context in one fetch.
+/// The caller's requested `[start_line, end_line]` is always fully included,
+/// so this padding only ever adds context — it can never drop a requested
+/// line, and recall cannot regress if it's tight. Kept modest because
+/// read_slice is the single highest-volume tool and most callers request a
+/// far narrower window (Haiku's median line read is ~20 lines); over-padding
+/// every such read toward a large target inflates input tokens on the
+/// dominant cost driver for no recall benefit.
+const READ_SLICE_AUTO_WIDEN_TARGET_LINES: u32 = 48;
 /// Threshold below which a caller-supplied line range is treated as "too
 /// tight" and gets auto-widened up to `READ_SLICE_AUTO_WIDEN_TARGET_LINES`.
-/// Ranges already at or above this size are left exactly as the caller asked.
-const READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES: u32 = 60;
+/// Ranges already at or above this size are left exactly as the caller asked
+/// — a caller that deliberately requested a wide window already has its
+/// context and should not be padded further.
+const READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES: u32 = 40;
 
 fn line_window(
     text: &str,
@@ -2213,8 +2331,17 @@ fn span_json(span: squeezy_core::SourceSpan) -> Value {
     // dropped for the same reason — start column plus the line range pins
     // the span. Saves ~40-60B per span across every packet, repo_map node,
     // symbol, edge, and reference hit.
+    // `start.column` is omitted when it is 0 (the overwhelmingly common case
+    // for declaration spans, which start at column 0): the line range alone
+    // pins the span and the model routes follow-ups by line, so a zero column
+    // is pure overhead.
+    let mut start = serde_json::Map::with_capacity(2);
+    start.insert("line".to_string(), json!(span.start.line));
+    if span.start.column != 0 {
+        start.insert("column".to_string(), json!(span.start.column));
+    }
     json!({
-        "start": {"line": span.start.line, "column": span.start.column},
+        "start": Value::Object(start),
         "end": {"line": span.end.line},
     })
 }
@@ -2244,7 +2371,7 @@ impl ToolRegistry {
     fn execute_graph_tool_blocking(&self, call: &ToolCall) -> ToolResult {
         let mode = graph_tool_diff_mode(call);
         let snapshot = self.diff_snapshot(mode, DiffOptions::default());
-        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(graph_ready_wait());
         let mut graph = match self.graph.lock() {
             Ok(graph) => graph,
             Err(_) => {
@@ -2932,6 +3059,52 @@ impl ToolRegistry {
             Ok(hash) => hash,
             Err(err) => return tool_error(call, err),
         };
+        // Resident-read dedup: if the model already read a byte window that
+        // ENCLOSES this one from an unchanged file, it still has these exact
+        // bytes in context — re-serializing them re-bills the whole transcript.
+        // Recall-safe by the same contract grep/read_file dedup ship: suppress
+        // only on an exact SHA match (file unchanged) AND a prior window that
+        // fully contains the requested one. The stub names `same_as_call_id`
+        // so the model can locate the resident bytes.
+        let projected_end = offset.saturating_add(limit).min(total_bytes as usize);
+        if let Some(store) = self.state_store.as_deref()
+            && let Ok(snaps) = store.read_snapshots_for_path(rel_str.as_str())
+        {
+            let prior = snaps
+                .iter()
+                .filter(|snap| matches!(snap.tool_name.as_str(), "read_file" | "read_slice"))
+                .filter(|snap| snap.content_sha256.as_deref() == Some(content_sha256.as_str()))
+                .filter(|snap| {
+                    snap.start_byte <= offset as u64 && snap.end_byte >= projected_end as u64
+                })
+                .max_by_key(|snap| snap.created_unix_millis);
+            if let Some(snap) = prior {
+                return make_result(
+                    call,
+                    ToolStatus::Success,
+                    json!({
+                        "tool": "read_slice",
+                        "path": &rel_str,
+                        "offset": offset,
+                        "bytes_returned": 0,
+                        "total_bytes": total_bytes,
+                        "sha256": &content_sha256,
+                        "unchanged": true,
+                        "receipt_stub": true,
+                        "dedup": true,
+                        "resident_read": true,
+                        "same_as_call_id": snap.call_id,
+                        "same_as_tool_name": snap.tool_name,
+                        "original_output_sha256": snap.stable_output_sha256,
+                        "original_content_sha256": snap.content_sha256,
+                        "original_model_output_bytes": snap.model_output_bytes,
+                        "truncated": false,
+                    }),
+                    ToolCostHint::default(),
+                    Some(content_sha256.clone()),
+                );
+            }
+        }
         let start_line_1based: u32 = if let Some(span) = resolved_span {
             span.start.line.saturating_add(1)
         } else if offset == 0 {
@@ -3470,7 +3643,7 @@ impl ToolRegistry {
         max_symbols_per_file: usize,
         max_references: usize,
     ) -> Value {
-        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(graph_ready_wait());
         let mut graph = match self.graph.lock() {
             Ok(graph) => graph,
             Err(_) => return json!({"available": false, "error": "semantic graph lock poisoned"}),
@@ -3617,6 +3790,41 @@ mod line_window_auto_widen_tests {
             "end_line clamped to file length, got {}",
             span.end.line + 1
         );
+    }
+}
+
+#[cfg(test)]
+mod attribute_filter_tests {
+    use super::attribute_filter_matches;
+
+    #[test]
+    fn single_value_filter_matches_exact_or_substring() {
+        let attrs = vec!["base:Session".to_string(), "decorator:property".to_string()];
+        assert!(attribute_filter_matches(&attrs, "base:Session"));
+        assert!(attribute_filter_matches(&attrs, "Session")); // substring
+        assert!(!attribute_filter_matches(&attrs, "base:AuthBase"));
+    }
+
+    #[test]
+    fn multi_value_filter_matches_any_alternative() {
+        // The python "9 bases" case: one decl_search instead of nine.
+        let session = vec!["base:Session".to_string()];
+        let auth = vec!["base:AuthBase".to_string()];
+        let unrelated = vec!["base:Widget".to_string()];
+        let filter = "base:Session|base:AuthBase|base:CookieJar";
+        assert!(attribute_filter_matches(&session, filter));
+        assert!(attribute_filter_matches(&auth, filter));
+        assert!(!attribute_filter_matches(&unrelated, filter));
+    }
+
+    #[test]
+    fn multi_value_filter_ignores_blank_alternatives_and_whitespace() {
+        let attrs = vec!["base:Session".to_string()];
+        assert!(attribute_filter_matches(
+            &attrs,
+            "base:Session | base:AuthBase"
+        ));
+        assert!(attribute_filter_matches(&attrs, "|base:Session|"));
     }
 }
 

@@ -265,6 +265,7 @@ pub(crate) fn c_family_symbol_from_node(
     let body = c_family_body_node(node);
     let span = span_from_node(node);
     let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let mut attributes = c_family_attributes_for_node(node, kind, &signature);
@@ -280,6 +281,7 @@ pub(crate) fn c_family_symbol_from_node(
         language_identity: None,
         span,
         body_span,
+        signature_span,
         signature,
         visibility: c_family_visibility_text(node, ctx.source),
         docs: Vec::new(),

@@ -92,6 +92,39 @@ impl From<Option<String>> for CacheSpec {
     }
 }
 
+impl CacheSpec {
+    /// Build a capability-gated cache hint for a control-plane / helper
+    /// request family that re-sends a large, stable prefix (system + tools +
+    /// growing history) across calls sharing the same `key`.
+    ///
+    /// Returns the requested `{ key, retention }` only when the destination
+    /// `(provider, model)` reports `prompt_caching` in the registry;
+    /// otherwise returns [`CacheSpec::default`] (retention `None`) so
+    /// non-supporting providers are byte-for-byte unchanged and never see a
+    /// cache directive they would reject. Centralizing the decision here keeps
+    /// every agent call site that opts into caching consistent — they pass the
+    /// *intent* (a stable key + desired retention) and the registry gate is
+    /// applied in one place.
+    ///
+    /// Callers must only supply a `key` that is stable across the requests
+    /// meant to share a cache prefix and unique to that family — never one that
+    /// mixes unrelated content, which would poison the provider-side affinity.
+    pub fn for_prefix_reuse(
+        provider: &str,
+        model: &str,
+        key: Option<String>,
+        retention: CacheRetention,
+    ) -> Self {
+        let supported = capabilities_for(provider, model)
+            .is_some_and(|capabilities| capabilities.prompt_caching);
+        if supported && retention != CacheRetention::None {
+            Self { key, retention }
+        } else {
+            Self::default()
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "cache_policy_tests.rs"]
 mod tests;
@@ -102,6 +135,36 @@ pub(crate) enum MessageStrategy {
     /// Mark the most recent user-role message (Anthropic recommended).
     LatestUserMessage,
 }
+
+/// How many user-role messages behind the moving (latest-user) breakpoint
+/// the stationary "stable-tail anchor" sits.
+///
+/// Anthropic gives every request four `cache_control` breakpoints. Squeezy's
+/// auto policy spends three (tools / system / latest-user) and historically
+/// left the fourth idle. With only the latest-user breakpoint, an agent loop
+/// re-bills the just-settled tail at the 1.25x cache-*write* rate every round:
+/// when the model appends a large multi-file tool-result batch, the single
+/// moving breakpoint hops onto that fresh batch, so the prefix it vacated is
+/// no longer a cache prefix boundary and gets re-written instead of read.
+/// Real Haiku traces showed `corr(cost, cache_write) = +0.95` and the corpus
+/// written to cache ~2x (e.g. 132k writes for ~67k unique tokens).
+///
+/// The fourth breakpoint anchors a *settled* user block a fixed distance back
+/// from the tail. The bulk prefix up to the anchor is then guaranteed a cheap
+/// cache *read* (0.1x) on the next round while the moving breakpoint absorbs
+/// only the new delta.
+///
+/// The backoff must be `>= 1` so the anchor is strictly behind the moving
+/// breakpoint (two `cache_control` markers on the same block is wasteful and
+/// the anchor would move in lockstep, defeating the purpose). A *small* value
+/// keeps the anchor close to the tail so it still covers nearly the whole
+/// prefix. `2` places the anchor two user turns back: with the typical
+/// assistant-tool-call → user-tool-result cadence that leaves exactly one full
+/// round (the in-flight assistant turn plus its fresh tool-result batch)
+/// between the anchor and the moving breakpoint, so the anchor never lands on
+/// a block that is still being appended to, yet trails the tail by the minimum
+/// needed to settle.
+pub(crate) const STABLE_ANCHOR_BACKOFF: usize = 2;
 
 /// Auto-placement policy: mark tools, system, and the latest user message.
 ///
@@ -216,6 +279,62 @@ pub(crate) mod json_markers {
     pub(crate) fn mark_last_user_block(messages: &mut [Value], retention: CacheRetention) {
         for message in messages.iter_mut().rev() {
             if message.get("role").and_then(Value::as_str) != Some("user") {
+                continue;
+            }
+            if let Some(block) = message
+                .get_mut("content")
+                .and_then(Value::as_array_mut)
+                .and_then(|content| content.last_mut())
+                .and_then(Value::as_object_mut)
+            {
+                block.insert(
+                    "cache_control".to_string(),
+                    super::ephemeral_marker(retention),
+                );
+            }
+            return;
+        }
+    }
+
+    /// Mark the last block of the user-role message that sits `backoff`
+    /// user-role messages behind the most recent one — the stationary
+    /// "stable-tail anchor".
+    ///
+    /// `mark_last_user_block` places the *moving* breakpoint on the latest
+    /// user block; this places a *settled* breakpoint `backoff` user turns
+    /// earlier so the cached prefix up to that point survives as a cheap
+    /// cache read while the moving breakpoint absorbs the freshly appended
+    /// tail. The two markers therefore land on different messages by
+    /// construction (`backoff >= 1`), so no block ever carries two
+    /// `cache_control` markers.
+    ///
+    /// No-op when fewer than `backoff + 1` user-role messages exist — short
+    /// conversations have no settled prefix worth anchoring, and forcing a
+    /// second marker there would collide with (or land adjacent to) the
+    /// moving breakpoint for no benefit. Callers must invoke this with the
+    /// *same* `messages` slice and *after* `mark_last_user_block` so the two
+    /// breakpoints are budgeted together.
+    pub(crate) fn mark_stable_anchor_block(
+        messages: &mut [Value],
+        backoff: usize,
+        retention: CacheRetention,
+    ) {
+        debug_assert!(
+            backoff >= 1,
+            "stable anchor must trail the moving breakpoint"
+        );
+        // Walk from the tail and skip past `backoff` user-role messages; the
+        // next user-role message after that is the anchor. Counting only
+        // user-role messages (not assistant/tool turns) keeps the anchor a
+        // fixed number of *user turns* back regardless of how many assistant
+        // or reasoning blocks sit between them.
+        let mut user_seen = 0usize;
+        for message in messages.iter_mut().rev() {
+            if message.get("role").and_then(Value::as_str) != Some("user") {
+                continue;
+            }
+            user_seen += 1;
+            if user_seen <= backoff {
                 continue;
             }
             if let Some(block) = message
