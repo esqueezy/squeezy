@@ -395,6 +395,52 @@ fn bundled_docs_are_complete_external_corpus() {
 }
 
 #[test]
+fn slash_help_theme_answers_locally() {
+    let help = SqueezyHelp::new("");
+    let answer = help.answer_for_input("/help /theme").expect("theme answer");
+    assert_eq!(answer.status, HelpStatus::Answered);
+    assert_eq!(answer.topic, "/theme");
+    let body = answer.render_markdown();
+    assert!(body.contains("## /theme"), "{body}");
+    assert!(body.contains("Syntax:"), "{body}");
+    assert!(body.contains("starlight"), "{body}");
+}
+
+#[test]
+fn slash_help_router_answers_locally() {
+    let help = SqueezyHelp::new("");
+    let answer = help
+        .answer_for_input("/help /router")
+        .expect("router answer");
+    assert_eq!(answer.status, HelpStatus::Answered);
+    assert_eq!(answer.topic, "/router");
+    let body = answer.render_markdown();
+    assert!(body.contains("routing"), "{body}");
+}
+
+#[test]
+fn slash_help_unknown_command_suggests_closest() {
+    let help = SqueezyHelp::new("");
+    let answer = help
+        .answer_for_input("/help /them")
+        .expect("answer for unknown command");
+    let body = answer.render_markdown();
+    assert!(
+        body.contains("/theme"),
+        "should suggest /theme for /them: {body}"
+    );
+}
+
+#[test]
+fn slash_help_index_shows_grouped_topics() {
+    let help = SqueezyHelp::new("");
+    let answer = help.answer_for_input("/help").expect("index answer");
+    let body = answer.render_markdown();
+    assert!(body.contains("Getting started"), "{body}");
+    assert!(body.contains("Navigation"), "{body}");
+}
+
+#[test]
 fn squeezy_help_doc_citations_are_bundled_paths() {
     let bundled = bundled_doc_paths().into_iter().collect::<BTreeSet<_>>();
     let topics = [
