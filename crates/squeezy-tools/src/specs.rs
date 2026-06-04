@@ -499,7 +499,7 @@ pub(crate) fn read_slice_spec() -> ToolSpec {
                 "max_ranges": {"type": "integer", "minimum": 1, "maximum": 100},
                 "start_byte": {"type": "integer", "minimum": 0},
                 "end_byte": {"type": "integer", "minimum": 0},
-                "start_line": {"type": "integer", "minimum": 1, "description": "1-based start line. Windows narrower than ~60 lines auto-widen symmetrically toward ~80 lines so the enclosing block fits in one fetch."},
+                "start_line": {"type": "integer", "minimum": 1, "description": "1-based start line. Windows narrower than ~40 lines auto-widen symmetrically toward ~48 lines so the enclosing block fits in one fetch."},
                 "end_line": {"type": "integer", "minimum": 1, "description": "1-based end line, inclusive. Pair with start_line; the window auto-widens when too tight."},
                 "context_lines": {"type": "integer", "minimum": 0, "description": "Extra context on each side of the line range, on top of the auto-widening default."},
                 "offset": {"type": "integer", "minimum": 0},

@@ -954,6 +954,55 @@ type Runner struct {
 }
 
 #[test]
+fn go_parser_tags_pointer_and_qualified_embedded_fields() {
+    // Embedded fields can be a pointer (`*Animal`) or qualified (`io.Reader`)
+    // embed with no field-name token. Both must produce a go:embed Field symbol
+    // named by the leaf type (Animal / Reader), not only a base: attribute.
+    let source = r#"
+package zoo
+
+import "io"
+
+type Animal struct {
+    Name string
+}
+
+type Cat struct {
+    *Animal
+    io.Reader
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = go_record("zoo/cat.go", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let cat_id = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Cat" && symbol.kind == SymbolKind::Struct)
+        .map(|symbol| symbol.id.clone())
+        .expect("Cat struct declaration");
+
+    for leaf in ["Animal", "Reader"] {
+        let embedded = parsed
+            .symbols
+            .iter()
+            .find(|symbol| {
+                symbol.name == leaf
+                    && symbol.kind == SymbolKind::Field
+                    && symbol.parent_id.as_ref() == Some(&cat_id)
+            })
+            .unwrap_or_else(|| panic!("embedded {leaf} field symbol (pointer/qualified embed)"));
+        assert!(
+            embedded.attributes.contains(&"go:embed".to_string()),
+            "{leaf} pointer/qualified embed should be tagged go:embed, got {:?}",
+            embedded.attributes
+        );
+        assert!(embedded.attributes.contains(&"go:field".to_string()));
+    }
+}
+
+#[test]
 fn go_parser_attaches_methods_to_types_declared_after_them() {
     let source = r#"
 package greeter
@@ -2779,6 +2828,69 @@ end
             .calls
             .iter()
             .any(|c| c.name == "new" && c.receiver.as_deref() == Some("Foo::Bar"))
+    );
+}
+
+#[test]
+fn ruby_namespaced_mixins_are_distinguishable_by_qualified_attribute() {
+    // Two classes include modules whose leaf name collides (`Component`) but
+    // whose namespace differs. Both carry the shared `mixin:Component` leaf
+    // (kept for the grep->graph augment), but must ALSO carry a fully-qualified
+    // `mixin:<ns>::Component` so `Sidekiq::Component` and `Other::Component`
+    // stay distinguishable instead of collapsing onto the shared leaf.
+    let source = "class Worker\n\
+                  include Sidekiq::Component\n\
+                  end\n\
+                  class Widget\n\
+                  include Other::Component\n\
+                  end\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ruby_record("app/worker.rb", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let worker = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "Worker" && s.kind == SymbolKind::Class)
+        .expect("Worker class");
+    let widget = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "Widget" && s.kind == SymbolKind::Class)
+        .expect("Widget class");
+
+    // Shared leaf on both (the augment relies on it).
+    assert!(worker.attributes.iter().any(|a| a == "mixin:Component"));
+    assert!(widget.attributes.iter().any(|a| a == "mixin:Component"));
+    // Fully-qualified, distinguishing forms.
+    assert!(
+        worker
+            .attributes
+            .iter()
+            .any(|a| a == "mixin:Sidekiq::Component"),
+        "Worker should carry mixin:Sidekiq::Component, got {:?}",
+        worker.attributes
+    );
+    assert!(
+        widget
+            .attributes
+            .iter()
+            .any(|a| a == "mixin:Other::Component"),
+        "Widget should carry mixin:Other::Component, got {:?}",
+        widget.attributes
+    );
+    // The qualified forms do not bleed between the two hosts.
+    assert!(
+        !worker
+            .attributes
+            .iter()
+            .any(|a| a == "mixin:Other::Component")
+    );
+    assert!(
+        !widget
+            .attributes
+            .iter()
+            .any(|a| a == "mixin:Sidekiq::Component")
     );
 }
 

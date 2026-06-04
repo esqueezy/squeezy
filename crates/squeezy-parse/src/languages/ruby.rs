@@ -636,6 +636,14 @@ fn extract_ruby_mixin_or_attr(
             if let Some(host) = ctx.symbols.iter_mut().find(|s| s.id == *parent_id) {
                 host.attributes.push(format!("mixin:{leaf}"));
                 host.attributes.push(format!("mixin:{mixin}:{leaf}"));
+                // For a namespace-qualified mixin (`Sidekiq::Component`), also
+                // record the fully-qualified form so `Sidekiq::Component` and
+                // `Other::Component` stay distinguishable — the bare
+                // `mixin:<leaf>` (kept for the grep→graph augment) collides on
+                // the shared leaf, and the kind-tagged form does too.
+                if text.contains("::") {
+                    host.attributes.push(format!("mixin:{text}"));
+                }
             }
             ctx.references.push(ParsedReference {
                 file_id: ctx.file.id.clone(),

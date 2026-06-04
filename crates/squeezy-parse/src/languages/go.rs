@@ -410,6 +410,17 @@ pub(crate) fn go_field_symbols(
                     }
                 }
             }
+            // Embedded fields can also be a pointer (`*Animal`), qualified
+            // (`io.Reader`), or generic (`Base[T]`) embed with no field-name
+            // token. `base:` attributes already record these via
+            // `go_leaf_type_name`; emit the embedded Field symbol too (named by
+            // the leaf type) so it is not silently dropped.
+            "pointer_type" | "qualified_type" | "generic_type" if names.is_empty() => {
+                if let Some(leaf) = go_leaf_type_name(child, ctx.source) {
+                    is_embed = true;
+                    names.push((leaf, span_from_node(child)));
+                }
+            }
             _ => {}
         }
     }
