@@ -120,7 +120,7 @@ use input::{
     reject_unknown_slash_command,
 };
 
-use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
+use notification::DesktopNotifier;
 use render::palette::{self, blend_color};
 use terminal_writer::TerminalWriter;
 use toast::ToastQueue;
@@ -836,9 +836,6 @@ async fn run_inner_with_terminal(
         if app.finalize_elapsed_settles() {
             app.needs_redraw = true;
         }
-        if app.app_notifications.tick() {
-            app.needs_redraw = true;
-        }
         if app.toasts.tick() {
             app.needs_redraw = true;
         }
@@ -1194,13 +1191,10 @@ async fn apply_plan_choice(
 /// session — the most common cause is mid-write (the editor truncating the
 /// file before re-writing) and the next poll will see the finished file.
 fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
-    use crate::notification::Severity;
-
     let new_cfg = match AppConfig::from_env_and_settings() {
         Ok(cfg) => cfg,
         Err(err) => {
-            app.app_notifications
-                .push(format!("settings reload failed: {err}"), Severity::Warn);
+            app.push_warn(format!("settings reload failed: {err}"));
             return;
         }
     };
@@ -1218,8 +1212,7 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     app.apply_config_change(&new_cfg);
     if old_provider == new_provider {
         agent.replace_config(new_cfg);
-        app.app_notifications
-            .push("settings reloaded from disk".to_string(), Severity::Info);
+        app.push_status("settings reloaded from disk".to_string());
         return;
     }
     let provider_cfg = new_cfg.provider.clone();
@@ -1233,28 +1226,34 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
                     "provider {old_provider} → {new_provider} (applies on next prompt)"
                 )),
             });
-            app.app_notifications.push(
-                format!(
-                    "settings reloaded — provider {old_provider} → {new_provider} arms on next prompt"
-                ),
-                Severity::Info,
-            );
+            app.push_status(format!(
+                "settings reloaded — provider {old_provider} → {new_provider} arms on next prompt"
+            ));
         }
         Ok(Err(err)) => {
             agent.replace_config(new_cfg);
-            app.app_notifications.push(
-                format!(
-                    "settings reloaded, but the new {new_provider} client failed to build: {err}"
-                ),
-                Severity::Error,
-            );
+            app.push_warn(format!(
+                "settings reloaded, but the new {new_provider} client failed to build: {err}"
+            ));
         }
         Err(_) => {
             agent.replace_config(new_cfg);
-            app.app_notifications.push(
-                "settings reloaded, but the provider client thread panicked".to_string(),
-                Severity::Error,
-            );
+            app.push_warn("settings reloaded, but the provider client thread panicked".to_string());
+        }
+    }
+}
+
+/// Drain the config screen's accumulated feedback into the durable
+/// transcript. Errors and warnings render as `⚠` warning lines; info and
+/// success notes render as dim operational chrome.
+fn forward_config_feedback(app: &mut TuiApp, mut feedback: config_screen::ConfigFeedback) {
+    use config_screen::Severity;
+    for entry in feedback.drain() {
+        match entry.severity {
+            Severity::Error | Severity::Warn => {
+                app.push_warn(entry.message);
+            }
+            Severity::Info | Severity::Success => app.push_status(entry.message),
         }
     }
 }
@@ -1973,10 +1972,12 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // While the config screen is open, route all other keys to it.
     if app.config_screen.is_some() {
         let state = app.config_screen.as_mut().expect("checked above");
-        let outcome = config_screen::handle_key(state, agent, &mut app.app_notifications, key);
+        let mut feedback = config_screen::ConfigFeedback::new();
+        let outcome = config_screen::handle_key(state, agent, &mut feedback, key);
         if matches!(outcome, config_screen::KeyOutcome::Close) {
             app.config_screen = None;
         }
+        forward_config_feedback(app, feedback);
         return Ok(false);
     }
 
@@ -1999,26 +2000,6 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             }
         }
         return Ok(false);
-    }
-
-    // `n` dismisses the current notification, `N` clears all. Only fires
-    // when the prompt is empty so we don't eat keystrokes the user is
-    // typing into the input area.
-    if app.transcript_overlay.is_none()
-        && app.input.is_empty()
-        && !app.app_notifications.is_empty()
-        && key.modifiers.is_empty()
-    {
-        if key.code == KeyCode::Char('n') {
-            if app.app_notifications.dismiss_current() {
-                return Ok(false);
-            }
-        } else if key.code == KeyCode::Char('N') {
-            let removed = app.app_notifications.clear_all();
-            if removed > 0 {
-                return Ok(false);
-            }
-        }
     }
 
     if app.exit_confirm_armed
@@ -2804,15 +2785,11 @@ fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: String) {
     }];
     match apply_edits(&scope_target, &edits) {
         Ok(_) => {
-            app.app_notifications
-                .push(format!("theme → {theme}"), NotifySeverity::Success);
+            app.push_status(format!("theme → {theme}"));
             app.status = format!("theme saved to {}", target_path.display());
         }
         Err(err) => {
-            app.app_notifications.push(
-                format!("theme switched but save failed: {err}"),
-                NotifySeverity::Warn,
-            );
+            app.push_warn(format!("theme switched but save failed: {err}"));
             app.status = format!("theme switched (not persisted): {err}");
         }
     }
@@ -3105,13 +3082,10 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 && !raw.is_empty()
                 && id.is_none()
             {
-                app.app_notifications.push(
-                    format!(
-                        "/config: '{raw}' is not a navigable section — opening the default view. \
-                         Press / to search field labels."
-                    ),
-                    NotifySeverity::Warn,
-                );
+                app.push_warn(format!(
+                    "/config: '{raw}' is not a navigable section — opening the default view. \
+                     Press / to search field labels."
+                ));
             }
             toggle_config_screen(app, agent, id);
         }
@@ -4325,10 +4299,7 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
     // for these session-scoped switches.
     app.status = format!("reasoning effort → {label}");
     if std::env::var("SQUEEZY_REASONING_EFFORT").is_ok() {
-        app.app_notifications.push(
-            "SQUEEZY_REASONING_EFFORT overrides this on next load".to_string(),
-            NotifySeverity::Warn,
-        );
+        app.push_warn("SQUEEZY_REASONING_EFFORT overrides this on next load".to_string());
     }
 }
 
@@ -4610,8 +4581,7 @@ fn start_user_turn_prepared(app: &mut TuiApp, agent: &mut Agent, prompt: Prepare
             .display_note
             .clone()
             .unwrap_or_else(|| "config applied".to_string());
-        app.app_notifications
-            .push(format!("✓ applied: {note}"), NotifySeverity::Success);
+        app.push_status(format!("✓ applied: {note}"));
     }
     let cancel = CancellationToken::new();
     app.task_state = None;
@@ -5581,35 +5551,11 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         return;
     }
     if let Some(state) = &app.status_line_setup {
-        let notif_h = app.app_notifications.height();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(if notif_h > 0 {
-                vec![Constraint::Min(0), Constraint::Length(notif_h)]
-            } else {
-                vec![Constraint::Min(0)]
-            })
-            .split(area);
-        status_line_setup::render(frame, chunks[0], state, app);
-        if notif_h > 0 {
-            render_notification_pane(frame, chunks[1], app);
-        }
+        status_line_setup::render(frame, area, state, app);
         return;
     }
     if let Some(state) = &app.config_screen {
-        let notif_h = app.app_notifications.height();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(if notif_h > 0 {
-                vec![Constraint::Min(0), Constraint::Length(notif_h)]
-            } else {
-                vec![Constraint::Min(0)]
-            })
-            .split(area);
-        config_screen::render(frame, chunks[0], state);
-        if notif_h > 0 {
-            render_notification_pane(frame, chunks[1], app);
-        }
+        config_screen::render(frame, area, state);
         return;
     }
     let include_startup_card = area.height >= 16;
@@ -5671,10 +5617,6 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     if approval_height > 0 {
         constraints.push(Constraint::Length(approval_height));
     }
-    let notification_height = app.app_notifications.height();
-    if notification_height > 0 {
-        constraints.push(Constraint::Length(notification_height));
-    }
     constraints.push(Constraint::Length(2));
     if subagent_height > 0 {
         constraints.push(Constraint::Length(subagent_height));
@@ -5710,10 +5652,6 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         render_approval(frame, chunks[index], app);
         index += 1;
     }
-    if notification_height > 0 {
-        render_notification_pane(frame, chunks[index], app);
-        index += 1;
-    }
     render_status(frame, chunks[index], app);
     index += 1;
     if subagent_height > 0 {
@@ -5724,51 +5662,6 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     // instead of pinning it to the terminal bottom.
     let _ = chunks[index];
     render_toast_overlay(frame, area, app);
-}
-
-fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    use ratatui::{
-        style::{Modifier, Style},
-        text::{Line, Span},
-        widgets::Paragraph,
-    };
-    let Some(current) = app.app_notifications.current() else {
-        return;
-    };
-    let remaining_secs = current.remaining().as_secs();
-    let mut spans = vec![
-        Span::styled(
-            current.severity.glyph(),
-            Style::default()
-                .fg(current.severity.color())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            current.message.as_str(),
-            Style::default().fg(palette::muted_fg()),
-        ),
-    ];
-    if let Some(hint) = current.action_hint {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            hint,
-            Style::default().fg(crate::render::theme::quiet()),
-        ));
-    }
-    if app.app_notifications.len() > 1 {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("({}+)", app.app_notifications.len() - 1),
-            Style::default().fg(crate::render::theme::quiet()),
-        ));
-    }
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        format!("· {remaining_secs}s"),
-        Style::default().fg(crate::render::theme::quiet()),
-    ));
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Overlay the corner-toast stack on the top-right of `area`. Each visible
@@ -5822,35 +5715,11 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
         return;
     }
     if let Some(state) = &app.status_line_setup {
-        let notif_h = app.app_notifications.height();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(if notif_h > 0 {
-                vec![Constraint::Min(0), Constraint::Length(notif_h)]
-            } else {
-                vec![Constraint::Min(0)]
-            })
-            .split(area);
-        status_line_setup::render(frame, chunks[0], state, app);
-        if notif_h > 0 {
-            render_notification_pane(frame, chunks[1], app);
-        }
+        status_line_setup::render(frame, area, state, app);
         return;
     }
     if let Some(state) = &app.config_screen {
-        let notif_h = app.app_notifications.height();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(if notif_h > 0 {
-                vec![Constraint::Min(0), Constraint::Length(notif_h)]
-            } else {
-                vec![Constraint::Min(0)]
-            })
-            .split(area);
-        config_screen::render(frame, chunks[0], state);
-        if notif_h > 0 {
-            render_notification_pane(frame, chunks[1], app);
-        }
+        config_screen::render(frame, area, state);
         return;
     }
     let input_height = input_panel_height(app, area.width);
@@ -14002,12 +13871,10 @@ pub(crate) struct TuiApp {
     pub(crate) pending_feedback: Option<PreparedFeedback>,
     pub(crate) pending_report: Option<BugReportBundle>,
     pub(crate) clipboard: Box<dyn Clipboard>,
-    pub(crate) app_notifications: NotificationQueue,
     /// Corner toast stack — short-lived overlays for fire-and-forget
-    /// status events (telemetry flush, MCP connect, index ready). Kept
-    /// separate from `app_notifications` because that surface is an
-    /// inline rotating banner; toasts overlay the top-right and stack up
-    /// to three at a time.
+    /// status events (telemetry flush, MCP connect, index ready). Toasts
+    /// overlay the top-right and stack up to three at a time; durable
+    /// notices land in the transcript instead.
     pub(crate) toasts: ToastQueue,
     /// Opt-in OSC 9 / BEL emitter for off-tab attention. Disabled by
     /// default; flips on via `[tui].desktop_notifications`.
@@ -14372,7 +14239,6 @@ impl TuiApp {
             pending_feedback: None,
             pending_report: None,
             clipboard,
-            app_notifications: NotificationQueue::new(),
             toasts: ToastQueue::new(),
             desktop_notifier: DesktopNotifier::new(config.tui.desktop_notifications),
             config_screen: None,

@@ -10823,11 +10823,10 @@ fn json_patch_preview_parser_emits_events_per_patch() {
 
 #[tokio::test]
 async fn shell_sandbox_best_effort_fallback_warns_user_once_per_session() {
-    // F3-4: the TUI must surface the silent sandbox degradation
-    // through the notification banner AND a transcript notice on the
-    // first fallback; the agent's once-per-session gate means this
-    // event only ever fires once, so we assert both surfaces hold a
-    // single entry afterwards.
+    // F3-4: the TUI must surface the silent sandbox degradation as a
+    // durable transcript warning on the first fallback; the agent's
+    // once-per-session gate means this event only ever fires once, so we
+    // assert the transcript holds a single naming entry afterwards.
     let mut app = test_app(SessionMode::Build);
     let (tx, rx) = mpsc::channel(8);
     app.turn_rx = Some(rx);
@@ -10841,34 +10840,30 @@ async fn shell_sandbox_best_effort_fallback_warns_user_once_per_session() {
     drop(tx);
     drain_agent_events(&mut app).await;
 
-    let banner_message = app
-        .app_notifications
-        .current()
-        .map(|notification| notification.message.clone())
-        .expect("banner notification should be queued");
-    assert!(
-        banner_message.contains("shell sandbox degraded"),
-        "banner text mismatch: {banner_message}"
-    );
-    assert!(
-        banner_message.contains("macos-sandbox-exec"),
-        "banner must name the degraded backend: {banner_message}"
-    );
-
     let needle = "shell sandbox degraded";
-    let occurrences = app
+    let matching: Vec<&str> = app
         .transcript
         .iter()
-        .filter(|entry| match &entry.kind {
-            TranscriptEntryKind::Message(item) => item.content.contains(needle),
-            TranscriptEntryKind::Log(LogEntry { message, .. }) => message.contains(needle),
-            _ => false,
+        .filter_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Message(item) if item.content.contains(needle) => {
+                Some(item.content.as_str())
+            }
+            TranscriptEntryKind::Log(LogEntry { message, .. }) if message.contains(needle) => {
+                Some(message.as_str())
+            }
+            _ => None,
         })
-        .count();
+        .collect();
     assert_eq!(
-        occurrences, 1,
+        matching.len(),
+        1,
         "fallback warning must render exactly once; transcript: {:?}",
         app.transcript
+    );
+    assert!(
+        matching[0].contains("macos-sandbox-exec"),
+        "fallback warning must name the degraded backend: {}",
+        matching[0]
     );
 }
 
@@ -13046,14 +13041,25 @@ async fn unknown_config_slug_emits_warning_then_opens_default() {
     .await
     .expect("handle key");
     assert!(app.config_screen.is_some(), "screen should still open");
-    let recent = (0..app.app_notifications.len())
-        .filter_map(|_| app.app_notifications.current())
-        .next();
-    let message = recent.map(|n| n.message.clone()).unwrap_or_default();
+    let message = transcript_log_text(&app);
     assert!(
         message.contains("nosuchsection") && message.contains("not a navigable section"),
         "unknown slug should surface a warning naming the bad slug, got: {message}"
     );
+}
+
+/// Concatenate every `Log` entry's message in the transcript. Tests use it
+/// to assert that a notice landed in the durable transcript instead of the
+/// removed rotating notification pane.
+fn transcript_log_text(app: &TuiApp) -> String {
+    app.transcript
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Log(LogEntry { message, .. }) => Some(message.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[tokio::test]
@@ -13068,8 +13074,7 @@ async fn config_slug_for_unregistered_meta_warns() {
     )
     .await
     .expect("handle key");
-    let recent = app.app_notifications.current();
-    let message = recent.map(|n| n.message.clone()).unwrap_or_default();
+    let message = transcript_log_text(&app);
     assert!(
         message.contains("skills"),
         "skills slug (SectionId variant w/o ConfigSectionMeta) should warn, got: {message}"
@@ -13088,8 +13093,7 @@ async fn config_with_no_arg_does_not_emit_unknown_slug_warning() {
     )
     .await
     .expect("handle key");
-    let note = app.app_notifications.current();
-    let message = note.map(|n| n.message.clone()).unwrap_or_default();
+    let message = transcript_log_text(&app);
     assert!(
         !message.contains("not a navigable section"),
         "no-arg /config must not warn about a missing slug, got: {message}"
