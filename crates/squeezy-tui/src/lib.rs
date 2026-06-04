@@ -133,9 +133,9 @@ const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
 const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
 /// Default tool-card cap for model-initiated tool calls. Aggressive on
-/// purpose — the structured detail is one keystroke (Ctrl-E / Ctrl-T)
-/// away, and a 5-line preview keeps the transcript readable even when
-/// the model fires off long commands.
+/// purpose — the structured detail is one keystroke (Ctrl+T) away, and a
+/// 5-line preview keeps the transcript readable even when the model fires
+/// off long commands.
 const TOOL_CALL_MAX_LINES: usize = 5;
 /// Larger cap for `!`-shell calls the user typed directly (those carry
 /// `direct_user_shell: true` in their arguments, set by
@@ -1321,13 +1321,14 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
 }
 
 /// Drain the config screen's accumulated feedback into the durable
-/// transcript. Errors and warnings render as `⚠` warning lines; info and
-/// success notes render as dim operational chrome.
+/// transcript. Errors render as red `✖` failure lines; warnings render as
+/// cyan `⚠` lines; info and success notes render as dim operational chrome.
 fn forward_config_feedback(app: &mut TuiApp, mut feedback: config_screen::ConfigFeedback) {
     use config_screen::Severity;
     for entry in feedback.drain() {
         match entry.severity {
-            Severity::Error | Severity::Warn => {
+            Severity::Error => app.push_error(entry.message),
+            Severity::Warn => {
                 app.push_warn(entry.message);
             }
             Severity::Info | Severity::Success => app.push_status(entry.message),
@@ -1942,13 +1943,16 @@ fn focus_subagent_pane_from_composer(app: &mut TuiApp) {
 /// this overlay (which renders the active conversation source).
 fn open_subagent_transcript_overlay(app: &mut TuiApp) {
     app.transcript_overlay_scrollbar_cache.set(None);
-    // Open folded, formatted like the main inline conversation; Ctrl-T then
+    // Open folded, formatted like the main inline conversation; Ctrl+T then
     // expands every body, Esc closes.
     app.transcript_overlay = Some(TranscriptOverlayState {
         detail: OverlayDetail::Collapsed,
         ..TranscriptOverlayState::default()
     });
-    app.status = "subagent conversation — Ctrl-T to expand, Esc to close".to_string();
+    app.status = format!(
+        "subagent conversation — {} to expand, Esc to close",
+        key_hint(app, keymap::Action::ToggleTranscriptOverlay)
+    );
 }
 
 fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
@@ -2197,9 +2201,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
-    // (Old `Ctrl+E` readline line-end is gone — that key now toggles
-    // expand-all unconditionally via the keymap. Use `End` /
-    // `Cmd+Right` for cursor-to-line-end.)
+    // `Ctrl+E` was removed; use `End` / `Cmd+Right` for cursor-to-line-end.
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
         delete_to_line_end(app);
@@ -2413,8 +2415,8 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             if reject_unknown_slash_command(app, &input) {
                 return Ok(false);
             }
-            // Stash the typed prompt before clearing so that a Ctrl-C/Esc
-            // during the turn can restore it via Ctrl-R. Completion clears
+            // Stash the typed prompt before clearing so that a Ctrl+C/Esc
+            // during the turn can restore it via Ctrl+R. Completion clears
             // this field; only Cancelled/Failed leave it set.
             app.cancelled_prompt = Some(input.clone());
             push_input_history(app, input.clone());
@@ -6777,7 +6779,7 @@ impl TranscriptOverlayMode {
 /// How much of each entry the overlay shows. `Collapsed` mirrors the main
 /// inline view — tool cards folded, reasoning trimmed — so a subagent opens
 /// formatted like the main conversation; `Expanded` unfolds every body for the
-/// "read everything" view. Ctrl-T steps Collapsed → Expanded → closed.
+/// "read everything" view. Ctrl+T steps Collapsed → Expanded → closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum OverlayDetail {
     Collapsed,
@@ -6856,7 +6858,10 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Some(state) => state,
         None => return,
     };
-    let title = " Transcript — Ctrl-T or Esc to close · PgUp/PgDn or wheel scroll ";
+    let title = format!(
+        " Transcript — {} or Esc to close · PgUp/PgDn or wheel scroll ",
+        key_hint(app, keymap::Action::ToggleTranscriptOverlay)
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -7291,13 +7296,13 @@ fn render_transcript_overlay_scrollbar(
 
 /// Build the per-entry line list for the overlay: every committed entry is
 /// forced to its expanded form, and the live assistant tail is appended so
-/// opening Ctrl-T mid-turn does not look frozen.
+/// opening Ctrl+T mid-turn does not look frozen.
 fn transcript_lines_for_overlay(
     app: &TuiApp,
     width: Option<u16>,
     expand_all: bool,
 ) -> Vec<Line<'static>> {
-    // Expanded is the "Ctrl-T for full transcript" escape hatch — body content
+    // Expanded is the "Ctrl+T for full transcript" escape hatch — body content
     // blocks (read_tool_output payloads, shell stdout/stderr) honour this
     // verbosity, so pin Verbose to defeat the per-mode line cap. Collapsed
     // mirrors the inline view, so it honours the user's configured verbosity.
@@ -9023,7 +9028,7 @@ fn reasoning_block_lines_with_extras(
             .unwrap_or_default();
         let mut suffix = if body_lines.len() > 1 {
             format!(
-                " … +{} lines (Ctrl-T for full transcript)",
+                " … +{} lines (Ctrl+T for full transcript)",
                 body_lines.len() - 1
             )
         } else {
@@ -9208,7 +9213,7 @@ fn collapsed_content_summary(content: &str) -> String {
     if lines.len() > 1 {
         let first = compact_text(lines.first().copied().unwrap_or_default(), 120);
         format!(
-            "{first} … +{} lines (Ctrl-T for full transcript)",
+            "{first} … +{} lines (Ctrl+T for full transcript)",
             lines.len() - 1
         )
     } else {
@@ -9287,7 +9292,7 @@ fn wrap_tool_card(header: Line<'static>, body: Vec<Line<'static>>) -> Vec<Line<'
 /// `extras + 1` consecutive same-tool same-status entries.
 ///
 /// In collapsed form the header reads `"Read 3 files"` etc., the body is
-/// one summary row per member followed by a `(Ctrl-T for full transcript)`
+/// one summary row per member followed by a `(Ctrl+T for full transcript)`
 /// affordance row. In expanded form the header is followed by each
 /// member's normal tool-card body rendered inline so the user can scan
 /// their full output.
@@ -9319,7 +9324,7 @@ fn format_grouped_tool_result_entry(
         body.push(detail_line(
             false,
             crate::render::theme::quiet(),
-            "(Ctrl-T for full transcript)".to_string(),
+            "(Ctrl+T for full transcript)".to_string(),
         ));
     } else {
         // Stack each child's full single-tool render. Each is already
@@ -9466,7 +9471,7 @@ fn collapsed_tool_preview_lines(
 }
 
 /// Head-tail truncate a list of rendered detail lines, inserting a single
-/// "… +N lines (Ctrl-T for full transcript)" ellipsis between the head and tail
+/// "… +N lines (Ctrl+T for full transcript)" ellipsis between the head and tail
 /// when the total exceeds `2 * cap`. Cap is the maximum number of lines
 /// to keep on EACH end. Mirrors codex's `output_ellipsis_line` UX —
 /// wording stays consistent with the existing diff renderer
@@ -9481,7 +9486,7 @@ fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'
     out.push(detail_line(
         false,
         crate::render::theme::quiet(),
-        format!("… +{omitted} lines (Ctrl-T for full transcript)"),
+        format!("… +{omitted} lines (Ctrl+T for full transcript)"),
     ));
     out.extend(
         lines
@@ -11157,7 +11162,7 @@ fn expanded_symbol_context_detail_lines(
             false,
             crate::render::theme::quiet(),
             format!(
-                "+{} more packets (Ctrl-T for full transcript)",
+                "+{} more packets (Ctrl+T for full transcript)",
                 total - packet_cap
             ),
         ));
@@ -11876,7 +11881,7 @@ fn expanded_read_tool_output_detail_lines(
         // Spilled tool payloads are routinely hundreds of lines of raw JSON,
         // so fold inline even on the expanded card — the overlay (which
         // pins Verbose) still hands the full content to anyone hitting
-        // Ctrl-T. Generic `output_block_lines` stays unbounded so the
+        // Ctrl+T. Generic `output_block_lines` stays unbounded so the
         // existing "expand grep → see every match" behaviour is preserved.
         let limit = saved_output_preview_limit(verbosity);
         let byte_limit = saved_output_line_byte_limit(verbosity);
@@ -11889,7 +11894,7 @@ fn expanded_read_tool_output_detail_lines(
                     // Clamp each line by bytes: spilled payloads are routinely
                     // minified single-line JSON, which the line-count cap above
                     // can't bound — one such line would otherwise wrap into
-                    // hundreds of rows. Verbose (the Ctrl-T overlay) is left
+                    // hundreds of rows. Verbose (the Ctrl+T overlay) is left
                     // unbounded so the full content stays available.
                     let text = truncate_bytes(&line.text, byte_limit);
                     lines.push(detail_spans_line(styled_output_spans(&text)));
@@ -12129,7 +12134,7 @@ fn expanded_generic_tool_detail_lines(
             false,
             crate::render::theme::quiet(),
             format!(
-                "+{} more fields (Ctrl-T for full transcript)",
+                "+{} more fields (Ctrl+T for full transcript)",
                 total_keys - shown
             ),
         ));
@@ -12233,7 +12238,7 @@ fn head_tail_lines(content: &str, limit: usize) -> Vec<PreviewLine> {
         })
         .collect::<Vec<_>>();
     preview.push(PreviewLine {
-        text: format!("… +{omitted} lines (Ctrl-T for full transcript)"),
+        text: format!("… +{omitted} lines (Ctrl+T for full transcript)"),
         truncated_marker: true,
     });
     preview.extend(
@@ -12462,12 +12467,12 @@ fn append_truncation_hint(spans: &mut Vec<Span<'static>>, tool: &ToolTranscript)
     //     payload was written to disk under `.squeezy/tool_outputs/<sha>`.
     //     The model gets a handle it can pass to `read_tool_output`. The
     //     card body shows a preview; the rest is NOT in the transcript
-    //     and Ctrl-T can't surface it, so name the file directly — that
+    //     and Ctrl+T can't surface it, so name the file directly — that
     //     is the only escape hatch a curious user has.
     //   * Tool-cap: the tool itself returned a partial slice (repo_map
     //     packet cap, decl_search row cap, etc.). The model needs to
     //     re-query with narrower filters to see more.
-    // The old shared "more available" label promised something Ctrl-T
+    // The old shared "more available" label promised something Ctrl+T
     // couldn't deliver — distinguish both so the affordance matches reality.
     let spilled = tool.result.content["spilled"].as_bool().unwrap_or(false);
     if spilled {
@@ -13577,7 +13582,7 @@ fn subagent_pane_summary_row(app: &TuiApp, width: u16) -> Line<'static> {
     let total = records.len();
 
     let (glyph, glyph_color) = if failed > 0 {
-        ("✗", crate::render::theme::red())
+        ("✖", crate::render::theme::red())
     } else if done > 0 {
         ("✓", crate::render::theme::green())
     } else {
@@ -13992,6 +13997,13 @@ fn format_status_hints(app: &TuiApp) -> String {
     }
 }
 
+/// Returns the display string (e.g. `"Ctrl+T"`, `"Ctrl+O"`) for a
+/// rebindable action, consulting the live resolved keymap so hints
+/// stay accurate after `[tui.keymap]` overrides.
+fn key_hint(app: &TuiApp, action: keymap::Action) -> String {
+    app.keymap.binding(action).display()
+}
+
 fn format_status_hint_base(app: &TuiApp) -> String {
     if let Some(overlay) = app.transcript_overlay.as_ref() {
         return if overlay.mode.mouse_capture() {
@@ -14025,13 +14037,16 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         }
         return "Enter accept · N decline · Esc cancel".to_string();
     } else if app.pending_approval.is_some() {
-        return "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Esc cancel"
+        return "Up/Down choose · Enter/Y approve once · A/P always approve repo · N/D deny · Esc cancel"
             .to_string();
     } else if app.pending_feedback.is_some() {
         return "Enter/Y send feedback · Esc/N discard".to_string();
     } else if app.cancel.is_some() {
-        let mut hint = String::from(
-            "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-T full transcript · Ctrl-Y copy · /help",
+        let mut hint = format!(
+            "Ctrl+C/Esc interrupt · Enter queue · Ctrl+J newline · {} task · {} full transcript · {} copy · /help",
+            key_hint(app, keymap::Action::ToggleTaskPanel),
+            key_hint(app, keymap::Action::ToggleTranscriptOverlay),
+            key_hint(app, keymap::Action::CopyLastAssistant),
         );
         if !app.subagent_pane.records.is_empty() {
             hint.push_str(" · Down subagents");
@@ -14046,11 +14061,15 @@ fn format_status_hint_base(app: &TuiApp) -> String {
     if app.cancelled_prompt.is_some() && app.turn_rx.is_none() && app.input.is_empty() {
         // We're idle right after a cancelled/failed turn — surface the
         // recovery affordance before the regular hint set.
-        return "Ctrl-R restore last prompt · Enter send · Ctrl+J newline · /help".to_string();
+        return format!(
+            "{} restore last prompt · Enter send · Ctrl+J newline · /help",
+            key_hint(app, keymap::Action::RestoreCancelledPrompt)
+        );
     }
-    let mut base =
-        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-T full transcript · /help"
-            .to_string();
+    let mut base = format!(
+        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · {} full transcript · /help",
+        key_hint(app, keymap::Action::ToggleTranscriptOverlay)
+    );
     if app.context_compaction_threshold > 0
         && context_window_pct(
             app.context_estimate.estimated_tokens,
@@ -14846,7 +14865,7 @@ pub(crate) struct TuiApp {
     pub(crate) pending_mcp_elicitation: Option<PendingMcpElicitation>,
     pub(crate) pending_request_user_input: Option<PendingRequestUserInput>,
     /// Prompt that was in flight when the most recent turn was cancelled
-    /// or failed. Surfaced via Ctrl-R so the user can recover from a
+    /// or failed. Surfaced via Ctrl+R so the user can recover from a
     /// typo without retyping. Cleared on successful completion.
     pub(crate) cancelled_prompt: Option<String>,
     /// True when the in-flight turn has already produced a successful
@@ -15643,7 +15662,7 @@ impl TuiApp {
 
     /// Record a subagent's completed tool call as a real `ToolResult` rail node
     /// in its transcript, so the subagent view renders `├─✔ Ran X` cards
-    /// (folded by default, body unfolded by Ctrl-T) exactly like the main
+    /// (folded by default, body unfolded by Ctrl+T) exactly like the main
     /// conversation — not the flat off-rail lifecycle line it used to show.
     pub(crate) fn note_subagent_tool_result(
         &mut self,
@@ -16083,7 +16102,7 @@ impl TranscriptEntry {
         // direct `!`-shell).
         //
         // Failed tool calls are the exception. The preview hides the
-        // actual error message under "Ctrl-O to expand", which is
+        // actual error message under "Ctrl+O to expand", which is
         // exactly the failure mode the user complained about — a row
         // of red ✖ "Failed X" with no visible reason. Auto-expand on
         // failure so the diagnostic is inline, without forcing a
@@ -16147,8 +16166,7 @@ impl TranscriptEntry {
         Self {
             id,
             kind: TranscriptEntryKind::Diff(Box::new(data)),
-            // `/diff` is never truncated by default. The user can still
-            // Ctrl-E to fold the body if it's huge.
+            // `/diff` is never truncated by default.
             collapsed: false,
             revision: 0,
             settle: None,
@@ -16175,7 +16193,7 @@ impl TranscriptEntry {
             kind: TranscriptEntryKind::Reasoning(Box::new(snapshot)),
             // Reasoning is visible by default when `show_reasoning_usage`
             // is enabled, but compact transcript mode keeps the body under
-            // a concise chip. Ctrl-T opens the full transcript with details.
+            // a concise chip. Ctrl+T opens the full transcript with details.
             collapsed: transcript_default == TranscriptDefault::Compact,
             revision: 0,
             settle: None,
