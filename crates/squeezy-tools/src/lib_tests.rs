@@ -1916,6 +1916,249 @@ async fn read_slice_diff_mode_returns_only_changed_worktree_ranges() {
 }
 
 #[tokio::test]
+async fn symbol_context_reports_truncated_when_matches_exceed_max_results() {
+    // Bug #10: `symbol_context` applied `take(max_results)` but always emitted
+    // `truncated:false`. With three matching symbols and `max_results:1`, the
+    // response must own up to truncation; raising the cap above the match count
+    // must report `false`.
+    let root = temp_workspace("symbol_context_truncated");
+    write_rust_crate(
+        &root,
+        "pub fn handler_one() {}\npub fn handler_two() {}\npub fn handler_three() {}\n",
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let truncated = registry
+        .execute(
+            ToolCall {
+                call_id: "ctx_trunc".to_string(),
+                name: "symbol_context".to_string(),
+                arguments: json!({"query": "handler", "max_results": 1}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(truncated.status, ToolStatus::Success);
+    assert_eq!(
+        truncated.content["packets"]
+            .as_array()
+            .expect("packets")
+            .len(),
+        1,
+        "max_results=1 must return a single packet"
+    );
+    assert_eq!(
+        truncated.content["truncated"], true,
+        "more matches than max_results must report truncated:true"
+    );
+
+    let complete = registry
+        .execute(
+            ToolCall {
+                call_id: "ctx_full".to_string(),
+                name: "symbol_context".to_string(),
+                arguments: json!({"query": "handler", "max_results": 10}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(complete.status, ToolStatus::Success);
+    assert_eq!(
+        complete.content["truncated"], false,
+        "fewer matches than max_results must report truncated:false"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_reports_truncated_when_single_hunk_exceeds_max_ranges() {
+    // Bug #12: a single hunk can hold many changed ranges. `take(max_ranges)`
+    // dropped the surplus but `truncated` only checked hunk count, so a
+    // many-range single-hunk diff reported `truncated:false`. Stage a file with
+    // several interleaved changed/unchanged lines (one contiguous hunk, many
+    // changed ranges) and cap `max_ranges` below the range count.
+    let root = temp_workspace("read_slice_diff_ranges_truncated");
+    let original = "a0\nKEEP\na1\nKEEP\na2\nKEEP\na3\nKEEP\na4\nKEEP\n";
+    write_rust_crate(&root, "pub fn placeholder() {}\n");
+    fs::write(root.join("data.txt"), original).expect("write original");
+    git_init_commit(&root);
+    // Flip every "aN" line; the unchanged "KEEP" lines between them split the
+    // edit into many distinct changed byte ranges inside one diff hunk.
+    let modified = "b0\nKEEP\nb1\nKEEP\nb2\nKEEP\nb3\nKEEP\nb4\nKEEP\n";
+    fs::write(root.join("data.txt"), modified).expect("write modified");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Baseline: with a generous cap, the single hunk yields more than two
+    // distinct changed ranges (the "KEEP" lines split the edit). This anchors
+    // the "more ranges than max_ranges" precondition the bug hinges on.
+    let uncapped = registry
+        .execute(
+            ToolCall {
+                call_id: "diff_uncapped".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "data.txt",
+                    "read_mode": "diff",
+                    "diff_baseline": "worktree",
+                    "max_ranges": 100,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(uncapped.status, ToolStatus::Success);
+    let uncapped_ranges = uncapped.content["ranges"].as_array().expect("ranges");
+    assert!(
+        uncapped_ranges.len() > 2,
+        "precondition: a single hunk must yield more than max_ranges ranges; got {}",
+        uncapped_ranges.len()
+    );
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "data.txt",
+                    "read_mode": "diff",
+                    "diff_baseline": "worktree",
+                    "max_ranges": 2,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let ranges = result.content["ranges"].as_array().expect("ranges");
+    assert_eq!(
+        ranges.len(),
+        2,
+        "ranges must be capped at max_ranges=2, got {}",
+        ranges.len()
+    );
+    assert_eq!(
+        result.content["truncated"], true,
+        "dropping ranges within a single hunk must report truncated:true"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_mode_reports_policy_ignored_metadata() {
+    // Bug #15: slice mode surfaced policy-exclusion metadata
+    // (`ignored`/`ignored_reason`) but diff mode dropped it, so a model could
+    // not tell a policy-excluded file apart from a clean one in diff mode.
+    let root = temp_workspace("read_slice_diff_ignored");
+    fs::create_dir_all(root.join("vendor/lib")).expect("mkdir vendor");
+    fs::write(
+        root.join("vendor/lib/generated.rs"),
+        "pub fn vendored() -> usize { 1 }\n",
+    )
+    .expect("write vendored");
+    git_init_commit(&root);
+    fs::write(
+        root.join("vendor/lib/generated.rs"),
+        "pub fn vendored() -> usize { 2 }\n",
+    )
+    .expect("modify vendored");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "vendor/lib/generated.rs",
+                    "read_mode": "diff",
+                    "diff_baseline": "worktree",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["read_mode"], "diff");
+    assert_eq!(
+        result.content["ignored"], true,
+        "diff mode must surface policy-ignored metadata: {}",
+        result.content
+    );
+    assert_eq!(result.content["ignored_reason"], "vendor");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_last_receipt_ignores_line_number_gutter_for_unchanged_source() {
+    // Bug #3: compaction stores the line-numbered `read_slice` render
+    // (`"{line_no}\t{source}"`) as the snapshot content. The last-receipt diff
+    // compared that gutter-prefixed text against the raw file bytes, so an
+    // otherwise-unchanged file produced a spurious changed range on every line.
+    // Store the line-numbered render of the *current* source and assert no
+    // changed ranges survive.
+    let root = temp_workspace("read_slice_last_receipt_line_gutter");
+    let source = "alpha\nbeta\ngamma\n";
+    fs::write(root.join("sample.txt"), source).expect("write sample");
+    // Mirror exactly what compaction persists: the model-facing, line-numbered
+    // render produced by `prefix_lines_with_numbers`.
+    let line_numbered = crate::graph_tools::prefix_lines_with_numbers(source, 1);
+    assert_ne!(
+        line_numbered, source,
+        "guard: stored content must actually carry the line-number gutter"
+    );
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_slice".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            // Deliberately stale hash so the unchanged-stub shortcut does not
+            // fire and we exercise the byte-diff path that carried the bug.
+            content_sha256: Some("stale-hash-forces-byte-diff".to_string()),
+            start_byte: 0,
+            end_byte: source.len() as u64,
+            content: line_numbered,
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "read_mode": "diff",
+                    "diff_baseline": "last_receipt",
+                    "limit": source.len(),
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["baseline_used"], "last_receipt");
+    let ranges = result.content["ranges"].as_array().expect("ranges");
+    assert!(
+        ranges.is_empty(),
+        "line-numbered gutter must be stripped before diffing; spurious ranges: {ranges:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn read_slice_diff_last_receipt_returns_stub_when_file_is_unchanged() {
     let root = temp_workspace("read_slice_last_receipt_unchanged");
     fs::write(root.join("sample.txt"), "alpha\nbeta\n").expect("write sample");

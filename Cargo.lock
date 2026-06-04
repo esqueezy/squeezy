@@ -3220,6 +3220,7 @@ dependencies = [
  "squeezy-core",
  "squeezy-graph",
  "squeezy-mcp",
+ "squeezy-parse",
  "squeezy-rank",
  "squeezy-skills",
  "squeezy-store",

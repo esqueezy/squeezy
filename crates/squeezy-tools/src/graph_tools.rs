@@ -181,6 +181,11 @@ struct ReadSliceDiffCtx<'a> {
     confidence: Confidence,
     provenance: Vec<Provenance>,
     span: Option<SourceSpan>,
+    /// Policy-exclusion reason for this file, mirrored from slice mode so the
+    /// diff payload can advertise `ignored`/`ignored_reason` too. Slice mode
+    /// surfaces this; without it a model can't tell a policy-excluded file
+    /// apart from a clean one when reading in diff mode.
+    ignored_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -886,8 +891,13 @@ fn symbol_matches_attribute_filter(symbol: &GraphSymbol, attribute: Option<&str>
 /// `base:A|base:B|base:C`) matches if the symbol satisfies ANY alternative.
 /// This lets an "enumerate symbols whose base is one of N" query be a SINGLE
 /// `decl_search` call instead of N — the difference between staying under the
-/// per-turn tool-call budget and starving it on a wide hierarchy. A
-/// single-value filter (no `|`) behaves exactly as the original substring match.
+/// per-turn tool-call budget and starving it on a wide hierarchy.
+///
+/// Each alternative is matched against an attribute with case-insensitive
+/// EQUALITY only. A substring fallback was a false-positive source: filter
+/// `base:User` would wrongly match a symbol carrying `base:UserProfile`.
+/// Exact, segmented attributes (`mixin:ns:leaf`) still match because the
+/// stored attribute string is compared in full.
 fn attribute_filter_matches(attributes: &[String], filter: &str) -> bool {
     filter
         .split('|')
@@ -896,7 +906,7 @@ fn attribute_filter_matches(attributes: &[String], filter: &str) -> bool {
         .any(|alternative| {
             attributes
                 .iter()
-                .any(|value| value.eq_ignore_ascii_case(alternative) || value.contains(alternative))
+                .any(|value| value.eq_ignore_ascii_case(alternative))
         })
 }
 
@@ -1560,8 +1570,12 @@ fn reference_packet(hit: &ReferenceHit) -> Value {
 }
 
 fn reference_matches_path(hit: &ReferenceHit, filter: &str) -> bool {
-    let path = hit.reference.file_id.0.as_str();
-    path_matches_exact_or_suffix(path, filter)
+    // Use the same directory-aware filter `decl_search` uses so a `path=`
+    // scope like `src/foo` matches references in `src/foo/bar.rs` (directory
+    // boundary) while rejecting `src/foobar/baz.rs`. The previous
+    // `path_matches_exact_or_suffix` only handled exact/trailing-segment
+    // matches and silently ignored directory scopes.
+    path_matches_filter(hit.reference.file_id.0.as_str(), filter)
 }
 
 fn path_matches_exact_or_suffix(path: &str, filter: &str) -> bool {
@@ -2320,6 +2334,31 @@ pub(crate) fn prefix_lines_with_numbers(content: &str, start_line: u32) -> Strin
     out
 }
 
+/// Inverse of [`prefix_lines_with_numbers`]: strip the leading `"{digits}\t"`
+/// gutter from each line so stored, line-numbered `read_slice` output can be
+/// diffed against raw file bytes. A line without the expected gutter (e.g.
+/// content that was never line-numbered) is passed through unchanged so this
+/// never corrupts non-prefixed input.
+fn strip_line_number_prefixes(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    for piece in content.split_inclusive('\n') {
+        // `split_inclusive` keeps the trailing `\n`, so the gutter we strip is
+        // the `{digits}\t` at the very start of `piece`. Only strip when the
+        // prefix before the first tab is all ASCII digits — otherwise the line
+        // is not a numbered render and must survive verbatim.
+        let stripped = match piece.split_once('\t') {
+            Some((number, rest))
+                if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                rest
+            }
+            _ => piece,
+        };
+        out.push_str(stripped);
+    }
+    out
+}
+
 fn read_slice_byte_window(
     path: &Path,
     total_bytes: u64,
@@ -3027,7 +3066,10 @@ impl ToolRegistry {
         let max_results = graph_limit(args.max_results);
         let path_filter = args.path.as_deref();
         let diff_only = args.diff_only.unwrap_or(false);
-        let mut symbols = graph_symbol_search(
+        // Count candidates BEFORE `take(max_results)` so the response can
+        // report `truncated` honestly: emitting `truncated:false` while
+        // dropping matches misleads the model into thinking it saw everything.
+        let candidates = graph_symbol_search(
             graph,
             Some(&args.query),
             None,
@@ -3040,19 +3082,22 @@ impl ToolRegistry {
         .filter(|symbol| {
             !diff_only || symbol.dirty.is_some() || dirty_paths.contains(&symbol.file_id.0)
         })
-        .take(max_results)
         .collect::<Vec<_>>();
+        let mut pre_take_len = candidates.len();
+        let mut symbols = candidates.into_iter().take(max_results).collect::<Vec<_>>();
         if symbols.is_empty() && diff_only {
-            symbols = graph
+            let fallback = graph
                 .dirty_symbols()
                 .into_iter()
                 .filter(|symbol| symbol_matches_path_filter(symbol, path_filter))
                 .filter(|symbol| {
                     symbol.name.contains(&args.query) || symbol.signature.contains(&args.query)
                 })
-                .take(max_results)
-                .collect();
+                .collect::<Vec<_>>();
+            pre_take_len = fallback.len();
+            symbols = fallback.into_iter().take(max_results).collect();
         }
+        let truncated = pre_take_len > max_results;
         let packets = symbols
             .iter()
             .map(|symbol| symbol_context_packet(graph, symbol, max_references))
@@ -3072,7 +3117,7 @@ impl ToolRegistry {
             "fallback".to_string(),
             graph_zero_hit_fallback(graph, path_filter, Some(&args.query), packet_count),
         );
-        payload.insert("truncated".to_string(), json!(false));
+        payload.insert("truncated".to_string(), json!(truncated));
         make_result(
             call,
             ToolStatus::Success,
@@ -3176,6 +3221,17 @@ impl ToolRegistry {
             );
         }
         if diff_mode {
+            // Mirror slice mode's policy-exclusion check so diff payloads carry
+            // the same `ignored`/`ignored_reason` metadata. The file may not
+            // exist on disk (deleted in the diff), in which case `read_prefix`
+            // / `policy_exclusion_for_file` simply yield no reason.
+            let ignored_reason = self
+                .policy_exclusion_for_file(
+                    &path,
+                    &rel,
+                    read_prefix(&path, POLICY_PREFIX_BYTES).ok().as_deref(),
+                )
+                .map(ExclusionReason::as_str);
             let ctx = ReadSliceDiffCtx {
                 call,
                 args: &args,
@@ -3186,6 +3242,7 @@ impl ToolRegistry {
                 confidence,
                 provenance,
                 span,
+                ignored_reason,
             };
             return self.execute_read_slice_diff_blocking(&ctx);
         }
@@ -3399,6 +3456,10 @@ impl ToolRegistry {
                 payload.insert("max_file_bytes".to_string(), json!(limit));
                 payload.insert("ranges".to_string(), json!([]));
                 payload.insert("packets".to_string(), json!([]));
+                if let Some(reason) = ctx.ignored_reason {
+                    payload.insert("ignored".to_string(), json!(true));
+                    payload.insert("ignored_reason".to_string(), json!(reason));
+                }
                 payload.insert("truncated".to_string(), json!(true));
                 return make_result(
                     call,
@@ -3480,6 +3541,12 @@ impl ToolRegistry {
                             diff_hunks_to_byte_ranges(&file.hunks, text)
                         }
                     });
+                // A single hunk can yield many changed ranges, so the per-file
+                // cap must be measured against the *range* count rather than the
+                // hunk count. Capture the total before `take(max_ranges)` so the
+                // `truncated` flag below reflects dropped ranges even when they
+                // all live in one hunk.
+                let total_changed_ranges = changed_ranges.len();
                 for range in changed_ranges.into_iter().take(max_ranges) {
                     let bytes = text.as_bytes();
                     let capped_end = range.end.min(range.start.saturating_add(MAX_READ_LIMIT));
@@ -3526,8 +3593,7 @@ impl ToolRegistry {
                         "content": content,
                     }));
                 }
-                truncated |= file.patch_truncated
-                    || (ranges.len() >= max_ranges && file.hunks.len() > max_ranges);
+                truncated |= file.patch_truncated || total_changed_ranges > max_ranges;
             }
         }
 
@@ -3582,6 +3648,12 @@ impl ToolRegistry {
         payload.insert("ranges".to_string(), json!(ranges));
         payload.insert("packets".to_string(), json!(packets));
         payload.insert("truncated".to_string(), json!(cost.truncated));
+        // Mirror slice mode's ignored-file metadata so a policy-excluded file
+        // read in diff mode is distinguishable from a clean one.
+        if let Some(reason) = ctx.ignored_reason {
+            payload.insert("ignored".to_string(), json!(true));
+            payload.insert("ignored_reason".to_string(), json!(reason));
+        }
         payload.insert("vcs".to_string(), json!(snapshot.vcs));
         payload.insert("errors".to_string(), json!(snapshot.errors));
         make_result(
@@ -3604,6 +3676,7 @@ impl ToolRegistry {
             confidence,
             provenance,
             span,
+            ..
         } = ctx;
         let rel = *rel;
         let Some(store) = self.state_store.as_deref() else {
@@ -3710,7 +3783,13 @@ impl ToolRegistry {
                 return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
             }
         };
-        let local_ranges = byte_diff_ranges(snapshot.content.as_bytes(), current.as_bytes());
+        // `snapshot.content` is the model-facing, line-numbered render
+        // (`"{line_no}\t{source}"` from `prefix_lines_with_numbers`). Diffing it
+        // directly against the raw file bytes treats every line-number gutter as
+        // a change, producing spurious ranges for an otherwise-unchanged file.
+        // Strip the gutter back to source bytes before diffing.
+        let baseline_content = strip_line_number_prefixes(&snapshot.content);
+        let local_ranges = byte_diff_ranges(baseline_content.as_bytes(), current.as_bytes());
         let mut cost = ToolCostHint::default();
         let mut ranges = Vec::new();
         let mut packets = Vec::new();
@@ -3961,11 +4040,40 @@ mod attribute_filter_tests {
     use super::attribute_filter_matches;
 
     #[test]
-    fn single_value_filter_matches_exact_or_substring() {
+    fn single_value_filter_matches_case_insensitive_equality_only() {
         let attrs = vec!["base:Session".to_string(), "decorator:property".to_string()];
         assert!(attribute_filter_matches(&attrs, "base:Session"));
-        assert!(attribute_filter_matches(&attrs, "Session")); // substring
+        // Case-insensitive equality still holds.
+        assert!(attribute_filter_matches(&attrs, "BASE:session"));
+        // Substring no longer matches: `Session` is not a stored attribute.
+        assert!(!attribute_filter_matches(&attrs, "Session"));
         assert!(!attribute_filter_matches(&attrs, "base:AuthBase"));
+    }
+
+    #[test]
+    fn prefix_filter_does_not_false_positive_on_longer_attribute() {
+        // Bug #6: `base:User` must NOT match a symbol carrying
+        // `base:UserProfile` — the old `contains` substring fallback did.
+        let profile = vec!["base:UserProfile".to_string()];
+        assert!(!attribute_filter_matches(&profile, "base:User"));
+        // It must still match the exact attribute.
+        let user = vec!["base:User".to_string()];
+        assert!(attribute_filter_matches(&user, "base:User"));
+    }
+
+    #[test]
+    fn segmented_attribute_still_matches_exactly() {
+        // Multi-segment attrs (`mixin:ns:leaf`) compare in full.
+        let attrs = vec!["mixin:ns:leaf".to_string()];
+        assert!(attribute_filter_matches(&attrs, "mixin:ns:leaf"));
+        assert!(!attribute_filter_matches(&attrs, "mixin:ns"));
+    }
+
+    #[test]
+    fn alternation_still_matches_a_listed_alternative() {
+        // `base:A|base:B` matches a symbol carrying `base:B`.
+        let symbol = vec!["base:B".to_string()];
+        assert!(attribute_filter_matches(&symbol, "base:A|base:B"));
     }
 
     #[test]
@@ -4092,6 +4200,51 @@ mod path_filter_tests {
         assert!(!path_matches_filter(
             "crates/squeezy-graph/src/lib.rs",
             "zzzznope",
+        ));
+    }
+}
+
+#[cfg(test)]
+mod reference_path_filter_tests {
+    use super::reference_matches_path;
+    use squeezy_core::{Confidence, FileId, Provenance, SourcePoint, SourceSpan};
+    use squeezy_graph::ReferenceHit;
+    use squeezy_parse::{ParsedReference, ReferenceKind};
+
+    fn hit_in(path: &str) -> ReferenceHit {
+        ReferenceHit {
+            owner: None,
+            reference: ParsedReference {
+                file_id: FileId::new(path.to_string()),
+                owner_id: None,
+                text: "Symbol".to_string(),
+                kind: ReferenceKind::Identifier,
+                span: SourceSpan::new(0, 0, SourcePoint::new(0, 0), SourcePoint::new(0, 0)),
+                provenance: Provenance::new("test", "test"),
+            },
+            confidence: Confidence::Heuristic,
+        }
+    }
+
+    #[test]
+    fn directory_scope_matches_files_under_tree() {
+        // Bug #9: `path="src/foo"` must match a reference in `src/foo/bar.rs`.
+        // The previous exact-or-suffix matcher ignored directory scopes.
+        assert!(reference_matches_path(&hit_in("src/foo/bar.rs"), "src/foo"));
+    }
+
+    #[test]
+    fn directory_scope_respects_boundary() {
+        // Must not bleed across the directory boundary into a sibling whose
+        // name merely starts with the filter.
+        assert!(!reference_matches_path(
+            &hit_in("src/foobar/baz.rs"),
+            "src/foo"
+        ));
+        // And not into an unrelated tree that contains the segment.
+        assert!(!reference_matches_path(
+            &hit_in("experimental_src/foo/x.rs"),
+            "src/foo"
         ));
     }
 }
