@@ -1935,3 +1935,31 @@ fn reviewer_rows_display_resolved_values_not_dashes() {
         "reviewer_model should resolve to a real model, got {model_str:?}"
     );
 }
+
+#[test]
+fn reviewer_rows_visible_when_saved_mode_diverges_from_snapshot() {
+    use squeezy_core::TierSource;
+    // The agent snapshot (effective) lags at the shipped `default`, but the
+    // saved settings file says auto_review — the divergence that hid the
+    // reviewer rows on open. Row visibility tracks the displayed (saved) mode.
+    let mut state = temp_config_state(Some(SectionId::Permissions));
+    assert_eq!(
+        state.effective.permissions.mode,
+        PermissionPolicyMode::Default
+    );
+    state.sources.user = Some(TierSource {
+        path: std::path::PathBuf::from("/virtual/user.toml"),
+        doc: "[permissions]\nmode = \"auto_review\"\n"
+            .parse()
+            .expect("valid toml"),
+    });
+    assert_eq!(
+        state.row_count(),
+        1 + PERMISSION_REVIEWER_ROWS,
+        "reviewer rows must show when the saved mode is auto_review, even if the snapshot lags"
+    );
+    assert_eq!(
+        state.field_at_row(state.row_count() - 1).map(|f| f.label),
+        Some("reviewer_capabilities")
+    );
+}

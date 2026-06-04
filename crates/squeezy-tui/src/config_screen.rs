@@ -607,15 +607,44 @@ impl ConfigScreenState {
     }
 
     /// Number of selectable rows on the active section, including the
+    /// Permission mode as shown in the `mode` row (resolved against the active
+    /// scope's saved sources). Visibility of the reviewer rows tracks this so
+    /// they stay consistent with the value the user actually sees, even when the
+    /// agent snapshot behind `effective` lags a freshly-saved settings file.
+    fn displayed_permission_mode(&self) -> Option<PermissionPolicyMode> {
+        let section = CONFIG_SECTIONS
+            .iter()
+            .find(|s| s.id == SectionId::Permissions)?;
+        let mode_field = section
+            .fields
+            .iter()
+            .find(|f| f.toml_path == ["permissions", "mode"])?;
+        match self.displayed_value_and_source(mode_field).0 {
+            FieldValue::Enum(s) => PermissionPolicyMode::parse(s),
+            _ => None,
+        }
+    }
+
+    /// Visible Permissions rows: the larger of what the running config
+    /// (`effective`) and the displayed (saved) mode would show, so the reviewer
+    /// rows appear whenever either indicates Auto-review/Custom. This keeps the
+    /// rows from disappearing when the agent snapshot and the saved file
+    /// disagree about the mode at open time.
+    fn permission_visible_rows(&self, field_count: usize) -> usize {
+        let by_effective = permissions_visible_rows(self.effective.permissions.mode, field_count);
+        match self.displayed_permission_mode() {
+            Some(mode) => by_effective.max(permissions_visible_rows(mode, field_count)),
+            None => by_effective,
+        }
+    }
+
     /// synthetic "API key" row for the Models section and the three
     /// per-tier action rows for the Reset section.
     pub(crate) fn row_count(&self) -> usize {
         let section = self.current_section();
         match section.id {
             SectionId::Models => section.fields.len() + 1,
-            SectionId::Permissions => {
-                permissions_visible_rows(self.effective.permissions.mode, section.fields.len())
-            }
+            SectionId::Permissions => self.permission_visible_rows(section.fields.len()),
             // The Reset section only ever surfaces the action for the active
             // scope tab — resetting another tab's file from here would be
             // confusing and the tier-tab context already disambiguates which
@@ -646,8 +675,7 @@ impl ConfigScreenState {
                 r => section.fields.get(r - 1),
             },
             SectionId::Permissions => {
-                let visible =
-                    permissions_visible_rows(self.effective.permissions.mode, section.fields.len());
+                let visible = self.permission_visible_rows(section.fields.len());
                 (row < visible).then(|| section.fields.get(row)).flatten()
             }
             SectionId::Reset | SectionId::Themes => None,
