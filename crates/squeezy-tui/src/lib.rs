@@ -4390,24 +4390,18 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
     }
 }
 
-/// `/router [on|off]`. Bare prints the current state and usage hint.
-/// `on` re-enables session-wide auto-routing to the cheap tier; `off`
-/// disables it (explicit `/cheap` still works). The toggle is one-shot
-/// at the override level — the user's persisted `[routing].auto_cheap`
-/// config is not touched.
+/// `/router [on|off]`. Bare opens the Routing config page (like `/model`),
+/// where the global toggles and the per-provider reroute/judge models live.
+/// `on` re-enables session-wide auto-routing to the cheap tier; `off` disables
+/// it (explicit `/cheap` still works). The toggle is one-shot at the override
+/// level — the user's persisted `[routing].enabled` config is not touched.
 fn handle_slash_router(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
-    let snapshot = agent.config_snapshot();
-    let config_default_on = snapshot.routing.auto_cheap;
     let Some(raw) = value else {
-        let state = if config_default_on {
-            "enabled"
-        } else {
-            "disabled (config default)"
-        };
-        app.status = format!("routing: {state}");
-        app.push_transcript_item(TranscriptItem::system(format!(
-            "routing = {state}\nusage: /router [on|off]"
-        )));
+        toggle_config_screen(
+            app,
+            agent,
+            Some(squeezy_core::config_schema::SectionId::Routing),
+        );
         return;
     };
     let disabled = match raw.trim().to_ascii_lowercase().as_str() {

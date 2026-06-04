@@ -10134,10 +10134,23 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
 /// to have, so it is returned verbatim rather than pretending a separate
 /// cheap tier exists.
 pub(crate) fn cheap_model_for(provider: &str, config: &AppConfig) -> Option<String> {
+    // Per-provider cheap (reroute target) model wins (routing never crosses
+    // providers), then the legacy global override, then the per-provider built-in.
+    if let Some(model) = config
+        .providers
+        .get(provider)
+        .and_then(|p| p.cheap_model.clone())
+        .filter(|m| !m.trim().is_empty())
+    {
+        return Some(resolve_model_alias_owned(provider, model));
+    }
     if let Some(model) = config.small_fast_model.clone() {
         return Some(resolve_model_alias_owned(provider, model));
     }
-    if let Some(model) = squeezy_core::small_fast_model_for_provider(provider) {
+    // Built-in default: the per-provider mini tier (not the nano `small_fast`
+    // tier). A notch up judges and handles easy turns far more reliably; this
+    // mirrors `default_cheap_model` in squeezy-core so the config UI agrees.
+    if let Some(model) = squeezy_core::judge_model_for_provider(provider) {
         return Some(resolve_model_alias_owned(provider, model.to_string()));
     }
     match provider {

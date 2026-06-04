@@ -178,6 +178,9 @@ pub(crate) struct ConfigScreenState {
     pub section_index: usize,
     pub field_index: usize,
     pub editor: Option<FieldEditor>,
+    /// Full-screen multi-line editor for long String fields (the routing judge
+    /// prompt). The inline single-line caret can't show or edit a paragraph.
+    pub prompt_editor: Option<PromptEditorState>,
     pub picker: Option<ModelPickerState>,
     pub search: Option<SearchOverlayState>,
     pub secret_entry: Option<SecretEntryState>,
@@ -202,6 +205,151 @@ pub(crate) struct ConfigScreenState {
     /// `Ctrl+Z` pops the last entry and rewrites the file to its
     /// pre-write contents.
     pub undo_stack: Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
+}
+
+/// Full-screen multi-line text editor for long String fields (e.g. the routing
+/// judge prompt). Models the buffer exactly like the main composer in
+/// `input.rs`: a flat `String` with a byte `cursor`, so newlines live in the
+/// text and the renderer soft-wraps to the pane width. Vertical scroll is
+/// derived from the cursor at render time, so it isn't stored here.
+pub(crate) struct PromptEditorState {
+    pub draft: String,
+    /// Byte index into `draft`. Always kept on a char boundary.
+    pub cursor: usize,
+}
+
+impl PromptEditorState {
+    pub(crate) fn new(draft: String) -> Self {
+        let cursor = draft.len();
+        Self { draft, cursor }
+    }
+
+    /// Snap the cursor to the nearest char boundary at or before its position.
+    fn clamp(&mut self) {
+        let mut c = self.cursor.min(self.draft.len());
+        while c > 0 && !self.draft.is_char_boundary(c) {
+            c -= 1;
+        }
+        self.cursor = c;
+    }
+
+    pub(crate) fn insert_char(&mut self, ch: char) {
+        self.clamp();
+        self.draft.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    pub(crate) fn backspace(&mut self) {
+        self.clamp();
+        if self.cursor == 0 {
+            return;
+        }
+        let prev = self.draft[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        self.draft.drain(prev..self.cursor);
+        self.cursor = prev;
+    }
+
+    pub(crate) fn delete(&mut self) {
+        self.clamp();
+        if self.cursor >= self.draft.len() {
+            return;
+        }
+        let next = self.cursor
+            + self.draft[self.cursor..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(0);
+        self.draft.drain(self.cursor..next);
+    }
+
+    pub(crate) fn left(&mut self) {
+        self.clamp();
+        self.cursor = self.draft[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+    }
+
+    pub(crate) fn right(&mut self) {
+        self.clamp();
+        if self.cursor >= self.draft.len() {
+            return;
+        }
+        self.cursor += self.draft[self.cursor..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(0);
+    }
+
+    fn line_start(&self) -> usize {
+        self.draft[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    }
+
+    fn line_end(&self) -> usize {
+        self.draft[self.cursor..]
+            .find('\n')
+            .map(|o| self.cursor + o)
+            .unwrap_or(self.draft.len())
+    }
+
+    pub(crate) fn home(&mut self) {
+        self.cursor = self.line_start();
+    }
+
+    pub(crate) fn end(&mut self) {
+        self.cursor = self.line_end();
+    }
+
+    /// Move up one logical line, preserving the byte column. Mirrors
+    /// `input.rs::move_input_cursor_up`.
+    pub(crate) fn up(&mut self) {
+        self.clamp();
+        let curr_start = self.line_start();
+        if curr_start == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let col = self.cursor - curr_start;
+        let prev_end = curr_start - 1;
+        let prev_start = self.draft[..prev_end]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let prev_len = prev_end - prev_start;
+        self.cursor = prev_start + col.min(prev_len);
+        self.clamp();
+    }
+
+    /// Move down one logical line, preserving the byte column.
+    pub(crate) fn down(&mut self) {
+        self.clamp();
+        let curr_start = self.line_start();
+        let col = self.cursor - curr_start;
+        let Some(next_start) = self.draft[curr_start..]
+            .find('\n')
+            .map(|o| curr_start + o + 1)
+        else {
+            self.cursor = self.draft.len();
+            return;
+        };
+        let next_end = self.draft[next_start..]
+            .find('\n')
+            .map(|o| next_start + o)
+            .unwrap_or(self.draft.len());
+        let next_len = next_end - next_start;
+        self.cursor = next_start + col.min(next_len);
+        self.clamp();
+    }
 }
 
 /// Masked text entry for an API key. The plaintext lives only in `draft`
@@ -401,6 +549,7 @@ impl ConfigScreenState {
             section_index,
             field_index: 0,
             editor: None,
+            prompt_editor: None,
             picker: None,
             search: None,
             secret_entry: None,
@@ -563,6 +712,11 @@ impl ConfigScreenState {
         &self,
         field: &FieldMeta,
     ) -> (FieldValue, FieldSource) {
+        // Read-only info rows are computed from the resolved config, not a TOML
+        // path — render the computed value verbatim.
+        if matches!(field.kind, FieldKind::Info) {
+            return ((field.get)(&self.effective), FieldSource::Default);
+        }
         // env always wins — render the running value with [env] regardless of tab.
         if let Some(var) = field.env_override
             && std::env::var(var).is_ok()
@@ -582,6 +736,23 @@ impl ConfigScreenState {
                 (FieldSource::User, &self.sources.user),
             ],
         };
+        // Per-provider routing fields (`["providers","*",<key>]`) resolve
+        // against the ACTIVE provider: show the resolved value (override →
+        // global → built-in) via `get`, and report the badge from whether THIS
+        // provider explicitly sets it in the active tab's chain.
+        if let ["providers", "*", key] = field.toml_path {
+            let value = (field.get)(&self.effective);
+            let slug = active_provider_slug(&self.effective);
+            let real: [&str; 3] = ["providers", slug.as_str(), key];
+            for (src, tier) in chain {
+                if let Some(t) = tier
+                    && t.contains_path(&real)
+                {
+                    return (value, *src);
+                }
+            }
+            return (value, FieldSource::Default);
+        }
         for (src, tier) in chain {
             if let Some(t) = tier
                 && let Some(val) = tier_value_at_path(t, field)
@@ -610,6 +781,39 @@ impl ConfigScreenState {
         field: &FieldMeta,
         skip: Option<ConfigScope>,
     ) -> (FieldValue, FieldSource) {
+        // Read-only info rows are computed from the resolved config.
+        if matches!(field.kind, FieldKind::Info) {
+            return ((field.get)(&self.effective), FieldSource::Default);
+        }
+        // Per-provider routing fields (`["providers","*",<key>]`) resolve
+        // against the ACTIVE provider: show the resolved value (override →
+        // global → built-in) and report whether THIS provider explicitly sets
+        // it (so the badge reads e.g. "user" when overridden, else "default").
+        if let ["providers", "*", key] = field.toml_path {
+            let value = (field.get)(&self.effective);
+            let slug = active_provider_slug(&self.effective);
+            let real: [&str; 3] = ["providers", slug.as_str(), key];
+            let chain = [
+                (FieldSource::Repo, ConfigScope::Local, &self.sources.repo),
+                (
+                    FieldSource::Project,
+                    ConfigScope::Repo,
+                    &self.sources.project,
+                ),
+                (FieldSource::User, ConfigScope::User, &self.sources.user),
+            ];
+            for (src, owns_scope, tier) in chain {
+                if Some(owns_scope) == skip {
+                    continue;
+                }
+                if let Some(t) = tier
+                    && t.contains_path(&real)
+                {
+                    return (value, src);
+                }
+            }
+            return (value, FieldSource::Default);
+        }
         if let Some(var) = field.env_override
             && std::env::var(var).is_ok()
         {
@@ -656,7 +860,8 @@ impl ConfigScreenState {
             for field in section.fields {
                 if matches!(
                     field.kind,
-                    FieldKind::TableArray { .. }
+                    FieldKind::Info
+                        | FieldKind::TableArray { .. }
                         | FieldKind::ProviderSubTabs
                         | FieldKind::Secret { .. }
                 ) {
@@ -774,9 +979,10 @@ fn tier_value_at_explicit_path(
         FieldKind::Path { .. } => value
             .as_str()
             .map(|s| FieldValue::Path(std::path::PathBuf::from(s))),
-        FieldKind::Secret { .. } | FieldKind::ProviderSubTabs | FieldKind::TableArray { .. } => {
-            None
-        }
+        FieldKind::Info
+        | FieldKind::Secret { .. }
+        | FieldKind::ProviderSubTabs
+        | FieldKind::TableArray { .. } => None,
     }
 }
 
@@ -904,12 +1110,15 @@ pub(crate) fn open_editor_for(field: &FieldMeta, current: FieldValue) -> FieldEd
             draft: String::new(),
             cursor: 0,
         },
-        // Secret / ProviderSubTabs / TableArray drop into dedicated sub-modes
-        // (Secret entry, provider sub-tabs, table-array editor) in commit 5.
-        // Until then, opening one is a no-op handled by `handle_key` — we
-        // shouldn't have reached `open_editor_for` for these kinds.
+        // Info / Secret / ProviderSubTabs / TableArray are not opened here —
+        // Info is read-only, the others drop into dedicated sub-modes handled
+        // by `handle_key`. Reaching this arm means a kind slipped past the
+        // editability gate; fall back to a harmless empty text editor.
         (
-            FieldKind::Secret { .. } | FieldKind::ProviderSubTabs | FieldKind::TableArray { .. },
+            FieldKind::Info
+            | FieldKind::Secret { .. }
+            | FieldKind::ProviderSubTabs
+            | FieldKind::TableArray { .. },
             _,
         ) => FieldEditor::Text {
             draft: String::new(),
@@ -1143,6 +1352,26 @@ pub(crate) fn tier_path(state: &ConfigScreenState, scope: ConfigScope) -> std::p
         ConfigScope::Repo => state.sources.project_path_default.clone(),
         ConfigScope::Local => state.sources.repo_path_default.clone(),
     }
+}
+
+/// Canonical slug of the active provider (the key into `[providers.<name>]`),
+/// read off the Models `[model].provider` field — the same lookup the model
+/// picker and the per-provider save path use.
+pub(crate) fn active_provider_slug(cfg: &AppConfig) -> String {
+    squeezy_core::config_schema::CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == squeezy_core::config_schema::SectionId::Models)
+        .and_then(|s| {
+            s.fields
+                .iter()
+                .find(|f| f.toml_path == ["model", "provider"])
+        })
+        .map(|pf| match (pf.get)(cfg) {
+            squeezy_core::config_schema::FieldValue::Enum(s) => s.to_string(),
+            other => other.as_display(),
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "openai".to_string())
 }
 
 /// Human-readable name for a `ProviderConfig` variant. Used in the

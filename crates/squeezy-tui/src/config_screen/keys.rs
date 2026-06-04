@@ -7,14 +7,14 @@ use squeezy_core::{
 
 use super::{
     ConfigFeedback, ConfigScope, ConfigScreenState, EditorOutcome, FieldEditor, KeyOutcome,
-    ModelPickerState, SearchOverlayState, SecretEntryState, Severity as NotifySeverity,
-    ThemeEditor, ThemeRow, clear_scope_override, clear_scope_override_silent,
-    compute_search_matches, cycle_to_next_registry_model, discard_all_session_writes,
-    handle_editor_key, model_field_meta, open_editor_for, perform_reset, picker_matches,
-    provider_api_key_env, provider_inline_api_key, provider_section_name, save_field,
-    save_field_silent, save_inline_provider_api_key, save_theme_color, save_theme_delete,
-    save_theme_rename, save_theme_selection, save_theme_snapshot, undo_last_write,
-    unset_theme_color,
+    ModelPickerState, PromptEditorState, SearchOverlayState, SecretEntryState,
+    Severity as NotifySeverity, ThemeEditor, ThemeRow, clear_scope_override,
+    clear_scope_override_silent, compute_search_matches, cycle_to_next_registry_model,
+    discard_all_session_writes, handle_editor_key, model_field_meta, open_editor_for,
+    perform_reset, picker_matches, provider_api_key_env, provider_inline_api_key,
+    provider_section_name, save_field, save_field_silent, save_inline_provider_api_key,
+    save_theme_color, save_theme_delete, save_theme_rename, save_theme_selection,
+    save_theme_snapshot, undo_last_write, unset_theme_color,
 };
 
 pub(crate) fn handle_key(
@@ -41,6 +41,9 @@ pub(crate) fn handle_key(
     }
     if state.picker.is_some() {
         return handle_picker_key(state, agent, notifications, key);
+    }
+    if state.prompt_editor.is_some() {
+        return handle_prompt_editor_key(state, agent, notifications, key);
     }
     if let Some(editor) = &mut state.editor {
         let commit = handle_editor_key(editor, key);
@@ -292,8 +295,16 @@ pub(crate) fn handle_key(
                 );
                 return KeyOutcome::KeepOpen;
             }
-            // The model field opens a registry-driven picker; every other
-            // field goes through the regular per-kind editor.
+            // Read-only info rows (e.g. the Routing provider banner) have
+            // nothing to edit.
+            if matches!(field.kind, FieldKind::Info) {
+                return KeyOutcome::KeepOpen;
+            }
+            // The model field opens a registry-driven picker; the per-provider
+            // routing model fields stay free-text (a short id/alias like
+            // "haiku" — and the picker's cross-provider switch would be wrong
+            // for a provider-scoped routing model). Everything else uses the
+            // regular per-kind editor.
             if field.toml_path == ["model", "model"] {
                 // Look up by toml_path instead of the hard-coded
                 // `CONFIG_SECTIONS[0].fields[0]` so reordering Models'
@@ -333,6 +344,15 @@ pub(crate) fn handle_key(
                     ),
                     NotifySeverity::Info,
                 );
+            } else if matches!(field.kind, FieldKind::String { multiline: true }) {
+                // Long paragraph fields (the judge prompt) open a full-screen
+                // multi-line editor — the inline single-line caret overflows
+                // the row and can't show the text being edited.
+                let initial = match (field.get)(&state.effective) {
+                    FieldValue::String(s) => s,
+                    _ => String::new(),
+                };
+                state.prompt_editor = Some(PromptEditorState::new(initial));
             } else {
                 state.editor = Some(open_editor_for(field, (field.get)(&state.effective)));
             }
@@ -496,6 +516,97 @@ fn handle_discard_confirm_key(
         (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
             state.discard_confirm = false;
             notifications.push("Discard cancelled.", NotifySeverity::Info);
+        }
+        _ => {}
+    }
+    KeyOutcome::KeepOpen
+}
+
+/// Full-screen multi-line editor for long String fields (the judge prompt).
+/// Enter inserts a newline; Ctrl+S saves and closes; Esc cancels (discarding
+/// edits, matching the inline editor). Clearing the buffer and saving reverts
+/// the field to its built-in default (the per-provider setter stores `None`).
+fn handle_prompt_editor_key(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut ConfigFeedback,
+    key: KeyEvent,
+) -> KeyOutcome {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            state.prompt_editor = None;
+        }
+        // Ctrl+S commits. (Ctrl+Enter is unreliable across terminals.)
+        KeyCode::Char('s') if ctrl => {
+            let value = state
+                .prompt_editor
+                .take()
+                .map(|e| e.draft)
+                .unwrap_or_default();
+            let field = state.current_field();
+            if let Err(msg) = (field.set)(&mut state.effective, FieldValue::String(value.clone())) {
+                notifications.push(format!("invalid: {msg}"), NotifySeverity::Error);
+            } else {
+                state.dirty = true;
+                save_field(
+                    state,
+                    agent,
+                    notifications,
+                    field,
+                    FieldValue::String(value),
+                );
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.insert_char('\n');
+            }
+        }
+        KeyCode::Char(c) if !ctrl => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.insert_char(c);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.backspace();
+            }
+        }
+        KeyCode::Delete => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.delete();
+            }
+        }
+        KeyCode::Left => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.left();
+            }
+        }
+        KeyCode::Right => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.right();
+            }
+        }
+        KeyCode::Up => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.up();
+            }
+        }
+        KeyCode::Down => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.down();
+            }
+        }
+        KeyCode::Home => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.home();
+            }
+        }
+        KeyCode::End => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.end();
+            }
         }
         _ => {}
     }

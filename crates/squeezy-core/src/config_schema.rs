@@ -123,6 +123,10 @@ pub enum FieldKind {
     Secret {
         env_var: &'static str,
     },
+    /// Read-only informational row. The `get` fn returns a `String` rendered
+    /// verbatim; there is no editor and saves never touch it. Used to surface
+    /// context like the active provider in the Routing section.
+    Info,
     /// Singleton kind used only by the `Providers` section to indicate the
     /// six per-provider sub-tabs along the right pane.
     ProviderSubTabs,
@@ -155,6 +159,7 @@ impl std::fmt::Debug for FieldKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Bool => write!(f, "Bool"),
+            Self::Info => write!(f, "Info"),
             Self::Integer { min, max, suffix } => f
                 .debug_struct("Integer")
                 .field("min", min)
@@ -271,6 +276,7 @@ pub enum SectionId {
     Limits,
     Telemetry,
     Providers,
+    Routing,
     Session,
     Modes,
     Context,
@@ -302,6 +308,7 @@ impl SectionId {
             Self::Limits => "limits",
             Self::Telemetry => "telemetry",
             Self::Providers => "providers",
+            Self::Routing => "routing",
             Self::Session => "session",
             Self::Modes => "modes",
             Self::Context => "context",
@@ -495,6 +502,117 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default: || FieldValue::Bool(false),
                 help: "(OpenAI/Azure only) Persist responses on the provider side for retrieval.",
                 env_override: Some("SQUEEZY_STORE_RESPONSES"),
+                secret: false,
+            },
+        ],
+    },
+    ConfigSectionMeta {
+        id: SectionId::Routing,
+        label: "Routing",
+        description: "Auto-route easy turns to a cheaper model to cut cost",
+        fields: &[
+            FieldMeta {
+                label: "provider",
+                toml_path: &["routing", "_provider_info"],
+                kind: FieldKind::Info,
+                tier: ApplyTier::Immediate,
+                get: get_routing_provider_info,
+                set: set_noop,
+                default_display: "",
+                default: || FieldValue::String(String::new()),
+                help: "Routing is per-provider — the model fields below apply to the ACTIVE provider (switch it in Models). The toggles above are global. Other providers keep their own saved settings.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "enabled",
+                toml_path: &["routing", "enabled"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_routing_enabled,
+                set: set_routing_enabled,
+                default_display: "true",
+                default: || FieldValue::Bool(crate::DEFAULT_ROUTING_ENABLED),
+                help: "Master switch: route easy turns to the cheaper model; harder turns stay on the main model. Same as `/router on|off`. Global.",
+                env_override: Some("SQUEEZY_ROUTING_ENABLED"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "heuristic",
+                toml_path: &["routing", "heuristic"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_routing_heuristic,
+                set: set_routing_heuristic,
+                default_display: "true",
+                default: || FieldValue::Bool(crate::DEFAULT_ROUTING_HEURISTIC),
+                help: "Static fast-path: instantly route obvious mechanical commands (e.g. 'run cargo test') with no judge call. Global.",
+                env_override: Some("SQUEEZY_ROUTING_HEURISTIC"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "llm_judge",
+                toml_path: &["routing", "llm_judge"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_routing_llm_judge,
+                set: set_routing_llm_judge,
+                default_display: "true",
+                default: || FieldValue::Bool(crate::DEFAULT_ROUTING_LLM_JUDGE),
+                help: "For non-obvious turns, ask the judge model whether to route cheap. Global.",
+                env_override: Some("SQUEEZY_ROUTING_LLM_JUDGE"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "cheap_model",
+                toml_path: &["providers", "*", "cheap_model"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_provider_cheap_model,
+                set: set_provider_cheap_model,
+                default_display: "auto",
+                default: || FieldValue::String(String::new()),
+                help: "Route TO: the cheap model easy turns are sent to, for the active provider. Shows the model in effect; clear it to inherit the per-provider default mini tier (e.g. openai gpt-5.4-mini, google gemini-3.5-flash).",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "judge_model",
+                toml_path: &["providers", "*", "judge_model"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_provider_judge_model,
+                set: set_provider_judge_model,
+                default_display: "auto",
+                default: || FieldValue::String(String::new()),
+                help: "Cheap/fast model that classifies turns cheap-vs-parent, for the active provider. Must be cheap — a mini tier judges better than nano. Empty = per-provider mini default. Accepts aliases like 'haiku'.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "expensive_models",
+                toml_path: &["providers", "*", "expensive_models"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_provider_expensive_models,
+                set: set_provider_expensive_models,
+                default_display: "auto",
+                default: || FieldValue::String(String::new()),
+                help: "Route FROM: one regex; the parent model is rerouted when it matches. Default uses a negative lookahead to skip this provider's cheap tiers and reroute every flagship — e.g. (?i)^(?!.*(nano|mini)).* — so it's forward-compatible. Set your own regex (e.g. opus|gpt-5 to restrict, or a lookahead to exclude), or clear it (shown as 'any') to reroute every model.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "judge_prompt",
+                toml_path: &["providers", "*", "judge_prompt"],
+                kind: FieldKind::String { multiline: true },
+                tier: ApplyTier::NextPrompt,
+                get: get_provider_judge_prompt,
+                set: set_provider_judge_prompt,
+                default_display: "built-in",
+                default: || FieldValue::String(String::new()),
+                help: "Judge instructions for the active provider. Press Enter to open the full editor. Shows the built-in per-provider prompt unless you override it.",
+                env_override: None,
                 secret: false,
             },
         ],
@@ -2271,6 +2389,218 @@ fn set_max_session_cost_usd_micros(
 }
 
 // Telemetry
+
+fn get_routing_enabled(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.routing.enabled)
+}
+fn set_routing_enabled(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.routing.enabled = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_routing_heuristic(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.routing.heuristic)
+}
+fn set_routing_heuristic(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.routing.heuristic = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_routing_llm_judge(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.routing.llm_judge)
+}
+fn set_routing_llm_judge(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.routing.llm_judge = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+// Per-provider routing model fields. They read/write `cfg.providers[<active
+// provider>]` so switching the active provider (in Models) instantly shows that
+// provider's own settings; routing never crosses providers. Persistence routes
+// through a `[providers.<slug>]` table write (see config_screen save).
+
+/// Canonical slug of the active provider — the key into `cfg.providers`.
+fn active_routing_provider(cfg: &AppConfig) -> &'static str {
+    crate::provider_kind(&cfg.provider)
+}
+
+fn set_noop(_cfg: &mut AppConfig, _value: FieldValue) -> Result<(), &'static str> {
+    Ok(())
+}
+
+fn get_routing_provider_info(cfg: &AppConfig) -> FieldValue {
+    let slug = active_routing_provider(cfg);
+    let cheap = resolved_cheap_model(cfg, slug);
+    let headline = cfg.model.trim();
+    // The cheap target and the reroute filter are shown in the rows below, so
+    // the banner only carries the pinned-provider note plus a flag when routing
+    // can't fire at all: no distinct cheaper model, or the headline is itself
+    // excluded by the filter (a cheap tier).
+    let inactive = if cheap.trim().is_empty() || cheap == headline {
+        Some("no cheaper model — set cheap_model")
+    } else if !crate::parent_is_reroute_eligible(
+        headline,
+        &crate::resolved_reroute_filter(cfg, slug),
+    ) {
+        Some("current model excluded by expensive_models")
+    } else {
+        None
+    };
+    match inactive {
+        Some(reason) => FieldValue::String(format!(
+            "{slug}  ·  routing inactive — {reason}  ·  pinned (change provider in Models)"
+        )),
+        None => FieldValue::String(format!("{slug}  ·  pinned (change provider in Models)")),
+    }
+}
+
+// Resolution helpers. `resolved_*` is what's actually used for the active
+// provider (per-provider override → legacy global → built-in). `default_*` is
+// the same chain WITHOUT the per-provider override, so a setter can store
+// `None` when the user keeps the inherited value (the field stays "default"
+// rather than pinning a redundant override).
+
+fn resolved_cheap_model(cfg: &AppConfig, slug: &str) -> String {
+    cfg.providers
+        .get(slug)
+        .and_then(|p| p.cheap_model.clone())
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| default_cheap_model(cfg, slug))
+}
+fn default_cheap_model(cfg: &AppConfig, slug: &str) -> String {
+    // The reroute target defaults to the provider's mini tier (not nano): a
+    // notch above the cheapest model judges and handles easy turns far more
+    // reliably. `small_fast_model` (used for titles/summaries) stays a legacy
+    // global override. Mirrors `cheap_model_for` in squeezy-agent exactly,
+    // including the single-model `ollama` fall-through, so the config display
+    // never disagrees with what the router actually uses.
+    cfg.small_fast_model
+        .clone()
+        .or_else(|| crate::judge_model_for_provider(slug).map(str::to_string))
+        .or_else(|| (slug == "ollama").then(|| crate::DEFAULT_OLLAMA_MODEL.to_string()))
+        .unwrap_or_default()
+}
+fn resolved_judge_model(cfg: &AppConfig, slug: &str) -> String {
+    cfg.providers
+        .get(slug)
+        .and_then(|p| p.judge_model.clone())
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| default_judge_model(cfg, slug))
+}
+fn default_judge_model(cfg: &AppConfig, slug: &str) -> String {
+    cfg.routing
+        .judge_model
+        .clone()
+        .or_else(|| crate::judge_model_for_provider(slug).map(str::to_string))
+        .unwrap_or_else(|| resolved_cheap_model(cfg, slug))
+}
+fn resolved_judge_prompt(cfg: &AppConfig, slug: &str) -> String {
+    cfg.providers
+        .get(slug)
+        .and_then(|p| p.judge_prompt.clone())
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| default_judge_prompt_for(cfg, slug))
+}
+fn default_judge_prompt_for(cfg: &AppConfig, slug: &str) -> String {
+    cfg.routing
+        .judge_prompt
+        .clone()
+        .unwrap_or_else(|| crate::default_judge_prompt(slug).to_string())
+}
+
+fn get_provider_cheap_model(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(resolved_cheap_model(cfg, active_routing_provider(cfg)))
+}
+fn set_provider_cheap_model(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("expects string"),
+    };
+    let slug = active_routing_provider(cfg);
+    let keep = s.trim().is_empty() || s == default_cheap_model(cfg, slug);
+    let slug = slug.to_string();
+    cfg.providers.entry(slug).or_default().cheap_model = (!keep).then_some(s);
+    Ok(())
+}
+
+fn get_provider_judge_model(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(resolved_judge_model(cfg, active_routing_provider(cfg)))
+}
+fn set_provider_judge_model(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("expects string"),
+    };
+    let slug = active_routing_provider(cfg);
+    let keep = s.trim().is_empty() || s == default_judge_model(cfg, slug);
+    let slug = slug.to_string();
+    cfg.providers.entry(slug).or_default().judge_model = (!keep).then_some(s);
+    Ok(())
+}
+
+fn get_provider_judge_prompt(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(resolved_judge_prompt(cfg, active_routing_provider(cfg)))
+}
+fn set_provider_judge_prompt(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("expects string"),
+    };
+    let slug = active_routing_provider(cfg);
+    let keep = s.trim().is_empty() || s == default_judge_prompt_for(cfg, slug);
+    let slug = slug.to_string();
+    cfg.providers.entry(slug).or_default().judge_prompt = (!keep).then_some(s);
+    Ok(())
+}
+
+fn get_provider_expensive_models(cfg: &AppConfig) -> FieldValue {
+    // The reroute filter in effect: one case-insensitive regex, a leading `!`
+    // excludes. The per-provider default (e.g. `!nano|mini`) reroutes every
+    // flagship while skipping already-cheap tiers. An explicit empty string
+    // ("reroute any") renders as "any" in the field pane.
+    FieldValue::String(crate::resolved_reroute_filter(
+        cfg,
+        active_routing_provider(cfg),
+    ))
+}
+fn set_provider_expensive_models(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    let filter = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("expects string"),
+    };
+    let slug = active_routing_provider(cfg);
+    // Store `None` (inherit) only when the value equals what would resolve
+    // anyway — the non-empty global filter, else the built-in per-provider
+    // default. Everything else (including an explicit empty "reroute any") is
+    // persisted verbatim, so the user's choice round-trips without surprise.
+    let inherited = if cfg.routing.expensive_models.is_empty() {
+        crate::default_reroute_filter(slug).to_string()
+    } else {
+        cfg.routing.expensive_models.clone()
+    };
+    let keep = filter == inherited;
+    let slug = slug.to_string();
+    cfg.providers.entry(slug).or_default().expensive_models = (!keep).then_some(filter);
+    Ok(())
+}
 
 fn get_telemetry_enabled(cfg: &AppConfig) -> FieldValue {
     FieldValue::Bool(cfg.telemetry.enabled)
