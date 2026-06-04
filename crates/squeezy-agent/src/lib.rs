@@ -48,7 +48,9 @@ use squeezy_store::{
     SessionStatus, SessionStore, SqueezyStore,
 };
 use squeezy_telemetry::{
-    ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback, ReportUpload,
+    ConfigChangeReport, ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback,
+    ReportUpload, SessionStatusKind as TelemetrySessionStatusKind, SessionTelemetryReport,
+    SlashAliasKind, SlashArgShape, SlashOutcome, SlashSurface, SlashTelemetryReport, StartupRoute,
     TelemetryClient, TelemetryEvent, ToolCostProperties, ToolStatusKind as TelemetryToolStatusKind,
     ToolTelemetryReport, prepare_feedback,
 };
@@ -1225,6 +1227,7 @@ pub struct Agent {
     tools: ToolRegistry,
     jobs: JobRegistry,
     telemetry: TelemetryClient,
+    session_started_at: Instant,
     redactor: Arc<Redactor>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
     session_log: Option<SessionHandle>,
@@ -1606,11 +1609,13 @@ impl Agent {
                 Err(_) => prune(),
             }
         }
+        let telemetry = TelemetryClient::from_config(&config);
         let registry_runtime = ToolRegistryRuntime::new_with_graph_cache_root(
             store.clone(),
             redactor.clone(),
             config.cache.root.clone(),
-        );
+        )
+        .with_telemetry(telemetry.clone());
         let tools = ToolRegistry::new_with_configs_skills_and_mcp(
             config.workspace_root.clone(),
             ToolRuntimeConfig {
@@ -1717,7 +1722,8 @@ impl Agent {
         let next_attachment_id = next_attachment_counter(&conversation_state.context_attachments);
         let (event_broadcast, _) = broadcast::channel(64);
         Self {
-            telemetry: TelemetryClient::from_config(&config),
+            telemetry,
+            session_started_at: Instant::now(),
             config,
             provider,
             tools,
@@ -1818,6 +1824,7 @@ impl Agent {
     /// build time (tools/MCP/redactor) are NOT rebuilt; pair this with the
     /// "restart required" badge in the UI for those.
     pub fn replace_config(&mut self, next: AppConfig) {
+        self.telemetry = TelemetryClient::from_config(&next);
         self.config = next;
     }
 
@@ -2067,6 +2074,29 @@ impl Agent {
 
     pub async fn flush_telemetry(&self) {
         let _ = self.telemetry.flush().await;
+    }
+
+    pub fn record_slash_command_telemetry(
+        &self,
+        command: &str,
+        surface: SlashSurface,
+        outcome: SlashOutcome,
+        alias_kind: SlashAliasKind,
+        arg_shape: SlashArgShape,
+    ) {
+        self.telemetry.spawn(TelemetryEvent::slash_command_used(
+            SlashTelemetryReport::new(command, surface, outcome, alias_kind, arg_shape),
+        ));
+    }
+
+    pub fn record_startup_ready_telemetry(&self, route: StartupRoute, duration: Duration) {
+        self.telemetry
+            .spawn(TelemetryEvent::startup_ready(&self.config, route, duration));
+    }
+
+    pub fn record_config_change_telemetry(&self, report: ConfigChangeReport<'_>) {
+        self.telemetry
+            .spawn(TelemetryEvent::config_change_committed(report));
     }
 
     pub fn session_id(&self) -> Option<String> {
@@ -2581,7 +2611,24 @@ impl Agent {
         };
         let state = self.conversation_state.lock().await.clone();
         let _ = session.write_resume_state(&state.to_resume_state());
+        let metrics = state.metrics.clone();
         let _ = session.finish(status, state.cost, state.metrics, state.redactions);
+        self.telemetry.spawn(TelemetryEvent::session_ended(
+            &self.config,
+            SessionTelemetryReport {
+                duration_ms: self.session_started_at.elapsed().as_millis() as u64,
+                status: telemetry_session_status(status),
+                turns: metrics.turns,
+                tool_calls: metrics.tool_calls,
+                tool_successes: metrics.tool_successes,
+                tool_errors: metrics.tool_errors,
+                tool_denials: metrics.tool_denials,
+                tool_cancellations: metrics.tool_cancellations,
+                budget_denials: metrics.budget_denials,
+                subagent_calls: metrics.subagent_calls,
+                subagent_failures: metrics.subagent_failures,
+            },
+        ));
     }
 
     fn flush_active_session_log(&self) {
@@ -3096,22 +3143,68 @@ impl Agent {
     /// [`DispatchOutcome::Error`] for usage failures.
     pub async fn dispatch_command_raw(&self, raw: &str) -> DispatchOutcome {
         match DispatchCommand::parse(raw) {
-            Ok(cmd) => self.dispatch_command(cmd).await,
+            Ok(cmd) => {
+                let command = cmd.slash_name();
+                let arg_shape = telemetry_slash_arg_shape(&cmd);
+                let outcome = self.dispatch_command(cmd).await;
+                self.record_slash_command_telemetry(
+                    command,
+                    SlashSurface::AgentRaw,
+                    telemetry_slash_outcome_from_dispatch(&outcome),
+                    SlashAliasKind::Canonical,
+                    arg_shape,
+                );
+                outcome
+            }
             Err(DispatchCommandParseError::Unknown { command }) => {
+                self.record_slash_command_telemetry(
+                    "unknown",
+                    SlashSurface::AgentRaw,
+                    SlashOutcome::Unknown,
+                    SlashAliasKind::Unknown,
+                    SlashArgShape::Present,
+                );
                 DispatchOutcome::Unsupported { command }
             }
-            Err(DispatchCommandParseError::Empty) => DispatchOutcome::Error {
-                command: String::new(),
-                message: "empty command".to_string(),
-            },
-            Err(DispatchCommandParseError::NotASlashCommand) => DispatchOutcome::Error {
-                command: raw.to_string(),
-                message: "expected a slash command".to_string(),
-            },
-            Err(DispatchCommandParseError::Usage { command, hint }) => DispatchOutcome::Error {
-                command,
-                message: hint,
-            },
+            Err(DispatchCommandParseError::Empty) => {
+                self.record_slash_command_telemetry(
+                    "unknown",
+                    SlashSurface::AgentRaw,
+                    SlashOutcome::UsageError,
+                    SlashAliasKind::Unknown,
+                    SlashArgShape::None,
+                );
+                DispatchOutcome::Error {
+                    command: String::new(),
+                    message: "empty command".to_string(),
+                }
+            }
+            Err(DispatchCommandParseError::NotASlashCommand) => {
+                self.record_slash_command_telemetry(
+                    "unknown",
+                    SlashSurface::AgentRaw,
+                    SlashOutcome::UsageError,
+                    SlashAliasKind::Unknown,
+                    SlashArgShape::Present,
+                );
+                DispatchOutcome::Error {
+                    command: raw.to_string(),
+                    message: "expected a slash command".to_string(),
+                }
+            }
+            Err(DispatchCommandParseError::Usage { command, hint }) => {
+                self.record_slash_command_telemetry(
+                    &command,
+                    SlashSurface::AgentRaw,
+                    SlashOutcome::UsageError,
+                    SlashAliasKind::Canonical,
+                    SlashArgShape::Present,
+                );
+                DispatchOutcome::Error {
+                    command,
+                    message: hint,
+                }
+            }
         }
     }
 
@@ -12173,6 +12266,147 @@ fn telemetry_tool_status(status: ToolStatus) -> TelemetryToolStatusKind {
         ToolStatus::Denied => TelemetryToolStatusKind::Denied,
         ToolStatus::Stale => TelemetryToolStatusKind::Stale,
         ToolStatus::Cancelled => TelemetryToolStatusKind::Cancelled,
+    }
+}
+
+fn telemetry_session_status(status: SessionStatus) -> TelemetrySessionStatusKind {
+    match status {
+        SessionStatus::Running => TelemetrySessionStatusKind::Running,
+        SessionStatus::Archived => TelemetrySessionStatusKind::Archived,
+        SessionStatus::Completed => TelemetrySessionStatusKind::Completed,
+        SessionStatus::Cancelled => TelemetrySessionStatusKind::Cancelled,
+        SessionStatus::Failed => TelemetrySessionStatusKind::Failed,
+        SessionStatus::Truncated => TelemetrySessionStatusKind::Truncated,
+    }
+}
+
+fn telemetry_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
+    match cmd {
+        DispatchCommand::Cost
+        | DispatchCommand::Context
+        | DispatchCommand::Reviewer
+        | DispatchCommand::Model
+        | DispatchCommand::Permissions
+        | DispatchCommand::Attachments
+        | DispatchCommand::Clear
+        | DispatchCommand::Diff
+        | DispatchCommand::Tasks
+        | DispatchCommand::Pins
+        | DispatchCommand::Sessions
+        | DispatchCommand::Fork
+        | DispatchCommand::Checkpoints
+        | DispatchCommand::Undo
+        | DispatchCommand::Statusline
+        | DispatchCommand::Keymap
+        | DispatchCommand::Cheap
+        | DispatchCommand::Parent => SlashArgShape::None,
+        DispatchCommand::Attach { .. } => SlashArgShape::Path,
+        DispatchCommand::Plan { prompt } | DispatchCommand::Build { prompt } => {
+            if option_has_text(prompt.as_ref()) {
+                SlashArgShape::FreeText
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Help { topic } => {
+            if option_has_text(topic.as_ref()) {
+                SlashArgShape::FreeText
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Theme { theme } => {
+            if option_has_text(theme.as_ref()) {
+                SlashArgShape::FixedSubcommand
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Spinner { spinner } => {
+            if option_has_text(spinner.as_ref()) {
+                SlashArgShape::FixedSubcommand
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Effort { value }
+        | DispatchCommand::Verbosity { value }
+        | DispatchCommand::ToolVerbosity { value }
+        | DispatchCommand::Router { value } => {
+            if option_has_text(value.as_ref()) {
+                SlashArgShape::FixedSubcommand
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Config { section } => {
+            if option_has_text(section.as_ref()) {
+                SlashArgShape::FixedSubcommand
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Compact { undo } => {
+            if *undo {
+                SlashArgShape::FixedSubcommand
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Plans { args }
+        | DispatchCommand::Feedback { args }
+        | DispatchCommand::Report { args } => {
+            if args.trim().is_empty() {
+                SlashArgShape::None
+            } else {
+                SlashArgShape::FixedSubcommand
+            }
+        }
+        DispatchCommand::Task { .. }
+        | DispatchCommand::TaskCancel { .. }
+        | DispatchCommand::Unpin { .. }
+        | DispatchCommand::Resume { .. }
+        | DispatchCommand::SessionExport { .. }
+        | DispatchCommand::Checkpoint { .. }
+        | DispatchCommand::RevertTurn { .. }
+        | DispatchCommand::Detach { .. } => SlashArgShape::Id,
+        DispatchCommand::Pin { target } => {
+            if target.is_some() {
+                SlashArgShape::Id
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Session { .. }
+        | DispatchCommand::SessionRename { .. }
+        | DispatchCommand::SessionLabel { .. } => SlashArgShape::FixedSubcommand,
+        DispatchCommand::SessionExportHtml { path, .. } => {
+            if path.is_some() {
+                SlashArgShape::Path
+            } else {
+                SlashArgShape::Id
+            }
+        }
+    }
+}
+
+fn option_has_text(value: Option<&String>) -> bool {
+    value.map(|value| !value.trim().is_empty()).unwrap_or(false)
+}
+
+fn telemetry_slash_outcome_from_dispatch(outcome: &DispatchOutcome) -> SlashOutcome {
+    match outcome {
+        DispatchOutcome::Error { .. } => SlashOutcome::Error,
+        DispatchOutcome::Unsupported { .. } => SlashOutcome::Unknown,
+        DispatchOutcome::TuiOnly { .. } => SlashOutcome::OpenedOverlay,
+        DispatchOutcome::ModeChanged {
+            prompt: Some(_), ..
+        } => SlashOutcome::StartedTurn,
+        DispatchOutcome::DiffSnapshot { .. } | DispatchOutcome::CheckpointUndo { .. } => {
+            SlashOutcome::StartedJob
+        }
+        DispatchOutcome::Compacted { skipped: true } => SlashOutcome::Skipped,
+        _ => SlashOutcome::LocalAction,
     }
 }
 

@@ -16,8 +16,8 @@ use squeezy_agent::Agent;
 use squeezy_core::{
     AppConfig, PermissionPolicyMode, SeparatedSources,
     config_schema::{
-        CONFIG_SECTIONS, ConfigSectionMeta, FieldKind, FieldMeta, FieldSource, FieldValue,
-        SectionId,
+        ApplyTier, CONFIG_SECTIONS, ConfigSectionMeta, FieldKind, FieldMeta, FieldSource,
+        FieldValue, SectionId,
     },
     load_separated_settings_sources,
 };
@@ -222,6 +222,26 @@ pub(crate) struct ConfigScreenState {
     /// `Ctrl+Z` pops the last entry and rewrites the file to its
     /// pre-write contents.
     pub undo_stack: Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
+    pub telemetry_undo_markers: Vec<usize>,
+    pub telemetry_changes: Vec<ConfigTelemetryChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigTelemetryChange {
+    pub scope: ConfigScope,
+    pub section: &'static str,
+    pub field: String,
+    pub apply_tier: ApplyTier,
+    pub change_kind: ConfigTelemetryChangeKind,
+    pub prev_value: String,
+    pub new_value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigTelemetryChangeKind {
+    Set,
+    Unset,
+    Reset,
 }
 
 /// Full-screen multi-line text editor for long String fields (e.g. the routing
@@ -578,7 +598,36 @@ impl ConfigScreenState {
             dirty: false,
             baseline,
             undo_stack: Vec::new(),
+            telemetry_undo_markers: Vec::new(),
+            telemetry_changes: Vec::new(),
         }
+    }
+
+    pub(crate) fn push_undo_snapshot(
+        &mut self,
+        path: std::path::PathBuf,
+        pre_write_bytes: Option<Vec<u8>>,
+    ) {
+        self.undo_stack.push((path, pre_write_bytes));
+        self.telemetry_undo_markers
+            .push(self.telemetry_changes.len());
+    }
+
+    pub(crate) fn pop_undo_snapshot(
+        &mut self,
+    ) -> Option<(std::path::PathBuf, Option<Vec<u8>>, usize)> {
+        let marker = self
+            .telemetry_undo_markers
+            .pop()
+            .unwrap_or(self.telemetry_changes.len());
+        self.undo_stack
+            .pop()
+            .map(|(path, pre_write_bytes)| (path, pre_write_bytes, marker))
+    }
+
+    pub(crate) fn truncate_telemetry_to(&mut self, marker: usize) {
+        self.telemetry_changes
+            .truncate(marker.min(self.telemetry_changes.len()));
     }
 
     pub(crate) fn current_section(&self) -> &'static ConfigSectionMeta {

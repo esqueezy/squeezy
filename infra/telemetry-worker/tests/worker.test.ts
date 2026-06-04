@@ -71,6 +71,59 @@ test("product telemetry accepts current trace and routing properties", async () 
               trace_id: "d".repeat(32),
             },
           },
+          {
+            event: "squeezy_config_change_committed",
+            timestamp_ms: Date.now(),
+            event_sequence: 4,
+            properties: {
+              config_scope: "project",
+              config_section: "models",
+              config_field: "model.model",
+              config_apply_tier: "next_prompt",
+              config_change_kind: "set",
+              config_prev_bucket: "model_custom",
+              config_new_bucket: "model_custom",
+              local_path: "/Users/example/project",
+            },
+          },
+          {
+            event: "squeezy_startup_ready",
+            timestamp_ms: Date.now(),
+            event_sequence: 5,
+            properties: {
+              startup_route: "resume_picker_resume",
+              duration_ms: 987,
+              status: "success",
+            },
+          },
+          {
+            event: "squeezy_slash_command_used",
+            timestamp_ms: Date.now(),
+            event_sequence: 6,
+            properties: {
+              slash_command: "plan",
+              slash_surface: "tui_composer",
+              slash_outcome: "accepted",
+              slash_alias_kind: "canonical",
+              slash_arg_shape: "free_text",
+            },
+          },
+          {
+            event: "squeezy_session_ended",
+            timestamp_ms: Date.now(),
+            event_sequence: 7,
+            properties: {
+              session_status: "completed",
+              duration_ms: 1234,
+              turn_count: 2,
+              tool_successes: 3,
+              tool_errors: 1,
+              tool_denials: 0,
+              tool_cancellations: 0,
+              subagent_calls: 1,
+              subagent_failures: 0,
+            },
+          },
         ],
       }),
     }),
@@ -84,8 +137,17 @@ test("product telemetry accepts current trace and routing properties", async () 
     "squeezy_tool_completed",
     "squeezy_routing_routed",
     "approval_best_effort_fallback",
+    "squeezy_config_change_committed",
+    "squeezy_startup_ready",
+    "squeezy_slash_command_used",
+    "squeezy_session_ended",
   ]);
   expect(batch.batch[0].properties.trace_id).toBe("d".repeat(32));
+  expect(batch.batch[3].properties.config_new_bucket).toBe("model_custom");
+  expect(batch.batch[3].properties.local_path).toBeUndefined();
+  expect(batch.batch[4].properties.startup_route).toBe("resume_picker_resume");
+  expect(batch.batch[5].properties.slash_command).toBe("plan");
+  expect(batch.batch[6].properties.session_status).toBe("completed");
 });
 
 test("product telemetry drops unknown or malformed optional properties", async () => {

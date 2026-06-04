@@ -56,13 +56,14 @@ pub(crate) fn handle_key(
             EditorOutcome::Commit(value) => {
                 state.editor = None;
                 let field = state.current_field();
+                let previous = (field.get)(&state.effective);
                 if let Err(msg) = (field.set)(&mut state.effective, value.clone()) {
                     notifications.push(format!("invalid: {msg}"), NotifySeverity::Error);
                 } else {
                     state.dirty = true;
                     // Save immediately; the apply pipeline below routes the
                     // change to the right tier and queues notifications.
-                    save_field(state, agent, notifications, field, value);
+                    save_field(state, agent, notifications, field, previous, value);
                 }
                 return KeyOutcome::KeepOpen;
             }
@@ -210,13 +211,13 @@ pub(crate) fn handle_key(
                     _ => None,
                 };
                 if should_clear {
-                    clear_scope_override_silent(state, notifications);
+                    clear_scope_override_silent(state, agent, notifications);
                     return KeyOutcome::KeepOpen;
                 }
                 if let Some(next) = next_value {
                     if (field.set)(&mut state.effective, next.clone()).is_ok() {
                         state.dirty = true;
-                        save_field_silent(state, agent, notifications, field, next);
+                        save_field_silent(state, agent, notifications, field, current_value, next);
                     }
                     return KeyOutcome::KeepOpen;
                 }
@@ -256,7 +257,7 @@ pub(crate) fn handle_key(
             if let Some(next) = next {
                 if (field.set)(&mut state.effective, next.clone()).is_ok() {
                     state.dirty = true;
-                    save_field_silent(state, agent, notifications, field, next);
+                    save_field_silent(state, agent, notifications, field, current_value, next);
                 }
             } else {
                 notifications.push(
@@ -417,11 +418,12 @@ pub(crate) fn handle_key(
                 return KeyOutcome::KeepOpen;
             }
             let default_val = (field.default)();
+            let previous = (field.get)(&state.effective);
             if let Err(msg) = (field.set)(&mut state.effective, default_val.clone()) {
                 notifications.push(format!("reset failed: {msg}"), NotifySeverity::Error);
             } else {
                 state.dirty = true;
-                save_field(state, agent, notifications, field, default_val);
+                save_field(state, agent, notifications, field, previous, default_val);
             }
             KeyOutcome::KeepOpen
         }
@@ -453,7 +455,7 @@ pub(crate) fn handle_key(
                     );
                 }
                 ConfigScope::Repo | ConfigScope::Local => {
-                    clear_scope_override(state, notifications);
+                    clear_scope_override(state, agent, notifications);
                 }
             }
             KeyOutcome::KeepOpen
@@ -545,6 +547,7 @@ fn handle_prompt_editor_key(
                 .map(|e| e.draft)
                 .unwrap_or_default();
             let field = state.current_field();
+            let previous = (field.get)(&state.effective);
             if let Err(msg) = (field.set)(&mut state.effective, FieldValue::String(value.clone())) {
                 notifications.push(format!("invalid: {msg}"), NotifySeverity::Error);
             } else {
@@ -554,6 +557,7 @@ fn handle_prompt_editor_key(
                     agent,
                     notifications,
                     field,
+                    previous,
                     FieldValue::String(value),
                 );
             }
@@ -712,6 +716,8 @@ fn commit_model_picker(
         FieldValue::Enum(s) => s,
         _ => "openai",
     };
+    let previous_provider_value = (provider_field.get)(&state.effective);
+    let previous_model_value = (model_field_meta().get)(&state.effective);
     let picked_provider = squeezy_llm::MODEL_REGISTRY
         .iter()
         .find(|m| m.id == model_id)
@@ -745,6 +751,7 @@ fn commit_model_picker(
             agent,
             notifications,
             provider_field,
+            previous_provider_value,
             FieldValue::Enum(new_provider),
         );
     } else {
@@ -753,7 +760,14 @@ fn commit_model_picker(
             return;
         }
         state.dirty = true;
-        save_field(state, agent, notifications, model_field, model_value);
+        save_field(
+            state,
+            agent,
+            notifications,
+            model_field,
+            previous_model_value,
+            model_value,
+        );
     }
 }
 

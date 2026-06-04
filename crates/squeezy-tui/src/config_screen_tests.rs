@@ -1527,9 +1527,17 @@ async fn next_prompt_tier_save_arms_pending_swap() {
         "test fixture relies on this being NextPrompt"
     );
     let before = agent.config_snapshot().subagents.max_tool_calls_per_call;
+    let previous = (max_calls_field.get)(&state.effective);
     let new_value = FieldValue::Integer((before as i64) + 1);
     (max_calls_field.set)(&mut state.effective, new_value.clone()).expect("set ok");
-    save_field(&mut state, &mut agent, &mut q, max_calls_field, new_value);
+    save_field(
+        &mut state,
+        &mut agent,
+        &mut q,
+        max_calls_field,
+        previous,
+        new_value,
+    );
     let swap = agent
         .pending_config_swap()
         .expect("NextPrompt save must arm a pending swap");
@@ -1565,9 +1573,10 @@ async fn next_prompt_swap_applies_on_drain() {
         .unwrap();
     state.field_index = idx;
     let before = agent.config_snapshot().subagents.max_tool_calls_per_call;
+    let previous = (field.get)(&state.effective);
     let new_value = FieldValue::Integer((before as i64) + 5);
     (field.set)(&mut state.effective, new_value.clone()).expect("set ok");
-    save_field(&mut state, &mut agent, &mut q, field, new_value);
+    save_field(&mut state, &mut agent, &mut q, field, previous, new_value);
     let drained = agent.drain_pending_swap();
     assert!(
         drained.is_some(),

@@ -43,6 +43,10 @@ const EVENT_NAMES = new Set([
   "squeezy_tool_completed",
   "squeezy_graph_build_completed",
   "squeezy_graph_refresh_completed",
+  "squeezy_startup_ready",
+  "squeezy_session_ended",
+  "squeezy_slash_command_used",
+  "squeezy_config_change_committed",
   "squeezy_failure_seen",
   "approval_best_effort_fallback",
   "ai_reviewer_allow_downgrade",
@@ -107,6 +111,33 @@ const REFRESH_KINDS = new Set(["cold", "incremental"]);
 const GRAPH_SEQUENCE_SCOPES = new Set(["one_shot", "repeated"]);
 const OUTCOME_STATUSES = new Set(["success", "error", "cancelled", "skipped"]);
 const ERROR_KINDS = new Set(["provider", "tool", "permission", "budget", "graph", "io", "config", "unknown"]);
+const SESSION_STATUSES = new Set(["running", "archived", "completed", "cancelled", "failed", "truncated"]);
+const STARTUP_ROUTES = new Set([
+  "fresh",
+  "direct_resume",
+  "resume_picker_fresh",
+  "resume_picker_resume",
+  "first_run_setup_fresh",
+]);
+const SLASH_SURFACES = new Set(["tui_composer", "tui_inline", "agent_raw"]);
+const SLASH_OUTCOMES = new Set([
+  "accepted",
+  "usage_error",
+  "blocked_during_turn",
+  "unknown",
+  "template_expanded",
+  "started_turn",
+  "opened_overlay",
+  "started_job",
+  "local_action",
+  "skipped",
+  "error",
+]);
+const SLASH_ALIAS_KINDS = new Set(["canonical", "compat_options", "unknown", "template"]);
+const SLASH_ARG_SHAPES = new Set(["none", "present", "fixed_subcommand", "id", "path", "free_text"]);
+const CONFIG_SCOPES = new Set(["user", "project", "local", "session"]);
+const CONFIG_APPLY_TIERS = new Set(["immediate", "next_prompt", "restart"]);
+const CONFIG_CHANGE_KINDS = new Set(["set", "unset", "reset"]);
 
 type PropertySchema = "u64" | "hex64" | "hex32" | "hex16" | "token" | Set<string>;
 
@@ -124,9 +155,20 @@ const PROPERTY_SCHEMAS: Record<string, PropertySchema> = {
   c_files: "u64",
   csharp_files: "u64",
   cpp_files: "u64",
+  dart_files: "u64",
   go_files: "u64",
+  java_files: "u64",
+  javascript_files: "u64",
+  jsx_files: "u64",
+  kotlin_files: "u64",
+  php_files: "u64",
   python_files: "u64",
+  ruby_files: "u64",
   rust_files: "u64",
+  scala_files: "u64",
+  swift_files: "u64",
+  typescript_files: "u64",
+  tsx_files: "u64",
   supported_files: "u64",
   unsupported_files: "u64",
   unknown_files: "u64",
@@ -145,10 +187,37 @@ const PROPERTY_SCHEMAS: Record<string, PropertySchema> = {
   receipt_stub_hits: "u64",
   negative_receipt_hits: "u64",
   budget_denials: "u64",
+  turn_count: "u64",
+  tool_successes: "u64",
+  tool_errors: "u64",
+  tool_denials: "u64",
+  tool_cancellations: "u64",
+  subagent_calls: "u64",
+  subagent_failures: "u64",
+  excluded_files: "u64",
+  excluded_dirs: "u64",
+  excluded_bytes: "u64",
+  persisted_files_loaded: "u64",
+  persisted_files_missed: "u64",
+  persistence_rebuilt: "u64",
   refresh_kind: REFRESH_KINDS,
   graph_sequence_scope: GRAPH_SEQUENCE_SCOPES,
   status: OUTCOME_STATUSES,
+  session_status: SESSION_STATUSES,
+  startup_route: STARTUP_ROUTES,
   error_kind: ERROR_KINDS,
+  slash_command: "token",
+  slash_surface: SLASH_SURFACES,
+  slash_outcome: SLASH_OUTCOMES,
+  slash_alias_kind: SLASH_ALIAS_KINDS,
+  slash_arg_shape: SLASH_ARG_SHAPES,
+  config_scope: CONFIG_SCOPES,
+  config_section: "token",
+  config_field: "token",
+  config_apply_tier: CONFIG_APPLY_TIERS,
+  config_change_kind: CONFIG_CHANGE_KINDS,
+  config_prev_bucket: "token",
+  config_new_bucket: "token",
   args_sha256: "hex64",
   output_sha256: "hex64",
   content_sha256: "hex64",
