@@ -1912,7 +1912,34 @@ impl Agent {
         if next.telemetry != self.config.telemetry {
             self.telemetry = TelemetryClient::from_config(&next);
         }
+        let skills_changed = next.skills != self.config.skills;
+        let workspace_changed = next.workspace_root != self.config.workspace_root;
         self.config = next;
+        if skills_changed || workspace_changed {
+            self.rebuild_skills_catalog();
+        }
+    }
+
+    /// Rebuild the skill catalog from the current `config.skills` and
+    /// workspace root. Called by `replace_config` when the skill
+    /// surface changed so external `settings.toml` edits — including
+    /// `[[skills.config]]` enable/disable entries and dropping a new
+    /// `SKILL.md` — take effect without a session restart.
+    pub fn rebuild_skills_catalog(&self) -> usize {
+        let count = self
+            .tools
+            .rebuild_skills(&self.config.workspace_root, &self.config.skills);
+        log_session_event(
+            self.session_log.as_ref(),
+            &self.redactor,
+            "skills_catalog_rebuilt",
+            None,
+            Some(format!(
+                "{count} skill(s) in the catalog after settings reload"
+            )),
+            json!({ "skills_count": count }),
+        );
+        count
     }
 
     /// Replace the LLM client. The in-flight turn (if any) holds a clone of
@@ -1938,9 +1965,14 @@ impl Agent {
     /// config takes effect for the very next request.
     pub fn drain_pending_swap(&mut self) -> Option<PendingConfigSwap> {
         let swap = self.pending_swap.take()?;
+        let skills_changed = swap.config.skills != self.config.skills;
+        let workspace_changed = swap.config.workspace_root != self.config.workspace_root;
         self.config = swap.config.clone();
         if let Some(provider) = swap.provider.clone() {
             self.provider = provider;
+        }
+        if skills_changed || workspace_changed {
+            self.rebuild_skills_catalog();
         }
         Some(swap)
     }
@@ -7922,7 +7954,10 @@ enum SubagentKind {
     /// passed through the standard `prompt` field. Wired but not yet
     /// auto-dispatched — fork-mode skills currently appear in a
     /// `<fork_skills>` system block and rely on the parent agent
-    /// invoking `delegate` to actually run them.
+    /// invoking `delegate` to actually run them. The `dead_code`
+    /// allowance covers the period before a `delegate`-style tool
+    /// learns to map onto this kind.
+    #[allow(dead_code)]
     Skill,
 }
 

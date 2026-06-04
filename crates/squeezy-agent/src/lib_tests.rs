@@ -2489,6 +2489,62 @@ async fn fork_mode_skills_render_in_fork_block_not_active_block() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn replace_config_rediscovers_skill_catalog() {
+    let root = temp_workspace("agent_skill_reload");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let initial_config = config_with_skill_dirs(&root);
+    let mut agent = Agent::new(initial_config.clone(), provider.clone());
+
+    // Drop a brand-new skill onto disk after the agent has been
+    // built. Without `replace_config` rebuilding the catalog the next
+    // turn would not see this file because `SkillCatalog::discover`
+    // had already run.
+    let skill_dir = root.join(".agents/skills/late-skill");
+    fs::create_dir_all(&skill_dir).expect("mkdir");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: late-skill\ndescription: \"added after init\"\ntriggers:\n  - late phrase\n---\n# Late\n",
+    )
+    .expect("write late skill");
+
+    // Mutate the skills config (a no-op `[[skills.config]]` rule is
+    // enough to change the value so `replace_config` rebuilds) and
+    // hand it back to the agent the same way the TUI reload path
+    // would.
+    let mut next_config = initial_config;
+    next_config
+        .skills
+        .config
+        .push(squeezy_core::SkillConfigEntry {
+            name: Some("late-skill".to_string()),
+            path: None,
+            enabled: true,
+        });
+    agent.replace_config(next_config);
+
+    let mut rx = agent.start_turn("trigger late phrase".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("captured request");
+    assert!(
+        request.instructions.contains("late-skill"),
+        "reloaded catalog must surface late-skill: {}",
+        request.instructions
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn agent_skill_hooks_default_to_disabled() {
     let root = temp_workspace("agent_skill_hooks_off");
