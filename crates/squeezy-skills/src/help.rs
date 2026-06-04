@@ -22,7 +22,7 @@ impl HelpAnswer {
     pub fn render_markdown(&self) -> String {
         let mut output = self.body.clone();
         if !self.citations.is_empty() {
-            output.push_str("\n\nCitations:\n");
+            output.push_str("\n\n**Sources:**\n");
             for citation in &self.citations {
                 output.push_str("- ");
                 output.push_str(&citation.render());
@@ -50,9 +50,9 @@ pub enum HelpCitation {
 impl HelpCitation {
     fn render(&self) -> String {
         match self {
-            Self::DocsPath(path) => format!("docs path: {path}"),
+            Self::DocsPath(path) => format!("See: {path}"),
             Self::ConfigInspectSection(section) => {
-                format!("config inspect section: [{section}]")
+                format!("From config: [{section}]")
             }
         }
     }
@@ -82,11 +82,12 @@ impl SqueezyHelp {
             topic: "index".to_string(),
             status: HelpStatus::Answered,
             body: format!(
-                "Squeezy help is the first-line support path for questions about Squeezy itself. It answers from bundled docs and this run's redacted `config inspect` output before any model or network lookup.\n\nSupported topics:\n{topics}\n\nUse `/help <topic>` for a local answer. For broader or current public information, use {SQUEEZY_WEBSITE_URL} or {SQUEEZY_REPO_URL}; if external lookup tools are enabled, ask Squeezy to search public docs or the repo."
+                "Available `/help` topics:\n{topics}\n\nUse `/help <topic>` for a local answer grounded in bundled docs. For broader coverage: https://squeezyagent.com/docs/"
             ),
             citations: vec![
                 HelpCitation::DocsPath("docs/external/README.md".to_string()),
                 HelpCitation::DocsPath("docs/external/SKILLS.md".to_string()),
+                HelpCitation::DocsPath("docs/external/TOOLS.md".to_string()),
             ],
             config_sections: Vec::new(),
         }
@@ -121,10 +122,7 @@ impl SqueezyHelp {
 
     fn answer_definition(&self, definition: &TopicDefinition) -> HelpAnswer {
         let extracted_sections = extract_config_sections(&self.config_inspect, definition.config);
-        let mut body = format!(
-            "Squeezy help: {}\n\n{}",
-            definition.title, definition.summary
-        );
+        let mut body = format!("## {}\n\n{}", definition.title, definition.summary);
         if !extracted_sections.is_empty() {
             body.push_str("\n\nRelevant redacted `config inspect` output:\n```toml\n");
             for section in &extracted_sections {
@@ -133,9 +131,25 @@ impl SqueezyHelp {
             }
             body.push_str("```");
         }
-        body.push_str(
-            "\n\nThis answer is limited to local Squeezy docs and config inspect output.",
-        );
+        // Append a short intro excerpt from each cited doc (first ~400 chars per doc, max 2 docs)
+        let mut doc_excerpt_count = 0;
+        for path in definition.docs.iter().take(2) {
+            if let Some(content) = bundled_doc(path) {
+                let excerpt = extract_doc_intro(content, 400);
+                if !excerpt.is_empty() {
+                    if doc_excerpt_count == 0 {
+                        body.push_str("\n\n**From the docs:**\n");
+                    }
+                    let _ = write!(body, "\n*{}*\n\n{}", path, excerpt);
+                    doc_excerpt_count += 1;
+                }
+            }
+        }
+        if extracted_sections.is_empty() && doc_excerpt_count == 0 {
+            body.push_str(
+                "\n\n---\n*Grounded in local Squeezy docs and current config. For newer or broader coverage use `/help` with a different topic, or check [squeezyagent.com/docs](https://squeezyagent.com/docs/).*",
+            );
+        }
 
         let mut citations = definition
             .docs
@@ -162,17 +176,26 @@ impl SqueezyHelp {
 
     fn unsupported(&self, topic: &str) -> HelpAnswer {
         let mut suggestions = String::new();
-        for topic in TOPICS {
+        for t in TOPICS {
             if !suggestions.is_empty() {
                 suggestions.push_str(", ");
             }
-            suggestions.push_str(topic.id);
+            suggestions.push_str(t.id);
         }
+        let did_you_mean = {
+            let candidates = top_topics_for_text(topic, 3);
+            if candidates.is_empty() {
+                String::new()
+            } else {
+                let ids: Vec<&str> = candidates.iter().map(|t| t.id).collect();
+                format!("\n\nDid you mean: {}?", ids.join(" or "))
+            }
+        };
         HelpAnswer {
             topic: topic.trim().to_string(),
             status: HelpStatus::Unsupported,
             body: format!(
-                "I don't have local Squeezy help coverage for `{}`.\n\nBuilt-in Squeezy help only answers from bundled docs and redacted `config inspect` output, so I won't guess. Try one of these local topics: {suggestions}.\n\nFor broader or current public information, use {SQUEEZY_WEBSITE_URL} or {SQUEEZY_REPO_URL}. If external lookup tools are enabled, ask Squeezy to search public docs or the repo.",
+                "No local help coverage for `{}`.{did_you_mean}\n\nTry one of these topics: {suggestions}.\n\nFor current or broader documentation: {SQUEEZY_WEBSITE_URL} or {SQUEEZY_REPO_URL}.",
                 topic.trim()
             ),
             citations: Vec::new(),
@@ -202,7 +225,6 @@ const TOPICS: &[TopicDefinition] = &[
         id: "cancel",
         title: "cancel or interrupt an in-flight Squeezy turn",
         aliases: &[
-            "cancel",
             "cancel turn",
             "cancel a turn",
             "cancel the turn",
@@ -232,10 +254,40 @@ const TOPICS: &[TopicDefinition] = &[
         config: &["tui"],
     },
     TopicDefinition {
+        id: "tui",
+        title: "TUI interface, keyboard shortcuts, and slash commands",
+        aliases: &[
+            "tui",
+            "keyboard",
+            "keyboard shortcuts",
+            "keybindings",
+            "keymap",
+            "shortcut",
+            "shortcuts",
+            "slash command",
+            "slash commands",
+            "slash menu",
+            "composer",
+            "footer",
+            "status line",
+            "statusline",
+            "theme",
+            "themes",
+            "/theme",
+            "/router",
+            "/reviewer",
+            "/statusline",
+            "/model",
+            "/permissions",
+        ],
+        summary: "The Squeezy TUI has a full-width composer at the bottom, a transcript pane above it, and a status footer. Key bindings: Esc or Ctrl+C cancel an in-flight turn or tool approval; Enter submits; Ctrl+J inserts a newline; Ctrl+T shows the full transcript overlay; Ctrl+P shows the task-state overlay; Ctrl+Y copies the last assistant message; Ctrl+R restores the last prompt; Shift+Tab toggles plan/build mode; Up/Down navigate input history or the slash menu. Slash commands cover: `/help`, `/plan`, `/build`, `/router`, `/model`, `/permissions`, `/config`, `/cost`, `/context`, `/compact`, `/pin`, `/unpin`, `/pins`, `/attach`, `/attachments`, `/detach`, `/sessions`, `/session`, `/resume`, `/clear`, `/feedback`, `/report`, `/verbosity`, `/tool-verbosity`, `/tasks`, `/skill`, `/theme`, `/reviewer`, `/diff`, `/checkpoints`, `/undo`, `/revert-turn`. Use `/theme <name>` to switch the color theme; built-in themes are `default`, `bright`, `fun`, and `starlight`. Use `/router on|off` to toggle cheap-model turn routing. Typing any `/` in the composer opens the slash suggestion menu; arrow keys navigate it.",
+        docs: &["docs/external/AGENT_APPROACH.md", "docs/external/TOOLS.md"],
+        config: &["tui", "session"],
+    },
+    TopicDefinition {
         id: "agent",
         title: "agent approach, modes, tools, and local-first workflow",
         aliases: &[
-            "agent",
             "approach",
             "how does squeezy work",
             "how squeezy works",
@@ -262,7 +314,6 @@ const TOPICS: &[TopicDefinition] = &[
         id: "config",
         title: "configuration and source precedence",
         aliases: &[
-            "config",
             "configuration",
             "settings",
             "config inspect",
@@ -293,7 +344,6 @@ const TOPICS: &[TopicDefinition] = &[
         title: "providers, models, and API key environment names",
         aliases: &[
             "provider",
-            "providers",
             "model",
             "models",
             "openai",
@@ -318,7 +368,6 @@ const TOPICS: &[TopicDefinition] = &[
         title: "permissions, approvals, and shell sandboxing",
         aliases: &[
             "permission",
-            "permissions",
             "approval",
             "approvals",
             "policy",
@@ -345,7 +394,6 @@ const TOPICS: &[TopicDefinition] = &[
         title: "local skills and built-in Squeezy help",
         aliases: &[
             "skill",
-            "skills",
             "/skill",
             "trigger",
             "triggers",
@@ -362,7 +410,6 @@ const TOPICS: &[TopicDefinition] = &[
         title: "sessions, logs, resume, and transcript export",
         aliases: &[
             "session",
-            "sessions",
             "resume",
             "transcript",
             "logs",
@@ -377,7 +424,6 @@ const TOPICS: &[TopicDefinition] = &[
         id: "feedback",
         title: "feedback, reports, redaction, and privacy",
         aliases: &[
-            "feedback",
             "report",
             "bug report",
             "bug-report",
@@ -397,13 +443,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "telemetry",
         title: "anonymous product telemetry",
-        aliases: &[
-            "telemetry",
-            "analytics",
-            "opt out",
-            "opt-out",
-            "product observability",
-        ],
+        aliases: &["analytics", "opt out", "opt-out", "product observability"],
         summary: "Squeezy telemetry is anonymous product observability. It records runtime-level events and aggregate metrics, not prompts, completions, file contents, commands, URLs, repository names, paths, or environment values. It can be disabled in configuration.",
         docs: &[
             "docs/external/TELEMETRY.md",
@@ -417,7 +457,6 @@ const TOPICS: &[TopicDefinition] = &[
         aliases: &[
             "semantic",
             "graph",
-            "navigation",
             "declaration",
             "declarations",
             "reference",
@@ -444,7 +483,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "checkpoints",
         title: "checkpoints, undo, and revert",
-        aliases: &["checkpoint", "checkpoints", "undo", "revert", "revert-turn"],
+        aliases: &["checkpoint", "undo", "revert", "revert-turn"],
         summary: "Checkpointing is disabled by default. When enabled, checkpoints preserve local before and after trees for agent edits, and TUI commands expose listing, detail, undo, and turn-level revert through the checkpoint tools.",
         docs: &["docs/external/CHECKPOINTS.md"],
         config: &["tools.checkpoints_enabled"],
@@ -453,7 +492,6 @@ const TOPICS: &[TopicDefinition] = &[
         id: "cost",
         title: "cost controls, receipts, and tool output budgets",
         aliases: &[
-            "cost",
             "costs",
             "budget",
             "budgets",
@@ -498,7 +536,6 @@ const TOPICS: &[TopicDefinition] = &[
         id: "install",
         title: "installation, first run, upgrades, and uninstall",
         aliases: &[
-            "install",
             "installation",
             "brew",
             "homebrew",
@@ -529,7 +566,6 @@ const TOPICS: &[TopicDefinition] = &[
             "platforms",
             "macos",
             "linux",
-            "install",
             "startup",
             "troubleshooting",
             "troubleshoot",
@@ -541,6 +577,49 @@ const TOPICS: &[TopicDefinition] = &[
             "docs/external/CONFIGURATION.md",
         ],
         config: &["session", "tui"],
+    },
+    TopicDefinition {
+        id: "hooks",
+        title: "hook events, mutation points, and skill scripts",
+        aliases: &[
+            "hook",
+            "hooks",
+            "hook event",
+            "hook events",
+            "pre tool",
+            "post tool",
+            "pre turn",
+            "user prompt",
+            "permission hook",
+            "subagent hook",
+            "compaction hook",
+            "script",
+            "scripts",
+            "skill script",
+        ],
+        summary: "Hooks are observation and mutation points fired at key lifecycle events in the agent loop. They are used internally by skills, telemetry, and MCP integration. Hook scripts are executables placed under a skill's `scripts/` directory; they receive a JSON payload on stdin. Events include PreTurn (may append extra_instructions), UserPromptSubmit (may rewrite the prompt), PreToolUse, PostToolUse, PostToolUseFailure, PreCompact, PostCompact, SubagentStart, SubagentStop, PermissionRequest, PermissionDenied, SessionStart, Stop, and Setup.",
+        docs: &["docs/external/HOOKS.md", "docs/external/SKILLS.md"],
+        config: &["skills"],
+    },
+    TopicDefinition {
+        id: "prompt-templates",
+        title: "prompt templates and reusable slash macros",
+        aliases: &[
+            "prompt template",
+            "prompt templates",
+            "prompt macro",
+            "/prompt-template",
+            "slash macro",
+            "prompts dir",
+            "custom prompt",
+            "reusable prompt",
+        ],
+        summary: "Prompt templates are reusable `.md` files stored in `~/.squeezy/prompts/` (user scope) or `<workspace>/.squeezy/prompts/` (project scope). Each file's name (without `.md`) becomes the template name. Activate with `/prompt-template <name>` in the composer. Project templates shadow user templates with the same name.",
+        docs: &[
+            "docs/external/PROMPT_TEMPLATES.md",
+            "docs/external/SKILLS.md",
+        ],
+        config: &["skills"],
     },
 ];
 
@@ -575,7 +654,14 @@ fn looks_like_squeezy_help_question(input: &str) -> bool {
     if lowered.is_empty() {
         return false;
     }
-    let product_marker = contains_any(&lowered, &["squeezy", "squeezyagent", "config inspect"])
+    let token_slices_for_marker: Vec<String> = lowered
+        .split_whitespace()
+        .map(|t| clean_token(t).to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let token_refs: Vec<&str> = token_slices_for_marker.iter().map(String::as_str).collect();
+    let product_marker = contains_any(&lowered, &["squeezy", "squeezyagent"])
+        || contains_word_sequence(&token_refs, "config inspect")
         || contains_any(
             &raw,
             &[
@@ -765,6 +851,34 @@ fn best_topic_for_text(input: &str) -> Option<&'static TopicDefinition> {
     best
 }
 
+fn top_topics_for_text(input: &str, n: usize) -> Vec<&'static TopicDefinition> {
+    let normalized = normalize(input);
+    let tokens: Vec<String> = normalized
+        .split_whitespace()
+        .map(|tok| clean_token(tok).to_string())
+        .filter(|tok| !tok.is_empty())
+        .collect();
+    let token_slices: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    let mut scored: Vec<(usize, &'static TopicDefinition)> = Vec::new();
+    for topic in TOPICS {
+        let mut score = 0;
+        if contains_word_sequence(&token_slices, topic.id) {
+            score += 3;
+        }
+        for alias in topic.aliases {
+            let alias_norm = normalize(alias);
+            if contains_word_sequence(&token_slices, &alias_norm) {
+                score += alias_norm.split_whitespace().count().max(1);
+            }
+        }
+        if score > 0 {
+            scored.push((score, topic));
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().take(n).map(|(_, topic)| topic).collect()
+}
+
 // Strips trailing/leading sentence punctuation from a token so word-boundary
 // matching ignores the `?` on `squeezy?` and the `.` on `press.`. The slash is
 // preserved so slash-command aliases like `/plan` still match.
@@ -920,3 +1034,52 @@ pub fn matches_squeezy_help_input(input: &str) -> bool {
     }
     looks_like_squeezy_help_question(trimmed) && best_topic_for_text(trimmed).is_some()
 }
+
+fn extract_doc_intro(content: &str, max_chars: usize) -> &str {
+    let trimmed = content.trim_start();
+    // Skip the first heading if present
+    let after_heading = if trimmed.starts_with('#') {
+        trimmed
+            .find('\n')
+            .map_or("", |i| &trimmed[i + 1..])
+            .trim_start()
+    } else {
+        trimmed
+    };
+    // Find end of first paragraph (first blank line = two consecutive newlines)
+    let end = after_heading
+        .find("\n\n")
+        .unwrap_or(after_heading.len())
+        .min(max_chars);
+    &after_heading[..end]
+}
+
+/// Return only the bundled docs that are relevant for the given input, falling
+/// back to the full corpus when no curated topic can be identified. Always
+/// includes README and AGENT_APPROACH so the subagent has core orientation.
+pub fn relevant_docs_for_input(input: &str) -> Vec<BundledDoc> {
+    let trimmed = input.trim();
+    let topic = parse_help_command(trimmed)
+        .filter(|t| !t.is_empty())
+        .and_then(find_topic)
+        .or_else(|| best_topic_for_text(trimmed));
+
+    let Some(topic) = topic else {
+        return bundled_docs();
+    };
+
+    let cited: std::collections::HashSet<&str> = topic.docs.iter().copied().collect();
+    BUNDLED_DOCS
+        .iter()
+        .filter(|doc| {
+            cited.contains(doc.path)
+                || doc.path == "docs/external/README.md"
+                || doc.path == "docs/external/AGENT_APPROACH.md"
+        })
+        .copied()
+        .collect()
+}
+
+#[cfg(test)]
+#[path = "help_tests.rs"]
+mod tests;

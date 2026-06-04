@@ -40,6 +40,7 @@ use squeezy_llm::{
 };
 use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
+    relevant_docs_for_input,
 };
 use squeezy_store::{
     BugReportBundle, BugReportOptions, HydratedTranscriptItem, ResumeItem, SessionEvent,
@@ -4163,7 +4164,8 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
         return DocHelpResolution::skipped();
     }
     let config_inspect = deps.config.inspect_redacted();
-    let prompt = doc_help_subagent_prompt(task_title, &config_inspect, &bundled_docs());
+    let relevant = relevant_docs_for_input(task_title);
+    let prompt = doc_help_subagent_prompt(task_title, &config_inspect, &relevant);
     let request = SubagentRequest {
         prompt,
         scope: Some(
@@ -10287,7 +10289,7 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
             .clone()
             .map(|model| resolve_model_alias_owned(provider, model))
             .unwrap_or_else(|| cheap_model_for(provider, config).unwrap_or(parent_model.clone())),
-        (SubagentKind::DocHelp, _) => parent_model,
+        (SubagentKind::DocHelp, _) => cheap_model_for(provider, config).unwrap_or(parent_model),
         (_, RoleModelPolicy::Parent) => parent_model,
         (_, RoleModelPolicy::Cheap) => cheap_model_for(provider, config).unwrap_or(parent_model),
     }
