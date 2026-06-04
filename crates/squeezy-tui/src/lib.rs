@@ -6492,35 +6492,156 @@ fn wrap_transcript_overlay_rows(lines: &[Line<'static>], width: u16) -> Vec<Line
     rows
 }
 
-fn wrap_transcript_overlay_line(line: &Line<'static>, width: usize, rows: &mut Vec<Line<'static>>) {
-    let mut row_spans: Vec<Span<'static>> = Vec::new();
-    let mut row_width = 0usize;
-    let mut saw_content = false;
+/// Characters that make up a rail line's leading gutter — the indent spaces,
+/// the vertical bars, the tee/close elbows, and the connecting dashes.
+const RAIL_GUTTER_CHARS: [char; 5] = [' ', '│', '├', '╰', '─'];
 
-    for span in &line.spans {
-        let style = span.style;
-        let mut chunk = String::new();
-        for ch in span.content.chars() {
-            if row_width >= width {
-                if !chunk.is_empty() {
-                    row_spans.push(Span::styled(std::mem::take(&mut chunk), style));
-                }
-                rows.push(Line::from(std::mem::take(&mut row_spans)));
-                row_width = 0;
-            }
-            chunk.push(ch);
-            row_width += 1;
-            saw_content = true;
+/// Width (in cells) of a rail line's leading gutter: the indent + `│`/`├`/`╰─`
+/// run, plus the node's marker glyph and its trailing space when the run opened
+/// with an elbow. Everything after that is the node's content.
+fn rail_prefix_width(text: &str) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() && RAIL_GUTTER_CHARS.contains(&chars[i]) {
+        i += 1;
+    }
+    let opened_with_elbow = chars[..i].iter().any(|&c| c == '├' || c == '╰');
+    if opened_with_elbow && i < chars.len() && chars[i] != ' ' {
+        // A header is `…├─<marker> content`; fold the marker glyph and the
+        // space after it into the gutter so the wrapped text hangs under the
+        // content, not under the marker.
+        let marker = i;
+        i += 1;
+        let mut saw_space = false;
+        while i < chars.len() && chars[i] == ' ' {
+            saw_space = true;
+            i += 1;
         }
-        if !chunk.is_empty() {
-            row_spans.push(Span::styled(chunk, style));
+        if !saw_space {
+            i = marker;
         }
     }
+    i
+}
 
-    if saw_content {
-        rows.push(Line::from(row_spans));
-    } else {
-        rows.push(Line::from(""));
+/// The gutter to repeat on a wrapped continuation row: a vertical bar (`│`) and
+/// a tee (`├`, whose run continues to the next node) stay as `│`; the close
+/// elbow `╰`, the dashes, and the marker glyph blank out, so the wrapped text
+/// hangs under the node's content with the rail still threading past it.
+fn rail_continuation_prefix(prefix: &str) -> String {
+    prefix
+        .chars()
+        .map(|c| {
+            if matches!(c, '│' | '├') {
+                '│'
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+/// Split a line's spans at display column `col`, preserving styles (splitting a
+/// span when the boundary falls inside it).
+fn split_spans_at_column(
+    spans: &[Span<'static>],
+    col: usize,
+) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    let mut consumed = 0usize;
+    for span in spans {
+        let len = span.content.chars().count();
+        if consumed >= col {
+            right.push(span.clone());
+        } else if consumed + len <= col {
+            left.push(span.clone());
+            consumed += len;
+        } else {
+            let at = col - consumed;
+            let head: String = span.content.chars().take(at).collect();
+            let tail: String = span.content.chars().skip(at).collect();
+            left.push(Span::styled(head, span.style));
+            right.push(Span::styled(tail, span.style));
+            consumed = col;
+        }
+    }
+    (left, right)
+}
+
+/// Wrap styled content to `width` cells, breaking at the last space inside each
+/// row when there is one (word wrap) and hard-breaking an over-long token
+/// otherwise. Unlike [`wrap_styled_words`] this preserves every character —
+/// runs of spaces and JSON/code indentation survive — so it is the right tool
+/// for the mixed tool output shown in the transcript overlay.
+fn wrap_cells_preserving(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let cells: Vec<(char, Style)> = spans
+        .iter()
+        .flat_map(|span| span.content.chars().map(move |ch| (ch, span.style)))
+        .collect();
+    if cells.is_empty() {
+        return vec![Vec::new()];
+    }
+    let mut rows = Vec::new();
+    let mut start = 0;
+    while start < cells.len() {
+        if cells.len() - start <= width {
+            rows.push(coalesce_cells_to_spans(cells[start..].to_vec()));
+            break;
+        }
+        let hard = start + width;
+        // Prefer the last space inside the row so words stay intact; the space
+        // itself stays at the end of this row, never leading the next one.
+        let mut brk = hard;
+        let mut k = hard;
+        while k > start {
+            if cells[k - 1].0 == ' ' {
+                brk = k;
+                break;
+            }
+            k -= 1;
+        }
+        if k == start {
+            brk = hard;
+        }
+        rows.push(coalesce_cells_to_spans(cells[start..brk].to_vec()));
+        start = brk;
+    }
+    rows
+}
+
+fn wrap_transcript_overlay_line(line: &Line<'static>, width: usize, rows: &mut Vec<Line<'static>>) {
+    let width = width.max(1);
+    let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    if full.chars().count() <= width {
+        // Fits as-is — pass it through untouched so the gutter and any inner
+        // whitespace are preserved exactly.
+        rows.push(line.clone());
+        return;
+    }
+    // Over-long: keep the gutter, word-wrap only the content past it.
+    let prefix_w = rail_prefix_width(&full).min(width.saturating_sub(1));
+    let (prefix_spans, content_spans) = split_spans_at_column(&line.spans, prefix_w);
+    let prefix_text: String = prefix_spans.iter().map(|s| s.content.as_ref()).collect();
+    let cont_text = rail_continuation_prefix(&prefix_text);
+    let chrome = prefix_spans.iter().rev().find_map(|s| s.style.fg);
+    let text_width = width.saturating_sub(prefix_w).max(1);
+    for (index, segment) in wrap_cells_preserving(&content_spans, text_width)
+        .into_iter()
+        .enumerate()
+    {
+        let mut spans: Vec<Span<'static>> = if index == 0 {
+            prefix_spans.clone()
+        } else {
+            let mut bar = Span::raw(cont_text.clone());
+            if let Some(color) = chrome {
+                bar.style = Style::default().fg(color);
+            }
+            vec![bar]
+        };
+        spans.extend(segment);
+        rows.push(Line::from(spans));
     }
 }
 

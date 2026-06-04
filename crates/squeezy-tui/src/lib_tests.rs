@@ -13480,3 +13480,49 @@ fn turn_failure_is_red_error_warning_is_cyan() {
         Some(crate::render::theme::cyan())
     );
 }
+
+#[test]
+fn overlay_wraps_long_lines_keeping_the_gutter() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("explore"));
+    let long = "I'll analyze the Rust codebase for modernization opportunities and \
+                report the concrete findings here."
+        .to_string();
+    app.push_tool_result(sample_tool_result("explore", &long));
+    if let Some(e) = app.transcript.last_mut() {
+        e.collapsed = false;
+    }
+    let rows = transcript_overlay_rows_for_render(&app, 60);
+    let text = lines_to_plain_text(&rows);
+    // Every wrapped row of the long body keeps the `│` gutter — none spill to
+    // column 0 the way the old hard char-wrap did.
+    let body_rows: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("analyze") || l.contains("opportunities") || l.contains("findings"))
+        .collect();
+    assert!(
+        body_rows.len() >= 2,
+        "long body should wrap into >=2 rows:\n{text}"
+    );
+    for row in &body_rows {
+        assert!(
+            row.starts_with("   │"),
+            "wrapped row lost the gutter: {row:?}"
+        );
+    }
+    // The break lands on a word boundary, not mid-word.
+    assert!(text.contains("for modernization"), "{text}");
+    assert!(text.contains("│   opportunities"), "{text}");
+}
+
+#[test]
+fn rail_prefix_and_continuation_track_the_gutter() {
+    assert_eq!(rail_prefix_width("   ├─✔ Ran explore"), 7);
+    assert_eq!(rail_prefix_width("   │   details"), 7);
+    assert_eq!(rail_prefix_width("  settings reloaded"), 2);
+    // A tee continues the rail as `│`; a close elbow blanks out (rail ended);
+    // nested bars are both preserved.
+    assert_eq!(rail_continuation_prefix("   ├─✔ "), "   │   ");
+    assert_eq!(rail_continuation_prefix("   ╰─✖ "), "       ");
+    assert_eq!(rail_continuation_prefix("   │   │   "), "   │   │   ");
+}
