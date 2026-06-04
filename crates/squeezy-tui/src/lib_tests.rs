@@ -683,6 +683,85 @@ async fn delete_clears_finished_subagents_and_keeps_running_ones() {
 }
 
 #[tokio::test]
+async fn subagent_pane_folds_to_summary_when_all_finished_and_expands_on_down() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "a".to_string());
+    app.note_subagent_started(2, "explore".to_string(), "b".to_string());
+
+    // While a subagent is still running the pane stays fully expanded (live).
+    assert!(!subagent_pane_collapsed(&app));
+    assert!(subagent_pane_height(&app) > 1);
+
+    app.note_subagent_completed(
+        1,
+        "delegate".to_string(),
+        "done".to_string(),
+        TurnMetrics::default(),
+    );
+    app.note_subagent_completed(
+        2,
+        "explore".to_string(),
+        "done".to_string(),
+        TurnMetrics::default(),
+    );
+
+    // All finished, unfocused, viewing main → fold to a one-line summary.
+    assert!(subagent_pane_collapsed(&app));
+    assert_eq!(subagent_pane_height(&app), 1);
+    let rendered = render_subagent_pane_to_string(&app, 80, 1);
+    assert!(rendered.contains("2 subagents"), "{rendered}");
+    assert!(rendered.contains("review"), "{rendered}");
+
+    // Down re-expands the list for review.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("expand pane");
+    assert!(app.subagent_pane.focused);
+    assert!(!subagent_pane_collapsed(&app));
+    assert!(subagent_pane_height(&app) > 1);
+
+    // Esc returns to main and the pane folds back down.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("collapse again");
+    assert!(!app.subagent_pane.focused);
+    assert!(subagent_pane_collapsed(&app));
+}
+
+#[test]
+fn subagent_pane_summary_reports_failures() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "a".to_string());
+    app.note_subagent_completed(
+        1,
+        "delegate".to_string(),
+        "done".to_string(),
+        TurnMetrics::default(),
+    );
+    app.note_subagent_started(2, "explore".to_string(), "b".to_string());
+    app.note_subagent_failed(
+        2,
+        "explore".to_string(),
+        "boom".to_string(),
+        TurnMetrics::default(),
+    );
+
+    assert!(subagent_pane_collapsed(&app));
+    let rendered = render_subagent_pane_to_string(&app, 80, 1);
+    assert!(rendered.contains("1 done"), "{rendered}");
+    assert!(rendered.contains("1 failed"), "{rendered}");
+}
+
+#[tokio::test]
 async fn enter_opens_full_screen_subagent_overlay_in_inline_mode() {
     // The default terminal mode is inline (alternate_screen = auto), where the
     // conversation lives in scrollback that can't be repainted. Enter on a
@@ -977,6 +1056,8 @@ async fn rejected_subagent_event_renders_human_reason_not_raw_token() {
     );
 
     // The pane row on screen carries the human phrasing, not the token.
+    // Expand the pane first — an all-finished pane folds to a one-line summary.
+    app.subagent_pane.focused = true;
     let output = render_to_string(&app, 120, 18);
     let pane_row = output
         .lines()

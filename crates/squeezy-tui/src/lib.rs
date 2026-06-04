@@ -12722,15 +12722,101 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(paragraph, area);
 }
 
+/// Once every subagent has finished and the user is neither navigating the
+/// pane nor viewing a subagent, the pane folds to a one-line summary so it
+/// stops holding the bottom rows of the screen. The records stay in memory —
+/// Down re-expands the list to review them, Del (while expanded) clears them.
+fn subagent_pane_collapsed(app: &TuiApp) -> bool {
+    !app.subagent_pane.records.is_empty()
+        && !app.subagent_pane.focused
+        && matches!(app.subagent_pane.active, ConversationSource::Main)
+        && !app
+            .subagent_pane
+            .records
+            .iter()
+            .any(|record| matches!(record.lifecycle, SubagentLifecycle::Running))
+}
+
 fn subagent_pane_height(app: &TuiApp) -> u16 {
     if app.subagent_pane.records.is_empty() {
         return 0;
     }
+    if subagent_pane_collapsed(app) {
+        return 1;
+    }
     (1 + app.subagent_pane.records.len()).min(7) as u16
+}
+
+/// One-line fold shown in place of the full pane when every subagent is done.
+/// Mirrors the row grammar (marker · label · quiet detail) used by the live
+/// rows so the surface reads consistently.
+fn subagent_pane_summary_row(app: &TuiApp, width: u16) -> Line<'static> {
+    let records = &app.subagent_pane.records;
+    let done = records
+        .iter()
+        .filter(|r| matches!(r.lifecycle, SubagentLifecycle::Completed))
+        .count();
+    let failed = records
+        .iter()
+        .filter(|r| matches!(r.lifecycle, SubagentLifecycle::Failed))
+        .count();
+    let capped = records
+        .iter()
+        .filter(|r| matches!(r.lifecycle, SubagentLifecycle::Rejected))
+        .count();
+    let total = records.len();
+
+    let (glyph, glyph_color) = if failed > 0 {
+        ("✗", crate::render::theme::red())
+    } else if done > 0 {
+        ("✓", crate::render::theme::green())
+    } else {
+        ("·", crate::render::theme::quiet())
+    };
+
+    let detail = if failed == 0 && capped == 0 {
+        "done · ↓ review".to_string()
+    } else {
+        let mut parts = Vec::new();
+        if done > 0 {
+            parts.push(format!("{done} done"));
+        }
+        if failed > 0 {
+            parts.push(format!("{failed} failed"));
+        }
+        if capped > 0 {
+            parts.push(format!("{capped} capped"));
+        }
+        format!("{} · ↓ review", parts.join(" · "))
+    };
+
+    let label = if total == 1 {
+        "1 subagent".to_string()
+    } else {
+        format!("{total} subagents")
+    };
+
+    subagent_pane_row(
+        glyph,
+        Style::default()
+            .fg(glyph_color)
+            .add_modifier(Modifier::BOLD),
+        &label,
+        Style::default().fg(crate::render::theme::foreground()),
+        &detail,
+        width,
+    )
 }
 
 fn render_subagent_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     if area.height == 0 {
+        return;
+    }
+    if subagent_pane_collapsed(app) {
+        frame.render_widget(
+            Paragraph::new(subagent_pane_summary_row(app, area.width)),
+            area,
+        );
         return;
     }
     let visible = usize::from(area.height);
