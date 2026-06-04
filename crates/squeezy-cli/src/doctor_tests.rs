@@ -146,6 +146,88 @@ fn mcp_check_accepts_disabled_server_without_command() {
     assert!(check.detail.contains("enabled=0"));
 }
 
+fn skills_doctor_workspace(name: &str) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("squeezy_doctor_{name}_{nonce}"));
+    std::fs::create_dir_all(&root).expect("mkdir");
+    root
+}
+
+#[test]
+fn skills_check_with_no_skills_is_ok() {
+    let root = skills_doctor_workspace("skills_empty");
+    let mut config = AppConfig::default();
+    config.workspace_root = root.clone();
+    config.skills.user_dir = root.join("user");
+    config.skills.compat_user_dir = root.join("compat");
+
+    let check = skills_check(&config);
+    assert_eq!(check.status, Status::Ok);
+    assert!(check.detail.contains("no skills discovered"), "{check:?}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn skills_check_reports_enabled_count() {
+    let root = skills_doctor_workspace("skills_counts");
+    let skill_dir = root.join(".agents/skills/example");
+    std::fs::create_dir_all(&skill_dir).expect("mkdir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: example\ndescription: \"d\"\n---\n# example\n",
+    )
+    .expect("write skill");
+
+    let mut config = AppConfig::default();
+    config.workspace_root = root.clone();
+    config.skills.user_dir = root.join("user");
+    config.skills.compat_user_dir = root.join("compat");
+
+    let check = skills_check(&config);
+    assert_eq!(check.status, Status::Ok);
+    assert!(
+        check.detail.contains("enabled=1") && check.detail.contains("disabled=0"),
+        "{check:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn skills_check_warns_on_ambiguous_same_precedence_names() {
+    let root = skills_doctor_workspace("skills_ambiguous");
+    let agents_dir = root.join(".agents/skills/dup");
+    std::fs::create_dir_all(&agents_dir).expect("mkdir agents");
+    std::fs::write(
+        agents_dir.join("SKILL.md"),
+        "---\nname: dup\ndescription: \"first\"\n---\n# dup-first\n",
+    )
+    .expect("write first dup");
+    let agents_dir2 = root.join(".agents/skills/dup-other");
+    std::fs::create_dir_all(&agents_dir2).expect("mkdir agents2");
+    std::fs::write(
+        agents_dir2.join("SKILL.md"),
+        "---\nname: dup\ndescription: \"second\"\n---\n# dup-second\n",
+    )
+    .expect("write second dup");
+
+    let mut config = AppConfig::default();
+    config.workspace_root = root.clone();
+    config.skills.user_dir = root.join("user");
+    config.skills.compat_user_dir = root.join("compat");
+
+    let check = skills_check(&config);
+    assert_eq!(check.status, Status::Warn);
+    assert!(check.detail.contains("ambiguous"), "{check:?}");
+    assert!(check.detail.contains("dup"), "{check:?}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn mcp_check_is_ok_when_fields_match_transport() {
     let mut servers = BTreeMap::new();
