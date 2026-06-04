@@ -1328,8 +1328,75 @@ fn home_dir() -> Option<String> {
         .map(|home| home.to_string_lossy().into_owned())
 }
 
-fn expand_home_prefix(path: &str) -> String {
-    if path == "~" {
+fn is_valid_var_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Substitute `$VAR` / `${VAR}` from the process environment. An unresolved
+/// variable is left literal (with its `$`) so the caller can treat it as an
+/// unverifiable — and therefore out-of-workspace — target.
+fn expand_env_vars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('{') => {
+                chars.next();
+                let mut name = String::new();
+                let mut closed = false;
+                for nc in chars.by_ref() {
+                    if nc == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(nc);
+                }
+                match std::env::var(&name) {
+                    Ok(val) if closed && is_valid_var_name(&name) => out.push_str(&val),
+                    _ => {
+                        out.push_str("${");
+                        out.push_str(&name);
+                        if closed {
+                            out.push('}');
+                        }
+                    }
+                }
+            }
+            Some(c2) if c2.is_ascii_alphabetic() || c2 == '_' => {
+                let mut name = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if nc.is_ascii_alphanumeric() || nc == '_' {
+                        name.push(nc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                match std::env::var(&name) {
+                    Ok(val) => out.push_str(&val),
+                    // Leave the literal `$NAME`; a remaining `$` signals an
+                    // unverifiable target to the workspace-escape check.
+                    Err(_) => {
+                        out.push('$');
+                        out.push_str(&name);
+                    }
+                }
+            }
+            _ => out.push('$'),
+        }
+    }
+    out
+}
+
+/// Expand `~`/`~/` and `$VAR`/`${VAR}` in a shell path so targets like
+/// `~/.bashrc` and `$HOME/x` resolve to their real (out-of-workspace)
+/// locations instead of looking like in-workspace relative paths.
+fn expand_path_vars(path: &str) -> String {
+    let tilde_expanded = if path == "~" {
         home_dir().unwrap_or_else(|| path.to_string())
     } else if let Some(rest) = path.strip_prefix("~/") {
         match home_dir() {
@@ -1338,7 +1405,8 @@ fn expand_home_prefix(path: &str) -> String {
         }
     } else {
         path.to_string()
-    }
+    };
+    expand_env_vars(&tilde_expanded)
 }
 
 fn push_write_target(raw: &str, out: &mut Vec<String>) {
@@ -1348,7 +1416,7 @@ fn push_write_target(raw: &str, out: &mut Vec<String>) {
     if raw.is_empty() || raw == "-" || raw.starts_with("/dev/") {
         return;
     }
-    let expanded = expand_home_prefix(raw);
+    let expanded = expand_path_vars(raw);
     if !out.contains(&expanded) {
         out.push(expanded);
     }

@@ -253,3 +253,23 @@ fn write_targets_relative_in_workspace_paths_are_still_reported() {
         vec!["src/b.txt".to_string()]
     );
 }
+
+#[test]
+fn write_targets_expand_env_vars() {
+    let home = test_home();
+    let home = home.trim_end_matches('/');
+    assert_eq!(
+        extract_shell_write_targets("touch \"$HOME/abbas.txt\""),
+        vec![format!("{home}/abbas.txt")],
+        "$HOME must expand so the home write is seen as out-of-workspace"
+    );
+    assert_eq!(
+        extract_shell_write_targets("tee ${HOME}/x"),
+        vec![format!("{home}/x")]
+    );
+    // An unset variable is left literal so the caller escalates on the `$`.
+    assert_eq!(
+        extract_shell_write_targets("touch $SQZ_DEFINITELY_UNSET_VAR/x"),
+        vec!["$SQZ_DEFINITELY_UNSET_VAR/x".to_string()]
+    );
+}

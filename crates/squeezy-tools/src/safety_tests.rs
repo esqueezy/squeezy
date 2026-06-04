@@ -202,3 +202,13 @@ fn writable_roots_honor_configured_write_roots() {
         &sandbox
     ));
 }
+
+#[test]
+fn writable_roots_escalate_unresolved_variables() {
+    // A target with an unresolved shell variable can't be proven in-workspace.
+    assert!(path_escapes_permission_writable_roots(
+        "$SQZ_UNSET_VAR/x",
+        ws_root(),
+        &sandbox()
+    ));
+}

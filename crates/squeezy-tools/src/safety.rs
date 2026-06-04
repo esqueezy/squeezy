@@ -227,6 +227,12 @@ pub(crate) fn path_escapes_permission_writable_roots(
     workspace_root: &Path,
     shell_sandbox: &ShellSandboxConfig,
 ) -> bool {
+    // An unresolved shell variable (`$VAR` left after env expansion) means we
+    // cannot prove the target stays in the workspace — escalate rather than
+    // silently allow it.
+    if raw.contains('$') {
+        return true;
+    }
     let normalized = normalize_candidate(raw, workspace_root);
     let roots = permission_writable_roots(workspace_root, shell_sandbox);
     !roots.iter().any(|root| normalized.starts_with(root))
