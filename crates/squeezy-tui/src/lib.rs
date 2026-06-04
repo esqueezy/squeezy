@@ -1315,8 +1315,12 @@ async fn apply_mcp_action(
             enabled,
             persist,
         } => {
-            if persist && let Err(err) = persist_mcp_toggle(app, &server, enabled) {
-                feedback.push(format!("mcp toggle persist failed: {err}"), Severity::Error);
+            if persist {
+                snapshot_active_scope_for_undo(app);
+                if let Err(err) = persist_mcp_toggle(app, &server, enabled) {
+                    pop_undo_snapshot(app);
+                    feedback.push(format!("mcp toggle persist failed: {err}"), Severity::Error);
+                }
             }
             match agent.set_mcp_server_enabled(&server, enabled).await {
                 Ok(_) => {}
@@ -1336,8 +1340,12 @@ async fn apply_mcp_action(
             server,
             persist,
         } => {
-            if persist && let Err(err) = persist_mcp_add(app, &name, &server) {
-                feedback.push(format!("mcp add persist failed: {err}"), Severity::Error);
+            if persist {
+                snapshot_active_scope_for_undo(app);
+                if let Err(err) = persist_mcp_add(app, &name, &server) {
+                    pop_undo_snapshot(app);
+                    feedback.push(format!("mcp add persist failed: {err}"), Severity::Error);
+                }
             }
             let mut next = agent.mcp_servers();
             next.insert(name.clone(), *server);
@@ -1345,29 +1353,53 @@ async fn apply_mcp_action(
         }
         McpAction::Remove { name, persist } => {
             if persist {
+                // Snapshot the active-scope file BEFORE the write so
+                // Ctrl+Z on the /config screen can revert this MCP
+                // remove the same way it reverts any other persisted
+                // field edit.
+                snapshot_active_scope_for_undo(app);
                 match persist_mcp_remove(app, &name) {
-                    Ok(touched) if touched.is_empty() => {
-                        // No tier file defined the server — the
-                        // remove only affects the running session.
-                        // Note this so the user knows the change
-                        // will not survive a restart.
-                        feedback.push(
-                            format!(
-                                "removed {name} from the running session; no settings.toml \
-                                 tier defined it"
-                            ),
-                            Severity::Info,
-                        );
-                    }
-                    Ok(touched) => {
-                        let paths = touched
-                            .iter()
-                            .map(|p| p.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        feedback.push(format!("removed {name} from {paths}"), Severity::Info);
+                    Ok(outcome) => {
+                        if outcome.removed_from_active_scope {
+                            feedback.push(
+                                format!("removed {name} from {}", outcome.path.display()),
+                                Severity::Info,
+                            );
+                        } else {
+                            // Drop the unused undo entry: the file
+                            // never changed because the active scope
+                            // did not define the server, so a Ctrl+Z
+                            // here would needlessly rewrite a fresh
+                            // file with its baseline.
+                            pop_undo_snapshot(app);
+                            feedback.push(
+                                format!(
+                                    "active scope does not define {name}; removed from running \
+                                     session only"
+                                ),
+                                Severity::Info,
+                            );
+                        }
+                        if !outcome.other_tiers_defining.is_empty() {
+                            let paths = outcome
+                                .other_tiers_defining
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            feedback.push(
+                                format!(
+                                    "{name} is still defined in {paths}; switch tabs to remove \
+                                     it from those tiers"
+                                ),
+                                Severity::Warn,
+                            );
+                        }
                     }
                     Err(err) => {
+                        // Drop the unused undo entry — the write
+                        // failed so there is nothing to revert.
+                        pop_undo_snapshot(app);
                         feedback.push(format!("mcp remove persist failed: {err}"), Severity::Error);
                     }
                 }
@@ -1386,6 +1418,31 @@ fn refresh_mcp_screen_state(app: &mut TuiApp, agent: &Agent) {
     if let Some(state) = app.config_screen.as_mut() {
         state.mcp_servers = agent.mcp_servers();
         state.mcp_status = agent.mcp_status_snapshot();
+    }
+}
+
+/// Push a snapshot of the active scope's settings file onto the
+/// config-screen undo stack so a subsequent `Ctrl+Z` reverts the
+/// persisted MCP write. Mirrors `save::save_field`'s pre-write
+/// bookkeeping. Reads the bytes BEFORE the persist runs; `None` is
+/// recorded when the tier file did not exist on disk yet so undo
+/// can recreate the absence.
+fn snapshot_active_scope_for_undo(app: &mut TuiApp) {
+    let Some(state) = app.config_screen.as_mut() else {
+        return;
+    };
+    let path = config_screen::tier_path(state, state.scope);
+    let pre_write_bytes = std::fs::read(&path).ok();
+    state.push_undo_snapshot(path, pre_write_bytes);
+}
+
+/// Undo the most recent `snapshot_active_scope_for_undo` push. Used
+/// when a persist fails or turns out to be a no-op (e.g. the active
+/// scope didn't define the server we tried to remove) so the undo
+/// stack stays in lockstep with what is actually on disk.
+fn pop_undo_snapshot(app: &mut TuiApp) {
+    if let Some(state) = app.config_screen.as_mut() {
+        let _ = state.pop_undo_snapshot();
     }
 }
 
@@ -1449,43 +1506,78 @@ fn persist_mcp_add(
     })
 }
 
-/// Persist a server removal.
+/// Outcome of a scoped persist_mcp_remove. Carries enough context
+/// for the caller to surface accurate feedback without reaching
+/// back into the screen state itself.
+struct McpRemoveOutcome {
+    /// Active scope's settings path the removal was directed at.
+    path: std::path::PathBuf,
+    /// `true` when the active scope's TOML actually had the entry
+    /// (so the write changed disk state); `false` when the active
+    /// scope inherited the entry from another tier and the persist
+    /// was effectively a no-op.
+    removed_from_active_scope: bool,
+    /// Other tier files (besides the active scope) that still
+    /// define this server. After the persisted write those tiers
+    /// will resurrect the server on the next merge — surfaced to
+    /// the user so the inheritance is not silent.
+    other_tiers_defining: Vec<std::path::PathBuf>,
+}
+
+/// Persist a server removal **scoped to the active /config tab**.
 ///
-/// Removing only from the active tier would leave any lower-tier
-/// definition intact, and the merge layer would resurrect the server
-/// on the next reload. To honour the user's "remove" intent we drop
-/// the entry from **every** tier file that currently defines it
-/// (User, Project, Local) and report which paths we touched via the
-/// returned vec. Tiers that never had this server are left untouched
-/// so we don't rewrite unrelated TOML files.
-fn persist_mcp_remove(app: &TuiApp, name: &str) -> std::io::Result<Vec<std::path::PathBuf>> {
+/// Earlier revisions of this helper iterated every tier file (User,
+/// Project, Local) so a remove always survived restart. That broke
+/// the `/config` model — a user on the User tab could silently
+/// edit Project/Local files for a server they didn't own. This
+/// version writes only to the active scope's TOML, mirroring the
+/// `add` and `toggle` paths. The caller still removes the server
+/// from the live registry so the running session reflects the user's
+/// intent immediately, and we surface the other tiers that still
+/// define the server so the user knows where to go to make the
+/// change durable everywhere.
+fn persist_mcp_remove(app: &TuiApp, name: &str) -> std::io::Result<McpRemoveOutcome> {
     let state = match app.config_screen.as_ref() {
         Some(state) => state,
-        None => return Ok(Vec::new()),
+        None => {
+            // Without a screen we cannot determine the active scope;
+            // an empty outcome keeps the caller's feedback honest.
+            return Ok(McpRemoveOutcome {
+                path: std::path::PathBuf::new(),
+                removed_from_active_scope: false,
+                other_tiers_defining: Vec::new(),
+            });
+        }
     };
-    let paths = [
+    let active_path = config_screen::tier_path(state, state.scope);
+    let mut removed_from_active_scope = false;
+    if active_path.exists() {
+        mcp_settings_edit::mcp_settings_edit(&active_path, |servers| {
+            removed_from_active_scope = servers.remove(name).is_some();
+            Ok(())
+        })?;
+    }
+    // Read-only sniff at the other tier files to spot inherited
+    // definitions. We do NOT mutate them — that's the whole point of
+    // the scope-respecting fix.
+    let mut other_tiers_defining = Vec::new();
+    for path in [
         state.sources.user_path_default.clone(),
         state.sources.project_path_default.clone(),
         state.sources.repo_path_default.clone(),
-    ];
-    let mut touched = Vec::new();
-    for path in paths {
-        // Skip tier files that don't exist on disk yet — there's
-        // nothing to remove from them and creating empty files just
-        // to record the absence would pollute the filesystem.
-        if !path.exists() {
+    ] {
+        if path == active_path || !path.exists() {
             continue;
         }
-        let mut removed = false;
-        mcp_settings_edit::mcp_settings_edit(&path, |servers| {
-            removed = servers.remove(name).is_some();
-            Ok(())
-        })?;
-        if removed {
-            touched.push(path);
+        if mcp_settings_edit::tier_defines_mcp_server(&path, name) {
+            other_tiers_defining.push(path);
         }
     }
-    Ok(touched)
+    Ok(McpRemoveOutcome {
+        path: active_path,
+        removed_from_active_scope,
+        other_tiers_defining,
+    })
 }
 
 fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {

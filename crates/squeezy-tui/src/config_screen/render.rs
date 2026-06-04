@@ -525,11 +525,12 @@ fn render_mcp_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenSta
     )]));
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![Span::styled(
-        "Enter / e   toggle enabled    r   restart    d / x   remove (with y/n)",
+        "Enter / e   toggle enabled    r   restart    a   add    d / x   remove",
         Style::default().fg(crate::render::theme::quiet()),
     )]));
     lines.push(Line::from(vec![Span::styled(
-        "S+e / S+r / S+a / S+d apply session-only (no settings.toml write)",
+        "Shift+e / Shift+a applies the change session-only (no settings.toml write); \
+         remove prompts y/s/n (y = persist · s = session-only · n / Esc = cancel)",
         Style::default().fg(crate::render::theme::quiet()),
     )]));
 

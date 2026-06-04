@@ -181,6 +181,28 @@ pub(crate) fn mcp_server_table(server: &squeezy_core::McpServerConfig) -> toml_e
     table
 }
 
+/// Return `true` when the file at `path` parses as a settings TOML
+/// containing `[mcp.servers.<name>]`. Used by the scoped
+/// `persist_mcp_remove` helper to flag other tiers that still
+/// define a server the user just removed from the active scope —
+/// the merge layer would otherwise resurrect the entry on the next
+/// reload. Parse errors and missing files are treated as "not
+/// defined here" because the caller is reporting hints, not
+/// enforcing state.
+pub(crate) fn tier_defines_mcp_server(path: &Path, name: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    doc.get("mcp")
+        .and_then(|mcp| mcp.as_table())
+        .and_then(|mcp| mcp.get("servers"))
+        .and_then(|servers| servers.as_table())
+        .is_some_and(|servers| servers.contains_key(name))
+}
+
 #[cfg(test)]
 #[path = "mcp_settings_edit_tests.rs"]
 mod tests;

@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{mcp_server_table, mcp_settings_edit};
+use super::{mcp_server_table, mcp_settings_edit, tier_defines_mcp_server};
 
 /// Generate a unique temp path so concurrent test runs do not clash.
 /// We rely on the process id plus a monotonic counter rather than
@@ -186,66 +186,85 @@ fn mcp_server_table_preserves_http_identity() {
     assert_eq!(bearer, Some("DOCS_BEARER"));
 }
 
-/// Drives the editor against three independent tier files to mirror
-/// the cross-tier removal behaviour in `persist_mcp_remove`: a
-/// remove request must drop the entry from every tier that defines
-/// it, otherwise an inherited definition resurrects the server at
-/// the next reload. We invoke the public `mcp_settings_edit` once
-/// per tier with the same `servers.remove(name)` body the real
-/// helper uses.
+/// `tier_defines_mcp_server` is the read-only sniff that lets
+/// `persist_mcp_remove` flag inherited definitions after a scoped
+/// remove. It must accept settings files that don't have an
+/// `[mcp]` block, ignore missing files, and only return `true`
+/// when the named server is explicitly declared under `[mcp.servers]`.
 #[test]
-fn cross_tier_remove_drops_entry_from_every_tier_file_that_defines_it() {
-    let dir = unique_temp_dir("cross-tier-remove");
-    let user = dir.join("user.toml");
-    let project = dir.join("project.toml");
-    let local = dir.join("local.toml");
+fn tier_defines_mcp_server_detects_explicit_declarations_only() {
+    let dir = unique_temp_dir("tier-defines");
+    let defines = dir.join("defines.toml");
+    let other = dir.join("other.toml");
+    let no_mcp = dir.join("no-mcp.toml");
+    let missing = dir.join("missing.toml");
+
     fs::write(
-        &user,
+        &defines,
+        "[mcp.servers.docs]\nenabled = true\ntransport = \"stdio\"\ncommand = \"docs\"\n\n\
+         [mcp.servers.other]\nenabled = true\ncommand = \"other\"\n",
+    )
+    .expect("seed");
+    fs::write(
+        &other,
+        "[mcp.servers.unrelated]\nenabled = true\ncommand = \"x\"\n",
+    )
+    .expect("seed");
+    fs::write(&no_mcp, "[tui]\ntheme = \"dark\"\n").expect("seed");
+
+    assert!(tier_defines_mcp_server(&defines, "docs"));
+    assert!(tier_defines_mcp_server(&defines, "other"));
+    assert!(!tier_defines_mcp_server(&other, "docs"));
+    assert!(
+        !tier_defines_mcp_server(&no_mcp, "docs"),
+        "files without [mcp] must report not-defined"
+    );
+    assert!(
+        !tier_defines_mcp_server(&missing, "docs"),
+        "missing files must report not-defined (no panic)"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `persist_mcp_remove` is now scoped to the active `/config` tab —
+/// editing a higher tier must NOT silently rewrite a lower tier's
+/// settings file. This pins the underlying editor property that
+/// the scoped helper relies on: removing from `path` mutates only
+/// `path` and never reaches into sibling files even when they
+/// define the same server.
+#[test]
+fn scoped_remove_only_touches_the_file_it_is_called_against() {
+    let dir = unique_temp_dir("scoped-remove");
+    let active = dir.join("project.toml");
+    let other = dir.join("user.toml");
+    fs::write(
+        &active,
+        "[mcp.servers.docs]\nenabled = true\ntransport = \"stdio\"\ncommand = \"docs-mcp\"\n",
+    )
+    .expect("seed active scope");
+    fs::write(
+        &other,
         "[mcp.servers.docs]\nenabled = true\ntransport = \"http\"\nurl = \"https://docs.example/mcp\"\n",
     )
-    .expect("seed user");
-    fs::write(
-        &project,
-        "[mcp.servers.docs]\nenabled = false\ntransport = \"stdio\"\ncommand = \"docs-mcp\"\n",
-    )
-    .expect("seed project");
-    // local intentionally does NOT define `docs`; the editor must
-    // skip non-defining tiers and not waste a write.
-    fs::write(
-        &local,
-        "[mcp.servers.other]\nenabled = true\ncommand = \"x\"\n",
-    )
-    .expect("seed local");
+    .expect("seed user tier");
 
-    let mut touched: Vec<PathBuf> = Vec::new();
-    for path in [&user, &project, &local] {
-        let mut removed = false;
-        mcp_settings_edit(path, |servers| {
-            removed = servers.remove("docs").is_some();
-            Ok(())
-        })
-        .expect("edit succeeds");
-        if removed {
-            touched.push(path.clone());
-        }
-    }
+    let mut removed_from_active = false;
+    mcp_settings_edit(&active, |servers| {
+        removed_from_active = servers.remove("docs").is_some();
+        Ok(())
+    })
+    .expect("active edit succeeds");
+    assert!(removed_from_active);
 
-    assert_eq!(touched, vec![user.clone(), project.clone()]);
+    let active_text = fs::read_to_string(&active).unwrap();
+    let other_text = fs::read_to_string(&other).unwrap();
     assert!(
-        !fs::read_to_string(&user)
-            .unwrap()
-            .contains("[mcp.servers.docs]")
+        !active_text.contains("[mcp.servers.docs]"),
+        "active scope drops the entry: {active_text}"
     );
     assert!(
-        !fs::read_to_string(&project)
-            .unwrap()
-            .contains("[mcp.servers.docs]")
-    );
-    // `local.toml`'s unrelated entry must survive the no-op pass.
-    assert!(
-        fs::read_to_string(&local)
-            .unwrap()
-            .contains("[mcp.servers.other]")
+        other_text.contains("[mcp.servers.docs]"),
+        "non-active tier must survive a scoped remove: {other_text}"
     );
     let _ = fs::remove_dir_all(&dir);
 }
