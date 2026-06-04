@@ -1914,30 +1914,7 @@ impl Agent {
         }
         let skills_changed = next.skills != self.config.skills;
         let workspace_changed = next.workspace_root != self.config.workspace_root;
-        // Hot-reload MCP servers when the diff touches `[mcp.servers]`.
-        // The tool *runtime* (the rest of `ToolRegistry`) still requires
-        // a full restart, but a server-map drift is exactly what the
-        // `/mcp` config page and the settings watcher need to propagate
-        // without losing the running session. We spawn into the tracked
-        // `JoinSet` so `Agent::shutdown` can wait for the registry to
-        // settle before dropping the redb store.
-        if next.mcp_servers != self.config.mcp_servers {
-            let tools = self.tools.clone();
-            let servers = next.mcp_servers.clone();
-            let task = async move {
-                let _ = tools
-                    .replace_mcp_servers(servers, CancellationToken::new())
-                    .await;
-            };
-            match self.background_tasks.lock() {
-                Ok(mut tasks) => {
-                    tasks.spawn(task);
-                }
-                Err(poison) => {
-                    poison.into_inner().spawn(task);
-                }
-            }
-        }
+        self.schedule_mcp_servers_reload_if_changed(&next);
         self.config = next;
         if skills_changed || workspace_changed {
             self.rebuild_skills_catalog();
@@ -1948,6 +1925,41 @@ impl Agent {
             // stale would let old `PreToolUse`/`PostToolUse` shell-outs keep
             // firing against the user's stated intent.
             self.rebuild_hooks_registry();
+        }
+    }
+
+    /// Spawn a background `replace_mcp_servers` against the tool
+    /// registry when the incoming `[mcp.servers]` map differs from the
+    /// currently-installed one. Shared between `replace_config`
+    /// (settings reload + Immediate-tier saves) and
+    /// `drain_pending_swap` (NextPrompt-tier saves that also change
+    /// provider) so a server-map change is never silently dropped on
+    /// either path. The tool *runtime* outside the MCP registry still
+    /// needs a full restart for other field changes — this helper
+    /// only addresses the registry hot-reload gap.
+    fn schedule_mcp_servers_reload_if_changed(&self, next: &AppConfig) {
+        if next.mcp_servers == self.config.mcp_servers {
+            return;
+        }
+        let tools = self.tools.clone();
+        let servers = next.mcp_servers.clone();
+        let task = async move {
+            let _ = tools
+                .replace_mcp_servers(servers, CancellationToken::new())
+                .await;
+        };
+        // Hand the spawn to the tracked `JoinSet` so `Agent::shutdown`
+        // waits for the registry to settle before dropping the redb
+        // store. Lock poisoning here only comes from a panic inside
+        // another spawn site; we recover the inner data rather than
+        // panic — the registry must stay usable across config edits.
+        match self.background_tasks.lock() {
+            Ok(mut tasks) => {
+                tasks.spawn(task);
+            }
+            Err(poison) => {
+                poison.into_inner().spawn(task);
+            }
         }
     }
 
@@ -2033,6 +2045,14 @@ impl Agent {
         let swap = self.pending_swap.take()?;
         let skills_changed = swap.config.skills != self.config.skills;
         let workspace_changed = swap.config.workspace_root != self.config.workspace_root;
+        // Honour any `[mcp.servers]` drift bundled into the swap on
+        // the same beat as the provider/config replacement. Without
+        // this, a settings-watcher reload that *also* changes the
+        // provider would arm a `PendingConfigSwap` instead of going
+        // through `replace_config`, and the MCP registry would
+        // silently fall out of sync with `AppConfig.mcp_servers` until
+        // the next process restart.
+        self.schedule_mcp_servers_reload_if_changed(&swap.config);
         self.config = swap.config.clone();
         if let Some(provider) = swap.provider.clone() {
             self.provider = provider;

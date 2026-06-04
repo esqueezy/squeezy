@@ -1344,8 +1344,33 @@ async fn apply_mcp_action(
             agent.replace_mcp_servers(next).await;
         }
         McpAction::Remove { name, persist } => {
-            if persist && let Err(err) = persist_mcp_remove(app, &name) {
-                feedback.push(format!("mcp remove persist failed: {err}"), Severity::Error);
+            if persist {
+                match persist_mcp_remove(app, &name) {
+                    Ok(touched) if touched.is_empty() => {
+                        // No tier file defined the server — the
+                        // remove only affects the running session.
+                        // Note this so the user knows the change
+                        // will not survive a restart.
+                        feedback.push(
+                            format!(
+                                "removed {name} from the running session; no settings.toml \
+                                 tier defined it"
+                            ),
+                            Severity::Info,
+                        );
+                    }
+                    Ok(touched) => {
+                        let paths = touched
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        feedback.push(format!("removed {name} from {paths}"), Severity::Info);
+                    }
+                    Err(err) => {
+                        feedback.push(format!("mcp remove persist failed: {err}"), Severity::Error);
+                    }
+                }
             }
             let mut next = agent.mcp_servers();
             next.remove(&name);
@@ -1365,24 +1390,42 @@ fn refresh_mcp_screen_state(app: &mut TuiApp, agent: &Agent) {
 }
 
 /// Persist a single server's `enabled` toggle to the active config
-/// scope's TOML. Mirrors `squeezy mcp enable/disable` so a CLI run
-/// later sees the same file.
+/// scope's TOML.
+///
+/// We write the **full** server table — not just the `enabled` flag
+/// — because `McpServerConfig::merge` (in `squeezy-core`)
+/// unconditionally overwrites `transport` from the higher-precedence
+/// tier. If the toggled server is inherited from a lower tier as
+/// HTTP/SSE and we wrote only `enabled = …` to the active tier, the
+/// parser would default the missing `transport` to `Stdio`, then the
+/// merge would replace the inherited HTTP/SSE transport with that
+/// `Stdio` default — silently corrupting the server config after
+/// reload. Writing the entire table preserves the running server's
+/// full identity on disk.
 fn persist_mcp_toggle(app: &TuiApp, name: &str, enabled: bool) -> std::io::Result<()> {
     let state = match app.config_screen.as_ref() {
         Some(state) => state,
         None => return Ok(()),
     };
+    // The live cached `mcp_servers` map already reflects the optimistic
+    // post-toggle `enabled` value (the `/mcp` key handler applies it
+    // before staging the action), so the table we serialize here is
+    // exactly what production should see at the next reload.
+    let server = match state.mcp_servers.get(name) {
+        Some(server) => server.clone(),
+        // Toggling a server that the cached snapshot does not know
+        // about would only happen if the registry got out of sync —
+        // a no-op persist is safer than fabricating a fresh table
+        // with default fields that could clobber other tiers.
+        None => return Ok(()),
+    };
+    debug_assert_eq!(server.enabled, enabled);
     let path = config_screen::tier_path(state, state.scope);
     mcp_settings_edit::mcp_settings_edit(&path, |servers| {
-        let entry = servers
-            .entry(name)
-            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-        if let Some(table) = entry.as_table_mut() {
-            table.insert(
-                "enabled",
-                toml_edit::Item::Value(toml_edit::Value::from(enabled)),
-            );
-        }
+        servers.insert(
+            name,
+            toml_edit::Item::Table(mcp_settings_edit::mcp_server_table(&server)),
+        );
         Ok(())
     })
 }
@@ -1398,42 +1441,51 @@ fn persist_mcp_add(
     };
     let path = config_screen::tier_path(state, state.scope);
     mcp_settings_edit::mcp_settings_edit(&path, |servers| {
-        let mut table = toml_edit::Table::new();
-        table.insert(
-            "enabled",
-            toml_edit::Item::Value(toml_edit::Value::from(server.enabled)),
+        servers.insert(
+            name,
+            toml_edit::Item::Table(mcp_settings_edit::mcp_server_table(server)),
         );
-        table.insert(
-            "transport",
-            toml_edit::Item::Value(toml_edit::Value::from(server.transport.as_str())),
-        );
-        if let Some(command) = &server.command {
-            table.insert(
-                "command",
-                toml_edit::Item::Value(toml_edit::Value::from(command.as_str())),
-            );
-        }
-        if let Some(url) = &server.url {
-            table.insert(
-                "url",
-                toml_edit::Item::Value(toml_edit::Value::from(url.as_str())),
-            );
-        }
-        servers.insert(name, toml_edit::Item::Table(table));
         Ok(())
     })
 }
 
-fn persist_mcp_remove(app: &TuiApp, name: &str) -> std::io::Result<()> {
+/// Persist a server removal.
+///
+/// Removing only from the active tier would leave any lower-tier
+/// definition intact, and the merge layer would resurrect the server
+/// on the next reload. To honour the user's "remove" intent we drop
+/// the entry from **every** tier file that currently defines it
+/// (User, Project, Local) and report which paths we touched via the
+/// returned vec. Tiers that never had this server are left untouched
+/// so we don't rewrite unrelated TOML files.
+fn persist_mcp_remove(app: &TuiApp, name: &str) -> std::io::Result<Vec<std::path::PathBuf>> {
     let state = match app.config_screen.as_ref() {
         Some(state) => state,
-        None => return Ok(()),
+        None => return Ok(Vec::new()),
     };
-    let path = config_screen::tier_path(state, state.scope);
-    mcp_settings_edit::mcp_settings_edit(&path, |servers| {
-        servers.remove(name);
-        Ok(())
-    })
+    let paths = [
+        state.sources.user_path_default.clone(),
+        state.sources.project_path_default.clone(),
+        state.sources.repo_path_default.clone(),
+    ];
+    let mut touched = Vec::new();
+    for path in paths {
+        // Skip tier files that don't exist on disk yet — there's
+        // nothing to remove from them and creating empty files just
+        // to record the absence would pollute the filesystem.
+        if !path.exists() {
+            continue;
+        }
+        let mut removed = false;
+        mcp_settings_edit::mcp_settings_edit(&path, |servers| {
+            removed = servers.remove(name).is_some();
+            Ok(())
+        })?;
+        if removed {
+            touched.push(path);
+        }
+    }
+    Ok(touched)
 }
 
 fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
