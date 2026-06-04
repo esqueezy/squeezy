@@ -228,6 +228,10 @@ pub(crate) fn foreground() -> Color {
     color(token::UI_FOREGROUND)
 }
 
+pub(crate) fn background() -> Color {
+    color(token::UI_BACKGROUND)
+}
+
 pub(crate) fn muted() -> Color {
     color(token::UI_MUTED)
 }

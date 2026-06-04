@@ -5565,7 +5565,7 @@ fn format_request_user_input_menu_lines(
             .add_modifier(Modifier::BOLD);
         let label_style = Style::default().fg(crate::render::theme::magenta());
         let cursor_style = Style::default()
-            .fg(Color::Black)
+            .fg(crate::render::theme::background())
             .bg(crate::render::theme::magenta());
         let mut spans = vec![
             Span::styled(marker, marker_style),
@@ -8962,7 +8962,7 @@ fn role_action(role: &Role) -> (&'static str, Color) {
     match role {
         Role::User => ("Asked", crate::render::theme::accent()),
         Role::Assistant => ("Answered", crate::render::theme::green()),
-        Role::System => ("Noted", crate::render::theme::secondary()),
+        Role::System => ("Noted", crate::render::theme::muted()),
     }
 }
 
@@ -12761,7 +12761,7 @@ fn format_status_overview_line(app: &TuiApp, width: u16) -> Line<'static> {
     let left_width = left.chars().count();
     let padding = " ".repeat((width as usize).saturating_sub(left_width + right_width));
     Line::from(vec![
-        Span::styled(left, Style::default().fg(Color::Gray)),
+        Span::styled(left, Style::default().fg(crate::render::theme::muted())),
         Span::raw(padding),
         Span::styled(right, Style::default().fg(mode_status_color(app.mode))),
     ])

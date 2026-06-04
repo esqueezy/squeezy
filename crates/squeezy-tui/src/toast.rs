@@ -49,9 +49,13 @@ pub(crate) enum ToastVariant {
 impl ToastVariant {
     pub(crate) fn color(self) -> Color {
         match self {
-            Self::Info => crate::render::theme::accent(),
+            // Mirror the rail's message taxonomy so a toast reads the same as its
+            // on-rail equivalent and amber stays rationed: info = blue (cool,
+            // not gold), warning = cyan (the warn tier), success = green,
+            // error = red.
+            Self::Info => crate::render::theme::blue(),
             Self::Success => crate::render::theme::green(),
-            Self::Warning => crate::render::theme::secondary(),
+            Self::Warning => crate::render::theme::cyan(),
             Self::Error => crate::render::theme::red(),
         }
     }
