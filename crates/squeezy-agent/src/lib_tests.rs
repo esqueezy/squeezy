@@ -8537,6 +8537,78 @@ async fn round_input_gate_noop_when_unset() {
     );
 }
 
+#[tokio::test]
+async fn provider_context_overflow_compacts_and_retries_once() {
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ContextOverflow {
+                provider: "mock".to_string(),
+                signal: squeezy_llm::overflow::OverflowSignal::ErrorPattern(
+                    "context_length_exceeded".to_string(),
+                ),
+            }),
+            Err(SqueezyError::ProviderStream(
+                "context_length_exceeded".to_string(),
+            )),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done after compact".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_after_compact".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            enabled: false,
+            enabled_mid_turn: false,
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+    agent.conversation_state.lock().await.conversation = mid_turn_test_conversation();
+
+    let mut rx = agent.start_turn("continue".to_string(), CancellationToken::new());
+    let mut compacted = None;
+    let mut completed = None;
+    let mut failed = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ContextCompacted { report, .. } => compacted = Some(report),
+            AgentEvent::Completed { message, .. } => completed = Some(message.content),
+            AgentEvent::Failed { error, .. } => failed = Some(error.to_string()),
+            _ => {}
+        }
+    }
+
+    assert!(
+        failed.is_none(),
+        "overflow should compact and retry once instead of failing: {failed:?}"
+    );
+    let report = compacted.expect("provider overflow should force compaction");
+    assert!(
+        report.record.after.estimated_tokens < report.record.before.estimated_tokens,
+        "overflow compaction should shrink context: {} -> {}",
+        report.record.before.estimated_tokens,
+        report.record.after.estimated_tokens,
+    );
+    assert_eq!(completed.as_deref(), Some("done after compact"));
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the first overflowing call should be retried exactly once after compaction"
+    );
+}
+
 /// Drives the broker through a scripted spent sequence: after a cheap first
 /// round lands, the next round's projection must trip the cap pre-flight even
 /// though the post-hoc check is still under cap.
