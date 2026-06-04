@@ -292,6 +292,8 @@ pub const PROVIDERS: &[&str] = &[
     "together",
     "fireworks",
     "cerebras",
+    "deepinfra",
+    "baseten",
     "lmstudio",
     "vllm",
     "llamacpp",

@@ -6,7 +6,7 @@ use squeezy_core::{
 };
 
 use super::{
-    MODEL_REGISTRY, estimate_json_tokens, estimate_text_tokens, model_info_for,
+    MODEL_REGISTRY, PROVIDERS, estimate_json_tokens, estimate_text_tokens, model_info_for,
     provider_honors_output_schema,
 };
 
@@ -137,6 +137,24 @@ fn catalog_has_no_duplicate_provider_id_pairs() {
             entry.id
         );
     }
+}
+
+#[test]
+fn providers_list_includes_every_curated_model_provider() {
+    let surfaced = PROVIDERS
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let curated = MODEL_REGISTRY
+        .iter()
+        .map(|entry| entry.provider)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let missing = curated.difference(&surfaced).copied().collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "PROVIDERS omits curated models.json provider(s): {missing:?}"
+    );
 }
 
 #[test]
