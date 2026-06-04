@@ -2605,17 +2605,21 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             app.transcript_overlay_scrollbar_cache.set(None);
-            // Step Collapsed → Expanded → closed: a folded subagent view first
-            // unfolds in place, and an already-expanded overlay closes. Opening
-            // from nothing (the main-transcript Ctrl-T) goes straight to expanded.
-            app.status = match app.transcript_overlay.as_mut() {
-                Some(state) if state.detail == OverlayDetail::Collapsed => {
-                    state.detail = OverlayDetail::Expanded;
-                    "transcript overlay expanded (Esc to close)".to_string()
+            // This toggle action is dispatched up top even while the overlay is
+            // open, so it runs the full cycle: a folded subagent view unfolds to
+            // Expanded in place, an already-expanded overlay closes (backing out
+            // to the main conversation when it was a subagent), and opening from
+            // nothing goes straight to expanded — the "see everything" view.
+            app.status = match app.transcript_overlay.map(|state| state.detail) {
+                Some(OverlayDetail::Collapsed) => {
+                    if let Some(state) = app.transcript_overlay.as_mut() {
+                        state.detail = OverlayDetail::Expanded;
+                    }
+                    "transcript expanded — Esc to close".to_string()
                 }
-                Some(_) => {
-                    app.transcript_overlay = None;
-                    "transcript overlay closed".to_string()
+                Some(OverlayDetail::Expanded) => {
+                    close_transcript_overlay(app);
+                    return true;
                 }
                 None => {
                     app.transcript_overlay = Some(TranscriptOverlayState::default());
@@ -4531,6 +4535,23 @@ fn select_next_transcript_entry(app: &mut TuiApp) {
 /// Handle a keystroke while the full-screen transcript overlay is open.
 /// Returns `true` when the key was consumed so the caller does not also
 /// dispatch it to the normal input/turn paths.
+/// Close the transcript overlay. When it was surfacing a subagent conversation
+/// (opened from the pane via Enter), back all the way out to the main
+/// conversation in one step, mirroring the pane's own Esc.
+fn close_transcript_overlay(app: &mut TuiApp) {
+    app.transcript_overlay_scrollbar_cache.set(None);
+    app.transcript_overlay = None;
+    if matches!(app.subagent_pane.active, ConversationSource::Subagent(_)) {
+        app.subagent_pane.focused = false;
+        app.subagent_pane.active = ConversationSource::Main;
+        app.subagent_pane.selected = 0;
+        set_active_transcript_scroll_from_bottom(app, 0);
+        app.status = "main conversation selected".to_string();
+    } else {
+        app.status = "transcript overlay closed".to_string();
+    }
+}
+
 fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if app.transcript_overlay.is_none() {
         return false;
@@ -4538,20 +4559,7 @@ fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     const PAGE: usize = 10;
     match key.code {
         KeyCode::Esc => {
-            app.transcript_overlay_scrollbar_cache.set(None);
-            app.transcript_overlay = None;
-            // When the overlay was surfacing a subagent conversation (opened
-            // from the pane via Enter), Esc backs all the way out to the main
-            // conversation in one press, mirroring the pane's own Esc.
-            if matches!(app.subagent_pane.active, ConversationSource::Subagent(_)) {
-                app.subagent_pane.focused = false;
-                app.subagent_pane.active = ConversationSource::Main;
-                app.subagent_pane.selected = 0;
-                set_active_transcript_scroll_from_bottom(app, 0);
-                app.status = "main conversation selected".to_string();
-            } else {
-                app.status = "transcript overlay closed".to_string();
-            }
+            close_transcript_overlay(app);
             true
         }
         KeyCode::PageUp => {

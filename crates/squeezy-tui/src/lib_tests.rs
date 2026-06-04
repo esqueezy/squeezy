@@ -13576,3 +13576,35 @@ fn subagent_overlay_opens_collapsed_default_is_expanded() {
         OverlayDetail::Expanded
     );
 }
+
+#[tokio::test]
+async fn ctrl_t_expands_then_closes_a_collapsed_overlay() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    open_subagent_transcript_overlay(&mut app);
+    assert_eq!(
+        app.transcript_overlay.unwrap().detail,
+        OverlayDetail::Collapsed
+    );
+    // First Ctrl-T unfolds in place (does not close).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(
+        app.transcript_overlay.unwrap().detail,
+        OverlayDetail::Expanded
+    );
+    // Second Ctrl-T closes the (already expanded) overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("handle key");
+    assert!(app.transcript_overlay.is_none());
+}
