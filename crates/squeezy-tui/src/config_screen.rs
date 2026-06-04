@@ -762,6 +762,21 @@ impl ConfigScreenState {
             }
             return (value, FieldSource::Default);
         }
+        // AI-reviewer fields resolve against the running config so the row
+        // reflects what will actually be used (the resolved reviewer model, the
+        // active capability set) rather than a static, often-empty default. The
+        // badge still reflects whether the active tab sets the value.
+        if let ["permissions", "ai_reviewer", _] = field.toml_path {
+            let value = (field.get)(&self.effective);
+            for (src, tier) in chain {
+                if let Some(t) = tier
+                    && tier_value_at_path(t, field).is_some()
+                {
+                    return (value, *src);
+                }
+            }
+            return (value, FieldSource::Default);
+        }
         for (src, tier) in chain {
             if let Some(t) = tier
                 && let Some(val) = tier_value_at_path(t, field)

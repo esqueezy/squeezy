@@ -2041,13 +2041,18 @@ fn set_perm_mode(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static 
 }
 
 fn get_ai_reviewer_model(cfg: &AppConfig) -> FieldValue {
-    FieldValue::String(
-        cfg.permissions
-            .ai_reviewer
-            .model
-            .clone()
-            .unwrap_or_default(),
-    )
+    // Show the model that will actually run: the explicit override, else the
+    // provider's resolved small/fast tier, else the main model — matching the
+    // reviewer's own resolution. Clearing the override reverts the row to the
+    // resolved default rather than a blank cell.
+    let resolved = cfg
+        .permissions
+        .ai_reviewer
+        .model
+        .clone()
+        .or_else(|| cfg.resolved_small_fast_model())
+        .unwrap_or_else(|| cfg.model.clone());
+    FieldValue::String(resolved)
 }
 // Unlike the per-capability setters, this does not force mode = Custom: the
 // reviewer model is meaningful under the Auto-review preset.

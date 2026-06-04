@@ -1848,3 +1848,90 @@ fn permissions_visible_rows_reveal_reviewer_under_auto_review() {
         total
     );
 }
+
+#[test]
+fn permission_mode_change_reveals_reviewer_rows_immediately() {
+    // State-level: flipping the effective mode changes the visible row count on
+    // the very next query — no navigation needed.
+    let mut state = temp_config_state(Some(SectionId::Permissions));
+    assert_eq!(
+        state.effective.permissions.mode,
+        PermissionPolicyMode::Default
+    );
+    assert_eq!(state.row_count(), 1, "default mode shows only the mode row");
+
+    let mode_field = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SectionId::Permissions)
+        .unwrap()
+        .fields
+        .iter()
+        .find(|f| f.label == "mode")
+        .unwrap();
+    (mode_field.set)(&mut state.effective, FieldValue::Enum("auto_review")).unwrap();
+    assert_eq!(
+        state.effective.permissions.mode,
+        PermissionPolicyMode::AutoReview
+    );
+    assert_eq!(state.row_count(), 1 + PERMISSION_REVIEWER_ROWS);
+}
+
+#[test]
+fn cycling_permission_mode_via_key_expands_rows() {
+    let mut state = temp_config_state(Some(SectionId::Permissions));
+    state.field_index = 0; // the `mode` row
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    assert_eq!(state.row_count(), 1);
+
+    // Space cycles the mode enum: default -> auto_review.
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    assert_eq!(
+        state.effective.permissions.mode,
+        PermissionPolicyMode::AutoReview,
+        "space must cycle the mode to auto_review"
+    );
+    assert_eq!(
+        state.row_count(),
+        1 + PERMISSION_REVIEWER_ROWS,
+        "cycling mode must reveal the reviewer rows in the same frame"
+    );
+}
+
+#[test]
+fn reviewer_rows_display_resolved_values_not_dashes() {
+    // Regression: reviewer rows used to show "—" because the display fell back
+    // to the static (empty) default instead of the running effective value.
+    let mut state = temp_config_state(Some(SectionId::Permissions));
+    state
+        .effective
+        .permissions
+        .apply_mode(PermissionPolicyMode::AutoReview);
+
+    let perms = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SectionId::Permissions)
+        .unwrap();
+    let field = |label: &str| perms.fields.iter().find(|f| f.label == label).unwrap();
+
+    // The capability remit shows the active set, not a bare dash.
+    let (caps, _) = state.displayed_value_and_source(field("reviewer_capabilities"));
+    let caps_str = caps.as_display();
+    assert!(
+        caps_str.contains("edit") && caps_str.contains("shell"),
+        "reviewer_capabilities should list the active set, got {caps_str:?}"
+    );
+
+    // The model shows the resolved model, never empty/dash.
+    let (model, _) = state.displayed_value_and_source(field("reviewer_model"));
+    let model_str = model.as_display();
+    assert!(
+        !model_str.is_empty() && model_str != "—",
+        "reviewer_model should resolve to a real model, got {model_str:?}"
+    );
+}

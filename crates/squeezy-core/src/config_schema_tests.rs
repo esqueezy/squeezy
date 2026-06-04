@@ -51,9 +51,11 @@ fn permission_round_trip() {
                     }
                 }
             }
-            // The Auto-review reviewer rows (reviewer_model, reviewer_policy):
-            // a value round-trips and empty clears back to the built-in
-            // default.
+            // The Auto-review reviewer rows (reviewer_model, reviewer_policy,
+            // reviewer_policy_extra): an explicit value round-trips, and
+            // clearing the override succeeds. (reviewer_model resolves to the
+            // provider's small/fast model when cleared, so the cleared value is
+            // not necessarily empty — assert only that clearing is accepted.)
             FieldKind::String { .. } => {
                 (f.set)(&mut cfg, FieldValue::String("custom-value".to_string())).unwrap();
                 match (f.get)(&cfg) {
@@ -62,7 +64,7 @@ fn permission_round_trip() {
                 }
                 (f.set)(&mut cfg, FieldValue::String(String::new())).unwrap();
                 match (f.get)(&cfg) {
-                    FieldValue::String(v) => assert!(v.is_empty(), "{}", f.label),
+                    FieldValue::String(_) => {}
                     other => panic!("unexpected: {other:?}"),
                 }
             }
