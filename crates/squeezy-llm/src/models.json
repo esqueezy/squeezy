@@ -91,6 +91,37 @@
   },
   {
     "provider": "anthropic",
+    "id": "claude-opus-4-8",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": true,
+      "default_reasoning_effort": "high"
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 5000000,
+      "output_usd_micros_per_mtok": 25000000,
+      "cache_read_usd_micros_per_mtok": 500000,
+      "cache_write_usd_micros_per_mtok": 6250000
+    },
+    "limits": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://platform.claude.com/docs/en/about-claude/models/overview"
+  },
+  {
+    "provider": "anthropic",
     "id": "claude-opus-4-7",
     "profile": "strong",
     "capabilities": {
@@ -405,6 +436,37 @@
   },
   {
     "provider": "bedrock",
+    "id": "anthropic.claude-opus-4-8",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": true,
+      "default_reasoning_effort": "high"
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 5000000,
+      "output_usd_micros_per_mtok": 25000000,
+      "cache_read_usd_micros_per_mtok": 500000,
+      "cache_write_usd_micros_per_mtok": 6250000
+    },
+    "limits": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions"
+  },
+  {
+    "provider": "bedrock",
     "id": "anthropic.claude-sonnet-4-6",
     "profile": "balanced",
     "capabilities": {
@@ -488,6 +550,32 @@
     "tokenizer": "ollama",
     "lifecycle": "local",
     "metadata_source": "runtime ollama /api/show metadata"
+  },
+  {
+    "provider": "openrouter",
+    "id": "anthropic/claude-opus-4.8",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": true,
+      "default_reasoning_effort": "high"
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/anthropic/claude-opus-4.8"
   },
   {
     "provider": "openrouter",
@@ -716,6 +804,31 @@
   },
   {
     "provider": "portkey",
+    "id": "anthropic/claude-opus-4-8",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://portkey.ai/docs/integrations/llms/anthropic"
+  },
+  {
+    "provider": "portkey",
     "id": "anthropic/claude-opus-4-7",
     "profile": "strong",
     "capabilities": {
@@ -813,6 +926,31 @@
     "tokenizer": "google",
     "lifecycle": "active",
     "metadata_source": "https://portkey.ai/docs/integrations/llms/google-gemini"
+  },
+  {
+    "provider": "vercel",
+    "id": "anthropic/claude-opus-4.8",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://vercel.com/ai-gateway/models/claude-opus-4.8"
   },
   {
     "provider": "vercel",
@@ -1818,6 +1956,56 @@
   },
   {
     "provider": "cloudflare_workers_ai",
+    "id": "anthropic/claude-opus-4.8",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.cloudflare.com/ai/models/anthropic/claude-opus-4.8/"
+  },
+  {
+    "provider": "cloudflare_ai_gateway",
+    "id": "anthropic/claude-opus-4.8",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.cloudflare.com/ai/models/anthropic/claude-opus-4.8/"
+  },
+  {
+    "provider": "cloudflare_workers_ai",
     "id": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     "profile": "balanced",
     "capabilities": {
@@ -1935,6 +2123,36 @@
     "tokenizer": "openai_compatible",
     "lifecycle": "active",
     "metadata_source": "https://developers.cloudflare.com/workers-ai/models/"
+  },
+  {
+    "provider": "vertex",
+    "id": "claude-opus-4-8",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 5000000,
+      "output_usd_micros_per_mtok": 25000000,
+      "cache_read_usd_micros_per_mtok": 500000,
+      "cache_write_usd_micros_per_mtok": 6250000
+    },
+    "limits": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://platform.claude.com/docs/en/about-claude/models/overview"
   },
   {
     "provider": "vertex",

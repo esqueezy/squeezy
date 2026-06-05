@@ -18,15 +18,15 @@ static GITHUB_COPILOT_AUTH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::ne
 fn resolve_opus_alias_for_anthropic() {
     assert_eq!(
         resolve_model_alias("anthropic", "opus"),
-        Some("claude-opus-4-7"),
+        Some("claude-opus-4-8"),
     );
     assert_eq!(
         resolve_model_alias("anthropic", "OPUS"),
-        Some("claude-opus-4-7")
+        Some("claude-opus-4-8")
     );
     assert_eq!(
         resolve_model_alias("anthropic", " opus "),
-        Some("claude-opus-4-7"),
+        Some("claude-opus-4-8"),
     );
     assert_eq!(
         resolve_model_alias("anthropic", "sonnet"),
@@ -57,18 +57,17 @@ fn resolve_opus_alias_for_openai_returns_flagship() {
 
 #[test]
 fn resolve_alias_passes_through_full_ids_and_unknown_inputs() {
-    assert_eq!(resolve_model_alias("anthropic", "claude-opus-4-7"), None);
+    assert_eq!(resolve_model_alias("anthropic", "claude-opus-4-8"), None);
     assert_eq!(resolve_model_alias("openai", "gpt-5.5"), None);
     assert_eq!(resolve_model_alias("anthropic", "opusplan"), None);
     assert_eq!(resolve_model_alias("ollama", "opus"), None);
-    assert_eq!(resolve_model_alias("openrouter", "opus"), None);
 }
 
 #[test]
 fn resolve_alias_for_bedrock_and_google() {
     assert_eq!(
         resolve_model_alias("bedrock", "opus"),
-        Some(DEFAULT_BEDROCK_MODEL)
+        Some("anthropic.claude-opus-4-8")
     );
     assert_eq!(
         resolve_model_alias("bedrock", "sonnet"),
@@ -85,6 +84,30 @@ fn resolve_alias_for_bedrock_and_google() {
     assert_eq!(
         resolve_model_alias("google", "haiku"),
         Some("gemini-2.5-flash-lite")
+    );
+}
+
+#[test]
+fn resolve_opus_alias_for_anthropic_gateways() {
+    assert_eq!(
+        resolve_model_alias("openrouter", "opus"),
+        Some(DEFAULT_OPENROUTER_MODEL)
+    );
+    assert_eq!(
+        resolve_model_alias("vercel", "best"),
+        Some(DEFAULT_VERCEL_AI_MODEL)
+    );
+    assert_eq!(
+        resolve_model_alias("portkey", "opus"),
+        Some(DEFAULT_PORTKEY_MODEL)
+    );
+    assert_eq!(
+        resolve_model_alias("cloudflare_workers_ai", "opus"),
+        Some("anthropic/claude-opus-4.8")
+    );
+    assert_eq!(
+        resolve_model_alias("cloudflare_ai_gateway", "best"),
+        Some("anthropic/claude-opus-4.8")
     );
 }
 
@@ -222,9 +245,9 @@ fn curated_default_models_resolve_without_fallback() {
     // defaults intentionally fall back rather than ship curated rows:
     //   - `openai_codex` reuses the OpenAI protocol but its default id is
     //     curated under the `openai` provider, not `openai_codex`.
-    //   - `together` / `cloudflare_ai_gateway` are light-preset tiers that
-    //     `models.json` deliberately leaves uncurated (see the squeezy-core
-    //     default-constant comments).
+    //   - `together` / `cloudflare_ai_gateway` default to light-preset ids
+    //     that `models.json` deliberately leaves uncurated (see the
+    //     squeezy-core default-constant comments).
     let curated = [
         ("openai", DEFAULT_OPENAI_MODEL),
         ("anthropic", DEFAULT_ANTHROPIC_MODEL),
@@ -248,6 +271,35 @@ fn curated_default_models_resolve_without_fallback() {
             info.metadata_source, "fallback",
             "default model ({provider}, {model}) resolved to synthetic fallback metadata \
              instead of a curated models.json row"
+        );
+    }
+}
+
+#[test]
+fn catalog_includes_claude_opus_4_8_across_anthropic_routes() {
+    let expected = [
+        ("anthropic", "claude-opus-4-8", Some(5_000_000)),
+        ("bedrock", "anthropic.claude-opus-4-8", Some(5_000_000)),
+        ("openrouter", "anthropic/claude-opus-4.8", None),
+        ("portkey", "anthropic/claude-opus-4-8", None),
+        ("vercel", "anthropic/claude-opus-4.8", None),
+        ("cloudflare_workers_ai", "anthropic/claude-opus-4.8", None),
+        ("cloudflare_ai_gateway", "anthropic/claude-opus-4.8", None),
+        ("vertex", "claude-opus-4-8", Some(5_000_000)),
+    ];
+
+    for (provider, model, input_rate) in expected {
+        let info = model_info_for(provider, model)
+            .unwrap_or_else(|| panic!("missing Claude Opus 4.8 row for {provider}/{model}"));
+        assert_ne!(info.metadata_source, "fallback");
+        assert_eq!(info.profile, squeezy_core::ModelProfile::Strong);
+        assert_eq!(info.tokenizer.as_str(), "anthropic_estimate");
+        assert_eq!(info.limits.unwrap().context_window_tokens, 1_000_000);
+        assert_eq!(info.limits.unwrap().max_output_tokens, 128_000);
+        assert_eq!(
+            info.pricing
+                .map(|pricing| pricing.input_usd_micros_per_mtok),
+            input_rate
         );
     }
 }
