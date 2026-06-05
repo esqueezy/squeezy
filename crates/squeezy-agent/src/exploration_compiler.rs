@@ -202,9 +202,9 @@ fn compile_exploration_plan_inner(input: &str) -> Option<ExplorationPlan> {
                     json!({"query": query.clone(), "max_results": PLANNER_GRAPH_MAX_RESULTS}),
                 ),
                 tool_call(
-                    "planner_upstream_flow",
-                    "upstream_flow",
-                    json!({"query": query.clone(), "max_depth": 3, "max_results": 25}),
+                    "planner_reference_search",
+                    "reference_search",
+                    json!({"query": query.clone(), "max_results": PLANNER_GRAPH_MAX_RESULTS}),
                 ),
             ],
             guard_raw_reads: true,
@@ -466,6 +466,20 @@ fn hierarchy_intent(input: &str) -> bool {
         || input.contains("everything that implements")
         || input.contains("every implementor")
         || input.contains("every subclass")
+        || composition_hierarchy_intent(input)
+}
+
+fn composition_hierarchy_intent(input: &str) -> bool {
+    input.contains("struct hierarchy")
+        || input.contains("embedding closure")
+        || ((input.contains("embed")
+            || input.contains("embeds")
+            || input.contains("embedded")
+            || input.contains("embedding"))
+            && (input.contains("struct")
+                || input.contains("anonymous")
+                || input.contains("field")
+                || input.contains("base")))
 }
 
 fn test_pairing_intent(input: &str) -> bool {
@@ -501,21 +515,17 @@ fn extract_symbol_query(input: &str) -> Option<ExtractedQuery> {
 
 fn extract_quoted(input: &str) -> Option<String> {
     for quote in ['`', '"', '\''] {
-        // Require a matched closing quote of the same kind so contractions
-        // like `What's` don't yield the trailing fragment as a query. A
-        // properly-delimited literal produces at least three parts after
-        // `splitn` (prefix, inside, suffix).
-        let mut parts = input.splitn(3, quote);
-        let _prefix = parts.next();
-        let Some(candidate) = parts.next() else {
-            continue;
-        };
-        if parts.next().is_none() {
-            continue;
-        }
-        let candidate = candidate.trim();
-        if is_useful_query(candidate) {
-            return Some(candidate.to_string());
+        let mut rest = input;
+        while let Some(start) = rest.find(quote) {
+            let after_open = &rest[start + quote.len_utf8()..];
+            let Some(end) = after_open.find(quote) else {
+                break;
+            };
+            let candidate = after_open[..end].trim();
+            if is_useful_query(candidate) {
+                return Some(candidate.to_string());
+            }
+            rest = &after_open[end + quote.len_utf8()..];
         }
     }
     None
@@ -620,10 +630,39 @@ fn is_prompt_noise_word(token: &str) -> bool {
 }
 
 fn looks_like_path(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        ".rs"
+            | ".py"
+            | ".java"
+            | ".cs"
+            | ".go"
+            | ".cpp"
+            | ".hpp"
+            | ".cc"
+            | ".cxx"
+            | ".h++"
+            | ".c"
+            | ".h"
+            | ".js"
+            | ".ts"
+            | ".tsx"
+            | ".jsx"
+            | ".rb"
+            | ".php"
+            | ".kt"
+            | ".kts"
+            | ".swift"
+            | ".scala"
+            | ".sc"
+            | ".dart"
+    ) {
+        return true;
+    }
     if token.contains('/') {
         return true;
     }
-    let lower = token.to_ascii_lowercase();
     matches!(
         std::path::Path::new(lower.as_str())
             .extension()

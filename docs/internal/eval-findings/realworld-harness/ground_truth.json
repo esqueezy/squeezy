@@ -418,93 +418,52 @@
     ]
   },
   "go": {
-    "count": 14,
-    "methods": {
-      "UseLine": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ],
-      "VisitParents": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go"
-      ],
-      "InitDefaultHelpCmd": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ],
-      "CommandPath": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ],
-      "IsAvailableCommand": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "util.go",
-        "yaml_docs.go"
-      ],
-      "Parent": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ],
-      "IsAdditionalHelpTopicCommand": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "util.go",
-        "yaml_docs.go"
-      ],
-      "Name": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "util.go"
-      ],
-      "HasParent": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "util.go",
-        "yaml_docs.go"
-      ],
-      "Commands": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "util.go",
-        "yaml_docs.go"
-      ],
-      "InitDefaultHelpFlag": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ],
-      "NonInheritedFlags": [
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ],
-      "InheritedFlags": [
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ],
-      "Runnable": [
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ]
-    }
+    "count": 43,
+    "rows": [
+      ["ApplyCommand", ["Meta"]],
+      ["CloudCommand", ["Meta"]],
+      ["ConsoleCommand", ["Meta"]],
+      ["FmtCommand", ["Meta"]],
+      ["GetCommand", ["Meta"]],
+      ["GraphCommand", ["Meta"]],
+      ["ImportCommand", ["Meta"]],
+      ["InitCommand", ["Meta"]],
+      ["LoginCommand", ["Meta"]],
+      ["LogoutCommand", ["Meta"]],
+      ["MetadataCommand", ["Meta"]],
+      ["MetadataFunctionsCommand", ["Meta"]],
+      ["ModulesCommand", ["Meta"]],
+      ["OutputCommand", ["Meta"]],
+      ["PlanCommand", ["Meta"]],
+      ["ProvidersCommand", ["Meta"]],
+      ["ProvidersLockCommand", ["Meta"]],
+      ["ProvidersMirrorCommand", ["Meta"]],
+      ["ProvidersSchemaCommand", ["Meta"]],
+      ["PushCommand", ["Meta"]],
+      ["RefreshCommand", ["Meta"]],
+      ["ShowCommand", ["Meta"]],
+      ["StateCommand", ["StateMeta"]],
+      ["StateListCommand", ["Meta", "StateMeta"]],
+      ["StateMeta", ["Meta"]],
+      ["StateMvCommand", ["StateMeta"]],
+      ["StatePullCommand", ["Meta", "StateMeta"]],
+      ["StatePushCommand", ["Meta", "StateMeta"]],
+      ["StateReplaceProviderCommand", ["StateMeta"]],
+      ["StateRmCommand", ["StateMeta"]],
+      ["StateShowCommand", ["Meta", "StateMeta"]],
+      ["TaintCommand", ["Meta"]],
+      ["TestCommand", ["Meta"]],
+      ["UnlockCommand", ["Meta"]],
+      ["UntaintCommand", ["Meta"]],
+      ["ValidateCommand", ["Meta"]],
+      ["VersionCommand", ["Meta"]],
+      ["WorkspaceCommand", ["Meta"]],
+      ["WorkspaceDeleteCommand", ["Meta"]],
+      ["WorkspaceListCommand", ["Meta"]],
+      ["WorkspaceNewCommand", ["Meta"]],
+      ["WorkspaceSelectCommand", ["Meta"]],
+      ["WorkspaceShowCommand", ["Meta"]]
+    ]
   },
   "java": {
     "count": 18,
@@ -1216,140 +1175,43 @@
     ]
   },
   "c": {
-    "count": 19,
-    "rows": [
+    "count": 6,
+    "edges": [
       [
-        "src/http/modules/ngx_http_access_module.c",
-        "ngx_http_access_module",
-        "ngx_http_access_init",
-        "NGX_HTTP_ACCESS_PHASE",
-        "ngx_http_access_handler"
+        "ngx_http_process_request_headers",
+        "ngx_http_process_request",
+        "src/http/ngx_http_request.c",
+        1571
       ],
       [
-        "src/http/modules/ngx_http_auth_basic_module.c",
-        "ngx_http_auth_basic_module",
-        "ngx_http_auth_basic_init",
-        "NGX_HTTP_ACCESS_PHASE",
-        "ngx_http_auth_basic_handler"
+        "ngx_http_process_request_line",
+        "ngx_http_process_request",
+        "src/http/ngx_http_request.c",
+        1213
       ],
       [
-        "src/http/modules/ngx_http_auth_request_module.c",
-        "ngx_http_auth_request_module",
-        "ngx_http_auth_request_init",
-        "NGX_HTTP_ACCESS_PHASE",
-        "ngx_http_auth_request_handler"
+        "ngx_http_v2_run_request",
+        "ngx_http_process_request",
+        "src/http/v2/ngx_http_v2.c",
+        3939
       ],
       [
-        "src/http/modules/ngx_http_autoindex_module.c",
-        "ngx_http_autoindex_module",
-        "ngx_http_autoindex_init",
-        "NGX_HTTP_CONTENT_PHASE",
-        "ngx_http_autoindex_handler"
+        "ngx_http_v3_process_request",
+        "ngx_http_process_request",
+        "src/http/v3/ngx_http_v3_request.c",
+        601
       ],
       [
-        "src/http/modules/ngx_http_dav_module.c",
-        "ngx_http_dav_module",
-        "ngx_http_dav_init",
-        "NGX_HTTP_CONTENT_PHASE",
-        "ngx_http_dav_handler"
+        "ngx_http_process_request",
+        "ngx_http_handler",
+        "src/http/ngx_http_request.c",
+        2205
       ],
       [
-        "src/http/modules/ngx_http_degradation_module.c",
-        "ngx_http_degradation_module",
-        "ngx_http_degradation_init",
-        "NGX_HTTP_PREACCESS_PHASE",
-        "ngx_http_degradation_handler"
-      ],
-      [
-        "src/http/modules/ngx_http_gzip_static_module.c",
-        "ngx_http_gzip_static_module",
-        "ngx_http_gzip_static_init",
-        "NGX_HTTP_CONTENT_PHASE",
-        "ngx_http_gzip_static_handler"
-      ],
-      [
-        "src/http/modules/ngx_http_index_module.c",
-        "ngx_http_index_module",
-        "ngx_http_index_init",
-        "NGX_HTTP_CONTENT_PHASE",
-        "ngx_http_index_handler"
-      ],
-      [
-        "src/http/modules/ngx_http_limit_conn_module.c",
-        "ngx_http_limit_conn_module",
-        "ngx_http_limit_conn_init",
-        "NGX_HTTP_PREACCESS_PHASE",
-        "ngx_http_limit_conn_handler"
-      ],
-      [
-        "src/http/modules/ngx_http_limit_req_module.c",
-        "ngx_http_limit_req_module",
-        "ngx_http_limit_req_init",
-        "NGX_HTTP_PREACCESS_PHASE",
-        "ngx_http_limit_req_handler"
-      ],
-      [
-        "src/http/modules/ngx_http_log_module.c",
-        "ngx_http_log_module",
-        "ngx_http_log_init",
-        "NGX_HTTP_LOG_PHASE",
-        "ngx_http_log_handler"
-      ],
-      [
-        "src/http/modules/ngx_http_mirror_module.c",
-        "ngx_http_mirror_module",
-        "ngx_http_mirror_init",
-        "NGX_HTTP_PRECONTENT_PHASE",
-        "ngx_http_mirror_handler"
-      ],
-      [
-        "src/http/modules/ngx_http_random_index_module.c",
-        "ngx_http_random_index_module",
-        "ngx_http_random_index_init",
-        "NGX_HTTP_CONTENT_PHASE",
-        "ngx_http_random_index_handler"
-      ],
-      [
-        "src/http/modules/ngx_http_realip_module.c",
-        "ngx_http_realip_module",
-        "ngx_http_realip_init",
-        "NGX_HTTP_POST_READ_PHASE",
-        "ngx_http_realip_handler"
-      ],
-      [
-        "src/http/modules/ngx_http_realip_module.c",
-        "ngx_http_realip_module",
-        "ngx_http_realip_init",
-        "NGX_HTTP_PREACCESS_PHASE",
-        "ngx_http_realip_handler"
-      ],
-      [
-        "src/http/modules/ngx_http_rewrite_module.c",
-        "ngx_http_rewrite_module",
-        "ngx_http_rewrite_init",
-        "NGX_HTTP_SERVER_REWRITE_PHASE",
-        "ngx_http_rewrite_handler"
-      ],
-      [
-        "src/http/modules/ngx_http_rewrite_module.c",
-        "ngx_http_rewrite_module",
-        "ngx_http_rewrite_init",
-        "NGX_HTTP_REWRITE_PHASE",
-        "ngx_http_rewrite_handler"
-      ],
-      [
-        "src/http/modules/ngx_http_static_module.c",
-        "ngx_http_static_module",
-        "ngx_http_static_init",
-        "NGX_HTTP_CONTENT_PHASE",
-        "ngx_http_static_handler"
-      ],
-      [
-        "src/http/modules/ngx_http_try_files_module.c",
-        "ngx_http_try_files_module",
-        "ngx_http_try_files_init",
-        "NGX_HTTP_PRECONTENT_PHASE",
-        "ngx_http_try_files_handler"
+        "ngx_http_handler",
+        "ngx_http_core_run_phases",
+        "src/http/ngx_http_core_module.c",
+        879
       ]
     ]
   },

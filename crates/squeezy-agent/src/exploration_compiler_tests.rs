@@ -42,12 +42,21 @@ fn what_methods_does_have_phrasing_also_compiles_to_method_listing() {
 }
 
 #[test]
-fn callers_prompt_uses_upstream_flow() {
+fn callers_prompt_uses_reference_search() {
     let plan = compile_exploration_plan("Who calls Runner::run?").expect("plan");
 
     assert_eq!(plan.intent, ExplorationIntent::FindCallers);
     assert_eq!(plan.query.as_deref(), Some("Runner::run"));
-    assert!(plan.calls.iter().any(|call| call.name == "upstream_flow"));
+    assert!(
+        plan.calls
+            .iter()
+            .any(|call| call.name == "reference_search"),
+        "direct caller lookup should preflight references, not a transitive flow search"
+    );
+    assert!(
+        plan.calls.iter().all(|call| call.name != "upstream_flow"),
+        "direct caller lookup should not preflight transitive upstream flow"
+    );
 }
 
 #[test]
@@ -129,6 +138,16 @@ fn quoted_literal_bypasses_symbol_heuristic() {
 }
 
 #[test]
+fn quoted_extractor_skips_path_literals_to_find_symbol_literal() {
+    let plan = compile_exploration_plan(
+        "List every struct in `hashicorp/terraform` under `internal/command/` that embeds `Meta`",
+    )
+    .expect("plan");
+    assert_eq!(plan.intent, ExplorationIntent::Hierarchy);
+    assert_eq!(plan.query.as_deref(), Some("Meta"));
+}
+
+#[test]
 fn intent_precedence_repo_map_wins_over_definition() {
     // `repo_map > test_pairing > change_impact > callers > route > definition`.
     // A prompt that mentions both `repository map` and `defines` should
@@ -167,6 +186,23 @@ fn source_file_extension_token_does_not_trigger_planner_preflight() {
     // rejected by the same gate.
     assert!(compile_exploration_plan("Which file defines main.go?").is_none());
 }
+
+#[test]
+fn quoted_extension_literals_do_not_drive_planner_query() {
+    // File-extension filters in benchmark/user prompts are scope constraints,
+    // not symbols. A leading-dot token like `.cpp` is a hidden-file-looking
+    // path to std::path and does not expose `cpp` as an extension, so pin it
+    // explicitly to avoid planner preflights against extension names.
+    for ext in [".cpp", ".hpp", ".cc", ".cxx", ".h++"] {
+        let prompt = format!(
+            "Ignore files with extension `{ext}`; find callers of `ngx_http_process_request`."
+        );
+        let plan = compile_exploration_plan(&prompt).expect("callers plan");
+        assert_eq!(plan.intent, ExplorationIntent::FindCallers);
+        assert_eq!(plan.query.as_deref(), Some("ngx_http_process_request"));
+    }
+}
+
 #[test]
 fn prompt_noise_words_are_rejected_by_is_useful_query() {
     // Capitalized English prompt scaffolding (`ONLY`, `OUTPUT`, `EXPECTED`,
@@ -345,6 +381,41 @@ fn dart_mixes_in_phrasing_compiles_to_hierarchy() {
             .expect("plan");
     assert_eq!(plan.intent, ExplorationIntent::Hierarchy);
     assert_eq!(plan.query.as_deref(), Some("WidgetsBindingObserver"));
+}
+
+#[test]
+fn go_embedding_phrasing_compiles_to_hierarchy() {
+    let plan = compile_exploration_plan(
+        "List every struct type that embeds `Meta` directly or transitively through StateMeta",
+    )
+    .expect("plan");
+    assert_eq!(plan.intent, ExplorationIntent::Hierarchy);
+    assert_eq!(plan.query.as_deref(), Some("Meta"));
+
+    let call = &plan.calls[0];
+    assert_eq!(call.name, "decl_search");
+    assert_eq!(
+        call.arguments.get("attribute").and_then(|v| v.as_str()),
+        Some("base:Meta|iface:Meta|mixin:Meta"),
+    );
+    assert_eq!(
+        call.arguments.get("transitive").and_then(|v| v.as_bool()),
+        Some(true),
+    );
+}
+
+#[test]
+fn realworld_go_struct_hierarchy_prompt_compiles_to_embedding_preflight() {
+    let prompt = "In the `hashicorp/terraform` repo, audit the CLI command struct hierarchy in \
+        the `internal/command/` package that is built on the base struct `Meta` \
+        (defined in `internal/command/meta.go`). List every struct type that embeds `Meta` \
+        as an anonymous embedded field, either directly or transitively.";
+
+    let plan = compile_exploration_plan(prompt).expect("plan");
+    assert_eq!(plan.intent, ExplorationIntent::Hierarchy);
+    assert_eq!(plan.query.as_deref(), Some("Meta"));
+    assert_eq!(plan.calls.len(), 1);
+    assert_eq!(plan.calls[0].name, "decl_search");
 }
 
 #[test]
