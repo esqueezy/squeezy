@@ -1761,19 +1761,14 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                 // agrees with what a real session resolves. Checking only the
                 // canonical env var reported "unset" while a working
                 // `ANTHROPIC_API_KEY`, credentials.json, or inline key was in
-                // effect. Mirrors `doctor`'s credential check; only the
-                // synthetic row resolves (not every field), and the screen
-                // redraws on input rather than per-frame, so the cost is
-                // negligible. Only `source` is read — the secret value never
-                // reaches the display.
+                // effect. Mirrors `doctor`'s credential check. Resolution is
+                // memoized on the state (recomputed only when the provider env
+                // var or inline key changes), so a config screen left open
+                // while a turn animates — which repaints per frame — does not
+                // re-read credentials.json each frame. Only the source is
+                // used; the secret value is never displayed.
                 let inline = super::provider_inline_api_key(&state.effective.provider);
-                let source = if env_var.is_empty() {
-                    None
-                } else {
-                    squeezy_llm::resolve_api_key_with_inline(inline.as_deref(), &env_var)
-                        .ok()
-                        .map(|resolved| resolved.source)
-                };
+                let source = state.credential_source(&env_var, inline.as_deref());
                 let label_style = if active {
                     Style::default()
                         .fg(crate::render::theme::magenta())

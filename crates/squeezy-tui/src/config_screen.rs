@@ -190,6 +190,15 @@ impl ConfigScope {
     }
 }
 
+/// Inputs and result for [`ConfigScreenState::credential_source`]'s memo:
+/// the provider env var and inline key the source was resolved for, so a
+/// later render can reuse it without re-walking the credential chain.
+struct CredentialSourceCache {
+    env_var: String,
+    inline: Option<String>,
+    source: Option<squeezy_llm::KeySource>,
+}
+
 pub(crate) struct ConfigScreenState {
     pub scope: ConfigScope,
     pub section_index: usize,
@@ -213,6 +222,12 @@ pub(crate) struct ConfigScreenState {
     /// undo every save made since the screen opened.
     pub discard_confirm: bool,
     pub effective: AppConfig,
+    /// Memoized credential source for the synthetic API-key row. The render
+    /// path reads this instead of re-resolving every frame (resolution
+    /// stats/reads credentials.json), recomputed only when the active
+    /// provider's env var or inline key changes. `RefCell` mirrors the
+    /// crate's other render-time caches.
+    credential_source_cache: std::cell::RefCell<Option<CredentialSourceCache>>,
     pub sources: SeparatedSources,
     pub dirty: bool,
     /// File bytes captured the moment the screen opened, per tier path.
@@ -627,6 +642,7 @@ impl ConfigScreenState {
             reset_confirm: None,
             discard_confirm: false,
             effective,
+            credential_source_cache: std::cell::RefCell::new(None),
             sources,
             dirty: false,
             baseline,
@@ -641,6 +657,40 @@ impl ConfigScreenState {
             mcp_last_status_line: None,
             mcp_animation_tick: 0,
         }
+    }
+
+    /// Resolved credential source for the synthetic API-key row, memoized so
+    /// the render path performs no per-frame credential resolution (which
+    /// stats/reads credentials.json). The full runtime chain
+    /// (`resolve_api_key_with_inline`) runs only when the provider's env var
+    /// or inline key changes — provider swap or inline-key save — so a config
+    /// screen left open while a turn animates does not re-read the credentials
+    /// file every frame. Returns `None` for providers without an env-var
+    /// credential or when nothing resolves. Only the source is retained; the
+    /// secret value is never kept.
+    pub(crate) fn credential_source(
+        &self,
+        env_var: &str,
+        inline: Option<&str>,
+    ) -> Option<squeezy_llm::KeySource> {
+        if env_var.is_empty() {
+            return None;
+        }
+        let mut cache = self.credential_source_cache.borrow_mut();
+        let fresh = cache
+            .as_ref()
+            .is_some_and(|c| c.env_var == env_var && c.inline.as_deref() == inline);
+        if !fresh {
+            let source = squeezy_llm::resolve_api_key_with_inline(inline, env_var)
+                .ok()
+                .map(|resolved| resolved.source);
+            *cache = Some(CredentialSourceCache {
+                env_var: env_var.to_string(),
+                inline: inline.map(str::to_string),
+                source,
+            });
+        }
+        cache.as_ref().and_then(|c| c.source)
     }
 
     /// Sorted list of configured server names — render path uses this

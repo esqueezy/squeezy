@@ -1257,6 +1257,37 @@ fn api_key_row_reports_fallback_env_var() {
     );
 }
 
+#[test]
+fn credential_source_memoizes_until_inputs_change() {
+    // The synthetic API-key row reads a memoized source so render does no
+    // per-frame credential resolution (which stats/reads credentials.json).
+    // Prove the memo: a second lookup with the same inputs returns the cached
+    // source even after the env var is removed, and changing the inputs forces
+    // a fresh resolution.
+    let canonical = "SQUEEZY_OPTIONS_EVAL_MEMO_KEY";
+    // SAFETY: tests in this module run single-threaded.
+    unsafe { std::env::set_var(canonical, "sk-test-memo") };
+    let state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
+    assert_eq!(
+        state.credential_source(canonical, None),
+        Some(squeezy_llm::KeySource::Env)
+    );
+    // Remove the env var; the cached result must persist for the same inputs.
+    // SAFETY: tests in this module run single-threaded.
+    unsafe { std::env::remove_var(canonical) };
+    assert_eq!(
+        state.credential_source(canonical, None),
+        Some(squeezy_llm::KeySource::Env),
+        "same inputs should return the memoized source without re-resolving"
+    );
+    // A different env var is a cache miss and re-resolves (now unset).
+    assert_eq!(
+        state.credential_source("SQUEEZY_OPTIONS_EVAL_MEMO_OTHER_KEY", None),
+        None,
+        "changed inputs should force a fresh resolution"
+    );
+}
+
 #[tokio::test]
 async fn model_picker_provider_swap_writes_once_not_twice() {
     // SAFETY: tests in this module run single-threaded.
