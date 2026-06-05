@@ -2,8 +2,9 @@
 
 This document is the user-facing source for Squeezy's language coverage. It is
 organized by `LanguageFamily`, which maps one or more source languages to a
-single parser backend and navigation behavior. The internal benchmark corpus
-uses the same family names so coverage claims stay checkable.
+single parser backend and navigation behavior. The benchmark CLI emits the same
+family IDs through `--list-languages` and `--list-oracles`, and CI checks this
+matrix against that live registry.
 
 ## Coverage Matrix
 
@@ -19,9 +20,9 @@ uses the same family names so coverage claims stay checkable.
 | `js-ts` | JavaScript, JSX, TypeScript, TSX | `cjs`, `cts`, `js`, `jsx`, `mjs`, `mts`, `ts`, `tsx` | `tree-sitter-javascript`, `tree-sitter-typescript` | `tsc` | yes | `benchmarks/fixtures/js-ts/semantic-cases` | `benchmarks/specs/js-ts-smoke-queries.json` | vite, redux, axios, express, prettier |
 | `php` | PHP | `php` | `tree-sitter-php` | `nikic_php_parser` | yes | `benchmarks/fixtures/php/semantic-cases` | `benchmarks/specs/php-smoke-queries.json` | symfony-console |
 | `ruby` | Ruby | `rb` | `tree-sitter-ruby` | `ruby_prism` | no | `benchmarks/fixtures/ruby/semantic-cases` | `benchmarks/specs/ruby-smoke-queries.json` | sinatra |
-| `scala` | Scala | `scala`, `sc` | `tree-sitter-scala` | `scala_semanticdb` | no | `benchmarks/fixtures/scala/semantic-cases` | `benchmarks/specs/scala-smoke-queries.json` | _(deferred to follow-up PR)_ |
+| `scala` | Scala | `scala`, `sc` | `tree-sitter-scala` | `scala_semanticdb` | no | `benchmarks/fixtures/scala/semantic-cases` | `benchmarks/specs/scala-smoke-queries.json` | utest |
 | `swift` | Swift | `swift` | `tree-sitter-swift` | `sourcekit_lsp` | no | `benchmarks/fixtures/swift/semantic-cases` | `benchmarks/specs/swift-smoke-queries.json` | swift-nio |
-| `dart` | Dart | `dart` | `tree-sitter-dart` | `dart_analyzer` | no | `benchmarks/fixtures/dart/semantic-cases` | `benchmarks/specs/dart-smoke-queries.json` | _(deferred to follow-up PR)_ |
+| `dart` | Dart | `dart` | `tree-sitter-dart` | `dart_analyzer` with scan-only fallback | no | `benchmarks/fixtures/dart/semantic-cases` | `benchmarks/specs/dart-smoke-queries.json` | _(smoke only)_ |
 
 ## Rust
 
@@ -84,10 +85,10 @@ expressions, and overload resolution stay heuristic for v0; the oracle
 suppresses the same set so the symbol-set gates remain symmetric. Multiplatform
 `expect`/`actual` matching is not attempted.
 
-Known follow-ups: companion-object owner-path collapsing for member
-resolution, sealed-class child enumeration, and a Kotlin LSP-based navigation
-oracle (fwcd/kotlin-language-server) are scoped for a phase-2 follow-up
-once the symbol-set gates hold.
+Known follow-ups: deeper companion-object/member lookup beyond the current
+`Host.member()` path, sealed-class child enumeration, and a Kotlin LSP-based
+navigation oracle are scoped for later work once the symbol-set gates remain
+stable.
 
 Oracle: JetBrains `kotlin-compiler-embeddable` PSI walker
 (`benchmarks/oracle/kotlin/KotlinOracle.kt`). Build with
@@ -185,8 +186,8 @@ Known follow-ups: Symfony attribute heuristics beyond `#[Route]`,
 a navigation oracle backed by phpactor LSP probes remain bounded
 deferrals.
 
-Oracle: nikic/PHP-Parser declaration scan invoked via a subprocess. CI
-installs PHP 8.3 + Composer + `composer install` in the oracle helper
+Oracle: nikic/PHP-Parser declaration scan invoked via a subprocess. CI attempts
+to install PHP 8.3 + Composer and runs `composer install` in the oracle helper
 directory; absent any of those, the oracle status is `skipped` and only
 fixture-query truth gates run.
 
@@ -207,9 +208,10 @@ gem-style `require` path resolution are documented recall gaps and are
 excluded from the oracle as well. Receiver-typed call resolution is best
 effort because Ruby lacks parameter types.
 
-Oracle: Ruby Prism subprocess. CI installs Ruby 3.3 via `ruby/setup-ruby`
-with `continue-on-error: true`; when the toolchain is missing the oracle
-degrades to a `mode = "scan-only"` self-compare.
+Oracle: Ruby Prism subprocess. CI attempts Ruby 3.3 setup with
+`continue-on-error: true`; when Ruby or Prism is missing the oracle degrades to
+a `mode = "scan-only"` self-compare, so the report mode/status is part of the
+accuracy signal.
 
 ## Swift
 
@@ -229,11 +231,12 @@ mappings), `#externalMacro`/`#freestanding` macro expansion, and SwiftPM
 contribute body hits to their enclosing symbol but do not produce symbols of
 their own.
 
-Oracle: SourceKit-LSP. The first PR ships the scan-only path that exercises the
-Swift extractor against a corpus-shaped fixture; CI installs the Swift 5.10
-toolchain on Linux and uses the bundled `sourcekit-lsp`. macOS-only frameworks
-(`Combine`, `SwiftUI`, `Network`) are intentionally absent from the fixture so
-the smoke run works on `ubuntu-latest`.
+Oracle: SourceKit-LSP when `sourcekit-lsp` or `SOURCEKIT_LSP` is available,
+with syntactic scan-only fallback recorded in the report when the Swift
+toolchain is absent or cannot launch. CI attempts to install the Swift toolchain
+for the language benchmark path. macOS-only frameworks (`Combine`, `SwiftUI`,
+`Network`) are intentionally absent from the fixture so the smoke run works on
+`ubuntu-latest`.
 
 ## Dart
 
@@ -250,8 +253,9 @@ alternate URIs as separate imports; the resolver prefers the primary when both
 exist. Generated `*.g.dart` / `*.freezed.dart` / `*.mocks.dart` files parse but
 are excluded from oracle precision/recall accounting via glob.
 
-Oracle: deferred to a follow-up PR. The first PR runs in scan-only mode while
-the `package:analyzer`-backed Dart oracle is wired up in CI.
+Oracle: `package:analyzer` helper when the Dart oracle helper is present and
+the analyzer run succeeds; otherwise the benchmark degrades to scan-only mode and
+records that status in the report.
 
 ## Benchmark Corpus Reporting
 
@@ -263,4 +267,6 @@ source paths; their specs assert those paths are surfaced as generated/vendor
 fallback evidence rather than graph-confident answers.
 
 Contributor steps for adding or changing a language family live in
-[`../internal/ARCHITECTURE.md`](../internal/ARCHITECTURE.md).
+[`../../../docs/internal/ARCHITECTURE.md`](../../../docs/internal/ARCHITECTURE.md).
+Benchmark workflow and gate details live in
+[`../../../docs/internal/BENCHMARKS.md`](../../../docs/internal/BENCHMARKS.md).

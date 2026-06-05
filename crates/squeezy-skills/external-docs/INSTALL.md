@@ -2,8 +2,8 @@
 
 Squeezy v0 supports macOS, Linux, and Windows (x86_64). On macOS and
 Linux the fastest path is the one-line installer; on Windows it is
-Winget. Homebrew, Cargo, and direct GitHub release archives work on every
-platform.
+Winget. Cargo and direct GitHub release archives work on every platform.
+Homebrew supports macOS and x86_64 Linux.
 
 ## One-line installer (macOS and Linux)
 
@@ -16,8 +16,19 @@ archive plus its SHA-256 sidecar, verifies the checksum, and installs the
 `squeezy` binary into `$HOME/.local/bin` (override with
 `SQUEEZY_INSTALL_DIR`). If that directory is not on your `PATH`, the
 installer prints the line to add. Pin a specific release with
-`SQUEEZY_INSTALL_TAG=v0.1.2`. The script is POSIX-shell only; Windows
-users should use Winget or the manual zip install.
+`SQUEEZY_INSTALL_TAG=v0.1.2`.
+
+Advanced installer knobs:
+
+- `SQUEEZY_INSTALL_BASE_URL` changes the release archive origin.
+- `SQUEEZY_INSTALL_CHECKSUM_BASE_URL` can fetch the `.sha256` sidecar from a
+  separate origin.
+- `SQUEEZY_GPG_KEY_PATH` points at a Squeezy release public key; when the file
+  exists and `gpg` is installed, the installer verifies the archive signature
+  after the checksum.
+
+The script is POSIX-shell only; Windows users should use Winget or the manual
+zip install.
 
 ## Winget (Windows)
 
@@ -77,6 +88,7 @@ Tagged releases publish prebuilt archives and SHA-256 checksum files:
 - `squeezy-aarch64-apple-darwin.tar.gz` for Apple Silicon macOS
 - `squeezy-x86_64-apple-darwin.tar.gz` for Intel macOS
 - `squeezy-x86_64-unknown-linux-musl.tar.gz` for Linux x86_64
+- `squeezy-aarch64-unknown-linux-musl.tar.gz` for Linux ARM64
 - `squeezy-x86_64-pc-windows-msvc.zip` for Windows x86_64
 
 Download the archive for your platform from
@@ -90,7 +102,8 @@ install -m 0755 squeezy /usr/local/bin/squeezy
 squeezy doctor
 ```
 
-Replace the archive name with the Intel macOS or Linux archive when needed.
+Replace the archive name with the Intel macOS, Linux x86_64, or Linux ARM64
+archive when needed.
 
 On Windows, expand the zip and add the install location to `PATH`:
 

@@ -1,7 +1,9 @@
-# Telemetry Next-Agent Handoff
+# Telemetry Summary Maintenance Notes
 
-This branch migrates high-frequency product telemetry into one bounded
+Squeezy reduces high-frequency product telemetry into one bounded
 `squeezy_session_summary` event built from a local durable telemetry ledger.
+This file is not an active next-agent task queue. It records the durable
+architecture and safety boundary for future telemetry changes.
 
 ## Current Implementation
 
@@ -15,9 +17,9 @@ This branch migrates high-frequency product telemetry into one bounded
   Tokio runtime.
 - The Worker accepts product event names that match `squeezy_*`, then forwards
   only bounded safe properties: non-negative counters, booleans, token strings,
-  and small count maps. This keeps the Worker forward-compatible with future
-  summary fields without forwarding raw text, paths, URLs, arrays, or arbitrary
-  nested objects.
+  trace/span ids, and small count maps. This keeps the Worker
+  forward-compatible with future summary fields without forwarding raw text,
+  paths, URLs, arrays, or arbitrary nested objects.
 
 ## One-Event Summary Direction
 
@@ -81,25 +83,23 @@ The `squeezy_session_summary` event now carries:
 - Approvals/permissions: capability × risk × decision × source counts.
 - Retry counts by reason kind.
 - Stop-reason counts by normalized reason token.
-- Cache fields: cache_supported, cache_write_tokens, reasoning_output_tokens.
+- Cache fields: cache_supported, cache_write_tokens, cached_tokens,
+  reasoning_output_tokens.
 - Cost/context: aggregate token/cost/cache/budget counters.
 
-## Files Touched In This Branch
+## Maintenance Pointers
 
-- `crates/squeezy-telemetry/src/lib.rs`
-- `crates/squeezy-telemetry/src/lib_tests.rs`
-- `crates/squeezy-agent/src/lib.rs`
-- `crates/squeezy-tools/src/lib.rs`
-- `crates/squeezy-tools/Cargo.toml`
-- `crates/squeezy-tui/src/lib.rs`
-- `crates/squeezy-tui/src/config_screen.rs`
-- `crates/squeezy-tui/src/config_screen/keys.rs`
-- `crates/squeezy-tui/src/config_screen/save.rs`
-- `infra/telemetry-worker/src/worker.ts`
-- `infra/telemetry-worker/tests/worker.test.ts`
-- `crates/squeezy-skills/external-docs/TELEMETRY.md`
+- Product telemetry client, reducer, local ledger, and feedback/report client:
+  `crates/squeezy-telemetry/src/lib.rs`.
+- Runtime event call sites: `crates/squeezy-agent/`, `crates/squeezy-tools/`,
+  `crates/squeezy-tui/`, and adjacent integration crates.
+- Worker validation and forwarding: `infra/telemetry-worker/src/worker.ts`.
+- Dashboard setup and smoke scripts: `infra/telemetry-worker/scripts/posthog.ts`.
+- User-facing privacy contract:
+  `crates/squeezy-skills/external-docs/TELEMETRY.md` and
+  `crates/squeezy-skills/external-docs/FEEDBACK.md`.
 
-## Validation Run
-
-- `cargo test -p squeezy-telemetry`
-- `cargo check -p squeezy-agent -p squeezy-tui -p squeezy`
+When adding a new summary field, update the typed reducer tests, the Worker
+allowlist/shape tests, the dashboard setup script if the field is meant to be
+queried, and the external telemetry doc when the user-visible privacy contract
+changes.

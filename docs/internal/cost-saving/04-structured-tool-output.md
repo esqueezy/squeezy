@@ -311,11 +311,19 @@ The recovery hint is significant — it names the tool (`read_tool_output`)
 and the parameter (`path`) so the model can pivot without inferring
 the contract from the surrounding chatter.
 
-### Shell spillover
+### Shell spillover and raw sidecars
 
 The shell tool caps in-memory capture at `output_cap` bytes and
-middle-truncates. The bytes past the boundary are routed to
-`ShellSpilloverStore`:
+middle-truncates. There are now two recovery paths:
+
+- the ordinary spill file stores the shaped/capped payload that survived
+  in-memory truncation, and
+- the raw sidecar (`{call_id}-raw.txt`) is opened before pipe readers apply
+  the hard cap, so bytes that would otherwise be dropped remain recoverable
+  on overflow.
+
+Both paths are served by `read_tool_output`, which accepts exactly one of
+`handle` or `path` plus optional `offset` / `limit`.
 
 ```rust
 // crates/squeezy-tools/src/shell_spillover.rs:1–34
@@ -328,8 +336,8 @@ middle-truncates. The bytes past the boundary are routed to
 //! would otherwise be permanently lost — discarding the signal a long
 //! build log, verbose stack trace, or other oversized output carries.
 //!
-//! [`ShellSpilloverStore`] preserves the captured raw stdout/stderr by
-//! writing it to a per-session directory under
+//! [`ShellSpilloverStore`] preserves recoverable stdout/stderr by
+//! writing spill files and raw sidecars to a per-session directory under
 //! `$TMPDIR/squeezy-spillover/<session-id>/`. The shell tool surfaces
 //! the path in the truncated result so the model can call
 //! `read_tool_output { path }` to fetch byte ranges.
@@ -340,9 +348,9 @@ middle-truncates. The bytes past the boundary are routed to
 pub(crate) const DEFAULT_SHELL_SPILLOVER_BUDGET_BYTES: u64 = 100 * 1024 * 1024;
 ```
 
-The spill path is constructed from a sha256-prefix of the payload plus
-a sanitised call id, written under the session directory, and
-returned as a `ShellSpilloverInfo { path, bytes }`:
+The ordinary spill path is constructed from a sha256-prefix of the payload
+plus a sanitised call id, written under the session directory, and returned
+as a `ShellSpilloverInfo { path, bytes }`:
 
 ```rust
 // crates/squeezy-tools/src/shell_spillover.rs:115–146
@@ -367,7 +375,7 @@ pub(crate) fn spill(
         self.release(size);
         return None;
     }
-    let short_hash = &sha256_hex(&bytes)[..SPILL_SHORT_HASH_HEX];
+    let short_hash = &sha256_hex(payload.as_bytes())[..SPILL_SHORT_HASH_HEX];
     let sanitized = sanitize_call_id(call_id);
     let path = self
         .session_dir
@@ -380,16 +388,14 @@ pub(crate) fn spill(
 }
 ```
 
-The 100 MiB session budget bounds disk usage across an entire
-agent loop. `try_reserve` (`shell_spillover.rs:175–189`) uses a
-`compare_exchange` loop so concurrent shell calls can't double-count
-their way past the cap. `read_range`
-(`shell_spillover.rs:152–173`) canonicalises the requested path and
-rejects anything outside `session_dir_canonical`
-(`shell_spillover.rs:202–223`), which closes the obvious symlink and
-`..`-traversal escapes. The `Drop` impl
-(`shell_spillover.rs:232–239`) does best-effort `remove_dir_all` so
-spillover never outlives the registry that produced it.
+The raw sidecar uses the same per-session directory but writes incrementally
+from the stream before the cap discards bytes. `reserve_up_to` charges each
+append against the same 100 MiB session budget; once exhausted, the sidecar
+keeps whatever was already written and stops granting more bytes. `read_range`
+canonicalises path reads and rejects anything outside the session directory,
+which closes the obvious symlink and `..`-traversal escapes. The `Drop` impl
+does best-effort `remove_dir_all` so spillover never outlives the registry
+that produced it.
 
 ### Grep caps
 
@@ -397,9 +403,9 @@ spillover never outlives the registry that produced it.
 output a single grep can pin to the prompt:
 
 ```rust
-// crates/squeezy-tools/src/file_ops.rs:407–451 (Content mode)
+// crates/squeezy-tools/src/file_ops.rs (Content mode)
 GrepOutputMode::Content => {
-    let line_text = truncate_text(line, 500);
+    let line_text = truncate_text(line, 2_000);
     let mut next = serde_json::Map::new();
     next.insert("path".to_string(), json!(&rel_str));
     next.insert("line".to_string(), json!(line_index + 1));
@@ -412,7 +418,7 @@ GrepOutputMode::Content => {
             .map(|(offset_idx, ctx_line)| {
                 json!({
                     "line": before_start + offset_idx + 1,
-                    "text": truncate_text(ctx_line, 500),
+                    "text": truncate_text(ctx_line, 2_000),
                 })
             })
             .collect();
@@ -435,8 +441,8 @@ GrepOutputMode::Content => {
 
 The cap stack:
 
-- **Per-line cap.** `truncate_text(line, 500)` (`file_ops.rs:408`)
-  shortens any single matched line to 500 characters. Generated code,
+- **Per-line cap.** `truncate_text(line, 2_000)` shortens any single matched
+  line or context line to 2,000 characters. Generated code,
   minified JS, and accidental binary matches can't blow the budget on
   one match.
 - **Total byte cap.** `DEFAULT_OUTPUT_BYTE_CAP = 48_000`
@@ -650,12 +656,9 @@ round-trip and gained nothing from it.
   the raw bytes for the remainder of the session. With a 100 MiB
   budget this is unreachable in normal use but it is the failure mode
   to watch for in extremely long agent loops.
-- **Image size cap is implicit.** The image path reads the full file
-  with no explicit size gate — anything that survives the workspace
-  policy exclusion gets fully base64-encoded into the response. A
-  multi-megabyte image will produce a multi-megabyte
-  `data_base64` payload. Callers that want a cap have to enforce it
-  upstream of the read.
+- **Image size cap.** Image reads are explicitly capped at 5 MiB before
+  base64 encoding. Larger images return an error instead of pinning a
+  multi-megabyte `data_base64` payload into the response.
 - **Grep dedup false negatives.** The
   `FilesWithMatches` mode dedupes by `rel_str.clone()`
   (`file_ops.rs:454`); two paths that point to the same file via

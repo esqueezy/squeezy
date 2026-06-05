@@ -34,8 +34,8 @@ Later sources override earlier ones:
 put shared project config there. `SQUEEZY_SETTINGS_PATH` redirects the user
 settings file.
 
-Authoritative reference: `docs/external/CONFIGURATION.md`. The bundled
-help index exposes the same content via `/help configuration`.
+Authoritative reference: `crates/squeezy-skills/external-docs/CONFIGURATION.md`.
+The bundled help index exposes the same content via `/help configuration`.
 
 ## Common edits
 
@@ -62,10 +62,14 @@ base_url = "https://api.openai.com/v1"
 default_model = "gpt-5.5"
 ```
 
-Squeezy never writes secret values into TOML; it stores the *name* of the
-environment variable that holds the key. On macOS, missing env vars fall
-back to the Keychain account matching the provider id (`openai`,
-`anthropic`, `google`, `azure_openai`).
+Prefer `api_key_env` for shared config. Squeezy also accepts an inline
+`api_key` in user or per-repo machine-local settings; `squeezy auth set`
+writes that field for known providers. Never commit an inline `api_key` in
+project `squeezy.toml`.
+
+A provider `api_key` value that starts with `!` is treated as a shell escape
+and resolved from stdout at config-load time. Use it only in trusted user-local
+settings.
 
 ### Add an MCP server (stdio)
 
@@ -158,10 +162,15 @@ Use narrower targets.
 [skills]
 user_dir = "/path/to/squeezy-skills"
 compat_user_dir = "/path/to/agent-skills"
+extra_roots = ["/mnt/team-skills"]
 active_budget_chars = 4000
 active_body_cap_chars = 16000
 preamble_enabled = true
 preamble_budget_chars = 800
+active_budget_mode = { context_percent = 2.0 }
+preamble_budget_mode = { context_percent = 2.0 }
+inline = false
+hooks_enabled = false
 
 [[skills.config]]
 name = "noisy-project-skill"
@@ -173,8 +182,10 @@ enabled = true
 ```
 
 Skills live at one of `~/.squeezy/skills/`, `~/.agents/skills/`,
-`<workspace>/.squeezy/skills/`, `<workspace>/.agents/skills/`. Project
-tiers override user tiers; native tiers override compat tiers.
+configured `extra_roots`, `<workspace>/.squeezy/skills/`, or
+`<workspace>/.agents/skills/`. Project tiers override user tiers; native tiers
+override compat tiers. Ancestor workspace skill roots are discovered for nested
+monorepo packages.
 `[[skills.config]]` selects by exact `name` OR by `path` (never both).
 
 ### Budgets and limits
@@ -210,8 +221,8 @@ edit/shell/git/network/MCP/compiler before normal permission checks.
 `[redaction]`, `[web]`, `[graph]`, `[cache]`, `[tools]`, `[tui]`,
 `[skills]`, `[[skills.config]]`.
 
-See `docs/external/CONFIGURATION.md` for the per-field reference, defaults,
-and apply-tier (immediate / next prompt / restart required).
+See `crates/squeezy-skills/external-docs/CONFIGURATION.md` for the per-field
+reference, defaults, and apply-tier (immediate / next prompt / restart required).
 
 ## Workflow
 
@@ -221,7 +232,8 @@ and apply-tier (immediate / next prompt / restart required).
 2. Use `squeezy config init --user` or `--project` to generate a commented
    skeleton; `--force` is required to overwrite an existing file.
 3. Make the edit. Keep secret values out of TOML; reference an env var
-   name via `api_key_env`.
+   name via `api_key_env`, or use `squeezy auth set` for local inline
+   `api_key` storage.
 4. Run `squeezy config inspect` to verify the effective merged config and
    confirm which source supplied each value.
 5. Run `squeezy doctor` to validate the merged config.

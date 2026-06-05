@@ -25,25 +25,31 @@ retrieval, and the difference compounds across an agent loop.
 
 ### Tree-sitter parsers
 
-`squeezy-parse` owns one `tree_sitter::Parser` per supported grammar
-(constructed eagerly at `crates/squeezy-parse/src/lib.rs:258-285`) and
-dispatches per `LanguageKind`:
+`squeezy-parse` owns a lazy `ParserPool` keyed by `LanguageKind`. Parsers are
+constructed on first use by `parser_for_language_kind` and then reused for
+subsequent files of the same language:
 
 ```rust
-// crates/squeezy-parse/src/lib.rs:457-474
-fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser> {
+// crates/squeezy-parse/src/lib.rs
+fn parser_for_language_kind(language: LanguageKind) -> Result<Parser> {
     match language {
-        LanguageKind::C => Ok(&mut self.c_parser),
-        LanguageKind::CSharp => Ok(&mut self.csharp_parser),
-        LanguageKind::Cpp => Ok(&mut self.cpp_parser),
-        LanguageKind::Go => Ok(&mut self.go_parser),
-        LanguageKind::Java => Ok(&mut self.java_parser),
-        LanguageKind::JavaScript => Ok(&mut self.javascript_parser),
-        LanguageKind::Jsx => Ok(&mut self.jsx_parser),
-        LanguageKind::Rust => Ok(&mut self.rust_parser),
-        LanguageKind::Python => Ok(&mut self.python_parser),
-        LanguageKind::TypeScript => Ok(&mut self.typescript_parser),
-        LanguageKind::Tsx => Ok(&mut self.tsx_parser),
+        LanguageKind::C => parser_with_c_language(),
+        LanguageKind::CSharp => parser_with_csharp_language(),
+        LanguageKind::Cpp => parser_with_cpp_language(),
+        LanguageKind::Dart => parser_with_dart_language(),
+        LanguageKind::Go => parser_with_go_language(),
+        LanguageKind::Java => parser_with_java_language(),
+        LanguageKind::JavaScript => parser_with_javascript_language(),
+        LanguageKind::Jsx => parser_with_jsx_language(),
+        LanguageKind::Kotlin => parser_with_kotlin_language(),
+        LanguageKind::Php => parser_with_php_language(),
+        LanguageKind::Python => parser_with_python_language(),
+        LanguageKind::Ruby => parser_with_ruby_language(),
+        LanguageKind::Rust => parser_with_rust_language(),
+        LanguageKind::Scala => parser_with_scala_language(),
+        LanguageKind::Swift => parser_with_swift_language(),
+        LanguageKind::TypeScript => parser_with_typescript_language(),
+        LanguageKind::Tsx => parser_with_tsx_language(),
         _ => Err(SqueezyError::Parse(format!(
             "unsupported parser language {language:?}"
         ))),
@@ -51,12 +57,14 @@ fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser>
 }
 ```
 
-The supported set is: C, C++, C#, Go, Java, JavaScript, JSX, Python,
-Rust, TypeScript, TSX. The per-language extractors live in
+The supported set is: Rust, Python, Java, Kotlin, Scala, C#, Go, C, C++,
+JavaScript, JSX, TypeScript, TSX, PHP, Ruby, Swift, and Dart. The per-language
+extractors live in
 `crates/squeezy-parse/src/languages/` — one module per family
-(`c_family.rs`, `csharp.rs`, `go.rs`, `java.rs`, `js_ts.rs`,
-`python.rs`, `rust.rs`) — each exporting an `extract_*` entry point
-that walks the tree-sitter tree and returns a `ParsedFile`.
+(`c_family.rs`, `csharp.rs`, `dart.rs`, `go.rs`, `java.rs`, `js_ts.rs`,
+`kotlin.rs`, `php.rs`, `python.rs`, `ruby.rs`, `rust.rs`, `scala.rs`,
+`swift.rs`) — each exporting an `extract_*` entry point that walks the
+tree-sitter tree and returns a `ParsedFile`.
 
 Each extractor produces the same five products: `symbols`, `imports`,
 `calls`, `references`, and `body_hits` (literals, identifiers, type
@@ -84,9 +92,10 @@ suggests `"bounded read/grep/list navigation"` as the fallback.
 
 ### Signature / body split
 
-The single most important field is `body_span`. Every symbol carries one
-`span` (covering the entire declaration including the body) and an
-optional `body_span` (covering just the body). The structure is at
+The two most important slice fields are `signature_span` and `body_span`. Every
+symbol carries one `span` (covering the entire declaration), a signature string,
+an optional `signature_span` for the declaration header, and an optional
+`body_span` (covering just the body). The structure is at
 `crates/squeezy-parse/src/lib.rs:64-88`:
 
 ```rust
@@ -422,7 +431,7 @@ if let Some(symbol_id) = args.symbol_id.as_deref() {
         .get(&SymbolId::new(symbol_id))
         .ok_or_else(|| format!("symbol_id not found: {symbol_id}"))?;
     let span = match args.span_kind.unwrap_or_default() {
-        ReadSliceSpanKind::Signature => symbol.span,
+        ReadSliceSpanKind::Signature => symbol.signature_span.unwrap_or(symbol.span),
         ReadSliceSpanKind::Body => symbol.body_span.unwrap_or(symbol.span),
     };
     return Ok((
@@ -435,10 +444,11 @@ if let Some(symbol_id) = args.symbol_id.as_deref() {
 }
 ```
 
-Note the fallback at line 1971: if `span_kind: "body"` is asked for a
-symbol that has no `body_span` (a `const`, a trait method declaration
-without a default body), it returns the full `span` rather than
-erroring. The model gets the declaration, not silence.
+Note the fallbacks: if `span_kind: "signature"` is asked for a symbol whose
+extractor could not anchor a separate `signature_span`, or `span_kind:
+"body"` is asked for a symbol with no `body_span` (a `const`, a trait method
+declaration without a default body), `read_slice` returns the full `span`
+rather than erroring. The model gets the declaration, not silence.
 
 ## Worked example
 
@@ -459,8 +469,8 @@ would be **15,000–40,000 tokens**.
 
 **Step 2 — read the shape.** Knowing the symbol ID, the model asks
 `read_slice {symbol_id, span_kind: "signature"}`. `read_slice_target`
-returns the symbol's full `span` (signature lives in the bytes from
-the declaration start to the body start) —
+uses `signature_span` when available and falls back to the declaration span only
+for symbols that do not carry a separate header span:
 `pub async fn verify_token(token: &str, now: SystemTime) -> Result<Claims, AuthError>`.
 Cost: roughly **50 tokens**. A naïve `Read auth/middleware.rs` is
 **~7000 tokens**.
@@ -483,11 +493,11 @@ sees code it doesn't need.
 
 ## Edge cases and limits
 
-**Unsupported languages.** Anything outside the list at
-`lib.rs:458-469` — Ruby, Kotlin, Swift, Scala, Zig, Haskell, Elixir,
-Lua, Bash, SQL, HTML, CSS, YAML, TOML, Markdown — produces a
+**Unsupported languages.** Anything outside the supported `LanguageFamily` set
+— for example Zig, Haskell, Elixir, Lua, Bash, SQL, HTML, CSS, YAML, TOML, and
+Markdown — produces a
 `ParsedFile::unsupported` and gets `"bounded read/grep/list navigation"`
-as the documented fallback (`lib.rs:48`). The graph contains a `File`
+as the documented fallback. The graph contains a `File`
 symbol for the file but no declarations; the agent can still read it,
 just with no slice shortcut.
 

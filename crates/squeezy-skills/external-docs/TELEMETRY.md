@@ -28,6 +28,11 @@ https://squeezy-telemetry.esqueezy.workers.dev/v1/batch
 Override it with `SQUEEZY_TELEMETRY_ENDPOINT` when testing a local or staging
 collector.
 
+The durable local telemetry ledger defaults to `~/.squeezy/telemetry.redb`.
+Tests and staging runs can override the install id path with
+`SQUEEZY_TELEMETRY_INSTALL_ID_PATH` and the ledger path with
+`SQUEEZY_TELEMETRY_STORE_PATH`.
+
 The same Worker also exposes consented intake endpoints for `/feedback` and
 `/report`, plus a separate website visitor endpoint:
 
@@ -37,11 +42,11 @@ https://squeezy-telemetry.esqueezy.workers.dev/v1/feedback
 https://squeezy-telemetry.esqueezy.workers.dev/v1/report
 ```
 
-Those endpoints are not anonymous product telemetry from the Squeezy binary.
+Those endpoints are not automatic product telemetry from the Squeezy binary.
 `/v1/site` receives anonymous website page-view and CTA events. `/feedback`
 sends short redacted user text after explicit confirmation. `/report` uploads a
-redacted archive to private R2 storage after explicit confirmation and forwards
-only metadata to PostHog.
+redacted archive to private R2 storage after explicit confirmation when the
+Worker has report storage configured, and forwards only metadata to PostHog.
 
 ## Identity
 
@@ -51,6 +56,9 @@ is used only to count anonymous unique users. Each process also gets a random
 `session_id`. Local telemetry facts are written with a millisecond timestamp
 and an increasing local sequence, then reduced into one bounded session summary
 before upload.
+Local facts include correlation ids such as `trace_id`, `span_id`, and
+`store_session_id` when they help connect safe runtime events in the ledger. The
+remote summary remains aggregate-first and does not upload raw timelines.
 
 ## Events
 
@@ -101,8 +109,8 @@ Telemetry must not include:
   model family buckets instead.
 
 Website visitor telemetry is separate from product telemetry. It is limited to
-anonymous visitor/session IDs, site-local paths, coarse referrer kind, bounded
-UTM fields, and CTA/target identifiers.
+pseudonymous visitor/session IDs, site-local paths, coarse referrer kind,
+bounded UTM fields, and CTA/target identifiers.
 
 These restrictions describe automatic telemetry events. Consented feedback and
 report submission have their own preview, redaction, and size caps documented

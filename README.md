@@ -5,23 +5,15 @@ citizens. Squeezy parses repositories into a persistent local semantic graph and
 queries that graph through structured tools that return compact evidence
 packets — spans, hashes, confidence, freshness — instead of raw file dumps.
 
-> **Status:** early development. The TUI scaffold is runnable; deterministic
-> validation harness tasks run in CI; graph-backed navigation tools expose
-> compact evidence packets. Providers:
->
-> - **Aggregators (one key, many models):** OpenRouter, Vercel AI Gateway,
->   PortKey.
-> - **First-party vendor APIs (single vendor):** OpenAI, Anthropic, Google
->   Gemini.
-> - **Cloud-platform hosts:** Amazon Bedrock (AWS multi-vendor catalog), Azure
->   OpenAI (Microsoft-hosted OpenAI), Google Vertex AI (GCP-hosted Gemini and
->   partner models).
-> - **Local runtime:** Ollama.
-> - **Other OpenAI-compatible:** Groq, xAI, DeepSeek, Mistral La Plateforme,
->   Together AI, Fireworks AI, Cerebras.
-> - Any other OpenAI-compatible endpoint — Microsoft Foundry (Azure AI Studio)
->   for the broader Foundry catalog, Cloudflare Workers AI, self-hosted
->   LiteLLM, … — works via the `openai_compatible` preset.
+> **Status:** early v0 development. The CLI/TUI is runnable; graph-backed
+> navigation, deterministic validation harnesses, local help, sessions/resume,
+> checkpoints, provider routing, MCP, skills, hooks, feedback/reporting, and
+> telemetry are implemented and still evolving. Provider and language support
+> change faster than this README, so use
+> [`PROVIDERS.md`](crates/squeezy-skills/external-docs/PROVIDERS.md) for exact
+> provider ids, defaults, environment variables, and model metadata, and
+> [`LANGUAGES.md`](crates/squeezy-skills/external-docs/LANGUAGES.md) for the
+> current graph-navigation coverage matrix.
 
 The **why** lives in [`docs/THESIS.md`](docs/THESIS.md). User docs live in
 [`crates/squeezy-skills/external-docs/`](crates/squeezy-skills/external-docs)
@@ -39,8 +31,11 @@ curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | 
 On macOS, Homebrew is also supported:
 
 ```sh
-brew install esqueezy/tap/squeezy
+brew install squeezy
 ```
+
+If the core formula is not available on your machine yet, use
+`brew install esqueezy/tap/squeezy`.
 
 Rust users can install with Cargo:
 
@@ -49,7 +44,7 @@ cargo install squeezy --locked
 ```
 
 Tagged releases also publish macOS Intel, macOS Apple Silicon, Linux x86_64
-musl, and Windows x86_64 archives. Full install, first-run, upgrade, and
+musl, Linux aarch64 musl, and Windows x86_64 archives. Full install, first-run, upgrade, and
 uninstall instructions are in [`INSTALL.md`](crates/squeezy-skills/external-docs/INSTALL.md).
 
 ## Quickstart
@@ -57,16 +52,18 @@ uninstall instructions are in [`INSTALL.md`](crates/squeezy-skills/external-docs
 ```sh
 squeezy doctor                    # diagnose configuration and providers
 squeezy config init --user        # write the default user settings file
+squeezy config inspect            # print the effective merged configuration
+squeezy --list-providers          # quick provider table
+squeezy providers list            # provider registry and model counts
+squeezy sessions list             # recent local sessions
+squeezy --resume                  # open the resume picker
 
-# Fastest path: one credit, every frontier model (recommended)
+# Aggregator path: one key can route to many upstream models.
 export OPENROUTER_API_KEY=...     # https://openrouter.ai/keys
 squeezy
 
-# Or use any other supported provider — first-party vendor APIs (OpenAI,
-# Anthropic, Google Gemini), cloud-platform hosts (Azure OpenAI, Amazon
-# Bedrock), local Ollama, or other OpenAI-compatible services (Vercel AI
-# Gateway, PortKey, Groq, xAI, DeepSeek, Mistral, Together AI, Fireworks AI,
-# Cerebras). See crates/squeezy-skills/external-docs/PROVIDERS.md for the matching env vars.
+# Or use any other supported provider. See
+# crates/squeezy-skills/external-docs/PROVIDERS.md for exact ids and env vars.
 ```
 
 `squeezy doctor` reports on the merged configuration sources, repo profile,

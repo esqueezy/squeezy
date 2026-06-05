@@ -17,10 +17,13 @@ Install pre-commit hooks:
 
 ```sh
 brew install pre-commit gitleaks actionlint cargo-deny typos-cli
+cargo install cargo-shear cargo-llvm-cov --locked
 pre-commit install
 ```
 
-If you do not use Homebrew, install `pre-commit`, `gitleaks`, `actionlint`, `cargo-deny`, and `typos` with your platform's package manager.
+If you do not use Homebrew, install `pre-commit`, `gitleaks`, `actionlint`,
+`cargo-deny`, and `typos` with your platform's package manager, and install
+`cargo-shear` / `cargo-llvm-cov` with Cargo or a trusted binary installer.
 
 On Debian/Ubuntu Linux, install the packages needed for the static musl release build:
 
@@ -59,24 +62,29 @@ cargo llvm-cov --workspace --all-targets --summary-only
 cargo build --workspace --all-targets
 ```
 
-Build release binaries:
+Build release-parity binaries:
 
 ```sh
-cargo build --release -p squeezy
+cargo build --profile dist -p squeezy
 CC_x86_64_unknown_linux_musl=musl-gcc \
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
-cargo build --release -p squeezy --target x86_64-unknown-linux-musl
+cargo build --profile dist -p squeezy --target x86_64-unknown-linux-musl
 ```
 
-The musl release build is the Linux distribution artifact. `musl-gcc` is used for native C dependencies, while `rust-lld` links the final self-contained Rust artifact. Verify that the binary has no dynamic loader and no shared-library dependencies:
+The `dist` profile is the release workflow profile: it inherits release
+optimization and enables LTO, one codegen unit, and symbol stripping. The musl
+build is the Linux distribution artifact. `musl-gcc` is used for native C
+dependencies, while `rust-lld` links the final self-contained Rust artifact.
+Verify that the binary has no dynamic loader and no shared-library
+dependencies:
 
 ```sh
-if readelf -l target/x86_64-unknown-linux-musl/release/squeezy | grep -q INTERP; then
+if readelf -l target/x86_64-unknown-linux-musl/dist/squeezy | grep -q INTERP; then
   echo "unexpected dynamic interpreter"
   exit 1
 fi
 
-if readelf -d target/x86_64-unknown-linux-musl/release/squeezy 2>/dev/null | grep -q NEEDED; then
+if readelf -d target/x86_64-unknown-linux-musl/dist/squeezy 2>/dev/null | grep -q NEEDED; then
   echo "unexpected shared-library dependency"
   exit 1
 fi
@@ -87,15 +95,21 @@ Both checks should pass without printing an error.
 ## Test
 
 ```sh
-cargo test --workspace --all-targets
+scripts/test_clean_env.sh --workspace --all-targets --profile ci
 CC_x86_64_unknown_linux_musl=musl-gcc \
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
-cargo test --workspace --all-targets --target x86_64-unknown-linux-musl
+scripts/test_clean_env.sh --workspace --all-targets --profile ci --target x86_64-unknown-linux-musl
 cargo run -p squeezy-harness -- run --jsonl target/harness.jsonl
 python3 scripts/check_test_layout.py
 ```
 
-Rust's stable test runner does not have first-class test tags. Costly integration tests use the `costly` name/ignore convention, a Cargo feature for explicit opt-in, and environment checks for required secrets. They are ignored by default and must be run explicitly:
+Rust's stable test runner does not have first-class test tags. Costly provider
+integration tests live under `crates/squeezy-llm/tests/*_costly.rs` and use the
+`costly` name/ignore convention, the `costly-tests` Cargo feature, the
+`SQUEEZY_RUN_COSTLY_TESTS=1` master flag, and provider-specific environment
+checks. They are ignored by default and must be run explicitly.
+
+Example OpenAI smoke:
 
 ```sh
 SQUEEZY_RUN_COSTLY_TESTS=1 \
@@ -103,7 +117,7 @@ OPENAI_API_KEY=... \
 cargo test -p squeezy-llm --features costly-tests --test openai_costly -- --ignored
 ```
 
-Run the Anthropic costly smoke test with:
+Example Anthropic smoke:
 
 ```sh
 SQUEEZY_RUN_COSTLY_TESTS=1 \
@@ -111,7 +125,13 @@ ANTHROPIC_API_KEY=... \
 cargo test -p squeezy-llm --features costly-tests --test anthropic_costly -- --ignored
 ```
 
-Use `SQUEEZY_COSTLY_OPENAI_MODEL` or `SQUEEZY_COSTLY_ANTHROPIC_MODEL` to test a different cheap model for one provider. `SQUEEZY_COSTLY_MODEL` is the shared fallback. The default costly OpenAI model is `gpt-5-nano`; the default costly Anthropic model is `claude-3-5-haiku-20241022`. Use `SQUEEZY_COSTLY_MAX_OUTPUT_TOKENS=256` if a smoke run is truncated by the provider before returning the expected text.
+Other costly test binaries document their required credentials in the
+`#[ignore = "costly: ..."]` reason. Many support a
+`SQUEEZY_COSTLY_<PROVIDER>_MODEL` override. OpenAI reads the shared
+`SQUEEZY_COSTLY_MODEL` override; Anthropic reads
+`SQUEEZY_COSTLY_ANTHROPIC_MODEL` first and then falls back to
+`SQUEEZY_COSTLY_MODEL`. Use `SQUEEZY_COSTLY_MAX_OUTPUT_TOKENS=256` if a smoke
+run is truncated by the provider before returning the expected text.
 
 For non-costly test runs where you want a hard guarantee that no paid provider call can fire, invoke nextest through the clean-env wrapper:
 
@@ -125,10 +145,10 @@ The wrapper unsets every vendor API key, every `SQUEEZY_<PROVIDER>_KEY` fallback
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --no-deps -- -D warnings
 CC_x86_64_unknown_linux_musl=musl-gcc \
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
-cargo clippy --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings
+cargo clippy --workspace --all-targets --no-deps --target x86_64-unknown-linux-musl -- -D warnings
 pre-commit run --all-files
 gitleaks detect --source . --redact --no-banner --no-color --verbose
 actionlint
@@ -140,16 +160,16 @@ cargo shear
 ## Coverage
 
 ```sh
-cargo llvm-cov --workspace --all-targets --summary-only
+cargo llvm-cov nextest --workspace --all-targets --profile ci --summary-only
 CC_x86_64_unknown_linux_musl=musl-gcc \
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
-cargo llvm-cov --workspace --all-targets --target x86_64-unknown-linux-musl --summary-only
+cargo llvm-cov nextest --workspace --all-targets --profile ci --target x86_64-unknown-linux-musl --summary-only
 ```
 
 For an HTML report:
 
 ```sh
-cargo llvm-cov --workspace --all-targets --html
+cargo llvm-cov nextest --workspace --all-targets --profile ci --html
 ```
 
 On every pull request and every push to `main`, CI runs:
@@ -158,16 +178,21 @@ On every pull request and every push to `main`, CI runs:
 - workflow linting (`actionlint`)
 - dependency policy (`cargo deny check --all-features`)
 - dead dependency scan (`cargo shear`)
+- build-script allowlist (`scripts/check_build_scripts.py`)
 - docs text linting (`typos`)
 - formatting (`cargo fmt --all -- --check`)
 - unit test layout (`scripts/check_test_layout.py`)
-- clippy (`cargo clippy --workspace --all-targets -- -D warnings`)
-- tests (`cargo test --workspace --all-targets`)
+- clippy (`cargo clippy --workspace --all-targets --no-deps -- -D warnings`)
+- tests through `scripts/test_clean_env.sh --workspace --all-targets --profile ci`
 - deterministic validation harness runners (`squeezy-harness`)
-- coverage summary (push-to-main and manual dispatch only)
+- coverage summary (pull requests, push-to-main, and manual dispatch)
 - debug artifact build and smoke-test
 
-The dependency policy in `deny.toml` covers RustSec advisories, duplicate dependencies, license allow-lists, and registry/git source policy for the macOS targets and the Linux musl release target. The Linux job runs clippy, tests, harness validation, coverage, and artifact packaging against `x86_64-unknown-linux-musl`. The coverage step writes its text summary to the GitHub job summary.
+The dependency policy in `deny.toml` covers RustSec advisories, duplicate
+dependencies, license allow-lists, and registry/git source policy. The Linux CI
+path runs clippy, tests, harness validation, debug artifact smoke checks, and
+coverage against `x86_64-unknown-linux-musl`. The coverage step writes its text
+summary to the GitHub job summary.
 
 Separately from the per-PR / per-release dependency policy job, the
 `Scheduled advisory rescan` workflow (`.github/workflows/advisory-rescan.yml`)
@@ -180,11 +205,16 @@ the existing open one) with the cargo-deny output, the run URL, and the
 justified entry to `[advisories.ignore]` in `deny.toml`, then close the issue
 after the next clean rescan.
 
-Pushing a `v*` tag runs the release workflow. It builds and smoke-tests downloadable archives for `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-unknown-linux-musl`, uploads checksum files, and publishes a GitHub Release with generated notes. Dependabot tracks Cargo workspace dependencies, benchmark harness dependencies, and GitHub Actions updates weekly.
+Pushing a `v*` tag runs the release workflow. It builds and smoke-tests downloadable archives for `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and `x86_64-pc-windows-msvc`, uploads checksum files, and publishes a GitHub Release with generated notes. Dependabot tracks Cargo workspace dependencies, benchmark harness dependencies, and GitHub Actions updates weekly.
 
 When `HOMEBREW_TAP_TOKEN` is configured for the repository, the release workflow
 also updates `esqueezy/homebrew-tap` from the published archive checksums. The
 tap update is generated by `scripts/update_homebrew_formula.sh`.
+
+When `WINGET_PKGS_TOKEN` is configured, the release workflow runs
+`scripts/update_winget_manifest.sh` against the `esqueezy/winget-pkgs` fork.
+The first manifest still needs a manual PR to `microsoft/winget-pkgs`;
+subsequent releases can reuse the same branch/update path.
 
 Before a crates.io release, list package contents for every publishable Squeezy
 crate, then dry-run publish crates in dependency order. During the first
@@ -201,6 +231,7 @@ for package in \
   squeezy-llm \
   squeezy-mcp \
   squeezy-skills \
+  squeezy-hooks \
   squeezy-telemetry \
   squeezy-parse \
   squeezy-store \

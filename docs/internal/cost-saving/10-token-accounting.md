@@ -137,15 +137,22 @@ defends against a hypothetical negative without aborting the stream.
 
 **Google** parses `usageMetadata` on every chunk and overwrites the cost
 state — Gemini emits running totals rather than deltas, so the latest chunk
-wins:
+wins. Gemini reports visible candidate tokens and thinking tokens as disjoint
+fields; Squeezy folds them into inclusive `output_tokens` and keeps
+`reasoning_output_tokens` as the thinking subset:
 
 ```rust
 // crates/squeezy-llm/src/google.rs:365-370
 if let Some(usage) = value.get("usageMetadata") {
     cost.input_tokens = usage.get("promptTokenCount").and_then(Value::as_u64);
-    cost.output_tokens = usage.get("candidatesTokenCount").and_then(Value::as_u64);
     cost.cached_input_tokens = usage.get("cachedContentTokenCount").and_then(Value::as_u64);
-    cost.reasoning_output_tokens = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
+    let visible = usage.get("candidatesTokenCount").and_then(Value::as_u64);
+    let thoughts = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
+    cost.output_tokens = match (visible, thoughts) {
+        (None, None) => None,
+        (visible, thoughts) => Some(visible.unwrap_or(0) + thoughts.unwrap_or(0)),
+    };
+    cost.reasoning_output_tokens = thoughts;
 }
 ```
 
@@ -336,9 +343,9 @@ per-source block runs `div_ceil(4)` over each byte counter:
 - system prompt + framing: `~24_020 tokens` (the remainder)
 
 Tool outputs are 51% of the consumed budget. The user runs
-`/tool-verbosity compact`. On the next turn, `read_file` shrinks its result
-formatter, `tool_output_bytes` drops to roughly 64_000, and the next
-`/context` shows `~62_000 tokens (~31% of window)`. The
+`/compact`. On the next turn, stale raw tool outputs are replaced by compact
+summaries or receipt stubs, `tool_output_bytes` drops to roughly 64_000, and the
+next `/context` shows `~62_000 tokens (~31% of window)`. The
 `SessionAccountingSnapshot` made the decision obvious — no guessing whether
 the system prompt, the conversation, or the tools was the driver. The
 compaction trigger reads the same `transmitted_request.used_input_percent_x100`

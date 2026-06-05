@@ -123,23 +123,24 @@ commented examples so that built-in defaults can evolve over time:
 # mode = "build"
 # log_dir = ".squeezy/sessions"
 # log_retention_days = 30
-# max_event_bytes = 65536
+# max_event_bytes = 131072
 # max_session_bytes = 52428800
 
 [context]
 # compaction_enabled = true
-# compaction_estimated_tokens = 6000
+# compaction_estimated_tokens = 60000
 # compaction_min_items = 16
-# compaction_recent_items = 6
+# compaction_recent_items = 10
 # compaction_max_summary_bytes = 12000
 
 [subagents]
 # enabled = true
 # explore_enabled = true
 # explore_model = "gpt-5-nano"
-# max_tool_calls_per_call = 24
-# max_tool_bytes_read_per_call = 8388608
-# max_search_files_per_call = 2000
+# max_concurrent = 20
+# max_tool_calls_per_call = 10000
+# max_tool_bytes_read_per_call = 1000000000
+# max_search_files_per_call = 1000000
 # max_model_rounds = 1000
 # max_summary_tokens = 64000
 
@@ -154,7 +155,7 @@ commented examples so that built-in defaults can evolve over time:
 # expensive_models = "(?i)^(?!.*(nano|mini)).*"   # regex; route only when the parent matches
 
 [permissions]
-# mode = "auto_review"           # default | auto_review | full_access | custom
+# mode = "default"               # default | auto_review | full_access | custom
 # read = "allow"
 # search = "allow"
 # edit = "allow"
@@ -182,8 +183,8 @@ commented examples so that built-in defaults can evolve over time:
 # [permissions.ai_reviewer]
 # enabled = true
 # model = "gpt-5-nano"
-# allow_capabilities = ["read", "search", "network", "mcp"]
-# policy_file = "docs/external/APPROVAL_POLICY.md"
+# allow_capabilities = ["read", "search", "network", "mcp", "edit", "shell", "git", "compiler"]
+# policy_file = "crates/squeezy-skills/external-docs/APPROVAL_POLICY.md"
 # timeout_secs = 15
 
 # [permissions.shell_sandbox]
@@ -202,6 +203,19 @@ commented examples so that built-in defaults can evolve over time:
 
 [telemetry]
 # enabled = true
+
+[skills]
+# user_dir = "~/.squeezy/skills"
+# compat_user_dir = "~/.agents/skills"
+# extra_roots = []
+# active_budget_chars = 4000          # legacy absolute cap; used when active_budget_mode is unset
+# active_body_cap_chars = 16000
+# preamble_enabled = true
+# preamble_budget_chars = 800         # legacy absolute cap; used when preamble_budget_mode is unset
+# active_budget_mode = { context_percent = 2.0 }
+# preamble_budget_mode = { context_percent = 2.0 }
+# inline = false                      # false advertises metadata and loads bodies on demand
+# hooks_enabled = false               # opt in before executing skill hook commands
 
 [hardening]
 # disable_core_dumps = true
@@ -227,10 +241,10 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 
 ```toml
 [budgets]
-# max_parallel_tools = 8
-# max_tool_calls_per_turn = 64
-# max_tool_bytes_read_per_turn = 20000000
-# max_search_files_per_turn = 50000
+# max_parallel_tools = 16
+# max_tool_calls_per_turn = 10000
+# max_tool_bytes_read_per_turn = 1000000000
+# max_search_files_per_turn = 1000000
 # max_tool_result_bytes_per_round = 50000
 
 [agent]
@@ -240,14 +254,14 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 # mode = "build"
 # log_dir = ".squeezy/sessions"
 # log_retention_days = 30
-# max_event_bytes = 65536
+# max_event_bytes = 131072
 # max_session_bytes = 52428800
 
 [context]
 # compaction_enabled = true
-# compaction_estimated_tokens = 6000
+# compaction_estimated_tokens = 60000
 # compaction_min_items = 16
-# compaction_recent_items = 6
+# compaction_recent_items = 10
 # compaction_max_summary_bytes = 12000
 
 # [redaction]
@@ -275,7 +289,7 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 # tool_output_verbosity = "compact"
 # transcript_default = "compact"
 # show_reasoning_usage = true
-# theme = "default"           # built-in: default, bright, fun, starlight
+# theme = "default"           # built-in: default, bright, fun, catppuccin, high-contrast
 
 # [tui.themes.myteam]
 # [tui.themes.myteam.colors]
@@ -292,12 +306,13 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   `reasoning_effort` accepts `low`, `medium`, `high`, or `xhigh` and is only
   sent to providers whose model registry entry marks native reasoning controls
   as supported.
-- `[providers.<id>]`: provider defaults such as `api_key_env`,
-  `region`. Environment variables always win. On macOS, when a provider has
-  using that service name and the provider account name (`openai`,
-  `anthropic`, `google`, or `azure_openai`). On non-macOS hosts this fallback
-  is unavailable and missing environment variables remain provider-config
-  errors.
+- `[providers.<id>]`: provider defaults such as `api_key_env`, `api_key`,
+  `base_url`, `region`, and provider-specific transport fields. API keys are
+  resolved in this order: inline `api_key`, the local credentials file
+  (`~/.squeezy/credentials.json` or `SQUEEZY_CREDENTIALS_FILE`), the configured
+  environment variable, provider fallback environment variables, then
+  `SQUEEZY_CREDENTIALS_JSON`. Use `squeezy auth set/list/status/remove` to
+  manage the local credentials file without putting secrets in TOML.
 - `[session]`: `mode`, either `build` (default) or `plan`. Build mode preserves
   normal tool behavior subject to permission policy. Plan mode advertises only
   read/search/navigation tools and refuses edit, shell, git, network, MCP,
@@ -339,8 +354,8 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   LLM round-trip per ambiguous shell call, so leave it off unless that cost
   is acceptable.
 - `[permissions.ai_reviewer]`: model-backed pre-review for permission prompts.
-  It is enabled by the default `auto_review` permission mode. When enabled, it
-  receives a bounded
+  It is enabled when `permissions.mode = "auto_review"` or when explicitly
+  enabled in custom settings. When enabled, it receives a bounded
   transcript window, the pending permission request, and the approval policy
   document, then returns `allow`, `deny`, or `ask` JSON. It may deny any
   request, but it may only auto-allow capabilities listed in
@@ -367,13 +382,15 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   shell commands that write and mutating tools refuse paths under those metadata
   directories even when the containing root is otherwise writable.
   Linux probes
-  `/proc/sys/kernel/unprivileged_userns_clone` and `/proc/self/ns/user` before
-  spawn; when namespacing is available, the child runs in a fresh user, mount,
-  and (optionally) network namespace via `unshare(CLONE_NEWUSER | CLONE_NEWNS |
-  ...)` with a uid_map back to the parent. Linux also applies Landlock
-  filesystem allowlists for workspace/default roots plus configured roots; in
-  `required` mode missing Landlock support denies pre-spawn, while
-  `best_effort` records that filesystem enforcement was unavailable.
+  `/proc/sys/kernel/unprivileged_userns_clone`, `/proc/self/ns/user`, and
+  Landlock support before spawn; when namespacing is available, the child runs
+  in a fresh user, mount, and (optionally) network namespace via
+  `unshare(CLONE_NEWUSER | CLONE_NEWNS | ...)` with a uid_map back to the
+  parent. Linux also applies Landlock filesystem allowlists for
+  workspace/default roots plus configured roots and a seccomp deny-list for
+  process-inspection and local-socket escape paths; in `required` mode missing
+  Landlock support denies pre-spawn, while `best_effort` records that
+  filesystem enforcement was unavailable.
   `network = "allow_when_approved"` opens the network namespace only when the
   permission policy allowed a classified network command; this is the default
   for `default`, `auto_review`, and `full_access` modes. Set
@@ -483,6 +500,16 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   telemetry: `/feedback` sends short redacted text, while `/report` uploads a
   redacted archive to private report storage and stores only metadata in
   PostHog.
+- `[skills]`: local skill discovery and rendering controls. `user_dir` and
+  `compat_user_dir` point at personal skill catalogs. `extra_roots` adds shared
+  catalogs above personal skills and below project-local skills. `active_*`
+  fields control the active-skill bundle for the current turn, and
+  `preamble_*` fields control the available-skill metadata catalog. Budget
+  modes default to `{ context_percent = 2.0 }`, scaling with
+  `[context].model_context_window`; the legacy `*_budget_chars` fields remain
+  absolute fallbacks. `inline = false` keeps skill bodies out of the system
+  prompt until `load_skill` is called. `hooks_enabled = false` keeps `hooks:`
+  declarations inert until a trusted catalog is explicitly allowed.
 - `[redaction]`: `custom_patterns`, an optional list of Rust regex patterns
   that extend Squeezy's built-in secret redaction.
 - `[web]`: `exa_mcp_url` and `exa_api_key_env`.
@@ -528,7 +555,7 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   (OpenAI o-series, Anthropic extended thinking, Gemini 2.5 thinking,
   Bedrock Claude reasoning).
   `theme` selects the active color theme. Built-in themes are `default`, `bright`,
-  `fun`, and `starlight`. Custom themes can be defined under
+  `fun`, `catppuccin`, and `high-contrast`. Custom themes can be defined under
   `[tui.themes.<name>.colors]` with named color tokens (e.g. `"palette.accent"`,
   `"palette.secondary"`, `"palette.red"`) mapped to 6-digit hex RGB values. Use
   `/theme <name>` in the TUI to switch themes live.

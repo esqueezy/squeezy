@@ -36,7 +36,8 @@ The crate layout separates:
 ## Storage Direction
 
 - Keep an in-memory query surface backed by persisted graph/cache partitions.
-- Use `redb` for persisted graph/cache state.
+- Use `redb` for persisted state: `state.redb` for session/cache metadata and
+  `graph.redb` for graph partitions and resolver-cache snapshots.
 - Hydrate graph partitions lazily when queries need them.
 - Add `tantivy` later for full-text ranking; do not make it part of the first graph milestone.
 
@@ -49,7 +50,7 @@ The crate layout separates:
 - Keep the graph schema and navigation behavior consistent across languages.
 - Attach provenance and confidence to every graph edge.
 
-Committed implementation documentation belongs in `docs/`. Personal notes, design motivation, reference research, and uncommitted decision thinking belong outside this repository.
+Contributor and implementation documentation belongs in `docs/`. User-facing bundled help documentation belongs in `crates/squeezy-skills/external-docs/`. Personal notes, design motivation, reference research, and uncommitted decision thinking belong outside this repository.
 
 Skill architecture scope is documented in `docs/internal/SKILLS_SCOPE.md`.
 Keep skills as local filesystem instruction bundles; do not add marketplace,
