@@ -164,6 +164,21 @@ const DELEGATE_CHAIN_MAX_STEPS: usize = 16;
 /// threshold was always meant to approximate.
 const REDUNDANT_DELEGATE_EXPLORE_CALLS: u64 = 8;
 const REDUNDANT_DELEGATE_READ_BYTES: u64 = 32_768;
+/// First-move-over-bounded-scope gate (companion to the redundant gate above).
+/// A weak model sometimes fires a whole-task `delegate` as its FIRST move on a
+/// single-pass audit whose target files already live under one known,
+/// enumerable path set. The cold subagent then re-explores from scratch
+/// (whole-repo `repo_map` + re-reads) and burns the bulk of the run's tokens for
+/// work the parent could do in-context with a few grep/read_slice calls. This
+/// branch denies that opening move, but ONLY when the parent has done
+/// essentially no exploration yet (so a deliberate context-isolating delegate
+/// mid-task is unaffected) AND the delegate's scope/prompt names a path set that
+/// actually resolves in the workspace (so genuine discovery-shaped delegations,
+/// where the file set must be found across many passes, still pass). The
+/// thresholds are intentionally strict to avoid over-denying: a single prior
+/// tool call or a few KB of ingest already disqualifies the "first move" label.
+const FIRST_MOVE_DELEGATE_MAX_CALLS: u64 = 1;
+const FIRST_MOVE_DELEGATE_MAX_OUTPUT_BYTES: u64 = 4_096;
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
@@ -11486,25 +11501,149 @@ enum DelegateGateDecision {
     /// Deny: the parent has already ingested substantial context for this
     /// task, so a cold subagent would only re-derive it (pure overhead).
     DenyRedundant,
+    /// Deny: a first-move whole-task delegate over an already-bounded scope.
+    /// The parent has explored ~nothing yet but the scope/prompt names a path
+    /// set that resolves in the workspace, so the parent could enumerate it
+    /// in-context (grep/read_slice) instead of paying a cold subagent to
+    /// re-discover and re-read it.
+    DenyBoundedFirstMove,
 }
 
-/// Decide whether a broad `delegate` should be denied as redundant given the
-/// parent's turn-spanning, parent-only exploration metrics.
+/// Decide whether a broad `delegate` should be denied given the parent's
+/// turn-spanning, parent-only exploration metrics and whether the delegate's
+/// scope/prompt names a path set that already resolves in the workspace.
 ///
-/// Keyed on `output_bytes` (context actually pulled into the parent's
-/// conversation) rather than `bytes_read` (bytes *scanned*): a directory grep
-/// scans megabytes but ingests only the matched lines, and re-deriving those
-/// matches is cheap, so a grep-heavy / low-ingest parent must NOT be denied.
-/// The `tool_calls` clause still catches a parent that has churned through many
-/// exploration calls regardless of byte volume.
-fn redundant_delegate_decision(tool_calls: u64, output_bytes: u64) -> DelegateGateDecision {
+/// Two independent deny reasons, checked in order:
+///
+/// 1. `DenyBoundedFirstMove` — the parent has done essentially no exploration
+///    (`tool_calls <= FIRST_MOVE_DELEGATE_MAX_CALLS`,
+///    `output_bytes <= FIRST_MOVE_DELEGATE_MAX_OUTPUT_BYTES`) AND
+///    `scope_is_bounded` (the scope/prompt resolves to a concrete, enumerable
+///    path set). This catches the cold whole-task hand-off over a known
+///    directory. Discovery-shaped delegations (no resolvable path set) are not
+///    bounded, so they fall through and are allowed.
+/// 2. `DenyRedundant` — keyed on `output_bytes` (context actually pulled into
+///    the parent's conversation) rather than `bytes_read` (bytes *scanned*): a
+///    directory grep scans megabytes but ingests only the matched lines, and
+///    re-deriving those matches is cheap, so a grep-heavy / low-ingest parent
+///    must NOT be denied. The `tool_calls` clause still catches a parent that
+///    has churned through many exploration calls regardless of byte volume.
+fn redundant_delegate_decision(
+    tool_calls: u64,
+    output_bytes: u64,
+    scope_is_bounded: bool,
+) -> DelegateGateDecision {
+    // A genuine "first move": the parent has barely touched the workspace yet.
+    // Only then do we treat a bounded-scope delegate as a cold hand-off the
+    // parent should have done itself. Keeping these thresholds strict means a
+    // deliberate context-isolating delegate fired mid-task (after any real
+    // exploration) is never caught here.
+    let is_first_move = tool_calls <= FIRST_MOVE_DELEGATE_MAX_CALLS
+        && output_bytes <= FIRST_MOVE_DELEGATE_MAX_OUTPUT_BYTES;
+    if is_first_move && scope_is_bounded {
+        return DelegateGateDecision::DenyBoundedFirstMove;
+    }
     if output_bytes >= REDUNDANT_DELEGATE_READ_BYTES
         || tool_calls >= REDUNDANT_DELEGATE_EXPLORE_CALLS
     {
-        DelegateGateDecision::DenyRedundant
-    } else {
-        DelegateGateDecision::Allow
+        return DelegateGateDecision::DenyRedundant;
     }
+    DelegateGateDecision::Allow
+}
+
+/// Whether a delegate's `scope`/`prompt` names a concrete, enumerable path set
+/// that already resolves in the workspace — i.e. the parent could grep/read the
+/// files in-context instead of spawning a cold subagent to re-discover them.
+///
+/// Generic, no benchmark strings. The heuristic only fires on tokens that look
+/// like real paths (contain a path separator or a file extension) and that, once
+/// any trailing glob/wildcard segment is stripped, resolve to an existing file
+/// or directory *inside* the workspace. A scope of pure prose, or one naming
+/// only paths that do not exist yet (a discovery target), is NOT bounded, so
+/// discovery-shaped delegations are left alone.
+///
+/// Limitation: this resolves literal path tokens only. It does not expand globs
+/// to confirm a non-empty match, and it does not resolve symbol names to their
+/// defining files (that would require a graph query on the gate hot path). A
+/// scope expressed purely as symbol names with no path is therefore treated as
+/// unbounded (allowed) — the safe direction, since the alternative is
+/// over-denying legitimate delegations.
+fn delegate_scope_is_bounded(scope: Option<&str>, prompt: &str, workspace_root: &Path) -> bool {
+    // The explicit `scope` field is the strongest bounded-scope signal; the
+    // prompt is scanned too so a model that inlines the path set into the
+    // prompt (and omits `scope`) is still caught.
+    let mut any_path_token = false;
+    for text in scope.into_iter().chain(std::iter::once(prompt)) {
+        for raw in text.split([' ', '\t', '\n', '\r', ',', ';', '(', ')', '`', '"', '\'']) {
+            let token = raw.trim_matches(|c: char| c == '.' || c == ':' || c == '#');
+            if !token_looks_like_path(token) {
+                continue;
+            }
+            any_path_token = true;
+            if path_token_resolves_in_workspace(token, workspace_root) {
+                return true;
+            }
+        }
+    }
+    // Tokens that looked like paths but resolved to nothing (or no path tokens
+    // at all) mean the file set is not a known bounded set in the workspace.
+    let _ = any_path_token;
+    false
+}
+
+/// A token is path-shaped if it carries a path separator or a file-extension
+/// suffix. Bare prose words (no `/`, no `.ext`) are rejected so the resolver
+/// never probes the filesystem for, say, the word "audit".
+fn token_looks_like_path(token: &str) -> bool {
+    if token.is_empty() || token.len() > 256 {
+        return false;
+    }
+    if token.contains('/') || token.contains('\\') {
+        return true;
+    }
+    // `name.ext`: a dot with a short alnum extension, e.g. `lib.rs`, `main.go`.
+    if let Some((stem, ext)) = token.rsplit_once('.') {
+        return !stem.is_empty()
+            && (1..=8).contains(&ext.len())
+            && ext.chars().all(|c| c.is_ascii_alphanumeric());
+    }
+    false
+}
+
+/// Resolve a literal path token against the workspace root and report whether it
+/// names an existing file or directory inside the workspace. Any trailing glob
+/// segment (the first component containing `*`, `?`, or `[`) is dropped so
+/// `src/**/*.rs` collapses to `src`. Tokens that escape the workspace via `..`
+/// or an absolute path outside it are rejected.
+fn path_token_resolves_in_workspace(token: &str, workspace_root: &Path) -> bool {
+    let candidate = Path::new(token);
+    // Keep only the leading components up to the first glob segment, so a glob
+    // pattern is checked by the existence of the directory it scans.
+    let mut base = PathBuf::new();
+    for component in candidate.components() {
+        let part = component.as_os_str().to_string_lossy();
+        if part.contains('*') || part.contains('?') || part.contains('[') {
+            break;
+        }
+        base.push(component);
+    }
+    if base.as_os_str().is_empty() {
+        return false;
+    }
+    let joined = if base.is_absolute() {
+        base.clone()
+    } else {
+        workspace_root.join(&base)
+    };
+    // Confine to the workspace: reject `..` escapes and absolute paths that
+    // canonicalize outside the root.
+    let (Ok(canon_root), Ok(canon_path)) = (
+        std::fs::canonicalize(workspace_root),
+        std::fs::canonicalize(&joined),
+    ) else {
+        return false;
+    };
+    canon_path.starts_with(&canon_root)
 }
 
 async fn execute_tool_calls(
@@ -11619,30 +11758,59 @@ async fn execute_tool_calls(
         };
         if let Some(kind) = delegate_batch_kind {
             // Anti-redundant-delegation gate (see the const docs above). Refuse a
-            // whole-task `delegate` when the parent has already gathered
-            // substantial context this task — a cold subagent would re-read the
-            // same files for pure overhead. Recall-safe: `Denied` removes no
-            // information (the parent already holds the context that tripped the
-            // gate and keeps every read/grep/graph tool), and `Denied` is ignored
-            // by the repeated-failure loop guard so it cannot abort the turn. An
-            // early/context-isolating delegate (counters near zero) is exempt.
+            // whole-task `delegate` either when the parent has already gathered
+            // substantial context this task (a cold subagent would re-read the
+            // same files for pure overhead) or when it is a FIRST-MOVE hand-off
+            // over an already-bounded scope (the parent could just enumerate the
+            // known path set in-context). Recall-safe: `Denied` removes no
+            // information (the parent keeps every read/grep/graph tool), and
+            // `Denied` is ignored by the repeated-failure loop guard so it cannot
+            // abort the turn. A context-isolating delegate fired after real
+            // exploration, or one whose file set must be discovered across many
+            // passes, is exempt.
             let gate_decision = if kind == SubagentKind::Delegate {
-                redundant_delegate_decision(broker.metrics.tool_calls, broker.metrics.output_bytes)
+                // Resolve the scope/prompt against the workspace only when the
+                // metrics already mark this as a first move; otherwise the
+                // filesystem probe is wasted (the bounded-first-move branch
+                // can't fire) and the redundant branch keys on metrics alone.
+                let first_move = broker.metrics.tool_calls <= FIRST_MOVE_DELEGATE_MAX_CALLS
+                    && broker.metrics.output_bytes <= FIRST_MOVE_DELEGATE_MAX_OUTPUT_BYTES;
+                let scope_is_bounded = first_move
+                    && delegate_scope_is_bounded(
+                        call.arguments.get("scope").and_then(Value::as_str),
+                        call.arguments
+                            .get("prompt")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        &context.config.workspace_root,
+                    );
+                redundant_delegate_decision(
+                    broker.metrics.tool_calls,
+                    broker.metrics.output_bytes,
+                    scope_is_bounded,
+                )
             } else {
                 DelegateGateDecision::Allow
             };
-            if gate_decision == DelegateGateDecision::DenyRedundant {
-                let result = control_tool_result(
-                    call,
-                    ToolStatus::Denied,
-                    json!({
-                        "ok": false,
-                        "error": "delegate is redundant: substantial context for this task is already gathered in-context",
-                        "parent_tool_calls": broker.metrics.tool_calls,
-                        "parent_output_bytes": broker.metrics.output_bytes,
-                        "guidance": "You have already read/searched substantial relevant context in this task. A delegate subagent starts cold and re-reads the same files — pure overhead. Finish in-context using what you have; use read_file/read_slice/grep and the graph tools directly for any remaining detail."
-                    }),
-                );
+            let denied_payload = match gate_decision {
+                DelegateGateDecision::DenyRedundant => Some(json!({
+                    "ok": false,
+                    "error": "delegate is redundant: substantial context for this task is already gathered in-context",
+                    "parent_tool_calls": broker.metrics.tool_calls,
+                    "parent_output_bytes": broker.metrics.output_bytes,
+                    "guidance": "You have already read/searched substantial relevant context in this task. A delegate subagent starts cold and re-reads the same files — pure overhead. Finish in-context using what you have; use read_file/read_slice/grep and the graph tools directly for any remaining detail."
+                })),
+                DelegateGateDecision::DenyBoundedFirstMove => Some(json!({
+                    "ok": false,
+                    "error": "delegate is redundant: scope is a known bounded file set; enumerate it in-context",
+                    "parent_tool_calls": broker.metrics.tool_calls,
+                    "parent_output_bytes": broker.metrics.output_bytes,
+                    "guidance": "Scope is a known bounded file set; enumerate it in-context with grep/read_slice/reference_search rather than a cold subagent. A first-move delegate over files that already live under a known path set just pays a cold subagent to re-discover and re-read them. Reserve delegate for when the file set itself must be discovered across many passes."
+                })),
+                DelegateGateDecision::Allow => None,
+            };
+            if let Some(payload) = denied_payload {
+                let result = control_tool_result(call, ToolStatus::Denied, payload);
                 record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
                 let _ = context
                     .tx

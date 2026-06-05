@@ -10675,7 +10675,8 @@ fn grep_heavy_low_output_parent_is_not_denied_delegate() {
     let tool_calls = 2; // a couple of greps, well under the call threshold
     let output_bytes = 1_024; // ~1KB of matched lines actually ingested
     assert_eq!(
-        redundant_delegate_decision(tool_calls, output_bytes),
+        // unbounded scope: this exercises the redundant (ingest) branch only
+        redundant_delegate_decision(tool_calls, output_bytes, false),
         DelegateGateDecision::Allow,
         "a grep-heavy parent that ingested only ~1KB of matches must keep its delegate",
     );
@@ -10688,7 +10689,7 @@ fn read_heavy_high_output_parent_is_denied_delegate() {
     let tool_calls = 3;
     let output_bytes = REDUNDANT_DELEGATE_READ_BYTES; // exactly at the ingest cap
     assert_eq!(
-        redundant_delegate_decision(tool_calls, output_bytes),
+        redundant_delegate_decision(tool_calls, output_bytes, false),
         DelegateGateDecision::DenyRedundant,
         "a parent that ingested >= 32KB of file bodies should be denied a redundant delegate",
     );
@@ -10702,7 +10703,8 @@ fn explore_call_count_still_trips_gate_regardless_of_output_bytes() {
     let tool_calls = REDUNDANT_DELEGATE_EXPLORE_CALLS;
     let output_bytes = 0;
     assert_eq!(
-        redundant_delegate_decision(tool_calls, output_bytes),
+        // unbounded scope, and well past the first-move window
+        redundant_delegate_decision(tool_calls, output_bytes, false),
         DelegateGateDecision::DenyRedundant,
         "reaching the exploration-call threshold denies the delegate even at zero ingest",
     );
@@ -10711,10 +10713,142 @@ fn explore_call_count_still_trips_gate_regardless_of_output_bytes() {
 #[test]
 fn early_low_ingest_low_call_delegate_is_allowed() {
     // A context-isolating delegate fired before the parent explores: both
-    // counters near zero, so it is intentionally exempt.
+    // counters near zero AND an unbounded (discovery-shaped) scope, so it is
+    // intentionally exempt.
     assert_eq!(
-        redundant_delegate_decision(0, 0),
+        redundant_delegate_decision(0, 0, false),
         DelegateGateDecision::Allow,
-        "an early delegate with both counters near zero stays exempt",
+        "an early delegate with both counters near zero and an unbounded scope stays exempt",
     );
+}
+
+// --- First-move-over-bounded-scope gate (COMMIT 2) ---
+
+#[test]
+fn first_move_delegate_over_bounded_scope_is_denied() {
+    // The haiku case: the parent's very first move is a whole-task delegate
+    // whose scope already resolves to a known path set in the workspace. The
+    // parent could enumerate it in-context, so this opening hand-off is denied.
+    assert_eq!(
+        redundant_delegate_decision(0, 0, true),
+        DelegateGateDecision::DenyBoundedFirstMove,
+        "a first-move delegate over a resolvable bounded scope must be denied",
+    );
+}
+
+#[test]
+fn first_move_delegate_over_unbounded_scope_is_allowed() {
+    // Discovery-shaped: the file set is not a known bounded path set, so the
+    // delegate's context isolation is legitimate and it is allowed. This guards
+    // against over-denying.
+    assert_eq!(
+        redundant_delegate_decision(0, 0, false),
+        DelegateGateDecision::Allow,
+        "a first-move delegate whose scope does not resolve to a known path set stays allowed",
+    );
+}
+
+#[test]
+fn bounded_scope_after_exploration_is_not_first_move_denied() {
+    // Once the parent is past the strict first-move window, the bounded-scope
+    // branch no longer fires; the redundant branch governs instead. Here the
+    // call count is above the first-move max but below the redundant threshold,
+    // and ingest is low, so even a bounded scope is allowed — the parent has
+    // started real work and a deliberate context-isolating delegate is fine.
+    let past_first_move = FIRST_MOVE_DELEGATE_MAX_CALLS + 1;
+    assert!(past_first_move < REDUNDANT_DELEGATE_EXPLORE_CALLS);
+    assert_eq!(
+        redundant_delegate_decision(past_first_move, 0, true),
+        DelegateGateDecision::Allow,
+        "a bounded-scope delegate past the first-move window is not denied by the first-move branch",
+    );
+}
+
+#[test]
+fn redundant_branch_still_wins_for_heavily_explored_parent() {
+    // A parent well past the exploration thresholds is denied as redundant even
+    // if scope resolution would also have flagged it — the post-exploration
+    // deny is preserved.
+    assert_eq!(
+        redundant_delegate_decision(REDUNDANT_DELEGATE_EXPLORE_CALLS, 0, false),
+        DelegateGateDecision::DenyRedundant,
+        "post-exploration redundant deny still works",
+    );
+}
+
+#[test]
+fn scope_resolves_to_existing_directory_is_bounded() {
+    let root = temp_workspace("delegate_scope_dir");
+    fs::create_dir_all(root.join("src/parser")).expect("mkdir");
+    fs::write(root.join("src/parser/lex.rs"), "fn lex() {}\n").expect("write");
+    // An existing directory named in the scope is a bounded, enumerable set.
+    assert!(
+        delegate_scope_is_bounded(Some("src/parser"), "audit the parser", &root),
+        "a scope naming an existing directory is bounded",
+    );
+    // A glob over an existing directory collapses to the directory and resolves.
+    assert!(
+        delegate_scope_is_bounded(Some("src/parser/**/*.rs"), "audit", &root),
+        "a glob rooted at an existing directory is bounded",
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn scope_resolves_via_prompt_path_token() {
+    let root = temp_workspace("delegate_scope_prompt");
+    fs::write(root.join("config.rs"), "fn cfg() {}\n").expect("write");
+    // No explicit scope, but the prompt names an existing file: still bounded.
+    assert!(
+        delegate_scope_is_bounded(None, "review config.rs for unwraps", &root),
+        "a path token in the prompt that resolves is treated as bounded",
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn nonexistent_or_prose_scope_is_unbounded() {
+    let root = temp_workspace("delegate_scope_none");
+    fs::write(root.join("real.rs"), "fn real() {}\n").expect("write");
+    // Pure prose: no path-shaped token, nothing to resolve -> unbounded.
+    assert!(
+        !delegate_scope_is_bounded(
+            Some("everything related to authentication"),
+            "find all the auth code wherever it lives",
+            &root,
+        ),
+        "a prose scope with no resolvable path set is unbounded",
+    );
+    // Path-shaped but non-existent (a discovery target) -> unbounded.
+    assert!(
+        !delegate_scope_is_bounded(Some("src/does_not_exist/"), "audit it", &root),
+        "a path token that does not resolve is unbounded",
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn scope_path_traversal_outside_workspace_is_unbounded() {
+    let root = temp_workspace("delegate_scope_escape");
+    fs::write(root.join("inside.rs"), "fn x() {}\n").expect("write");
+    // A `..` escape resolves outside the workspace and must not count as a
+    // bounded in-workspace set, even though the target may exist on disk.
+    assert!(
+        !delegate_scope_is_bounded(Some("../"), "audit parent", &root),
+        "a `..` traversal outside the workspace is not a bounded in-workspace set",
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn token_path_shape_classification() {
+    assert!(token_looks_like_path("src/lib.rs"));
+    assert!(token_looks_like_path("lib.rs"));
+    assert!(token_looks_like_path("crates/squeezy-agent"));
+    assert!(token_looks_like_path("src/**/*.go"));
+    assert!(!token_looks_like_path("audit"));
+    assert!(!token_looks_like_path("authentication"));
+    assert!(!token_looks_like_path(""));
+    // A trailing-dot sentence word is not a path (empty extension).
+    assert!(!token_looks_like_path("done."));
 }
