@@ -7321,6 +7321,26 @@ fn failed_turn_shows_red_moon_duration_row() {
 }
 
 #[test]
+fn cancelled_turn_shows_cyan_moon_duration_row() {
+    let mut app = test_app(SessionMode::Build);
+    app.turn_visual = TurnVisualState::Cancelled;
+    app.last_turn_duration = Some(Duration::from_secs(5));
+
+    let line = last_turn_divider_line(&app, Duration::from_secs(5), 80);
+
+    assert_eq!(line.spans[0].content.as_ref(), "☽");
+    assert_eq!(line.spans[0].style.fg, Some(crate::render::theme::cyan()));
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(text.contains("Cancelled after 5s"), "{text}");
+    assert!(!text.contains("Worked for"), "{text}");
+    assert!(!text.contains("Failed after"), "{text}");
+}
+
+#[test]
 fn working_shimmer_sweeps_left_to_right() {
     let left = shimmer_word_spans("Working", 1_200);
     let right = shimmer_word_spans("Working", 2_200);

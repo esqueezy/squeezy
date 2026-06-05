@@ -6867,22 +6867,19 @@ fn worked_divider_line(duration: Duration, width: u16) -> Line<'static> {
 }
 
 fn last_turn_divider_line(app: &TuiApp, duration: Duration, width: u16) -> Line<'static> {
-    if app.turn_visual != TurnVisualState::Failed {
-        return worked_divider_line(duration, width);
-    }
-    let label = format!("☽ Failed after {}", format_turn_duration(duration));
+    let (state_label, color) = match app.turn_visual {
+        TurnVisualState::Failed => ("Failed", crate::render::theme::red()),
+        TurnVisualState::Cancelled => ("Cancelled", crate::render::theme::cyan()),
+        _ => return worked_divider_line(duration, width),
+    };
+    let label = format!("☽ {state_label} after {}", format_turn_duration(duration));
     let label_width = label.chars().count();
     let fill_width = (width as usize).saturating_sub(label_width + 1);
     Line::from(vec![
-        Span::styled(
-            "☽",
-            Style::default()
-                .fg(crate::render::theme::red())
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("☽", Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!(
-                " Failed after {} {}",
+                " {state_label} after {} {}",
                 format_turn_duration(duration),
                 "─".repeat(fill_width)
             ),
@@ -13182,6 +13179,7 @@ pub(crate) enum TurnVisualState {
     Idle,
     Running,
     Succeeded,
+    Cancelled,
     Failed,
 }
 
@@ -13197,6 +13195,7 @@ impl TurnVisualState {
                 }
             }
             Self::Succeeded => crate::render::theme::green(),
+            Self::Cancelled => crate::render::theme::cyan(),
             Self::Failed => crate::render::theme::red(),
         }
     }
