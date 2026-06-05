@@ -40,7 +40,7 @@ use squeezy_llm::{
 };
 use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpCitation, HelpStatus, SkillActivationKind, SqueezyHelp,
-    bundled_docs, matches_squeezy_help_input, relevant_docs_for_input,
+    matches_squeezy_help_input, relevant_docs_for_input,
 };
 use squeezy_store::{
     BugReportBundle, BugReportOptions, HydratedTranscriptItem, ResumeItem, SessionEvent,
@@ -5645,9 +5645,8 @@ impl TurnRuntime {
                     squeezy_skills::SkillContextMode::Fork
                 )
             });
-        let (active_block, skill_metrics) = self
-            .tools
-            .format_active_skills_with_metrics(&inline_skills);
+        let (active_block, skill_metrics) =
+            self.tools.format_active_skills_with_metrics(&inline_skills);
         let fork_block = self.tools.format_fork_skills(&fork_skills);
         // Fire skill activation telemetry for all activated skills.
         if !activation.skills.is_empty() {

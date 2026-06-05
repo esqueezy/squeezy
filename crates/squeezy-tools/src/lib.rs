@@ -2771,11 +2771,12 @@ impl ToolRegistry {
         &self,
         skills: &[LoadedSkill],
     ) -> (Option<String>, SkillActivationMetrics) {
-        self.skills.render_active_skills_with_metrics(skills)
+        self.skills_snapshot()
+            .render_active_skills_with_metrics(skills)
     }
 
     pub fn skill_discovery_summary(&self) -> SkillDiscoverySummary {
-        self.skills.discovery_summary()
+        self.skills_snapshot().discovery_summary()
     }
 
     pub fn skills_preamble(&self) -> Option<SkillPreambleRender> {

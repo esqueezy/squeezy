@@ -434,7 +434,8 @@ impl McpClientRegistry {
 
         // Build per-transport server counts up-front.
         let mut stats = McpDiscoveryStats::default();
-        for server in self.servers.values() {
+        let current_servers = self.servers_snapshot();
+        for server in current_servers.values() {
             if server.enabled {
                 stats.servers_enabled += 1;
                 match server.transport {
