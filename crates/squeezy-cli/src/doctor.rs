@@ -12,7 +12,7 @@ use squeezy_llm::{
 use squeezy_store::{
     SessionStore, SqueezyStore, cache_diagnostics, ensure_repo_profile, prune_cache_backups,
 };
-use squeezy_tools::{McpClientRegistry, McpServerStatus};
+use squeezy_tools::{McpClientRegistry, McpServerStatus, McpStaleOutcome};
 use tokio_util::sync::CancellationToken;
 
 use crate::update::{self, UpdateStatus};
@@ -644,6 +644,16 @@ async fn probe_mcp_servers(
                     Status::Ok,
                     format!("handshake ok; {tools_count} tools advertised"),
                 ),
+                McpServerStatus::Stale {
+                    tools_count,
+                    outcome,
+                } => (
+                    Status::Warn,
+                    format!(
+                        "handshake stale; serving {tools_count} cached tools after {}",
+                        mcp_stale_outcome_detail(outcome)
+                    ),
+                ),
                 McpServerStatus::Failed { error } => {
                     (Status::Fail, format!("handshake failed: {error}"))
                 }
@@ -662,6 +672,13 @@ async fn probe_mcp_servers(
             }
         })
         .collect()
+}
+
+fn mcp_stale_outcome_detail(outcome: &McpStaleOutcome) -> String {
+    match outcome {
+        McpStaleOutcome::Failed { error } => format!("discovery failed: {error}"),
+        McpStaleOutcome::Cancelled => "discovery was cancelled".to_string(),
+    }
 }
 
 /// Summarize the discovered skill catalog without doing any network or

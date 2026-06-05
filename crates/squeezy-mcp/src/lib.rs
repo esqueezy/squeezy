@@ -131,7 +131,22 @@ pub struct ExternalMcpToolResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum McpServerStatus {
     Starting,
-    Ready { tools_count: usize, cached: bool },
+    Ready {
+        tools_count: usize,
+        cached: bool,
+    },
+    Stale {
+        tools_count: usize,
+        outcome: McpStaleOutcome,
+    },
+    Failed {
+        error: String,
+    },
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpStaleOutcome {
     Failed { error: String },
     Cancelled,
 }
@@ -559,15 +574,40 @@ impl McpClientRegistry {
             {
                 stats.tools_stale_retained += 1;
                 next.insert(model_name.clone(), tool.clone());
-                per_server
-                    .entry(tool.server.clone())
-                    .or_insert(McpServerStatus::Ready {
-                        tools_count: cached_tool_counts
-                            .get(&tool.server)
-                            .copied()
-                            .unwrap_or_default(),
-                        cached: true,
-                    });
+                let tools_count = cached_tool_counts
+                    .get(&tool.server)
+                    .copied()
+                    .unwrap_or_default();
+                match per_server.get(&tool.server).cloned() {
+                    Some(McpServerStatus::Failed { error }) => {
+                        per_server.insert(
+                            tool.server.clone(),
+                            McpServerStatus::Stale {
+                                tools_count,
+                                outcome: McpStaleOutcome::Failed { error },
+                            },
+                        );
+                    }
+                    Some(McpServerStatus::Cancelled) => {
+                        per_server.insert(
+                            tool.server.clone(),
+                            McpServerStatus::Stale {
+                                tools_count,
+                                outcome: McpStaleOutcome::Cancelled,
+                            },
+                        );
+                    }
+                    Some(McpServerStatus::Stale { .. }) => {}
+                    _ => {
+                        per_server.insert(
+                            tool.server.clone(),
+                            McpServerStatus::Ready {
+                                tools_count,
+                                cached: true,
+                            },
+                        );
+                    }
+                }
             } else if !server_still_enabled {
                 stats.tools_dropped_disabled += 1;
             }

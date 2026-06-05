@@ -84,8 +84,14 @@ async fn refresh_preserves_cached_tools_when_enabled_server_discovery_fails() {
         .get("docs")
         .expect("server status");
     assert!(
-        matches!(status, McpServerStatus::Failed { error } if error.contains("missing command")),
-        "missing-command refresh should publish a failed per-server status: {status:?}"
+        matches!(
+            status,
+            McpServerStatus::Stale {
+                tools_count: 1,
+                outcome: McpStaleOutcome::Failed { error },
+            } if error.contains("missing command")
+        ),
+        "missing-command refresh should publish a stale cached per-server status: {status:?}"
     );
 }
 

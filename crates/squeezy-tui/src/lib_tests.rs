@@ -10715,6 +10715,29 @@ fn apply_mcp_status_update_logs_transitions_to_and_from_servers() {
 }
 
 #[test]
+fn mcp_status_summary_reports_stale_cached_servers() {
+    let mut per_server = std::collections::BTreeMap::new();
+    per_server.insert(
+        "docs".to_string(),
+        McpServerStatus::Stale {
+            tools_count: 2,
+            outcome: squeezy_tools::McpStaleOutcome::Failed {
+                error: "missing command".to_string(),
+            },
+        },
+    );
+    let snapshot = McpStatusSnapshot {
+        per_server,
+        generated_unix_millis: 0,
+    };
+
+    let summary = super::format_mcp_status_snapshot(&snapshot);
+    assert!(summary.contains("0/1 ready"), "{summary}");
+    assert!(summary.contains("2 tools"), "{summary}");
+    assert!(summary.contains("1 stale"), "{summary}");
+}
+
+#[test]
 fn terminal_title_for_clears_when_idle() {
     assert_eq!(
         terminal_title_for(TerminalTitleState::Cleared, "~/proj", 0),

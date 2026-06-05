@@ -580,6 +580,7 @@ pub(crate) fn mcp_status_icon(
             // difference when the snapshot is stale.
             ('●', crate::render::theme::cyan())
         }
+        Some(McpServerStatus::Stale { .. }) => ('●', crate::render::theme::cyan()),
         Some(McpServerStatus::Starting) => {
             // Pulse `◐ ◓ ◑ ◒` so an in-flight discovery or restart
             // is obviously alive. Falls back to a static `◐` if
@@ -615,6 +616,10 @@ fn format_mcp_row_status(status: &squeezy_tools::McpServerStatus) -> String {
                 format!("ready {tools_count}")
             }
         }
+        McpServerStatus::Stale {
+            tools_count,
+            outcome,
+        } => format!("stale·{} {tools_count}", mcp_stale_outcome_label(outcome)),
         McpServerStatus::Failed { error } => {
             // Trim long error strings so the row stays single-line;
             // the user can still see the leading clause which is the
@@ -623,6 +628,13 @@ fn format_mcp_row_status(status: &squeezy_tools::McpServerStatus) -> String {
             format!("failed:{trimmed}")
         }
         McpServerStatus::Cancelled => "cancelled".to_string(),
+    }
+}
+
+fn mcp_stale_outcome_label(outcome: &squeezy_tools::McpStaleOutcome) -> &'static str {
+    match outcome {
+        squeezy_tools::McpStaleOutcome::Failed { .. } => "failed",
+        squeezy_tools::McpStaleOutcome::Cancelled => "cancelled",
     }
 }
 

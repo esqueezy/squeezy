@@ -33,7 +33,7 @@ use squeezy_mcp::ExternalMcpTool;
 pub use squeezy_mcp::{
     McpClientRegistry, McpElicitationAction, McpElicitationAuditEvent, McpElicitationAuditOutcome,
     McpElicitationHandler, McpElicitationKind, McpElicitationRequest, McpElicitationResponse,
-    McpError, McpRefreshOutcome, McpResult, McpServerStatus, McpStatusSnapshot,
+    McpError, McpRefreshOutcome, McpResult, McpServerStatus, McpStaleOutcome, McpStatusSnapshot,
 };
 use squeezy_skills::{
     LoadedSkill, SkillActivation, SkillCatalog, SkillDiscoverySummary, SkillPreambleRender,
@@ -2899,7 +2899,8 @@ impl ToolRegistry {
             .per_server
             .into_iter()
             .filter_map(|(name, status)| match status {
-                squeezy_mcp::McpServerStatus::Ready { .. } => Some(name),
+                squeezy_mcp::McpServerStatus::Ready { .. }
+                | squeezy_mcp::McpServerStatus::Stale { .. } => Some(name),
                 _ => None,
             })
             .collect();

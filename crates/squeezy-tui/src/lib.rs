@@ -6703,6 +6703,7 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
             match status {
                 McpServerStatus::Starting => starting += 1,
                 McpServerStatus::Ready { .. } => ready += 1,
+                McpServerStatus::Stale { .. } => ready += 1,
                 _ => {}
             }
         }
@@ -14552,6 +14553,7 @@ pub(crate) fn format_mcp_status_snapshot(snapshot: &McpStatusSnapshot) -> String
     }
     let mut ready = 0usize;
     let mut cached = 0usize;
+    let mut stale = 0usize;
     let mut failed = 0usize;
     let mut cancelled = 0usize;
     let mut tools = 0usize;
@@ -14567,6 +14569,10 @@ pub(crate) fn format_mcp_status_snapshot(snapshot: &McpStatusSnapshot) -> String
                     cached += 1;
                 }
             }
+            McpServerStatus::Stale { tools_count, .. } => {
+                stale += 1;
+                tools += *tools_count;
+            }
             McpServerStatus::Failed { .. } => failed += 1,
             McpServerStatus::Cancelled => cancelled += 1,
             McpServerStatus::Starting => {}
@@ -14575,6 +14581,9 @@ pub(crate) fn format_mcp_status_snapshot(snapshot: &McpStatusSnapshot) -> String
     let mut parts = vec![format!("{ready}/{total} ready"), format!("{tools} tools")];
     if cached > 0 {
         parts.push(format!("{cached} cached"));
+    }
+    if stale > 0 {
+        parts.push(format!("{stale} stale"));
     }
     if failed > 0 {
         parts.push(format!("{failed} failed"));

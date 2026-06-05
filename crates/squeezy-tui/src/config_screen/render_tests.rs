@@ -119,6 +119,16 @@ fn mcp_status_icon_picks_glyph_per_server_state() {
     assert_eq!(icon, '●');
     assert_eq!(color, crate::render::theme::cyan());
 
+    let stale = McpServerStatus::Stale {
+        tools_count: 3,
+        outcome: squeezy_tools::McpStaleOutcome::Failed {
+            error: "boom".to_string(),
+        },
+    };
+    let (icon, color) = mcp_status_icon(&enabled, Some(&stale), 0);
+    assert_eq!(icon, '●');
+    assert_eq!(color, crate::render::theme::cyan());
+
     // Failure modes all read red so a busted server cannot
     // accidentally look ready.
     for status in [
