@@ -1207,6 +1207,77 @@ presence_penalty = 0.2
 }
 
 #[test]
+fn refresh_config_warnings_recomputes_mutated_sampling_options() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "openai"
+temperature = 0.2
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let mut config = AppConfig::try_from_settings_and_env_vars_with_sources_and_warnings(
+        settings,
+        vec!["defaults".to_string(), "test".to_string()],
+        vec![ConfigWarning {
+            source: "test".to_string(),
+            field: "unknown field preserved".to_string(),
+        }],
+        None,
+        |_| None,
+    )
+    .expect("config builds");
+    assert!(
+        !config
+            .config_warnings
+            .iter()
+            .any(|warning| warning.field.contains("model.seed"))
+    );
+
+    config.seed = Some(123);
+    config.refresh_config_warnings();
+    assert!(
+        config
+            .config_warnings
+            .iter()
+            .any(|warning| warning.field.contains("model.seed")),
+        "refresh must add unsupported seed warning: {:?}",
+        config.config_warnings
+    );
+    assert!(
+        config
+            .config_warnings
+            .iter()
+            .any(|warning| warning.field == "unknown field preserved"),
+        "refresh must not drop non-generated warnings: {:?}",
+        config.config_warnings
+    );
+    config.refresh_config_warnings();
+    assert_eq!(
+        config
+            .config_warnings
+            .iter()
+            .filter(|warning| warning.field.contains("model.seed"))
+            .count(),
+        1,
+        "refresh must not duplicate generated warnings"
+    );
+
+    config.seed = None;
+    config.refresh_config_warnings();
+    assert!(
+        !config
+            .config_warnings
+            .iter()
+            .any(|warning| warning.field.contains("model.seed")),
+        "refresh must remove stale generated warnings: {:?}",
+        config.config_warnings
+    );
+}
+
+#[test]
 fn xai_responses_route_warns_for_sampling_options_not_lowered_by_responses() {
     let settings = SettingsFile::from_toml_str(
         r#"

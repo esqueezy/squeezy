@@ -1089,39 +1089,20 @@ impl AppConfig {
         let stop = model_settings.stop.unwrap_or_default();
         let frequency_penalty = model_settings.frequency_penalty;
         let presence_penalty = model_settings.presence_penalty;
-        warn_unsupported_model_options(
+        add_provider_model_warnings(
             &provider,
             &model,
-            temperature,
-            top_p,
-            seed,
-            !stop.is_empty(),
-            frequency_penalty,
-            presence_penalty,
+            ModelSamplingOptions {
+                temperature,
+                top_p,
+                seed,
+                stop_set: !stop.is_empty(),
+                frequency_penalty,
+                presence_penalty,
+            },
+            max_output_tokens,
             &mut config_warnings,
         );
-        // M-58: Cerebras chat-completions v1 accepts `max_tokens` as an
-        // alias today, but the v2 default-switchover (2026-07-21)
-        // tightens schema validation to require `max_completion_tokens`.
-        // Surface a soft warning at config-build time so operators
-        // shipping pre-cutoff configs know they need to update before
-        // the date rolls in; squeezy-llm's Cerebras path is responsible
-        // for emitting `max_completion_tokens` on the wire from this
-        // same `max_output_tokens`.
-        if let ProviderConfig::OpenAiCompatible(compatible) = &provider
-            && compatible.preset == OpenAiCompatiblePreset::Cerebras
-            && max_output_tokens.is_some()
-        {
-            config_warnings.push(ConfigWarning {
-                source: "providers.cerebras".to_string(),
-                field: "model.max_output_tokens emits `max_tokens` today; \
-                        Cerebras v2 (default 2026-07-21) requires `max_completion_tokens`. \
-                        squeezy-llm will switch wire keys automatically, but \
-                        reasoning-model budgets count thinking tokens against \
-                        the limit on v2."
-                    .to_string(),
-            });
-        }
         // M-64: the `Custom` preset carries no URL allow-list and accepts
         // whatever `base_url` the (possibly project-local) config supplies,
         // making it a credential-exfil primitive. `build_openai_compatible_config`
@@ -1442,6 +1423,31 @@ impl AppConfig {
     fn built_in_defaults() -> Self {
         Self::try_from_settings_and_env_vars(SettingsFile::default(), None, |_| None)
             .expect("built-in config defaults are valid")
+    }
+
+    /// Recompute warnings that depend on effective provider/model values.
+    ///
+    /// The config screen mutates an `AppConfig` in memory before arming the
+    /// next-prompt swap. Recomputing only generated provider/model warnings
+    /// keeps those edits honest without discarding parse or unknown-field
+    /// warnings that came from TOML loading.
+    pub fn refresh_config_warnings(&mut self) {
+        self.config_warnings
+            .retain(|warning| !is_generated_provider_model_warning(warning));
+        add_provider_model_warnings(
+            &self.provider,
+            &self.model,
+            ModelSamplingOptions {
+                temperature: self.temperature,
+                top_p: self.top_p,
+                seed: self.seed,
+                stop_set: !self.stop.is_empty(),
+                frequency_penalty: self.frequency_penalty,
+                presence_penalty: self.presence_penalty,
+            },
+            self.max_output_tokens,
+            &mut self.config_warnings,
+        );
     }
 
     /// Resolves the small-fast-model id for background calls (compaction
@@ -2329,15 +2335,59 @@ fn provider_kind(provider: &ProviderConfig) -> &'static str {
     }
 }
 
-fn warn_unsupported_model_options(
-    provider: &ProviderConfig,
-    model: &str,
+#[derive(Debug, Clone, Copy)]
+struct ModelSamplingOptions {
     temperature: Option<f32>,
     top_p: Option<f32>,
     seed: Option<u64>,
     stop_set: bool,
     frequency_penalty: Option<f32>,
     presence_penalty: Option<f32>,
+}
+
+fn add_provider_model_warnings(
+    provider: &ProviderConfig,
+    model: &str,
+    sampling: ModelSamplingOptions,
+    max_output_tokens: Option<u32>,
+    warnings: &mut Vec<ConfigWarning>,
+) {
+    warn_unsupported_model_options(provider, model, sampling, warnings);
+    // M-58: Cerebras chat-completions v1 accepts `max_tokens` as an
+    // alias today, but the v2 default-switchover (2026-07-21)
+    // tightens schema validation to require `max_completion_tokens`.
+    // Surface a soft warning at config-build time so operators
+    // shipping pre-cutoff configs know they need to update before
+    // the date rolls in; squeezy-llm's Cerebras path is responsible
+    // for emitting `max_completion_tokens` on the wire from this
+    // same `max_output_tokens`.
+    if let ProviderConfig::OpenAiCompatible(compatible) = provider
+        && compatible.preset == OpenAiCompatiblePreset::Cerebras
+        && max_output_tokens.is_some()
+    {
+        warnings.push(ConfigWarning {
+            source: "providers.cerebras".to_string(),
+            field: "model.max_output_tokens emits `max_tokens` today; \
+                    Cerebras v2 (default 2026-07-21) requires `max_completion_tokens`. \
+                    squeezy-llm will switch wire keys automatically, but \
+                    reasoning-model budgets count thinking tokens against \
+                    the limit on v2."
+                .to_string(),
+        });
+    }
+}
+
+fn is_generated_provider_model_warning(warning: &ConfigWarning) -> bool {
+    warning.field.contains("Squeezy will omit it.")
+        || warning
+            .field
+            .starts_with("model.max_output_tokens emits `max_tokens` today;")
+}
+
+fn warn_unsupported_model_options(
+    provider: &ProviderConfig,
+    model: &str,
+    sampling: ModelSamplingOptions,
     warnings: &mut Vec<ConfigWarning>,
 ) {
     let support = model_option_support(provider, model);
@@ -2350,22 +2400,22 @@ fn warn_unsupported_model_options(
             ),
         });
     };
-    if temperature.is_some() && !support.temperature {
+    if sampling.temperature.is_some() && !support.temperature {
         warn("temperature");
     }
-    if top_p.is_some() && !support.top_p {
+    if sampling.top_p.is_some() && !support.top_p {
         warn("top_p");
     }
-    if seed.is_some() && !support.seed {
+    if sampling.seed.is_some() && !support.seed {
         warn("seed");
     }
-    if stop_set && !support.stop {
+    if sampling.stop_set && !support.stop {
         warn("stop");
     }
-    if frequency_penalty.is_some() && !support.frequency_penalty {
+    if sampling.frequency_penalty.is_some() && !support.frequency_penalty {
         warn("frequency_penalty");
     }
-    if presence_penalty.is_some() && !support.presence_penalty {
+    if sampling.presence_penalty.is_some() && !support.presence_penalty {
         warn("presence_penalty");
     }
 }

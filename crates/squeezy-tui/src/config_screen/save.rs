@@ -106,6 +106,7 @@ pub(crate) fn save_inline_provider_api_key(
         return;
     }
 
+    state.effective.refresh_config_warnings();
     agent.arm_config_swap(PendingConfigSwap {
         config: state.effective.clone(),
         provider: new_provider,
@@ -786,6 +787,7 @@ fn apply_by_tier(
     outcome: &WriteOutcome,
     silent: bool,
 ) {
+    state.effective.refresh_config_warnings();
     let path_str = outcome.path.display().to_string();
     match field.tier {
         ApplyTier::Immediate => {
