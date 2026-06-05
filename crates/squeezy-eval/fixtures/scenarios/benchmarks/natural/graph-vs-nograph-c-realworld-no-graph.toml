@@ -1,14 +1,11 @@
 id = "graph-vs-nograph-c-realworld-no-graph"
-title = "nginx HTTP phase-handler audit — no graph (openai mini)"
+title = "nginx HTTP request phase-entry caller graph — no graph (openai mini)"
 description = """
 No-graph half of the C real-world A/B. Same prompt as
 `graph-vs-nograph-c-realworld-with-graph.toml`. The semantic-graph
 tool family is excluded and the exploration planner is disabled; the
-model must grep for the
-`ngx_array_push(&cmcf->phases[…].handlers)` pattern across
-`src/http/modules/`, then read each enclosing file backwards to
-recover the `ngx_module_t` instance name and the postconfig function
-name from the `ngx_http_module_t` struct-literal block.
+model must find the request-processing and phase-engine caller graph
+with lexical search and bounded reads.
 """
 
 [workspace.github]
@@ -55,58 +52,25 @@ This audit is C only. Restrict every lookup to nginx C sources
 (`.cpp`/`.hpp`/`.cc`/`.cxx`/`.h++`) — nginx has none in this tree, so
 seeing one means you wandered into the wrong place.
 
-For every nginx HTTP module under `src/http/modules/` whose
-`postconfiguration` callback (the 2nd field of the
-`static ngx_http_module_t  <name>_ctx = { ... }` struct literal)
-points at a non-NULL function that installs one or more
-request-phase handlers via the canonical pattern
+Find every distinct production C call-graph edge needed to connect
+all direct callers of `ngx_http_process_request` to nginx's HTTP phase
+engine entrypoint `ngx_http_core_run_phases`.
 
-    h = ngx_array_push(&cmcf->phases[NGX_HTTP_<PHASE>_PHASE].handlers);
-    if (h == NULL) { return NGX_ERROR; }
-    *h = ngx_http_<handler>;
+Output exactly six tab-separated rows, no header and no prose:
 
-enumerate every distinct push site.
+    <caller>	<callee>	<repo-relative-path>:<line>
 
-Inclusion rules:
-- Only modules whose `.c` file lives directly under
-  `src/http/modules/` (not `src/http/`, not `src/core/`, not
-  `src/event/`, not the upstream balancer files outside
-  `src/http/modules/`).
-- Only the `ngx_array_push(&cmcf->phases[…].handlers)` pattern
-  counts. Filter modules that install only into
-  `ngx_http_top_header_filter` / `ngx_http_top_body_filter`
-  (e.g. `ngx_http_addition_filter_module`,
-  `ngx_http_gzip_filter_module`) do NOT count and must be excluded.
-- Modules whose postconfig only adds variables, log handlers,
-  body filters, or initializes SSL/QUIC (e.g.
-  `ngx_http_ssl_module`, `ngx_http_charset_filter_module`) do NOT
-  count and must be excluded.
-- Postconfig = NULL modules are excluded.
-- A module that pushes into N distinct phases contributes N rows
-  (e.g. `ngx_http_realip_module` pushes into both
-  `NGX_HTTP_POST_READ_PHASE` and `NGX_HTTP_PREACCESS_PHASE`).
-- Pushes inside `#if`/`#ifdef` blocks still count.
-
-For each push site give exactly five fields, tab-separated, one row
-per push, no header row:
-- `module_file`: path relative to repo root of the module's `.c`
-  file (e.g. `src/http/modules/ngx_http_access_module.c`).
-- `module_var`: the C identifier of the file-scope
-  `ngx_module_t` instance (e.g. `ngx_http_access_module`). This is
-  the symbol declared `ngx_module_t  <name> = { NGX_MODULE_V1, … };`
-  NOT the `<name>_ctx` static.
-- `postconfig_fn`: the C identifier in the `postconfiguration`
-  slot of the `ngx_http_module_t` context struct (e.g.
-  `ngx_http_access_init`).
-- `phase`: the `NGX_HTTP_*_PHASE` enumerator inside the
-  `phases[…]` subscript (e.g. `NGX_HTTP_ACCESS_PHASE`,
-  `NGX_HTTP_CONTENT_PHASE`).
-- `handler_fn`: the C identifier assigned via `*h = …;` right after
-  the matching `ngx_array_push` (e.g. `ngx_http_access_handler`).
-
-Output the rows sorted ascending by `module_file`, then by the
-order the push appears within that postconfig function body. No
-prose, no header line, no extra commentary.
+Rules:
+- Use the concrete call sites in production C source, not declarations.
+- Include every direct caller of `ngx_http_process_request` under
+  `src/http/`, including HTTP/1.x, HTTP/2, and HTTP/3 paths.
+- Include the shared suffix edge where `ngx_http_process_request`
+  calls `ngx_http_handler`.
+- Include the shared suffix edge where `ngx_http_handler` calls
+  `ngx_http_core_run_phases`.
+- Do not include error-response or upstream finalization paths.
+- Sort rows by caller name ascending, except put the two shared suffix
+  edges last in execution order.
 """
 
 [expect]

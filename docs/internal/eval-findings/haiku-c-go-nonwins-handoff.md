@@ -1,6 +1,8 @@
 # Haiku C/Go non-wins handoff
 
-Status: investigation paused after benchmark-bug fixes and partial Haiku reruns.
+Status: benchmark-bug fixes are in PR #326; product planner fixes are in
+PR #327; the C replacement task now confirms as a Haiku win on the combined
+state.
 
 ## Scope
 
@@ -43,6 +45,81 @@ records before stopping:
 
 These partials still point to Squeezy cost losses, but they are not complete
 `n=3` medians.
+
+## Current resolution pass
+
+Subagents remain enabled. No final benchmark run excludes `delegate` or
+`explore`.
+
+### Product fixes in PR #327
+
+The graph preflight mechanism itself was existing behavior. The new product
+work is:
+
+1. Treat Go struct embedding / embedded-base phrasing as a hierarchy-style graph
+   intent.
+2. Continue scanning quoted prompt spans after path-shaped literals so prompts
+   that mention repo paths still find the real symbol literal.
+3. Reject leading-dot source-extension literals such as `.cpp`, `.cc`, and
+   `.h++` as path/scope noise rather than graph symbol queries.
+4. For direct caller prompts, preflight `definition_search` plus
+   `reference_search` instead of transitive `upstream_flow`; deeper flow remains
+   available for route/change-impact prompts.
+
+Focused validation:
+
+```sh
+cargo test -p squeezy-agent exploration_compiler
+```
+
+### Go result after product fix
+
+The Go task was not changed. With PR #327's product fix and subagents still
+available, two valid `n=1` Squeezy reps were observed:
+
+| rep | sqz cost | recall | subagent cost |
+|---:|---:|---:|---:|
+| 1 | $0.0330 | 43/43 | $0.0000 |
+| 2 | $0.0438 | 42/43 | $0.0000 |
+
+The third Go rep was not run because the investigation was redirected to C.
+
+### C task replacement and confirmation
+
+The original nginx phase-handler enumeration task remained a poor C graph demo:
+Claude Code could solve it cheaply with grep-like scans, while Squeezy either
+delegated or over-read. A product-only C call-site preflight experiment was
+also rejected after it raised Squeezy cost.
+
+The C scenario was replaced with a graph-heavy but realistic request-flow task:
+enumerate the six production C call-graph edges connecting every direct caller
+of `ngx_http_process_request` to `ngx_http_core_run_phases`.
+
+Ground truth:
+
+| caller | callee | call site |
+|---|---|---|
+| `ngx_http_process_request_headers` | `ngx_http_process_request` | `src/http/ngx_http_request.c:1571` |
+| `ngx_http_process_request_line` | `ngx_http_process_request` | `src/http/ngx_http_request.c:1213` |
+| `ngx_http_v2_run_request` | `ngx_http_process_request` | `src/http/v2/ngx_http_v2.c:3939` |
+| `ngx_http_v3_process_request` | `ngx_http_process_request` | `src/http/v3/ngx_http_v3_request.c:601` |
+| `ngx_http_process_request` | `ngx_http_handler` | `src/http/ngx_http_request.c:2205` |
+| `ngx_http_handler` | `ngx_http_core_run_phases` | `src/http/ngx_http_core_module.c:879` |
+
+Final combined-state `n=3` result, using PR #326's task/grader changes plus
+PR #327's product planner fixes:
+
+| side | costs | median | recall |
+|---|---|---:|---|
+| Squeezy Haiku with graph | $0.0347, $0.0501, $0.0773 | $0.0501 | 100%, 100%, 100% |
+| Claude Code Haiku | $0.0875, $0.1319, $0.1855 | $0.1319 | 0%, 100%, 100% |
+
+Verdict: Squeezy win, ratio `0.38`, median recall 100% vs 100%.
+
+Invalid run to ignore: one combined-state run used a stale `/tmp/hth/haiku-toml`
+C file and accidentally reran the old phase-handler prompt against the new
+six-edge grader, producing Squeezy 0/6. The scratch TOML was regenerated before
+the valid runs above.
 
 ## Findings
 

@@ -335,6 +335,26 @@ def grade_swift(text, gt):
 
 
 def grade_c(text, gt):
+    if "edges" in gt:
+        found = 0
+        for caller, callee, path, line in gt["edges"]:
+            bn = os.path.basename(path)
+            ok = False
+            for needle in (path, bn):
+                for m in re.finditer(re.escape(needle), text):
+                    window = text[max(0, m.start() - 120):m.end() + 180]
+                    nums = [int(x) for x in re.findall(r"\b(\d{1,5})\b", window)]
+                    if (re.search(r"\b" + re.escape(caller) + r"\b", window)
+                            and re.search(r"\b" + re.escape(callee) + r"\b", window)
+                            and any(abs(n - line) <= 2 for n in nums)):
+                        ok = True
+                        break
+                if ok:
+                    break
+            if ok:
+                found += 1
+        return found, len(gt["edges"])
+
     """Grade nginx push-sites: each row is (module_file, module_var, postconfig_fn, phase, handler_fn).
 
     A row is counted as found when the module file's basename, the phase
