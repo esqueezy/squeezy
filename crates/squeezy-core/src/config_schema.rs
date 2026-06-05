@@ -104,6 +104,10 @@ pub enum FieldKind {
         max: i64,
         suffix: Option<&'static str>,
     },
+    OptionalFloat {
+        min: f64,
+        max: f64,
+    },
     Enum {
         options: &'static [&'static str],
     },
@@ -180,6 +184,11 @@ impl std::fmt::Debug for FieldKind {
                 .field("max", max)
                 .field("suffix", suffix)
                 .finish(),
+            Self::OptionalFloat { min, max } => f
+                .debug_struct("OptionalFloat")
+                .field("min", min)
+                .field("max", max)
+                .finish(),
             Self::Enum { options } => f.debug_struct("Enum").field("options", options).finish(),
             Self::OptionalEnum { options } => f
                 .debug_struct("OptionalEnum")
@@ -216,6 +225,7 @@ pub enum FieldValue {
     Bool(bool),
     Integer(i64),
     OptionalInteger(Option<i64>),
+    OptionalFloat(Option<f64>),
     Enum(&'static str),
     OptionalEnum(Option<&'static str>),
     String(String),
@@ -243,6 +253,8 @@ impl FieldValue {
             Self::Integer(v) => v.to_string(),
             Self::OptionalInteger(Some(v)) => v.to_string(),
             Self::OptionalInteger(None) => "—".to_string(),
+            Self::OptionalFloat(Some(v)) => format_config_float(*v),
+            Self::OptionalFloat(None) => "(unset)".to_string(),
             Self::Enum(v) => (*v).to_string(),
             Self::OptionalEnum(Some(v)) => (*v).to_string(),
             Self::OptionalEnum(None) => "—".to_string(),
@@ -269,6 +281,17 @@ impl FieldValue {
             Self::TableArrayOrdered(rows) => format!("{} rows", rows.len()),
         }
     }
+}
+
+fn format_config_float(value: f64) -> String {
+    let mut formatted = format!("{value:.6}");
+    while formatted.contains('.') && formatted.ends_with('0') {
+        formatted.pop();
+    }
+    if formatted.ends_with('.') {
+        formatted.push('0');
+    }
+    formatted
 }
 
 /// Ordered TOML path. e.g. `["model", "provider"]` or `["tui", "tick_rate_ms"]`.
@@ -484,6 +507,94 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default: || FieldValue::OptionalInteger(None),
                 help: "Cap on output tokens per request. Unset means provider default.",
                 env_override: Some("SQUEEZY_MAX_OUTPUT_TOKENS"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "temperature",
+                toml_path: &["model", "temperature"],
+                kind: FieldKind::OptionalFloat { min: 0.0, max: 2.0 },
+                tier: ApplyTier::NextPrompt,
+                get: get_temperature,
+                set: set_temperature,
+                default_display: "(unset)",
+                default: || FieldValue::OptionalFloat(None),
+                help: "Sampling randomness. Lower is more deterministic; unset leaves the provider/model default.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "top_p",
+                toml_path: &["model", "top_p"],
+                kind: FieldKind::OptionalFloat { min: 0.0, max: 1.0 },
+                tier: ApplyTier::NextPrompt,
+                get: get_top_p,
+                set: set_top_p,
+                default_display: "(unset)",
+                default: || FieldValue::OptionalFloat(None),
+                help: "Nucleus-sampling cutoff. Lower narrows token choices; unset leaves the provider/model default.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "seed",
+                toml_path: &["model", "seed"],
+                kind: FieldKind::OptionalInteger {
+                    min: 0,
+                    max: i64::MAX,
+                    suffix: None,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_seed,
+                set: set_seed,
+                default_display: "(unset)",
+                default: || FieldValue::OptionalInteger(None),
+                help: "Deterministic sampling seed where supported. Unset leaves provider/model default randomness.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "stop",
+                toml_path: &["model", "stop"],
+                kind: FieldKind::StringList { min: 0, max: 32 },
+                tier: ApplyTier::NextPrompt,
+                get: get_stop_sequences,
+                set: set_stop_sequences,
+                default_display: "(unset)",
+                default: || FieldValue::StringList(Vec::new()),
+                help: "Stop generation when any listed string appears. Empty/unset leaves the provider/model default.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "frequency_penalty",
+                toml_path: &["model", "frequency_penalty"],
+                kind: FieldKind::OptionalFloat {
+                    min: -2.0,
+                    max: 2.0,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_frequency_penalty,
+                set: set_frequency_penalty,
+                default_display: "(unset)",
+                default: || FieldValue::OptionalFloat(None),
+                help: "Reduce repeated wording where supported. Unset leaves the provider/model default.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "presence_penalty",
+                toml_path: &["model", "presence_penalty"],
+                kind: FieldKind::OptionalFloat {
+                    min: -2.0,
+                    max: 2.0,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_presence_penalty,
+                set: set_presence_penalty,
+                default_display: "(unset)",
+                default: || FieldValue::OptionalFloat(None),
+                help: "Encourage new topics where supported. Unset leaves the provider/model default.",
+                env_override: None,
                 secret: false,
             },
             FieldMeta {
@@ -2365,6 +2476,90 @@ fn set_max_output_tokens(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &
         _ => return Err("max_output_tokens expects integer"),
     };
     Ok(())
+}
+
+fn get_temperature(cfg: &AppConfig) -> FieldValue {
+    FieldValue::OptionalFloat(cfg.temperature.map(f64::from))
+}
+fn set_temperature(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.temperature = optional_f32_range(value, 0.0, 2.0, "temperature")?;
+    Ok(())
+}
+
+fn get_top_p(cfg: &AppConfig) -> FieldValue {
+    FieldValue::OptionalFloat(cfg.top_p.map(f64::from))
+}
+fn set_top_p(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.top_p = optional_f32_range(value, 0.0, 1.0, "top_p")?;
+    Ok(())
+}
+
+fn get_seed(cfg: &AppConfig) -> FieldValue {
+    FieldValue::OptionalInteger(cfg.seed.and_then(|seed| i64::try_from(seed).ok()))
+}
+fn set_seed(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.seed = match value {
+        FieldValue::OptionalInteger(None) | FieldValue::Unset => None,
+        FieldValue::OptionalInteger(Some(v)) | FieldValue::Integer(v) => {
+            if v < 0 {
+                return Err("seed must be >= 0");
+            }
+            Some(v as u64)
+        }
+        _ => return Err("seed expects integer"),
+    };
+    Ok(())
+}
+
+fn get_stop_sequences(cfg: &AppConfig) -> FieldValue {
+    FieldValue::StringList(cfg.stop.clone())
+}
+fn set_stop_sequences(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.stop = match value {
+        FieldValue::StringList(items) => items,
+        FieldValue::Unset => Vec::new(),
+        _ => return Err("stop expects string list"),
+    };
+    Ok(())
+}
+
+fn get_frequency_penalty(cfg: &AppConfig) -> FieldValue {
+    FieldValue::OptionalFloat(cfg.frequency_penalty.map(f64::from))
+}
+fn set_frequency_penalty(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.frequency_penalty = optional_f32_range(value, -2.0, 2.0, "frequency_penalty")?;
+    Ok(())
+}
+
+fn get_presence_penalty(cfg: &AppConfig) -> FieldValue {
+    FieldValue::OptionalFloat(cfg.presence_penalty.map(f64::from))
+}
+fn set_presence_penalty(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.presence_penalty = optional_f32_range(value, -2.0, 2.0, "presence_penalty")?;
+    Ok(())
+}
+
+fn optional_f32_range(
+    value: FieldValue,
+    min: f64,
+    max: f64,
+    label: &'static str,
+) -> Result<Option<f32>, &'static str> {
+    let value = match value {
+        FieldValue::OptionalFloat(None) | FieldValue::Unset => return Ok(None),
+        FieldValue::OptionalFloat(Some(v)) => v,
+        _ => return Err("sampling option expects number"),
+    };
+    if !value.is_finite() || value < min || value > max {
+        return Err(match label {
+            "temperature" => "temperature out of range",
+            "top_p" => "top_p out of range",
+            "frequency_penalty" => "frequency_penalty out of range",
+            "presence_penalty" => "presence_penalty out of range",
+            _ => "value out of range",
+        });
+    }
+    Ok(Some(value as f32))
 }
 
 fn get_stream_idle_timeout(cfg: &AppConfig) -> FieldValue {

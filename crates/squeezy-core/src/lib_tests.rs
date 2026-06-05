@@ -1089,6 +1089,243 @@ reasoning_effort = "medium"
 }
 
 #[test]
+fn model_table_sampling_options_parse_and_round_trip() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "openrouter"
+model = "openai/gpt-5.5"
+temperature = 0.25
+top_p = 0.75
+seed = 42
+stop = ["END", "STOP"]
+frequency_penalty = -0.5
+presence_penalty = 0.6
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    assert_eq!(config.temperature, Some(0.25));
+    assert_eq!(config.top_p, Some(0.75));
+    assert_eq!(config.seed, Some(42));
+    assert_eq!(config.stop, vec!["END".to_string(), "STOP".to_string()]);
+    assert_eq!(config.frequency_penalty, Some(-0.5));
+    assert_eq!(config.presence_penalty, Some(0.6));
+
+    let inspect = config.inspect_redacted();
+    assert!(inspect.contains("temperature = 0.25"));
+    assert!(inspect.contains("top_p = 0.75"));
+    assert!(inspect.contains("seed = 42"));
+    assert!(inspect.contains("stop = [\"END\", \"STOP\"]"));
+    assert!(inspect.contains("frequency_penalty = -0.5"));
+    assert!(inspect.contains("presence_penalty = 0.6"));
+
+    let round_tripped = SettingsFile::from_toml_str(&inspect, "inspect").expect("inspect parses");
+    let round_tripped = AppConfig::from_settings_and_env_vars(round_tripped, |_| None);
+    assert_eq!(round_tripped.temperature, Some(0.25));
+    assert_eq!(round_tripped.top_p, Some(0.75));
+    assert_eq!(round_tripped.seed, Some(42));
+    assert_eq!(
+        round_tripped.stop,
+        vec!["END".to_string(), "STOP".to_string()]
+    );
+    assert_eq!(round_tripped.frequency_penalty, Some(-0.5));
+    assert_eq!(round_tripped.presence_penalty, Some(0.6));
+}
+
+#[test]
+fn provider_route_unsupported_sampling_options_warn_but_remain_configured() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "openai"
+temperature = 0.2
+top_p = 0.8
+seed = 123
+stop = ["END"]
+frequency_penalty = 0.1
+presence_penalty = 0.2
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::try_from_settings_and_env_vars_with_sources_and_warnings(
+        settings,
+        vec!["defaults".to_string(), "test".to_string()],
+        Vec::new(),
+        None,
+        |_| None,
+    )
+    .expect("config builds");
+
+    assert_eq!(config.temperature, Some(0.2));
+    assert_eq!(config.top_p, Some(0.8));
+    assert_eq!(config.seed, Some(123));
+    assert_eq!(config.stop, vec!["END".to_string()]);
+    assert_eq!(config.frequency_penalty, Some(0.1));
+    assert_eq!(config.presence_penalty, Some(0.2));
+
+    let warnings = config
+        .config_warnings
+        .iter()
+        .map(|warning| warning.field.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("model.seed"))
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("model.stop"))
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("model.frequency_penalty"))
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("model.presence_penalty"))
+    );
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("model.temperature"))
+    );
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("model.top_p"))
+    );
+}
+
+#[test]
+fn xai_responses_route_warns_for_sampling_options_not_lowered_by_responses() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "xai"
+model = "xai/grok-4.3"
+temperature = 0.2
+top_p = 0.8
+seed = 123
+stop = ["END"]
+frequency_penalty = 0.1
+presence_penalty = 0.2
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::try_from_settings_and_env_vars_with_sources_and_warnings(
+        settings,
+        vec!["defaults".to_string(), "test".to_string()],
+        Vec::new(),
+        None,
+        |_| None,
+    )
+    .expect("config builds");
+
+    let warnings = config
+        .config_warnings
+        .iter()
+        .map(|warning| warning.field.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("model.seed")),
+        "xAI Responses route should warn for seed: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("model.stop")),
+        "xAI Responses route should warn for stop: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("model.frequency_penalty")),
+        "xAI Responses route should warn for frequency_penalty: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("model.presence_penalty")),
+        "xAI Responses route should warn for presence_penalty: {warnings:?}"
+    );
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("model.temperature")),
+        "xAI Responses route lowers temperature: {warnings:?}"
+    );
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("model.top_p")),
+        "xAI Responses route lowers top_p: {warnings:?}"
+    );
+}
+
+#[test]
+fn xai_chat_route_does_not_warn_for_chat_completions_sampling_options() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "xai"
+model = "xai/grok-2"
+temperature = 0.2
+top_p = 0.8
+seed = 123
+stop = ["END"]
+frequency_penalty = 0.1
+presence_penalty = 0.2
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::try_from_settings_and_env_vars_with_sources_and_warnings(
+        settings,
+        vec!["defaults".to_string(), "test".to_string()],
+        Vec::new(),
+        None,
+        |_| None,
+    )
+    .expect("config builds");
+
+    let warnings = config
+        .config_warnings
+        .iter()
+        .map(|warning| warning.field.as_str())
+        .collect::<Vec<_>>();
+    for field in [
+        "temperature",
+        "top_p",
+        "seed",
+        "stop",
+        "frequency_penalty",
+        "presence_penalty",
+    ] {
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains(&format!("model.{field}"))),
+            "xAI Chat route should not warn for model.{field}: {warnings:?}"
+        );
+    }
+}
+
+#[test]
 fn env_overrides_settings_file_provider_and_model() {
     let settings = SettingsFile::from_toml_str(
         r#"
@@ -2411,6 +2648,36 @@ response_verbosity = "chatty"
     )
     .expect_err("invalid response verbosity");
     assert!(response.to_string().contains("response_verbosity"));
+
+    let top_p = SettingsFile::from_toml_str(
+        r#"
+[model]
+top_p = 1.5
+"#,
+        "test",
+    )
+    .expect_err("invalid top_p");
+    assert!(top_p.to_string().contains("top_p"));
+
+    let penalty = SettingsFile::from_toml_str(
+        r#"
+[model]
+frequency_penalty = 3.0
+"#,
+        "test",
+    )
+    .expect_err("invalid frequency penalty");
+    assert!(penalty.to_string().contains("frequency_penalty"));
+
+    let seed = SettingsFile::from_toml_str(
+        r#"
+[model]
+seed = -1
+"#,
+        "test",
+    )
+    .expect_err("invalid seed");
+    assert!(seed.to_string().contains("seed"));
 
     let tool = SettingsFile::from_toml_str(
         r#"
@@ -4059,6 +4326,75 @@ model = "repo-model"
     assert!(warnings.is_empty());
     let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
     assert_eq!(config.model, "repo-model");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn model_sampling_options_follow_user_project_repo_precedence() {
+    let dir = std::env::temp_dir().join(format!(
+        "squeezy_sampling_precedence_{}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos(),
+        CONFIG_TEST_NONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let user_path = dir.join("user.toml");
+    let project_path = dir.join("squeezy.toml");
+    let repo_path = dir.join("repo-settings.toml");
+    std::fs::write(
+        &user_path,
+        r#"
+[model]
+provider = "openrouter"
+temperature = 0.9
+top_p = 0.95
+seed = 1
+stop = ["USER"]
+frequency_penalty = 0.1
+presence_penalty = 0.2
+"#,
+    )
+    .expect("write user file");
+    std::fs::write(
+        &project_path,
+        r#"
+[model]
+temperature = 0.4
+stop = ["PROJECT"]
+frequency_penalty = 0.3
+"#,
+    )
+    .expect("write project file");
+    std::fs::write(
+        &repo_path,
+        r#"
+[model]
+top_p = 0.7
+seed = 3
+presence_penalty = -0.2
+"#,
+    )
+    .expect("write repo file");
+
+    let (settings, _sources, warnings) = load_settings_from_paths(
+        Some(user_path.as_path()),
+        Some(project_path.as_path()),
+        Some(repo_path.as_path()),
+    )
+    .expect("merge sources");
+    assert!(warnings.is_empty());
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert_eq!(config.temperature, Some(0.4));
+    assert_eq!(config.top_p, Some(0.7));
+    assert_eq!(config.seed, Some(3));
+    assert_eq!(config.stop, vec!["PROJECT".to_string()]);
+    assert_eq!(config.frequency_penalty, Some(0.3));
+    assert_eq!(config.presence_penalty, Some(-0.2));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

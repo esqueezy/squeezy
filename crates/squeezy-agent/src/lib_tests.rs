@@ -1661,6 +1661,12 @@ async fn parallel_tool_calls_config_flows_into_dispatched_request() {
         let config = AppConfig {
             parallel_tool_calls: parallel,
             batch_tool_calls_hint: hint,
+            temperature: Some(0.2),
+            top_p: Some(0.75),
+            seed: Some(99),
+            stop: vec!["END".to_string()],
+            frequency_penalty: Some(0.1),
+            presence_penalty: Some(-0.1),
             ..Default::default()
         };
         let agent = Agent::new(config, provider.clone());
@@ -1674,6 +1680,12 @@ async fn parallel_tool_calls_config_flows_into_dispatched_request() {
             requests[0].parallel_tool_calls, parallel,
             "request must carry the configured parallel_tool_calls={parallel:?}"
         );
+        assert_eq!(requests[0].temperature, Some(0.2));
+        assert_eq!(requests[0].top_p, Some(0.75));
+        assert_eq!(requests[0].seed, Some(99));
+        assert_eq!(requests[0].stop, vec!["END".to_string()]);
+        assert_eq!(requests[0].frequency_penalty, Some(0.1));
+        assert_eq!(requests[0].presence_penalty, Some(-0.1));
         let carries_hint = requests[0].instructions.contains(BATCH_TOOL_CALLS_HINT);
         assert_eq!(
             carries_hint, hint,

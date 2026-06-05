@@ -1237,6 +1237,7 @@ fn insert_into_editor(editor: &mut FieldEditor, text: &str) {
         }
         FieldEditor::Integer { draft, cursor, .. }
         | FieldEditor::OptionalInteger { draft, cursor, .. }
+        | FieldEditor::OptionalFloat { draft, cursor, .. }
         | FieldEditor::Duration { draft, cursor } => {
             insert_chars_at(
                 draft,

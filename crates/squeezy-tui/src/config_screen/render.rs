@@ -1967,6 +1967,20 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                 )),
             ]
         }
+        FieldEditor::OptionalFloat {
+            draft,
+            cursor,
+            min,
+            max,
+        } => {
+            vec![
+                caret_line(draft, *cursor),
+                Line::from(Span::styled(
+                    format!("range: {min}..={max} · Enter to commit · Esc to cancel"),
+                    Style::default().fg(crate::render::theme::quiet()),
+                )),
+            ]
+        }
         FieldEditor::Enum { options, cursor } => {
             let mut spans = vec![Span::raw("  ")];
             for (i, opt) in options.iter().enumerate() {

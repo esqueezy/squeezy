@@ -598,6 +598,26 @@ pub struct AppConfig {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub instructions: String,
     pub max_output_tokens: Option<u32>,
+    /// Sampling temperature. `None` leaves the provider/model default in
+    /// place. Configured via `[model].temperature`.
+    pub temperature: Option<f32>,
+    /// Nucleus-sampling cutoff. `None` leaves the provider/model default in
+    /// place. Configured via `[model].top_p`.
+    pub top_p: Option<f32>,
+    /// Deterministic sampling seed where supported. `None` leaves generation
+    /// non-deterministic. Configured via `[model].seed`.
+    pub seed: Option<u64>,
+    /// Stop sequences. Empty leaves the provider/model default in place.
+    /// Configured via `[model].stop`.
+    pub stop: Vec<String>,
+    /// OpenAI-style frequency penalty where supported. `None` leaves the
+    /// provider/model default in place. Configured via
+    /// `[model].frequency_penalty`.
+    pub frequency_penalty: Option<f32>,
+    /// OpenAI-style presence penalty where supported. `None` leaves the
+    /// provider/model default in place. Configured via
+    /// `[model].presence_penalty`.
+    pub presence_penalty: Option<f32>,
     /// Forwarded as `tool_choice` to providers when tools are advertised.
     /// `None` omits the field; providers default to `auto`. Set to
     /// `"required"` to force a tool call every turn — needed for
@@ -1063,6 +1083,23 @@ impl AppConfig {
             .filter(|value| *value > 0)
             .or(model_settings.max_output_tokens)
             .or(DEFAULT_MAX_OUTPUT_TOKENS);
+        let temperature = model_settings.temperature;
+        let top_p = model_settings.top_p;
+        let seed = model_settings.seed;
+        let stop = model_settings.stop.unwrap_or_default();
+        let frequency_penalty = model_settings.frequency_penalty;
+        let presence_penalty = model_settings.presence_penalty;
+        warn_unsupported_model_options(
+            &provider,
+            &model,
+            temperature,
+            top_p,
+            seed,
+            !stop.is_empty(),
+            frequency_penalty,
+            presence_penalty,
+            &mut config_warnings,
+        );
         // M-58: Cerebras chat-completions v1 accepts `max_tokens` as an
         // alias today, but the v2 default-switchover (2026-07-21)
         // tightens schema validation to require `max_completion_tokens`.
@@ -1329,6 +1366,12 @@ impl AppConfig {
             reasoning_effort,
             instructions: DEFAULT_INSTRUCTIONS.to_string(),
             max_output_tokens,
+            temperature,
+            top_p,
+            seed,
+            stop,
+            frequency_penalty,
+            presence_penalty,
             tool_choice,
             parallel_tool_calls,
             batch_tool_calls_hint,
@@ -1471,6 +1514,44 @@ impl AppConfig {
             output.push_str(
                 "# max_output_tokens = unset  # no Squeezy cap; provider/model limit applies\n",
             );
+        }
+        if let Some(temperature) = self.temperature {
+            output.push_str(&format!("temperature = {}\n", format_f32(temperature)));
+        } else {
+            output.push_str("# temperature = unset  # provider/model default\n");
+        }
+        if let Some(top_p) = self.top_p {
+            output.push_str(&format!("top_p = {}\n", format_f32(top_p)));
+        } else {
+            output.push_str("# top_p = unset  # provider/model default\n");
+        }
+        if let Some(seed) = self.seed {
+            output.push_str(&format!("seed = {seed}\n"));
+        } else {
+            output.push_str("# seed = unset  # provider/model default\n");
+        }
+        if self.stop.is_empty() {
+            output.push_str(
+                "# stop = []  # provider/model default; add strings to stop generation early\n",
+            );
+        } else {
+            output.push_str(&format!("stop = {}\n", toml_string_array(&self.stop)));
+        }
+        if let Some(frequency_penalty) = self.frequency_penalty {
+            output.push_str(&format!(
+                "frequency_penalty = {}\n",
+                format_f32(frequency_penalty)
+            ));
+        } else {
+            output.push_str("# frequency_penalty = unset  # provider/model default\n");
+        }
+        if let Some(presence_penalty) = self.presence_penalty {
+            output.push_str(&format!(
+                "presence_penalty = {}\n",
+                format_f32(presence_penalty)
+            ));
+        } else {
+            output.push_str("# presence_penalty = unset  # provider/model default\n");
         }
         match self.parallel_tool_calls {
             Some(value) => {
@@ -2248,6 +2329,161 @@ fn provider_kind(provider: &ProviderConfig) -> &'static str {
     }
 }
 
+fn warn_unsupported_model_options(
+    provider: &ProviderConfig,
+    model: &str,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
+    stop_set: bool,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    warnings: &mut Vec<ConfigWarning>,
+) {
+    let support = model_option_support(provider, model);
+    let provider_name = provider_kind(provider);
+    let mut warn = |field: &'static str| {
+        warnings.push(ConfigWarning {
+            source: format!("providers.{provider_name}"),
+            field: format!(
+                "model.{field} is configured, but provider {provider_name} has no supported wire field for it; Squeezy will omit it."
+            ),
+        });
+    };
+    if temperature.is_some() && !support.temperature {
+        warn("temperature");
+    }
+    if top_p.is_some() && !support.top_p {
+        warn("top_p");
+    }
+    if seed.is_some() && !support.seed {
+        warn("seed");
+    }
+    if stop_set && !support.stop {
+        warn("stop");
+    }
+    if frequency_penalty.is_some() && !support.frequency_penalty {
+        warn("frequency_penalty");
+    }
+    if presence_penalty.is_some() && !support.presence_penalty {
+        warn("presence_penalty");
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModelOptionSupport {
+    temperature: bool,
+    top_p: bool,
+    seed: bool,
+    stop: bool,
+    frequency_penalty: bool,
+    presence_penalty: bool,
+}
+
+fn model_option_support(provider: &ProviderConfig, model: &str) -> ModelOptionSupport {
+    let chat_completions = ModelOptionSupport {
+        temperature: true,
+        top_p: true,
+        seed: true,
+        stop: true,
+        frequency_penalty: true,
+        presence_penalty: true,
+    };
+    let openai_responses = ModelOptionSupport {
+        temperature: true,
+        top_p: true,
+        seed: false,
+        stop: false,
+        frequency_penalty: false,
+        presence_penalty: false,
+    };
+    let temp_top_stop = ModelOptionSupport {
+        temperature: true,
+        top_p: true,
+        seed: false,
+        stop: true,
+        frequency_penalty: false,
+        presence_penalty: false,
+    };
+    match provider {
+        ProviderConfig::OpenAi(_)
+        | ProviderConfig::AzureOpenAi(_)
+        | ProviderConfig::OpenAiCodex(_) => openai_responses,
+        ProviderConfig::Anthropic(_) | ProviderConfig::Google(_) | ProviderConfig::Bedrock(_) => {
+            temp_top_stop
+        }
+        ProviderConfig::Ollama(_) => ModelOptionSupport {
+            temperature: true,
+            top_p: true,
+            seed: true,
+            stop: true,
+            frequency_penalty: false,
+            presence_penalty: false,
+        },
+        ProviderConfig::GitHubCopilot(_) => chat_completions,
+        ProviderConfig::OpenAiCompatible(config)
+            if config.preset == OpenAiCompatiblePreset::XAi =>
+        {
+            match classify_xai_route(model) {
+                XaiRoute::Responses => openai_responses,
+                XaiRoute::Chat => chat_completions,
+                XaiRoute::ImageNotRouted => ModelOptionSupport {
+                    temperature: false,
+                    top_p: false,
+                    seed: false,
+                    stop: false,
+                    frequency_penalty: false,
+                    presence_penalty: false,
+                },
+            }
+        }
+        ProviderConfig::OpenAiCompatible(_) => chat_completions,
+        ProviderConfig::Faux(_) => ModelOptionSupport {
+            temperature: false,
+            top_p: false,
+            seed: false,
+            stop: false,
+            frequency_penalty: false,
+            presence_penalty: false,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XaiRoute {
+    Responses,
+    Chat,
+    ImageNotRouted,
+}
+
+fn classify_xai_route(model: &str) -> XaiRoute {
+    let lower = model.to_ascii_lowercase();
+    let id = lower.rsplit_once('/').map(|(_, id)| id).unwrap_or(&lower);
+    if id.starts_with("grok-imagine") {
+        return XaiRoute::ImageNotRouted;
+    }
+    if id.starts_with("grok-4") || id.starts_with("grok-build") || id.starts_with("grok-code") {
+        return XaiRoute::Responses;
+    }
+    if matches_xai_grok_family(id, "grok-2")
+        || matches_xai_grok_family(id, "grok-1")
+        || id.starts_with("grok-beta")
+    {
+        return XaiRoute::Chat;
+    }
+    if id.starts_with("grok-") {
+        return XaiRoute::Responses;
+    }
+    XaiRoute::Chat
+}
+
+fn matches_xai_grok_family(id: &str, family: &str) -> bool {
+    id == family
+        || id
+            .strip_prefix(family)
+            .is_some_and(|suffix| suffix.starts_with(['-', '.']))
+}
+
 /// Escape `value` as a TOML basic string. Public so persistence helpers in
 /// downstream crates (e.g. permission rule writing) can share the same
 /// escaping rules used by `config inspect`.
@@ -2271,6 +2507,17 @@ pub fn escape_toml_basic_string(value: &str) -> String {
 
 fn toml_string(value: &str) -> String {
     escape_toml_basic_string(value)
+}
+
+fn format_f32(value: f32) -> String {
+    let mut formatted = format!("{value:.6}");
+    while formatted.contains('.') && formatted.ends_with('0') {
+        formatted.pop();
+    }
+    if formatted.ends_with('.') {
+        formatted.push('0');
+    }
+    formatted
 }
 
 fn toml_string_array<S: AsRef<str>>(values: &[S]) -> String {
@@ -3911,7 +4158,7 @@ where
     entries.end()
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ModelSettings {
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -3922,6 +4169,12 @@ pub struct ModelSettings {
     pub profile: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_output_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub seed: Option<u64>,
+    pub stop: Option<Vec<String>>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
     pub stream_idle_timeout_ms: Option<u64>,
     pub store_responses: Option<bool>,
     pub selection_version: Option<u32>,
@@ -3965,6 +4218,12 @@ impl ModelSettings {
                 "profile",
                 "reasoning_effort",
                 "max_output_tokens",
+                "temperature",
+                "top_p",
+                "seed",
+                "stop",
+                "frequency_penalty",
+                "presence_penalty",
                 "stream_idle_timeout_ms",
                 "store_responses",
                 "selection_version",
@@ -4006,6 +4265,33 @@ impl ModelSettings {
                 "max_output_tokens",
                 source,
                 &field(path, "max_output_tokens"),
+            )?,
+            temperature: f32_range_value(
+                table,
+                "temperature",
+                source,
+                &field(path, "temperature"),
+                0.0,
+                2.0,
+            )?,
+            top_p: f32_range_value(table, "top_p", source, &field(path, "top_p"), 0.0, 1.0)?,
+            seed: u64_nonnegative_value(table, "seed", source, &field(path, "seed"))?,
+            stop: string_array_value(table, "stop", source, &field(path, "stop"))?,
+            frequency_penalty: f32_range_value(
+                table,
+                "frequency_penalty",
+                source,
+                &field(path, "frequency_penalty"),
+                -2.0,
+                2.0,
+            )?,
+            presence_penalty: f32_range_value(
+                table,
+                "presence_penalty",
+                source,
+                &field(path, "presence_penalty"),
+                -2.0,
+                2.0,
             )?,
             stream_idle_timeout_ms: u64_value(
                 table,
@@ -4053,6 +4339,12 @@ impl ModelSettings {
         replace_if_some(&mut self.profile, next.profile);
         replace_if_some(&mut self.reasoning_effort, next.reasoning_effort);
         replace_if_some(&mut self.max_output_tokens, next.max_output_tokens);
+        replace_if_some(&mut self.temperature, next.temperature);
+        replace_if_some(&mut self.top_p, next.top_p);
+        replace_if_some(&mut self.seed, next.seed);
+        replace_if_some(&mut self.stop, next.stop);
+        replace_if_some(&mut self.frequency_penalty, next.frequency_penalty);
+        replace_if_some(&mut self.presence_penalty, next.presence_penalty);
         replace_if_some(
             &mut self.stream_idle_timeout_ms,
             next.stream_idle_timeout_ms,
@@ -9179,6 +9471,12 @@ pub fn user_settings_template() -> &'static str {
 # model = "gpt-5.5"            # provider-specific model id; leave unset to use the provider default
 # reasoning_effort = "medium"  # low | medium | high | xhigh; only sent to capable providers
 # max_output_tokens = 64000    # optional output cap; unset means provider/model limit
+# temperature = 0.2             # 0.0..2.0; absent means provider/model default
+# top_p = 0.9                   # 0.0..1.0; absent means provider/model default
+# seed = 42                     # non-negative integer; absent means provider/model default
+# stop = []                     # stop sequences; empty/unset means provider/model default
+# frequency_penalty = 0.0       # -2.0..2.0; absent means provider/model default
+# presence_penalty = 0.0        # -2.0..2.0; absent means provider/model default
 # stream_idle_timeout_ms = 300000 # fail a stalled model stream after 5m idle
 # store_responses = false      # only honored by openai/azure_openai
 # selection_version = 1        # maintained by the startup provider/model selector
@@ -9412,6 +9710,21 @@ pub fn user_settings_template() -> &'static str {
 pub fn project_settings_template() -> &'static str {
     r#"# Project-level Squeezy settings (committed alongside the project).
 # Uncomment any key to override the built-in defaults shown after `=`.
+
+[model]
+# provider = "openai"          # openai | anthropic | google | azure_openai | bedrock | ollama
+# profile = "balanced"         # cheap | balanced | strong
+# model = "gpt-5.5"            # provider-specific model id; leave unset to use the provider default
+# reasoning_effort = "medium"  # low | medium | high | xhigh; only sent to capable providers
+# max_output_tokens = 64000    # optional output cap; unset means provider/model limit
+# temperature = 0.2             # 0.0..2.0; absent means provider/model default
+# top_p = 0.9                   # 0.0..1.0; absent means provider/model default
+# seed = 42                     # non-negative integer; absent means provider/model default
+# stop = []                     # stop sequences; empty/unset means provider/model default
+# frequency_penalty = 0.0       # -2.0..2.0; absent means provider/model default
+# presence_penalty = 0.0        # -2.0..2.0; absent means provider/model default
+# stream_idle_timeout_ms = 300000 # fail a stalled model stream after 5m idle
+# store_responses = false      # only honored by openai/azure_openai
 
 [budgets]
 # max_parallel_tools = 8
@@ -10872,6 +11185,33 @@ fn u64_nonnegative_value(
     match table.get(key) {
         None => Ok(None),
         Some(value) => Ok(Some(non_negative_integer(value, source, path)?)),
+    }
+}
+
+fn f32_range_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+    min: f32,
+    max: f32,
+) -> Result<Option<f32>> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(value) => {
+            let number = value
+                .as_float()
+                .or_else(|| value.as_integer().map(|integer| integer as f64))
+                .ok_or_else(|| type_error(source, path, "number"))?;
+            if !number.is_finite() || number < f64::from(min) || number > f64::from(max) {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {path}: expected a number from {} to {}",
+                    format_f32(min),
+                    format_f32(max)
+                )));
+            }
+            Ok(Some(number as f32))
+        }
     }
 }
 

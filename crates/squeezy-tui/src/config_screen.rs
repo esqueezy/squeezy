@@ -572,6 +572,12 @@ pub(crate) enum FieldEditor {
         min: i64,
         max: i64,
     },
+    OptionalFloat {
+        draft: String,
+        cursor: usize,
+        min: f64,
+        max: f64,
+    },
     Enum {
         options: &'static [&'static str],
         cursor: usize,
@@ -1171,6 +1177,10 @@ fn tier_value_at_explicit_path(
         FieldKind::OptionalInteger { .. } => value
             .as_integer()
             .map(|v| FieldValue::OptionalInteger(Some(v))),
+        FieldKind::OptionalFloat { .. } => value
+            .as_float()
+            .or_else(|| value.as_integer().map(|v| v as f64))
+            .map(|v| FieldValue::OptionalFloat(Some(v))),
         FieldKind::Enum { options } => value
             .as_str()
             .and_then(|s| options.iter().find(|o| **o == s).copied())
@@ -1359,6 +1369,22 @@ pub(crate) fn open_editor_for(field: &FieldMeta, current: FieldValue) -> FieldEd
             min,
             max,
         },
+        (FieldKind::OptionalFloat { min, max }, FieldValue::OptionalFloat(Some(v))) => {
+            let draft = format_editor_float(v);
+            let cursor = draft.len();
+            FieldEditor::OptionalFloat {
+                draft,
+                cursor,
+                min,
+                max,
+            }
+        }
+        (FieldKind::OptionalFloat { min, max }, _) => FieldEditor::OptionalFloat {
+            draft: String::new(),
+            cursor: 0,
+            min,
+            max,
+        },
         (FieldKind::Enum { options }, FieldValue::Enum(v)) => {
             let cursor = options.iter().position(|o| *o == v).unwrap_or(0);
             FieldEditor::Enum { options, cursor }
@@ -1445,6 +1471,12 @@ pub(crate) fn handle_editor_key(editor: &mut FieldEditor, key: KeyEvent) -> Edit
             min,
             max,
         } => integer_editor_key(draft, cursor, *min, *max, key, true),
+        FieldEditor::OptionalFloat {
+            draft,
+            cursor,
+            min,
+            max,
+        } => float_editor_key(draft, cursor, *min, *max, key, true),
         FieldEditor::Duration { draft, cursor } => {
             integer_editor_key(draft, cursor, 0, i64::MAX, key, false).map_value(|v| match v {
                 FieldValue::Integer(ms) => {
@@ -1637,6 +1669,77 @@ fn integer_editor_key(
         }
         _ => EditorOutcome::KeepEditing,
     }
+}
+
+fn float_editor_key(
+    draft: &mut String,
+    cursor: &mut usize,
+    min: f64,
+    max: f64,
+    key: KeyEvent,
+    optional: bool,
+) -> EditorOutcome {
+    match key.code {
+        KeyCode::Enter => {
+            if optional && draft.trim().is_empty() {
+                return EditorOutcome::Commit(FieldValue::OptionalFloat(None));
+            }
+            match draft.trim().parse::<f64>() {
+                Ok(v) if v.is_finite() && (min..=max).contains(&v) => {
+                    if optional {
+                        EditorOutcome::Commit(FieldValue::OptionalFloat(Some(v)))
+                    } else {
+                        EditorOutcome::KeepEditing
+                    }
+                }
+                Ok(_) | Err(_) => EditorOutcome::KeepEditing,
+            }
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() || c == '-' || c == '.' => {
+            let mut chars: Vec<char> = draft.chars().collect();
+            chars.insert(*cursor, c);
+            *draft = chars.into_iter().collect();
+            *cursor += 1;
+            EditorOutcome::KeepEditing
+        }
+        KeyCode::Backspace => {
+            if *cursor > 0 {
+                let mut chars: Vec<char> = draft.chars().collect();
+                chars.remove(*cursor - 1);
+                *draft = chars.into_iter().collect();
+                *cursor -= 1;
+            }
+            EditorOutcome::KeepEditing
+        }
+        KeyCode::Left => {
+            *cursor = cursor.saturating_sub(1);
+            EditorOutcome::KeepEditing
+        }
+        KeyCode::Right => {
+            *cursor = (*cursor + 1).min(draft.chars().count());
+            EditorOutcome::KeepEditing
+        }
+        KeyCode::Home => {
+            *cursor = 0;
+            EditorOutcome::KeepEditing
+        }
+        KeyCode::End => {
+            *cursor = draft.chars().count();
+            EditorOutcome::KeepEditing
+        }
+        _ => EditorOutcome::KeepEditing,
+    }
+}
+
+fn format_editor_float(value: f64) -> String {
+    let mut formatted = format!("{value:.6}");
+    while formatted.contains('.') && formatted.ends_with('0') {
+        formatted.pop();
+    }
+    if formatted.ends_with('.') {
+        formatted.push('0');
+    }
+    formatted
 }
 
 // ─── Reset tab (tier-file deletion) ──────────────────────────────────────────
