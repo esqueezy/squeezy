@@ -51,6 +51,28 @@ enum OpenAiAuthMode {
     HeadersOnly,
 }
 
+struct OpenAiProviderOptions {
+    api_version: Option<String>,
+    auth_mode: OpenAiAuthMode,
+    extra_headers: BTreeMap<String, String>,
+    organization: Option<String>,
+    project: Option<String>,
+    service_tier: Option<String>,
+}
+
+impl Default for OpenAiProviderOptions {
+    fn default() -> Self {
+        Self {
+            api_version: None,
+            auth_mode: OpenAiAuthMode::Bearer,
+            extra_headers: BTreeMap::new(),
+            organization: None,
+            project: None,
+            service_tier: None,
+        }
+    }
+}
+
 impl std::fmt::Debug for OpenAiProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAiProvider")
@@ -128,13 +150,13 @@ impl OpenAiProvider {
             "azure_openai",
             static_api_key_source(api_key, "azure_openai"),
             config.base_url.trim_end_matches('/').to_string(),
-            Some(config.api_version.clone()),
-            auth_mode,
-            config.extra_headers.clone(),
-            None,
-            None,
-            None,
             config.transport,
+            OpenAiProviderOptions {
+                api_version: Some(config.api_version.clone()),
+                auth_mode,
+                extra_headers: config.extra_headers.clone(),
+                ..Default::default()
+            },
         );
         provider.deployment_name_map = config.deployment_name_map.clone();
         Ok(provider)
@@ -191,13 +213,11 @@ impl OpenAiProvider {
             name,
             api_key,
             base_url,
-            api_version,
-            OpenAiAuthMode::Bearer,
-            BTreeMap::new(),
-            None,
-            None,
-            None,
             transport,
+            OpenAiProviderOptions {
+                api_version,
+                ..Default::default()
+            },
         )
     }
 
@@ -210,25 +230,20 @@ impl OpenAiProvider {
         name: &'static str,
         api_key: Arc<dyn ApiKeySource>,
         base_url: String,
-        api_version: Option<String>,
-        auth_mode: OpenAiAuthMode,
-        extra_headers: BTreeMap<String, String>,
-        organization: Option<String>,
-        project: Option<String>,
-        service_tier: Option<String>,
         transport: ProviderTransportConfig,
+        options: OpenAiProviderOptions,
     ) -> Self {
         Self {
             name,
             client: shared_client(&transport),
             api_key,
             base_url,
-            api_version,
-            auth_mode,
-            extra_headers,
-            organization,
-            project,
-            service_tier,
+            api_version: options.api_version,
+            auth_mode: options.auth_mode,
+            extra_headers: options.extra_headers,
+            organization: options.organization,
+            project: options.project,
+            service_tier: options.service_tier,
             deployment_name_map: BTreeMap::new(),
             transport,
         }
