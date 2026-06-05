@@ -706,6 +706,7 @@ async fn sse_transport_parses_event_data_lines_and_posts_to_advertised_endpoint(
         elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
         elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(256))),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
+        resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
     };
     let (auth_header, custom_headers) =
         resolve_http_auth_and_headers("sse-server", &server, |name| match name {
@@ -820,6 +821,7 @@ async fn streamable_http_transport_sends_authorization_bearer_header() {
         elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         pause_state: ElicitationPauseState::default(),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
+        resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
     };
     // The serve call will fail because we hang up after one round trip — that
     // is fine, we only need it to issue the initialize POST so the listener
@@ -1022,6 +1024,7 @@ fn client_info_advertises_squeezy_identity_and_elicitation_capability() {
         elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         pause_state: ElicitationPauseState::default(),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
+        resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
     };
     let info = ClientHandler::get_info(&handler);
     assert_eq!(info.client_info.name, env!("CARGO_PKG_NAME"));
@@ -1123,6 +1126,7 @@ async fn server_capabilities_surfaces_experimental_flags_from_initialize_respons
         elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(256))),
         pause_state: ElicitationPauseState::default(),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
+        resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
     };
     let (auth_header, custom_headers) = resolve_http_auth_and_headers("fixture", &server, |_| None);
     let worker =
@@ -1275,6 +1279,66 @@ fn resource_list_changed_notification_evicts_only_that_servers_reads() {
             .cached_resource_read_for_test("other", "file:///c.txt")
             .is_some(),
         "other servers' cached reads must be untouched"
+    );
+}
+
+#[tokio::test]
+async fn resource_declaration_cache_satisfies_gate_without_enumerating() {
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    registry.seed_resource_declarations_for_test(
+        "docs",
+        &["file:///a.txt"],
+        &["docs://api/{owner}/{repo}"],
+    );
+    let server = fixture_server(true, None);
+
+    assert!(
+        registry
+            .resource_uri_is_declared("docs", &server, "file:///a.txt", CancellationToken::new())
+            .await
+            .expect("cached exact declaration")
+    );
+    assert!(
+        registry
+            .resource_uri_is_declared(
+                "docs",
+                &server,
+                "docs://api/openai/codex",
+                CancellationToken::new()
+            )
+            .await
+            .expect("cached template declaration")
+    );
+    assert!(
+        !registry
+            .resource_uri_is_declared(
+                "docs",
+                &server,
+                "file:///missing.txt",
+                CancellationToken::new()
+            )
+            .await
+            .expect("cached negative declaration")
+    );
+}
+
+#[test]
+fn resource_list_changed_notification_evicts_declaration_cache() {
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    registry.seed_resource_declarations_for_test("docs", &["file:///a.txt"], &[]);
+    registry.seed_resource_declarations_for_test("other", &["file:///b.txt"], &[]);
+
+    registry
+        .client_handler_for_test("docs")
+        .evict_server_resource_declarations();
+
+    assert!(
+        !registry.cached_resource_declarations_for_test("docs"),
+        "resource-list change must drop declarations for that server"
+    );
+    assert!(
+        registry.cached_resource_declarations_for_test("other"),
+        "other servers' declaration cache must stay intact"
     );
 }
 

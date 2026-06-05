@@ -67,6 +67,7 @@ const MCP_TOOL_CACHE_SCHEMA_VERSION: u64 = 1;
 const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
 const HASH_SUFFIX_BYTES: usize = 12;
 const RESOURCE_READ_CACHE_TTL: Duration = Duration::from_secs(300);
+const RESOURCE_DECLARATION_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Cap on retained resource-read cache entries. The registry lives for the
 /// whole session, so without a bound a server (or agent loop) that reads many
 /// distinct URIs would accumulate their full bodies indefinitely. Mirrors the
@@ -312,6 +313,7 @@ pub struct McpClientRegistry {
     elicitation_audit: Arc<Mutex<std::collections::VecDeque<McpElicitationAuditEvent>>>,
     pause_state: ElicitationPauseState,
     resource_reads: Arc<Mutex<BTreeMap<(String, String), CachedResourceRead>>>,
+    resource_declarations: Arc<Mutex<BTreeMap<String, CachedResourceDeclarations>>>,
 }
 
 impl Default for McpClientRegistry {
@@ -343,6 +345,7 @@ impl McpClientRegistry {
             ))),
             pause_state: ElicitationPauseState::default(),
             resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
+            resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
         };
         registry.load_cached_tools();
         registry
@@ -999,6 +1002,7 @@ impl McpClientRegistry {
             elicitation_audit: self.elicitation_audit.clone(),
             pause_state: self.pause_state.clone(),
             resource_reads: self.resource_reads.clone(),
+            resource_declarations: self.resource_declarations.clone(),
         };
         let entry = match server.transport {
             McpTransport::Stdio => start_stdio_service(server_name, server, handler).await?,
@@ -1017,11 +1021,17 @@ impl McpClientRegistry {
     async fn invalidate_session(&self, server_name: &str) {
         let mut sessions = self.sessions.lock().await;
         sessions.remove(server_name);
+        if let Ok(mut cache) = self.resource_declarations.lock() {
+            cache.remove(server_name);
+        }
     }
 
     pub async fn shutdown(&self) {
         let mut sessions = self.sessions.lock().await;
         sessions.clear();
+        if let Ok(mut cache) = self.resource_declarations.lock() {
+            cache.clear();
+        }
     }
 
     /// Server-advertised capabilities captured during `initialize`, or `None`
@@ -1096,6 +1106,35 @@ impl McpClientRegistry {
     }
 
     #[cfg(test)]
+    fn seed_resource_declarations_for_test(
+        &self,
+        server: &str,
+        resource_uris: &[&str],
+        resource_templates: &[&str],
+    ) {
+        if let Ok(mut cache) = self.resource_declarations.lock() {
+            cache.insert(
+                server.to_string(),
+                CachedResourceDeclarations {
+                    resource_uris: resource_uris.iter().map(|uri| uri.to_string()).collect(),
+                    resource_templates: resource_templates
+                        .iter()
+                        .map(|template| template.to_string())
+                        .collect(),
+                    fetched_at: Instant::now(),
+                },
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn cached_resource_declarations_for_test(&self, server: &str) -> bool {
+        self.resource_declarations
+            .lock()
+            .is_ok_and(|cache| cache.contains_key(server))
+    }
+
+    #[cfg(test)]
     fn client_handler_for_test(&self, server_name: &str) -> SqueezyMcpClientHandler {
         SqueezyMcpClientHandler {
             server_name: server_name.to_string(),
@@ -1104,6 +1143,7 @@ impl McpClientRegistry {
             elicitation_audit: self.elicitation_audit.clone(),
             pause_state: self.pause_state.clone(),
             resource_reads: self.resource_reads.clone(),
+            resource_declarations: self.resource_declarations.clone(),
         }
     }
 
@@ -1299,20 +1339,69 @@ impl McpClientRegistry {
         uri: &str,
         cancel: CancellationToken,
     ) -> McpResult<bool> {
-        let resources = self
-            .all_resources(server_name, server, cancel.clone())
-            .await
-            .unwrap_or_default();
-        if resources.iter().any(|resource| resource.raw.uri == uri) {
-            return Ok(true);
+        if let Some(cached) = self.cached_resource_declarations_match(server_name, uri) {
+            return Ok(cached);
         }
-        let templates = self
+
+        let resources_result = self
+            .all_resources(server_name, server, cancel.clone())
+            .await;
+        let templates_result = self
             .all_resource_templates(server_name, server, cancel)
-            .await
-            .unwrap_or_default();
-        Ok(templates
-            .iter()
-            .any(|template| uri_matches_template(uri, &template.raw.uri_template)))
+            .await;
+        let resources = resources_result.as_ref().map(Vec::as_slice).unwrap_or(&[]);
+        let templates = templates_result.as_ref().map(Vec::as_slice).unwrap_or(&[]);
+
+        if let (Ok(resources), Ok(templates)) = (&resources_result, &templates_result) {
+            self.store_resource_declarations(server_name, resources, templates);
+        }
+
+        Ok(resources.iter().any(|resource| resource.raw.uri == uri)
+            || templates
+                .iter()
+                .any(|template| uri_matches_template(uri, &template.raw.uri_template)))
+    }
+
+    fn cached_resource_declarations_match(&self, server_name: &str, uri: &str) -> Option<bool> {
+        let mut cache = self.resource_declarations.lock().ok()?;
+        let Some(cached) = cache.get(server_name) else {
+            return None;
+        };
+        if cached.fetched_at.elapsed() > RESOURCE_DECLARATION_CACHE_TTL {
+            cache.remove(server_name);
+            return None;
+        }
+        Some(
+            cached.resource_uris.contains(uri)
+                || cached
+                    .resource_templates
+                    .iter()
+                    .any(|template| uri_matches_template(uri, template)),
+        )
+    }
+
+    fn store_resource_declarations(
+        &self,
+        server_name: &str,
+        resources: &[Resource],
+        templates: &[rmcp::model::ResourceTemplate],
+    ) {
+        if let Ok(mut cache) = self.resource_declarations.lock() {
+            cache.insert(
+                server_name.to_string(),
+                CachedResourceDeclarations {
+                    resource_uris: resources
+                        .iter()
+                        .map(|resource| resource.raw.uri.clone())
+                        .collect(),
+                    resource_templates: templates
+                        .iter()
+                        .map(|template| template.raw.uri_template.clone())
+                        .collect(),
+                    fetched_at: Instant::now(),
+                },
+            );
+        }
     }
 }
 
@@ -1334,6 +1423,13 @@ struct CachedResourceRead {
     fetched_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct CachedResourceDeclarations {
+    resource_uris: BTreeSet<String>,
+    resource_templates: Vec<String>,
+    fetched_at: Instant,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct McpToolCacheRecord {
     schema_version: u64,
@@ -1351,6 +1447,9 @@ struct SqueezyMcpClientHandler {
     /// Shared with `McpClientRegistry` so resource-change notifications can
     /// evict stale cached reads before their TTL lapses.
     resource_reads: Arc<Mutex<BTreeMap<(String, String), CachedResourceRead>>>,
+    /// Shared with `McpClientRegistry` so resource-list changes invalidate the
+    /// declaration gate cache alongside cached reads.
+    resource_declarations: Arc<Mutex<BTreeMap<String, CachedResourceDeclarations>>>,
 }
 
 impl SqueezyMcpClientHandler {
@@ -1368,6 +1467,12 @@ impl SqueezyMcpClientHandler {
     fn evict_server_resource_reads(&self) {
         if let Ok(mut cache) = self.resource_reads.lock() {
             cache.retain(|(server, _), _| server != &self.server_name);
+        }
+    }
+
+    fn evict_server_resource_declarations(&self) {
+        if let Ok(mut cache) = self.resource_declarations.lock() {
+            cache.remove(&self.server_name);
         }
     }
 }
@@ -1539,6 +1644,7 @@ impl ClientHandler for SqueezyMcpClientHandler {
 
     async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
         self.evict_server_resource_reads();
+        self.evict_server_resource_declarations();
         tracing::info!(
             target: "squeezy::mcp",
             server = %self.server_name,
