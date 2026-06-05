@@ -567,6 +567,67 @@ async fn terminal_stream_error_preserves_partial_assistant_text_in_conversation_
     assert_eq!(assistant.content, partial);
 }
 
+#[test]
+fn approval_context_excerpt_prefers_complete_bounded_text() {
+    let excerpt = approval_context_excerpt(
+        "I need to validate the Rust workspace before reporting back. Next I will run tests and inspect the result.",
+    )
+    .expect("excerpt");
+
+    assert_eq!(
+        excerpt,
+        "I need to validate the Rust workspace before reporting back. Next I will run tests and inspect the result."
+    );
+    assert!(!excerpt.contains("..."));
+    assert!(!excerpt.contains('…'));
+}
+
+#[test]
+fn approval_context_excerpt_omits_unbounded_fragments() {
+    let long_fragment = "word ".repeat(APPROVAL_CONTEXT_CAP + 20);
+
+    assert_eq!(approval_context_excerpt(&long_fragment), None);
+}
+
+#[test]
+fn approval_context_excerpt_uses_complete_boundary_before_cap() {
+    let first_sentence = "I need to validate the Rust workspace before reporting back.";
+    let long_tail = " Next I will keep explaining the same approval rationale".repeat(20);
+    let input = format!("{first_sentence}{long_tail}");
+
+    assert!(input.chars().count() > APPROVAL_CONTEXT_CAP);
+    assert_eq!(
+        approval_context_excerpt(&input).as_deref(),
+        Some(first_sentence)
+    );
+}
+
+#[tokio::test]
+async fn approval_context_from_state_uses_clean_latest_assistant_excerpt() {
+    let state = Arc::new(tokio::sync::Mutex::new(ConversationState {
+        transcript: vec![
+            TranscriptItem::assistant("Older assistant note."),
+            TranscriptItem::user("Please run the checks."),
+            TranscriptItem::assistant(
+                "I need to validate the Rust workspace before reporting back. Then I will summarize the result.",
+            ),
+        ],
+        ..ConversationState::default()
+    }));
+
+    let redactor = Redactor::new(&Default::default()).expect("redactor");
+    let context = approval_context_from_state(Some(&state), &redactor)
+        .await
+        .expect("approval context");
+
+    assert_eq!(
+        context,
+        "I need to validate the Rust workspace before reporting back. Then I will summarize the result."
+    );
+    assert!(!context.contains("..."));
+    assert!(!context.contains('…'));
+}
+
 #[tokio::test]
 async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
     let root = temp_workspace("task_state_session");
