@@ -45,6 +45,7 @@ squeezy mcp list
 squeezy mcp add docs --project --transport stdio --command docs-mcp
 squeezy mcp disable docs --project
 squeezy doctor
+squeezy doctor --probe
 squeezy --mode plan
 ```
 
@@ -52,8 +53,11 @@ squeezy --mode plan
 with sensitive-looking values redacted; the document can be parsed back
 through the same loader. `config init` refuses to overwrite an existing
 file unless `--force` is passed. `doctor` validates configuration and
-prints the source chain used for resolution. `--mode plan|build` selects the
-starting session mode for the TUI.
+prints the source chain used for resolution. `doctor --probe` also performs a
+cheap provider reachability check where the configured provider exposes one;
+Bedrock, OpenAI Codex, and GitHub Copilot currently warn that no low-cost probe
+is implemented. `--mode plan|build` selects the starting session mode for the
+TUI.
 
 ## Agent Behavior
 
@@ -312,7 +316,10 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   (`~/.squeezy/credentials.json` or `SQUEEZY_CREDENTIALS_FILE`), the configured
   environment variable, provider fallback environment variables, then
   `SQUEEZY_CREDENTIALS_JSON`. Use `squeezy auth set/list/status/remove` to
-  manage the local credentials file without putting secrets in TOML.
+  manage the local credentials file without putting secrets in TOML. Ollama also
+  accepts `route_style = "native"` or `route_style = "openai_compatible"`;
+  native uses Squeezy's `/api/chat` integration and local defaults, while the
+  OpenAI-compatible route uses the portable Chat Completions wire shape.
 - `[session]`: `mode`, either `build` (default) or `plan`. Build mode preserves
   normal tool behavior subject to permission policy. Plan mode advertises only
   read/search/navigation tools and refuses edit, shell, git, network, MCP,

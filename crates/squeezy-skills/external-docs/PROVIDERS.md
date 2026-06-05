@@ -77,6 +77,40 @@ fields `api_key_env`, `api_key`, `base_url`, `default_model`, and
 `extra_headers`; only fields that differ from the defaults are shown
 below.
 
+### Provider capability limits
+
+Squeezy's main `[model]` config only exposes provider controls that are
+currently routed by the agent: `max_output_tokens`, `reasoning_effort`,
+`tool_choice`, `parallel_tool_calls`, `store_responses`, and the selected
+provider/model. Lower-level request fields exist for future provider work, but
+they are not all universal wire controls today:
+
+- Sampling knobs such as `temperature`, `top_p`, `seed`, stop sequences, and
+  frequency/presence penalties are provider-dependent. Bedrock currently lowers
+  `temperature`, `top_p`, and stop sequences through Converse; other provider
+  paths either use their provider default or do not expose those fields through
+  Squeezy's public config yet.
+- Provider-hosted tools such as hosted web/file search and computer-use are not
+  a universal contract. Squeezy's built-in local function tools are the stable
+  cross-provider tool surface.
+- Strict structured output is only requested when the provider path forwards
+  Squeezy's JSON schema and the selected model advertises JSON mode. OpenAI,
+  Azure OpenAI, OpenAI Codex, Google, xAI, and OpenAI-compatible presets forward
+  schemas. Anthropic, Bedrock, and native Ollama do not; Squeezy keeps those
+  requests free-form and parses the result.
+- Anthropic `pause_turn` is surfaced explicitly. If a paused response includes
+  local tool calls, Squeezy executes those tool calls and continues through the
+  normal tool-result loop. If it pauses without an actionable continuation,
+  Squeezy fails the turn with a retry hint; bounded re-issue of hosted-tool
+  partial state is not implemented yet.
+- xAI image-generation models such as `grok-imagine-*` are not part of the
+  built-in text/code catalog. If manually configured, Squeezy rejects them before
+  the network request because `/v1/images/generations` is not routed.
+- Native Ollama (`route_style = "native"`) uses Ollama's role-based tool-result
+  wire shape and synthesizes Squeezy call ids such as `ollama_call_0` for
+  streamed tool calls. Use `route_style = "openai_compatible"` when you prefer
+  the portable Chat Completions wire shape over Ollama-specific options.
+
 ### Aggregators (one credit, many models)
 
 #### `openrouter` — OpenRouter
@@ -265,6 +299,8 @@ default_model = "google/gemini-3.1-pro-preview"
 - Uses `/api/chat` NDJSON streaming with function tool schemas and
   zero-dollar pricing. An opt-in `/v1` route is available for
   OpenAI-compatible Ollama wire; see [`CONFIGURATION.md`](CONFIGURATION.md).
+- Native Ollama preserves local tool execution order but does not preserve
+  provider-native tool-call ids on replay; Squeezy generates per-stream ids.
 - Model metadata (context window) is queried from `/api/show`; if
   absent, the context window is reported as unknown.
 
@@ -498,10 +534,17 @@ squeezy providers list
 squeezy providers list --configured
 squeezy providers info openrouter
 squeezy refresh-models
+squeezy doctor --probe
 squeezy --provider openrouter --model anthropic/claude-opus-4-7 --prompt "hello"
 squeezy --provider groq --model llama-3.1-8b-instant --prompt "hello"
 squeezy --provider ollama --model qwen3 --prompt "hello"
 ```
+
+`doctor --probe` is a cheap reachability check, not a full generation smoke
+test. It probes model-list endpoints for OpenAI-compatible providers,
+Anthropic, Google, Azure OpenAI, and Ollama. Bedrock, OpenAI Codex, and GitHub
+Copilot currently report a warning because their runtime/OAuth chat backends do
+not expose a stable low-cost list-models probe through Squeezy's runtime path.
 
 Existing env overrides remain supported: `SQUEEZY_PROVIDER`, `SQUEEZY_MODEL`,
 `SQUEEZY_PROFILE`, the provider-specific base URL variables
