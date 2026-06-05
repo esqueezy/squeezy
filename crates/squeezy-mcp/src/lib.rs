@@ -2610,8 +2610,53 @@ fn uri_matches_template(uri: &str, template: &str) -> bool {
     if uri == template {
         return true;
     }
-    let prefix = template.split('{').next().unwrap_or(template);
-    !prefix.is_empty() && uri.starts_with(prefix)
+    let mut uri_rest = uri;
+    let mut template_rest = template;
+    loop {
+        let Some(open) = template_rest.find('{') else {
+            return uri_rest == template_rest;
+        };
+        let literal = &template_rest[..open];
+        let Some(after_literal) = uri_rest.strip_prefix(literal) else {
+            return false;
+        };
+        uri_rest = after_literal;
+
+        let Some(close_rel) = template_rest[open + 1..].find('}') else {
+            return false;
+        };
+        let after_placeholder = open + 1 + close_rel + 1;
+        template_rest = &template_rest[after_placeholder..];
+        let next_literal = template_rest.split('{').next().unwrap_or_default();
+        if next_literal.is_empty() {
+            let has_more_placeholders = template_rest.contains('{');
+            if has_more_placeholders {
+                let Some((_, ch)) = uri_rest.char_indices().next() else {
+                    return false;
+                };
+                if uri_template_placeholder_delimiter(ch) {
+                    return false;
+                }
+                uri_rest = &uri_rest[ch.len_utf8()..];
+                continue;
+            }
+            return !uri_rest.is_empty()
+                && !uri_rest.chars().any(uri_template_placeholder_delimiter);
+        }
+
+        let Some(match_start) = uri_rest.match_indices(next_literal).find_map(|(index, _)| {
+            let value = &uri_rest[..index];
+            (!value.is_empty() && !value.chars().any(uri_template_placeholder_delimiter))
+                .then_some(index)
+        }) else {
+            return false;
+        };
+        uri_rest = &uri_rest[match_start..];
+    }
+}
+
+fn uri_template_placeholder_delimiter(ch: char) -> bool {
+    matches!(ch, '/' | '?' | '#')
 }
 
 fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {

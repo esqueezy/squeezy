@@ -288,14 +288,24 @@ fn strip_untrusted_meta_removes_nested_meta_keys() {
 }
 
 #[test]
-fn uri_templates_allow_declared_prefix_only() {
+fn uri_templates_match_declared_segments() {
     assert!(uri_matches_template(
         "docs://api/v3/repos/openai/codex",
         "docs://api/v3/repos/{owner}/{repo}"
     ));
+    assert!(uri_matches_template("db://users/rows", "db://{table}/rows"));
     assert!(!uri_matches_template(
         "file:///etc/passwd",
         "docs://api/v3/repos/{owner}/{repo}"
+    ));
+    assert!(!uri_matches_template("db://users", "db://{table}/rows"));
+    assert!(!uri_matches_template(
+        "db://users/columns",
+        "db://{table}/rows"
+    ));
+    assert!(!uri_matches_template(
+        "db://users/rows/extra",
+        "db://{table}/rows"
     ));
 }
 
