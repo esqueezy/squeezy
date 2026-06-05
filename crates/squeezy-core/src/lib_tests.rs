@@ -1243,16 +1243,14 @@ temperature = 0.2
             .config_warnings
             .iter()
             .any(|warning| warning.field.contains("model.seed")),
-        "refresh must add unsupported seed warning: {:?}",
-        config.config_warnings
+        "refresh must add unsupported seed warning"
     );
     assert!(
         config
             .config_warnings
             .iter()
             .any(|warning| warning.field == "unknown field preserved"),
-        "refresh must not drop non-generated warnings: {:?}",
-        config.config_warnings
+        "refresh must not drop non-generated warnings"
     );
     config.refresh_config_warnings();
     assert_eq!(
@@ -1272,8 +1270,7 @@ temperature = 0.2
             .config_warnings
             .iter()
             .any(|warning| warning.field.contains("model.seed")),
-        "refresh must remove stale generated warnings: {:?}",
-        config.config_warnings
+        "refresh must remove stale generated warnings"
     );
 }
 
