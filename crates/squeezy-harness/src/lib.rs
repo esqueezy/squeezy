@@ -665,6 +665,7 @@ async fn run_agent_with_config(
             AgentEvent::ToolCallQueued { .. } | AgentEvent::ToolCallCompleted { .. } => {}
             AgentEvent::ToolCallStarted { .. }
             | AgentEvent::ApprovalRequested { .. }
+            | AgentEvent::SkillActivationWarning { .. }
             | AgentEvent::TaskStateUpdated { .. }
             | AgentEvent::McpStatusUpdated { .. }
             | AgentEvent::McpElicitationRequested { .. }

@@ -2190,6 +2190,7 @@ impl Driver {
                     )?;
                     let _ = decision_tx.send(decision);
                 }
+                AgentEvent::SkillActivationWarning { .. } => {}
                 AgentEvent::McpElicitationRequested {
                     turn_id,
                     request,
