@@ -6603,6 +6603,7 @@ async fn compact_with_strategy_falls_back_to_extractive_when_hanging_provider_ti
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .await
     .expect("compaction should fire even when model assist times out");
@@ -6728,6 +6729,7 @@ fn compaction_persists_checkpoint_and_stamps_replacement_id() {
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .expect("compaction");
     assert!(conversation.len() < original_len);
@@ -6764,6 +6766,7 @@ fn compaction_without_store_leaves_replacement_id_none() {
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .expect("compaction");
     assert!(report.record.replacement_id.is_none());
@@ -6822,6 +6825,7 @@ fn compaction_drops_orphan_function_call_outputs_from_interleaved_parallel_calls
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .expect("compaction should run");
 
@@ -7081,6 +7085,7 @@ async fn compact_with_strategy_uses_extractive_when_no_model_configured() {
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .await
     .expect("compaction should still produce extractive output");
@@ -7144,6 +7149,7 @@ async fn compact_with_strategy_accepts_structured_template_output() {
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .await
     .expect("structured compaction should accept the model output");
@@ -7231,6 +7237,7 @@ async fn compact_with_strategy_falls_back_when_model_output_missing_slots() {
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .await
     .expect("compaction should still produce extractive output");
@@ -7370,6 +7377,7 @@ async fn maybe_compact_conversation_honors_model_assisted_strategy() {
         &redactor,
         &config,
         ContextCompactionTrigger::Auto,
+        0,
     )
     .await
     .expect("post-turn auto-compaction should fire");
@@ -7456,6 +7464,7 @@ async fn compact_with_strategy_passes_previous_summary_block_on_iterative_compac
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .await
     .expect("first compaction");
@@ -7473,6 +7482,7 @@ async fn compact_with_strategy_passes_previous_summary_block_on_iterative_compac
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .await
     .expect("second compaction");
@@ -7889,6 +7899,67 @@ fn arm_then_drain_applies_swap_with_optional_provider() {
     assert_eq!(drained.display_note.as_deref(), Some("model swap"));
     assert_eq!(agent.config_snapshot().model, "claude-opus-4-7");
     assert!(agent.pending_config_swap().is_none());
+}
+
+#[test]
+fn model_switch_re_derives_context_window() {
+    // openai gpt-5.5 has a 400K registered window; anthropic claude-opus-4-7
+    // has 200K. A runtime switch must re-derive the new model's window so
+    // mid-turn thresholds stop computing against the old one (finding #1).
+    let openai: Arc<dyn LlmProvider> = Arc::new(MockProvider::named("openai", vec![]));
+    let config = AppConfig {
+        model: "gpt-5.5".to_string(),
+        ..AppConfig::default()
+    };
+    let mut agent = Agent::new(config, openai);
+    assert_eq!(
+        agent
+            .config_snapshot()
+            .context_compaction
+            .model_context_window,
+        Some(400_000)
+    );
+
+    let anthropic: Arc<dyn LlmProvider> = Arc::new(MockProvider::named("anthropic", vec![]));
+    agent.replace_provider(anthropic, "claude-opus-4-7".to_string());
+    assert_eq!(
+        agent
+            .config_snapshot()
+            .context_compaction
+            .model_context_window,
+        Some(200_000)
+    );
+}
+
+#[test]
+fn explicit_context_window_survives_model_switch() {
+    // An explicit override (squeezy.toml / SQUEEZY_CONTEXT_MODEL_CONTEXT_WINDOW)
+    // must win over registry derivation across a model switch (finding #1).
+    let openai: Arc<dyn LlmProvider> = Arc::new(MockProvider::named("openai", vec![]));
+    let mut config = AppConfig {
+        model: "gpt-5.5".to_string(),
+        ..AppConfig::default()
+    };
+    config.context_compaction.model_context_window = Some(123_456);
+    let mut agent = Agent::new(config, openai);
+    assert_eq!(
+        agent
+            .config_snapshot()
+            .context_compaction
+            .model_context_window,
+        Some(123_456)
+    );
+
+    let anthropic: Arc<dyn LlmProvider> = Arc::new(MockProvider::named("anthropic", vec![]));
+    agent.replace_provider(anthropic, "claude-opus-4-7".to_string());
+    assert_eq!(
+        agent
+            .config_snapshot()
+            .context_compaction
+            .model_context_window,
+        Some(123_456),
+        "explicit window override must not be clobbered by re-derivation"
+    );
 }
 
 /// Pin the hot-reload bridge between `PendingConfigSwap` and the MCP
@@ -8592,6 +8663,7 @@ async fn round_input_gate_compacts_then_proceeds_when_over_limit() {
         &probe_config,
         ContextCompactionTrigger::Auto,
         true,
+        0,
     )
     .expect("forced compaction must produce a report on the seed conversation");
     let compacted_floor = super::estimate_context(&probe_conversation).estimated_tokens;

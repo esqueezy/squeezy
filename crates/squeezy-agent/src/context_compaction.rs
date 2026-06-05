@@ -162,13 +162,7 @@ pub(crate) async fn maybe_compact_mid_turn(
     if !config.context_compaction.enabled_mid_turn {
         return None;
     }
-    let window = config.context_compaction.model_context_window?;
-    if window == 0 {
-        return None;
-    }
-    let threshold = window
-        .saturating_mul(config.context_compaction.threshold_percent.min(100) as u64)
-        .saturating_div(100);
+    let threshold = config.context_compaction.mid_turn_full_threshold()?;
     let observed =
         last_total_tokens.unwrap_or_else(|| estimate_context(conversation).estimated_tokens);
     if observed < threshold {
@@ -185,6 +179,9 @@ pub(crate) async fn maybe_compact_mid_turn(
         config,
         ContextCompactionTrigger::Auto,
         true,
+        // Forced mid-turn path shrinks via the `force` branch; overhead is
+        // already reflected in the provider-reported `last_total_tokens` gate.
+        0,
     )
     .await
 }
@@ -205,14 +202,26 @@ pub(crate) async fn maybe_compact_conversation(
     redactor: &Redactor,
     config: &AppConfig,
     trigger: ContextCompactionTrigger,
+    overhead_tokens: u64,
 ) -> Option<ContextCompactionReport> {
     if !config.context_compaction.enabled {
         return None;
     }
+    let cc = &config.context_compaction;
     let estimate = estimate_context(conversation);
-    if estimate.items < config.context_compaction.min_items
-        || estimate.estimated_tokens < config.context_compaction.estimated_tokens
-    {
+    // The conversation estimate omits the system instructions and tool
+    // schemas that ride along on every request; fold in the caller's measured
+    // request overhead so the gate reflects the real input size (finding #2).
+    let tokens = estimate.estimated_tokens.saturating_add(overhead_tokens);
+    // Window-aware ceiling: capped at the flat budget so large windows keep
+    // the deliberate 60K cost-thesis behavior while small windows no longer
+    // sit above their own window (findings #4/#6).
+    let ceiling = cc.post_turn_token_ceiling();
+    // A few but enormous items can dwarf the window while sitting under
+    // `min_items`; once over the high-water mark, bypass the item floor so
+    // they still compact proactively (finding #3).
+    let over_high_water = tokens >= cc.min_items_bypass_threshold();
+    if (estimate.items < cc.min_items && !over_high_water) || tokens < ceiling {
         return None;
     }
     compact_conversation_with_strategy(
@@ -226,10 +235,12 @@ pub(crate) async fn maybe_compact_conversation(
         config,
         trigger,
         false,
+        overhead_tokens,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compact_conversation(
     conversation: &mut Vec<LlmInputItem>,
     state: &mut ContextCompactionState,
@@ -238,9 +249,26 @@ pub(crate) fn compact_conversation(
     config: &AppConfig,
     trigger: ContextCompactionTrigger,
     force: bool,
+    overhead_tokens: u64,
 ) -> Option<ContextCompactionReport> {
     let before = estimate_context(conversation);
-    let keep = config.context_compaction.recent_items.max(1);
+    let mut keep = config.context_compaction.recent_items.max(1);
+    // Few-but-enormous (finding #3): with the default `recent_items` (10) a
+    // handful of huge items keeps everything verbatim and folds nothing, so the
+    // post-turn `min_items` bypass would be a no-op and — worse — a forced
+    // overflow/mid-turn retry could fail to shrink at all. When compaction is
+    // genuinely warranted (forced, or the conversation crossed the high-water
+    // mark) but `recent_items` would swallow the whole conversation, cap `keep`
+    // so a foldable older slice exists. Gated on `items <= keep` so larger
+    // conversations are untouched. The high-water check folds in the same
+    // request overhead the gate uses, so the two stay consistent. The
+    // `after.bytes >= before.bytes` guard below still declines a fold that
+    // cannot actually shrink.
+    let over_high_water = before.estimated_tokens.saturating_add(overhead_tokens)
+        >= config.context_compaction.min_items_bypass_threshold();
+    if (force || over_high_water) && before.items > 1 && before.items <= keep {
+        keep = (before.items / 2).max(1);
+    }
     if !force && before.items <= keep {
         return None;
     }
@@ -640,13 +668,15 @@ pub(crate) fn estimate_context(conversation: &[LlmInputItem]) -> ContextEstimate
         .fold(0usize, usize::saturating_add);
     ContextEstimate {
         bytes,
-        estimated_tokens: estimated_tokens(bytes),
+        estimated_tokens: estimated_tokens(bytes as u64),
         items: conversation.len(),
     }
 }
 
-fn estimated_tokens(bytes: usize) -> u64 {
-    bytes.saturating_add(3).saturating_div(4) as u64
+/// Byte → token heuristic (`bytes / 4`, rounding up). Shared so the post-turn
+/// gate's request-overhead conversion matches `estimate_context` exactly.
+pub(crate) fn estimated_tokens(bytes: u64) -> u64 {
+    bytes.saturating_add(3).saturating_div(4)
 }
 
 fn llm_item_estimated_bytes(item: &LlmInputItem) -> usize {
@@ -718,6 +748,7 @@ pub(crate) async fn compact_conversation_with_strategy(
     config: &AppConfig,
     trigger: ContextCompactionTrigger,
     force: bool,
+    overhead_tokens: u64,
 ) -> Option<ContextCompactionReport> {
     // Capture the prior compaction's summary BEFORE `compact_conversation`
     // overwrites `state.summary` with the new extractive blob. The
@@ -737,6 +768,7 @@ pub(crate) async fn compact_conversation_with_strategy(
         config,
         trigger,
         force,
+        overhead_tokens,
     )?;
     let strategy = config.context_compaction.strategy;
     if strategy == squeezy_core::CompactionStrategy::Extractive {
