@@ -3159,6 +3159,7 @@ fn request_turn_interrupt(app: &mut TuiApp) -> bool {
     }
     if let Some(pending) = app.pending_mcp_elicitation.take() {
         let _ = pending.response_tx.send(McpElicitationResponse::cancel());
+        clear_mcp_elicitation_seeded_input(app);
         interrupted = true;
     }
     if interrupted {
@@ -5702,12 +5703,14 @@ fn send_mcp_elicitation_response(
                 .response_tx
                 .send(McpElicitationResponse::accept(content));
             clear_input(app);
+            app.mcp_elicitation_seeded_input = None;
             app.status = format!("accepted mcp request from {server}");
             true
         }
         McpElicitationChoice::Decline => {
             let server = pending.request.server.clone();
             let _ = pending.response_tx.send(McpElicitationResponse::decline());
+            clear_mcp_elicitation_seeded_input(app);
             app.status = format!("declined mcp request from {server}");
             true
         }
@@ -5717,6 +5720,7 @@ fn send_mcp_elicitation_response(
 fn send_mcp_elicitation_cancel(app: &mut TuiApp, pending: PendingMcpElicitation) -> bool {
     let server = pending.request.server.clone();
     let _ = pending.response_tx.send(McpElicitationResponse::cancel());
+    clear_mcp_elicitation_seeded_input(app);
     app.status = format!("cancelled mcp request from {server}");
     true
 }
@@ -5759,17 +5763,29 @@ const MCP_ELICITATION_DECLINE: McpElicitationOption = McpElicitationOption {
     label: "Decline",
     hint: "deny request",
 };
+const MCP_ELICITATION_SCHEMA_MAX_LINES: usize = 24;
 
 fn mcp_elicitation_options() -> &'static [McpElicitationOption] {
     &[MCP_ELICITATION_ACCEPT, MCP_ELICITATION_DECLINE]
 }
 
 pub(crate) fn seed_mcp_elicitation_form_input(app: &mut TuiApp, request: &McpElicitationRequest) {
+    app.mcp_elicitation_seeded_input = None;
     if request.kind != McpElicitationKind::Form || !app.input.trim().is_empty() {
         return;
     }
-    app.input = mcp_elicitation_form_template(request.schema.as_ref());
+    let template = mcp_elicitation_form_template(request.schema.as_ref());
+    app.input = template.clone();
     app.input_cursor = app.input.len();
+    app.mcp_elicitation_seeded_input = Some(template);
+}
+
+pub(crate) fn clear_mcp_elicitation_seeded_input(app: &mut TuiApp) {
+    if let Some(seeded) = app.mcp_elicitation_seeded_input.take()
+        && app.input == seeded
+    {
+        clear_input(app);
+    }
 }
 
 fn mcp_elicitation_form_template(schema: Option<&serde_json::Value>) -> String {
@@ -6102,11 +6118,24 @@ fn format_mcp_elicitation_menu_lines(
                     Span::raw("  "),
                     Span::styled("schema", Style::default().fg(crate::render::theme::quiet())),
                 ]));
-                for line in schema.lines() {
+                let schema_lines = schema.lines().collect::<Vec<_>>();
+                for line in schema_lines.iter().take(MCP_ELICITATION_SCHEMA_MAX_LINES) {
                     lines.push(Line::from(vec![
                         Span::raw("  "),
                         Span::styled(
-                            line.to_string(),
+                            (*line).to_string(),
+                            Style::default().fg(crate::render::theme::quiet()),
+                        ),
+                    ]));
+                }
+                let omitted = schema_lines
+                    .len()
+                    .saturating_sub(MCP_ELICITATION_SCHEMA_MAX_LINES);
+                if omitted > 0 {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("... {omitted} schema lines omitted"),
                             Style::default().fg(crate::render::theme::quiet()),
                         ),
                     ]));
@@ -15333,6 +15362,7 @@ pub(crate) struct TuiApp {
     pub(crate) pending_approval: Option<PendingApproval>,
     pub(crate) approval_selection_index: usize,
     pub(crate) pending_mcp_elicitation: Option<PendingMcpElicitation>,
+    pub(crate) mcp_elicitation_seeded_input: Option<String>,
     pub(crate) pending_request_user_input: Option<PendingRequestUserInput>,
     /// Prompt that was in flight when the most recent turn was cancelled
     /// or failed. Surfaced via Ctrl+R so the user can recover from a
@@ -15712,6 +15742,7 @@ impl TuiApp {
             pending_approval: None,
             approval_selection_index: 0,
             pending_mcp_elicitation: None,
+            mcp_elicitation_seeded_input: None,
             pending_request_user_input: None,
             cancelled_prompt: None,
             last_turn_had_edits: false,

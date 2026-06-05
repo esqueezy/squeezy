@@ -316,6 +316,7 @@ impl TuiHarness {
         let (response_tx, response_rx) = oneshot::channel();
         if let Some(previous) = self.app.pending_mcp_elicitation.take() {
             let _ = previous.response_tx.send(McpElicitationResponse::cancel());
+            crate::clear_mcp_elicitation_seeded_input(&mut self.app);
         }
         self.app.status = format_mcp_elicitation_status_line(&request);
         self.app.mcp_elicitation_selection_index = 0;
