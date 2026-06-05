@@ -7163,21 +7163,53 @@ fn accounting_block_dispatch_skips_unrelated_system_messages() {
 
 #[test]
 fn context_snapshot_stays_expanded_in_compact_transcript() {
+    use squeezy_agent::{
+        AttachmentShape, ConversationShape, SessionAccountingSnapshot, TranscriptShape,
+    };
+    use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
+    use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
+
     let mut config = test_config(SessionMode::Build);
     config.tui.transcript_default = TranscriptDefault::Compact;
     let mut app = test_app_with_config(&config, SessionMode::Build);
-    let body = std::iter::once("Context window".to_string())
-        .chain((0..30).map(|index| format!("source_{index}=tokens")))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let estimate = RequestTokenEstimate {
+        input_tokens: 123_456,
+        context_window_tokens: Some(400_000),
+        effective_context_window_tokens: Some(368_000),
+        headroom_tokens: Some(32_000),
+        max_output_tokens: Some(64_000),
+        input_budget_tokens: Some(304_000),
+        remaining_input_tokens: Some(180_544),
+        used_input_percent_x100: Some(30_86),
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        estimated: true,
+    };
+    let snapshot = SessionAccountingSnapshot {
+        session_id: Some("sess-context".to_string()),
+        provider: "openai",
+        model: squeezy_core::DEFAULT_OPENAI_MODEL.to_string(),
+        mode: SessionMode::Build,
+        store_responses: false,
+        previous_response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: SessionMetrics::default(),
+        redactions: 0,
+        transcript: TranscriptShape::default(),
+        conversation: ConversationShape::default(),
+        attachments: AttachmentShape::default(),
+        transmitted_request: estimate,
+        full_history_request: estimate,
+    };
+    let body = commands::format_context_command(&snapshot);
 
     app.push_transcript_item(TranscriptItem::system(body));
     let output = render_to_string(&app, 120, 40);
 
     assert!(output.contains("Context window"), "{output}");
-    assert!(output.contains("source_25=tokens"), "{output}");
+    assert!(output.contains("Consumption by source"), "{output}");
+    assert!(output.contains("remaining:"), "{output}");
     assert!(
-        !output.contains("Context window …"),
+        !output.contains("for full transcript"),
         "explicit /context output should not collapse to a summary: {output}"
     );
 }

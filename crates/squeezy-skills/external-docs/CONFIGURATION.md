@@ -61,10 +61,10 @@ TUI.
 
 ## Agent Behavior
 
-`[agent].exploration_compiler` defaults to `true`. When enabled, common
+`[agent].exploration_graph` defaults to `true`. When enabled, common
 navigation prompts are classified before the first model request and routed
 through deterministic graph-backed tool plans. The equivalent environment
-override is `SQUEEZY_EXPLORATION_COMPILER=off` or `false` to disable it for a
+override is `SQUEEZY_EXPLORATION_GRAPH=off` or `false` to disable it for a
 run, for example when comparing planner-on and planner-off harness metrics.
 
 ## Turn Routing
@@ -116,7 +116,7 @@ commented examples so that built-in defaults can evolve over time:
 # selection_version = 1
 
 [agent]
-# exploration_compiler = true
+# exploration_graph = true
 
 [routing]
 # enabled = true          # master switch (same as `/router on|off`)
@@ -252,7 +252,7 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 # max_tool_result_bytes_per_round = 50000
 
 [agent]
-# exploration_compiler = true
+# exploration_graph = true
 
 [session]
 # mode = "build"

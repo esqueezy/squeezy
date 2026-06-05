@@ -74,8 +74,8 @@ The TUI supports local commands for common work without requiring a model turn:
 - `/feedback`, `/report`: prepare consented maintainer feedback or bug reports.
 - `/tasks`, `/task <id>`, `/task-cancel <id>`: inspect and cancel background
   tasks.
-- `/effort`, `/cheap`, `/parent`, `/verbosity`, `/tool-verbosity`: local model
-  and display controls.
+- `/effort`, `/cheap`, `/parent`, `/tool-verbosity`: local model and display
+  controls.
 - `/checkpoints`, `/checkpoint <id>`, `/undo`, `/revert-turn <id>`:
   available when checkpointing is enabled.
 - `/router [on|off]`: toggle cheap-model turn routing for the session; without
@@ -83,7 +83,6 @@ The TUI supports local commands for common work without requiring a model turn:
 - `/theme [name]`: switch the TUI color theme. Built-in themes: `default`,
   `bright`, `fun`, `catppuccin`, `high-contrast`. Use `/theme default` to
   reset.
-- `/spinner [name]`: set the working-status spinner.
 - `/reviewer`: show recent AI reviewer auto-decisions.
 - `/statusline`: configure the custom status line footer.
 - `/keymap`: list current key bindings.

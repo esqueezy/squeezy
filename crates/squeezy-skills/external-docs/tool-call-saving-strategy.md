@@ -139,7 +139,7 @@ model-facing tool output compact enough to be useful.
 - `SQUEEZY_MAX_TOOL_BYTES_READ_PER_TURN` controls the per-turn read-byte cap.
 - `SQUEEZY_MAX_SEARCH_FILES_PER_TURN` controls the per-turn search file-scan
   cap.
-- `SQUEEZY_EXPLORATION_COMPILER=off` disables the deterministic graph-first
+- `SQUEEZY_EXPLORATION_GRAPH=off` disables the deterministic graph-first
   planner for comparison runs or debugging. It is enabled by default.
 - `SQUEEZY_WEB_PERMISSION` controls the allow/ask/deny policy for `websearch`
   and `webfetch`. The default is `ask`.

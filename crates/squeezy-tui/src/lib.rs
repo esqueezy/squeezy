@@ -9142,17 +9142,6 @@ fn format_message_entry_with_width(
         color
     };
     let content_style = message_content_style(&item.role);
-    if collapsed {
-        return vec![action_line_styled(
-            selected,
-            "• ",
-            label_color,
-            action,
-            action_color,
-            collapsed_content_summary(&item.content, transcript_shortcut),
-            content_style,
-        )];
-    }
     if item.role == Role::System
         && !failed
         && let Some(lines) = format_ansi_system_entry(
@@ -9165,6 +9154,17 @@ fn format_message_entry_with_width(
         )
     {
         return lines;
+    }
+    if collapsed {
+        return vec![action_line_styled(
+            selected,
+            "• ",
+            label_color,
+            action,
+            action_color,
+            collapsed_content_summary(&item.content, transcript_shortcut),
+            content_style,
+        )];
     }
     action_text_lines_styled(
         selected,
