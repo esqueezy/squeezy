@@ -1112,6 +1112,8 @@ impl McpClientRegistry {
                         .iter()
                         .map(|template| template.to_string())
                         .collect(),
+                    resource_uris_complete: true,
+                    resource_templates_complete: true,
                     fetched_at: Instant::now(),
                 },
             );
@@ -1337,14 +1339,21 @@ impl McpClientRegistry {
         let resources_result = self
             .all_resources(server_name, server, cancel.clone())
             .await;
+        let resources = resources_result.as_ref().map(Vec::as_slice).unwrap_or(&[]);
+        if let Ok(resources) = &resources_result {
+            self.store_resource_declarations_partial(server_name, Some(resources), None);
+            if resources.iter().any(|resource| resource.raw.uri == uri) {
+                return Ok(true);
+            }
+        }
+
         let templates_result = self
             .all_resource_templates(server_name, server, cancel)
             .await;
-        let resources = resources_result.as_ref().map(Vec::as_slice).unwrap_or(&[]);
         let templates = templates_result.as_ref().map(Vec::as_slice).unwrap_or(&[]);
 
-        if let (Ok(resources), Ok(templates)) = (&resources_result, &templates_result) {
-            self.store_resource_declarations(server_name, resources, templates);
+        if let Ok(templates) = &templates_result {
+            self.store_resource_declarations_partial(server_name, None, Some(templates));
         }
 
         Ok(resources.iter().any(|resource| resource.raw.uri == uri)
@@ -1362,36 +1371,51 @@ impl McpClientRegistry {
             cache.remove(server_name);
             return None;
         }
-        Some(
-            cached.resource_uris.contains(uri)
-                || cached
-                    .resource_templates
-                    .iter()
-                    .any(|template| uri_matches_template(uri, template)),
-        )
+        if cached.resource_uris.contains(uri)
+            || cached
+                .resource_templates
+                .iter()
+                .any(|template| uri_matches_template(uri, template))
+        {
+            return Some(true);
+        }
+        if cached.resource_uris_complete && cached.resource_templates_complete {
+            return Some(false);
+        }
+        None
     }
 
-    fn store_resource_declarations(
+    fn store_resource_declarations_partial(
         &self,
         server_name: &str,
-        resources: &[Resource],
-        templates: &[rmcp::model::ResourceTemplate],
+        resources: Option<&[Resource]>,
+        templates: Option<&[rmcp::model::ResourceTemplate]>,
     ) {
         if let Ok(mut cache) = self.resource_declarations.lock() {
-            cache.insert(
-                server_name.to_string(),
+            let entry = cache.entry(server_name.to_string()).or_insert_with(|| {
                 CachedResourceDeclarations {
-                    resource_uris: resources
-                        .iter()
-                        .map(|resource| resource.raw.uri.clone())
-                        .collect(),
-                    resource_templates: templates
-                        .iter()
-                        .map(|template| template.raw.uri_template.clone())
-                        .collect(),
+                    resource_uris: BTreeSet::new(),
+                    resource_templates: Vec::new(),
+                    resource_uris_complete: false,
+                    resource_templates_complete: false,
                     fetched_at: Instant::now(),
-                },
-            );
+                }
+            });
+            if let Some(resources) = resources {
+                entry.resource_uris = resources
+                    .iter()
+                    .map(|resource| resource.raw.uri.clone())
+                    .collect();
+                entry.resource_uris_complete = true;
+            }
+            if let Some(templates) = templates {
+                entry.resource_templates = templates
+                    .iter()
+                    .map(|template| template.raw.uri_template.clone())
+                    .collect();
+                entry.resource_templates_complete = true;
+            }
+            entry.fetched_at = Instant::now();
         }
     }
 }
@@ -1418,6 +1442,8 @@ struct CachedResourceRead {
 struct CachedResourceDeclarations {
     resource_uris: BTreeSet<String>,
     resource_templates: Vec<String>,
+    resource_uris_complete: bool,
+    resource_templates_complete: bool,
     fetched_at: Instant,
 }
 

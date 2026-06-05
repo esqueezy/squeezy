@@ -1419,6 +1419,37 @@ async fn resource_declaration_cache_satisfies_gate_without_enumerating() {
 }
 
 #[test]
+fn partial_resource_declaration_cache_does_not_deny_templates() {
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    let resources = vec![Resource {
+        raw: rmcp::model::RawResource {
+            uri: "file:///a.txt".to_string(),
+            name: "a.txt".to_string(),
+            title: None,
+            description: None,
+            mime_type: None,
+            size: None,
+            icons: None,
+            meta: None,
+        },
+        annotations: None,
+    }];
+
+    registry.store_resource_declarations_partial("docs", Some(&resources), None);
+
+    assert_eq!(
+        registry.cached_resource_declarations_match("docs", "file:///a.txt"),
+        Some(true),
+        "resources-only cache should answer exact positives"
+    );
+    assert_eq!(
+        registry.cached_resource_declarations_match("docs", "docs://api/openai/codex"),
+        None,
+        "resources-only cache must not become a negative cache for templates"
+    );
+}
+
+#[test]
 fn resource_list_changed_notification_evicts_declaration_cache() {
     let registry = McpClientRegistry::new(BTreeMap::new());
     registry.seed_resource_declarations_for_test("docs", &["file:///a.txt"], &[]);
