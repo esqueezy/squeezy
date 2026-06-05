@@ -89,13 +89,13 @@ pub use dispatch::{
 };
 
 use cancel::{CancelErr, OrCancelExt};
+#[cfg(test)]
+use context_compaction::build_compaction_summary;
 use context_compaction::{
-    PendingToolResult, SeenToolOutputs, compact_conversation_with_strategy,
+    PendingToolResult, SeenToolOutputs, compact_conversation, compact_conversation_with_strategy,
     drop_orphan_function_call_outputs, estimate_context, maybe_compact_conversation,
     maybe_compact_mid_turn, next_context_pin_id, pack_tool_results, repair_orphan_function_calls,
 };
-#[cfg(test)]
-use context_compaction::{build_compaction_summary, compact_conversation};
 use cost_broker::{
     CostBroker, format_cap_reached_reason, format_pressure_gate_reason,
     format_round_input_gate_reason, llm_request_input_bytes, round_input_gate_status,
@@ -5604,6 +5604,66 @@ impl TurnRuntime {
         log_observational_results("PostCompact", self.turn_id, &results);
     }
 
+    async fn try_provider_context_overflow_compaction(
+        &self,
+        conversation: &mut Vec<LlmInputItem>,
+        context_compaction: &mut ContextCompactionState,
+        active_attachments: &[ContextAttachment],
+        previous_response_id: &mut Option<String>,
+        next_input: &mut Vec<LlmInputItem>,
+    ) -> bool {
+        let pre_estimate = estimate_context(conversation).estimated_tokens;
+        self.dispatch_pre_compact(pre_estimate);
+        let Some(report) = compact_conversation_with_strategy(
+            conversation,
+            context_compaction,
+            active_attachments,
+            self.store.as_deref(),
+            &self.provider,
+            self.session_log.as_ref(),
+            &self.redactor,
+            &self.config,
+            ContextCompactionTrigger::Auto,
+            true,
+        )
+        .await
+        else {
+            return false;
+        };
+
+        self.dispatch_post_compact(
+            report.record.before.estimated_tokens,
+            report.record.after.estimated_tokens,
+        );
+        self.log_event(
+            "context_compacted",
+            Some(self.turn_id),
+            Some(format!(
+                "provider overflow compacted gen={} {}->{} estimated tokens",
+                report.record.generation,
+                report.record.before.estimated_tokens,
+                report.record.after.estimated_tokens,
+            )),
+            json!({
+                "record": report.record,
+                "summary": report.summary,
+                "replacement_id": report.record.replacement_id,
+                "conversation": report.post_compact,
+                "phase": "provider_context_overflow",
+            }),
+        );
+        let _ = self
+            .tx
+            .send(AgentEvent::ContextCompacted {
+                turn_id: self.turn_id,
+                report,
+            })
+            .await;
+        *previous_response_id = None;
+        *next_input = conversation.clone();
+        true
+    }
+
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
         // Open a per-turn span so all events emitted during this turn carry
         // the same span_id. `begin_turn` returns None when telemetry is
@@ -6050,7 +6110,7 @@ impl TurnRuntime {
                         call_id: pending.result.call_id,
                         output,
                         content_parts: None,
-                        is_error: false,
+                        is_error: tool_status_is_model_error(pending.result.status),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -6207,6 +6267,7 @@ impl TurnRuntime {
         }
         let mut escalation_state = turn_router::EscalationState::default();
         let mut cheap_provider_error_retry_used = false;
+        let mut context_overflow_retry_used = false;
         let mut routing_diversity_results_seen = 0u64;
         let mut routing_diversity_paths = BTreeSet::new();
         for round in 0..MAX_TOOL_ROUNDS {
@@ -6516,6 +6577,7 @@ impl TurnRuntime {
                 ..LlmRequest::default()
             };
             let request_model = Arc::clone(&request.model);
+            let mut effective_model = Arc::clone(&request_model);
             let request_input_bytes = llm_request_input_bytes(&request);
             self.record_replay_request(&request);
             let mut stream = self
@@ -6547,6 +6609,7 @@ impl TurnRuntime {
             let mut round_output_bytes: u64 = 0;
 
             let mut provider_stream_error = None;
+            let mut context_overflow_seen = false;
             loop {
                 let Some(event) = (match next_llm_stream_event(
                     &mut stream,
@@ -6582,7 +6645,7 @@ impl TurnRuntime {
                     self.fold_partial_cancel_cost(
                         &mut total_cost,
                         &mut broker,
-                        request_model.as_ref(),
+                        effective_model.as_ref(),
                         request_input_bytes,
                         round_output_bytes,
                     )
@@ -6831,7 +6894,7 @@ impl TurnRuntime {
                     } => {
                         if cost.estimated_usd_micros.is_none() {
                             cost.estimated_usd_micros =
-                                estimate_cost(self.provider.name(), &request_model, &cost);
+                                estimate_cost(self.provider.name(), &effective_model, &cost);
                         }
                         let warning = broker.record_provider_cost(&cost);
                         if broker.note_unenforceable_cap_round(&cost) {
@@ -6840,7 +6903,7 @@ impl TurnRuntime {
                                 .send(AgentEvent::CostCapUnenforceable {
                                     turn_id: self.turn_id,
                                     provider: self.provider.name().to_string(),
-                                    model: request_model.to_string(),
+                                    model: effective_model.to_string(),
                                 })
                                 .await;
                         }
@@ -6890,7 +6953,7 @@ impl TurnRuntime {
                         self.fold_partial_cancel_cost(
                             &mut total_cost,
                             &mut broker,
-                            request_model.as_ref(),
+                            effective_model.as_ref(),
                             request_input_bytes,
                             round_output_bytes,
                         )
@@ -6905,7 +6968,12 @@ impl TurnRuntime {
                         .await;
                         return Ok(());
                     }
-                    LlmEvent::ContextOverflow { .. } | LlmEvent::ServerModel(_) => {}
+                    LlmEvent::ContextOverflow { .. } => {
+                        context_overflow_seen = true;
+                    }
+                    LlmEvent::ServerModel(model) => {
+                        effective_model = Arc::from(model);
+                    }
                     // Known additive variants the main loop intentionally
                     // does not act on yet. `Citation` (OpenAI annotations /
                     // xAI Live Search sources) has no transcript recording
@@ -6924,6 +6992,26 @@ impl TurnRuntime {
             }
 
             if let Some(error) = provider_stream_error {
+                if context_overflow_seen
+                    && !context_overflow_retry_used
+                    && round_output_bytes == 0
+                    && tool_calls.is_empty()
+                    && !round_text_started
+                {
+                    context_overflow_retry_used = true;
+                    if self
+                        .try_provider_context_overflow_compaction(
+                            &mut conversation,
+                            &mut context_compaction,
+                            &active_attachments,
+                            &mut previous_response_id,
+                            &mut next_input,
+                        )
+                        .await
+                    {
+                        continue;
+                    }
+                }
                 if on_cheap_turn
                     && !cheap_provider_error_retry_used
                     && round_output_bytes == 0
@@ -6987,7 +7075,7 @@ impl TurnRuntime {
                 self.fold_partial_cancel_cost(
                     &mut total_cost,
                     &mut broker,
-                    request_model.as_ref(),
+                    effective_model.as_ref(),
                     request_input_bytes,
                     round_output_bytes,
                 )
@@ -7086,6 +7174,26 @@ impl TurnRuntime {
             // and future compaction-retry logic can hook in here without
             // touching every provider. `EndTurn` and `ToolUse` fall
             // through to the existing tool-calls / completion logic.
+            if matches!(stop_reason, Some(StopReason::ContextWindowExceeded))
+                && !context_overflow_retry_used
+                && round_output_bytes == 0
+                && tool_calls.is_empty()
+                && !round_text_started
+            {
+                context_overflow_retry_used = true;
+                if self
+                    .try_provider_context_overflow_compaction(
+                        &mut conversation,
+                        &mut context_compaction,
+                        &active_attachments,
+                        &mut previous_response_id,
+                        &mut next_input,
+                    )
+                    .await
+                {
+                    continue;
+                }
+            }
             match &stop_reason {
                 Some(StopReason::MaxTokens) => {
                     if let Some(tail) = self
@@ -7513,7 +7621,7 @@ impl TurnRuntime {
                         call_id: pending.result.call_id,
                         output,
                         content_parts: None,
-                        is_error: false,
+                        is_error: tool_status_is_model_error(status),
                     };
                     (item, tool_name, status)
                 })
@@ -9815,8 +9923,11 @@ async fn run_subagent_rounds(
     // returns `None` on providers without `prompt_caching`, leaving them
     // unchanged.
     let subagent_cache_key = subagent_prompt_cache_key(parent);
-    for round in 0..config.subagents.max_model_rounds {
+    let mut context_overflow_retry_used = false;
+    let mut context_compaction = ContextCompactionState::default();
+    'rounds: for round in 0..config.subagents.max_model_rounds {
         let request_model: Arc<str> = Arc::from(config.model.as_str());
+        let mut effective_model = Arc::clone(&request_model);
         // P1.3 fail-soft subagent input-token guard. Reuses the EXISTING
         // `max_round_input_tokens` ceiling (the same pre-flight gate the
         // parent loop applies) instead of inventing a new cap. When the
@@ -9895,6 +10006,7 @@ async fn run_subagent_rounds(
             .stream_response(llm_request, parent.cancel.child_token());
         let mut tool_calls = Vec::new();
         let mut completed = false;
+        let mut context_overflow_seen = false;
         loop {
             let event = match next_llm_stream_event(
                 &mut stream,
@@ -9906,6 +10018,22 @@ async fn run_subagent_rounds(
                 Ok(Some(event)) => event,
                 Ok(None) => break,
                 Err(error) => {
+                    if context_overflow_seen
+                        && !context_overflow_retry_used
+                        && compact_conversation(
+                            conversation,
+                            &mut context_compaction,
+                            &[],
+                            None,
+                            config,
+                            ContextCompactionTrigger::Auto,
+                            true,
+                        )
+                        .is_some()
+                    {
+                        context_overflow_retry_used = true;
+                        continue 'rounds;
+                    }
                     broker.metrics.redactions += assistant_stream.total_redactions();
                     return SubagentExecution {
                         status: ToolStatus::Error,
@@ -9938,10 +10066,47 @@ async fn run_subagent_rounds(
                         arguments: tool_call.arguments,
                     });
                 }
-                LlmEvent::Completed { mut cost, .. } => {
+                LlmEvent::Completed {
+                    mut cost,
+                    stop_reason,
+                    ..
+                } => {
+                    if matches!(stop_reason, Some(StopReason::ContextWindowExceeded)) {
+                        if !context_overflow_retry_used
+                            && compact_conversation(
+                                conversation,
+                                &mut context_compaction,
+                                &[],
+                                None,
+                                config,
+                                ContextCompactionTrigger::Auto,
+                                true,
+                            )
+                            .is_some()
+                        {
+                            context_overflow_retry_used = true;
+                            continue 'rounds;
+                        }
+                        broker.metrics.redactions += assistant_stream.total_redactions();
+                        return SubagentExecution {
+                            status: ToolStatus::Error,
+                            summary: String::new(),
+                            status_label: "context_overflow",
+                            error: Some(
+                                "subagent model reported the context window was exceeded"
+                                    .to_string(),
+                            ),
+                            metrics: broker.metrics.clone(),
+                            supporting_receipts: std::mem::take(supporting_receipts),
+                            model,
+                            structured_output: None,
+                            files_touched: Vec::new(),
+                            transcript: Vec::new(),
+                        };
+                    }
                     if cost.estimated_usd_micros.is_none() {
                         cost.estimated_usd_micros =
-                            estimate_cost(parent.provider.name(), &request_model, &cost);
+                            estimate_cost(parent.provider.name(), &effective_model, &cost);
                     }
                     broker.metrics.record_provider(&cost);
                     completed = true;
@@ -9962,7 +10127,12 @@ async fn run_subagent_rounds(
                         transcript: Vec::new(),
                     };
                 }
-                LlmEvent::ContextOverflow { .. } | LlmEvent::ServerModel(_) => {}
+                LlmEvent::ContextOverflow { .. } => {
+                    context_overflow_seen = true;
+                }
+                LlmEvent::ServerModel(model) => {
+                    effective_model = Arc::from(model);
+                }
                 // Known additive variants the subagent loop does not act on:
                 // `Refusal` text and `Citation` sources have no sink here
                 // (the subagent only accumulates assistant text + tool
@@ -10085,7 +10255,7 @@ async fn run_subagent_rounds(
                 call_id: pending.result.call_id,
                 output,
                 content_parts: None,
-                is_error: false,
+                is_error: tool_status_is_model_error(pending.result.status),
             }
         }));
     }
@@ -11020,6 +11190,10 @@ fn redact_task_state(mut snapshot: TaskStateSnapshot, redactor: &Redactor) -> Ta
         .map(|value| redactor.redact(&value).text)
         .collect();
     snapshot.normalized()
+}
+
+fn tool_status_is_model_error(status: ToolStatus) -> bool {
+    !matches!(status, ToolStatus::Success)
 }
 
 fn control_tool_result(call: &ToolCall, status: ToolStatus, content: Value) -> ToolResult {

@@ -2953,6 +2953,7 @@ pub enum ProviderKind {
     CloudflareAiGateway,
     OpenAiCompatible,
     OpenAiCodex,
+    GitHubCopilot,
     /// In-process faux provider used by the eval harness and tests.
     /// Reported alongside the real provider kinds so telemetry stays
     /// honest about which sessions touched the network and which ran
@@ -2971,6 +2972,7 @@ impl ProviderKind {
             ProviderConfig::Bedrock(_) => Self::Bedrock,
             ProviderConfig::Ollama(_) => Self::Ollama,
             ProviderConfig::OpenAiCodex(_) => Self::OpenAiCodex,
+            ProviderConfig::GitHubCopilot(_) => Self::GitHubCopilot,
             ProviderConfig::OpenAiCompatible(config) => match config.preset {
                 OpenAiCompatiblePreset::OpenRouter => Self::OpenRouter,
                 OpenAiCompatiblePreset::Vercel => Self::Vercel,

@@ -597,6 +597,39 @@ fn cli_session_dir_parses_value_as_pathbuf() {
 // files; serialize the precedence tests below so they don't race each other
 // or other env-mutating tests in this module.
 static SESSION_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static NONEMPTY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn env_var_is_nonempty_treats_blank_values_as_unset() {
+    let _guard = NONEMPTY_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key = "SQUEEZY_TEST_NONEMPTY_ENV";
+    let previous = env::var_os(key);
+    // SAFETY: NONEMPTY_ENV_LOCK serializes mutations for this key in this
+    // module.
+    unsafe {
+        env::remove_var(key);
+    }
+    assert!(!env_var_is_nonempty(key));
+
+    unsafe {
+        env::set_var(key, "   ");
+    }
+    assert!(!env_var_is_nonempty(key));
+
+    unsafe {
+        env::set_var(key, "configured");
+    }
+    assert!(env_var_is_nonempty(key));
+
+    unsafe {
+        match previous {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
+        }
+    }
+}
 
 /// Point `HOME` and `SQUEEZY_SESSION_DIR` at known values inside a single
 /// guarded section, then restore the previous environment when the returned
