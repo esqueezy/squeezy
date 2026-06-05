@@ -123,6 +123,7 @@ pub use subagent_catalog::{
 // Emergency belt on tool rounds per turn. 200 keeps a true safety
 // ceiling without truncating legitimate long-running exploration.
 const MAX_TOOL_ROUNDS: usize = 200;
+const MAX_PAUSE_TURN_REISSUES: usize = 2;
 const MAX_CONTROL_ONLY_TOOL_ROUNDS: usize = 2;
 const LOCAL_SHELL_TIMEOUT_MS: u64 = 10_000;
 const LOCAL_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
@@ -2553,6 +2554,12 @@ impl Agent {
             )),
             input: Arc::from(input),
             max_output_tokens: self.config.max_output_tokens,
+            temperature: self.config.temperature,
+            top_p: self.config.top_p,
+            seed: self.config.seed,
+            stop: self.config.stop.clone(),
+            frequency_penalty: self.config.frequency_penalty,
+            presence_penalty: self.config.presence_penalty,
             response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
             reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
             previous_response_id: if include_response_state {
@@ -4087,13 +4094,15 @@ impl Agent {
         let monitor_redactor = redactor.clone();
         let monitor_cancel = cancel.clone();
         let turn_handle = spawn_observed_turn(
-            turn_id,
-            turn_done.clone(),
-            panic_tx,
-            panic_session_log,
-            panic_redactor,
-            panic_telemetry,
-            active_turn.clone(),
+            ObservedTurnContext {
+                turn_id,
+                done: turn_done.clone(),
+                tx: panic_tx,
+                session_log: panic_session_log,
+                redactor: panic_redactor,
+                telemetry: panic_telemetry,
+                active_turn: active_turn.clone(),
+            },
             async move {
                 let redacted_input = redactor.redact(&input);
                 let redacted_display_input = if display_input == input {
@@ -4338,8 +4347,7 @@ fn active_turn_is_current(
         .is_some_and(|active| active.turn_id == turn_id)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_observed_turn<F>(
+struct ObservedTurnContext {
     turn_id: TurnId,
     done: Arc<Notify>,
     tx: mpsc::Sender<AgentEvent>,
@@ -4347,11 +4355,21 @@ fn spawn_observed_turn<F>(
     redactor: Arc<Redactor>,
     telemetry: TelemetryClient,
     active_turn: Arc<StdMutex<Option<ActiveTurn>>>,
-    future: F,
-) -> tokio::task::JoinHandle<()>
+}
+
+fn spawn_observed_turn<F>(context: ObservedTurnContext, future: F) -> tokio::task::JoinHandle<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    let ObservedTurnContext {
+        turn_id,
+        done,
+        tx,
+        session_log,
+        redactor,
+        telemetry,
+        active_turn,
+    } = context;
     tokio::spawn(async move {
         let outcome = AssertUnwindSafe(future).catch_unwind().await;
         if outcome.is_err() {
@@ -6292,6 +6310,7 @@ impl TurnRuntime {
         // one retry per turn to prevent infinite loops if the model
         // ignores the nudge.
         let mut replan_retry_used = false;
+        let mut pause_turn_reissues = 0usize;
         // Per-turn model routing decision. The classifier runs once at
         // the top of the turn; `current_model` is what each round
         // dispatches on. On mid-turn escalation it is overwritten with
@@ -6683,6 +6702,12 @@ impl TurnRuntime {
                 instructions: Arc::from(cached_instructions),
                 input: Arc::from(next_input.as_slice()),
                 max_output_tokens: self.config.max_output_tokens,
+                temperature: self.config.temperature,
+                top_p: self.config.top_p,
+                seed: self.config.seed,
+                stop: self.config.stop.clone(),
+                frequency_penalty: self.config.frequency_penalty,
+                presence_penalty: self.config.presence_penalty,
                 response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
                 reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
                 previous_response_id: previous_response_id.clone(),
@@ -7418,23 +7443,39 @@ impl TurnRuntime {
                 // Anthropic `pause_turn`: the model voluntarily paused
                 // mid-turn (typically a hosted tool still processing) and
                 // expects the caller to re-issue with the partial state.
-                // Full re-issue-with-partial-state handling is deferred —
-                // wiring it risks an unbounded re-issue loop without a
-                // dedicated guard. For now, when the pause carried tool
-                // calls we fall through to the normal tool-execution path
-                // below (results feed the next round, the closest safe
-                // approximation of re-issue). When it carried nothing
-                // actionable we surface an explicit failure rather than
-                // letting it masquerade as a clean `EndTurn`, so the user
-                // is not left staring at a silently truncated turn.
-                // TODO: implement true pause_turn re-issue with a bounded
-                // retry guard once the partial-state replay path lands.
+                // When the pause carried local tool calls we fall through
+                // to the normal tool-execution path below; otherwise retry
+                // the partial conversation a small bounded number of times
+                // before surfacing a clear failure.
                 Some(StopReason::PauseTurn) if tool_calls.is_empty() => {
                     if let Some(tail) = self
                         .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
                         .await
                     {
                         self.record_replay_model_text_delta(&tail);
+                    }
+                    self.record_replay_model_completed(response_id.clone(), &completed_cost);
+                    broker.metrics.redactions += assistant_stream.total_redactions();
+                    if pause_turn_reissues < MAX_PAUSE_TURN_REISSUES {
+                        pause_turn_reissues += 1;
+                        let raw_assistant_text = std::mem::take(&mut assistant_message);
+                        if !raw_assistant_text.is_empty() {
+                            conversation.push(redact_input_item(
+                                LlmInputItem::AssistantText(raw_assistant_text.clone()),
+                                &self.redactor,
+                            ));
+                        }
+                        previous_response_id = None;
+                        next_input = conversation.clone();
+                        tracing::debug!(
+                            target: "squeezy_agent::pause_turn_reissue",
+                            round,
+                            pause_turn_reissues,
+                            max_pause_turn_reissues = MAX_PAUSE_TURN_REISSUES,
+                            partial_assistant_chars = raw_assistant_text.chars().count(),
+                            "reissuing paused provider turn with partial conversation"
+                        );
+                        continue;
                     }
                     self.stamp_routing_savings(&mut broker.metrics);
                     self.publish_terminal_task_state(
@@ -7448,7 +7489,7 @@ impl TurnRuntime {
                         .send(AgentEvent::Failed {
                             turn_id: self.turn_id,
                             error: SqueezyError::Agent(
-                                "model paused the turn (pause_turn) without an actionable continuation; re-issue handling is not yet implemented — retry the turn".to_string(),
+                                "model paused the turn (pause_turn) without an actionable continuation after bounded re-issue; retry the turn".to_string(),
                             ),
                         })
                         .await;
@@ -10128,6 +10169,12 @@ async fn run_subagent_rounds(
             instructions: Arc::from(instructions),
             input: Arc::from(conversation.as_slice()),
             max_output_tokens: config.max_output_tokens,
+            temperature: config.temperature,
+            top_p: config.top_p,
+            seed: config.seed,
+            stop: config.stop.clone(),
+            frequency_penalty: config.frequency_penalty,
+            presence_penalty: config.presence_penalty,
             response_verbosity: request_response_verbosity(config, parent.provider.name()),
             reasoning_effort: request_reasoning_effort(config, parent.provider.name()),
             previous_response_id: None,

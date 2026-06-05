@@ -106,6 +106,7 @@ pub(crate) fn save_inline_provider_api_key(
         return;
     }
 
+    state.effective.refresh_config_warnings();
     agent.arm_config_swap(PendingConfigSwap {
         config: state.effective.clone(),
         provider: new_provider,
@@ -689,6 +690,8 @@ fn telemetry_value_bucket(field: &'static FieldMeta, value: &FieldValue) -> Stri
         FieldValue::Integer(value) => integer_bucket(*value),
         FieldValue::OptionalInteger(Some(value)) => integer_bucket(*value),
         FieldValue::OptionalInteger(None) => "integer_none".to_string(),
+        FieldValue::OptionalFloat(Some(_)) => "float_set".to_string(),
+        FieldValue::OptionalFloat(None) => "float_none".to_string(),
         FieldValue::Enum(value) | FieldValue::OptionalEnum(Some(value)) => {
             if field.toml_path == ["model", "model"] {
                 "model_custom".to_string()
@@ -784,6 +787,7 @@ fn apply_by_tier(
     outcome: &WriteOutcome,
     silent: bool,
 ) {
+    state.effective.refresh_config_warnings();
     let path_str = outcome.path.display().to_string();
     match field.tier {
         ApplyTier::Immediate => {
@@ -901,6 +905,8 @@ fn field_edit(field: &'static FieldMeta, value: &FieldValue) -> SettingsEdit {
         (_, FieldValue::Integer(v)) => EditOp::SetInteger(*v),
         (_, FieldValue::OptionalInteger(Some(v))) => EditOp::SetInteger(*v),
         (_, FieldValue::OptionalInteger(None)) => EditOp::Unset,
+        (_, FieldValue::OptionalFloat(Some(v))) => EditOp::SetFloat(*v),
+        (_, FieldValue::OptionalFloat(None)) => EditOp::Unset,
         (_, FieldValue::Enum(s)) => EditOp::SetString((*s).to_string()),
         (_, FieldValue::OptionalEnum(Some(s))) => EditOp::SetString((*s).to_string()),
         (_, FieldValue::OptionalEnum(None)) => EditOp::Unset,

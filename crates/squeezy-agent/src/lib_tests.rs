@@ -1661,6 +1661,12 @@ async fn parallel_tool_calls_config_flows_into_dispatched_request() {
         let config = AppConfig {
             parallel_tool_calls: parallel,
             batch_tool_calls_hint: hint,
+            temperature: Some(0.2),
+            top_p: Some(0.75),
+            seed: Some(99),
+            stop: vec!["END".to_string()],
+            frequency_penalty: Some(0.1),
+            presence_penalty: Some(-0.1),
             ..Default::default()
         };
         let agent = Agent::new(config, provider.clone());
@@ -1674,6 +1680,12 @@ async fn parallel_tool_calls_config_flows_into_dispatched_request() {
             requests[0].parallel_tool_calls, parallel,
             "request must carry the configured parallel_tool_calls={parallel:?}"
         );
+        assert_eq!(requests[0].temperature, Some(0.2));
+        assert_eq!(requests[0].top_p, Some(0.75));
+        assert_eq!(requests[0].seed, Some(99));
+        assert_eq!(requests[0].stop, vec!["END".to_string()]);
+        assert_eq!(requests[0].frequency_penalty, Some(0.1));
+        assert_eq!(requests[0].presence_penalty, Some(-0.1));
         let carries_hint = requests[0].instructions.contains(BATCH_TOOL_CALLS_HINT);
         assert_eq!(
             carries_hint, hint,
@@ -9301,6 +9313,50 @@ async fn refusal_stop_reason_emits_failed_with_safety_hint() {
     assert!(
         err.contains("refused"),
         "error message should mention refusal, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn pause_turn_without_tool_calls_reissues_before_failing() {
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_pause".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::PauseTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_done".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut saw_success = false;
+    let mut saw_failure = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Completed { .. } => saw_success = true,
+            AgentEvent::Failed { .. } => saw_failure = true,
+            _ => {}
+        }
+    }
+
+    assert!(saw_success, "pause_turn reissue should allow completion");
+    assert!(!saw_failure, "successful pause_turn reissue must not fail");
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "agent must issue a second provider request after pause_turn"
     );
 }
 
