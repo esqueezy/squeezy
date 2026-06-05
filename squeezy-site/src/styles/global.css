@@ -325,6 +325,12 @@ small {
   font-size: 1.42rem;
 }
 
+.hero-note {
+  max-width: 560px;
+  color: var(--accent);
+  font-weight: 800;
+}
+
 .hero-actions,
 .actions {
   display: flex;
@@ -362,9 +368,73 @@ small {
 .hero-visual {
   position: relative;
   z-index: 1;
+  display: grid;
+  gap: 16px;
   width: 100%;
   max-width: 640px;
   margin-left: auto;
+}
+
+.proof-card strong {
+  color: var(--accent);
+  font-size: clamp(3.2rem, 7vw, 5.6rem);
+  line-height: 0.95;
+}
+
+.proof-card h3 {
+  font-size: 1.55rem;
+}
+
+.benchmark-summary,
+.benchmark-boards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: clamp(18px, 3vw, 28px);
+  align-items: start;
+}
+
+.benchmark-boards > article {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.board-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.board-heading h3 {
+  font-size: 1.22rem;
+}
+
+.mini-stack {
+  display: grid;
+  gap: 10px;
+}
+
+.mini-stack article {
+  display: grid;
+  gap: 4px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(20, 18, 14, 0.72);
+}
+
+.mini-stack span {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+}
+
+.mini-stack strong {
+  color: var(--text);
+  font-size: 1rem;
+  line-height: 1.25;
 }
 
 .evidence-loop {
@@ -1145,6 +1215,8 @@ small {
   }
 
   .metric-strip,
+  .benchmark-summary,
+  .benchmark-boards,
   .grid-2,
   .grid-3,
   .platform-grid,

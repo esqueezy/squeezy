@@ -5,30 +5,29 @@ import { providerGroups } from "../facts";
 
 <BaseLayout
   title="Providers · Squeezy"
-  description="Squeezy provider support across native APIs, OAuth subscription routes, local runtimes, and OpenAI-compatible services."
+  description="Bring your own model key or local runtime while Squeezy keeps code context focused before the provider call."
   active="providers"
 >
   <section class="page-hero">
     <div class="page-hero-inner">
       <span class="eyebrow">providers</span>
-      <h1>Bring your model. Keep the optimization local.</h1>
+      <h1>Bring your model. Keep the waste reduction local.</h1>
       <p class="lead">
-        Squeezy is multi-provider, but the cost-saving work happens before the
-        provider call: local graph navigation, bounded tools, lazy schemas,
-        compaction, routing, and session accounting.
+        Squeezy works with hosted providers, compatible APIs, and local
+        runtimes. The cost work happens before the provider call: focus context,
+        shrink repeated output, and track usage.
       </p>
     </div>
   </section>
 
   <section class="section">
     <div class="section-header">
-      <span class="eyebrow">catalog shape</span>
-      <h2>Native APIs, OAuth routes, local runtimes, and compatible endpoints.</h2>
+      <span class="eyebrow">model choice</span>
+      <h2>Use the route that fits your team.</h2>
       <p>
-        Provider availability depends on your local config, credentials, and the
-        selected model. Squeezy keeps unknown pricing honest: when registry
-        metadata is missing, dollar estimates may be unavailable instead of
-        invented.
+        Provider setup stays practical: configure credentials or a local
+        endpoint, pick a model, and let Squeezy handle the context discipline
+        around each turn.
       </p>
     </div>
     <div class="matrix">
@@ -48,46 +47,35 @@ import { providerGroups } from "../facts";
     <div class="grid-3">
       <article class="card">
         <span class="label">routing</span>
-        <h3>Cheap routing stays provider-local</h3>
-        <p>When a narrow mechanical turn is eligible, Squeezy can use the configured provider's small-fast tier. It does not silently jump to a different provider.</p>
+        <h3>Simple turns can use cheaper paths</h3>
+        <p>Eligible mechanical requests can start on a smaller provider-local model and escalate when the task needs the parent model.</p>
       </article>
       <article class="card">
         <span class="label">accounting</span>
-        <h3>Usage is normalized, estimates are guarded</h3>
-        <p>Provider streams normalize token and cache counters where available. USD estimates require pricing metadata for the selected provider/model pair.</p>
+        <h3>Usage is visible where providers expose it</h3>
+        <p>Squeezy tracks token usage, cache counters, and estimates when provider metadata makes that possible.</p>
       </article>
       <article class="card">
-        <span class="label">credentials</span>
-        <h3>Keys and OAuth live locally</h3>
-        <p>API keys, credential files, env vars, OAuth login flows, Bedrock credential chains, and local runtimes are configured on your machine.</p>
+        <span class="label">control</span>
+        <h3>Credentials stay on your machine</h3>
+        <p>API keys, OAuth files, cloud credentials, compatible endpoints, and local runtimes are configured locally.</p>
       </article>
     </div>
   </section>
 
   <section class="section">
     <div class="section-header">
-      <span class="eyebrow">configuration example</span>
-      <h2>Start with a provider, then tune routing and cost controls.</h2>
+      <span class="eyebrow">docs</span>
+      <h2>Provider details belong in setup docs.</h2>
       <p>
-        The exact model catalog changes over time. The provider registry and
-        docs are the source for current presets, pricing metadata, cache
-        capability, context estimates, and live-test status.
+        Current model IDs, environment variables, pricing metadata, cache
+        behavior, and live-test requirements change over time, so the docs keep
+        the operational detail.
       </p>
+      <div class="actions">
+        <a class="button" href="/docs/providers/" data-track-click="providers_docs">Provider docs</a>
+        <a class="button secondary" href="/install/" data-track-click="providers_install">Install</a>
+      </div>
     </div>
-    <div class="card code-card">
-      <pre><code>[model]
-provider = "openrouter"
-model = "anthropic/claude-opus-4-7"
-
-[providers.openrouter]
-api_key_env = "OPENROUTER_API_KEY"
-
-[router]
-enabled = true</code></pre>
-    </div>
-    <p class="footnote">
-      Live provider tests are intentionally gated by credentials, a costly-test
-      feature, and an explicit opt-in environment variable.
-    </p>
   </section>
 </BaseLayout>

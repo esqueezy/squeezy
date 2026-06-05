@@ -1,106 +1,93 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
 import CostChart from "../components/CostChart.astro";
-import { accuracyRows, benchmarkRows, benchmarkSummary } from "../facts";
+import { benchmarkRows, benchmarkSummary, haikuBenchmarkRows } from "../facts";
 ---
 
 <BaseLayout
   title="Benchmarks · Squeezy"
-  description="Measured Squeezy cost, graph accuracy, and benchmark caveats from checked-in repository data."
+  description="Same-task benchmark boards comparing Squeezy cost against Codex Mini and Claude Code Haiku."
   active="benchmarks"
 >
   <section class="page-hero">
     <div class="page-hero-inner">
       <span class="eyebrow">benchmarks</span>
-      <h1>Show the savings and the losses.</h1>
+      <h1>Measured cost on the same coding tasks.</h1>
       <p class="lead">
-        The public benchmark story is intentionally narrow: one checked-in
-        Mini suite, every language row visible, and accuracy caveats next to
-        the charts.
+        These boards compare Squeezy against external coding-agent baselines on
+        the same repository prompts, same grader, and same model tier. Lower
+        ratio means Squeezy used less model spend for that language task.
       </p>
     </div>
   </section>
 
   <section class="section">
-    <div class="section-header wide">
-      <span class="eyebrow">cost data</span>
-      <h2>{benchmarkSummary.totalDelta} lower total spend across the measured Mini suite.</h2>
-      <p>
-        {benchmarkSummary.suite} Squeezy was cheaper on {benchmarkSummary.wins}
-        rows and at parity or more expensive on {benchmarkSummary.losses} rows.
-        A win requires 100% measured recall and at least a 5% lower cost.
-      </p>
+    <div class="benchmark-summary">
+      <article class="card proof-card">
+        <span class="label">Mini board</span>
+        <strong>{benchmarkSummary.codexWins}</strong>
+        <h3>{benchmarkSummary.codexModel}</h3>
+        <p>{benchmarkSummary.runs}. All 15 language rows are lower cost.</p>
+      </article>
+      <article class="card proof-card">
+        <span class="label">Haiku board</span>
+        <strong>{benchmarkSummary.claudeWins}</strong>
+        <h3>{benchmarkSummary.claudeModel}</h3>
+        <p>{benchmarkSummary.runs}. C and Go are the two higher-cost rows.</p>
+      </article>
     </div>
-    <CostChart rows={benchmarkRows} />
-    <p class="footnote">
-      Source: <code>docs/internal/eval-findings/mini-vs-codex-realworld.csv</code>.
-      Squeezy cost includes parent and delegate subagent spend. This is not a
-      universal provider-independent savings claim.
-    </p>
   </section>
 
   <section class="section band">
-    <div class="section-header">
-      <span class="eyebrow">what the chart means</span>
-      <h2>The graph helps when code discovery would otherwise become context-heavy.</h2>
+    <div class="section-header wide">
+      <span class="eyebrow">language ratios</span>
+      <h2>Cost ratio by language.</h2>
       <p>
-        The best public reading is practical: graph navigation can lower model
-        spend on multi-file code-navigation tasks, but the graph is not free.
-        Small or read-heavy tasks can sit near parity or lose.
+        Ratio is Squeezy cost divided by the baseline cost. A value below 1.0
+        means Squeezy was lower cost on that same task. The benchmark counts
+        cost only when recall passes the board rule.
       </p>
     </div>
-    <div class="grid-3">
-      <article class="card">
-        <span class="label">include losses</span>
-        <h3>Four rows are not wins</h3>
-        <p>C#, Go, Java, and Ruby are shown as losses or near-parity rows in the checked-in CSV. Hiding them would overstate the product.</p>
+    <div class="benchmark-boards">
+      <article>
+        <div class="board-heading">
+          <span class="label">Mini / Codex</span>
+          <h3>15 language tasks</h3>
+        </div>
+        <CostChart rows={benchmarkRows} />
       </article>
-      <article class="card">
-        <span class="label">quality first</span>
-        <h3>Cost alone is not enough</h3>
-        <p>The benchmark only counts a win when recall holds. Cheaper wrong answers are not treated as product wins.</p>
-      </article>
-      <article class="card">
-        <span class="label">task scope</span>
-        <h3>This is code navigation data</h3>
-        <p>The suite measures real-world navigation prompts across languages. It does not claim every editing, debugging, or creative task is cheaper.</p>
+      <article>
+        <div class="board-heading">
+          <span class="label">Haiku / Claude Code</span>
+          <h3>15 language tasks</h3>
+        </div>
+        <CostChart rows={haikuBenchmarkRows} />
       </article>
     </div>
+    <p class="footnote">
+      Sources: <code>docs/internal/eval-findings/board-and-graph-fixes-summary.md</code>,
+      <code>mini-vs-codex-realworld.csv</code>, and
+      <code>haiku-vs-cc-realworld.csv</code>.
+    </p>
   </section>
 
   <section class="section">
-    <div class="section-header">
-      <span class="eyebrow">graph validation</span>
-      <h2>Benchmarks also measure whether local graph evidence is accurate.</h2>
-      <p>
-        Squeezy uses compiler and language-service oracles in benchmark mode to
-        check local tree-sitter graph output. Those oracles are validation
-        tools, not production navigation dependencies.
-      </p>
-    </div>
-    <div class="matrix">
-      {
-        accuracyRows.map((row) => (
-          <article class="matrix-row">
-            <div><h3>{row.name}</h3></div>
-            <p>{row.detail}</p>
-            {row.status && <span class="status-pill ok">{row.status}</span>}
-          </article>
-        ))
-      }
-    </div>
-  </section>
-
-  <section class="section compact band">
-    <div class="section-header">
-      <span class="eyebrow">methodology guardrails</span>
-      <h2>What not to infer from this page.</h2>
-      <p>
-        Do not read this as "Squeezy is always cheaper" or "the graph has
-        perfect code understanding." The current safe claim is that Squeezy has
-        a measured cost-saving path for code navigation, with the data and
-        losses published beside the claim.
-      </p>
+    <div class="grid-3">
+      <article class="card">
+        <span class="label">same task</span>
+        <h3>Prompt and repo are matched</h3>
+        <p>Each row compares answers to the same real-world repository question, scored by the same grader.</p>
+      </article>
+      <article class="card">
+        <span class="label">median</span>
+        <h3>Multiple runs reduce noise</h3>
+        <p>The board reports n=3 medians because single agent runs can vary in both cost and recall.</p>
+      </article>
+      <article class="card">
+        <span class="label">scope</span>
+        <h3>Scientific benchmark, not a universal claim</h3>
+        <p>These results are for this benchmark suite and model tier. Provider pricing, task shape, and model behavior can change results.</p>
+      </article>
     </div>
   </section>
 </BaseLayout>

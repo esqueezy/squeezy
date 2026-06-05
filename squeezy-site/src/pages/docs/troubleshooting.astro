@@ -5,50 +5,107 @@ import { SITE } from "../../config";
 
 <DocsLayout
   title="Troubleshooting · Squeezy"
-  description="How to debug Squeezy startup, provider, graph, permission, and report issues."
+  description="Concrete Squeezy diagnostics, feedback, report, provider, permission, and session recovery workflows."
   activeDoc="/docs/troubleshooting/"
   eyebrow="support"
-  heading="Start with local evidence."
-  lead="The support path mirrors the product architecture: inspect local config, run diagnostics, ask Squeezy local help, then prepare a redacted report when maintainers need more detail."
+  heading="Collect local evidence before opening an issue."
+  lead="Start with the command that matches the failure. Use report previews for diagnostics, and keep private code and secrets out of public GitHub issues."
 >
   <section class="doc-block">
-    <h2>First commands</h2>
+    <h2>Fast path</h2>
     <div class="doc-card-grid">
       <article class="card">
-        <span class="label">doctor</span>
-        <h3>Environment check</h3>
+        <span class="label">install/config</span>
+        <h3>Run doctor first</h3>
         <pre><code>squeezy doctor</code></pre>
-        <p>Checks config sources, repo profile, provider credential, session store, and sandbox availability.</p>
+        <p>Use this for startup, provider credentials, local storage, sandbox, and basic environment failures.</p>
       </article>
       <article class="card">
-        <span class="label">config</span>
-        <h3>Effective settings</h3>
+        <span class="label">effective config</span>
+        <h3>Inspect merged settings</h3>
         <pre><code>squeezy config inspect</code></pre>
-        <p>Shows merged settings with sensitive values redacted.</p>
+        <p>Use this when a setting behaves differently than expected. Sensitive values are redacted.</p>
+      </article>
+      <article class="card">
+        <span class="label">local docs</span>
+        <h3>Ask built-in help</h3>
+        <pre><code>/help
+/help providers
+/help permissions
+/help sessions</code></pre>
+        <p>Use this for setup questions before spending provider tokens on a general model answer.</p>
       </article>
     </div>
   </section>
 
   <section class="doc-block">
-    <h2>Ask Squeezy how Squeezy works</h2>
-    <p>Use `/help`, `/help providers`, `/help sessions`, `/help permissions`, or a natural question about Squeezy. Product-help questions are answered from bundled docs and redacted config before provider work starts, so Squeezy can explain its own setup without spending model tokens first.</p>
+    <h2>Feedback and report commands</h2>
+    <div class="matrix">
+      <article class="matrix-row">
+        <div><h3><code>/feedback</code></h3></div>
+        <p>Short feedback from inside the TUI. Best for copy issues, confusing UI, small product suggestions, or a problem that does not need logs.</p>
+        <span class="status-pill">lightweight</span>
+      </article>
+      <article class="matrix-row">
+        <div><h3><code>/report</code></h3></div>
+        <p>Current-session diagnostic report. Best for a failed run, bad provider response, confusing tool behavior, permission denial, or broken resume.</p>
+        <span class="status-pill">current session</span>
+      </article>
+      <article class="matrix-row">
+        <div><h3><code>squeezy sessions report &lt;id&gt; --preview</code></h3></div>
+        <p>Preview a redacted report for a past session before upload. Check paths, prompts, command summaries, and metadata before sending.</p>
+        <span class="status-pill">preview first</span>
+      </article>
+      <article class="matrix-row">
+        <div><h3><code>squeezy sessions report &lt;id&gt; --send</code></h3></div>
+        <p>Send the report after preview. Include the returned report id in a GitHub issue instead of attaching private archives publicly.</p>
+        <span class="status-pill">send after review</span>
+      </article>
+    </div>
   </section>
 
   <section class="doc-block">
-    <h2>Unexpected permissions</h2>
-    <p>Inspect `[permissions]`, `[[permissions.rules]]`, and `[permissions.shell_sandbox]` in `squeezy config inspect`. With no overrides, default mode allows workspace read/search/edit plus local shell, git, and compiler commands; web, MCP, destructive actions, and outside-workspace file paths still ask.</p>
-    <p>Default and auto-review modes use `network = "allow_when_approved"` unless the shell sandbox network policy is explicitly configured. Set `network = "deny_by_default"` when approved network-classified shell commands should still run without network access.</p>
-  </section>
-
-  <section class="doc-block">
-    <h2>Report an issue</h2>
-    <pre><code>/feedback
-/report
-squeezy sessions report &lt;session_id&gt; --preview
-squeezy sessions report &lt;session_id&gt; --send</code></pre>
-    <p>Feedback is short redacted text. Reports are redacted diagnostic archives with a preview step. Public GitHub issues should include a sanitized summary and returned feedback/report id, not private code or archive contents.</p>
+    <h2>What to include in a public issue</h2>
+    <div class="doc-card-grid">
+      <article class="card">
+        <span class="label">environment</span>
+        <h3>Platform and version</h3>
+        <p>Operating system, install path, Squeezy version or commit, provider route, and whether the issue is reproducible in a clean repo.</p>
+      </article>
+      <article class="card">
+        <span class="label">symptom</span>
+        <h3>Exact failure shape</h3>
+        <p>The command or prompt that failed, the visible error message, and whether retrying changed the behavior.</p>
+      </article>
+      <article class="card">
+        <span class="label">diagnostic id</span>
+        <h3>Report or feedback id</h3>
+        <p>Use the id returned by `/feedback`, `/report`, or `squeezy sessions report`. Do not paste private code, secrets, or full archives.</p>
+      </article>
+    </div>
     <div class="actions">
       <a class="button" href={SITE.issuesUrl} data-track-click="troubleshooting_issues" data-track-target="github">Open GitHub issues</a>
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <h2>Common checks</h2>
+    <div class="matrix">
+      <article class="matrix-row">
+        <div><h3>Provider failures</h3></div>
+        <p>Run `squeezy config inspect`, confirm the active provider/model, check the expected API key or OAuth file, and retry with a simple prompt.</p>
+        <span class="status-pill">model route</span>
+      </article>
+      <article class="matrix-row">
+        <div><h3>Permission prompts</h3></div>
+        <p>Inspect `[permissions]`, shell sandbox settings, outside-workspace paths, MCP/web access, and whether the action is destructive.</p>
+        <span class="status-pill">policy</span>
+      </article>
+      <article class="matrix-row">
+        <div><h3>Session resume issues</h3></div>
+        <p>Use the resume picker, then generate a past-session report with `squeezy sessions report &lt;id&gt; --preview` if state looks wrong.</p>
+        <span class="status-pill">sessions</span>
+      </article>
     </div>
   </section>
 </DocsLayout>

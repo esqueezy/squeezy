@@ -5,18 +5,16 @@ import { languageRows } from "../facts";
 
 <BaseLayout
   title="Languages · Squeezy"
-  description="Graph-backed navigation across 13 language families and bounded fallback for unsupported files."
+  description="Squeezy supports local code understanding and navigation for 15 programming languages."
   active="languages"
 >
   <section class="page-hero">
     <div class="page-hero-inner">
-      <span class="eyebrow">language coverage</span>
-      <h1>Graph-backed navigation for 13 language families.</h1>
+      <span class="eyebrow">language support</span>
+      <h1>15 languages for local code understanding.</h1>
       <p class="lead">
-        Squeezy treats programming languages as first-class inputs. Supported
-        files get local graph navigation for declarations, calls, references,
-        hierarchy, body hits, and exact slices. Unsupported files still work
-        through bounded search and reads, without graph confidence.
+        The list below is the supported source-language surface. Support and
+        docs pages cover platform targets, providers, and diagnostic commands.
       </p>
     </div>
   </section>
@@ -30,59 +28,24 @@ import { languageRows } from "../facts";
               <h3>{row.name}</h3>
             </div>
             <p>{row.detail}</p>
-            {row.status && <span class:list={["status-pill", row.status === "strong" ? "ok" : row.status === "emerging" ? "warning" : ""]}>{row.status}</span>}
           </article>
         ))
       }
     </div>
   </section>
 
-  <section class="section">
-    <div class="section-header">
-      <span class="eyebrow">known limitations</span>
-      <h2>What graph navigation deliberately does not solve.</h2>
-      <p>
-        Squeezy's graph is local and tree-sitter-based. It is fast and
-        deterministic, but it is not a type checker or a runtime model. The
-        following items stay heuristic, external, or fallback by design.
-      </p>
-    </div>
-    <div class="grid-3">
-      <article class="card">
-        <span class="label">dynamic dispatch</span>
-        <h3>Runtime resolution</h3>
-        <p>Virtual dispatch, interface satisfaction, dynamic attribute access, and reflection-style call resolution stay candidate-grade.</p>
-      </article>
-      <article class="card">
-        <span class="label">type solving</span>
-        <h3>Overloads and inference</h3>
-        <p>Overload resolution, generic constraint solving, and full type inference are out of scope. Squeezy defers to compilers when the task needs them.</p>
-      </article>
-      <article class="card">
-        <span class="label">build systems</span>
-        <h3>Macros, generated code, templates</h3>
-        <p>Macro expansion, code generation, template instantiation, and complex preprocessor state are evidence for fallback, not exact compiler state.</p>
-      </article>
-    </div>
-  </section>
-
   <section class="section band">
-    <div class="section-header">
-      <span class="eyebrow">graph coverage</span>
-      <h2>Language-aware indexing narrows the starting question.</h2>
+    <div class="section-header wide">
+      <span class="eyebrow">fallbacks</span>
+      <h2>Unsupported files still remain usable.</h2>
       <p>
-        Language-aware indexing is what makes cost savings concrete. The model
-        can start with local declarations, relationships, calls, references,
-        workspace facts, and changed-code context instead of reading broad file
-        sets into paid context.
+        Files outside this list fall back to bounded search, targeted reads,
+        shell commands, and verifier tools.
       </p>
       <div class="actions">
-        <a class="button" href="/docs/semantic-navigation/" data-track-click="languages_graph_docs">
-          Graph docs
-        </a>
-        <a class="button secondary" href="/docs/cost-receipts/" data-track-click="languages_cost_docs">
-          Cost &amp; receipts
-        </a>
+        <a class="button" href="/support/" data-track-click="languages_support">Support coverage</a>
+        <a class="button" href="/docs/languages/" data-track-click="languages_docs">Language docs</a>
+        <a class="button secondary" href="/benchmarks/" data-track-click="languages_benchmarks">Benchmarks</a>
       </div>
     </div>
   </section>

@@ -33,9 +33,9 @@ const softwareJsonLd = {
 
 const navItems = [
   { href: "/how-it-works/", label: "How it works", key: "how" },
-  { href: "/languages/", label: "Languages", key: "languages" },
-  { href: "/providers/", label: "Providers", key: "providers" },
+  { href: "/cost/", label: "Cost", key: "cost" },
   { href: "/benchmarks/", label: "Benchmarks", key: "benchmarks" },
+  { href: "/support/", label: "Support", key: "support" },
   { href: "/install/", label: "Install", key: "install" },
   { href: "/docs/", label: "Docs", key: "docs" }
 ];
@@ -73,12 +73,6 @@ const navItems = [
           <span class="brand-mark">sq</span>
           <span>Squeezy</span>
         </a>
-        <a
-          class="brand-status"
-          href="/roadmap/"
-          aria-label="Squeezy is pre-1.0. See the roadmap."
-          data-track-click="brand_status"
-        >Pre-1.0</a>
       </div>
       <nav class="site-nav" aria-label="Primary navigation">
         {
@@ -113,19 +107,18 @@ const navItems = [
           <span>Squeezy</span>
         </a>
         <p>
-          A terminal coding agent with a local semantic graph at its core.
+          A terminal coding agent built to keep model context focused.
         </p>
         <p class="footer-meta">
-          Squeezy is pre-1.0; some surfaces are marked WIP.
+          Website analytics help improve the site and documentation.
         </p>
       </div>
       <div class="footer-links">
         <a href="/install/" data-track-click="footer_install">Install</a>
+        <a href="/cost/" data-track-click="footer_cost">Cost</a>
+        <a href="/support/" data-track-click="footer_support">Support</a>
         <a href="/docs/" data-track-click="footer_docs">Docs</a>
         <a href="/benchmarks/" data-track-click="footer_benchmarks">Benchmark</a>
-        <a href="/roadmap/" data-track-click="footer_roadmap">Roadmap</a>
-        <a href="/support/" data-track-click="footer_support">Support</a>
-        <a href="/privacy/" data-track-click="footer_privacy">Privacy</a>
         <a href={SITE.repoUrl} data-track-click="footer_github" data-track-target="github">GitHub</a>
       </div>
     </footer>

@@ -1,93 +1,33 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
-import TerminalWindow from "../components/TerminalWindow.astro";
-import EvidenceLoop from "../components/EvidenceLoop.astro";
-import { costPillars, operatingLoop, productSubjects } from "../facts";
+import { costPillars, operatingLoop } from "../facts";
 ---
 
 <BaseLayout
   title="How it works · Squeezy"
-  description="How Squeezy uses local static analysis, graph refreshes, bounded reads, and verification before model work."
+  description="How Squeezy prepares local code context, keeps conversations compact, sends focused work to the model, and tracks token spend."
   active="how"
 >
   <section class="page-hero">
     <div class="page-hero-inner">
-      <span class="eyebrow">agent architecture</span>
-      <h1>Local structure first. Model judgment second.</h1>
+      <span class="eyebrow">how it works</span>
+      <h1>Prepare locally. Ask the model with focus.</h1>
       <p class="lead">
-        Squeezy uses local repository understanding, graph navigation, output
-        shaping, compaction, and routing to prepare a narrower task before
-        asking a model to reason about code.
+        Squeezy is built around a simple loop: understand the repo locally,
+        gather the relevant context, keep the conversation tight, and send the
+        model a smaller, better-shaped task.
       </p>
     </div>
   </section>
 
   <section class="section">
-    <div class="grid-2 align-center">
-      <EvidenceLoop />
-      <div class="list">
-        {
-          operatingLoop.map((item) => (
-            <div class="list-item">
-              <span class="num">{item.label}</span>
-              <div>
-                <h3>{item.title}</h3>
-                <p>{item.body}</p>
-              </div>
-            </div>
-          ))
-        }
-      </div>
-    </div>
-  </section>
-
-  <section class="section band">
-    <div class="grid-2 align-center">
-      <div class="section-header">
-        <span class="eyebrow">graph evidence</span>
-        <h2>The graph records what is known, how fresh it is, and how confident it is.</h2>
-        <p>
-          Static navigation works best when the agent can see how each result
-          was produced. Squeezy keeps syntax, import, candidate, external, and
-          freshness labels attached so the model can move from graph evidence
-          to exact reads or verifier commands.
-        </p>
-      </div>
-      <TerminalWindow title="symbol_context output shape">
-        <div class="terminal-body">
-          <div class="terminal-line">
-            <span class="green">path</span>
-            <span>crates/squeezy-agent/src/lib.rs</span>
-          </div>
-          <div class="terminal-line">
-            <span class="cyan">span</span>
-            <span>line or byte range, source hash, and freshness</span>
-          </div>
-          <div class="terminal-line">
-            <span class="amber">confidence</span>
-            <span>syntax facts, resolved imports, candidate sets, freshness</span>
-          </div>
-          <div class="terminal-line">
-            <span class="muted">next</span>
-            <span>read_slice, reference_search, upstream_flow, bounded grep</span>
-          </div>
-        </div>
-      </TerminalWindow>
-    </div>
-  </section>
-
-  <section class="section">
-    <div class="section-header">
-      <span class="eyebrow">cost levers</span>
-      <h2>The saving happens across several local mechanisms.</h2>
-    </div>
-    <div class="grid-3">
+    <div class="flow">
       {
-        costPillars.map((fact) => (
-          <article class="card">
-            <span class="label">{fact.label}</span>
-            <h3>{fact.title}</h3>
-            <p>{fact.body}</p>
+        operatingLoop.map((item) => (
+          <article class="flow-step">
+            <span>{item.label}</span>
+            <strong>{item.title}</strong>
+            <p>{item.body}</p>
           </article>
         ))
       }
@@ -95,18 +35,19 @@ import { costPillars, operatingLoop, productSubjects } from "../facts";
   </section>
 
   <section class="section band">
-    <div class="section-header">
-      <span class="eyebrow">product surface</span>
-      <h2>Convenience features support the coding loop.</h2>
+    <div class="section-header wide">
+      <span class="eyebrow">cost controls</span>
+      <h2>The loop is supported by several independent savings.</h2>
       <p>
-        Squeezy is still a coding agent. Permissions, sessions, provider
-        routing, local skills, MCP/web access, and validation workflows exist to
-        keep the graph-first loop usable in real work.
+        Local code understanding is only one part. Squeezy also shapes tool
+        output, reuses stable prompt context when possible, compacts older
+        conversation state, isolates exploration, and routes simple turns
+        through cheaper paths.
       </p>
     </div>
     <div class="grid-3">
       {
-        productSubjects.slice(0, 6).map((fact) => (
+        costPillars.slice(0, 6).map((fact) => (
           <article class="card">
             <span class="label">{fact.label}</span>
             <h3>{fact.title}</h3>
@@ -114,6 +55,29 @@ import { costPillars, operatingLoop, productSubjects } from "../facts";
           </article>
         ))
       }
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="grid-2">
+      <article class="card">
+        <span class="label">fallbacks</span>
+        <h3>It still uses ordinary tools when that is the right path.</h3>
+        <p>
+          Some tasks are best answered by search, a focused file read, a build,
+          a test, or a verifier command. Squeezy should spend local work where
+          it helps, not force one navigation path onto every task.
+        </p>
+      </article>
+      <article class="card">
+        <span class="label">visibility</span>
+        <h3>The bill is something you can inspect.</h3>
+        <p>
+          Token accounting and context views make provider usage, cache hits,
+          tool output, subagent work, and estimates visible instead of treating
+          spend as a black box.
+        </p>
+      </article>
     </div>
   </section>
 </BaseLayout>

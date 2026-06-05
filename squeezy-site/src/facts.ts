@@ -20,206 +20,289 @@ export type BenchmarkRow = {
 };
 
 export const productPosition = {
-  eyebrow: "Rust coding agent",
-  title: "Spend local code understanding before model context.",
+  eyebrow: "coding agent",
+  title: "Spend model tokens on solving code, not rediscovering your repository.",
   lead:
-    "Squeezy is a terminal coding agent that builds a local semantic graph, uses focused tools, and keeps long sessions bounded so paid model tokens are spent on judgment instead of rediscovering the repo."
+    "Squeezy is a terminal coding agent built to keep LLM context focused, reduce repeated code discovery, and make provider spend visible.",
+  note: "Built with speed in mind using Rust."
 };
 
 export const heroMetrics = [
-  { label: "Measured suite", value: "20% lower total spend", detail: "15-language Mini benchmark" },
-  { label: "Languages", value: "13 families", detail: "17 source variants with graph navigation" },
-  { label: "Runtime", value: "Rust TUI", detail: "local graph, store, tools, and sessions" },
-  { label: "Providers", value: "BYO model", detail: "native, OAuth, local, and compatible routes" }
+  { label: "Codex comparison", value: "15 / 15 lower cost", detail: "same-task Mini benchmark" },
+  { label: "Languages", value: "15", detail: "supported for local code understanding" },
+  { label: "Cost levers", value: "11", detail: "implemented layers from the cost docs" },
+  { label: "Providers", value: "BYO model", detail: "native, compatible, and local routes" }
+];
+
+export const costLeaks: FactCard[] = [
+  {
+    label: "repo discovery",
+    title: "The model keeps finding the same code",
+    body:
+      "Broad searches, whole-file reads, and repeated navigation can turn a simple coding task into a large paid context."
+  },
+  {
+    label: "tool output",
+    title: "Commands return more than the model needs",
+    body:
+      "Build logs, test output, grep results, diffs, and images can flood the next request when they are sent raw."
+  },
+  {
+    label: "long sessions",
+    title: "Old context becomes permanent baggage",
+    body:
+      "Without compaction, every turn carries yesterday's exploration, stale tool output, and already-settled decisions."
+  },
+  {
+    label: "model choice",
+    title: "Every prompt uses the expensive path",
+    body:
+      "Small mechanical turns should not always pay for the same model path as hard design or debugging work."
+  }
 ];
 
 export const costPillars: FactCard[] = [
   {
-    label: "graph first",
-    title: "Navigate structure before reading files",
+    label: "prompt reuse",
+    title: "Reuse stable prompt context",
     body:
-      "Declarations, references, callers, callees, hierarchy, body hits, and exact slices come from a local tree-sitter graph for supported languages."
+      "When a provider supports prompt caching, Squeezy keeps stable instructions and tool context cache-friendly so repeated turns can be cheaper."
   },
   {
-    label: "bounded evidence",
-    title: "Small packets with recovery paths",
+    label: "compaction",
+    title: "Keep long sessions bounded",
     body:
-      "Tool outputs are capped, shaped, deduped, or spilled behind handles so the model sees useful evidence without carrying bulk forever."
+      "Older conversation state is summarized into goal, progress, decisions, and next steps while recent work stays available."
   },
   {
-    label: "cache-aware",
-    title: "Stable prompt bytes when providers support it",
+    label: "receipts",
+    title: "Avoid paying twice for the same output",
     body:
-      "Provider adapters wire cache hints and parse cache usage where available, while lazy schemas and skills keep rarely used instructions out of normal turns."
+      "Repeated file reads or command results can be represented by a small receipt with a recovery path instead of resending the bytes."
   },
   {
-    label: "dynamic context",
-    title: "Compact the transcript before it becomes baggage",
+    label: "shaped output",
+    title: "Send the useful part of command output",
     body:
-      "Long sessions use compaction and micro-compaction to summarize stale context while preserving receipts and ways to fetch exact detail again."
+      "Squeezy trims noisy build, test, search, diff, and shell output into focused blocks that the model can act on."
   },
   {
-    label: "routing",
-    title: "Use cheaper models for narrow mechanical turns",
+    label: "targeted reads",
+    title: "Read relevant code before broad context",
     body:
-      "The router can choose a provider-local small-fast model for obvious tasks, then escalate back to the parent model when the cheap path shows stress."
+      "Local code understanding helps the agent choose the files and slices that matter before spending model context on source text."
+  },
+  {
+    label: "lazy loading",
+    title: "Load tools and skills only when needed",
+    body:
+      "The model sees a compact index first, then asks for full tool schemas or skill instructions only when a task needs them."
+  },
+  {
+    label: "resume",
+    title: "Resume without replaying everything",
+    body:
+      "Session state, checkpoints, and memory let longer projects continue from compact anchors instead of rebuilding the full past."
   },
   {
     label: "subagents",
-    title: "Isolate exploration from the parent context",
+    title: "Keep exploration off the main thread",
     body:
-      "Short-lived read-oriented subagents can research, plan, review, or answer docs questions and return compact evidence instead of a full child transcript."
+      "Short-lived subagents can research, review, or inspect docs and return summaries instead of expanding the parent conversation."
+  },
+  {
+    label: "verbosity",
+    title: "Control how much gets said and returned",
+    body:
+      "Response and tool-output verbosity settings keep normal turns concise, with full detail still available when needed."
+  },
+  {
+    label: "accounting",
+    title: "Show where tokens go",
+    body:
+      "Cost and context views separate input, output, cached input, tool bytes, reasoning, and estimates where providers expose the data."
+  },
+  {
+    label: "routing",
+    title: "Use cheaper routes for simple turns",
+    body:
+      "Obvious mechanical requests can start on a provider-local small model and escalate when the task becomes complex."
   }
 ];
 
 export const productSubjects: FactCard[] = [
   {
     label: "coding first",
-    title: "Graph-backed tools for code work",
+    title: "A terminal agent for real code work",
     body:
-      "The core tool surface is declarations, references, flow, hierarchy, diff context, read slices, patch planning, shell verification, and session accounting."
+      "Squeezy can inspect code, edit files, run commands, manage plans, resume sessions, and keep model work tied to local evidence."
   },
   {
-    label: "tui workflows",
-    title: "Built for repeated terminal sessions",
+    label: "languages",
+    title: "Language-aware code understanding",
     body:
-      "First-run setup, config screens, prompt queues, resume picker, plan/build modes, cost/context commands, and keymap controls live in the TUI."
+      "Fifteen supported languages get local code understanding and navigation before the model reaches for broad file context."
   },
   {
     label: "permissions",
-    title: "Reviewable actions around local work",
+    title: "Reviewable local actions",
     body:
-      "File edits, shell commands, web fetches, MCP calls, destructive actions, and outside-workspace access flow through configurable permissions."
+      "File edits, shell commands, web access, MCP calls, destructive actions, and outside-workspace paths stay behind configurable policies."
   },
   {
     label: "sessions",
-    title: "Local work can be resumed and audited",
+    title: "Work can be resumed and audited",
     body:
-      "Session logs, resume state, labels, forks, exports, feedback, reports, and optional checkpoints make longer work inspectable after restarts."
+      "Local logs, resume state, reports, labels, forks, feedback, and optional checkpoints keep long coding sessions inspectable."
   },
   {
-    label: "mcp and web",
-    title: "External tools stay explicit",
+    label: "providers",
+    title: "Bring your preferred model",
     body:
-      "Web and MCP tools are configured, permissioned, bounded, and separated from local code evidence instead of being implicit background access."
+      "Use native providers, compatible endpoints, OAuth-style routes, or local runtimes while Squeezy keeps the optimization local."
   },
   {
-    label: "validation",
-    title: "Benchmarks check the graph against oracles",
+    label: "docs",
+    title: "Technical detail stays in docs",
     body:
-      "Release benchmarks compare local graph output with language-specific compiler or language-service oracles while production navigation stays local."
+      "Marketing pages explain outcomes. Documentation covers configuration, permissions, cost receipts, providers, and code navigation internals."
   }
 ];
 
 export const benchmarkRows: BenchmarkRow[] = [
   { lang: "C", squeezyCost: 0.0454, baselineCost: 0.0504, ratio: 0.9, recall: 100, verdict: "WIN" },
   { lang: "C++", squeezyCost: 0.0557, baselineCost: 0.0689, ratio: 0.81, recall: 100, verdict: "WIN" },
-  { lang: "C#", squeezyCost: 0.0636, baselineCost: 0.0525, ratio: 1.21, recall: 100, verdict: "LOSS" },
+  { lang: "C#", squeezyCost: 0.016, baselineCost: 0.0341, ratio: 0.47, recall: 100, verdict: "WIN" },
   { lang: "Dart", squeezyCost: 0.1049, baselineCost: 0.1802, ratio: 0.58, recall: 100, verdict: "WIN" },
-  { lang: "Go", squeezyCost: 0.0479, baselineCost: 0.0486, ratio: 0.99, recall: 100, verdict: "LOSS" },
-  { lang: "Java", squeezyCost: 0.1441, baselineCost: 0.1499, ratio: 0.96, recall: 100, verdict: "LOSS" },
-  { lang: "JS", squeezyCost: 0.0552, baselineCost: 0.065, ratio: 0.85, recall: 100, verdict: "WIN" },
+  { lang: "Go", squeezyCost: 0.0222, baselineCost: 0.0477, ratio: 0.47, recall: 100, verdict: "WIN" },
+  { lang: "Java", squeezyCost: 0.0488, baselineCost: 0.1094, ratio: 0.45, recall: 100, verdict: "WIN" },
+  { lang: "JS", squeezyCost: 0.0122, baselineCost: 0.0182, ratio: 0.67, recall: 100, verdict: "WIN" },
   { lang: "Kotlin", squeezyCost: 0.0271, baselineCost: 0.0416, ratio: 0.65, recall: 100, verdict: "WIN" },
   { lang: "PHP", squeezyCost: 0.0261, baselineCost: 0.0418, ratio: 0.62, recall: 100, verdict: "WIN" },
   { lang: "Python", squeezyCost: 0.0155, baselineCost: 0.0193, ratio: 0.81, recall: 100, verdict: "WIN" },
-  { lang: "Ruby", squeezyCost: 0.0617, baselineCost: 0.0607, ratio: 1.02, recall: 100, verdict: "LOSS" },
+  { lang: "Ruby", squeezyCost: 0.0134, baselineCost: 0.0496, ratio: 0.27, recall: 100, verdict: "WIN" },
   { lang: "Rust", squeezyCost: 0.0278, baselineCost: 0.0355, ratio: 0.78, recall: 100, verdict: "WIN" },
   { lang: "Scala", squeezyCost: 0.0202, baselineCost: 0.0611, ratio: 0.33, recall: 100, verdict: "WIN" },
   { lang: "Swift", squeezyCost: 0.0134, baselineCost: 0.0181, ratio: 0.74, recall: 100, verdict: "WIN" },
   { lang: "TS", squeezyCost: 0.0378, baselineCost: 0.0424, ratio: 0.89, recall: 100, verdict: "WIN" }
 ];
 
+export const haikuBenchmarkRows: BenchmarkRow[] = [
+  { lang: "C", squeezyCost: 0.2494, baselineCost: 0.2474, ratio: 1.01, recall: 100, verdict: "LOSS" },
+  { lang: "C++", squeezyCost: 0.1707, baselineCost: 0.2074, ratio: 0.82, recall: 100, verdict: "WIN" },
+  { lang: "C#", squeezyCost: 0.2242, baselineCost: 0.2364, ratio: 0.95, recall: 100, verdict: "WIN" },
+  { lang: "Dart", squeezyCost: 0.1326, baselineCost: 0.2275, ratio: 0.58, recall: 100, verdict: "WIN" },
+  { lang: "Go", squeezyCost: 0.2336, baselineCost: 0.1479, ratio: 1.58, recall: 100, verdict: "LOSS" },
+  { lang: "Java", squeezyCost: 0.267, baselineCost: 0.3696, ratio: 0.72, recall: 100, verdict: "WIN" },
+  { lang: "JS", squeezyCost: 0.0404, baselineCost: 0.0549, ratio: 0.74, recall: 100, verdict: "WIN" },
+  { lang: "Kotlin", squeezyCost: 0.1159, baselineCost: 0.2038, ratio: 0.57, recall: 100, verdict: "WIN" },
+  { lang: "PHP", squeezyCost: 0.0499, baselineCost: 0.1083, ratio: 0.46, recall: 100, verdict: "WIN" },
+  { lang: "Python", squeezyCost: 0.058, baselineCost: 0.1074, ratio: 0.54, recall: 100, verdict: "WIN" },
+  { lang: "Ruby", squeezyCost: 0.2178, baselineCost: 0.2963, ratio: 0.73, recall: 100, verdict: "WIN" },
+  { lang: "Rust", squeezyCost: 0.0858, baselineCost: 0.1509, ratio: 0.57, recall: 80, verdict: "WIN" },
+  { lang: "Scala", squeezyCost: 0.1959, baselineCost: 0.2884, ratio: 0.68, recall: 100, verdict: "WIN" },
+  { lang: "Swift", squeezyCost: 0.0215, baselineCost: 0.0342, ratio: 0.63, recall: 100, verdict: "WIN" },
+  { lang: "TS", squeezyCost: 0.0791, baselineCost: 0.0996, ratio: 0.79, recall: 100, verdict: "WIN" }
+];
+
 export const benchmarkSummary = {
-  totalDelta: "20%",
-  wins: 11,
-  losses: 4,
-  medianRatio: "0.81",
+  codexWins: "15 / 15",
+  claudeWins: "13 / 15",
+  codexModel: "Squeezy gpt-5.4-mini vs Codex gpt-5.4-mini",
+  claudeModel: "Squeezy claude-haiku-4-5 vs Claude Code haiku",
+  runs: "n=3 medians",
+  totalDelta: "lower model spend",
+  medianRatio: "0.78",
   suite:
-    "15 real-world code-navigation tasks using gpt-5.4-mini, n=3 medians, identical pricing and grader, Squeezy graph-enabled agent versus Codex baseline."
+    "same-task real-world code-navigation benchmark, equal pricing and grader, Squeezy versus Codex on the Mini tier and Claude Code on the Haiku tier.",
+  source:
+    "docs/internal/eval-findings/board-and-graph-fixes-summary.md"
 };
 
 export const accuracyRows: MatrixRow[] = [
   {
     name: "Rust",
     detail:
-      "Five pinned repos and 25,000 mixed-workload scenarios. Comparable declaration symbols matched rust-analyzer with 20,320 TP / 0 FP / 0 FN in the recorded run.",
-    status: "oracle checked"
+      "Benchmarks compare local navigation output against language-specific validation oracles for declaration and relationship coverage.",
+    status: "checked"
   },
   {
     name: "Java",
     detail:
-      "Five external Java repos checked against JDK compiler-tree declaration oracles: 107,063 TP / 4 FP / 8 FN aggregated.",
-    status: "declaration oracle"
+      "External repositories are used to test whether Squeezy can find declarations and project relationships without relying on model guesses.",
+    status: "checked"
   },
   {
     name: "Go",
     detail:
-      "Five external Go repos checked against Go parser/types oracle: 29,038 TP / 0 FP / 0 FN, with refresh probes reparsing only edited files.",
-    status: "declaration oracle"
+      "Refresh probes verify that changed files can be re-indexed without rebuilding the whole repository understanding from scratch.",
+    status: "checked"
   }
 ];
 
 export const operatingLoop: FactCard[] = [
   {
     label: "1",
-    title: "Index local code",
+    title: "Understand the repo locally",
     body:
-      "Parse supported files, classify workspace facts, build graph/cache partitions, and refresh changed files as the repo moves."
+      "Squeezy builds a local code map and workspace view so the first model call does not start from a blank repository."
   },
   {
     label: "2",
-    title: "Plan with graph evidence",
+    title: "Read only the relevant code",
     body:
-      "Route navigation prompts through declarations, references, callers, hierarchy, body hits, diff context, and exact next reads."
+      "The agent narrows broad questions into specific files, symbols, diffs, command outputs, or verifier steps."
   },
   {
     label: "3",
-    title: "Spend model context selectively",
+    title: "Keep context tight",
     body:
-      "Send focused evidence and escalate to raw reads, shell, web, MCP, or compiler tools only when local structure is not enough."
+      "Repeated output is replaced with receipts, noisy output is shaped, and long conversations are compacted before they become expensive."
   },
   {
     label: "4",
-    title: "Account and compact",
+    title: "Send focused work to the model",
     body:
-      "Track provider tokens, cache counters, tool bytes, spills, subagent cost, and compact stale transcript bulk during longer work."
+      "The selected provider gets the useful context, and Squeezy tracks tokens, cache usage, tool output, and estimated spend."
   }
 ];
 
 export const languageRows: MatrixRow[] = [
-  { name: "Rust", detail: "Modules, traits, impls, macros, tests, calls, references, and Cargo facts.", status: "strong" },
-  { name: "Python", detail: "Classes, functions, imports, decorators, bases, annotations, calls, exports, and references.", status: "solid" },
-  { name: "Java", detail: "Packages, types, members, constructors, inheritance, implements edges, calls, references, and Maven/Gradle facts.", status: "solid" },
-  { name: "Kotlin", detail: "Packages, imports, classes, objects, companion objects, sealed/data types, extension receivers, and Gradle facts.", status: "solid" },
-  { name: "Scala", detail: "Packages, classes, traits, objects, case classes, enums, extension methods, givens, and references.", status: "emerging" },
-  { name: "C#/.NET", detail: "Namespaces, usings, types, members, attributes, calls, references, partial links, inheritance, and project facts.", status: "strong" },
-  { name: "Go", detail: "Packages, imports, structs, interfaces, aliases, functions, methods, receivers, calls, tests, and references.", status: "strong" },
-  { name: "C/C++", detail: "Includes, namespaces, classes, structs, unions, enums, typedefs, functions, methods, templates, macros, and references.", status: "strong" },
-  { name: "JavaScript/TypeScript", detail: "Imports, exports, CommonJS aliases, functions, classes, interfaces, types, JSX/TSX declarations, member calls, and references.", status: "strong" },
-  { name: "PHP", detail: "Namespaces, use imports, classes, interfaces, traits, enums, methods, properties, attributes, calls, references, and trait edges.", status: "strong" },
-  { name: "Ruby", detail: "Classes, modules, methods, singleton methods, attr accessors, require/import hints, mixins, calls, and references.", status: "solid" },
-  { name: "Swift", detail: "Classes, structs, actors, protocols, enums, extensions, generics, property wrappers, imports, and module hints.", status: "emerging" },
-  { name: "Dart", detail: "Libraries, parts, classes, mixins, extensions, extension types, sealed types, enums, constructors, imports, calls, and type refs.", status: "emerging" }
+  { name: "Rust", detail: "Cargo workspaces, crates, traits, impls, modules, and tests." },
+  { name: "Python", detail: "Packages, imports, classes, functions, decorators, and inheritance." },
+  { name: "Java", detail: "Packages, Maven/Gradle projects, classes, members, and inheritance." },
+  { name: "Kotlin", detail: "Packages, Gradle projects, classes, objects, companions, and extensions." },
+  { name: "Scala", detail: "Packages, traits, objects, case classes, enums, and extension methods." },
+  { name: "C#/.NET", detail: "Solutions, namespaces, usings, partial types, attributes, and members." },
+  { name: "Go", detail: "Modules, packages, structs, interfaces, receivers, imports, and tests." },
+  { name: "C", detail: "Headers, includes, structs, functions, typedefs, macros, and references." },
+  { name: "C++", detail: "Headers, namespaces, classes, templates, methods, and overload-heavy code." },
+  { name: "JavaScript", detail: "ES modules, CommonJS, functions, classes, exports, and JSX." },
+  { name: "TypeScript", detail: "Types, interfaces, imports, generics, classes, and TSX." },
+  { name: "PHP", detail: "Namespaces, Composer-style code, traits, enums, attributes, and methods." },
+  { name: "Ruby", detail: "Classes, modules, mixins, singleton methods, accessors, and require paths." },
+  { name: "Swift", detail: "Modules, protocols, actors, structs, extensions, and property wrappers." },
+  { name: "Dart", detail: "Libraries, parts, classes, mixins, extensions, and Flutter-style projects." }
 ];
 
 export const providerGroups: MatrixRow[] = [
   {
-    name: "Native APIs",
+    name: "Native providers",
     detail:
-      "OpenAI, Anthropic, Google Gemini, Azure OpenAI, AWS Bedrock, and Ollama have dedicated runtime paths or local runtime handling.",
-    status: "first-party routes"
+      "OpenAI, Anthropic, Google Gemini, Azure OpenAI, AWS Bedrock, and Ollama have dedicated or local runtime paths.",
+    status: "API keys or local config"
   },
   {
-    name: "OAuth subscriptions",
+    name: "Compatible APIs",
     detail:
-      "Anthropic, OpenAI Codex/ChatGPT subscription, and GitHub Copilot auth flows are represented in the CLI and provider registry.",
-    status: "login flows"
+      "OpenRouter, Vercel AI Gateway, PortKey, Groq, xAI, DeepSeek, Mistral, Together, Fireworks, Cerebras, DeepInfra, Baseten, Cloudflare Workers AI, and custom compatible endpoints.",
+    status: "bring an endpoint"
   },
   {
-    name: "OpenAI-compatible services",
+    name: "Local runtimes",
     detail:
-      "OpenRouter, Vercel, PortKey, Groq, xAI, DeepSeek, Vertex, Mistral, Together, Fireworks, Cerebras, DeepInfra, Baseten, Cloudflare Workers AI, local LM Studio/vLLM/llama.cpp, and custom compatible endpoints.",
-    status: "presets"
+      "Use local or self-hosted routes such as Ollama, LM Studio, vLLM, llama.cpp-style servers, or custom compatible base URLs.",
+    status: "local when configured"
   }
 ];
 
@@ -316,8 +399,31 @@ export const installRows: MatrixRow[] = [
   },
   {
     name: "Windows",
-    detail: "x86_64 MSVC archive and Winget manifest update path. Shell sandboxing is Job-Object-only on Windows.",
+    detail: "x86_64 MSVC archive and Winget manifest update path. Some sandbox behavior is platform-limited on Windows.",
     status: "x86_64"
+  }
+];
+
+export const supportCoverageRows: MatrixRow[] = [
+  {
+    name: "Operating systems",
+    detail: "macOS on Apple Silicon and Intel, Linux x86_64, and Windows x86_64.",
+    status: "install targets"
+  },
+  {
+    name: "Languages",
+    detail: "Rust, Python, Java, Kotlin, Scala, C#/.NET, Go, C, C++, JavaScript, TypeScript, PHP, Ruby, Swift, and Dart.",
+    status: "15"
+  },
+  {
+    name: "Providers",
+    detail: "Native providers, compatible APIs, cloud hosts, OAuth-style routes, custom endpoints, and local runtimes.",
+    status: "bring your model"
+  },
+  {
+    name: "Diagnostics",
+    detail: "`/feedback`, `/report`, and `squeezy sessions report` create support material you can preview before sending.",
+    status: "redacted"
   }
 ];
 
@@ -325,19 +431,19 @@ export const trustRows: MatrixRow[] = [
   {
     name: "Permissions",
     detail:
-      "Configurable policies cover edits, shell, web, MCP, destructive actions, and outside-workspace paths. Defaults keep external access reviewable.",
+      "Configurable policies cover edits, shell, web, MCP, destructive actions, and outside-workspace paths.",
     status: "reviewable"
   },
   {
-    name: "Telemetry",
+    name: "Website analytics",
     detail:
-      "Website events go through a Cloudflare Worker to PostHog. Product telemetry is bounded and opt-controlled; reports and feedback are explicit.",
-    status: "worker proxy"
+      "Website visits and clicks are sent through the configured telemetry endpoint so the site can be improved.",
+    status: "PostHog"
   },
   {
     name: "Rollback",
     detail:
-      "Optional checkpoints can record mutating tool calls and support call-level or turn-level rollback when a provider is configured.",
+      "Optional checkpoints can record mutating tool calls and support call-level or turn-level rollback when configured.",
     status: "optional"
   }
 ];
