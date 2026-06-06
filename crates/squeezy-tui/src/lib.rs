@@ -7588,11 +7588,12 @@ fn wrap_cells_preserving(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<
 
 fn wrap_transcript_overlay_line(line: &Line<'static>, width: usize, rows: &mut Vec<Line<'static>>) {
     let width = width.max(1);
+    let line = flatten_embedded_line_breaks(line);
     let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     if full.chars().count() <= width {
         // Fits as-is — pass it through untouched so the gutter and any inner
         // whitespace are preserved exactly.
-        rows.push(line.clone());
+        rows.push(line);
         return;
     }
     // Over-long: keep the gutter, word-wrap only the content past it.
@@ -7617,6 +7618,28 @@ fn wrap_transcript_overlay_line(line: &Line<'static>, width: usize, rows: &mut V
         };
         spans.extend(segment);
         rows.push(Line::from(spans));
+    }
+}
+
+fn flatten_embedded_line_breaks(line: &Line<'static>) -> Line<'static> {
+    let mut changed = false;
+    let spans = line
+        .spans
+        .iter()
+        .map(|span| {
+            let content = span.content.as_ref();
+            if content.contains('\n') || content.contains('\r') {
+                changed = true;
+                Span::styled(content.replace(['\n', '\r'], " "), span.style)
+            } else {
+                span.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    if changed {
+        Line::from(spans)
+    } else {
+        line.clone()
     }
 }
 
@@ -11587,6 +11610,7 @@ pub(crate) fn tool_call_label(call: &ToolCall) -> String {
     match call.name.as_str() {
         "shell" => string_arg(&call.arguments, "command")
             .or_else(|| string_arg(&call.arguments, "description"))
+            .map(|label| single_line_label(&label))
             .unwrap_or_else(|| call.name.clone()),
         "verify" => verify_call_label(call),
         "decl_search" => {
@@ -11647,6 +11671,10 @@ pub(crate) fn tool_call_label(call: &ToolCall) -> String {
             .unwrap_or_else(|| "web search".to_string()),
         _ => call.name.clone(),
     }
+}
+
+fn single_line_label(label: &str) -> String {
+    label.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn active_tool_spans(call: &ToolCall) -> Vec<Span<'static>> {

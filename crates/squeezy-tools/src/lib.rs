@@ -694,7 +694,7 @@ pub fn human_label_for_call(name: &str, args: &Value) -> String {
             let pat = s("pattern").unwrap_or_else(|| "?".to_string());
             format!("globbing for `{pat}`")
         }
-        "shell" => match s("command") {
+        "shell" => match s("command").map(|cmd| single_line_label(&cmd)) {
             Some(cmd) => format!("running `{cmd}`"),
             None => format!("running {name}"),
         },
@@ -733,6 +733,10 @@ pub fn human_label_for_call(name: &str, args: &Value) -> String {
         },
         _ => name.to_string(),
     }
+}
+
+fn single_line_label(label: &str) -> String {
+    label.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

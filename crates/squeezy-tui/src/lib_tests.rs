@@ -5560,6 +5560,22 @@ fn tool_call_label_describes_verify_by_scope_and_level() {
 }
 
 #[test]
+fn tool_call_label_flattens_multiline_shell_commands() {
+    let call = ToolCall {
+        call_id: "s-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({
+            "command": "sonar context navigation get-source\n  | python3 -c \"print('signature')\"",
+        }),
+    };
+
+    assert_eq!(
+        tool_call_label(&call),
+        "sonar context navigation get-source | python3 -c \"print('signature')\""
+    );
+}
+
+#[test]
 fn read_tool_output_hides_cargo_json_artifacts_in_normal_mode() {
     let mut app = test_app(SessionMode::Build);
     let mut result = sample_tool_result("read_tool_output", "");
@@ -14720,6 +14736,26 @@ fn overlay_wraps_long_lines_keeping_the_gutter() {
     // The break lands on a word boundary, not mid-word.
     assert!(text.contains("for modernization"), "{text}");
     assert!(text.contains("│   opportunities"), "{text}");
+}
+
+#[test]
+fn rail_wrap_flattens_embedded_line_breaks_before_measuring() {
+    let lines = vec![Line::from(vec![
+        Span::raw("   ├─"),
+        Span::styled("✔ ", Style::default().fg(crate::render::theme::green())),
+        Span::raw("Ran "),
+        Span::raw("sonar context\nnavigation get-source"),
+    ])];
+
+    let rows = wrap_transcript_overlay_rows(&lines, 80);
+    let text = lines_to_plain_text(&rows);
+
+    assert_eq!(rows.len(), 1, "{text}");
+    assert!(!text.contains('\n') || text.lines().count() == 1, "{text}");
+    assert!(
+        text.contains("Ran sonar context navigation get-source"),
+        "{text}"
+    );
 }
 
 #[test]
