@@ -245,8 +245,9 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
         .saturating_sub(snapshot.conversation.skill_output_bytes);
     let tool_tokens = approx(tool_only_bytes);
     // MCP tool schemas live in the per-request framing; carve them out of the
-    // opaque system + framing remainder computed below.
-    let mcp_tokens = approx(snapshot.mcp.total_schema_bytes);
+    // opaque system + framing remainder computed below. Lazy loading means the
+    // live cost is the stub lines plus only the loaded full schemas.
+    let mcp_tokens = approx(snapshot.mcp.in_context_bytes_total);
     let reasoning_tokens = approx(snapshot.conversation.reasoning_bytes);
     let image_tokens = approx(snapshot.conversation.image_bytes);
     let attachment_tokens = approx(snapshot.attachments.stored_bytes);
@@ -289,14 +290,14 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
             )),
         ));
     }
-    if snapshot.mcp.total_schema_bytes > 0 {
+    if snapshot.mcp.in_context_bytes_total > 0 {
         out.push_str(&format!(
             "  {} mcp tool schemas:         ~{} tokens  {}\n",
             style::accent("◆"),
             style::accent_bold(&style::group_thousands(mcp_tokens as u64)),
             style::muted(&format!(
-                "({} bytes; {} tool(s) across {} server(s))",
-                snapshot.mcp.total_schema_bytes,
+                "({} bytes live; {} tool(s) across {} server(s))",
+                snapshot.mcp.in_context_bytes_total,
                 snapshot.mcp.total_tools,
                 snapshot.mcp.servers.len(),
             )),
@@ -377,10 +378,16 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
         }
     }
 
-    out.push('\n');
-    format_skills_section(&mut out, &snapshot.skills);
-    out.push('\n');
-    format_mcp_section(&mut out, &snapshot.mcp);
+    // Only surface the Skills/MCP block when there is something to show — an
+    // empty inventory would just add noise (and height) to every /context.
+    if snapshot.skills.discovered > 0 || !snapshot.mcp.servers.is_empty() {
+        out.push('\n');
+        format_skills_mcp_total(&mut out, &snapshot.skills, &snapshot.mcp);
+        out.push('\n');
+        format_skills_section(&mut out, &snapshot.skills);
+        out.push('\n');
+        format_mcp_section(&mut out, &snapshot.mcp);
+    }
 
     out.push('\n');
     out.push_str(&style::header("Session"));
@@ -503,29 +510,47 @@ fn truncate_display(value: &str, max: usize) -> String {
     out
 }
 
-/// Render the "Skills" section: every discovered skill with a body-token
-/// estimate, ordered as discovered, with a `(loaded)` marker on skills whose
-/// body is materialized in this session.
+/// Round bytes to the same 4-bytes/token estimate used across `/context`.
+fn approx_tokens(bytes: usize) -> u64 {
+    bytes.div_ceil(4) as u64
+}
+
+/// Render the combined "Skills + MCP" grand total that heads the two sections:
+/// the in-context cost of skill metadata + loaded bodies plus MCP stubs +
+/// loaded schemas, with the two subtotals broken out.
+fn format_skills_mcp_total(out: &mut String, skills: &SkillsAccounting, mcp: &McpAccounting) {
+    let skills_bytes = skills.metadata_bytes_total + skills.loaded_body_bytes_total;
+    let mcp_bytes = mcp.in_context_bytes_total;
+    out.push_str(&style::header("Skills + MCP"));
+    out.push(' ');
+    out.push_str(&style::muted(&format!(
+        "(~{} tok in context = skills ~{} + mcp ~{})",
+        style::group_thousands(approx_tokens(skills_bytes + mcp_bytes)),
+        style::group_thousands(approx_tokens(skills_bytes)),
+        style::group_thousands(approx_tokens(mcp_bytes)),
+    )));
+    out.push('\n');
+}
+
+/// Render the "Skills" section: every discovered skill split into its
+/// always-present metadata cost and its body cost (counted when loaded),
+/// with a `(loaded)` marker and the section subtotal in the header.
 fn format_skills_section(out: &mut String, skills: &SkillsAccounting) {
-    let approx = |bytes: usize| bytes.div_ceil(4) as u64;
     out.push_str(&style::header("Skills"));
     if skills.discovered == 0 {
         out.push('\n');
         out.push_str(&format!("  {}\n", style::muted("none discovered")));
         return;
     }
-    let loaded_bytes: usize = skills
-        .entries
-        .iter()
-        .filter(|entry| entry.loaded)
-        .map(|entry| entry.body_bytes)
-        .sum();
+    let total_bytes = skills.metadata_bytes_total + skills.loaded_body_bytes_total;
     out.push(' ');
     out.push_str(&style::muted(&format!(
-        "({} discovered, {} loaded, ~{} tok loaded)",
+        "({} discovered, {} loaded · meta ~{} + bodies ~{} = ~{} tok)",
         skills.discovered,
         skills.loaded,
-        style::group_thousands(approx(loaded_bytes)),
+        style::group_thousands(approx_tokens(skills.metadata_bytes_total)),
+        style::group_thousands(approx_tokens(skills.loaded_body_bytes_total)),
+        style::group_thousands(approx_tokens(total_bytes)),
     )));
     out.push('\n');
     let name_width = skills
@@ -541,26 +566,39 @@ fn format_skills_section(out: &mut String, skills: &SkillsAccounting) {
             style::secondary("◇")
         };
         let pad = " ".repeat(name_width.saturating_sub(entry.name.chars().count()));
-        let marker = if entry.loaded {
-            style::muted("  (loaded)")
+        let meta_tokens = approx_tokens(entry.metadata_bytes);
+        let body_tokens = approx_tokens(entry.body_bytes);
+        // Loaded: meta + body are both in context. Not loaded: only meta is
+        // present; show the body as the cost a first load would add.
+        let breakdown = if entry.loaded {
+            format!(
+                "meta ~{} + body ~{} = ~{} tok  {}",
+                style::group_thousands(meta_tokens),
+                style::group_thousands(body_tokens),
+                style::accent_bold(&style::group_thousands(meta_tokens + body_tokens)),
+                style::muted("(loaded)"),
+            )
         } else {
-            String::new()
+            format!(
+                "meta ~{} tok  {}",
+                style::accent_bold(&style::group_thousands(meta_tokens)),
+                style::muted(&format!(
+                    "(+~{} if loaded)",
+                    style::group_thousands(body_tokens)
+                )),
+            )
         };
         out.push_str(&format!(
-            "  {} {}{}  ~{} tok{}\n",
-            icon,
-            entry.name,
-            pad,
-            style::accent_bold(&style::group_thousands(approx(entry.body_bytes))),
-            marker,
+            "  {} {}{}  {}\n",
+            icon, entry.name, pad, breakdown
         ));
     }
 }
 
-/// Render the "MCPs" section: connected servers with live status and schema
-/// token cost, each followed by its tools (name + truncated description).
+/// Render the "MCPs" section: connected servers with live status and a
+/// per-tool split of the lazy stub cost from the full-schema (first-load)
+/// cost, with per-server and section subtotals.
 fn format_mcp_section(out: &mut String, mcp: &McpAccounting) {
-    let approx = |bytes: usize| bytes.div_ceil(4) as u64;
     out.push_str(&style::header("MCPs"));
     if mcp.servers.is_empty() {
         out.push('\n');
@@ -569,10 +607,12 @@ fn format_mcp_section(out: &mut String, mcp: &McpAccounting) {
     }
     out.push(' ');
     out.push_str(&style::muted(&format!(
-        "({} server(s), {} tool(s), ~{} tok schemas)",
+        "({} server(s), {} tool(s) · stubs ~{} + loaded ~{} = ~{} tok)",
         mcp.servers.len(),
         mcp.total_tools,
-        style::group_thousands(approx(mcp.total_schema_bytes)),
+        style::group_thousands(approx_tokens(mcp.stub_bytes_total)),
+        style::group_thousands(approx_tokens(mcp.loaded_full_bytes_total)),
+        style::group_thousands(approx_tokens(mcp.in_context_bytes_total)),
     )));
     out.push('\n');
     for server in &mcp.servers {
@@ -581,14 +621,47 @@ fn format_mcp_section(out: &mut String, mcp: &McpAccounting) {
             style::accent("●"),
             style::accent(&server.name),
             style::muted(&server.status),
-            style::accent_bold(&style::group_thousands(approx(server.schema_bytes))),
+            style::accent_bold(&style::group_thousands(approx_tokens(
+                server.in_context_bytes
+            ))),
         ));
         for tool in &server.tools {
+            let stub_tokens = approx_tokens(tool.stub_bytes);
+            let full_tokens = approx_tokens(tool.full_bytes);
+            // Loaded tools carry stub + full; lazy-deferred tools carry only the
+            // stub, with the full schema shown as the first-load cost increase.
+            let cost = if tool.loaded {
+                if tool.stub_bytes > 0 {
+                    format!(
+                        "stub ~{} + schema ~{} = ~{} tok  {}",
+                        style::group_thousands(stub_tokens),
+                        style::group_thousands(full_tokens),
+                        style::group_thousands(stub_tokens + full_tokens),
+                        style::muted("(loaded)"),
+                    )
+                } else {
+                    format!(
+                        "schema ~{} tok  {}",
+                        style::group_thousands(full_tokens),
+                        style::muted("(loaded)"),
+                    )
+                }
+            } else {
+                format!(
+                    "stub ~{} tok  {}",
+                    style::group_thousands(stub_tokens),
+                    style::muted(&format!(
+                        "(+~{} on first load)",
+                        style::group_thousands(full_tokens)
+                    )),
+                )
+            };
             out.push_str(&format!(
-                "      {} {}  {}\n",
+                "      {} {}  {}  {}\n",
                 style::secondary("-"),
                 tool.name,
-                style::muted(&truncate_display(&tool.description, 60)),
+                style::muted(&truncate_display(&tool.description, 48)),
+                cost,
             ));
         }
     }

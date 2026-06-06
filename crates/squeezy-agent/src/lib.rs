@@ -604,25 +604,41 @@ pub struct SkillAccountingEntry {
     pub description: String,
     /// `true` when the skill body is currently materialized in this session.
     pub loaded: bool,
-    /// Estimated body size in bytes: the cached body length when loaded,
-    /// otherwise the on-disk `SKILL.md` size.
+    /// Byte size of the always-present metadata block (no body).
+    pub metadata_bytes: usize,
+    /// Body byte size: exact for loaded skills (in context now), on-disk
+    /// `SKILL.md` size otherwise (the cost a first load would add).
     pub body_bytes: usize,
 }
 
-/// Skill catalog accounting for `/context`.
+/// Skill catalog accounting for `/context`. Totals split the always-present
+/// metadata cost from the body cost that only loaded skills contribute.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SkillsAccounting {
     pub discovered: usize,
     pub loaded: usize,
     pub entries: Vec<SkillAccountingEntry>,
+    /// Sum of every discovered skill's metadata block.
+    pub metadata_bytes_total: usize,
+    /// Sum of loaded skills' bodies (materialized in context).
+    pub loaded_body_bytes_total: usize,
 }
 
-/// One MCP tool's accounting entry for the `/context` "MCPs" section.
+/// One MCP tool's accounting entry for the `/context` "MCPs" section. MCP tools
+/// are lazily loaded: `stub_bytes` (tool-index line) is always present, and the
+/// full schema (`full_bytes`) is attached only after first load.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct McpToolAccountingEntry {
     pub name: String,
     pub description: String,
-    pub schema_bytes: usize,
+    /// Tool-index stub line cost (initial lazy cost; 0 when lazy loading off).
+    pub stub_bytes: usize,
+    /// Full schema cost — the delta a first load adds (or always-on when lazy
+    /// loading is disabled).
+    pub full_bytes: usize,
+    /// `true` when the full schema is live in the request (loaded this session,
+    /// or always-on when lazy loading is disabled).
+    pub loaded: bool,
 }
 
 /// One MCP server's accounting for `/context`, grouping its tools.
@@ -633,16 +649,26 @@ pub struct McpServerAccounting {
     /// or `configured` when no live status is reported yet.
     pub status: String,
     pub tools: Vec<McpToolAccountingEntry>,
-    pub schema_bytes: usize,
+    /// Sum of this server's stub lines.
+    pub stub_bytes: usize,
+    /// Sum of this server's live full schemas (loaded tools).
+    pub loaded_full_bytes: usize,
+    /// Live in-context cost: `stub_bytes + loaded_full_bytes`.
+    pub in_context_bytes: usize,
 }
 
-/// MCP accounting for `/context`. `total_schema_bytes` is the request-framing
-/// cost of all advertised MCP tool schemas, carved out of "system + framing".
+/// MCP accounting for `/context`. `in_context_bytes_total` is the live
+/// request-framing cost (stub lines + loaded full schemas), carved out of
+/// "system + framing".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct McpAccounting {
     pub servers: Vec<McpServerAccounting>,
     pub total_tools: usize,
-    pub total_schema_bytes: usize,
+    /// Whether lazy schema loading is active (stubs in play).
+    pub lazy: bool,
+    pub stub_bytes_total: usize,
+    pub loaded_full_bytes_total: usize,
+    pub in_context_bytes_total: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2568,56 +2594,59 @@ impl Agent {
                 Some(&state.token_calibration),
             ),
             skills: self.skills_accounting(),
-            mcp: self.mcp_accounting(),
+            mcp: self.mcp_accounting(&loaded_tool_schemas),
         }
     }
 
-    /// Build the `/context` "Skills" view: every discovered skill, marked
-    /// `loaded` when its body is materialized this session, with a per-skill
-    /// body-size estimate (cached body length when loaded, on-disk `SKILL.md`
-    /// size otherwise — read without materializing the body).
+    /// Build the `/context` "Skills" view: every discovered skill with its
+    /// always-present metadata cost split from its body cost. A skill is
+    /// `loaded` when its body is materialized this session; body bytes are
+    /// exact for loaded skills and the on-disk `SKILL.md` size (first-load cost)
+    /// otherwise.
     fn skills_accounting(&self) -> SkillsAccounting {
-        let summaries = self.tools.skill_summaries();
-        let loaded_sizes = self.tools.loaded_skill_body_sizes();
-        let mut entries = Vec::with_capacity(summaries.len());
+        let breakdown = self.tools.skill_context_breakdown();
+        let mut entries = Vec::with_capacity(breakdown.len());
         let mut loaded = 0;
-        for summary in summaries {
-            let is_loaded = loaded_sizes.contains_key(&summary.name);
-            if is_loaded {
+        let mut metadata_bytes_total = 0;
+        let mut loaded_body_bytes_total = 0;
+        for item in breakdown {
+            metadata_bytes_total += item.metadata_bytes;
+            if item.loaded {
                 loaded += 1;
+                loaded_body_bytes_total += item.body_bytes;
             }
-            let body_bytes = match loaded_sizes.get(&summary.name) {
-                Some(bytes) => *bytes,
-                None => std::fs::metadata(&summary.location)
-                    .map(|meta| meta.len() as usize)
-                    .unwrap_or(0),
-            };
             entries.push(SkillAccountingEntry {
-                name: summary.name,
-                description: summary
+                name: item.name,
+                description: item
                     .description
                     .lines()
                     .next()
                     .unwrap_or_default()
                     .to_string(),
-                loaded: is_loaded,
-                body_bytes,
+                loaded: item.loaded,
+                metadata_bytes: item.metadata_bytes,
+                body_bytes: item.body_bytes,
             });
         }
         SkillsAccounting {
             discovered: entries.len(),
             loaded,
             entries,
+            metadata_bytes_total,
+            loaded_body_bytes_total,
         }
     }
 
     /// Build the `/context` "MCPs" view: connected MCP tools grouped by server,
-    /// each tool's advertised schema byte size, and per-server live status.
-    fn mcp_accounting(&self) -> McpAccounting {
+    /// each split into its lazy stub cost and full-schema (first-load) cost,
+    /// with per-server live status. `loaded_tool_schemas` is the set of tool
+    /// names whose full schema is attached to the request this session.
+    fn mcp_accounting(&self, loaded_tool_schemas: &[String]) -> McpAccounting {
+        let lazy = self.config.tools.lazy_schema_loading;
+        let loaded_set: BTreeSet<&str> = loaded_tool_schemas.iter().map(String::as_str).collect();
         let status = self.tools.mcp_status_snapshot();
         let tool_infos = self.tools.mcp_tool_schema_infos();
         let total_tools = tool_infos.len();
-        let total_schema_bytes = tool_infos.iter().map(|info| info.schema_bytes).sum();
 
         // Group tools under their owning server. Seed the map from the status
         // snapshot so configured-but-toolless servers still render.
@@ -2628,31 +2657,46 @@ impl Agent {
                 McpServerAccounting {
                     name: name.clone(),
                     status: format_mcp_status(server_status),
-                    tools: Vec::new(),
-                    schema_bytes: 0,
+                    ..McpServerAccounting::default()
                 },
             );
         }
+        let mut stub_bytes_total = 0;
+        let mut loaded_full_bytes_total = 0;
         for info in tool_infos {
+            // Without lazy loading every schema is always sent (no stub, always
+            // "loaded"). With it, the stub line is always present and the full
+            // schema is live only after `load_tool_schema`.
+            let full_live = !lazy || loaded_set.contains(info.name.as_str());
+            let stub = if lazy { info.stub_bytes } else { 0 };
+            let live_full = if full_live { info.full_bytes } else { 0 };
+            stub_bytes_total += stub;
+            loaded_full_bytes_total += live_full;
             let entry = servers
                 .entry(info.server.clone())
                 .or_insert_with(|| McpServerAccounting {
                     name: info.server.clone(),
                     status: "configured".to_string(),
-                    tools: Vec::new(),
-                    schema_bytes: 0,
+                    ..McpServerAccounting::default()
                 });
-            entry.schema_bytes += info.schema_bytes;
+            entry.stub_bytes += stub;
+            entry.loaded_full_bytes += live_full;
+            entry.in_context_bytes += stub + live_full;
             entry.tools.push(McpToolAccountingEntry {
                 name: info.name,
                 description: info.description,
-                schema_bytes: info.schema_bytes,
+                stub_bytes: stub,
+                full_bytes: info.full_bytes,
+                loaded: full_live,
             });
         }
         McpAccounting {
             servers: servers.into_values().collect(),
             total_tools,
-            total_schema_bytes,
+            lazy,
+            stub_bytes_total,
+            loaded_full_bytes_total,
+            in_context_bytes_total: stub_bytes_total + loaded_full_bytes_total,
         }
     }
 
@@ -15152,6 +15196,10 @@ fn format_mcp_status(status: &squeezy_tools::McpServerStatus) -> String {
                 format!("ready ({tools_count} tools)")
             }
         }
+        squeezy_tools::McpServerStatus::Stale {
+            tools_count,
+            outcome,
+        } => format!("stale ({tools_count} tools, {outcome:?})"),
         squeezy_tools::McpServerStatus::Failed { error } => format!("failed: {error}"),
         squeezy_tools::McpServerStatus::Cancelled => "cancelled".to_string(),
     }

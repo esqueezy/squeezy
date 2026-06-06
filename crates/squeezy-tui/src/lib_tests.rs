@@ -4320,6 +4320,8 @@ fn context_breaks_out_skills_and_mcp_sources() {
         ..ConversationShape::default()
     };
 
+    // One loaded skill (meta 400B + body 4_000B) and one discovered-only skill
+    // (meta 400B; body 800B would land on first load).
     let skills = SkillsAccounting {
         discovered: 2,
         loaded: 1,
@@ -4328,17 +4330,23 @@ fn context_breaks_out_skills_and_mcp_sources() {
                 name: "sonar-context-augmentation".to_string(),
                 description: "always invoke".to_string(),
                 loaded: true,
+                metadata_bytes: 400,
                 body_bytes: 4_000,
             },
             SkillAccountingEntry {
                 name: "rust-nav".to_string(),
                 description: "navigate rust".to_string(),
                 loaded: false,
+                metadata_bytes: 400,
                 body_bytes: 800,
             },
         ],
+        metadata_bytes_total: 800,
+        loaded_body_bytes_total: 4_000,
     };
 
+    // Lazy MCP: search is loaded (stub 80 + full 1_200 live), fetch deferred
+    // (stub 80 live, full 800 only on first load).
     let mcp = McpAccounting {
         servers: vec![McpServerAccounting {
             name: "docs".to_string(),
@@ -4347,18 +4355,27 @@ fn context_breaks_out_skills_and_mcp_sources() {
                 McpToolAccountingEntry {
                     name: "search".to_string(),
                     description: "search the docs".to_string(),
-                    schema_bytes: 1_200,
+                    stub_bytes: 80,
+                    full_bytes: 1_200,
+                    loaded: true,
                 },
                 McpToolAccountingEntry {
                     name: "fetch".to_string(),
                     description: "fetch a page".to_string(),
-                    schema_bytes: 800,
+                    stub_bytes: 80,
+                    full_bytes: 800,
+                    loaded: false,
                 },
             ],
-            schema_bytes: 2_000,
+            stub_bytes: 160,
+            loaded_full_bytes: 1_200,
+            in_context_bytes: 1_360,
         }],
         total_tools: 2,
-        total_schema_bytes: 2_000,
+        lazy: true,
+        stub_bytes_total: 160,
+        loaded_full_bytes_total: 1_200,
+        in_context_bytes_total: 1_360,
     };
 
     let snapshot = SessionAccountingSnapshot {
@@ -4382,22 +4399,39 @@ fn context_breaks_out_skills_and_mcp_sources() {
 
     let output = strip_ansi_escape_sequences(&commands::format_context_command(&snapshot));
 
-    // Skills section lists every discovered skill and marks the loaded one.
-    assert!(output.contains("Skills"), "{output}");
-    assert!(output.contains("2 discovered, 1 loaded"), "{output}");
-    assert!(output.contains("sonar-context-augmentation"), "{output}");
+    // Combined grand total at the top: skills (800+4_000)/4 = 1_200, mcp
+    // 1_360/4 = 340, together (6_160)/4 = 1_540.
+    assert!(output.contains("Skills + MCP"), "{output}");
+    assert!(output.contains("skills ~1,200 + mcp ~340"), "{output}");
+
+    // Skills section: per-skill metadata/body split, (loaded) marker, and a
+    // first-load hint for the deferred skill.
+    assert!(
+        output.contains("2 discovered, 1 loaded · meta ~200 + bodies ~1,000 = ~1,200 tok"),
+        "{output}"
+    );
+    assert!(
+        output.contains("meta ~100 + body ~1,000 = ~1,100 tok"),
+        "{output}"
+    );
     assert!(output.contains("(loaded)"), "{output}");
     assert!(output.contains("rust-nav"), "{output}");
+    assert!(output.contains("(+~200 if loaded)"), "{output}");
 
-    // MCPs section lists the server, its live status, and its tools.
-    assert!(output.contains("MCPs"), "{output}");
-    assert!(output.contains("docs"), "{output}");
-    assert!(output.contains("ready (2 tools)"), "{output}");
-    assert!(output.contains("search"), "{output}");
+    // MCPs section: per-tool stub vs full-schema split, loaded vs first-load.
+    assert!(
+        output.contains("stubs ~40 + loaded ~300 = ~340 tok"),
+        "{output}"
+    );
+    assert!(
+        output.contains("stub ~20 + schema ~300 = ~320 tok"),
+        "{output}"
+    );
+    assert!(output.contains("(+~200 on first load)"), "{output}");
 
     // Consumption by source carves skills out of tool outputs (~4_000/4 =
-    // 1_000) and MCP schemas out of framing (~2_000/4 = 500); the genuine tool
-    // output is the 400-byte remainder (~100).
+    // 1_000) and live MCP schemas out of framing (~1_360/4 = 340); the genuine
+    // tool output is the 400-byte remainder (~100).
     assert!(
         output.contains("tool call outputs:        ~100 tokens"),
         "{output}"
@@ -4407,7 +4441,7 @@ fn context_breaks_out_skills_and_mcp_sources() {
         "{output}"
     );
     assert!(
-        output.contains("mcp tool schemas:         ~500 tokens"),
+        output.contains("mcp tool schemas:         ~340 tokens"),
         "{output}"
     );
 }
@@ -7294,7 +7328,8 @@ fn accounting_block_dispatch_skips_unrelated_system_messages() {
 #[test]
 fn context_snapshot_stays_expanded_in_compact_transcript() {
     use squeezy_agent::{
-        AttachmentShape, ConversationShape, SessionAccountingSnapshot, TranscriptShape,
+        AttachmentShape, ConversationShape, McpAccounting, SessionAccountingSnapshot,
+        SkillsAccounting, TranscriptShape,
     };
     use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
     use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
@@ -7329,6 +7364,8 @@ fn context_snapshot_stays_expanded_in_compact_transcript() {
         attachments: AttachmentShape::default(),
         transmitted_request: estimate,
         full_history_request: estimate,
+        skills: SkillsAccounting::default(),
+        mcp: McpAccounting::default(),
     };
     let body = commands::format_context_command(&snapshot);
 
