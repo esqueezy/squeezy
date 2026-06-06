@@ -10399,8 +10399,21 @@ fn retry_ack_recognizes_bare_done_confirmation() {
     assert!(assistant_text_is_retry_ack("Done."));
     assert!(assistant_text_is_retry_ack("`DONE`"));
     assert!(assistant_text_is_retry_ack("**Done.**"));
+    // A short, content-free completeness confirmation is still an ack.
+    assert!(assistant_text_is_retry_ack(
+        "The previous output is the complete answer."
+    ));
     assert!(!assistant_text_is_retry_ack(
         "Done — I also updated the changelog.",
+    ));
+    // A response that OPENS like a confirmation ("the previous response
+    // is ...") but actually negates it and supplies the missing content
+    // must NOT be treated as an ack — it carries the real continuation.
+    assert!(!assistant_text_is_retry_ack(
+        "The previous response is incomplete; the missing file is src/foo.rs.",
+    ));
+    assert!(!assistant_text_is_retry_ack(
+        "The previous answer is wrong — the correct value is 42 because the cache resets at midnight UTC.",
     ));
 }
 
@@ -10431,6 +10444,21 @@ fn merge_retried_appends_real_continuation() {
     assert_eq!(
         merged,
         "I scanned the tree.\n\nThe entrypoint is `main` in cli.rs."
+    );
+}
+
+#[test]
+fn merge_retried_appends_continuation_that_references_the_prior() {
+    // The retry response opens by referencing the prior output but then
+    // negates it and delivers the missing content. It is a real
+    // continuation and must be APPENDED, not discarded as an ack.
+    let mut deferred = String::new();
+    append_deferred_visible_assistant_text(&mut deferred, "I summarized the config.");
+    let continuation = "The previous response is incomplete; the missing file is src/foo.rs.";
+    let merged = merge_retried_visible_assistant_text(&mut deferred, continuation);
+    assert_eq!(
+        merged,
+        format!("I summarized the config.\n\n{continuation}"),
     );
 }
 

@@ -12281,13 +12281,37 @@ fn assistant_text_is_retry_ack(text: &str) -> bool {
             '.' | '!' | ' ' | '\t' | '\n' | '\r' | '"' | '\'' | '`' | '*' | '_'
         )
     });
-    bare == "done"
-        || lower.starts_with("the previous output is")
-        || lower.starts_with("the previous answer is")
-        || lower.starts_with("the previous response is")
-        || lower.contains("previous output is the complete answer")
-        || lower.contains("previous output was the complete answer")
-        || lower.contains("previous response is complete")
+    if bare == "done" {
+        return true;
+    }
+    // Beyond the bare token, only an explicit AND essentially content-free
+    // completeness confirmation collapses to the prior answer. A response
+    // that adds real content — even one that opens "the previous response
+    // is ..." but then negates it or supplies the missing content (e.g.
+    // "the previous response is incomplete; the missing file is foo.rs") —
+    // must be MERGED (appended), never dropped. So: short, affirms
+    // completeness, and carries no negation/continuation signal.
+    let chars = lower.chars().count();
+    if chars > 120
+        || lower.contains("incomplete")
+        || lower.contains("not complete")
+        || lower.contains("missing")
+    {
+        return false;
+    }
+    const COMPLETE_AFFIRMATIONS: &[&str] = &[
+        "is the complete answer",
+        "was the complete answer",
+        "previous response is complete",
+        "previous output is complete",
+        "previous answer is complete",
+        "already complete",
+        "nothing to add",
+        "no changes needed",
+    ];
+    COMPLETE_AFFIRMATIONS
+        .iter()
+        .any(|phrase| lower.contains(phrase))
 }
 
 /// Phrases that turn an "intent" verb into an *offer* rather than a
