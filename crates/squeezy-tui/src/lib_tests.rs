@@ -7178,6 +7178,60 @@ fn turn_divider_flush_inserts_before_queued_prompt_started_before_draw() {
 }
 
 #[test]
+fn fullscreen_transcript_inserts_pending_turn_divider_before_queued_prompt_for_all_outcomes() {
+    for (visual, expected, color) in [
+        (
+            TurnVisualState::Succeeded,
+            "╰─☽ Worked for 4s",
+            crate::render::theme::green(),
+        ),
+        (
+            TurnVisualState::Failed,
+            "╰─☽ Failed after 4s",
+            crate::render::theme::red(),
+        ),
+        (
+            TurnVisualState::Cancelled,
+            "╰─☽ Cancelled after 4s",
+            crate::render::theme::cyan(),
+        ),
+    ] {
+        let mut app = test_app(SessionMode::Build);
+        app.push_transcript_item(TranscriptItem::user("first prompt"));
+        complete_turn_for_test(&mut app, visual, Duration::from_secs(4));
+
+        app.note_turn_started();
+        app.push_transcript_item(TranscriptItem::user("queued prompt"));
+
+        let lines = transcript_lines_for_render(&app, Some(120), false);
+        let rendered_lines = lines.iter().map(rendered_line_text).collect::<Vec<_>>();
+        let divider_index = rendered_lines
+            .iter()
+            .position(|line| line.contains(expected))
+            .expect("divider should render");
+        let queued_prompt_index = rendered_lines
+            .iter()
+            .position(|line| line.contains("queued prompt"))
+            .expect("queued prompt should render");
+        assert!(
+            divider_index < queued_prompt_index,
+            "fullscreen transcript must close the completed turn before showing the queued prompt:\n{}",
+            rendered_lines.join("\n")
+        );
+        assert_eq!(
+            rendered_lines
+                .iter()
+                .filter(|line| line.contains(expected))
+                .count(),
+            1,
+            "fullscreen transcript should render exactly one completed divider:\n{}",
+            rendered_lines.join("\n")
+        );
+        assert_eq!(lines[divider_index].spans[2].style.fg, Some(color));
+    }
+}
+
+#[test]
 fn transcript_overlay_appends_completed_turn_divider_after_warn_tail() {
     let mut app = test_app(SessionMode::Build);
     app.transcript_overlay = Some(TranscriptOverlayState::default());
@@ -7696,6 +7750,53 @@ fn completed_turn_shows_worked_duration_divider() {
     assert_eq!(line.spans[2].style.fg, Some(crate::render::theme::green()));
     assert!(!output.contains("Working ("), "{output}");
     assert!(!output.contains("• Done"), "{output}");
+}
+
+#[test]
+fn inline_view_hides_completed_divider_after_scrollback_flush() {
+    for (visual, label) in [
+        (TurnVisualState::Succeeded, "Worked for 8s"),
+        (TurnVisualState::Cancelled, "Cancelled after 8s"),
+        (TurnVisualState::Failed, "Failed after 8s"),
+    ] {
+        let mut app = test_app(SessionMode::Build);
+        app.push_transcript_item(TranscriptItem::user("why?"));
+        app.push_transcript_item(TranscriptItem::assistant("Because."));
+        complete_turn_for_test(&mut app, visual, Duration::from_secs(8));
+
+        let before_flush = render_inline_to_string(&app, 120, 10);
+        assert!(
+            before_flush.contains(label),
+            "unflushed inline view should still close the completed turn: {before_flush}"
+        );
+
+        let len = app.transcript.len();
+        let (scrollback_lines, flushed_generation) =
+            inline_history_lines_for_flush_with_turn_divider(&app, 120, false, 0, len, None);
+        assert_eq!(flushed_generation, Some(app.turn_divider_generation));
+        let scrollback = lines_to_plain_text(&scrollback_lines);
+        assert!(
+            scrollback.contains(label),
+            "scrollback must own the completed divider after flush: {scrollback}"
+        );
+
+        let after_flush = render_inline_to_string_with_flushed_turn_divider(
+            &app,
+            120,
+            10,
+            app.turn_divider_generation,
+        );
+        assert!(
+            !after_flush.contains(label),
+            "once scrollback owns the divider, the live viewport must not duplicate it: {after_flush}"
+        );
+        let combined = format!("{scrollback}\n{after_flush}");
+        assert_eq!(
+            combined.matches(label).count(),
+            1,
+            "completed turn should have exactly one closing divider: {combined}"
+        );
+    }
 }
 
 #[test]
@@ -10197,10 +10298,21 @@ fn render_to_string(app: &TuiApp, width: u16, height: u16) -> String {
 }
 
 fn render_inline_to_string(app: &TuiApp, width: u16, height: u16) -> String {
+    render_inline_to_string_with_flushed_turn_divider(app, width, height, 0)
+}
+
+fn render_inline_to_string_with_flushed_turn_divider(
+    app: &TuiApp,
+    width: u16,
+    height: u16,
+    flushed_turn_divider_generation: u64,
+) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
+    let flushed_generation =
+        (flushed_turn_divider_generation != 0).then_some(flushed_turn_divider_generation);
     terminal
-        .draw(|frame| render_inline(frame, app))
+        .draw(|frame| render_inline(frame, app, flushed_generation))
         .expect("draw");
     let buffer = terminal.backend().buffer();
     let mut output = String::new();

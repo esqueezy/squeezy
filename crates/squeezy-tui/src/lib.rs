@@ -6449,7 +6449,8 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let approval_height = approval_menu_height(app, area.width);
     let plan_indicator_height = plan_mode_indicator_height(app);
     let subagent_height = subagent_pane_height(app);
-    let task_height = if should_show_task_panel(app) {
+    let show_completed_turn_divider = should_show_live_completed_turn_divider(app, None);
+    let task_height = if should_show_task_panel(app, show_completed_turn_divider) {
         let h = if approval_height > 0 {
             task_panel_height(app).min(5)
         } else {
@@ -6521,7 +6522,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         index += 1;
     }
     if task_height.is_some() {
-        render_task_state(frame, chunks[index], app);
+        render_task_state(frame, chunks[index], app, show_completed_turn_divider);
         index += 1;
     }
     if attachment_height > 0 {
@@ -6593,7 +6594,11 @@ fn render_toast_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
 }
 
-pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
+fn render_inline(
+    frame: &mut Frame<'_>,
+    app: &TuiApp,
+    flushed_turn_divider_generation: Option<u64>,
+) {
     app.begin_frame_clickables();
     let area = frame.area();
     if app.transcript_overlay.is_some() {
@@ -6611,7 +6616,10 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     let input_height = input_panel_height(app, area.width);
     let approval_height = approval_menu_height(app, area.width);
     let plan_indicator_height = plan_mode_indicator_height(app);
-    let task_height = should_show_task_panel(app).then_some(task_panel_height(app));
+    let show_completed_turn_divider =
+        should_show_live_completed_turn_divider(app, flushed_turn_divider_generation);
+    let task_height =
+        should_show_task_panel(app, show_completed_turn_divider).then_some(task_panel_height(app));
     let status_height = 2;
     let subagent_height = subagent_pane_height(app);
     // Just-finished work nodes that are still folding render here in the live
@@ -6677,7 +6685,7 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
         index += 1;
     }
     if task_height.is_some() {
-        render_task_state(frame, chunks[index], app);
+        render_task_state(frame, chunks[index], app, show_completed_turn_divider);
         index += 1;
     }
     if attachment_height > 0 {
@@ -6702,6 +6710,13 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     render_toast_overlay(frame, area, app);
 }
 
+fn should_show_live_completed_turn_divider(app: &TuiApp, flushed_generation: Option<u64>) -> bool {
+    let Some(snapshot) = live_turn_divider_snapshot(app) else {
+        return false;
+    };
+    flushed_generation != Some(snapshot.generation)
+}
+
 fn transcript_prompt_gap_height(app: &TuiApp) -> u16 {
     if active_transcript_entries(app).is_empty()
         && (active_subagent_record(app).is_some() || app.pending_assistant.is_empty())
@@ -6712,9 +6727,9 @@ fn transcript_prompt_gap_height(app: &TuiApp) -> u16 {
     }
 }
 
-fn should_show_task_panel(app: &TuiApp) -> bool {
+fn should_show_task_panel(app: &TuiApp, show_completed_turn_divider: bool) -> bool {
     turn_in_progress(app)
-        || app.last_turn_duration.is_some()
+        || show_completed_turn_divider
         || app
             .task_state
             .as_ref()
@@ -6729,7 +6744,12 @@ fn task_panel_height(app: &TuiApp) -> u16 {
     }
 }
 
-fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+fn render_task_state(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    show_completed_turn_divider: bool,
+) {
     // A subagent's live work threads its rail in magenta, matching the
     // settled subagent nodes; the main agent's stays dim.
     let live_chrome = if active_subagent_record(app).is_some() {
@@ -6753,7 +6773,10 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             rows.push(detail);
         }
         rows
-    } else if let Some(duration) = app.last_turn_duration {
+    } else if show_completed_turn_divider {
+        let duration = app
+            .last_turn_duration
+            .expect("completed turn divider requires a recorded duration");
         vec![last_turn_divider_line(app, duration, area.width)]
     } else if let Some(snapshot) = app.task_state.as_ref() {
         vec![compact_task_state_line(snapshot)]
@@ -7010,6 +7033,13 @@ fn overlay_turn_divider_snapshot(app: &TuiApp) -> Option<TurnDividerSnapshot> {
     live_turn_divider_snapshot(app)
 }
 
+fn transcript_turn_divider_snapshot(app: &TuiApp) -> Option<TurnDividerSnapshot> {
+    if active_subagent_record(app).is_some() || app.last_turn_duration.is_some() {
+        return None;
+    }
+    app.pending_turn_divider
+}
+
 fn turn_divider_snapshot_for_flush(
     app: &TuiApp,
     transcript_flushed_to: usize,
@@ -7025,6 +7055,7 @@ fn turn_divider_snapshot_for_flush(
     Some(snapshot)
 }
 
+#[cfg(test)]
 fn turn_divider_lines_for_flush(
     app: &TuiApp,
     width: u16,
@@ -8288,6 +8319,9 @@ fn transcript_lines_for_render(
     let selected_entry = active_selected_entry(app);
     let mut prev_work = false;
     let subagent_view = active_subagent_record(app).is_some();
+    let turn_divider = transcript_turn_divider_snapshot(app);
+    let turn_divider_width = width.unwrap_or(SETTLE_MEASURE_WIDTH);
+    let mut turn_divider_pushed = false;
     for (index, item) in entries.iter().enumerate() {
         // A finished work node that is mid settle-fold renders folded —
         // its expanded block truncated to an eased height that descends to
@@ -8312,6 +8346,13 @@ fn transcript_lines_for_render(
                 &mut prev_work,
                 rail_chrome(&item.kind, subagent_view),
             );
+            maybe_push_overlay_turn_divider(
+                &mut lines,
+                turn_divider,
+                &mut turn_divider_pushed,
+                index + 1,
+                turn_divider_width,
+            );
             continue;
         }
         match reasoning_run_info(entries, index) {
@@ -8334,6 +8375,13 @@ fn transcript_lines_for_render(
                         rail_chrome(&item.kind, subagent_view),
                     );
                 }
+                maybe_push_overlay_turn_divider(
+                    &mut lines,
+                    turn_divider,
+                    &mut turn_divider_pushed,
+                    index + 1 + extras,
+                    turn_divider_width,
+                );
                 continue;
             }
             None => {}
@@ -8356,6 +8404,13 @@ fn transcript_lines_for_render(
                     &mut block,
                     &mut prev_work,
                     rail_chrome(&item.kind, subagent_view),
+                );
+                maybe_push_overlay_turn_divider(
+                    &mut lines,
+                    turn_divider,
+                    &mut turn_divider_pushed,
+                    index + 1 + extras,
+                    turn_divider_width,
                 );
                 continue;
             }
@@ -8389,7 +8444,21 @@ fn transcript_lines_for_render(
             lines.append(&mut block);
             prev_work = false;
         }
+        maybe_push_overlay_turn_divider(
+            &mut lines,
+            turn_divider,
+            &mut turn_divider_pushed,
+            index + 1,
+            turn_divider_width,
+        );
     }
+    maybe_push_overlay_turn_divider(
+        &mut lines,
+        turn_divider,
+        &mut turn_divider_pushed,
+        entries.len(),
+        turn_divider_width,
+    );
     let pending_reasoning = active_pending_reasoning(app);
     if app.show_reasoning_usage && !pending_reasoning.trim().is_empty() {
         lines.extend(streaming_reasoning_lines(pending_reasoning));
@@ -17525,6 +17594,7 @@ impl TerminalGuard {
             self.flush_history(app)?;
         }
         let synchronized = self.synchronized_output && !overlay_frame;
+        let flushed_turn_divider_generation = self.turn_divider_flushed_generation;
         let terminal = self.term();
         // DEC 2026 Begin Synchronized Update bracket. Writing it through
         // the backend buffer puts it ahead of the cell-diff bytes that
@@ -17548,7 +17618,9 @@ impl TerminalGuard {
         } else if use_fullscreen_render {
             terminal.draw(|frame| render(frame, app)).map(|_| ())
         } else {
-            terminal.draw(|frame| render_inline(frame, app)).map(|_| ())
+            terminal
+                .draw(|frame| render_inline(frame, app, flushed_turn_divider_generation))
+                .map(|_| ())
         };
         // Always emit ESU (even when draw fails) so the terminal does
         // not stay parked in a buffered-update state — the spec lets a
