@@ -1888,6 +1888,91 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
 }
 
 #[tokio::test]
+async fn promised_action_retry_preserves_prior_visible_answer_in_transcript() {
+    let root = temp_workspace("agent_promised_action_retry_transcript");
+    fs::write(root.join("sample.rs"), "fn marker() {}\n").expect("write sample");
+    let substantive_answer = "Let me re-run each bug scenario directly rather than trusting the compacted summary.\n\n## Bug-by-Bug Verdict\nBug 1 confirmed. Bug 2 retracted.";
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "marker", "include": ["*.rs"]}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::ToolUse),
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(substantive_answer.to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "The previous output is the complete answer. All scenarios were re-tested."
+                    .to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_3".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+
+    let mut rx = agent.start_turn("revisit your reports".to_string(), CancellationToken::new());
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed { message, .. } = event {
+            completed = Some(message.content);
+        }
+    }
+
+    let completed = completed.expect("turn should complete");
+    assert_eq!(
+        completed, substantive_answer,
+        "a substantive answer that triggered the one-shot retry must remain the visible turn output"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        3,
+        "the test must exercise the promised-action retry round"
+    );
+
+    let state = agent.conversation_state.lock().await;
+    let assistant = state
+        .transcript
+        .iter()
+        .find(|item| item.role == squeezy_core::Role::Assistant)
+        .expect("transcript must persist the completed assistant turn");
+    assert_eq!(
+        assistant.content, substantive_answer,
+        "resume/transcript state must not replace the answer with the retry acknowledgement"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn server_model_echo_drives_cost_estimation() {
     let usage = CostSnapshot {
         input_tokens: Some(1_000_000),

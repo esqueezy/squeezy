@@ -6515,6 +6515,7 @@ impl TurnRuntime {
         // one retry per turn to prevent infinite loops if the model
         // ignores the nudge.
         let mut replan_retry_used = false;
+        let mut deferred_retry_visible_assistant = String::new();
         let mut pause_turn_reissues = 0usize;
         // Per-turn model routing decision. The classifier runs once at
         // the top of the turn; `current_model` is what each round
@@ -7477,8 +7478,12 @@ impl TurnRuntime {
                     LlmInputItem::AssistantText(raw_assistant_text.clone()),
                     &self.redactor,
                 ));
-                let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
+                let visible_assistant_text = merge_retried_visible_assistant_text(
+                    &mut deferred_retry_visible_assistant,
                     &raw_assistant_text,
+                );
+                let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
+                    &visible_assistant_text,
                 ));
                 self.stamp_routing_savings(&mut broker.metrics);
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
@@ -7763,6 +7768,12 @@ impl TurnRuntime {
                         LlmInputItem::AssistantText(raw_assistant_text.clone()),
                         &self.redactor,
                     ));
+                    if promised_action_branch {
+                        append_deferred_visible_assistant_text(
+                            &mut deferred_retry_visible_assistant,
+                            &raw_assistant_text,
+                        );
+                    }
                     let nudge = if reasoning_only_branch {
                         if plan_mode {
                             "You finished thinking but produced no `<proposed_plan>...</proposed_plan>` block. \
@@ -7818,8 +7829,12 @@ impl TurnRuntime {
                     LlmInputItem::AssistantText(raw_assistant_text.clone()),
                     &self.redactor,
                 ));
-                let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
+                let visible_assistant_text = merge_retried_visible_assistant_text(
+                    &mut deferred_retry_visible_assistant,
                     &raw_assistant_text,
+                );
+                let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
+                    &visible_assistant_text,
                 ));
                 self.stamp_routing_savings(&mut broker.metrics);
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
@@ -11739,6 +11754,37 @@ fn is_control_tool_name(name: &str) -> bool {
         name,
         TASK_STATE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME | REQUEST_USER_INPUT_TOOL_NAME
     )
+}
+
+fn append_deferred_visible_assistant_text(deferred: &mut String, text: &str) {
+    let display_text = plan_mode::strip_proposed_plan_blocks(text);
+    if display_text.trim().is_empty() {
+        return;
+    }
+    if !deferred.is_empty() {
+        deferred.push_str("\n\n");
+    }
+    deferred.push_str(display_text.trim());
+}
+
+fn merge_retried_visible_assistant_text(deferred: &mut String, final_text: &str) -> String {
+    let prior = std::mem::take(deferred);
+    let final_display = plan_mode::strip_proposed_plan_blocks(final_text);
+    if prior.trim().is_empty() {
+        return final_display;
+    }
+    if final_display.trim().is_empty() || assistant_text_is_retry_ack(&final_display) {
+        return prior;
+    }
+    format!("{}\n\n{}", prior.trim_end(), final_display.trim_start())
+}
+
+fn assistant_text_is_retry_ack(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    lower.starts_with("the previous output is")
+        || lower.starts_with("the previous answer is")
+        || lower.contains("previous output is the complete answer")
+        || lower.contains("previous output was the complete answer")
 }
 
 /// Heuristic: does the assistant text contain an intent phrase that
