@@ -254,7 +254,7 @@ impl FieldValue {
             Self::OptionalInteger(Some(v)) => v.to_string(),
             Self::OptionalInteger(None) => "—".to_string(),
             Self::OptionalFloat(Some(v)) => format_config_float(*v),
-            Self::OptionalFloat(None) => "(unset)".to_string(),
+            Self::OptionalFloat(None) => "—".to_string(),
             Self::Enum(v) => (*v).to_string(),
             Self::OptionalEnum(Some(v)) => (*v).to_string(),
             Self::OptionalEnum(None) => "—".to_string(),
@@ -516,7 +516,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 tier: ApplyTier::NextPrompt,
                 get: get_temperature,
                 set: set_temperature,
-                default_display: "(unset)",
+                default_display: "—",
                 default: || FieldValue::OptionalFloat(None),
                 help: "Sampling randomness. Lower is more deterministic; unset leaves the provider/model default.",
                 env_override: None,
@@ -529,7 +529,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 tier: ApplyTier::NextPrompt,
                 get: get_top_p,
                 set: set_top_p,
-                default_display: "(unset)",
+                default_display: "—",
                 default: || FieldValue::OptionalFloat(None),
                 help: "Nucleus-sampling cutoff. Lower narrows token choices; unset leaves the provider/model default.",
                 env_override: None,
@@ -546,7 +546,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 tier: ApplyTier::NextPrompt,
                 get: get_seed,
                 set: set_seed,
-                default_display: "(unset)",
+                default_display: "—",
                 default: || FieldValue::OptionalInteger(None),
                 help: "Deterministic sampling seed where supported. Unset leaves provider/model default randomness.",
                 env_override: None,
@@ -559,7 +559,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 tier: ApplyTier::NextPrompt,
                 get: get_stop_sequences,
                 set: set_stop_sequences,
-                default_display: "(unset)",
+                default_display: "—",
                 default: || FieldValue::StringList(Vec::new()),
                 help: "Stop generation when any listed string appears. Empty/unset leaves the provider/model default.",
                 env_override: None,
@@ -575,7 +575,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 tier: ApplyTier::NextPrompt,
                 get: get_frequency_penalty,
                 set: set_frequency_penalty,
-                default_display: "(unset)",
+                default_display: "—",
                 default: || FieldValue::OptionalFloat(None),
                 help: "Reduce repeated wording where supported. Unset leaves the provider/model default.",
                 env_override: None,
@@ -591,7 +591,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 tier: ApplyTier::NextPrompt,
                 get: get_presence_penalty,
                 set: set_presence_penalty,
-                default_display: "(unset)",
+                default_display: "—",
                 default: || FieldValue::OptionalFloat(None),
                 help: "Encourage new topics where supported. Unset leaves the provider/model default.",
                 env_override: None,
@@ -1698,16 +1698,16 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
-                label: "exploration_compiler",
-                toml_path: &["agent", "exploration_compiler"],
+                label: "exploration_graph",
+                toml_path: &["agent", "exploration_graph"],
                 kind: FieldKind::Bool,
                 tier: ApplyTier::NextPrompt,
-                get: get_exploration_compiler,
-                set: set_exploration_compiler,
+                get: get_exploration_graph,
+                set: set_exploration_graph,
                 default_display: "true",
                 default: || FieldValue::Bool(true),
-                help: "Use the graph-first exploration compiler before LLM tool dispatch.",
-                env_override: Some("SQUEEZY_EXPLORATION_COMPILER"),
+                help: "Use graph-first exploration before LLM tool dispatch.",
+                env_override: Some("SQUEEZY_EXPLORATION_GRAPH"),
                 secret: false,
             },
         ],
@@ -3175,16 +3175,31 @@ fn get_context_trigger_info(cfg: &AppConfig) -> FieldValue {
     let cc = &cfg.context_compaction;
     let window = match cc.model_context_window {
         Some(w) if w > 0 => format!("window {w} tok"),
-        _ => "window — (auto-derive failed; mid-turn dormant)".to_string(),
+        _ => "window — (unknown; mid-turn dormant)".to_string(),
     };
-    let fmt = |label: &str, value: Option<u64>| match value {
-        Some(v) => format!("{label} @{v}"),
-        None => format!("{label} off"),
+    let fmt_mid_turn = |label: &str, enabled: bool, percent: u8, value: Option<u64>| {
+        if !enabled {
+            return format!("{label} off");
+        }
+        match value {
+            Some(v) => format!("{label} on @{v}"),
+            None => format!("{label} on (dormant @{percent}%)"),
+        }
     };
     FieldValue::String(format!(
         "{window}  ·  {}  ·  {}  ·  post-turn @{}",
-        fmt("micro", cc.mid_turn_micro_threshold()),
-        fmt("full", cc.mid_turn_full_threshold()),
+        fmt_mid_turn(
+            "micro",
+            cc.micro_compaction_enabled,
+            cc.micro_compaction_threshold_percent,
+            cc.mid_turn_micro_threshold(),
+        ),
+        fmt_mid_turn(
+            "full",
+            cc.enabled_mid_turn,
+            cc.threshold_percent,
+            cc.mid_turn_full_threshold(),
+        ),
         cc.post_turn_token_ceiling(),
     ))
 }
@@ -3642,13 +3657,13 @@ fn set_session_resume_picker(cfg: &mut AppConfig, value: FieldValue) -> Result<(
     Ok(())
 }
 
-fn get_exploration_compiler(cfg: &AppConfig) -> FieldValue {
-    FieldValue::Bool(cfg.exploration_compiler)
+fn get_exploration_graph(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.exploration_graph)
 }
-fn set_exploration_compiler(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+fn set_exploration_graph(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
     match value {
         FieldValue::Bool(v) => {
-            cfg.exploration_compiler = v;
+            cfg.exploration_graph = v;
             Ok(())
         }
         _ => Err("expects bool"),

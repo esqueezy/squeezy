@@ -4991,7 +4991,7 @@ fn missing_cargo_manifest_shell_failure_renders_as_not_run_warning() {
     let mut result = sample_tool_result("shell", "");
     result.status = ToolStatus::Error;
     result.content = serde_json::json!({
-        "command": "cargo check -p sonar-arch-graph",
+        "command": "cargo check -p sample-arch-graph",
         "exit_code": 101,
         "stdout": "",
         "stderr": "error: could not find `Cargo.toml` in `/tmp/example-workspace` or any parent directory",
@@ -5001,7 +5001,7 @@ fn missing_cargo_manifest_shell_failure_renders_as_not_run_warning() {
     let output = render_to_string(&app, 140, 16);
 
     assert!(
-        output.contains("⚠ Not run cargo check -p sonar-arch-graph · no Cargo.toml found"),
+        output.contains("⚠ Not run cargo check -p sample-arch-graph · no Cargo.toml found"),
         "{output}"
     );
     assert!(!output.contains("✖ Failed cargo check"), "{output}");
@@ -7163,21 +7163,53 @@ fn accounting_block_dispatch_skips_unrelated_system_messages() {
 
 #[test]
 fn context_snapshot_stays_expanded_in_compact_transcript() {
+    use squeezy_agent::{
+        AttachmentShape, ConversationShape, SessionAccountingSnapshot, TranscriptShape,
+    };
+    use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
+    use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
+
     let mut config = test_config(SessionMode::Build);
     config.tui.transcript_default = TranscriptDefault::Compact;
     let mut app = test_app_with_config(&config, SessionMode::Build);
-    let body = std::iter::once("Context window".to_string())
-        .chain((0..30).map(|index| format!("source_{index}=tokens")))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let estimate = RequestTokenEstimate {
+        input_tokens: 123_456,
+        context_window_tokens: Some(400_000),
+        effective_context_window_tokens: Some(368_000),
+        headroom_tokens: Some(32_000),
+        max_output_tokens: Some(64_000),
+        input_budget_tokens: Some(304_000),
+        remaining_input_tokens: Some(180_544),
+        used_input_percent_x100: Some(30_86),
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        estimated: true,
+    };
+    let snapshot = SessionAccountingSnapshot {
+        session_id: Some("sess-context".to_string()),
+        provider: "openai",
+        model: squeezy_core::DEFAULT_OPENAI_MODEL.to_string(),
+        mode: SessionMode::Build,
+        store_responses: false,
+        previous_response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: SessionMetrics::default(),
+        redactions: 0,
+        transcript: TranscriptShape::default(),
+        conversation: ConversationShape::default(),
+        attachments: AttachmentShape::default(),
+        transmitted_request: estimate,
+        full_history_request: estimate,
+    };
+    let body = commands::format_context_command(&snapshot);
 
     app.push_transcript_item(TranscriptItem::system(body));
     let output = render_to_string(&app, 120, 40);
 
     assert!(output.contains("Context window"), "{output}");
-    assert!(output.contains("source_25=tokens"), "{output}");
+    assert!(output.contains("Consumption by source"), "{output}");
+    assert!(output.contains("remaining:"), "{output}");
     assert!(
-        !output.contains("Context window …"),
+        !output.contains("for full transcript"),
         "explicit /context output should not collapse to a summary: {output}"
     );
 }
@@ -7267,6 +7299,45 @@ fn completed_turn_shows_worked_duration_divider() {
     assert!(output.contains("─ Worked for 13m 23s"), "{output}");
     assert!(!output.contains("Working ("), "{output}");
     assert!(!output.contains("• Done"), "{output}");
+}
+
+#[test]
+fn failed_turn_shows_red_moon_duration_row() {
+    let mut app = test_app(SessionMode::Build);
+    app.turn_visual = TurnVisualState::Failed;
+    app.last_turn_duration = Some(Duration::from_secs(7));
+
+    let line = last_turn_divider_line(&app, Duration::from_secs(7), 80);
+
+    assert_eq!(line.spans[0].content.as_ref(), "☽");
+    assert_eq!(line.spans[0].style.fg, Some(crate::render::theme::red()));
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(text.contains("Failed after 7s"), "{text}");
+    assert!(!text.contains("Worked for"), "{text}");
+}
+
+#[test]
+fn cancelled_turn_shows_cyan_moon_duration_row() {
+    let mut app = test_app(SessionMode::Build);
+    app.turn_visual = TurnVisualState::Cancelled;
+    app.last_turn_duration = Some(Duration::from_secs(5));
+
+    let line = last_turn_divider_line(&app, Duration::from_secs(5), 80);
+
+    assert_eq!(line.spans[0].content.as_ref(), "☽");
+    assert_eq!(line.spans[0].style.fg, Some(crate::render::theme::cyan()));
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(text.contains("Cancelled after 5s"), "{text}");
+    assert!(!text.contains("Worked for"), "{text}");
+    assert!(!text.contains("Failed after"), "{text}");
 }
 
 #[test]
@@ -7471,6 +7542,27 @@ fn failure_log_renders_as_detail_under_user_turn() {
         "{output}"
     );
     assert!(!output.contains("chars  turn failed"), "{output}");
+}
+
+#[test]
+fn long_error_log_wraps_on_the_rail() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("yo"));
+    app.push_error(
+        "turn failed: provider request failed: Unsupported parameter temperature for this model"
+            .to_string(),
+    );
+
+    let output = render_to_string(&app, 48, 16);
+    let wrapped = output
+        .lines()
+        .find(|line| line.contains("temperature"))
+        .unwrap_or_else(|| panic!("missing wrapped error continuation:\n{output}"));
+
+    assert!(
+        wrapped.trim_start().starts_with('│'),
+        "wrapped error continuation must stay on the rail:\n{output}"
+    );
 }
 
 #[test]
@@ -9938,31 +10030,6 @@ fn sample_attachment(id: &str) -> ContextAttachment {
     }
 }
 
-// ---- /verbosity inline back-compat ----
-//
-// `/model`, `/permissions`, `/verbosity`, and `/tool-verbosity` open the
-// `/config` screen focused on the matching section; the original overlay
-// flow was replaced by the full editor. Section-routing coverage lives in
-// `slash_model_opens_config_at_models_section` and friends below.
-
-#[tokio::test]
-async fn slash_verbosity_with_inline_arg_applies_immediately() {
-    let mut agent = test_agent_without_session_log(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.response_verbosity = ResponseVerbosity::Normal;
-    let ran = handle_slash_command(&mut app, &mut agent, "/verbosity verbose").await;
-    assert!(ran);
-    assert!(
-        app.config_screen.is_none(),
-        "inline form should not open the screen"
-    );
-    assert_eq!(app.response_verbosity, ResponseVerbosity::Verbose);
-    assert_eq!(
-        agent.config_snapshot().tui.response_verbosity,
-        ResponseVerbosity::Verbose
-    );
-}
-
 // ---- /effort session-level reasoning-effort setter ----
 
 #[tokio::test]
@@ -10012,36 +10079,6 @@ async fn slash_effort_rejects_unknown_value() {
         app.status.contains("unknown effort"),
         "expected error status, got {}",
         app.status,
-    );
-}
-
-#[tokio::test]
-async fn slash_verbosity_without_arg_prints_current_value_and_usage_hint() {
-    // squeezy-3ys0 (audit U2): bare /verbosity no longer diverts into
-    // the config_screen modal. It prints the current value + usage
-    // hint into the transcript (matching /effort's surface) so users
-    // get consistent shape between bare and arg-form invocations.
-    let mut agent = test_agent_without_session_log(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    let ran = handle_slash_command(&mut app, &mut agent, "/verbosity").await;
-    assert!(ran);
-    assert!(
-        app.config_screen.is_none(),
-        "bare /verbosity should not open config_screen"
-    );
-    assert!(
-        app.status.starts_with("response verbosity:"),
-        "status should report the current verbosity; got {:?}",
-        app.status
-    );
-    let body = last_message_content(&app).expect("transcript usage hint");
-    assert!(
-        body.contains("response verbosity"),
-        "transcript should include the usage hint; got {body:?}"
-    );
-    assert!(
-        body.contains("/verbosity [concise|normal|verbose]"),
-        "transcript should include the usage line; got {body:?}"
     );
 }
 
@@ -10943,7 +10980,6 @@ fn slash_commands_have_documented_capability_for_every_entry() {
         "/undo",
         "/revert-turn",
         "/effort",
-        "/verbosity",
         "/tool-verbosity",
     ];
     for command in SLASH_COMMANDS {
@@ -11043,13 +11079,25 @@ async fn slash_help_is_allowed_during_turn() {
 #[test]
 fn slash_parameter_hint_appears_in_render() {
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/verbosity".to_string());
+    set_input(&mut app, "/tool-verbosity".to_string());
     let output = render_to_string(&app, 120, 16);
     assert!(
-        output.contains("concise|normal|verbose"),
-        "expected parameter hint to render the response-verbosity options actually accepted \
-         by `/verbosity`: {output}"
+        output.contains("compact|normal|verbose"),
+        "expected parameter hint to render the tool-verbosity options actually accepted \
+         by `/tool-verbosity`: {output}"
     );
+}
+
+#[test]
+fn slash_menu_omits_low_value_config_shortcuts() {
+    let commands = SLASH_COMMANDS
+        .iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
+
+    assert!(!commands.contains(&"/verbosity"), "{commands:?}");
+    assert!(!commands.contains(&"/spinner"), "{commands:?}");
+    assert!(commands.contains(&"/config"), "{commands:?}");
 }
 
 #[test]

@@ -46,7 +46,7 @@ excluded_tools = [
 # Disable the graph-first planner so the no-graph half is genuinely
 # graph-free. Without this, the planner pre-fires `definition_search`
 # before the model takes its first turn, polluting the comparison.
-SQUEEZY_EXPLORATION_COMPILER = "0"
+SQUEEZY_EXPLORATION_GRAPH = "0"
 
 [[steps]]
 kind = "prompt"

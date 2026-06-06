@@ -446,7 +446,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         append_edit_recovery_hint(&mut message, app);
                     }
                     app.status = message;
-                    app.turn_visual = TurnVisualState::Failed;
+                    app.turn_visual = TurnVisualState::Cancelled;
                     app.push_warn("turn cancelled".to_string());
                     if app.last_turn_had_edits {
                         app.push_log(edit_recovery_hint(app).to_string());

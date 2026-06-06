@@ -813,6 +813,29 @@ async fn enter_on_env_shadowed_field_emits_warning_instead_of_opening_editor() {
 }
 
 #[tokio::test]
+async fn enter_on_info_row_emits_hint_instead_of_silent_noop() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Context));
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    state.field_index = field_index(SectionId::Context, &["context", "_trigger_info"]);
+
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+
+    assert!(state.editor.is_none(), "info row should not open an editor");
+    let current = q.current().expect("info notification queued");
+    assert!(
+        current.message.contains("triggers is informational"),
+        "expected info-row hint, got: {}",
+        current.message
+    );
+}
+
+#[tokio::test]
 async fn space_cycling_provider_resets_model_in_memory() {
     use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId};
     // SAFETY: tests in this module run single-threaded.
@@ -999,6 +1022,40 @@ fn render_screen_to_text(state: &ConfigScreenState, width: u16, height: u16) -> 
         output.push('\n');
     }
     output
+}
+
+#[test]
+fn model_absent_sampling_rows_render_dash() {
+    let cfg = AppConfig {
+        temperature: None,
+        top_p: None,
+        seed: None,
+        stop: Vec::new(),
+        frequency_penalty: None,
+        presence_penalty: None,
+        ..AppConfig::default()
+    };
+    let mut state = temp_config_state(Some(SectionId::Models));
+    state.effective = cfg;
+    let rendered = render_screen_to_text(&state, 120, 40);
+
+    for label in [
+        "temperature",
+        "top_p",
+        "seed",
+        "stop",
+        "frequency_penalty",
+        "presence_penalty",
+    ] {
+        let row = rendered
+            .lines()
+            .find(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("missing {label} row:\n{rendered}"));
+        assert!(
+            row.contains('—') && !row.contains("(unset)"),
+            "{label} should render the absent value as a dash, got:\n{row}"
+        );
+    }
 }
 
 #[test]

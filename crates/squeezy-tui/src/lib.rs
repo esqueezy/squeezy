@@ -3298,33 +3298,6 @@ fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: String) {
     app.needs_redraw = true;
 }
 
-fn apply_spinner_change(app: &mut TuiApp, agent: &mut Agent, spinner: String) {
-    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
-
-    let mut next = agent.config_snapshot();
-    next.tui.spinner = spinner.clone();
-    crate::render::spinner::set_active_spinner(&next);
-    agent.replace_config(next);
-
-    let target_path = app.user_settings_path();
-    let scope_target = SettingsScope::user(&target_path);
-    let edits = [SettingsEdit {
-        path: &["tui", "spinner"],
-        op: EditOp::SetString(spinner.clone()),
-    }];
-    match apply_edits(&scope_target, &edits) {
-        Ok(_) => {
-            app.push_status(format!("spinner → {spinner}"));
-            app.status = format!("spinner saved to {}", target_path.display());
-        }
-        Err(err) => {
-            app.push_warn(format!("spinner switched but save failed: {err}"));
-            app.status = format!("spinner switched (not persisted): {err}");
-        }
-    }
-    app.needs_redraw = true;
-}
-
 /// Persist the picker's selection to `[tui].status_line` /
 /// `[tui].status_line_use_colors` in the user-scope settings file and
 /// apply it in-memory immediately.
@@ -3392,10 +3365,10 @@ fn save_status_line(
 /// (`/config`, `/statusline`, …) are silenced — the overlay is the
 /// affordance. Commands that route through `start_user_turn` and
 /// already produce a user-message bubble (`/help`) are also silenced
-/// to avoid duplication. `/verbosity` and `/tool-verbosity` open a UI
-/// when called bare but silently apply a value when given an arg —
-/// echo only the second form. Unrecognized commands are not echoed:
-/// they fall through to be sent as regular user prompts.
+/// to avoid duplication. `/tool-verbosity` reports when called bare but
+/// silently applies a value when given an arg — echo only the second form.
+/// Unrecognized commands are not echoed: they fall through to be sent as
+/// regular user prompts.
 fn should_echo_slash_command(command: &str, rest: &str) -> bool {
     if !SLASH_COMMANDS.iter().any(|spec| spec.name == command) {
         return false;
@@ -3404,7 +3377,7 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
         "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/mcp" | "/help" => {
             false
         }
-        "/verbosity" | "/tool-verbosity" => !rest.trim().is_empty(),
+        "/tool-verbosity" => !rest.trim().is_empty(),
         _ => true,
     }
 }
@@ -3569,11 +3542,7 @@ fn telemetry_tui_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         DispatchCommand::Theme { theme } => {
             slash_option_shape(theme.as_ref(), SlashArgShape::FixedSubcommand)
         }
-        DispatchCommand::Spinner { spinner } => {
-            slash_option_shape(spinner.as_ref(), SlashArgShape::FixedSubcommand)
-        }
         DispatchCommand::Effort { value }
-        | DispatchCommand::Verbosity { value }
         | DispatchCommand::ToolVerbosity { value }
         | DispatchCommand::Router { value } => {
             slash_option_shape(value.as_ref(), SlashArgShape::FixedSubcommand)
@@ -4109,9 +4078,6 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         }
         DispatchCommand::Router { value } => handle_slash_router(app, agent, value.as_deref()),
         DispatchCommand::Effort { value } => handle_slash_effort(app, agent, value.as_deref()),
-        DispatchCommand::Verbosity { value } => {
-            handle_slash_verbosity(app, agent, value.as_deref());
-        }
         DispatchCommand::ToolVerbosity { value } => {
             handle_slash_tool_verbosity(app, agent, value.as_deref());
         }
@@ -4145,31 +4111,6 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 return;
             }
             apply_theme_change(app, agent, parsed);
-        }
-        DispatchCommand::Spinner { spinner: None } => {
-            let current = agent.config_snapshot().tui.spinner.clone();
-            let options = squeezy_core::BUILTIN_TUI_SPINNER_NAMES.join(", ");
-            set_status_with_notice(
-                app,
-                format!("spinner: {current} (options: {options})"),
-                format!(
-                    "Working-status spinner is {current:?}. Set one with `/spinner <name>` — options: {options}."
-                ),
-            );
-        }
-        DispatchCommand::Spinner {
-            spinner: Some(spinner),
-        } => {
-            let Some(parsed) = squeezy_core::normalize_tui_spinner_name(&spinner) else {
-                let options = squeezy_core::BUILTIN_TUI_SPINNER_NAMES.join(", ");
-                set_status_with_notice(
-                    app,
-                    format!("unknown spinner {spinner:?}; options: {options}"),
-                    format!("Unknown spinner {spinner:?}. Options: {options}."),
-                );
-                return;
-            };
-            apply_spinner_change(app, agent, parsed);
         }
         DispatchCommand::Keymap => {
             let body = keymap::format_keymap_command(&app.keymap);
@@ -5047,15 +4988,6 @@ fn last_assistant_clipboard_text(app: &TuiApp) -> Option<String> {
         .find_map(TranscriptEntry::assistant_content)
 }
 
-fn parse_response_verbosity(value: &str) -> Option<ResponseVerbosity> {
-    match value {
-        "concise" => Some(ResponseVerbosity::Concise),
-        "normal" => Some(ResponseVerbosity::Normal),
-        "verbose" => Some(ResponseVerbosity::Verbose),
-        _ => None,
-    }
-}
-
 fn parse_tool_output_verbosity(value: &str) -> Option<ToolOutputVerbosity> {
     match value {
         "compact" => Some(ToolOutputVerbosity::Compact),
@@ -5106,9 +5038,9 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
     );
     // squeezy-a19z (audit U1): status line only; the previous
     // app_notification push duplicated feedback and diverged from
-    // /verbosity / /tool-verbosity, which only used notifications.
-    // Unify on the status line — it's the immediate-feedback surface
-    // for these session-scoped switches.
+    // /tool-verbosity, which only used notifications. Unify on the
+    // status line — it's the immediate-feedback surface for these
+    // session-scoped switches.
     app.status = format!("reasoning effort → {label}");
     if std::env::var("SQUEEZY_REASONING_EFFORT").is_ok() {
         app.push_warn("SQUEEZY_REASONING_EFFORT overrides this on next load".to_string());
@@ -5147,39 +5079,9 @@ fn handle_slash_router(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
     );
 }
 
-/// `/verbosity [concise|normal|verbose]`. Bare prints the current
-/// value and usage hint into the transcript (matches `/effort`'s
-/// surface); with an explicit value, sets `tui.response_verbosity`
-/// and reports via the status line. Previously the bare form
-/// short-circuited to the `/config` config_screen — surprising
-/// mode-switch on argument presence (squeezy-3ys0 / audit U2).
-fn handle_slash_verbosity(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
-    let Some(raw) = value else {
-        let current = agent.config_snapshot().tui.response_verbosity;
-        app.status = format!("response verbosity: {}", current.as_str());
-        app.push_transcript_item(TranscriptItem::system(format!(
-            "response verbosity = {}\nusage: /verbosity [concise|normal|verbose]",
-            current.as_str()
-        )));
-        return;
-    };
-    let Some(verbosity) = parse_response_verbosity(raw) else {
-        set_status_notice(
-            app,
-            format!("unknown response verbosity {raw:?}; expected concise, normal, or verbose"),
-        );
-        return;
-    };
-    app.response_verbosity = verbosity;
-    let mut next = agent.config_snapshot();
-    next.tui.response_verbosity = verbosity;
-    agent.replace_config(next);
-    app.status = format!("response verbosity → {}", verbosity.as_str());
-}
-
-/// `/tool-verbosity [compact|normal|verbose]`. Same shape as
-/// [`handle_slash_verbosity`] — bare prints + usage hint, with-arg
-/// sets and reports via the status line. squeezy-a19z + squeezy-3ys0.
+/// `/tool-verbosity [compact|normal|verbose]`. Bare prints + usage hint;
+/// with an explicit value, sets `tui.tool_output_verbosity` and reports via
+/// the status line. squeezy-a19z + squeezy-3ys0.
 fn handle_slash_tool_verbosity(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
     let Some(raw) = value else {
         let current = agent.config_snapshot().tui.tool_output_verbosity;
@@ -6757,7 +6659,7 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         }
         rows
     } else if let Some(duration) = app.last_turn_duration {
-        vec![worked_divider_line(duration, area.width)]
+        vec![last_turn_divider_line(app, duration, area.width)]
     } else if let Some(snapshot) = app.task_state.as_ref() {
         vec![compact_task_state_line(snapshot)]
     } else {
@@ -6962,6 +6864,28 @@ fn worked_divider_line(duration: Duration, width: u16) -> Line<'static> {
         text,
         Style::default().fg(crate::render::theme::quiet()),
     ))
+}
+
+fn last_turn_divider_line(app: &TuiApp, duration: Duration, width: u16) -> Line<'static> {
+    let (state_label, color) = match app.turn_visual {
+        TurnVisualState::Failed => ("Failed", crate::render::theme::red()),
+        TurnVisualState::Cancelled => ("Cancelled", crate::render::theme::cyan()),
+        _ => return worked_divider_line(duration, width),
+    };
+    let label = format!("☽ {state_label} after {}", format_turn_duration(duration));
+    let label_width = label.chars().count();
+    let fill_width = (width as usize).saturating_sub(label_width + 1);
+    Line::from(vec![
+        Span::styled("☽", Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(
+                " {state_label} after {} {}",
+                format_turn_duration(duration),
+                "─".repeat(fill_width)
+            ),
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ])
 }
 
 fn compact_task_state_line(snapshot: &TaskStateSnapshot) -> Line<'static> {
@@ -7762,7 +7686,11 @@ fn transcript_lines_for_overlay(
         }
         lines.extend(pending);
     }
-    lines
+    if let Some(width) = width {
+        wrap_transcript_overlay_rows(&lines, width)
+    } else {
+        lines
+    }
 }
 
 fn format_transcript_entry_expanded(
@@ -8246,7 +8174,11 @@ fn transcript_lines_for_render(
         ));
         lines.push(Line::from(""));
     }
-    lines
+    if let Some(width) = width {
+        wrap_transcript_overlay_rows(&lines, width)
+    } else {
+        lines
+    }
 }
 
 /// Render a finished work node mid settle-fold: its expanded block,
@@ -9207,17 +9139,6 @@ fn format_message_entry_with_width(
         color
     };
     let content_style = message_content_style(&item.role);
-    if collapsed {
-        return vec![action_line_styled(
-            selected,
-            "• ",
-            label_color,
-            action,
-            action_color,
-            collapsed_content_summary(&item.content, transcript_shortcut),
-            content_style,
-        )];
-    }
     if item.role == Role::System
         && !failed
         && let Some(lines) = format_ansi_system_entry(
@@ -9230,6 +9151,17 @@ fn format_message_entry_with_width(
         )
     {
         return lines;
+    }
+    if collapsed {
+        return vec![action_line_styled(
+            selected,
+            "• ",
+            label_color,
+            action,
+            action_color,
+            collapsed_content_summary(&item.content, transcript_shortcut),
+            content_style,
+        )];
     }
     action_text_lines_styled(
         selected,
@@ -12553,7 +12485,7 @@ fn expanded_generic_tool_detail_lines(
 ) -> Vec<Line<'static>> {
     // Verbose mode preserves the legacy `details {...}` JSON dump so users
     // who really want the raw payload (debugging a new tool, comparing two
-    // runs) can still get it via `/verbosity verbose`.
+    // runs) can still get it via `/tool-verbosity verbose`.
     if matches!(verbosity, ToolOutputVerbosity::Verbose) {
         let preview = preview_tool_result(&tool.result, verbosity);
         return output_block_lines("details", &preview, verbosity, transcript_shortcut);
@@ -13247,6 +13179,7 @@ pub(crate) enum TurnVisualState {
     Idle,
     Running,
     Succeeded,
+    Cancelled,
     Failed,
 }
 
@@ -13262,6 +13195,7 @@ impl TurnVisualState {
                 }
             }
             Self::Succeeded => crate::render::theme::green(),
+            Self::Cancelled => crate::render::theme::cyan(),
             Self::Failed => crate::render::theme::red(),
         }
     }

@@ -455,7 +455,7 @@ async fn run_replay(task: &TaskSpec, tasks_dir: &Path) -> Result<RunnerOutput> {
 async fn run_planner_probe(
     task: &TaskSpec,
     runner: RunnerKind,
-    exploration_compiler: bool,
+    exploration_graph: bool,
 ) -> Result<RunnerOutput> {
     let baseline = task.baseline.as_ref().ok_or_else(|| {
         SqueezyError::Agent(format!("task {} has no planner-probe baseline", task.id))
@@ -465,7 +465,7 @@ async fn run_planner_probe(
     disable_product_telemetry(&mut config);
     config.model = runner.name().to_string();
     config.max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS;
-    config.exploration_compiler = exploration_compiler;
+    config.exploration_graph = exploration_graph;
     run_agent_with_config(task, runner, provider, config).await
 }
 

@@ -3528,11 +3528,9 @@ impl Agent {
             | DispatchCommand::Feedback { .. }
             | DispatchCommand::Report { .. }
             | DispatchCommand::Effort { .. }
-            | DispatchCommand::Verbosity { .. }
             | DispatchCommand::ToolVerbosity { .. }
             | DispatchCommand::Statusline
             | DispatchCommand::Theme { .. }
-            | DispatchCommand::Spinner { .. }
             | DispatchCommand::Keymap
             | DispatchCommand::Cheap
             | DispatchCommand::Parent
@@ -6105,7 +6103,7 @@ impl TurnRuntime {
         );
         let exploration_plan = self
             .config
-            .exploration_compiler
+            .exploration_graph
             .then(|| compile_exploration_plan(&input))
             .flatten();
         let exploration_state = Arc::new(Mutex::new(ExplorationTurnState::from_plan(
@@ -6270,7 +6268,7 @@ impl TurnRuntime {
                     "tool_result",
                     Some(self.turn_id),
                     tool_output_summary(output),
-                    json!({ "output": resume_item_for_json(output.clone()), "source": "exploration_compiler" }),
+                    json!({ "output": resume_item_for_json(output.clone()), "source": "exploration_graph" }),
                 );
             }
             if self.config.store_responses {
@@ -13362,15 +13360,7 @@ fn telemetry_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
                 SlashArgShape::None
             }
         }
-        DispatchCommand::Spinner { spinner } => {
-            if option_has_text(spinner.as_ref()) {
-                SlashArgShape::FixedSubcommand
-            } else {
-                SlashArgShape::None
-            }
-        }
         DispatchCommand::Effort { value }
-        | DispatchCommand::Verbosity { value }
         | DispatchCommand::ToolVerbosity { value }
         | DispatchCommand::Router { value } => {
             if option_has_text(value.as_ref()) {
@@ -13629,10 +13619,12 @@ async fn permission_decision_for_request(
         .permissions
         .evaluate_with_extra(&request, &session_rules);
     // The structural pre-classifier runs for every shell call, not just those
-    // whose policy verdict is already Ask. Its AutoDeny floor (dangerous
-    // interpreter, destructive verb, sensitive path) must be able to override a
-    // permissive `shell = Allow` default — otherwise `python -c '...'`,
-    // `sudo ...`, and sensitive-path access execute with no gate.
+    // whose policy verdict is already Ask. Its hazardous-shape floor
+    // (dangerous interpreter, destructive verb, sensitive path) must be able to
+    // override a permissive `shell = Allow` default — otherwise
+    // `python -c '...'`, `sudo ...`, and sensitive-path access execute with no
+    // gate. It should not turn a default human prompt into an automatic denial;
+    // false positives must stay recoverable by approval.
     if request.tool_name == "shell"
         && let Some(command) = request.metadata.get("command")
     {
@@ -13663,19 +13655,21 @@ async fn permission_decision_for_request(
                 }
             }
             ShellPreClassification::AutoDeny { reason } => {
-                // Tighten one step toward deny so the command cannot run
-                // silently: Allow -> Ask (force a human/reviewer gate),
-                // Ask -> Deny. An existing Deny is left untouched.
+                // Tighten permissive verdicts into a gate so the command cannot
+                // run silently. Existing Ask/Deny verdicts already carry the
+                // desired user or policy boundary and should not be escalated
+                // further by a structural heuristic.
                 let tightened = match verdict.action {
                     PermissionAction::Allow => PermissionAction::Ask,
-                    PermissionAction::Ask | PermissionAction::Deny => PermissionAction::Deny,
+                    PermissionAction::Ask => PermissionAction::Ask,
+                    PermissionAction::Deny => PermissionAction::Deny,
                 };
                 if tightened != verdict.action {
-                    let reason = format!("pre-classifier auto-deny: {reason}");
+                    let reason = format!("pre-classifier requires approval: {reason}");
                     log_session_event(
                         context.session_log.as_ref(),
                         &context.redactor,
-                        "permission_pre_classifier_deny",
+                        "permission_pre_classifier_ask",
                         Some(context.turn_id),
                         Some(reason.clone()),
                         json!({

@@ -50,7 +50,7 @@ excluded_tools = [
 ]
 
 [env_vars]
-SQUEEZY_EXPLORATION_COMPILER = "0"
+SQUEEZY_EXPLORATION_GRAPH = "0"
 
 [[steps]]
 kind = "prompt"
