@@ -4,6 +4,13 @@ use tracing::warn;
 const STUB_DESCRIPTION_MAX_CHARS: usize = 240;
 const STUB_WHEN_TO_USE_MAX_CHARS: usize = 240;
 const PREAMBLE_DESCRIPTION_MAX_CHARS: usize = 180;
+const PREAMBLE_INTRO: &str = "Squeezy skills are local instruction bundles. The list below is metadata only; skill bodies stay on disk until `load_skill` fetches the full `SKILL.md`.";
+const PREAMBLE_HOW_TO_USE: &[&str] = &[
+    "- Discovery: Each available skill is listed by name, description, source, and the exact `load_skill` name.",
+    "- Trigger rules: If the user names a skill or the task clearly matches a skill description, you must use that skill for the turn by calling `load_skill` before doing the specialized work.",
+    "- Applicability: Treat imperative phrases in descriptions, such as \"always\" or \"first prompt\", as binding routing guidance for when the skill must be loaded.",
+    "- Scope: Load only the minimal relevant skill set. If a needed skill is unavailable or cannot be loaded, say so briefly and continue with the best fallback.",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillPreambleRender {
@@ -237,9 +244,7 @@ pub fn render_skill_preamble(
             .then_with(|| left.name.cmp(&right.name))
     });
 
-    let header = "Available Squeezy skills. Use `load_skill` when a task benefits from one of these local instruction sets.";
-    let mut lines = Vec::with_capacity(sorted.len() + 1);
-    lines.push(header.to_string());
+    let mut skill_lines = Vec::with_capacity(sorted.len());
     let mut omitted = 0usize;
     for summary in &sorted {
         let line = format!(
@@ -249,17 +254,17 @@ pub fn render_skill_preamble(
             summary.source.as_str(),
             summary.name
         );
-        lines.push(line);
-        if char_count(&wrap_preamble(&lines)) > budget_chars {
-            lines.pop();
+        skill_lines.push(line);
+        if char_count(&wrap_preamble(&skill_lines)) > budget_chars {
+            skill_lines.pop();
             omitted += 1;
         }
     }
 
-    if lines.len() == 1 {
+    if skill_lines.is_empty() {
         return None;
     }
-    let body = wrap_preamble(&lines);
+    let body = wrap_preamble(&skill_lines);
     if omitted > 0 {
         warn!(
             target: "squeezy_skills",
@@ -363,7 +368,14 @@ pub fn render_fork_skills(
     Some(rendered)
 }
 
-fn wrap_preamble(lines: &[String]) -> String {
+fn wrap_preamble(skill_lines: &[String]) -> String {
+    let mut lines = Vec::with_capacity(skill_lines.len() + PREAMBLE_HOW_TO_USE.len() + 5);
+    lines.push("## Skills".to_string());
+    lines.push(PREAMBLE_INTRO.to_string());
+    lines.push("### Available skills".to_string());
+    lines.extend(skill_lines.iter().cloned());
+    lines.push("### How to use skills".to_string());
+    lines.extend(PREAMBLE_HOW_TO_USE.iter().map(|line| line.to_string()));
     format!(
         "<available_skills>\n{}\n</available_skills>",
         lines.join("\n")
