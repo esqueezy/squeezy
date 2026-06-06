@@ -1,7 +1,10 @@
 use super::*;
 use crate::format_approval_prompt;
 use squeezy_agent::ToolApprovalRequest;
-use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRisk, PermissionScope};
+use squeezy_core::{
+    PermissionCapability, PermissionMode, PermissionRequest, PermissionRisk, PermissionRule,
+    PermissionRuleSource, PermissionScope,
+};
 use std::collections::BTreeMap;
 
 fn flatten(lines: &[Line<'static>]) -> String {
@@ -60,7 +63,30 @@ fn shell_preview_shows_command_and_cwd() {
     let out = flatten(&render_preview(&req));
     assert!(out.contains("cargo test --workspace"), "{out}");
     assert!(out.contains("cwd /repo"), "{out}");
-    assert!(out.contains("Rule: shell:cargo test"), "{out}");
+    assert!(out.contains("Rule: command prefix cargo test"), "{out}");
+}
+
+#[test]
+fn shell_rule_preview_names_command_prefix_instead_of_internal_capability() {
+    let mut req = request_with(
+        "shell",
+        PermissionCapability::Destructive,
+        "find:*",
+        &[
+            ("command", "find . -name pom.xml"),
+            ("shell_prefix", "find:*"),
+        ],
+    );
+    req.permission.suggested_rules.push(PermissionRule::new(
+        "destructive",
+        "find:*",
+        PermissionMode::Allow,
+        PermissionRuleSource::Session,
+        Some("approved shell command prefix".to_string()),
+    ));
+    let out = flatten(&render_preview(&req));
+    assert!(out.contains("Rule: command prefix find:*"), "{out}");
+    assert!(!out.contains("Rule: destructive:find:*"), "{out}");
 }
 
 #[test]
@@ -170,7 +196,7 @@ fn approval_preview_separates_rationale_command_rule_and_choices() {
         .expect("command line");
     let rule = rendered
         .iter()
-        .position(|line| line.contains("Rule: shell:cargo test"))
+        .position(|line| line.contains("Rule: command prefix cargo test"))
         .expect("rule line");
 
     assert_eq!(rendered.get(command - 1).map(String::as_str), Some(""));

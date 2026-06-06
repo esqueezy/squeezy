@@ -13735,21 +13735,18 @@ fn classify_provider_error(error: &SqueezyError) -> Option<ProviderErrorKind> {
 /// dominating the approval modal.
 const APPROVAL_CONTEXT_CAP: usize = 240;
 
-/// Extract the most recent assistant message from `state`, redact it, and
-/// keep only a complete short sentence/line. If the message cannot produce a
-/// clean bounded rationale, return `None` instead of showing a clipped thought.
-async fn approval_context_from_state(
-    state: Option<&Arc<Mutex<ConversationState>>>,
+/// Extract an explicit tool-call rationale, redact it, and keep only a
+/// complete short sentence/line. Approval prompts should omit this field
+/// rather than reuse unrelated transcript text.
+fn approval_context_from_request(
+    request: &PermissionRequest,
     redactor: &Redactor,
 ) -> Option<String> {
-    let state = state?;
-    let guard = state.lock().await;
-    let last_assistant = guard
-        .transcript
-        .iter()
-        .rev()
-        .find(|item| item.role == Role::Assistant)?;
-    let redacted = redactor.redact(&last_assistant.content).text;
+    let rationale = request
+        .metadata
+        .get("description")
+        .or_else(|| request.metadata.get("justification"))?;
+    let redacted = redactor.redact(rationale).text;
     let trimmed = redacted.trim();
     if trimmed.is_empty() {
         return None;
@@ -14020,9 +14017,7 @@ async fn permission_decision_for_request(
         }
         PermissionAction::Ask => {
             let (decision_tx, decision_rx) = oneshot::channel();
-            let approval_context =
-                approval_context_from_state(context.conversation_state.as_ref(), &context.redactor)
-                    .await;
+            let approval_context = approval_context_from_request(&request, &context.redactor);
             let preview = context.tools.preview_for(call, &request);
             let approval_request = ToolApprovalRequest {
                 id: context.approval_ids.fetch_add(1, Ordering::Relaxed),
