@@ -8570,7 +8570,9 @@ impl SkillsSettings {
 pub const DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS: usize = 4_000;
 pub const DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS: usize = 16_000;
 pub const DEFAULT_SKILLS_PREAMBLE_ENABLED: bool = true;
-pub const DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS: usize = 800;
+/// Must fit the fixed `<available_skills>` wrapper (intro + usage contract)
+/// plus at least one catalog line; the contract alone is ~900 chars.
+pub const DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS: usize = 1_200;
 /// Default for `[skills] inline`. The metadata-only default keeps skill
 /// bodies out of the system prompt; users that want the legacy behavior
 /// of inlining each activated skill's body can set `[skills] inline = true`.
@@ -9854,7 +9856,7 @@ pub fn user_settings_template() -> &'static str {
 # active_budget_chars = 4000          # legacy absolute cap; used only when active_budget_mode is unset
 # active_body_cap_chars = 16000
 # preamble_enabled = true
-# preamble_budget_chars = 800         # legacy absolute cap; used only when preamble_budget_mode is unset
+# preamble_budget_chars = 1200        # legacy absolute cap; used only when preamble_budget_mode is unset
 # active_budget_mode = { context_percent = 2.0 }   # default; scales with [context].model_context_window
 # preamble_budget_mode = { context_percent = 2.0 } # alternative: active_budget_mode = { chars = 4000 }
 # inline = false                      # default; emit only metadata for active skills and let the model call load_skill on demand
