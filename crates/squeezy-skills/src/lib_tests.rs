@@ -1229,7 +1229,7 @@ fn available_skills_preamble_respects_budget() {
     let config = SkillsConfig {
         user_dir: root.join("user"),
         compat_user_dir: root.join("compat"),
-        preamble_budget_chars: 420,
+        preamble_budget_chars: 1_200,
         ..Default::default()
     };
     for name in ["alpha-nav", "beta-nav", "gamma-nav"] {

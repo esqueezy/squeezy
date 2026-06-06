@@ -160,3 +160,51 @@ fn render_active_skills_matches_metrics_variant_under_overflow() {
     assert_eq!(metrics.included + metrics.dropped, metrics.total);
     assert_eq!(metrics.body_truncated, metrics.included);
 }
+
+#[test]
+fn skill_preamble_includes_usage_contract() {
+    let summary = skill("first-turn-helper", "").summary;
+    let rendered = render_skill_preamble(&[summary], 4_000)
+        .expect("preamble should fit")
+        .body;
+
+    assert!(
+        rendered.starts_with("<available_skills>\n## Skills"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("### Available skills"), "{rendered}");
+    assert!(
+        rendered.contains(
+            "- first-turn-helper: desc for first-turn-helper (source: project, load_skill name: first-turn-helper)"
+        ),
+        "{rendered}"
+    );
+    assert!(rendered.contains("### How to use skills"), "{rendered}");
+    assert!(
+        rendered.contains("If the user names a skill or the task clearly matches a skill description, you must use that skill"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Treat imperative phrases in descriptions, such as \"always\" or \"first prompt\", as binding routing guidance"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn skill_preamble_budget_accounts_for_usage_contract() {
+    let alpha = skill("alpha", "").summary;
+    let mut beta = skill("beta", "").summary;
+    beta.description = "long beta description ".repeat(20);
+    let summaries = vec![alpha, beta];
+
+    let tight = render_skill_preamble(&summaries, 200);
+    assert!(
+        tight.is_none(),
+        "fixed wrapper must count against tight budgets: {tight:?}"
+    );
+
+    let rendered = render_skill_preamble(&summaries, 950).expect("one skill should fit");
+    assert!(rendered.body.chars().count() <= 950);
+    assert!(rendered.omitted_count > 0, "{rendered:?}");
+    assert!(rendered.body.contains("- alpha:"), "{rendered:?}");
+}
