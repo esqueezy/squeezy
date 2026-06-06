@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env,
     fmt::Write as _,
     fs,
@@ -31,11 +31,11 @@ use squeezy_core::{
 };
 use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
-    CacheRetention, CacheSpec, INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY,
-    INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider,
-    LlmRequest, LlmStream, LlmToolCall, LlmToolSpec, ReasoningPayload, ReasoningSnapshot,
-    RequestTokenEstimate, StopReason, capabilities_for, estimate_cost,
-    estimate_request_context_calibrated, fetch_ollama_context_window,
+    CacheRetention, CacheSpec, ContextLimitInput, INVALID_TOOL_ARGUMENTS_ERROR_KEY,
+    INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem,
+    LlmOutputSchema, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
+    ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate, StopReason, capabilities_for,
+    estimate_cost, estimate_request_context_full, fetch_ollama_context_window,
     provider_honors_output_schema,
 };
 use squeezy_skills::{
@@ -226,6 +226,13 @@ struct ConversationState {
     routing_sticky_remaining_turns: u8,
     routing_session_disabled: bool,
     routing_prior_turn_was_hard: bool,
+    /// Per-`(provider, model)` observed context ceiling: the estimated input
+    /// size at which the provider last returned a context-window-exceeded
+    /// error. Clamps the resolved window down for that route for the rest of
+    /// the session (so `/context` and the reroute fit-check stop trusting an
+    /// over-optimistic catalog/override). In-memory only — a best-effort safety
+    /// signal, not persisted across resume.
+    observed_context_ceilings: HashMap<(String, String), u64>,
 }
 
 impl ConversationState {
@@ -247,6 +254,7 @@ impl ConversationState {
             routing_sticky_remaining_turns: state.routing_sticky_remaining_turns,
             routing_session_disabled: state.routing_session_disabled,
             routing_prior_turn_was_hard: state.routing_prior_turn_was_hard,
+            observed_context_ceilings: HashMap::new(),
         }
     }
 
@@ -1412,13 +1420,84 @@ pub struct PendingConfigSwap {
     pub display_note: Option<String>,
 }
 
-/// Look up a model's registered context-window size from the model registry.
-/// Shared by `build()` (initial derivation) and `re_derive_model_context_window`
-/// (runtime model switch) so both compute the window the same way (finding #1).
-fn derive_model_context_window(provider: &dyn LlmProvider, model: &str) -> Option<u64> {
-    squeezy_llm::model_info_for(provider.name(), model)
-        .and_then(|info| info.limits)
-        .map(|limits| limits.context_window_tokens)
+/// Resolve the compaction window for the active model through the layered limit
+/// resolver. Shared by `build()` (initial derivation) and
+/// `re_derive_model_context_window` (runtime model switch) so both compute the
+/// window the same way (finding #1) and so compaction sizing matches the
+/// `/context` accounting window.
+///
+/// `global_override` is the operator's explicit *global*
+/// `[context].model_context_window` (captured before the field is overwritten);
+/// a per-model `[model_limits."p:m"]` entry takes precedence over it.
+///
+/// Returns `None` for a low-confidence (synthetic-fallback) window so mid-turn
+/// compaction stays dormant rather than arming off a blanket 272K guess — the
+/// "dormant when underivable" contract. Curated/models.dev/override windows arm
+/// it.
+fn derive_model_context_window(
+    config: &AppConfig,
+    provider: &dyn LlmProvider,
+    global_override: Option<u64>,
+) -> Option<u64> {
+    let per_model = config
+        .model_limits
+        .get(&config.model_limit_key())
+        .and_then(|entry| entry.context_window);
+    let mut input = ContextLimitInput::new(provider.name(), &config.model);
+    input.user_override = per_model.or(global_override);
+    input.models_dev = squeezy_llm::cached_models_dev_view();
+    input.effective_percent_override = config.context_compaction.effective_context_window_percent;
+    input.baseline_reserve_override = config.context_compaction.baseline_reserve_tokens;
+    let resolved = squeezy_llm::resolve_context_limits(&input);
+    if matches!(resolved.confidence, squeezy_llm::LimitConfidence::Low) {
+        None
+    } else {
+        resolved.context_window_tokens
+    }
+}
+
+/// Whether `model`'s effective context window can hold the assembled
+/// `conversation` plus the projected output, used by the reroute fit-check.
+/// Resolves the target model's window through the same layered resolver
+/// (per-model override → global → curated → models.dev → observed clamp), so a
+/// reroute to a smaller-window model is only allowed when it fits *as-is* — we
+/// never compact to squeeze into a cheaper model. Returns `true` (permissive)
+/// when the window is only a low-confidence guess: a real overflow there is
+/// caught by the mid-turn escalation + observed-ceiling path instead of being
+/// pre-emptively skipped on a guess.
+fn model_fits_conversation(
+    config: &AppConfig,
+    provider_name: &str,
+    model: &str,
+    conversation: &[LlmInputItem],
+    observed_ceiling: Option<u64>,
+) -> bool {
+    let key = format!(
+        "{}:{}",
+        squeezy_core::provider_slug(&config.provider),
+        model
+    );
+    let per_model = config
+        .model_limits
+        .get(&key)
+        .and_then(|entry| entry.context_window);
+    let mut input = ContextLimitInput::new(provider_name, model);
+    input.user_override = per_model;
+    input.observed_ceiling = observed_ceiling;
+    input.models_dev = squeezy_llm::cached_models_dev_view();
+    input.effective_percent_override = config.context_compaction.effective_context_window_percent;
+    input.baseline_reserve_override = config.context_compaction.baseline_reserve_tokens;
+    let resolved = squeezy_llm::resolve_context_limits(&input);
+    if matches!(resolved.confidence, squeezy_llm::LimitConfidence::Low) {
+        return true;
+    }
+    let Some(effective) = squeezy_llm::effective_window_tokens(&resolved) else {
+        return true;
+    };
+    let estimated_input = estimate_context(conversation).estimated_tokens;
+    let projected_output =
+        CostBroker::projected_output_tokens(config.max_output_tokens, resolved.max_output_tokens);
+    estimated_input.saturating_add(projected_output) <= effective
 }
 
 impl Agent {
@@ -1715,8 +1794,11 @@ impl Agent {
         // (`squeezy.toml` / `SQUEEZY_CONTEXT_MODEL_CONTEXT_WINDOW`) takes
         // precedence; otherwise we fall back to the registry value.
         let configured_model_context_window = config.context_compaction.model_context_window;
-        config.context_compaction.model_context_window = configured_model_context_window
-            .or_else(|| derive_model_context_window(provider.as_ref(), &config.model));
+        config.context_compaction.model_context_window = derive_model_context_window(
+            &config,
+            provider.as_ref(),
+            configured_model_context_window,
+        );
         let output_config = ToolOutputConfig {
             spill_threshold_bytes: config.tool_spill_threshold_bytes,
             preview_bytes: config.tool_preview_bytes,
@@ -2159,9 +2241,24 @@ impl Agent {
     /// session. Without this, `build()` baked in the *old* model's window and
     /// the swap paths never recomputed it.
     fn re_derive_model_context_window(&mut self) {
-        self.config.context_compaction.model_context_window = self
-            .configured_model_context_window
-            .or_else(|| derive_model_context_window(self.provider.as_ref(), &self.config.model));
+        self.config.context_compaction.model_context_window = derive_model_context_window(
+            &self.config,
+            self.provider.as_ref(),
+            self.configured_model_context_window,
+        );
+    }
+
+    /// The operator's explicit context-window override for the active model: a
+    /// per-model `[model_limits."p:m"]` entry, else the global configured value
+    /// captured at build. This is the resolver's "user override" layer; keeping
+    /// it here lets the `/context` snapshot and the reroute fit-check resolve
+    /// the window identically to `derive_model_context_window`.
+    fn operator_context_window_override(&self) -> Option<u64> {
+        self.config
+            .model_limits
+            .get(&self.config.model_limit_key())
+            .and_then(|entry| entry.context_window)
+            .or(self.configured_model_context_window)
     }
 
     /// Queue a NextPrompt-tier swap. Drained by `drain_pending_swap()` at the
@@ -2537,11 +2634,31 @@ impl Agent {
     pub async fn session_accounting_snapshot(&self) -> SessionAccountingSnapshot {
         let state = self.conversation_state.lock().await.clone();
         let mode = load_session_mode(&self.session_mode);
-        let context_window_override = match &self.config.provider {
+        // Live provider window probe (Ollama only today). Folded into the
+        // resolver as the `provider_live_window` layer rather than a blanket
+        // override so its provenance shows as "provider live".
+        let provider_live_window = match &self.config.provider {
             ProviderConfig::Ollama(ollama) => {
                 fetch_ollama_context_window(&ollama.base_url, &self.config.model).await
             }
             _ => None,
+        };
+        let observed_ceiling = state
+            .observed_context_ceilings
+            .get(&(self.provider.name().to_string(), self.config.model.clone()))
+            .copied();
+        let limit_input = ContextLimitInput {
+            provider: self.provider.name(),
+            model: &self.config.model,
+            user_override: self.operator_context_window_override(),
+            provider_live_window,
+            observed_ceiling,
+            models_dev: squeezy_llm::cached_models_dev_view(),
+            effective_percent_override: self
+                .config
+                .context_compaction
+                .effective_context_window_percent,
+            baseline_reserve_override: self.config.context_compaction.baseline_reserve_tokens,
         };
         let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();
         let full_history_request = self.accounting_request(
@@ -2579,18 +2696,14 @@ impl Agent {
             transcript: transcript_shape(&state.transcript),
             conversation: conversation_shape(&state.conversation),
             attachments: attachment_shape(&state.context_attachments),
-            transmitted_request: estimate_request_context_calibrated(
-                self.provider.name(),
-                &self.config.model,
+            transmitted_request: estimate_request_context_full(
+                &limit_input,
                 &transmitted_request,
-                context_window_override,
                 Some(&state.token_calibration),
             ),
-            full_history_request: estimate_request_context_calibrated(
-                self.provider.name(),
-                &self.config.model,
+            full_history_request: estimate_request_context_full(
+                &limit_input,
                 &full_history_request,
-                context_window_override,
                 Some(&state.token_calibration),
             ),
             skills: self.skills_accounting(),
@@ -6604,6 +6717,52 @@ impl TurnRuntime {
             turn_router::TurnRoutingDecision::Parent => parent_model.clone(),
         };
         let mut on_cheap_turn = decision.is_cheap();
+        // Reroute fit-check (NO compaction). A cheap turn must fit the cheaper
+        // model's effective window exactly as the conversation already stands.
+        // If it wouldn't fit, stay on the parent rather than compact-to-fit —
+        // routing must never shrink the context the parent resumes on next turn
+        // (the Opus→Haiku→broken-context hazard). Compaction stays owned by the
+        // parent model's own pressure logic.
+        if on_cheap_turn {
+            let observed_ceiling = {
+                let state = self.conversation_state.lock().await;
+                state
+                    .observed_context_ceilings
+                    .get(&(self.provider.name().to_string(), current_model.to_string()))
+                    .copied()
+            };
+            if !model_fits_conversation(
+                &self.config,
+                self.provider.name(),
+                &current_model,
+                &conversation,
+                observed_ceiling,
+            ) {
+                self.log_event(
+                    "routing_skipped_context",
+                    Some(self.turn_id),
+                    Some(format!(
+                        "cheap model {current_model} cannot fit the current context; staying on \
+                         parent {parent_model_str} (no compaction)"
+                    )),
+                    json!({
+                        "cheap_model": current_model.to_string(),
+                        "parent_model": parent_model_str,
+                    }),
+                );
+                let _ = self
+                    .tx
+                    .send(AgentEvent::TurnRouted {
+                        turn_id: self.turn_id,
+                        from: parent_model_str.clone(),
+                        to: parent_model_str.clone(),
+                        reason: "reroute_skipped_context".to_string(),
+                    })
+                    .await;
+                current_model = parent_model.clone();
+                on_cheap_turn = false;
+            }
+        }
         if on_cheap_turn {
             broker.metrics.routed_to_cheap = true;
             if let Some(reason_label) = decision.reason_label() {
@@ -7545,6 +7704,21 @@ impl TurnRuntime {
             // and future compaction-retry logic can hook in here without
             // touching every provider. `EndTurn` and `ToolUse` fall
             // through to the existing tool-calls / completion logic.
+            if matches!(stop_reason, Some(StopReason::ContextWindowExceeded)) {
+                // The provider just proved its real window is no larger than
+                // what we sent. Record an observed ceiling for this route so the
+                // limit resolver clamps the window down (and the reroute
+                // fit-check stops trusting an over-optimistic catalog/override)
+                // for the rest of the session.
+                let observed = estimate_context(&conversation).estimated_tokens;
+                let mut state = self.conversation_state.lock().await;
+                let key = (self.provider.name().to_string(), current_model.to_string());
+                let ceiling = state
+                    .observed_context_ceilings
+                    .entry(key)
+                    .or_insert(observed);
+                *ceiling = (*ceiling).min(observed);
+            }
             if matches!(stop_reason, Some(StopReason::ContextWindowExceeded))
                 && !context_overflow_retry_used
                 && round_output_bytes == 0
