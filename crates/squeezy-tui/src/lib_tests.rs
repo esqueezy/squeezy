@@ -12581,6 +12581,75 @@ fn transcript_overlay_shows_full_generic_tool_json_content() {
 }
 
 #[test]
+fn transcript_overlay_shows_full_repo_map_payload() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("repo_map", "");
+    result.content = serde_json::json!({
+        "stats": {"files": 1, "symbols": 2},
+        "languages": {"Rust": 1},
+        "hierarchy": [{
+            "name": "workspace-root",
+            "children": [{
+                "name": "very_unique_repo_map_child_symbol",
+                "path": "src/repo_map_child.rs"
+            }]
+        }],
+        "packets": [{
+            "name": "repo_map_packet_symbol",
+            "path": "src/repo_map_packet.rs"
+        }],
+    });
+    app.push_tool_result(result);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(180), true));
+
+    assert!(
+        rendered.contains("very_unique_repo_map_child_symbol"),
+        "Ctrl+T must show repo_map hierarchy payload, not only summary lines: {rendered}"
+    );
+    assert!(
+        rendered.contains("repo_map_packet_symbol"),
+        "Ctrl+T must show repo_map packet payload, not only summary lines: {rendered}"
+    );
+}
+
+#[test]
+fn transcript_overlay_shows_full_decl_search_payload() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("decl_search", "");
+    result.content = serde_json::json!({
+        "total_matches": 1,
+        "returned_matches": 1,
+        "counts_by_language": {"Rust": 1},
+        "counts_by_kind": {"function": 1},
+        "packets": [{
+            "name": "very_unique_decl_search_packet",
+            "kind": "function",
+            "path": "src/decl_search_packet.rs",
+            "span": {"start_line": 42},
+            "references": [{
+                "path": "src/reference.rs",
+                "symbol": "decl_search_reference_payload"
+            }]
+        }],
+    });
+    app.push_tool_result(result);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(180), true));
+
+    assert!(
+        rendered.contains("very_unique_decl_search_packet"),
+        "Ctrl+T must show decl_search packet payload, not only summary lines: {rendered}"
+    );
+    assert!(
+        rendered.contains("decl_search_reference_payload"),
+        "Ctrl+T must show nested decl_search payload fields: {rendered}"
+    );
+}
+
+#[test]
 fn transcript_overlay_shows_full_grep_matches_and_lines() {
     let mut app = test_app(SessionMode::Build);
     let matches = (0..24)

@@ -11576,7 +11576,13 @@ fn expanded_tool_detail_lines(
 ) -> Vec<Line<'static>> {
     match tool.result.tool_name.as_str() {
         "shell" | "verify" => expanded_shell_detail_lines(tool, mode, transcript_shortcut),
+        "decl_search" if mode.is_full() => {
+            expanded_generic_tool_detail_lines(tool, mode, transcript_shortcut)
+        }
         "decl_search" => expanded_decl_search_detail_lines(tool, mode),
+        "repo_map" if mode.is_full() => {
+            expanded_generic_tool_detail_lines(tool, mode, transcript_shortcut)
+        }
         "repo_map" => expanded_repo_map_detail_lines(tool),
         "diff_context" => expanded_diff_context_detail_lines(tool, mode),
         "plan_patch" => expanded_plan_patch_detail_lines(tool, mode),
