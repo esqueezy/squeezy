@@ -12209,10 +12209,12 @@ fn assistant_text_is_retry_ack(text: &str) -> bool {
     // emphasis ("`DONE`", "**Done.**"). Only an *essentially empty*
     // confirmation collapses to the prior answer; if the model added real
     // content alongside it, that content is merged (G1 never drops text).
+    // Note: `?` is deliberately NOT trimmed — "Done?" is the model asking,
+    // not confirming, so it must not collapse to the prior answer.
     let bare = lower.trim_matches(|c: char| {
         matches!(
             c,
-            '.' | '!' | '?' | ' ' | '\t' | '\n' | '\r' | '"' | '\'' | '`' | '*' | '_'
+            '.' | '!' | ' ' | '\t' | '\n' | '\r' | '"' | '\'' | '`' | '*' | '_'
         )
     });
     bare == "done"
@@ -12230,6 +12232,11 @@ fn assistant_text_is_retry_ack(text: &str) -> bool {
 /// closing offer, not abandoned work. Excluding these (when they appear
 /// in the final clause) removes the dominant strong-model false-positive
 /// class for [`assistant_text_has_unresolved_intent`].
+///
+/// Kept tight to phrases that are *structurally* a trailing offer. Looser
+/// markers like "happy to" / "feel free to" were dropped: they can sit in
+/// front of a genuine stall ("I'm happy to fix this — let me edit it now")
+/// and would wrongly suppress it.
 const STALL_OFFER_MARKERS: &[&str] = &[
     "let me know",
     "if you'd like",
@@ -12238,8 +12245,6 @@ const STALL_OFFER_MARKERS: &[&str] = &[
     "if you'd prefer",
     "would you like",
     "do you want",
-    "feel free to",
-    "happy to",
 ];
 
 /// Return the trailing sentence/clause of an already-lowercased,
@@ -12307,6 +12312,14 @@ fn assistant_final_clause(lower_trimmed: &str) -> &str {
 /// done just confirms), so a residual false positive costs at most one
 /// bounded recovery round and can neither drop text nor force an unwanted
 /// action.
+///
+/// The tradeoff is intentional and asymmetric. Final-clause anchoring
+/// trades *recall* for *precision*: a genuine stall whose announced
+/// action is not the last clause (e.g. "Let me search.\nThanks!") is
+/// missed. We accept that — under-firing only means a weak model that was
+/// already failing gets no extra recovery round; it never hurts a model
+/// that succeeded. Over-firing is what hurt strong models (the spurious
+/// retry that drove unrequested edits), so precision is what matters here.
 pub fn assistant_text_has_unresolved_intent(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {

@@ -535,6 +535,19 @@ impl Rule for ExpectationsAsFindings {
                 });
             }
         }
+        for forbidden in &scenario.expect.final_text_not_contains {
+            if ctx.last_assistant_text.contains(forbidden) {
+                out.push(Finding {
+                    rule_id: "expect_final_text_not_contains".into(),
+                    severity: Severity::Major,
+                    category: "correctness".into(),
+                    summary: format!(
+                        "final assistant output contains forbidden text: {forbidden:?}"
+                    ),
+                    evidence: vec![],
+                });
+            }
+        }
         if scenario.expect.no_tool_errors && ctx.tool_error_count > 0 {
             out.push(Finding {
                 rule_id: "expect_no_tool_errors".into(),

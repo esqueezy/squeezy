@@ -1891,7 +1891,10 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
 async fn promised_action_retry_preserves_prior_visible_answer_in_transcript() {
     let root = temp_workspace("agent_promised_action_retry_transcript");
     fs::write(root.join("sample.rs"), "fn marker() {}\n").expect("write sample");
-    let substantive_answer = "Let me re-run each bug scenario directly rather than trusting the compacted summary.\n\n## Bug-by-Bug Verdict\nBug 1 confirmed. Bug 2 retracted.";
+    // A genuine stall: a substantive verdict followed by a trailing,
+    // undelivered intent. The final clause is the unresolved action, so the
+    // sharpened detector fires the retry — exercising the preservation path.
+    let substantive_answer = "## Bug-by-Bug Verdict\nBug 1 confirmed. Bug 2 retracted.\n\nNow let me re-run each scenario directly to double-check the compacted summary.";
     let provider = Arc::new(MockProvider::new(vec![
         vec![
             Ok(LlmEvent::Started),
@@ -2029,7 +2032,7 @@ async fn promised_action_retry_preserves_prior_visible_answer_on_terminal_failur
     let root = temp_workspace("agent_promised_action_retry_terminal_failure");
     fs::write(root.join("sample.rs"), "fn marker() {}\n").expect("write sample");
     let substantive_answer =
-        "Let me inspect the result directly.\n\nThe report was already complete.";
+        "The report was already complete.\n\nNow let me inspect the result directly to confirm.";
     let provider = Arc::new(MockProvider::new(vec![
         vec![
             Ok(LlmEvent::Started),
@@ -2127,7 +2130,7 @@ async fn promised_action_retry_preserves_prior_visible_answer_on_soft_completion
         INVALID_TOOL_ARGUMENTS_RAW_KEY: "{\"query\":\"getFoo",
     });
     let substantive_answer =
-        "Let me inspect the failed lookup directly.\n\nThe useful answer is already here.";
+        "The useful answer is already here.\n\nNow let me inspect the failed lookup directly.";
     let provider = Arc::new(MockProvider::new(vec![
         vec![
             Ok(LlmEvent::Started),

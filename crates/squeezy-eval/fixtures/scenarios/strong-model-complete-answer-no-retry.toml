@@ -14,10 +14,14 @@ then drove unrequested file edits and buried the answer. The sharpened,
 final-clause-anchored detector must clear this answer so the turn
 completes at round 1 with no retry.
 
-Witness: round 2 is a TRAP — an empty `stop` turn that only gets
-requested if a spurious retry fires. If reached, it completes as the
-`stop_no_action` sentinel and the `expect_finish_reason` finding fires,
-failing the scenario. With the fix, round 2 is never requested.
+Witness: round 2 is a TRAP that only gets requested if a spurious retry
+fires. It emits the sentinel text "UNREQUESTED EXTRA WORK", which the
+recovery path would merge into the visible turn output. `final_text_not_contains`
+forbids that sentinel, so a fired retry fails the scenario; with the fix,
+round 2 is never requested and the sentinel never appears. (The eval
+harness has no per-round visibility — it sees one turn-completion per
+turn — so this merged-text footprint is the reliable signal, not the
+`stop_no_action` sentinel which can't observe an intra-turn retry.)
 
 Runs entirely offline against the mock provider.
 """
@@ -38,7 +42,9 @@ wait_for = "turn_completed"
 [expect]
 # The complete answer is preserved verbatim (G1: never drop visible text)...
 final_text_contains = ["Want me to proceed with that and continue the modernization"]
-# ...and no spurious retry fired (the round-2 trap is never reached).
+# ...and no spurious retry fired: the round-2 trap's sentinel must never
+# surface in the visible output (it only would if a retry merged it in).
+final_text_not_contains = ["UNREQUESTED EXTRA WORK"]
 finish_reason_not = ["stop_no_action"]
 max_wall_clock_seconds = 30
 
@@ -78,12 +84,13 @@ output_tokens = 240
 finish_reason = "stop"
 
 # Round 2: TRAP. Only requested if a spurious promised-action retry
-# fires. An empty `stop` turn completes as the `stop_no_action` sentinel,
-# tripping `finish_reason_not` and failing the scenario.
+# fires. Its sentinel text would be merged into the visible turn output,
+# tripping `final_text_not_contains` and failing the scenario. With the
+# fix this round is never requested.
 [[mock.turns]]
-text = ""
+text = "UNREQUESTED EXTRA WORK: the retry wrongly fired and the model kept going."
 input_tokens = 130
-output_tokens = 0
+output_tokens = 20
 finish_reason = "stop"
 
 [triage]
