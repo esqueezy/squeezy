@@ -10252,6 +10252,115 @@ fn assistant_text_has_unresolved_intent_handles_multibyte_tail() {
     let _ = assistant_text_has_unresolved_intent(&text);
 }
 
+#[test]
+fn unresolved_intent_anchors_on_final_clause_not_midanswer() {
+    // Strong-model shape: an intent phrase used mid-answer, but the
+    // message CONCLUDES. Anchoring on the final clause means this is not
+    // treated as an unresolved promise (the dominant false positive).
+    assert!(!assistant_text_has_unresolved_intent(
+        "Let me check: yes, the bug is in foo.rs. The fix is to add a guard.",
+    ));
+}
+
+#[test]
+fn unresolved_intent_skips_offer_idiom() {
+    // "Let me know if you'd like me to check ..." is a closing offer,
+    // not abandoned tool work.
+    assert!(!assistant_text_has_unresolved_intent(
+        "I fixed the parser. Let me know if you'd like me to check the other files.",
+    ));
+}
+
+#[test]
+fn unresolved_intent_fires_when_final_clause_announces_action() {
+    // Multi-sentence message that ENDS on an announced, undelivered action.
+    assert!(assistant_text_has_unresolved_intent(
+        "I read the file. Now let me search the repository for callers.",
+    ));
+}
+
+#[test]
+fn unresolved_intent_fires_on_dangling_colon() {
+    // A trailing ':' is itself an "about to act" signal.
+    assert!(assistant_text_has_unresolved_intent(
+        "Now let me grep for the symbol:",
+    ));
+}
+
+#[test]
+fn unresolved_intent_keeps_dotted_tokens_intact() {
+    // The '.' in "src/lib.rs" must not be read as a sentence boundary,
+    // or the intent that precedes it would be lost.
+    assert!(assistant_text_has_unresolved_intent(
+        "I'll edit src/lib.rs to add the guard.",
+    ));
+}
+
+#[test]
+fn retry_ack_recognizes_bare_done_confirmation() {
+    // The G2 "reply DONE if complete" path: a bare confirmation collapses
+    // back to the prior answer, but added content does not.
+    assert!(assistant_text_is_retry_ack("DONE"));
+    assert!(assistant_text_is_retry_ack("Done."));
+    assert!(assistant_text_is_retry_ack("`DONE`"));
+    assert!(assistant_text_is_retry_ack("**Done.**"));
+    assert!(!assistant_text_is_retry_ack(
+        "Done — I also updated the changelog.",
+    ));
+}
+
+#[test]
+fn merge_retried_keeps_prior_answer_when_retry_confirms_done() {
+    // G1+G2: confirm-or-continue nudge -> a done model replies DONE, and
+    // the prior substantive answer is preserved verbatim (nothing dropped).
+    let mut deferred = String::new();
+    append_deferred_visible_assistant_text(
+        &mut deferred,
+        "The function `needle` is defined once in src/lib.rs at line 12.",
+    );
+    let merged = merge_retried_visible_assistant_text(&mut deferred, "DONE");
+    assert_eq!(
+        merged,
+        "The function `needle` is defined once in src/lib.rs at line 12."
+    );
+}
+
+#[test]
+fn merge_retried_appends_real_continuation() {
+    // A genuine stall recovery: the retry produced new substantive text,
+    // appended after the prior visible text — nothing is dropped.
+    let mut deferred = String::new();
+    append_deferred_visible_assistant_text(&mut deferred, "I scanned the tree.");
+    let merged =
+        merge_retried_visible_assistant_text(&mut deferred, "The entrypoint is `main` in cli.rs.");
+    assert_eq!(
+        merged,
+        "I scanned the tree.\n\nThe entrypoint is `main` in cli.rs."
+    );
+}
+
+#[test]
+fn unresolved_intent_skips_real_complete_answer_ending_in_question() {
+    // Regression witness from a real incident (gctoolkit session
+    // 1780784071532-67685-1, turn-2): the user asked "what model are you
+    // and why didn't you load the skill yet?". The model gave a complete,
+    // well-behaved 2.2k-char answer that ENDS on a permission question,
+    // but whose BODY contains mid-answer intent phrases ("I'll find out
+    // when I try", "I'll run them") that the old whole-text scan matched —
+    // firing a spurious `promised_action` retry whose pushy "call the tool
+    // now" nudge then drove unrequested file edits. Anchoring on the final
+    // clause clears the answer, so no retry fires.
+    let answer = "You're right to call that out — let me address both honestly. \
+On the model: I don't have a reliable way to verify my exact underlying model \
+from inside this environment, so I won't guess. I operate here as \"Squeezy\". \
+Those commands may or may not run in this shell — I'll find out when I try, and \
+I'll run them and surface any config/auth errors to you rather than retrying \
+blindly. So before I touch CPUSummary.java (a clean record conversion, ~4 caller \
+sites), the correct next step per the skill is to run `guidelines get`. Want me \
+to proceed with that and continue the modernization?";
+    assert!(!assistant_text_has_unresolved_intent(answer));
+}
+
 // F17-dispatch-command-completeness: each typed `DispatchCommand`
 // variant lands in `Agent::dispatch_command` with a deterministic
 // outcome. Variants whose effect lives in the TUI return `TuiOnly`;

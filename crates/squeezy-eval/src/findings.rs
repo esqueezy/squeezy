@@ -1337,46 +1337,6 @@ impl Rule for StopWithIntentTextNoToolCall {
         "stop_with_intent_text_no_tool_call"
     }
     fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
-        const INTENT_PATTERNS: &[&str] = &[
-            "let me ",
-            "let's ",
-            "i'll ",
-            "ill ",
-            "i will ",
-            "now i'll ",
-            "now i ",
-            "next i ",
-            "next, i ",
-            "i need to ",
-            "i can ",
-            "first, i ",
-            "going to ",
-        ];
-        const ACTION_PATTERNS: &[&str] = &[
-            "scan",
-            "search",
-            "explore",
-            "find",
-            "read",
-            "look",
-            "check",
-            "inspect",
-            "grep",
-            "map",
-            "list",
-            "open",
-            "fetch",
-            "load",
-            "fix",
-            "edit",
-            "modify",
-            "write",
-            "create",
-            "rename",
-            "investigate",
-            "trace",
-            "follow",
-        ];
         let mut out = Vec::new();
         for (turn, (seq, stop_reason, _)) in &ctx.turn_finish_states {
             // Only check turns that actually finished with EndTurn (the
@@ -1400,24 +1360,12 @@ impl Rule for StopWithIntentTextNoToolCall {
                 .assistant_text_by_turn
                 .get(turn)
                 .cloned()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if text.trim().is_empty() {
-                continue;
-            }
-            // Look for `let me X` / `I'll X` / ... where X is an action verb.
-            let intent_match = INTENT_PATTERNS.iter().any(|intent| {
-                if let Some(idx) = text.find(intent) {
-                    let tail = &text[idx + intent.len()..];
-                    let next_30 = &tail[..tail.len().min(40)];
-                    ACTION_PATTERNS
-                        .iter()
-                        .any(|action| next_30.contains(action))
-                } else {
-                    false
-                }
-            });
-            if !intent_match {
+                .unwrap_or_default();
+            // Single source of truth: this eval finding shares the EXACT
+            // live recovery trigger so the benchmark signal can never drift
+            // from what the runtime actually retries on. The detector is
+            // model-agnostic and anchors on the message's final clause.
+            if !squeezy_agent::assistant_text_has_unresolved_intent(&text) {
                 continue;
             }
             out.push(Finding {

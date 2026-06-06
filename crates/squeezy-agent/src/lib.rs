@@ -8107,10 +8107,17 @@ impl TurnRuntime {
                              Respond directly to the user now."
                         }
                     } else {
-                        "You described a follow-up action but did not call any tool. \
-                         If you need to call a tool to complete the user's request, \
-                         call it now. If the previous output is enough, give the final \
-                         answer directly instead."
+                        // G2 (action safety): grant permission to finish,
+                        // do not command an action. A model that was
+                        // actually done replies `DONE` (recognized as an
+                        // ack, so its prior visible text is kept verbatim);
+                        // a model that genuinely stalled picks up the work.
+                        // This is what lets the same recovery run harmlessly
+                        // on a strong model that didn't fail.
+                        "If your previous response already fully answers the request, \
+                         reply with just `DONE` and nothing else. Otherwise, finish the \
+                         work now — call the tool you described, or give the final answer \
+                         directly. Do not repeat what you already said."
                     };
                     let nudge_item = redact_input_item(
                         LlmInputItem::UserText(nudge.to_string()),
@@ -12197,37 +12204,121 @@ fn merge_retried_visible_assistant_text(deferred: &mut String, final_text: &str)
 
 fn assistant_text_is_retry_ack(text: &str) -> bool {
     let lower = text.trim().to_ascii_lowercase();
-    lower.starts_with("the previous output is")
+    // Bare `DONE` confirmation from the G2 "reply DONE if complete" nudge,
+    // tolerant of trailing/wrapping punctuation, quotes, or markdown
+    // emphasis ("`DONE`", "**Done.**"). Only an *essentially empty*
+    // confirmation collapses to the prior answer; if the model added real
+    // content alongside it, that content is merged (G1 never drops text).
+    let bare = lower.trim_matches(|c: char| {
+        matches!(
+            c,
+            '.' | '!' | '?' | ' ' | '\t' | '\n' | '\r' | '"' | '\'' | '`' | '*' | '_'
+        )
+    });
+    bare == "done"
+        || lower.starts_with("the previous output is")
         || lower.starts_with("the previous answer is")
+        || lower.starts_with("the previous response is")
         || lower.contains("previous output is the complete answer")
         || lower.contains("previous output was the complete answer")
+        || lower.contains("previous response is complete")
 }
 
-/// Heuristic: does the assistant text contain an intent phrase that
-/// implies the model promised follow-up tool work it never delivered?
+/// Phrases that turn an "intent" verb into an *offer* rather than a
+/// commitment to act now. "Let me know if you'd like me to check the
+/// other files" parses structurally like "let me ... check" but is a
+/// closing offer, not abandoned work. Excluding these (when they appear
+/// in the final clause) removes the dominant strong-model false-positive
+/// class for [`assistant_text_has_unresolved_intent`].
+const STALL_OFFER_MARKERS: &[&str] = &[
+    "let me know",
+    "if you'd like",
+    "if you would like",
+    "if you want",
+    "if you'd prefer",
+    "would you like",
+    "do you want",
+    "feel free to",
+    "happy to",
+];
+
+/// Return the trailing sentence/clause of an already-lowercased,
+/// already-trimmed message. A stalled model ends *on* an intent ("Now
+/// let me search the codebase."); a complete answer ends *on* a
+/// conclusion. Anchoring the intent check to this final clause — rather
+/// than scanning the whole body — is the model-agnostic discriminator
+/// that keeps a strong model's mid-answer "let me check: yes, the bug is
+/// in foo.rs. The fix is ..." from reading as an unresolved promise.
+fn assistant_final_clause(lower_trimmed: &str) -> &str {
+    // Drop trailing sentence punctuation / dangling separators so
+    // "...the bug. let me fix it." and "...let me fix it:" both expose
+    // the real final clause. A trailing ':' or '...' is itself an "about
+    // to act" signal, so we keep the clause that precedes it.
+    let core = lower_trimmed.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '.' | '!' | '?' | ':' | ';' | ' ' | '\t' | '\n' | '\r' | '"' | '\'' | ')'
+        )
+    });
+    if core.is_empty() {
+        return lower_trimmed;
+    }
+    // Split on the rightmost *sentence* boundary: a terminator (`.!?`)
+    // immediately followed by whitespace, or a bare newline. We do NOT
+    // split on a bare `.`, so dotted tokens ("src/lib.rs", "v1.2") stay
+    // intact — splitting there would drop the intent that precedes them.
+    // ASCII terminators/whitespace are single-byte and never collide with
+    // UTF-8 continuation bytes, so the byte scan is boundary-safe.
+    let bytes = core.as_bytes();
+    let mut idx = core.len();
+    while idx >= 1 {
+        idx -= 1;
+        let c = bytes[idx];
+        if c == b'\n' {
+            return core[idx..].trim();
+        }
+        if idx >= 1
+            && (c == b' ' || c == b'\t' || c == b'\r')
+            && matches!(bytes[idx - 1], b'.' | b'!' | b'?')
+        {
+            return core[idx..].trim();
+        }
+    }
+    core.trim()
+}
+
+/// Heuristic: does the assistant's FINAL clause announce follow-up tool
+/// work the model never delivered (the "promised action then stopped"
+/// stall)?
 ///
 /// True when ALL of the following hold:
-///   1. The text is non-empty (an actually visible message, not just whitespace).
-///   2. The text contains at least one intent phrase (`let me`, `i'll`,
-///      `i will`, `going to`, `i need to`, etc.).
-///   3. The intent phrase is followed within ~40 chars by an action verb
-///      that maps to a tool the model has access to (`scan`, `search`,
-///      `read`, `explore`, `find`, ...).
+///   1. The message is non-empty visible text (not just whitespace).
+///   2. It is not plan-mode output (`<proposed_plan>`) or an explicit
+///      final-answer marker (`final answer:`, `in summary:`, ...).
+///   3. The FINAL clause contains an intent phrase (`let me`, `i'll`,
+///      `going to`, ...) followed shortly by an action verb that maps to
+///      a tool (`scan`, `read`, `search`, ...), and is not an *offer*
+///      ("let me know if you'd like me to ...").
 ///
-/// Skipped when the text contains a `<proposed_plan>` block (plan-mode
-/// output is a legitimate finish_reason=stop) or a fenced final-answer
-/// marker (`final answer:`, `here is the answer:`).
-fn assistant_text_has_unresolved_intent(text: &str) -> bool {
-    if text.trim().is_empty() {
+/// This is deliberately model-agnostic — the same rule for strong and
+/// weak models. It is NOT relied on to be perfect: callers pair it with
+/// the carried-visible-output invariant (already-shown text is never
+/// dropped) and a "confirm-or-continue" nudge (a model that was actually
+/// done just confirms), so a residual false positive costs at most one
+/// bounded recovery round and can neither drop text nor force an unwanted
+/// action.
+pub fn assistant_text_has_unresolved_intent(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
         return false;
     }
-    let lower = text.to_ascii_lowercase();
+    let lower = trimmed.to_ascii_lowercase();
     // Plan-mode output: a `<proposed_plan>` block is the expected
     // end-of-turn shape; not a chatty-stop bug.
     if lower.contains("<proposed_plan>") {
         return false;
     }
-    // Final-answer markers: model is signaling "this is my answer".
+    // Final-answer markers anywhere: model is signaling "this is my answer".
     const FINAL_MARKERS: &[&str] = &[
         "final answer:",
         "here is the answer:",
@@ -12235,6 +12326,11 @@ fn assistant_text_has_unresolved_intent(text: &str) -> bool {
         "to summarize:",
     ];
     if FINAL_MARKERS.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+    let clause = assistant_final_clause(&lower);
+    // Offer idioms in the final clause are closings, not abandoned work.
+    if STALL_OFFER_MARKERS.iter().any(|m| clause.contains(m)) {
         return false;
     }
     const INTENT_PATTERNS: &[&str] = &[
@@ -12282,13 +12378,13 @@ fn assistant_text_has_unresolved_intent(text: &str) -> bool {
         "run ",
     ];
     for intent in INTENT_PATTERNS {
-        if let Some(idx) = lower.find(intent) {
+        if let Some(idx) = clause.find(intent) {
             let tail_start = idx + intent.len();
-            let mut tail_end = (tail_start + 40).min(lower.len());
-            while tail_end > tail_start && !lower.is_char_boundary(tail_end) {
+            let mut tail_end = (tail_start + 40).min(clause.len());
+            while tail_end > tail_start && !clause.is_char_boundary(tail_end) {
                 tail_end -= 1;
             }
-            let tail = &lower[tail_start..tail_end];
+            let tail = &clause[tail_start..tail_end];
             if ACTION_PATTERNS.iter().any(|action| tail.contains(action)) {
                 return true;
             }
