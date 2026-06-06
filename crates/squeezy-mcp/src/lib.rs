@@ -1367,9 +1367,7 @@ impl McpClientRegistry {
 
     fn cached_resource_declarations_match(&self, server_name: &str, uri: &str) -> Option<bool> {
         let mut cache = self.resource_declarations.lock().ok()?;
-        let Some(cached) = cache.get(server_name) else {
-            return None;
-        };
+        let cached = cache.get(server_name)?;
         if cached.fetched_at.elapsed() > RESOURCE_DECLARATION_CACHE_TTL {
             cache.remove(server_name);
             return None;
