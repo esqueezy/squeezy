@@ -3159,6 +3159,7 @@ fn request_turn_interrupt(app: &mut TuiApp) -> bool {
     }
     if let Some(pending) = app.pending_mcp_elicitation.take() {
         let _ = pending.response_tx.send(McpElicitationResponse::cancel());
+        clear_mcp_elicitation_seeded_input(app);
         interrupted = true;
     }
     if interrupted {
@@ -5702,12 +5703,14 @@ fn send_mcp_elicitation_response(
                 .response_tx
                 .send(McpElicitationResponse::accept(content));
             clear_input(app);
+            app.mcp_elicitation_seeded_input = None;
             app.status = format!("accepted mcp request from {server}");
             true
         }
         McpElicitationChoice::Decline => {
             let server = pending.request.server.clone();
             let _ = pending.response_tx.send(McpElicitationResponse::decline());
+            clear_mcp_elicitation_seeded_input(app);
             app.status = format!("declined mcp request from {server}");
             true
         }
@@ -5717,6 +5720,7 @@ fn send_mcp_elicitation_response(
 fn send_mcp_elicitation_cancel(app: &mut TuiApp, pending: PendingMcpElicitation) -> bool {
     let server = pending.request.server.clone();
     let _ = pending.response_tx.send(McpElicitationResponse::cancel());
+    clear_mcp_elicitation_seeded_input(app);
     app.status = format!("cancelled mcp request from {server}");
     true
 }
@@ -5759,9 +5763,79 @@ const MCP_ELICITATION_DECLINE: McpElicitationOption = McpElicitationOption {
     label: "Decline",
     hint: "deny request",
 };
+const MCP_ELICITATION_SCHEMA_MAX_LINES: usize = 24;
 
 fn mcp_elicitation_options() -> &'static [McpElicitationOption] {
     &[MCP_ELICITATION_ACCEPT, MCP_ELICITATION_DECLINE]
+}
+
+pub(crate) fn seed_mcp_elicitation_form_input(app: &mut TuiApp, request: &McpElicitationRequest) {
+    app.mcp_elicitation_seeded_input = None;
+    if request.kind != McpElicitationKind::Form || !app.input.trim().is_empty() {
+        return;
+    }
+    let template = mcp_elicitation_form_template(request.schema.as_ref());
+    app.input = template.clone();
+    app.input_cursor = app.input.len();
+    app.mcp_elicitation_seeded_input = Some(template);
+}
+
+pub(crate) fn clear_mcp_elicitation_seeded_input(app: &mut TuiApp) {
+    if let Some(seeded) = app.mcp_elicitation_seeded_input.take()
+        && app.input == seeded
+    {
+        clear_input(app);
+    }
+}
+
+fn mcp_elicitation_form_template(schema: Option<&serde_json::Value>) -> String {
+    let mut object = serde_json::Map::new();
+    if let Some(schema) = schema {
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object);
+        let required = schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(properties) = properties {
+            let names: Vec<&str> = if required.is_empty() {
+                properties.keys().map(String::as_str).collect()
+            } else {
+                required
+            };
+            for name in names {
+                let value = properties
+                    .get(name)
+                    .map(schema_placeholder_value)
+                    .unwrap_or(serde_json::Value::Null);
+                object.insert(name.to_string(), value);
+            }
+        }
+    }
+    serde_json::to_string_pretty(&serde_json::Value::Object(object))
+        .unwrap_or_else(|_| "{}".to_string())
+}
+
+fn schema_placeholder_value(schema: &serde_json::Value) -> serde_json::Value {
+    if let Some(default) = schema.get("default") {
+        return default.clone();
+    }
+    match schema.get("type").and_then(serde_json::Value::as_str) {
+        Some("string") => serde_json::Value::String(String::new()),
+        Some("integer") => serde_json::json!(0),
+        Some("number") => serde_json::json!(0.0),
+        Some("boolean") => serde_json::json!(false),
+        Some("array") => serde_json::Value::Array(Vec::new()),
+        Some("object") => serde_json::Value::Object(serde_json::Map::new()),
+        _ => serde_json::Value::Null,
+    }
 }
 
 fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
@@ -6038,15 +6112,34 @@ fn format_mcp_elicitation_menu_lines(
     match request.kind {
         McpElicitationKind::Form => {
             if let Some(schema) = request.schema.as_ref() {
-                let schema = serde_json::to_string(schema)
+                let schema = serde_json::to_string_pretty(schema)
                     .unwrap_or_else(|_| "<schema unavailable>".to_string());
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(
-                        format!("schema {}", compact_text(&schema, 160)),
-                        Style::default().fg(crate::render::theme::quiet()),
-                    ),
+                    Span::styled("schema", Style::default().fg(crate::render::theme::quiet())),
                 ]));
+                let schema_lines = schema.lines().collect::<Vec<_>>();
+                for line in schema_lines.iter().take(MCP_ELICITATION_SCHEMA_MAX_LINES) {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            (*line).to_string(),
+                            Style::default().fg(crate::render::theme::quiet()),
+                        ),
+                    ]));
+                }
+                let omitted = schema_lines
+                    .len()
+                    .saturating_sub(MCP_ELICITATION_SCHEMA_MAX_LINES);
+                if omitted > 0 {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("... {omitted} schema lines omitted"),
+                            Style::default().fg(crate::render::theme::quiet()),
+                        ),
+                    ]));
+                }
             }
             lines.push(Line::from(vec![
                 Span::raw("  "),
@@ -6703,6 +6796,7 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
             match status {
                 McpServerStatus::Starting => starting += 1,
                 McpServerStatus::Ready { .. } => ready += 1,
+                McpServerStatus::Stale { .. } => ready += 1,
                 _ => {}
             }
         }
@@ -6966,22 +7060,14 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
             width,
         )
     } else if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
-        match pending.request.kind {
-            McpElicitationKind::Form => {
-                if pending.request.schema.is_some() {
-                    6
-                } else {
-                    5
-                }
-            }
-            McpElicitationKind::Url => {
-                if pending.request.url.is_some() {
-                    5
-                } else {
-                    4
-                }
-            }
-        }
+        visual_line_count(
+            &format_mcp_elicitation_menu_lines(
+                &pending.request,
+                app.mcp_elicitation_selection_index,
+                &app.input,
+            ),
+            width,
+        )
     } else if let Some(pending) = app.pending_request_user_input.as_ref() {
         visual_line_count(
             &format_request_user_input_menu_lines(
@@ -14552,6 +14638,7 @@ pub(crate) fn format_mcp_status_snapshot(snapshot: &McpStatusSnapshot) -> String
     }
     let mut ready = 0usize;
     let mut cached = 0usize;
+    let mut stale = 0usize;
     let mut failed = 0usize;
     let mut cancelled = 0usize;
     let mut tools = 0usize;
@@ -14567,6 +14654,10 @@ pub(crate) fn format_mcp_status_snapshot(snapshot: &McpStatusSnapshot) -> String
                     cached += 1;
                 }
             }
+            McpServerStatus::Stale { tools_count, .. } => {
+                stale += 1;
+                tools += *tools_count;
+            }
             McpServerStatus::Failed { .. } => failed += 1,
             McpServerStatus::Cancelled => cancelled += 1,
             McpServerStatus::Starting => {}
@@ -14575,6 +14666,9 @@ pub(crate) fn format_mcp_status_snapshot(snapshot: &McpStatusSnapshot) -> String
     let mut parts = vec![format!("{ready}/{total} ready"), format!("{tools} tools")];
     if cached > 0 {
         parts.push(format!("{cached} cached"));
+    }
+    if stale > 0 {
+        parts.push(format!("{stale} stale"));
     }
     if failed > 0 {
         parts.push(format!("{failed} failed"));
@@ -15268,6 +15362,7 @@ pub(crate) struct TuiApp {
     pub(crate) pending_approval: Option<PendingApproval>,
     pub(crate) approval_selection_index: usize,
     pub(crate) pending_mcp_elicitation: Option<PendingMcpElicitation>,
+    pub(crate) mcp_elicitation_seeded_input: Option<String>,
     pub(crate) pending_request_user_input: Option<PendingRequestUserInput>,
     /// Prompt that was in flight when the most recent turn was cancelled
     /// or failed. Surfaced via Ctrl+R so the user can recover from a
@@ -15647,6 +15742,7 @@ impl TuiApp {
             pending_approval: None,
             approval_selection_index: 0,
             pending_mcp_elicitation: None,
+            mcp_elicitation_seeded_input: None,
             pending_request_user_input: None,
             cancelled_prompt: None,
             last_turn_had_edits: false,

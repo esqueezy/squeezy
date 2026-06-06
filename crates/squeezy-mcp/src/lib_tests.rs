@@ -84,8 +84,14 @@ async fn refresh_preserves_cached_tools_when_enabled_server_discovery_fails() {
         .get("docs")
         .expect("server status");
     assert!(
-        matches!(status, McpServerStatus::Failed { error } if error.contains("missing command")),
-        "missing-command refresh should publish a failed per-server status: {status:?}"
+        matches!(
+            status,
+            McpServerStatus::Stale {
+                tools_count: 1,
+                outcome: McpStaleOutcome::Failed { error },
+            } if error.contains("missing command")
+        ),
+        "missing-command refresh should publish a stale cached per-server status: {status:?}"
     );
 }
 
@@ -282,14 +288,41 @@ fn strip_untrusted_meta_removes_nested_meta_keys() {
 }
 
 #[test]
-fn uri_templates_allow_declared_prefix_only() {
+fn uri_templates_match_declared_segments() {
     assert!(uri_matches_template(
         "docs://api/v3/repos/openai/codex",
         "docs://api/v3/repos/{owner}/{repo}"
     ));
+    assert!(uri_matches_template("db://users/rows", "db://{table}/rows"));
+    assert!(uri_matches_template(
+        "file:///tmp/project/a.txt",
+        "file:///{path}"
+    ));
+    assert!(uri_matches_template(
+        "file:///tmp/project/a.txt",
+        "file:///{path}.txt"
+    ));
     assert!(!uri_matches_template(
         "file:///etc/passwd",
         "docs://api/v3/repos/{owner}/{repo}"
+    ));
+    assert!(!uri_matches_template("db://users", "db://{table}/rows"));
+    assert!(!uri_matches_template(
+        "db://users/columns",
+        "db://{table}/rows"
+    ));
+    assert!(!uri_matches_template(
+        "db://users/rows/extra",
+        "db://{table}/rows"
+    ));
+    assert!(!uri_matches_template("db://users/rows", "db://{table}"));
+    assert!(!uri_matches_template(
+        "file:///tmp/project/a.rs",
+        "file:///{path}.txt"
+    ));
+    assert!(!uri_matches_template(
+        "file:///tmp/project/a.txt?raw=1",
+        "file:///{path}"
     ));
 }
 
@@ -317,6 +350,82 @@ fn separate_startup_and_tool_timeouts_apply() {
     server.discovery_timeout_ms = None;
     assert_eq!(discovery_timeout_ms(&server), DEFAULT_MCP_TIMEOUT_MS);
     assert_eq!(tool_call_timeout_ms(&server), 120_000);
+}
+
+#[tokio::test]
+async fn timeout_pause_does_not_affect_other_servers() {
+    let pause_state = ElicitationPauseState::default();
+    let _pause = pause_state.enter("docs");
+    let error = with_timeout(
+        "other",
+        20,
+        CancellationToken::new(),
+        pause_state,
+        std::future::pending::<McpResult<()>>(),
+    )
+    .await
+    .expect_err("other server must still time out");
+
+    assert!(matches!(error, McpError::Timeout { server, .. } if server == "other"));
+}
+
+#[tokio::test]
+async fn timeout_pause_suspends_same_server_until_guard_drops() {
+    let pause_state = ElicitationPauseState::default();
+    let pause = pause_state.enter("docs");
+    let task_state = pause_state.clone();
+    let handle = tokio::spawn(async move {
+        with_timeout(
+            "docs",
+            20,
+            CancellationToken::new(),
+            task_state,
+            std::future::pending::<McpResult<()>>(),
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        !handle.is_finished(),
+        "same-server pause must suspend timeout"
+    );
+    drop(pause);
+
+    let error = tokio::time::timeout(Duration::from_millis(100), handle)
+        .await
+        .expect("timeout should resume after pause")
+        .expect("task should not panic")
+        .expect_err("pending future must time out");
+    assert!(matches!(error, McpError::Timeout { server, .. } if server == "docs"));
+}
+
+#[tokio::test]
+async fn timeout_pause_preserves_elapsed_budget() {
+    let pause_state = ElicitationPauseState::default();
+    let task_state = pause_state.clone();
+    let handle = tokio::spawn(async move {
+        with_timeout(
+            "docs",
+            80,
+            CancellationToken::new(),
+            task_state,
+            std::future::pending::<McpResult<()>>(),
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let pause = pause_state.enter("docs");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    drop(pause);
+
+    let error = tokio::time::timeout(Duration::from_millis(70), handle)
+        .await
+        .expect("timeout should use remaining budget, not restart")
+        .expect("task should not panic")
+        .expect_err("pending future must time out");
+    assert!(matches!(error, McpError::Timeout { server, .. } if server == "docs"));
 }
 
 #[test]
@@ -700,6 +809,7 @@ async fn sse_transport_parses_event_data_lines_and_posts_to_advertised_endpoint(
         elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
         elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(256))),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
+        resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
     };
     let (auth_header, custom_headers) =
         resolve_http_auth_and_headers("sse-server", &server, |name| match name {
@@ -814,6 +924,7 @@ async fn streamable_http_transport_sends_authorization_bearer_header() {
         elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         pause_state: ElicitationPauseState::default(),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
+        resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
     };
     // The serve call will fail because we hang up after one round trip — that
     // is fine, we only need it to issue the initialize POST so the listener
@@ -1016,6 +1127,7 @@ fn client_info_advertises_squeezy_identity_and_elicitation_capability() {
         elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         pause_state: ElicitationPauseState::default(),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
+        resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
     };
     let info = ClientHandler::get_info(&handler);
     assert_eq!(info.client_info.name, env!("CARGO_PKG_NAME"));
@@ -1117,6 +1229,7 @@ async fn server_capabilities_surfaces_experimental_flags_from_initialize_respons
         elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(256))),
         pause_state: ElicitationPauseState::default(),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
+        resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
     };
     let (auth_header, custom_headers) = resolve_http_auth_and_headers("fixture", &server, |_| None);
     let worker =
@@ -1153,6 +1266,11 @@ async fn server_capabilities_surfaces_experimental_flags_from_initialize_respons
         server_capabilities: Some(capabilities.clone()),
     });
     let registry = McpClientRegistry::new(BTreeMap::new());
+    assert_eq!(
+        registry.aggregate_capabilities().await,
+        (false, false, false),
+        "empty registry must not report capabilities"
+    );
     registry
         .sessions
         .lock()
@@ -1167,6 +1285,11 @@ async fn server_capabilities_surfaces_experimental_flags_from_initialize_respons
         .experimental
         .expect("experimental must survive accessor round-trip");
     assert!(observed_experimental.contains_key("squeezy/test"));
+    assert_eq!(
+        registry.aggregate_capabilities().await,
+        (false, true, true),
+        "connected sessions advertise client-side elicitation even when server caps do not"
+    );
 
     assert!(
         registry
@@ -1269,6 +1392,97 @@ fn resource_list_changed_notification_evicts_only_that_servers_reads() {
             .cached_resource_read_for_test("other", "file:///c.txt")
             .is_some(),
         "other servers' cached reads must be untouched"
+    );
+}
+
+#[tokio::test]
+async fn resource_declaration_cache_satisfies_gate_without_enumerating() {
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    registry.seed_resource_declarations_for_test(
+        "docs",
+        &["file:///a.txt"],
+        &["docs://api/{owner}/{repo}"],
+    );
+    let server = fixture_server(true, None);
+
+    assert!(
+        registry
+            .resource_uri_is_declared("docs", &server, "file:///a.txt", CancellationToken::new())
+            .await
+            .expect("cached exact declaration")
+    );
+    assert!(
+        registry
+            .resource_uri_is_declared(
+                "docs",
+                &server,
+                "docs://api/openai/codex",
+                CancellationToken::new()
+            )
+            .await
+            .expect("cached template declaration")
+    );
+    assert!(
+        !registry
+            .resource_uri_is_declared(
+                "docs",
+                &server,
+                "file:///missing.txt",
+                CancellationToken::new()
+            )
+            .await
+            .expect("cached negative declaration")
+    );
+}
+
+#[test]
+fn partial_resource_declaration_cache_does_not_deny_templates() {
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    let resources = vec![Resource {
+        raw: rmcp::model::RawResource {
+            uri: "file:///a.txt".to_string(),
+            name: "a.txt".to_string(),
+            title: None,
+            description: None,
+            mime_type: None,
+            size: None,
+            icons: None,
+            meta: None,
+        },
+        annotations: None,
+    }];
+
+    registry.store_resource_declarations_partial("docs", Some(&resources), None);
+
+    assert_eq!(
+        registry.cached_resource_declarations_match("docs", "file:///a.txt"),
+        Some(true),
+        "resources-only cache should answer exact positives"
+    );
+    assert_eq!(
+        registry.cached_resource_declarations_match("docs", "docs://api/openai/codex"),
+        None,
+        "resources-only cache must not become a negative cache for templates"
+    );
+}
+
+#[test]
+fn resource_list_changed_notification_evicts_declaration_cache() {
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    registry.seed_resource_declarations_for_test("docs", &["file:///a.txt"], &[]);
+    registry.seed_resource_declarations_for_test("other", &["file:///b.txt"], &[]);
+
+    registry
+        .client_handler_for_test("docs")
+        .evict_server_resource_declarations();
+
+    assert!(
+        !registry.cached_resource_declarations_for_test("docs"),
+        "resource-list change must drop declarations for that server"
+    );
+    assert!(
+        registry.cached_resource_declarations_for_test("other"),
+        "other servers' declaration cache must stay intact"
     );
 }
 

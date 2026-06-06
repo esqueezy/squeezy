@@ -10715,6 +10715,233 @@ fn apply_mcp_status_update_logs_transitions_to_and_from_servers() {
 }
 
 #[test]
+fn mcp_status_summary_reports_stale_cached_servers() {
+    let mut per_server = std::collections::BTreeMap::new();
+    per_server.insert(
+        "docs".to_string(),
+        McpServerStatus::Stale {
+            tools_count: 2,
+            outcome: squeezy_tools::McpStaleOutcome::Failed {
+                error: "missing command".to_string(),
+            },
+        },
+    );
+    let snapshot = McpStatusSnapshot {
+        per_server,
+        generated_unix_millis: 0,
+    };
+
+    let summary = super::format_mcp_status_snapshot(&snapshot);
+    assert!(summary.contains("0/1 ready"), "{summary}");
+    assert!(summary.contains("2 tools"), "{summary}");
+    assert!(summary.contains("1 stale"), "{summary}");
+}
+
+#[test]
+fn mcp_form_template_uses_required_schema_fields() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "required": ["name", "count", "enabled"],
+        "properties": {
+            "name": { "type": "string" },
+            "count": { "type": "integer", "default": 3 },
+            "enabled": { "type": "boolean" },
+            "optional": { "type": "string" }
+        }
+    });
+
+    let template = super::mcp_elicitation_form_template(Some(&schema));
+    let value: serde_json::Value = serde_json::from_str(&template).expect("template JSON");
+    assert_eq!(value["name"], "");
+    assert_eq!(value["count"], 3);
+    assert_eq!(value["enabled"], false);
+    assert!(value.get("optional").is_none(), "{value}");
+}
+
+#[test]
+fn mcp_form_menu_renders_full_pretty_schema() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "required": ["long_field"],
+        "properties": {
+            "long_field": {
+                "type": "string",
+                "description": "this description is intentionally far longer than the old compact schema limit so the test proves the full pretty schema is rendered"
+            }
+        }
+    });
+    let request = McpElicitationRequest {
+        server: "docs".to_string(),
+        request_id: "r1".to_string(),
+        kind: McpElicitationKind::Form,
+        message: "fill this".to_string(),
+        schema: Some(schema),
+        url: None,
+        elicitation_id: None,
+    };
+
+    let text = format_mcp_elicitation_menu_lines(&request, 0, "{}")
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("schema"), "{text}");
+    assert!(text.contains("long_field"), "{text}");
+    assert!(
+        text.contains("intentionally far longer than the old compact schema limit"),
+        "{text}"
+    );
+}
+
+#[test]
+fn mcp_form_input_is_seeded_without_overwriting_user_text() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "required": ["name"],
+        "properties": { "name": { "type": "string" } }
+    });
+    let request = McpElicitationRequest {
+        server: "docs".to_string(),
+        request_id: "r1".to_string(),
+        kind: McpElicitationKind::Form,
+        message: "fill this".to_string(),
+        schema: Some(schema),
+        url: None,
+        elicitation_id: None,
+    };
+    let mut app = test_app(SessionMode::Build);
+
+    seed_mcp_elicitation_form_input(&mut app, &request);
+    assert!(app.input.contains("\"name\""), "{}", app.input);
+    assert_eq!(app.input_cursor, app.input.len());
+
+    app.input = "{\"custom\": true}".to_string();
+    app.input_cursor = app.input.len();
+    seed_mcp_elicitation_form_input(&mut app, &request);
+    assert_eq!(app.input, "{\"custom\": true}");
+}
+
+#[test]
+fn mcp_form_decline_clears_untouched_seeded_input() {
+    let request = McpElicitationRequest {
+        server: "docs".to_string(),
+        request_id: "r1".to_string(),
+        kind: McpElicitationKind::Form,
+        message: "fill this".to_string(),
+        schema: Some(serde_json::json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": { "name": { "type": "string" } }
+        })),
+        url: None,
+        elicitation_id: None,
+    };
+    let mut app = test_app(SessionMode::Build);
+    seed_mcp_elicitation_form_input(&mut app, &request);
+    assert!(app.input.contains("\"name\""), "{}", app.input);
+    let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+    let pending = PendingMcpElicitation {
+        request,
+        response_tx,
+    };
+
+    assert!(send_mcp_elicitation_response(
+        &mut app,
+        pending,
+        McpElicitationChoice::Decline
+    ));
+
+    assert_eq!(app.input, "");
+    assert!(app.mcp_elicitation_seeded_input.is_none());
+    let response = response_rx.try_recv().expect("decline response");
+    assert_eq!(
+        response.action,
+        squeezy_tools::McpElicitationAction::Decline
+    );
+}
+
+#[test]
+fn mcp_form_cancel_preserves_user_modified_seeded_input() {
+    let request = McpElicitationRequest {
+        server: "docs".to_string(),
+        request_id: "r1".to_string(),
+        kind: McpElicitationKind::Form,
+        message: "fill this".to_string(),
+        schema: Some(serde_json::json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": { "name": { "type": "string" } }
+        })),
+        url: None,
+        elicitation_id: None,
+    };
+    let mut app = test_app(SessionMode::Build);
+    seed_mcp_elicitation_form_input(&mut app, &request);
+    app.input = "{\"name\":\"edited\"}".to_string();
+    app.input_cursor = app.input.len();
+    let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+    let pending = PendingMcpElicitation {
+        request,
+        response_tx,
+    };
+
+    assert!(send_mcp_elicitation_cancel(&mut app, pending));
+
+    assert_eq!(app.input, "{\"name\":\"edited\"}");
+    assert!(app.mcp_elicitation_seeded_input.is_none());
+    let response = response_rx.try_recv().expect("cancel response");
+    assert_eq!(response.action, squeezy_tools::McpElicitationAction::Cancel);
+}
+
+#[test]
+fn mcp_form_schema_preview_is_bounded() {
+    let properties = (0..40)
+        .map(|index| {
+            (
+                format!("field_{index}"),
+                serde_json::json!({
+                    "type": "string",
+                    "description": format!("field {index} description")
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let request = McpElicitationRequest {
+        server: "docs".to_string(),
+        request_id: "r1".to_string(),
+        kind: McpElicitationKind::Form,
+        message: "fill this".to_string(),
+        schema: Some(serde_json::json!({
+            "type": "object",
+            "properties": properties
+        })),
+        url: None,
+        elicitation_id: None,
+    };
+
+    let text = format_mcp_elicitation_menu_lines(&request, 0, "{}")
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(text.contains("schema lines omitted"), "{text}");
+    assert!(text.contains("response {}"), "{text}");
+    assert!(text.contains("Accept"), "{text}");
+    assert!(text.contains("Decline"), "{text}");
+}
+
+#[test]
 fn terminal_title_for_clears_when_idle() {
     assert_eq!(
         terminal_title_for(TerminalTitleState::Cleared, "~/proj", 0),

@@ -223,6 +223,18 @@ fn folded_block_scalar_folds_blank_line_to_newline() {
 }
 
 #[test]
+fn parses_skill_frontmatter_after_bom_and_leading_blanks() {
+    let (metadata, body) = parse_skill_file(
+        "\u{feff}\n\n---\nname: rust-nav\ndescription: Use Rust navigation\n---\n# Rust Nav\n",
+    )
+    .expect("parse");
+
+    assert_eq!(metadata.name, "rust-nav");
+    assert_eq!(metadata.description, "Use Rust navigation");
+    assert_eq!(body.trim(), "# Rust Nav");
+}
+
+#[test]
 fn compat_project_overrides_user_and_compat_user() {
     let root = temp_workspace("skills_precedence_compat_project");
     let user = root.join("user");
@@ -701,6 +713,102 @@ fn explicit_and_trigger_activation_loads_lazily() {
         .expect("activate");
     assert_eq!(trigger.skills.len(), 1);
     assert_eq!(trigger.kinds, vec![SkillActivationKind::Trigger]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn unknown_explicit_skill_warns_and_preserves_task() {
+    let root = temp_workspace("skills_unknown_explicit");
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+
+    let activation = catalog
+        .activate_for_input("/skill rust-nva inspect main")
+        .expect("unknown explicit skill must not abort activation");
+    assert_eq!(activation.task_input, "inspect main");
+    assert!(activation.skills.is_empty());
+    assert!(activation.kinds.is_empty());
+    assert_eq!(activation.warnings.len(), 1);
+    assert_eq!(activation.warnings[0].name, "rust-nva");
+    assert!(
+        activation.warnings[0].message.contains("skill not found"),
+        "{:?}",
+        activation.warnings
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn disabled_explicit_skill_warns_and_preserves_task() {
+    let root = temp_workspace("skills_disabled_explicit");
+    write_skill(
+        &root.join(".squeezy/skills/rust-nav"),
+        "rust-nav",
+        "Rust nav",
+        &["rust symbol"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        config: vec![SkillConfigEntry {
+            name: Some("rust-nav".to_string()),
+            enabled: false,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+
+    let activation = catalog
+        .activate_for_input("/skill rust-nav inspect main")
+        .expect("disabled explicit skill must not abort activation");
+    assert_eq!(activation.task_input, "inspect main");
+    assert!(activation.skills.is_empty());
+    assert!(activation.kinds.is_empty());
+    assert_eq!(activation.warnings.len(), 1);
+    assert_eq!(activation.warnings[0].name, "rust-nav");
+    assert!(
+        activation.warnings[0].message.contains("skill disabled"),
+        "{:?}",
+        activation.warnings
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn trigger_skill_load_failure_warns_and_preserves_task() {
+    let root = temp_workspace("skills_trigger_stale_file");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    write_skill(&skill_dir, "rust-nav", "Rust nav", &["rust symbol"]);
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+    fs::remove_file(skill_dir.join("SKILL.md")).expect("remove skill file after discovery");
+
+    let activation = catalog
+        .activate_for_input("please inspect this rust symbol")
+        .expect("stale trigger skill must not abort activation");
+    assert_eq!(activation.task_input, "please inspect this rust symbol");
+    assert!(activation.skills.is_empty());
+    assert!(activation.kinds.is_empty());
+    assert_eq!(activation.warnings.len(), 1);
+    assert_eq!(activation.warnings[0].name, "rust-nav");
+    assert!(
+        activation.warnings[0].message.contains("No such file")
+            || activation.warnings[0].message.contains("os error"),
+        "{:?}",
+        activation.warnings
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1274,6 +1382,39 @@ fn detects_implicit_skill_from_script_and_doc_read() {
         .expect("doc detection");
 
     assert_eq!(script.name, "rust-nav");
+    assert_eq!(doc.name, "rust-nav");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn detects_implicit_skill_doc_read_through_symlinked_skill_file() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_workspace("skills_implicit_symlink");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    let target_dir = root.join("canonical");
+    fs::create_dir_all(&target_dir).expect("mkdir canonical");
+    let target = target_dir.join("rust-nav.md");
+    fs::write(
+        &target,
+        "---\nname: rust-nav\ndescription: Rust nav\ntriggers:\n\n---\n# rust-nav\n",
+    )
+    .expect("write target skill");
+    symlink(&target, skill_dir.join("SKILL.md")).expect("symlink skill");
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let doc = catalog
+        .detect_for_command("cat .squeezy/skills/rust-nav/SKILL.md", &root)
+        .expect("doc detection through symlink");
+
     assert_eq!(doc.name, "rust-nav");
 
     let _ = fs::remove_dir_all(root);

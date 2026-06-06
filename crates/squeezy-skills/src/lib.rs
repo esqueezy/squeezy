@@ -578,16 +578,34 @@ impl SkillCatalog {
         let mut seen = BTreeSet::new();
         let mut loaded = Vec::new();
         let mut kinds = Vec::new();
+        let mut warnings = Vec::new();
         for (name, kind) in candidates {
             if seen.insert(name.clone()) {
-                loaded.push(self.load(&name)?);
-                kinds.push(kind);
+                match self.load(&name) {
+                    Ok(skill) => {
+                        loaded.push(skill);
+                        kinds.push(kind);
+                    }
+                    Err(error)
+                        if matches!(
+                            kind,
+                            SkillActivationKind::Explicit | SkillActivationKind::Trigger
+                        ) =>
+                    {
+                        warnings.push(SkillActivationWarning {
+                            name: name.clone(),
+                            message: error.to_string(),
+                        });
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
         Ok(SkillActivation {
             task_input: task,
             skills: loaded,
             kinds,
+            warnings,
         })
     }
 
@@ -1077,6 +1095,16 @@ pub struct SkillActivation {
     /// callers emit `skill.activation.kind` telemetry so trigger-vs-explicit
     /// hit rates are observable without re-deriving from the input.
     pub kinds: Vec<SkillActivationKind>,
+    /// Non-fatal issues encountered while activating skills. Explicit
+    /// `/skill <name>` requests and trigger matches use this path so stale
+    /// or mistyped skill references do not discard the user's turn.
+    pub warnings: Vec<SkillActivationWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillActivationWarning {
+    pub name: String,
+    pub message: String,
 }
 
 /// Why a skill was activated for a turn. Stays in sync with the
@@ -1142,7 +1170,8 @@ fn parse_explicit_skill_command(input: &str) -> Option<(&str, &str)> {
 }
 
 fn parse_skill_file(content: &str) -> std::result::Result<(SkillMetadata, String), String> {
-    let mut lines = content.lines();
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let mut lines = content.lines().skip_while(|line| line.trim().is_empty());
     if lines.next() != Some("---") {
         return Err("missing YAML frontmatter".to_string());
     }

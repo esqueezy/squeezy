@@ -5,7 +5,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -67,6 +67,7 @@ const MCP_TOOL_CACHE_SCHEMA_VERSION: u64 = 1;
 const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
 const HASH_SUFFIX_BYTES: usize = 12;
 const RESOURCE_READ_CACHE_TTL: Duration = Duration::from_secs(300);
+const RESOURCE_DECLARATION_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Cap on retained resource-read cache entries. The registry lives for the
 /// whole session, so without a bound a server (or agent loop) that reads many
 /// distinct URIs would accumulate their full bodies indefinitely. Mirrors the
@@ -131,7 +132,22 @@ pub struct ExternalMcpToolResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum McpServerStatus {
     Starting,
-    Ready { tools_count: usize, cached: bool },
+    Ready {
+        tools_count: usize,
+        cached: bool,
+    },
+    Stale {
+        tools_count: usize,
+        outcome: McpStaleOutcome,
+    },
+    Failed {
+        error: String,
+    },
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpStaleOutcome {
     Failed { error: String },
     Cancelled,
 }
@@ -297,6 +313,7 @@ pub struct McpClientRegistry {
     elicitation_audit: Arc<Mutex<std::collections::VecDeque<McpElicitationAuditEvent>>>,
     pause_state: ElicitationPauseState,
     resource_reads: Arc<Mutex<BTreeMap<(String, String), CachedResourceRead>>>,
+    resource_declarations: Arc<Mutex<BTreeMap<String, CachedResourceDeclarations>>>,
 }
 
 impl Default for McpClientRegistry {
@@ -328,6 +345,7 @@ impl McpClientRegistry {
             ))),
             pause_state: ElicitationPauseState::default(),
             resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
+            resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
         };
         registry.load_cached_tools();
         registry
@@ -559,15 +577,40 @@ impl McpClientRegistry {
             {
                 stats.tools_stale_retained += 1;
                 next.insert(model_name.clone(), tool.clone());
-                per_server
-                    .entry(tool.server.clone())
-                    .or_insert(McpServerStatus::Ready {
-                        tools_count: cached_tool_counts
-                            .get(&tool.server)
-                            .copied()
-                            .unwrap_or_default(),
-                        cached: true,
-                    });
+                let tools_count = cached_tool_counts
+                    .get(&tool.server)
+                    .copied()
+                    .unwrap_or_default();
+                match per_server.get(&tool.server).cloned() {
+                    Some(McpServerStatus::Failed { error }) => {
+                        per_server.insert(
+                            tool.server.clone(),
+                            McpServerStatus::Stale {
+                                tools_count,
+                                outcome: McpStaleOutcome::Failed { error },
+                            },
+                        );
+                    }
+                    Some(McpServerStatus::Cancelled) => {
+                        per_server.insert(
+                            tool.server.clone(),
+                            McpServerStatus::Stale {
+                                tools_count,
+                                outcome: McpStaleOutcome::Cancelled,
+                            },
+                        );
+                    }
+                    Some(McpServerStatus::Stale { .. }) => {}
+                    _ => {
+                        per_server.insert(
+                            tool.server.clone(),
+                            McpServerStatus::Ready {
+                                tools_count,
+                                cached: true,
+                            },
+                        );
+                    }
+                }
             } else if !server_still_enabled {
                 stats.tools_dropped_disabled += 1;
             }
@@ -959,6 +1002,7 @@ impl McpClientRegistry {
             elicitation_audit: self.elicitation_audit.clone(),
             pause_state: self.pause_state.clone(),
             resource_reads: self.resource_reads.clone(),
+            resource_declarations: self.resource_declarations.clone(),
         };
         let entry = match server.transport {
             McpTransport::Stdio => start_stdio_service(server_name, server, handler).await?,
@@ -977,11 +1021,17 @@ impl McpClientRegistry {
     async fn invalidate_session(&self, server_name: &str) {
         let mut sessions = self.sessions.lock().await;
         sessions.remove(server_name);
+        if let Ok(mut cache) = self.resource_declarations.lock() {
+            cache.remove(server_name);
+        }
     }
 
     pub async fn shutdown(&self) {
         let mut sessions = self.sessions.lock().await;
         sessions.clear();
+        if let Ok(mut cache) = self.resource_declarations.lock() {
+            cache.clear();
+        }
     }
 
     /// Server-advertised capabilities captured during `initialize`, or `None`
@@ -1002,21 +1052,15 @@ impl McpClientRegistry {
     pub async fn aggregate_capabilities(&self) -> (bool, bool, bool) {
         let sessions = self.sessions.lock().await;
         let mut has_resources = false;
-        let mut has_elicitation = false;
+        // Squeezy advertises client-side elicitation support during
+        // initialize, so this means "a connected session can ask us to
+        // elicit" rather than "a server declared an elicitation capability."
+        let has_elicitation = !sessions.is_empty();
         let mut has_experimental = false;
         for entry in sessions.values() {
             if let Some(caps) = &entry.server_capabilities {
                 if caps.resources.is_some() {
                     has_resources = true;
-                }
-                if caps
-                    .tasks
-                    .as_ref()
-                    .and_then(|t| t.requests.as_ref())
-                    .and_then(|r| r.elicitation.as_ref())
-                    .is_some()
-                {
-                    has_elicitation = true;
                 }
                 if caps.experimental.is_some() {
                     has_experimental = true;
@@ -1056,6 +1100,37 @@ impl McpClientRegistry {
     }
 
     #[cfg(test)]
+    fn seed_resource_declarations_for_test(
+        &self,
+        server: &str,
+        resource_uris: &[&str],
+        resource_templates: &[&str],
+    ) {
+        if let Ok(mut cache) = self.resource_declarations.lock() {
+            cache.insert(
+                server.to_string(),
+                CachedResourceDeclarations {
+                    resource_uris: resource_uris.iter().map(|uri| uri.to_string()).collect(),
+                    resource_templates: resource_templates
+                        .iter()
+                        .map(|template| template.to_string())
+                        .collect(),
+                    resource_uris_complete: true,
+                    resource_templates_complete: true,
+                    fetched_at: Instant::now(),
+                },
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn cached_resource_declarations_for_test(&self, server: &str) -> bool {
+        self.resource_declarations
+            .lock()
+            .is_ok_and(|cache| cache.contains_key(server))
+    }
+
+    #[cfg(test)]
     fn client_handler_for_test(&self, server_name: &str) -> SqueezyMcpClientHandler {
         SqueezyMcpClientHandler {
             server_name: server_name.to_string(),
@@ -1064,6 +1139,7 @@ impl McpClientRegistry {
             elicitation_audit: self.elicitation_audit.clone(),
             pause_state: self.pause_state.clone(),
             resource_reads: self.resource_reads.clone(),
+            resource_declarations: self.resource_declarations.clone(),
         }
     }
 
@@ -1259,20 +1335,89 @@ impl McpClientRegistry {
         uri: &str,
         cancel: CancellationToken,
     ) -> McpResult<bool> {
-        let resources = self
-            .all_resources(server_name, server, cancel.clone())
-            .await
-            .unwrap_or_default();
-        if resources.iter().any(|resource| resource.raw.uri == uri) {
-            return Ok(true);
+        if let Some(cached) = self.cached_resource_declarations_match(server_name, uri) {
+            return Ok(cached);
         }
-        let templates = self
+
+        let resources_result = self
+            .all_resources(server_name, server, cancel.clone())
+            .await;
+        let resources = resources_result.as_ref().map(Vec::as_slice).unwrap_or(&[]);
+        if let Ok(resources) = &resources_result {
+            self.store_resource_declarations_partial(server_name, Some(resources), None);
+            if resources.iter().any(|resource| resource.raw.uri == uri) {
+                return Ok(true);
+            }
+        }
+
+        let templates_result = self
             .all_resource_templates(server_name, server, cancel)
-            .await
-            .unwrap_or_default();
-        Ok(templates
-            .iter()
-            .any(|template| uri_matches_template(uri, &template.raw.uri_template)))
+            .await;
+        let templates = templates_result.as_ref().map(Vec::as_slice).unwrap_or(&[]);
+
+        if let Ok(templates) = &templates_result {
+            self.store_resource_declarations_partial(server_name, None, Some(templates));
+        }
+
+        Ok(resources.iter().any(|resource| resource.raw.uri == uri)
+            || templates
+                .iter()
+                .any(|template| uri_matches_template(uri, &template.raw.uri_template)))
+    }
+
+    fn cached_resource_declarations_match(&self, server_name: &str, uri: &str) -> Option<bool> {
+        let mut cache = self.resource_declarations.lock().ok()?;
+        let cached = cache.get(server_name)?;
+        if cached.fetched_at.elapsed() > RESOURCE_DECLARATION_CACHE_TTL {
+            cache.remove(server_name);
+            return None;
+        }
+        if cached.resource_uris.contains(uri)
+            || cached
+                .resource_templates
+                .iter()
+                .any(|template| uri_matches_template(uri, template))
+        {
+            return Some(true);
+        }
+        if cached.resource_uris_complete && cached.resource_templates_complete {
+            return Some(false);
+        }
+        None
+    }
+
+    fn store_resource_declarations_partial(
+        &self,
+        server_name: &str,
+        resources: Option<&[Resource]>,
+        templates: Option<&[rmcp::model::ResourceTemplate]>,
+    ) {
+        if let Ok(mut cache) = self.resource_declarations.lock() {
+            let entry = cache.entry(server_name.to_string()).or_insert_with(|| {
+                CachedResourceDeclarations {
+                    resource_uris: BTreeSet::new(),
+                    resource_templates: Vec::new(),
+                    resource_uris_complete: false,
+                    resource_templates_complete: false,
+                    fetched_at: Instant::now(),
+                }
+            });
+            if let Some(resources) = resources {
+                entry.resource_uris = resources
+                    .iter()
+                    .map(|resource| resource.raw.uri.clone())
+                    .collect();
+                entry.resource_uris_complete = true;
+            }
+            if let Some(templates) = templates {
+                entry.resource_templates = templates
+                    .iter()
+                    .map(|template| template.raw.uri_template.clone())
+                    .collect();
+                entry.resource_templates_complete = true;
+            }
+            entry.fetched_at = Instant::now();
+        }
     }
 }
 
@@ -1294,6 +1439,15 @@ struct CachedResourceRead {
     fetched_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct CachedResourceDeclarations {
+    resource_uris: BTreeSet<String>,
+    resource_templates: Vec<String>,
+    resource_uris_complete: bool,
+    resource_templates_complete: bool,
+    fetched_at: Instant,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct McpToolCacheRecord {
     schema_version: u64,
@@ -1311,6 +1465,9 @@ struct SqueezyMcpClientHandler {
     /// Shared with `McpClientRegistry` so resource-change notifications can
     /// evict stale cached reads before their TTL lapses.
     resource_reads: Arc<Mutex<BTreeMap<(String, String), CachedResourceRead>>>,
+    /// Shared with `McpClientRegistry` so resource-list changes invalidate the
+    /// declaration gate cache alongside cached reads.
+    resource_declarations: Arc<Mutex<BTreeMap<String, CachedResourceDeclarations>>>,
 }
 
 impl SqueezyMcpClientHandler {
@@ -1328,6 +1485,12 @@ impl SqueezyMcpClientHandler {
     fn evict_server_resource_reads(&self) {
         if let Ok(mut cache) = self.resource_reads.lock() {
             cache.retain(|(server, _), _| server != &self.server_name);
+        }
+    }
+
+    fn evict_server_resource_declarations(&self) {
+        if let Ok(mut cache) = self.resource_declarations.lock() {
+            cache.remove(&self.server_name);
         }
     }
 }
@@ -1438,7 +1601,7 @@ impl ClientHandler for SqueezyMcpClientHandler {
                     },
                 );
                 let ui_request = elicitation_request_for_ui(&self.server_name, &context, &request);
-                let _pause = self.pause_state.enter();
+                let _pause = self.pause_state.enter(&self.server_name);
                 let response = handler(ui_request).await;
                 Ok(CreateElicitationResult {
                     action: match response.action {
@@ -1499,6 +1662,7 @@ impl ClientHandler for SqueezyMcpClientHandler {
 
     async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
         self.evict_server_resource_reads();
+        self.evict_server_resource_declarations();
         tracing::info!(
             target: "squeezy::mcp",
             server = %self.server_name,
@@ -1590,46 +1754,66 @@ impl ClientHandler for SqueezyMcpClientHandler {
 
 #[derive(Clone)]
 struct ElicitationPauseState {
-    active: Arc<AtomicUsize>,
-    tx: Arc<watch::Sender<usize>>,
+    active: Arc<Mutex<BTreeMap<String, usize>>>,
+    sequence: Arc<AtomicU64>,
+    tx: Arc<watch::Sender<u64>>,
 }
 
 impl Default for ElicitationPauseState {
     fn default() -> Self {
-        let (tx, _) = watch::channel(0usize);
+        let (tx, _) = watch::channel(0u64);
         Self {
-            active: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(Mutex::new(BTreeMap::new())),
+            sequence: Arc::new(AtomicU64::new(0)),
             tx: Arc::new(tx),
         }
     }
 }
 
 impl ElicitationPauseState {
-    fn enter(&self) -> ElicitationPauseGuard {
-        let next = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = self.tx.send(next);
+    fn enter(&self, server_name: &str) -> ElicitationPauseGuard {
+        if let Ok(mut active) = self.active.lock() {
+            *active.entry(server_name.to_string()).or_default() += 1;
+        }
+        self.notify();
         ElicitationPauseGuard {
             state: self.clone(),
+            server_name: server_name.to_string(),
         }
     }
 
-    fn subscribe(&self) -> watch::Receiver<usize> {
+    fn is_paused(&self, server_name: &str) -> bool {
+        self.active
+            .lock()
+            .is_ok_and(|active| active.get(server_name).copied().unwrap_or_default() > 0)
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
         self.tx.subscribe()
+    }
+
+    fn notify(&self) {
+        let next = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.tx.send(next);
     }
 }
 
 struct ElicitationPauseGuard {
     state: ElicitationPauseState,
+    server_name: String,
 }
 
 impl Drop for ElicitationPauseGuard {
     fn drop(&mut self) {
-        let next = self
-            .state
-            .active
-            .fetch_sub(1, Ordering::SeqCst)
-            .saturating_sub(1);
-        let _ = self.state.tx.send(next);
+        if let Ok(mut active) = self.state.active.lock()
+            && let Some(count) = active.get_mut(&self.server_name)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&self.server_name);
+            }
+        }
+        self.state.notify();
     }
 }
 
@@ -1922,10 +2106,10 @@ async fn with_timeout<T>(
     future: impl Future<Output = McpResult<T>>,
 ) -> McpResult<T> {
     let mut pause_rx = pause_state.subscribe();
-    let timeout = Duration::from_millis(timeout_ms);
+    let mut remaining = Duration::from_millis(timeout_ms);
     let mut future = Box::pin(future);
     loop {
-        if *pause_rx.borrow() > 0 {
+        if pause_state.is_paused(server_name) {
             tokio::select! {
                 _ = cancel.cancelled() => return Err(McpError::Cancelled { server: server_name.to_string() }),
                 changed = pause_rx.changed() => {
@@ -1939,9 +2123,16 @@ async fn with_timeout<T>(
                 result = &mut future => return result,
             }
         } else {
+            if remaining.is_zero() {
+                return Err(McpError::Timeout {
+                    server: server_name.to_string(),
+                    timeout_ms,
+                });
+            }
+            let started = Instant::now();
             tokio::select! {
                 _ = cancel.cancelled() => return Err(McpError::Cancelled { server: server_name.to_string() }),
-                _ = tokio::time::sleep(timeout) => return Err(McpError::Timeout {
+                _ = tokio::time::sleep(remaining) => return Err(McpError::Timeout {
                     server: server_name.to_string(),
                     timeout_ms,
                 }),
@@ -1952,6 +2143,7 @@ async fn with_timeout<T>(
                             message: "MCP timeout pause watcher closed".to_string(),
                         });
                     }
+                    remaining = remaining.saturating_sub(started.elapsed());
                 }
                 result = &mut future => return result,
             }
@@ -2436,8 +2628,65 @@ fn uri_matches_template(uri: &str, template: &str) -> bool {
     if uri == template {
         return true;
     }
-    let prefix = template.split('{').next().unwrap_or(template);
-    !prefix.is_empty() && uri.starts_with(prefix)
+    let mut uri_rest = uri;
+    let mut template_rest = template;
+    loop {
+        let Some(open) = template_rest.find('{') else {
+            return uri_rest == template_rest;
+        };
+        let literal = &template_rest[..open];
+        let Some(after_literal) = uri_rest.strip_prefix(literal) else {
+            return false;
+        };
+        uri_rest = after_literal;
+
+        let Some(close_rel) = template_rest[open + 1..].find('}') else {
+            return false;
+        };
+        let placeholder = &template_rest[open + 1..open + 1 + close_rel];
+        let placeholder_allows_slashes = uri_template_placeholder_allows_slashes(placeholder);
+        let after_placeholder = open + 1 + close_rel + 1;
+        template_rest = &template_rest[after_placeholder..];
+        let next_literal = template_rest.split('{').next().unwrap_or_default();
+        if next_literal.is_empty() {
+            let has_more_placeholders = template_rest.contains('{');
+            if has_more_placeholders {
+                let Some((_, ch)) = uri_rest.char_indices().next() else {
+                    return false;
+                };
+                if uri_template_placeholder_delimiter(ch, placeholder_allows_slashes) {
+                    return false;
+                }
+                uri_rest = &uri_rest[ch.len_utf8()..];
+                continue;
+            }
+            return uri_template_placeholder_value_valid(uri_rest, placeholder_allows_slashes);
+        }
+
+        let Some(match_start) = uri_rest.match_indices(next_literal).find_map(|(index, _)| {
+            let value = &uri_rest[..index];
+            uri_template_placeholder_value_valid(value, placeholder_allows_slashes).then_some(index)
+        }) else {
+            return false;
+        };
+        uri_rest = &uri_rest[match_start..];
+    }
+}
+
+fn uri_template_placeholder_value_valid(value: &str, allows_slashes: bool) -> bool {
+    !value.is_empty()
+        && !value
+            .chars()
+            .any(|ch| uri_template_placeholder_delimiter(ch, allows_slashes))
+}
+
+fn uri_template_placeholder_delimiter(ch: char, allows_slashes: bool) -> bool {
+    matches!(ch, '?' | '#') || (!allows_slashes && ch == '/')
+}
+
+fn uri_template_placeholder_allows_slashes(placeholder: &str) -> bool {
+    let placeholder = placeholder.to_ascii_lowercase();
+    placeholder == "path" || placeholder.ends_with("_path") || placeholder.ends_with("-path")
 }
 
 fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {

@@ -83,6 +83,37 @@ fn metrics_count_dropped_when_aggregate_overflows() {
 }
 
 #[test]
+fn metrics_do_not_count_name_prefix_as_included() {
+    let body = "body ".repeat(120);
+    let skills = vec![skill("alpha-extra", &body), skill("alpha", &body)];
+    let (rendered, metrics) = render_active_skills_with_metrics(&skills, 600, 16_000);
+    let rendered = rendered.expect("one stub should fit");
+
+    assert_eq!(metrics.total, 2);
+    assert_eq!(metrics.included, 1);
+    assert_eq!(metrics.dropped, 1);
+    assert_eq!(metrics.body_truncated, 1);
+    assert!(rendered.contains("name=\"alpha-extra\""), "{rendered}");
+    assert!(!rendered.contains("name=\"alpha\""), "{rendered}");
+}
+
+#[test]
+fn metrics_ignore_fake_skill_tags_inside_body() {
+    let skills = vec![skill(
+        "alpha",
+        "not a real top-level skill: <skill name=\"beta\" truncated=\"true\">",
+    )];
+    let (rendered, metrics) = render_active_skills_with_metrics(&skills, 4_000, 16_000);
+    let rendered = rendered.expect("body should fit");
+
+    assert_eq!(metrics.total, 1);
+    assert_eq!(metrics.included, 1);
+    assert_eq!(metrics.dropped, 0);
+    assert_eq!(metrics.body_truncated, 0);
+    assert!(rendered.contains("<skill name=\"beta\""), "{rendered}");
+}
+
+#[test]
 fn metrics_zero_when_inputs_empty() {
     let (rendered, metrics) =
         render_active_skills_with_metrics(&[], /* budget */ 4_000, /* cap */ 16_000);
@@ -110,4 +141,22 @@ fn render_active_skills_matches_metrics_variant_string() {
     let (with_metrics, _) = render_active_skills_with_metrics(&skills, 4_000, 16_000);
     let without = render_active_skills(&skills, 4_000, 16_000);
     assert_eq!(with_metrics, without);
+}
+
+#[test]
+fn render_active_skills_matches_metrics_variant_under_overflow() {
+    let body = "body ".repeat(120);
+    let skills = vec![
+        skill("alpha", &body),
+        skill("beta", &body),
+        skill("gamma", &body),
+    ];
+    let (with_metrics, metrics) = render_active_skills_with_metrics(&skills, 700, 16_000);
+    let without = render_active_skills(&skills, 700, 16_000);
+
+    assert_eq!(with_metrics, without);
+    assert!(metrics.included > 0, "{metrics:?}");
+    assert!(metrics.dropped > 0, "{metrics:?}");
+    assert_eq!(metrics.included + metrics.dropped, metrics.total);
+    assert_eq!(metrics.body_truncated, metrics.included);
 }
