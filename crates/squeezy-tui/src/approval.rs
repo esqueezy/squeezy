@@ -220,8 +220,8 @@ fn append_rule_preview(lines: &mut Vec<Line<'static>>, permission: &PermissionRe
     let rule = permission
         .suggested_rules
         .first()
-        .map(format_rule)
-        .unwrap_or_else(|| format!("{}:{}", permission.capability.as_str(), permission.target,));
+        .map(|rule| format_rule(permission, rule))
+        .unwrap_or_else(|| format_rule_target(permission));
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
@@ -237,8 +237,20 @@ fn append_rule_preview(lines: &mut Vec<Line<'static>>, permission: &PermissionRe
     ]));
 }
 
-fn format_rule(rule: &PermissionRule) -> String {
-    format!("{}:{}", rule.capability, rule.target)
+fn format_rule(permission: &PermissionRequest, rule: &PermissionRule) -> String {
+    if permission.tool_name == "shell" || permission.metadata.contains_key("shell_prefix") {
+        format!("command prefix {}", rule.target)
+    } else {
+        format!("{} {}", rule.capability, rule.target)
+    }
+}
+
+fn format_rule_target(permission: &PermissionRequest) -> String {
+    if permission.tool_name == "shell" || permission.metadata.contains_key("shell_prefix") {
+        format!("command prefix {}", permission.target)
+    } else {
+        format!("{} {}", permission.capability.as_str(), permission.target)
+    }
 }
 
 fn plain_white(text: String) -> Line<'static> {

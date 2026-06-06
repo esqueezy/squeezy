@@ -602,23 +602,26 @@ fn approval_context_excerpt_uses_complete_boundary_before_cap() {
     );
 }
 
-#[tokio::test]
-async fn approval_context_from_state_uses_clean_latest_assistant_excerpt() {
-    let state = Arc::new(tokio::sync::Mutex::new(ConversationState {
-        transcript: vec![
-            TranscriptItem::assistant("Older assistant note."),
-            TranscriptItem::user("Please run the checks."),
-            TranscriptItem::assistant(
-                "I need to validate the Rust workspace before reporting back. Then I will summarize the result.",
-            ),
-        ],
-        ..ConversationState::default()
-    }));
-
+#[test]
+fn approval_context_from_request_uses_explicit_description() {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "description".to_string(),
+        "I need to validate the Rust workspace before reporting back. Then I will summarize the result."
+            .to_string(),
+    );
+    let request = PermissionRequest {
+        call_id: "call_1".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: "cargo:*".to_string(),
+        risk: PermissionRisk::Medium,
+        summary: "run shell command".to_string(),
+        metadata,
+        suggested_rules: Vec::new(),
+    };
     let redactor = Redactor::new(&Default::default()).expect("redactor");
-    let context = approval_context_from_state(Some(&state), &redactor)
-        .await
-        .expect("approval context");
+    let context = approval_context_from_request(&request, &redactor).expect("approval context");
 
     assert_eq!(
         context,
@@ -626,6 +629,59 @@ async fn approval_context_from_state_uses_clean_latest_assistant_excerpt() {
     );
     assert!(!context.contains("..."));
     assert!(!context.contains('…'));
+}
+
+#[tokio::test]
+async fn approval_request_omits_unrelated_transcript_context() {
+    let root = temp_workspace("agent_approval_unrelated_context");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::ToolCall(LlmToolCall {
+            call_id: "call_find".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({
+                "command": "find . -name pom.xml",
+            }),
+        })),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_find".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            shell: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+    {
+        let mut state = agent.conversation_state.lock().await;
+        state.transcript.push(TranscriptItem::assistant(
+            "Hi! I'm Squeezy. How can I help?",
+        ));
+    }
+
+    let mut rx = agent.start_turn("inspect project".to_string(), CancellationToken::new());
+    let mut approval_context = Some("not captured".to_string());
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ApprovalRequested {
+            request,
+            decision_tx,
+            ..
+        } = event
+        {
+            approval_context = request.context;
+            let _ = decision_tx.send(ToolApprovalDecision::Denied);
+        }
+    }
+
+    assert_eq!(approval_context, None);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
