@@ -12321,8 +12321,8 @@ fn human_label_renders_one_phrase_for_known_tools() {
         ),
         (
             "shell",
-            json!({"command": "cargo test"}),
-            "running `cargo test`",
+            json!({"command": "cargo test\n--workspace"}),
+            "running `cargo test --workspace`",
         ),
         (
             "websearch",
