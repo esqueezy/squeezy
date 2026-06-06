@@ -3202,7 +3202,7 @@ async fn automatic_context_compaction_replaces_old_raw_history() {
     let mut config = config_for(root.clone());
     config.context_compaction = ContextCompactionConfig {
         enabled: true,
-        estimated_tokens: 10,
+        model_context_window: Some(10),
         min_items: 3,
         recent_items: 1,
         max_summary_bytes: 1_200,
@@ -3312,7 +3312,7 @@ async fn manual_context_compaction_preserves_pins_in_resume_state() {
     let mut config = config_for(root.clone());
     config.context_compaction = ContextCompactionConfig {
         enabled: true,
-        estimated_tokens: 10_000,
+        fallback_window_tokens: 10_000,
         min_items: 99,
         recent_items: 1,
         max_summary_bytes: 1_200,
@@ -3379,12 +3379,12 @@ async fn manual_context_compaction_broadcasts_context_compacted_event() {
     let mut config = config_for(root.clone());
     // `min_items: 99` keeps the auto-compaction gate closed during
     // `start_turn` so only the explicit `compact_context_manual` call
-    // below fires; `recent_items: 1` + `estimated_tokens: 10_000` lets a
+    // below fires; `recent_items: 1` + `fallback_window_tokens: 10_000` lets a
     // single seeded turn produce a non-empty older slice once we run a
     // manual compact.
     config.context_compaction = ContextCompactionConfig {
         enabled: true,
-        estimated_tokens: 10_000,
+        fallback_window_tokens: 10_000,
         min_items: 99,
         recent_items: 1,
         max_summary_bytes: 1_200,
@@ -3476,7 +3476,7 @@ async fn auto_compaction_does_not_orphan_function_call_output() {
     config.store_responses = false;
     config.context_compaction = ContextCompactionConfig {
         enabled: true,
-        estimated_tokens: 10,
+        model_context_window: Some(10),
         min_items: 3,
         recent_items: 2,
         max_summary_bytes: 1_200,
@@ -3543,7 +3543,7 @@ async fn pinned_context_is_visible_to_model_before_compaction() {
     let mut config = config_for(root.clone());
     config.context_compaction = ContextCompactionConfig {
         enabled: true,
-        estimated_tokens: 1_000_000,
+        fallback_window_tokens: 1_000_000,
         min_items: 1_000,
         recent_items: 1,
         max_summary_bytes: 1_200,
