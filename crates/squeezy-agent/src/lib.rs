@@ -588,8 +588,61 @@ pub struct ConversationShape {
     pub image_items: usize,
     pub text_bytes: usize,
     pub tool_output_bytes: usize,
+    /// Subset of `tool_output_bytes` produced by `load_skill` calls — the skill
+    /// bodies materialized into the transcript. Carved out of tool outputs and
+    /// reported as the "skills" bucket in `/context`.
+    pub skill_output_bytes: usize,
     pub reasoning_bytes: usize,
     pub image_bytes: usize,
+}
+
+/// One discovered skill's accounting entry for the `/context` "Skills" section.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillAccountingEntry {
+    pub name: String,
+    /// First line of the skill description.
+    pub description: String,
+    /// `true` when the skill body is currently materialized in this session.
+    pub loaded: bool,
+    /// Estimated body size in bytes: the cached body length when loaded,
+    /// otherwise the on-disk `SKILL.md` size.
+    pub body_bytes: usize,
+}
+
+/// Skill catalog accounting for `/context`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillsAccounting {
+    pub discovered: usize,
+    pub loaded: usize,
+    pub entries: Vec<SkillAccountingEntry>,
+}
+
+/// One MCP tool's accounting entry for the `/context` "MCPs" section.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpToolAccountingEntry {
+    pub name: String,
+    pub description: String,
+    pub schema_bytes: usize,
+}
+
+/// One MCP server's accounting for `/context`, grouping its tools.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpServerAccounting {
+    pub name: String,
+    /// Human-readable status: `ready`, `starting`, `failed: …`, `cancelled`,
+    /// or `configured` when no live status is reported yet.
+    pub status: String,
+    pub tools: Vec<McpToolAccountingEntry>,
+    pub schema_bytes: usize,
+}
+
+/// MCP accounting for `/context`. `total_schema_bytes` is the request-framing
+/// cost of all advertised MCP tool schemas, carved out of "system + framing".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpAccounting {
+    pub servers: Vec<McpServerAccounting>,
+    pub total_tools: usize,
+    pub total_schema_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -618,6 +671,8 @@ pub struct SessionAccountingSnapshot {
     pub attachments: AttachmentShape,
     pub transmitted_request: RequestTokenEstimate,
     pub full_history_request: RequestTokenEstimate,
+    pub skills: SkillsAccounting,
+    pub mcp: McpAccounting,
 }
 
 impl SessionAccountingSnapshot {
@@ -2512,6 +2567,92 @@ impl Agent {
                 context_window_override,
                 Some(&state.token_calibration),
             ),
+            skills: self.skills_accounting(),
+            mcp: self.mcp_accounting(),
+        }
+    }
+
+    /// Build the `/context` "Skills" view: every discovered skill, marked
+    /// `loaded` when its body is materialized this session, with a per-skill
+    /// body-size estimate (cached body length when loaded, on-disk `SKILL.md`
+    /// size otherwise — read without materializing the body).
+    fn skills_accounting(&self) -> SkillsAccounting {
+        let summaries = self.tools.skill_summaries();
+        let loaded_sizes = self.tools.loaded_skill_body_sizes();
+        let mut entries = Vec::with_capacity(summaries.len());
+        let mut loaded = 0;
+        for summary in summaries {
+            let is_loaded = loaded_sizes.contains_key(&summary.name);
+            if is_loaded {
+                loaded += 1;
+            }
+            let body_bytes = match loaded_sizes.get(&summary.name) {
+                Some(bytes) => *bytes,
+                None => std::fs::metadata(&summary.location)
+                    .map(|meta| meta.len() as usize)
+                    .unwrap_or(0),
+            };
+            entries.push(SkillAccountingEntry {
+                name: summary.name,
+                description: summary
+                    .description
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+                loaded: is_loaded,
+                body_bytes,
+            });
+        }
+        SkillsAccounting {
+            discovered: entries.len(),
+            loaded,
+            entries,
+        }
+    }
+
+    /// Build the `/context` "MCPs" view: connected MCP tools grouped by server,
+    /// each tool's advertised schema byte size, and per-server live status.
+    fn mcp_accounting(&self) -> McpAccounting {
+        let status = self.tools.mcp_status_snapshot();
+        let tool_infos = self.tools.mcp_tool_schema_infos();
+        let total_tools = tool_infos.len();
+        let total_schema_bytes = tool_infos.iter().map(|info| info.schema_bytes).sum();
+
+        // Group tools under their owning server. Seed the map from the status
+        // snapshot so configured-but-toolless servers still render.
+        let mut servers: BTreeMap<String, McpServerAccounting> = BTreeMap::new();
+        for (name, server_status) in &status.per_server {
+            servers.insert(
+                name.clone(),
+                McpServerAccounting {
+                    name: name.clone(),
+                    status: format_mcp_status(server_status),
+                    tools: Vec::new(),
+                    schema_bytes: 0,
+                },
+            );
+        }
+        for info in tool_infos {
+            let entry = servers
+                .entry(info.server.clone())
+                .or_insert_with(|| McpServerAccounting {
+                    name: info.server.clone(),
+                    status: "configured".to_string(),
+                    tools: Vec::new(),
+                    schema_bytes: 0,
+                });
+            entry.schema_bytes += info.schema_bytes;
+            entry.tools.push(McpToolAccountingEntry {
+                name: info.name,
+                description: info.description,
+                schema_bytes: info.schema_bytes,
+            });
+        }
+        McpAccounting {
+            servers: servers.into_values().collect(),
+            total_tools,
+            total_schema_bytes,
         }
     }
 
@@ -14993,11 +15134,39 @@ fn transcript_shape(transcript: &[TranscriptItem]) -> TranscriptShape {
     shape
 }
 
+/// Tool name whose outputs deliver skill bodies into the transcript. Used to
+/// attribute output bytes to the skills bucket in [`conversation_shape`].
+const LOAD_SKILL_TOOL_NAME: &str = "load_skill";
+
+/// Render an MCP server's live status into the short label shown by `/context`.
+fn format_mcp_status(status: &squeezy_tools::McpServerStatus) -> String {
+    match status {
+        squeezy_tools::McpServerStatus::Starting => "starting".to_string(),
+        squeezy_tools::McpServerStatus::Ready {
+            tools_count,
+            cached,
+        } => {
+            if *cached {
+                format!("ready (cached, {tools_count} tools)")
+            } else {
+                format!("ready ({tools_count} tools)")
+            }
+        }
+        squeezy_tools::McpServerStatus::Failed { error } => format!("failed: {error}"),
+        squeezy_tools::McpServerStatus::Cancelled => "cancelled".to_string(),
+    }
+}
+
 fn conversation_shape(conversation: &[LlmInputItem]) -> ConversationShape {
     let mut shape = ConversationShape {
         items: conversation.len(),
         ..ConversationShape::default()
     };
+    // Call ids whose originating `FunctionCall` was `load_skill`, so the
+    // matching output bytes can be attributed to the "skills" bucket rather
+    // than left lumped into generic tool outputs. A `FunctionCall` always
+    // precedes its `FunctionCallOutput`, so a single forward pass suffices.
+    let mut load_skill_call_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for item in conversation {
         match item {
             LlmInputItem::UserText(text) => {
@@ -15008,13 +15177,25 @@ fn conversation_shape(conversation: &[LlmInputItem]) -> ConversationShape {
                 shape.assistant_text += 1;
                 shape.text_bytes += text.len();
             }
-            LlmInputItem::FunctionCall { arguments, .. } => {
+            LlmInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
                 shape.function_calls += 1;
                 shape.text_bytes += arguments.to_string().len();
+                if name == LOAD_SKILL_TOOL_NAME {
+                    load_skill_call_ids.insert(call_id.as_str());
+                }
             }
-            LlmInputItem::FunctionCallOutput { output, .. } => {
+            LlmInputItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
                 shape.function_outputs += 1;
                 shape.tool_output_bytes += output.len();
+                if load_skill_call_ids.contains(call_id.as_str()) {
+                    shape.skill_output_bytes += output.len();
+                }
             }
             LlmInputItem::Reasoning(payload) => {
                 shape.reasoning_items += 1;

@@ -4103,7 +4103,8 @@ fn format_reviewer_command_handles_empty_buffer() {
 #[test]
 fn format_cost_command_renders_active_buckets() {
     use squeezy_agent::{
-        AttachmentShape, ConversationShape, SessionAccountingSnapshot, TranscriptShape,
+        AttachmentShape, ConversationShape, McpAccounting, SessionAccountingSnapshot,
+        SkillsAccounting, TranscriptShape,
     };
     use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
     use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
@@ -4158,6 +4159,8 @@ fn format_cost_command_renders_active_buckets() {
         attachments: AttachmentShape::default(),
         transmitted_request: estimate,
         full_history_request: estimate,
+        skills: SkillsAccounting::default(),
+        mcp: McpAccounting::default(),
     };
 
     let raw = commands::format_cost_command(&snapshot);
@@ -4254,6 +4257,7 @@ fn context_recommendations_flag_largest_and_secondary_sources() {
         image: 0,
         attachments: 0,
         system: 2_100,
+        ..ContextSourceTokens::default()
     });
     assert_eq!(recs.len(), 2, "{recs:?}");
     assert_eq!(
@@ -4275,11 +4279,137 @@ fn context_recommendations_flag_largest_and_secondary_sources() {
         image: 1_000,
         attachments: 1_000,
         system: 1_000,
+        ..ContextSourceTokens::default()
     });
     assert!(balanced.is_empty(), "{balanced:?}");
 
     // An empty/fresh session has nothing actionable to say.
     assert!(context_source_recommendations(&ContextSourceTokens::default()).is_empty());
+}
+
+#[test]
+fn context_breaks_out_skills_and_mcp_sources() {
+    use squeezy_agent::{
+        AttachmentShape, ConversationShape, McpAccounting, McpServerAccounting,
+        McpToolAccountingEntry, SessionAccountingSnapshot, SkillAccountingEntry, SkillsAccounting,
+        TranscriptShape,
+    };
+    use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
+    use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
+
+    let estimate = RequestTokenEstimate {
+        input_tokens: 10_000,
+        context_window_tokens: Some(200_000),
+        effective_context_window_tokens: None,
+        headroom_tokens: None,
+        max_output_tokens: Some(64_000),
+        input_budget_tokens: None,
+        remaining_input_tokens: None,
+        used_input_percent_x100: None,
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        estimated: true,
+    };
+
+    // 4_400 tool-output bytes, of which 4_000 came from load_skill: skills are
+    // carved out, leaving 400 bytes of genuine tool output.
+    let conversation = ConversationShape {
+        items: 4,
+        function_outputs: 2,
+        tool_output_bytes: 4_400,
+        skill_output_bytes: 4_000,
+        ..ConversationShape::default()
+    };
+
+    let skills = SkillsAccounting {
+        discovered: 2,
+        loaded: 1,
+        entries: vec![
+            SkillAccountingEntry {
+                name: "sonar-context-augmentation".to_string(),
+                description: "always invoke".to_string(),
+                loaded: true,
+                body_bytes: 4_000,
+            },
+            SkillAccountingEntry {
+                name: "rust-nav".to_string(),
+                description: "navigate rust".to_string(),
+                loaded: false,
+                body_bytes: 800,
+            },
+        ],
+    };
+
+    let mcp = McpAccounting {
+        servers: vec![McpServerAccounting {
+            name: "docs".to_string(),
+            status: "ready (2 tools)".to_string(),
+            tools: vec![
+                McpToolAccountingEntry {
+                    name: "search".to_string(),
+                    description: "search the docs".to_string(),
+                    schema_bytes: 1_200,
+                },
+                McpToolAccountingEntry {
+                    name: "fetch".to_string(),
+                    description: "fetch a page".to_string(),
+                    schema_bytes: 800,
+                },
+            ],
+            schema_bytes: 2_000,
+        }],
+        total_tools: 2,
+        total_schema_bytes: 2_000,
+    };
+
+    let snapshot = SessionAccountingSnapshot {
+        session_id: Some("sess".to_string()),
+        provider: "scripted",
+        model: "gpt".to_string(),
+        mode: SessionMode::Build,
+        store_responses: false,
+        previous_response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: SessionMetrics::default(),
+        redactions: 0,
+        transcript: TranscriptShape::default(),
+        conversation,
+        attachments: AttachmentShape::default(),
+        transmitted_request: estimate,
+        full_history_request: estimate,
+        skills,
+        mcp,
+    };
+
+    let output = strip_ansi_escape_sequences(&commands::format_context_command(&snapshot));
+
+    // Skills section lists every discovered skill and marks the loaded one.
+    assert!(output.contains("Skills"), "{output}");
+    assert!(output.contains("2 discovered, 1 loaded"), "{output}");
+    assert!(output.contains("sonar-context-augmentation"), "{output}");
+    assert!(output.contains("(loaded)"), "{output}");
+    assert!(output.contains("rust-nav"), "{output}");
+
+    // MCPs section lists the server, its live status, and its tools.
+    assert!(output.contains("MCPs"), "{output}");
+    assert!(output.contains("docs"), "{output}");
+    assert!(output.contains("ready (2 tools)"), "{output}");
+    assert!(output.contains("search"), "{output}");
+
+    // Consumption by source carves skills out of tool outputs (~4_000/4 =
+    // 1_000) and MCP schemas out of framing (~2_000/4 = 500); the genuine tool
+    // output is the 400-byte remainder (~100).
+    assert!(
+        output.contains("tool call outputs:        ~100 tokens"),
+        "{output}"
+    );
+    assert!(
+        output.contains("skills (loaded bodies):   ~1,000 tokens"),
+        "{output}"
+    );
+    assert!(
+        output.contains("mcp tool schemas:         ~500 tokens"),
+        "{output}"
+    );
 }
 
 #[tokio::test]

@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::time::SystemTime;
 
-use squeezy_agent::{Agent, ReviewerAuditEntry, SessionAccountingSnapshot};
+use squeezy_agent::{
+    Agent, McpAccounting, ReviewerAuditEntry, SessionAccountingSnapshot, SkillsAccounting,
+};
 use squeezy_llm::RequestTokenEstimate;
 use squeezy_store::parse_bug_report_section;
 
@@ -233,7 +235,18 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
     out.push('\n');
     let approx = |bytes: usize| bytes.div_ceil(4);
     let user_tokens = approx(snapshot.conversation.text_bytes);
-    let tool_tokens = approx(snapshot.conversation.tool_output_bytes);
+    // Skill bodies (load_skill outputs) are carved out of the raw tool-output
+    // total and reported as their own bucket; the remainder is the genuine
+    // tool-output cost.
+    let skill_tokens = approx(snapshot.conversation.skill_output_bytes);
+    let tool_only_bytes = snapshot
+        .conversation
+        .tool_output_bytes
+        .saturating_sub(snapshot.conversation.skill_output_bytes);
+    let tool_tokens = approx(tool_only_bytes);
+    // MCP tool schemas live in the per-request framing; carve them out of the
+    // opaque system + framing remainder computed below.
+    let mcp_tokens = approx(snapshot.mcp.total_schema_bytes);
     let reasoning_tokens = approx(snapshot.conversation.reasoning_bytes);
     let image_tokens = approx(snapshot.conversation.image_bytes);
     let attachment_tokens = approx(snapshot.attachments.stored_bytes);
@@ -253,10 +266,42 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
         style::accent("◆"),
         style::accent_bold(&style::group_thousands(tool_tokens as u64)),
         style::muted(&format!(
-            "({} bytes from {} call(s); MCP / skill / internal split needs deeper accounting)",
-            snapshot.conversation.tool_output_bytes, snapshot.conversation.function_outputs,
+            "({} bytes from {} call(s){})",
+            tool_only_bytes,
+            snapshot.conversation.function_outputs,
+            if skill_tokens > 0 {
+                "; skill bodies carved out below"
+            } else {
+                ""
+            },
         )),
     ));
+    if skill_tokens > 0 {
+        out.push_str(&format!(
+            "  {} skills (loaded bodies):   ~{} tokens  {}\n",
+            style::accent("◆"),
+            style::accent_bold(&style::group_thousands(skill_tokens as u64)),
+            style::muted(&format!(
+                "({} bytes via load_skill; {} of {} skills loaded)",
+                snapshot.conversation.skill_output_bytes,
+                snapshot.skills.loaded,
+                snapshot.skills.discovered,
+            )),
+        ));
+    }
+    if snapshot.mcp.total_schema_bytes > 0 {
+        out.push_str(&format!(
+            "  {} mcp tool schemas:         ~{} tokens  {}\n",
+            style::accent("◆"),
+            style::accent_bold(&style::group_thousands(mcp_tokens as u64)),
+            style::muted(&format!(
+                "({} bytes; {} tool(s) across {} server(s))",
+                snapshot.mcp.total_schema_bytes,
+                snapshot.mcp.total_tools,
+                snapshot.mcp.servers.len(),
+            )),
+        ));
+    }
     if snapshot.conversation.reasoning_bytes > 0 {
         out.push_str(&format!(
             "  {} reasoning content:        ~{} tokens  {}\n",
@@ -292,14 +337,20 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
             )),
         ));
     }
-    let accounted = user_tokens + tool_tokens + reasoning_tokens + image_tokens + attachment_tokens;
+    let accounted = user_tokens
+        + tool_tokens
+        + skill_tokens
+        + mcp_tokens
+        + reasoning_tokens
+        + image_tokens
+        + attachment_tokens;
     let system_estimate = consumed.saturating_sub(accounted as u64);
     out.push_str(&format!(
         "  {} system prompt + framing: ~{} tokens  {}\n",
         style::secondary("◇"),
         style::secondary(&style::group_thousands(system_estimate)),
         style::muted(
-            "(consumed minus the above; covers system prompt, tool schemas, and per-request framing)",
+            "(remainder: system prompt, built-in tool schemas, tool index, and per-request framing)",
         ),
     ));
 
@@ -310,6 +361,8 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
     let recommendations = context_source_recommendations(&ContextSourceTokens {
         user: user_tokens as u64,
         tool_outputs: tool_tokens as u64,
+        skills: skill_tokens as u64,
+        mcp: mcp_tokens as u64,
         reasoning: reasoning_tokens as u64,
         image: image_tokens as u64,
         attachments: attachment_tokens as u64,
@@ -323,6 +376,11 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
             out.push_str(&format!("  {} {}\n", style::warn("→"), rec));
         }
     }
+
+    out.push('\n');
+    format_skills_section(&mut out, &snapshot.skills);
+    out.push('\n');
+    format_mcp_section(&mut out, &snapshot.mcp);
 
     out.push('\n');
     out.push_str(&style::header("Session"));
@@ -435,6 +493,107 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
     out
 }
 
+/// Truncate `value` to `max` display characters, appending `…` when cut.
+fn truncate_display(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Render the "Skills" section: every discovered skill with a body-token
+/// estimate, ordered as discovered, with a `(loaded)` marker on skills whose
+/// body is materialized in this session.
+fn format_skills_section(out: &mut String, skills: &SkillsAccounting) {
+    let approx = |bytes: usize| bytes.div_ceil(4) as u64;
+    out.push_str(&style::header("Skills"));
+    if skills.discovered == 0 {
+        out.push('\n');
+        out.push_str(&format!("  {}\n", style::muted("none discovered")));
+        return;
+    }
+    let loaded_bytes: usize = skills
+        .entries
+        .iter()
+        .filter(|entry| entry.loaded)
+        .map(|entry| entry.body_bytes)
+        .sum();
+    out.push(' ');
+    out.push_str(&style::muted(&format!(
+        "({} discovered, {} loaded, ~{} tok loaded)",
+        skills.discovered,
+        skills.loaded,
+        style::group_thousands(approx(loaded_bytes)),
+    )));
+    out.push('\n');
+    let name_width = skills
+        .entries
+        .iter()
+        .map(|entry| entry.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    for entry in &skills.entries {
+        let icon = if entry.loaded {
+            style::accent("◆")
+        } else {
+            style::secondary("◇")
+        };
+        let pad = " ".repeat(name_width.saturating_sub(entry.name.chars().count()));
+        let marker = if entry.loaded {
+            style::muted("  (loaded)")
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "  {} {}{}  ~{} tok{}\n",
+            icon,
+            entry.name,
+            pad,
+            style::accent_bold(&style::group_thousands(approx(entry.body_bytes))),
+            marker,
+        ));
+    }
+}
+
+/// Render the "MCPs" section: connected servers with live status and schema
+/// token cost, each followed by its tools (name + truncated description).
+fn format_mcp_section(out: &mut String, mcp: &McpAccounting) {
+    let approx = |bytes: usize| bytes.div_ceil(4) as u64;
+    out.push_str(&style::header("MCPs"));
+    if mcp.servers.is_empty() {
+        out.push('\n');
+        out.push_str(&format!("  {}\n", style::muted("none configured")));
+        return;
+    }
+    out.push(' ');
+    out.push_str(&style::muted(&format!(
+        "({} server(s), {} tool(s), ~{} tok schemas)",
+        mcp.servers.len(),
+        mcp.total_tools,
+        style::group_thousands(approx(mcp.total_schema_bytes)),
+    )));
+    out.push('\n');
+    for server in &mcp.servers {
+        out.push_str(&format!(
+            "  {} {}  {}  ~{} tok\n",
+            style::accent("●"),
+            style::accent(&server.name),
+            style::muted(&server.status),
+            style::accent_bold(&style::group_thousands(approx(server.schema_bytes))),
+        ));
+        for tool in &server.tools {
+            out.push_str(&format!(
+                "      {} {}  {}\n",
+                style::secondary("-"),
+                tool.name,
+                style::muted(&truncate_display(&tool.description, 60)),
+            ));
+        }
+    }
+}
+
 /// Per-source token estimates fed into [`context_source_recommendations`].
 /// Mirrors the buckets rendered under "Consumption by source" so the advice
 /// stays consistent with the breakdown the user already sees.
@@ -442,6 +601,8 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
 pub(crate) struct ContextSourceTokens {
     pub user: u64,
     pub tool_outputs: u64,
+    pub skills: u64,
+    pub mcp: u64,
     pub reasoning: u64,
     pub image: u64,
     pub attachments: u64,
@@ -460,6 +621,8 @@ pub(crate) struct ContextSourceTokens {
 pub(crate) fn context_source_recommendations(tokens: &ContextSourceTokens) -> Vec<String> {
     let total = tokens.user
         + tokens.tool_outputs
+        + tokens.skills
+        + tokens.mcp
         + tokens.reasoning
         + tokens.image
         + tokens.attachments
@@ -472,7 +635,7 @@ pub(crate) fn context_source_recommendations(tokens: &ContextSourceTokens) -> Ve
     let pct = |value: u64| ((value as f64 / total as f64) * 100.0).round() as u64;
     // Ordered by descending share so "largest" ties break deterministically
     // toward the bucket the user is most likely to recognize as actionable.
-    let sources: [(&str, u64, &str); 6] = [
+    let sources: [(&str, u64, &str); 8] = [
         (
             "tool_outputs",
             tokens.tool_outputs,
@@ -482,6 +645,16 @@ pub(crate) fn context_source_recommendations(tokens: &ContextSourceTokens) -> Ve
             "history",
             tokens.user,
             "run /compact to summarize older turns",
+        ),
+        (
+            "skills",
+            tokens.skills,
+            "unload skills you are done with (they reload on demand) or use metadata-only skill mode",
+        ),
+        (
+            "mcp",
+            tokens.mcp,
+            "disable unused MCP servers to shrink the advertised tool schemas",
         ),
         (
             "reasoning",

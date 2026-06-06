@@ -491,6 +491,23 @@ impl SkillCatalog {
             .collect()
     }
 
+    /// Byte length of every skill body currently materialized (loaded) in
+    /// this session's cache, keyed by skill name. A skill is "loaded" once its
+    /// body has been read into the cache — via `load_skill`, inline activation,
+    /// or a previous `load`. Used by `/context` to mark loaded skills and size
+    /// the in-context skill cost without re-reading bodies from disk.
+    pub fn loaded_body_sizes(&self) -> BTreeMap<String, usize> {
+        self.cache
+            .lock()
+            .map(|cache| {
+                cache
+                    .iter()
+                    .map(|(name, loaded)| (name.clone(), loaded.body.len()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn summaries_json(&self) -> Value {
         json!({
             "skills": self.summaries()

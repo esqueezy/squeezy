@@ -37,7 +37,7 @@ pub use squeezy_mcp::{
 };
 use squeezy_skills::{
     LoadedSkill, SkillActivation, SkillCatalog, SkillDiscoverySummary, SkillPreambleRender,
-    render::SkillActivationMetrics,
+    SkillSummary, render::SkillActivationMetrics,
 };
 use squeezy_store::{GraphStore, Observation, ObservationKind, SqueezyStore};
 use squeezy_telemetry::{
@@ -50,6 +50,20 @@ use squeezy_vcs::{
 };
 use squeezy_workspace::{CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexingPolicy};
 use tokio::sync::{Mutex, Semaphore};
+
+/// One connected MCP tool's contribution to the request framing, surfaced by
+/// [`ToolRegistry::mcp_tool_schema_infos`] for the `/context` accounting view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolSchemaInfo {
+    /// Owning MCP server name.
+    pub server: String,
+    /// Tool name as advertised to the model (`model_name`).
+    pub name: String,
+    /// First line of the tool description.
+    pub description: String,
+    /// Serialized byte size of the advertised `ToolSpec` (schema cost).
+    pub schema_bytes: usize,
+}
 use tokio_util::sync::CancellationToken;
 use unicode_normalization::UnicodeNormalization;
 
@@ -2023,6 +2037,53 @@ impl ToolRegistry {
 
     pub fn mcp_status_snapshot(&self) -> McpStatusSnapshot {
         self.mcp.status_snapshot()
+    }
+
+    /// Per-tool accounting view for `/context`: every connected MCP tool with
+    /// its owning server, first-line description, and the serialized byte size
+    /// of the exact `ToolSpec` the model receives each request. The byte size
+    /// is what the schema costs in the request framing, so the caller can
+    /// attribute that share away from the opaque "system prompt + framing"
+    /// bucket. Returns one entry per tool, unsorted (caller groups by server).
+    pub fn mcp_tool_schema_infos(&self) -> Vec<McpToolSchemaInfo> {
+        self.mcp
+            .tools()
+            .into_iter()
+            .map(|tool| {
+                let server = tool.server.clone();
+                let name = tool.model_name.clone();
+                let description = tool
+                    .description
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                // Count the schema exactly as advertised to the model — same
+                // ToolSpec shape produced for the live request.
+                let schema_bytes = serde_json::to_string(&mcp_tool_spec(tool))
+                    .map(|json| json.len())
+                    .unwrap_or(0);
+                McpToolSchemaInfo {
+                    server,
+                    name,
+                    description,
+                    schema_bytes,
+                }
+            })
+            .collect()
+    }
+
+    /// Skill catalog metadata for `/context` — one summary per discovered
+    /// skill (name, description, on-disk location, source).
+    pub fn skill_summaries(&self) -> Vec<SkillSummary> {
+        self.skills_snapshot().summaries()
+    }
+
+    /// Byte length of each skill body currently loaded (materialized) into the
+    /// session's skill cache, keyed by skill name. See
+    /// [`SkillCatalog::loaded_body_sizes`].
+    pub fn loaded_skill_body_sizes(&self) -> BTreeMap<String, usize> {
+        self.skills_snapshot().loaded_body_sizes()
     }
 
     /// Aggregate MCP server capability presence booleans.
