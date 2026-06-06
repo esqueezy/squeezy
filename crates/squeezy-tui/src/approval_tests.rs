@@ -60,7 +60,7 @@ fn shell_preview_shows_command_and_cwd() {
     let out = flatten(&render_preview(&req));
     assert!(out.contains("cargo test --workspace"), "{out}");
     assert!(out.contains("cwd /repo"), "{out}");
-    assert!(out.contains("Allow Project: shell:cargo test"), "{out}");
+    assert!(out.contains("Rule: shell:cargo test"), "{out}");
 }
 
 #[test]
@@ -114,12 +114,12 @@ fn context_field_is_rendered_above_rule_preview() {
     let lines = render_preview(&req);
     let out = flatten(&lines);
     assert!(out.contains(snippet), "context snippet missing: {out}");
+    assert!(out.contains("Why: "), "context label missing: {out}");
+    assert!(!out.contains("context:"), "old context label leaked: {out}");
     // The context block must appear above the rule preview line so the
     // user reads "why" before scanning the suggested rule and buttons.
     let context_idx = out.find(snippet).expect("context substring");
-    let rule_idx = out
-        .find("Allow Project:")
-        .expect("rule preview line missing");
+    let rule_idx = out.find("Rule:").expect("rule preview line missing");
     assert!(
         context_idx < rule_idx,
         "context should render above rule preview ({context_idx} >= {rule_idx})\n{out}",
@@ -136,6 +136,94 @@ fn missing_context_keeps_existing_preview_layout() {
     );
     let out = flatten(&render_preview(&req));
     assert!(!out.contains("context:"), "stray context label: {out}");
+    assert!(!out.contains("Why:"), "stray rationale label: {out}");
+}
+
+#[test]
+fn approval_preview_separates_rationale_command_rule_and_choices() {
+    let mut req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[("command", "cargo test --workspace"), ("cwd", "/repo")],
+    );
+    req.context = Some("I need to validate the Rust workspace before reporting back.".to_string());
+
+    let lines = render_preview(&req);
+    let rendered: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+
+    let why = rendered
+        .iter()
+        .position(|line| line.contains("Why:"))
+        .expect("why line");
+    let command = rendered
+        .iter()
+        .position(|line| line.contains("$ cargo test --workspace"))
+        .expect("command line");
+    let rule = rendered
+        .iter()
+        .position(|line| line.contains("Rule: shell:cargo test"))
+        .expect("rule line");
+
+    assert_eq!(rendered.get(command - 1).map(String::as_str), Some(""));
+    assert_eq!(rendered.get(rule - 1).map(String::as_str), Some(""));
+    assert_eq!(rendered.get(rule + 1).map(String::as_str), Some(""));
+    assert!(why < command && command < rule, "{rendered:#?}");
+}
+
+#[test]
+fn approval_preview_header_and_labels_avoid_accent_colors() {
+    let mut req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[("command", "cargo test")],
+    );
+    req.context = Some("I need to validate the Rust workspace.".to_string());
+
+    let lines = render_preview(&req);
+    let quiet = crate::render::theme::quiet();
+    let accent = crate::render::theme::accent();
+    let secondary = crate::render::theme::secondary();
+    let foreground = crate::render::theme::foreground();
+    let header = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "Approval needed")
+        .expect("approval header");
+    assert_eq!(
+        header.style.fg,
+        Some(foreground),
+        "header should be neutral"
+    );
+    assert_ne!(
+        header.style.fg,
+        Some(accent),
+        "header should not use accent"
+    );
+    assert_ne!(
+        header.style.fg,
+        Some(secondary),
+        "header should not use secondary accent"
+    );
+
+    let label_spans = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .filter(|span| span.content.as_ref() == "Why: " || span.content.as_ref() == "Rule: ");
+
+    for span in label_spans {
+        assert_eq!(span.style.fg, Some(quiet), "label should be quiet");
+        assert_ne!(span.style.fg, Some(accent), "label should not use accent");
+    }
 }
 
 #[test]

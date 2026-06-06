@@ -20,14 +20,19 @@ use crate::compact_text;
 /// prompt stays scannable on short terminals — reviewers can still see the
 /// full patch via `/diff` once the call lands.
 const APPROVAL_DIFF_BODY_CAP: usize = 18;
+const APPROVAL_CONTEXT_WRAP: usize = 96;
 
 /// Render the preview block above the option menu.
 pub(crate) fn render_preview(request: &ToolApprovalRequest) -> Vec<Line<'static>> {
     let permission = &request.permission;
     let header = header_line(request);
     let mut lines = vec![header];
+    let mut rendered_context = false;
     if let Some(ctx) = request.context.as_deref() {
-        append_context(&mut lines, ctx);
+        rendered_context = append_context(&mut lines, ctx);
+    }
+    if rendered_context {
+        lines.push(Line::raw(""));
     }
     match permission.capability {
         PermissionCapability::Shell => append_shell(&mut lines, permission),
@@ -41,28 +46,44 @@ pub(crate) fn render_preview(request: &ToolApprovalRequest) -> Vec<Line<'static>
         | PermissionCapability::Compiler
         | PermissionCapability::Destructive => append_generic(&mut lines, permission),
     }
+    lines.push(Line::raw(""));
     append_rule_preview(&mut lines, permission);
+    lines.push(Line::raw(""));
     lines
 }
 
-fn append_context(lines: &mut Vec<Line<'static>>, context: &str) {
+fn append_context(lines: &mut Vec<Line<'static>>, context: &str) -> bool {
     let trimmed = context.trim();
     if trimmed.is_empty() {
-        return;
+        return false;
     }
+    let wrapped = wrap_words(&trimmed.replace('\n', " "), APPROVAL_CONTEXT_WRAP);
+    let Some((first, rest)) = wrapped.split_first() else {
+        return false;
+    };
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            "context: ",
+            "Why: ",
             Style::default()
-                .fg(crate::render::theme::accent())
+                .fg(crate::render::theme::quiet())
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            trimmed.replace('\n', " "),
+            first.to_string(),
             Style::default().fg(crate::render::theme::foreground()),
         ),
     ]));
+    for line in rest {
+        lines.push(Line::from(vec![
+            Span::raw("       "),
+            Span::styled(
+                line.to_string(),
+                Style::default().fg(crate::render::theme::foreground()),
+            ),
+        ]));
+    }
+    true
 }
 
 fn header_line(request: &ToolApprovalRequest) -> Line<'static> {
@@ -71,7 +92,7 @@ fn header_line(request: &ToolApprovalRequest) -> Line<'static> {
         Span::styled(
             "Approval needed",
             Style::default()
-                .fg(crate::render::theme::secondary())
+                .fg(crate::render::theme::foreground())
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -129,7 +150,7 @@ fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
         let shown = total.min(APPROVAL_DIFF_BODY_CAP);
         for mut line in body.into_iter().take(shown) {
             // Indent the diff body two spaces so it aligns with the other
-            // preview lines (`✎`, `context:`, `Allow Project:`).
+            // preview lines (`✎`, `Why:`, `Rule:`).
             line.spans.insert(0, Span::raw("  "));
             lines.push(line);
         }
@@ -204,9 +225,9 @@ fn append_rule_preview(lines: &mut Vec<Line<'static>>, permission: &PermissionRe
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            "Allow Project: ",
+            "Rule: ",
             Style::default()
-                .fg(crate::render::theme::accent())
+                .fg(crate::render::theme::quiet())
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -264,6 +285,53 @@ fn middle_truncate(text: &str, max_chars: usize) -> String {
     out.push('…');
     out.push_str(&text[tail_start..]);
     out
+}
+
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if current.is_empty() {
+            if word_len <= width {
+                current.push_str(word);
+            } else {
+                push_wrapped_word(&mut lines, word, width);
+            }
+            continue;
+        }
+
+        let current_len = current.chars().count();
+        if current_len + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            if word_len <= width {
+                current.push_str(word);
+            } else {
+                push_wrapped_word(&mut lines, word, width);
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn push_wrapped_word(lines: &mut Vec<String>, word: &str, width: usize) {
+    let width = width.max(1);
+    let mut current = String::new();
+    for ch in word.chars() {
+        if current.chars().count() == width {
+            lines.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
 }
 
 #[cfg(test)]

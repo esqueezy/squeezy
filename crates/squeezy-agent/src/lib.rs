@@ -13533,14 +13533,14 @@ fn classify_provider_error(error: &SqueezyError) -> Option<ProviderErrorKind> {
     }
 }
 
-/// Maximum bytes of preceding assistant text passed in
-/// [`ToolApprovalRequest::context`]. Sized to fit a few sentences without
+/// Maximum chars of preceding assistant text passed in
+/// [`ToolApprovalRequest::context`]. Sized to fit a short rationale without
 /// dominating the approval modal.
-const APPROVAL_CONTEXT_CAP: usize = 300;
+const APPROVAL_CONTEXT_CAP: usize = 240;
 
 /// Extract the most recent assistant message from `state`, redact it, and
-/// head-truncate to [`APPROVAL_CONTEXT_CAP`] bytes so the approval modal
-/// can render "you asked me to X, so I'm trying Y" above the buttons.
+/// keep only a complete short sentence/line. If the message cannot produce a
+/// clean bounded rationale, return `None` instead of showing a clipped thought.
 async fn approval_context_from_state(
     state: Option<&Arc<Mutex<ConversationState>>>,
     redactor: &Redactor,
@@ -13557,22 +13557,33 @@ async fn approval_context_from_state(
     if trimmed.is_empty() {
         return None;
     }
-    Some(head_truncate_bytes(trimmed, APPROVAL_CONTEXT_CAP))
+    approval_context_excerpt(trimmed)
 }
 
-/// Truncate `value` to at most `cap` bytes on a UTF-8 boundary, appending
-/// an ellipsis when truncation occurred.
-fn head_truncate_bytes(value: &str, cap: usize) -> String {
-    if value.len() <= cap {
-        return value.to_string();
+fn approval_context_excerpt(value: &str) -> Option<String> {
+    let collapsed = collapse_status_text(value);
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return None;
     }
-    let mut end = cap;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
+    if trimmed.chars().count() <= APPROVAL_CONTEXT_CAP {
+        return Some(trimmed.to_string());
     }
-    let mut out = value[..end].trim_end().to_string();
-    out.push('…');
-    out
+
+    let mut best_boundary = None;
+    for (idx, ch) in trimmed.char_indices() {
+        let end = idx + ch.len_utf8();
+        let chars = trimmed[..end].chars().count();
+        if chars > APPROVAL_CONTEXT_CAP {
+            break;
+        }
+        if matches!(ch, '.' | '!' | '?' | ':') {
+            best_boundary = Some(end);
+        }
+    }
+    let end = best_boundary?;
+    let excerpt = trimmed[..end].trim();
+    (!excerpt.is_empty()).then(|| excerpt.to_string())
 }
 
 async fn permission_decision(
