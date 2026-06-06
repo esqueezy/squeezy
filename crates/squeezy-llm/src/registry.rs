@@ -436,16 +436,20 @@ pub fn estimate_request_context_full(
     let headroom_tokens = context_window_tokens
         .zip(effective_context_window_tokens)
         .map(|(raw_window, effective_window)| raw_window.saturating_sub(effective_window));
+    // Cap an explicit request value at the model's real max output, but NOT at
+    // the synthetic 64K fallback for unknown models — that would silently
+    // shrink what the operator asked for. The cap only applies when the limit
+    // came from a trustworthy layer.
+    let max_output_cap = if matches!(resolved.source, LimitSource::SyntheticFallback) {
+        None
+    } else {
+        resolved.max_output_tokens
+    };
     let max_output_tokens = request
         .max_output_tokens
         .map(u64::from)
         .or(resolved.max_output_tokens)
-        .map(|tokens| {
-            resolved
-                .max_output_tokens
-                .map(|cap| tokens.min(cap))
-                .unwrap_or(tokens)
-        });
+        .map(|tokens| max_output_cap.map(|cap| tokens.min(cap)).unwrap_or(tokens));
     let input_budget_tokens = effective_context_window_tokens
         .map(|window| window.saturating_sub(max_output_tokens.unwrap_or(0)));
     let remaining_input_tokens =

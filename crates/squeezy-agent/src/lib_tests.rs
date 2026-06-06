@@ -11288,7 +11288,7 @@ fn model_fits_conversation_skips_reroute_when_window_too_small() {
         },
     );
     assert!(
-        !model_fits_conversation(&config, slug, "cheap-x", &convo, None),
+        !model_fits_conversation(&config, slug, None, "cheap-x", &convo, None),
         "a conversation larger than the cheap model's window must not reroute"
     );
     // A roomy pinned window fits → reroute is allowed.
@@ -11299,7 +11299,25 @@ fn model_fits_conversation_skips_reroute_when_window_too_small() {
         },
     );
     assert!(
-        model_fits_conversation(&config, slug, "cheap-x", &convo, None),
+        model_fits_conversation(&config, slug, None, "cheap-x", &convo, None),
         "a conversation that fits the cheap model's window may reroute"
+    );
+}
+
+#[test]
+fn model_fits_conversation_honors_global_override() {
+    let config = AppConfig::default();
+    let slug = squeezy_core::provider_slug(&config.provider);
+    // ~5K tokens; "cheap-y" has no per-model entry and is unknown to the catalog.
+    let convo = vec![LlmInputItem::UserText("x".repeat(20_000))];
+    // A small GLOBAL [context].model_context_window must still constrain a cheap
+    // reroute even with no per-model entry, mirroring the parent path.
+    assert!(
+        !model_fits_conversation(&config, slug, Some(100), "cheap-y", &convo, None),
+        "a small global window must block a cheap reroute"
+    );
+    assert!(
+        model_fits_conversation(&config, slug, Some(1_000_000), "cheap-y", &convo, None),
+        "a large global window allows the reroute"
     );
 }

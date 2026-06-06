@@ -188,10 +188,13 @@ pub fn resolve_context_limits(input: &ContextLimitInput<'_>) -> ResolvedContextL
         .or_else(|| models_dev_limits.and_then(|limits| limits.max_output))
         .or(Some(SYNTHETIC_FALLBACK_MAX_OUTPUT));
 
+    // Clamp to 1..=100 so a bad override/catalog value can neither zero the
+    // window (0) nor inflate it past the raw size (>100).
     let effective_context_window_percent = input
         .effective_percent_override
         .or_else(|| curated_limits.map(|limits| limits.effective_context_window_percent))
-        .unwrap_or_else(default_effective_context_window_percent);
+        .unwrap_or_else(default_effective_context_window_percent)
+        .clamp(1, 100);
 
     let baseline_reserve_tokens = input
         .baseline_reserve_override

@@ -1468,6 +1468,7 @@ fn derive_model_context_window(
 fn model_fits_conversation(
     config: &AppConfig,
     provider_name: &str,
+    global_override: Option<u64>,
     model: &str,
     conversation: &[LlmInputItem],
     observed_ceiling: Option<u64>,
@@ -1482,7 +1483,7 @@ fn model_fits_conversation(
         .get(&key)
         .and_then(|entry| entry.context_window);
     let mut input = ContextLimitInput::new(provider_name, model);
-    input.user_override = per_model;
+    input.user_override = per_model.or(global_override);
     input.observed_ceiling = observed_ceiling;
     input.models_dev = squeezy_llm::cached_models_dev_view();
     input.effective_percent_override = config.context_compaction.effective_context_window_percent;
@@ -4379,6 +4380,7 @@ impl Agent {
         let active_turn = self.active_turn.clone();
         set_active_turn(&active_turn, turn_id, cancel.clone());
         let last_request_overhead_tokens = self.last_request_overhead_tokens.clone();
+        let configured_model_context_window = self.configured_model_context_window;
 
         let turn_done = Arc::new(Notify::new());
         let panic_tx = tx.clone();
@@ -4541,6 +4543,7 @@ impl Agent {
                     routing_state,
                     active_turn,
                     last_request_overhead_tokens,
+                    configured_model_context_window,
                 }
                 .run(task_title.clone())
                 .await;
@@ -5575,6 +5578,11 @@ struct TurnRuntime {
     /// carried across turns so the post-turn compaction gate does not
     /// under-count the real input size (finding #2).
     last_request_overhead_tokens: Arc<AtomicU64>,
+    /// The operator's explicit global `[context].model_context_window`,
+    /// captured before `build()` derived a per-model window. Lets the reroute
+    /// fit-check apply it as the cheap model's override fallback, mirroring how
+    /// the parent model's compaction window honors it.
+    configured_model_context_window: Option<u64>,
 }
 
 impl TurnRuntime {
@@ -6094,6 +6102,37 @@ impl TurnRuntime {
         *previous_response_id = None;
         *next_input = conversation.clone();
         true
+    }
+
+    /// Record that `model` overflowed at ~`observed` input tokens: clamp the
+    /// per-route observed ceiling down to it. When `clamp_compaction` is set
+    /// (the overflow is on the active/parent model whose window backs
+    /// compaction), also tighten the live compaction window so mid/post-turn
+    /// compaction sizes against the proven-smaller window for the rest of the
+    /// session — keeping it consistent with what `/context` now shows.
+    async fn record_observed_context_ceiling(
+        &mut self,
+        model: &str,
+        observed: u64,
+        clamp_compaction: bool,
+    ) {
+        {
+            let mut state = self.conversation_state.lock().await;
+            let key = (self.provider.name().to_string(), model.to_string());
+            let ceiling = state
+                .observed_context_ceilings
+                .entry(key)
+                .or_insert(observed);
+            *ceiling = (*ceiling).min(observed);
+        }
+        if clamp_compaction {
+            let clamped = self
+                .config
+                .context_compaction
+                .model_context_window
+                .map_or(observed, |window| window.min(observed));
+            self.config.context_compaction.model_context_window = Some(clamped);
+        }
     }
 
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
@@ -6734,6 +6773,7 @@ impl TurnRuntime {
             if !model_fits_conversation(
                 &self.config,
                 self.provider.name(),
+                self.configured_model_context_window,
                 &current_model,
                 &conversation,
                 observed_ceiling,
@@ -7522,6 +7562,21 @@ impl TurnRuntime {
             }
 
             if let Some(error) = provider_stream_error {
+                if context_overflow_seen {
+                    // Most providers signal context overflow as a transport
+                    // error here (classified into `ContextOverflow`), NOT as a
+                    // clean `StopReason::ContextWindowExceeded`. Record the
+                    // observed ceiling BEFORE the compaction below shrinks the
+                    // conversation, so the recorded size reflects what actually
+                    // overflowed.
+                    let observed = estimate_context(&conversation).estimated_tokens;
+                    self.record_observed_context_ceiling(
+                        &current_model,
+                        observed,
+                        current_model == parent_model,
+                    )
+                    .await;
+                }
                 if context_overflow_seen
                     && !context_overflow_retry_used
                     && round_output_bytes == 0
@@ -7705,19 +7760,13 @@ impl TurnRuntime {
             // touching every provider. `EndTurn` and `ToolUse` fall
             // through to the existing tool-calls / completion logic.
             if matches!(stop_reason, Some(StopReason::ContextWindowExceeded)) {
-                // The provider just proved its real window is no larger than
-                // what we sent. Record an observed ceiling for this route so the
-                // limit resolver clamps the window down (and the reroute
-                // fit-check stops trusting an over-optimistic catalog/override)
-                // for the rest of the session.
                 let observed = estimate_context(&conversation).estimated_tokens;
-                let mut state = self.conversation_state.lock().await;
-                let key = (self.provider.name().to_string(), current_model.to_string());
-                let ceiling = state
-                    .observed_context_ceilings
-                    .entry(key)
-                    .or_insert(observed);
-                *ceiling = (*ceiling).min(observed);
+                self.record_observed_context_ceiling(
+                    &current_model,
+                    observed,
+                    current_model == parent_model,
+                )
+                .await;
             }
             if matches!(stop_reason, Some(StopReason::ContextWindowExceeded))
                 && !context_overflow_retry_used

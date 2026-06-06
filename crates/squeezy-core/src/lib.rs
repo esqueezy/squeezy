@@ -736,8 +736,7 @@ pub struct ConfigWarning {
 /// Canonical provider slug (`openai`, `anthropic`, an aggregator preset, …)
 /// used both as the `[providers.<slug>]` key and as the provider half of a
 /// `[model_limits."<provider>:<model>"]` key. One source of truth so the config
-/// screen's write key and [`AppConfig::resolved_context_window_override`] always
-/// agree.
+/// screen's write key and every reader of [`AppConfig::model_limit_key`] agree.
 pub fn provider_slug(provider: &ProviderConfig) -> &'static str {
     match provider {
         ProviderConfig::OpenAi(_) => "openai",
@@ -757,17 +756,6 @@ impl AppConfig {
     /// The `[model_limits]` key for the active `(provider, model)`.
     pub fn model_limit_key(&self) -> String {
         format!("{}:{}", provider_slug(&self.provider), self.model)
-    }
-
-    /// Operator-set context window for the active model, if any: the per-model
-    /// `[model_limits."p:m"].context_window`, else the global
-    /// `[context].model_context_window`. This is the resolver's "user override"
-    /// layer and the value compaction sizes against.
-    pub fn resolved_context_window_override(&self) -> Option<u64> {
-        self.model_limits
-            .get(&self.model_limit_key())
-            .and_then(|entry| entry.context_window)
-            .or(self.context_compaction.model_context_window)
     }
 
     pub fn from_env() -> Self {
@@ -1711,6 +1699,12 @@ impl AppConfig {
         ));
         if let Some(window) = self.context_compaction.model_context_window {
             output.push_str(&format!("model_context_window = {}\n", window));
+        }
+        if let Some(percent) = self.context_compaction.effective_context_window_percent {
+            output.push_str(&format!("effective_context_window_percent = {}\n", percent));
+        }
+        if let Some(reserve) = self.context_compaction.baseline_reserve_tokens {
+            output.push_str(&format!("baseline_reserve_tokens = {}\n", reserve));
         }
         output.push_str(&format!(
             "threshold_percent = {}\n",
@@ -6006,8 +6000,11 @@ impl ContextCompactionConfig {
             )
             .as_deref()
             .and_then(|raw| raw.parse::<u8>().ok())
-            .map(clamp_percent)
-            .or(settings.effective_context_window_percent),
+            .or(settings.effective_context_window_percent)
+            // Clamp BOTH env and file values to 1..=100 — a checked-in 200 would
+            // otherwise double the usable window and 0 would zero it. The config
+            // screen enforces the same range; this guards raw TOML/env.
+            .map(|percent| percent.clamp(1, 100)),
             baseline_reserve_tokens: get_var("SQUEEZY_CONTEXT_BASELINE_RESERVE_TOKENS")
                 .as_deref()
                 .and_then(|raw| raw.parse::<u64>().ok())

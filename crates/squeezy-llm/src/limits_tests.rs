@@ -159,6 +159,25 @@ fn effective_math_respects_overrides() {
 }
 
 #[test]
+fn effective_percent_is_clamped_to_1_through_100() {
+    let mut over = ContextLimitInput::new("openai", "custom-x");
+    over.user_override = Some(200_000);
+    over.effective_percent_override = Some(200); // absurd: would otherwise inflate
+    let r = resolve_context_limits(&over);
+    assert_eq!(r.effective_context_window_percent, 100);
+    // 200_000 * 100% - 12_000 baseline = 188_000 (never larger than the raw window)
+    assert_eq!(effective_window_tokens(&r), Some(188_000));
+
+    let mut zero = ContextLimitInput::new("openai", "custom-x");
+    zero.user_override = Some(200_000);
+    zero.effective_percent_override = Some(0); // would otherwise zero the window
+    assert_eq!(
+        resolve_context_limits(&zero).effective_context_window_percent,
+        1
+    );
+}
+
+#[test]
 fn aggregator_namespaced_id_resolves_via_vendor_suffix() {
     // models.dev lists the bare vendor id; the aggregator route uses a
     // namespaced id. lookup() must strip the namespace.
