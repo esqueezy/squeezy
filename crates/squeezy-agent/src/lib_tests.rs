@@ -4462,24 +4462,17 @@ fn shell_classifier_output_schema_mirrors_parse_target() {
 }
 
 #[test]
-fn plan_mode_denies_mutating_capabilities_before_policy() {
+fn plan_mode_denies_repo_mutations_before_policy() {
     for capability in [
-        PermissionCapability::Shell,
-        PermissionCapability::Git,
-        PermissionCapability::Network,
-        PermissionCapability::Mcp,
-        PermissionCapability::Compiler,
+        PermissionCapability::Edit,
         PermissionCapability::Destructive,
     ] {
         let request = permission_request_for_capability(capability);
         let verdict = mode_permission_verdict(SessionMode::Plan, &request, None)
-            .expect("plan mode should deny mutating capability");
+            .expect("plan mode should deny repo mutation capability");
         assert_eq!(verdict.action, PermissionAction::Deny);
         assert_eq!(verdict.matched_rule, None);
-        assert_eq!(
-            verdict.reason,
-            format!("plan mode refuses {}", capability.as_str())
-        );
+        assert!(verdict.reason.contains(capability.as_str()));
     }
 }
 
@@ -4557,8 +4550,16 @@ fn plan_mode_denies_edit_when_sibling_plan_file_targeted() {
 }
 
 #[test]
-fn plan_mode_keeps_read_and_search_on_normal_policy_path() {
-    for capability in [PermissionCapability::Read, PermissionCapability::Search] {
+fn plan_mode_keeps_discovery_capabilities_on_normal_policy_path() {
+    for capability in [
+        PermissionCapability::Read,
+        PermissionCapability::Search,
+        PermissionCapability::Shell,
+        PermissionCapability::Git,
+        PermissionCapability::Network,
+        PermissionCapability::Mcp,
+        PermissionCapability::Compiler,
+    ] {
         let request = permission_request_for_capability(capability);
         assert_eq!(
             mode_permission_verdict(SessionMode::Plan, &request, None),
@@ -4702,8 +4703,12 @@ fn advertised_tool_specs_are_mode_aware() {
             "read_tool_output",
             "reference_search",
             "repo_map",
+            "shell",
             "symbol_context",
             "upstream_flow",
+            "verify",
+            "webfetch",
+            "websearch",
         ]
     );
 }

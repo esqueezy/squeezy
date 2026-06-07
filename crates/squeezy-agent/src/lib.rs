@@ -15218,13 +15218,14 @@ pub(crate) fn mode_permission_verdict(
 }
 
 /// Single source of truth for whether a session mode forbids a capability.
-/// Plan mode allows Read, Search, and (when `plan_edit_allowed` is true)
-/// Edit; Build mode allows everything (the configured `PermissionPolicy`
-/// still applies). The capability list is intentionally exhaustive
-/// (`match`) so adding a new capability is a compile-time prompt to
-/// decide whether plan mode admits it. `plan_edit_allowed` is computed
-/// by `plan_mode::plan_edit_allowed_in_workspace` at schema-build sites
-/// and by `plan_mode::is_active_plan_path` at runtime (issue 2).
+/// Plan mode is mutation-gated, not shell-gated: non-mutating discovery
+/// commands (shell/git/compiler/network/MCP) stay on the normal permission
+/// path, while edits and destructive calls are blocked before policy can
+/// approve them. The capability list is intentionally exhaustive (`match`) so
+/// adding a new capability is a compile-time prompt to decide whether plan
+/// mode admits it. `plan_edit_allowed` is computed by
+/// `plan_mode::plan_edit_allowed_in_workspace` at schema-build sites and by
+/// `plan_mode::is_active_plan_path` at runtime (issue 2).
 fn mode_refuses_capability(
     mode: SessionMode,
     capability: PermissionCapability,
@@ -15234,14 +15235,15 @@ fn mode_refuses_capability(
         return false;
     }
     match capability {
-        PermissionCapability::Read | PermissionCapability::Search => false,
-        PermissionCapability::Edit => !plan_edit_allowed,
-        PermissionCapability::Shell
+        PermissionCapability::Read
+        | PermissionCapability::Search
+        | PermissionCapability::Shell
         | PermissionCapability::Git
         | PermissionCapability::Network
         | PermissionCapability::Mcp
-        | PermissionCapability::Compiler
-        | PermissionCapability::Destructive => true,
+        | PermissionCapability::Compiler => false,
+        PermissionCapability::Edit => !plan_edit_allowed,
+        PermissionCapability::Destructive => true,
     }
 }
 
