@@ -547,11 +547,6 @@ fn cache_check(config: &AppConfig, prune: bool, storage: bool) -> Check {
                     report.removed_files.len(),
                     format_bytes(report.removed_bytes)
                 ));
-                if diagnostics.state.size_bytes <= STATE_CACHE_WARN_BYTES
-                    && diagnostics.graph.size_bytes <= GRAPH_CACHE_WARN_BYTES
-                {
-                    status = Status::Ok;
-                }
             }
             Err(error) => {
                 status = Status::Fail;

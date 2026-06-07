@@ -433,6 +433,41 @@ fn cache_check_prunes_redb_backups() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn cache_check_prune_preserves_storage_warning() {
+    let workspace = std::env::temp_dir().join(format!(
+        "squeezy-doctor-cache-prune-storage-warn-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let cache_dir = workspace.join(".squeezy").join("cache");
+    fs::create_dir_all(&cache_dir).expect("create cache dir");
+    let backup = cache_dir.join("schema-2-test.redb.bak");
+    fs::write(&backup, b"old").expect("write backup");
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+    config.session_logs.log_dir = Some(std::path::PathBuf::from("/proc/squeezy-sessions"));
+
+    let check = cache_check(&config, true, true);
+
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check
+            .detail
+            .contains("storage warning: sessions=proc(virtual)"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(check.detail.contains("pruned 1 backups"));
+    assert!(!backup.exists(), "backup should be removed");
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 #[test]
 fn cache_check_storage_reports_paths_and_backup_age() {
     let workspace = std::env::temp_dir().join(format!(
