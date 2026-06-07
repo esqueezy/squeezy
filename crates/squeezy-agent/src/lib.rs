@@ -7877,6 +7877,22 @@ impl TurnRuntime {
                         // the same input (next_input / previous_response_id
                         // are unchanged).
                         assistant_message.clear();
+                        // Surface the recovery as an `assistant_retry`
+                        // session event, the same diagnostic channel the
+                        // stall and malformed-call retries use, so every
+                        // recovery kind is traceable from the session log.
+                        self.log_event(
+                            "assistant_retry",
+                            Some(self.turn_id),
+                            Some(format!(
+                                "max_tokens escalation: retrying round {round} at {escalated} output tokens"
+                            )),
+                            json!({
+                                "branch": "max_tokens_escalation",
+                                "round": round,
+                                "escalated_max_output_tokens": escalated,
+                            }),
+                        );
                         tracing::debug!(
                             target: "squeezy_agent::max_tokens_escalation",
                             round,

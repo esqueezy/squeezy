@@ -9931,7 +9931,13 @@ async fn max_tokens_truncation_escalates_budget_and_recovers() {
             }),
         ],
     ]));
+    let root = temp_workspace("agent_max_tokens_escalation");
     let mut config = AppConfig::default();
+    config.workspace_root = root.clone();
+    config.session_logs = SessionLogConfig {
+        log_dir: Some(PathBuf::from(".squeezy/sessions")),
+        ..SessionLogConfig::default()
+    };
     // An off-catalog model resolves to the synthetic-fallback limits
     // (64k output ceiling), so escalation has known headroom above the
     // configured 1k budget regardless of what the default model's curated
@@ -9970,6 +9976,16 @@ async fn max_tokens_truncation_escalates_budget_and_recovers() {
         escalated > 1_000,
         "retry budget {escalated} must exceed the configured 1000 (raised to the model ceiling)"
     );
+    // The escalation is traceable via the shared `assistant_retry` event.
+    let session_id = agent.session_id().expect("session id");
+    let record = agent.show_session(&session_id).expect("session record");
+    let retry_event = record
+        .events
+        .iter()
+        .find(|event| event.kind == "assistant_retry")
+        .expect("escalation must record an assistant_retry event");
+    assert_eq!(retry_event.payload["branch"], "max_tokens_escalation");
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
