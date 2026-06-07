@@ -205,7 +205,7 @@ fn cli_prompt_permission_mode_accepts_strict_modes() {
         "deny-ask",
     ])
     .expect("parse deny-ask");
-    assert_eq!(cli.prompt_permission_mode, PromptPermissionMode::DenyAsk);
+    assert_eq!(cli.prompt_permission_mode, PromptPermissionMode::Deny);
 
     let cli = Cli::try_parse_from([
         "squeezy",
@@ -215,7 +215,7 @@ fn cli_prompt_permission_mode_accepts_strict_modes() {
         "fail-on-ask",
     ])
     .expect("parse fail-on-ask");
-    assert_eq!(cli.prompt_permission_mode, PromptPermissionMode::FailOnAsk);
+    assert_eq!(cli.prompt_permission_mode, PromptPermissionMode::Fail);
 }
 
 #[test]
@@ -971,7 +971,7 @@ async fn print_mode_runs_tools_through_agent_loop_in_text_mode() {
     pump_prompt_events(
         rx,
         PromptFormat::Default,
-        PromptPermissionMode::AutoApproveAsk,
+        PromptPermissionMode::AutoApprove,
         &mut stdout,
         &mut stderr,
     )
@@ -1046,7 +1046,7 @@ async fn print_mode_emits_tool_events_as_jsonl() {
     pump_prompt_events(
         rx,
         PromptFormat::Json,
-        PromptPermissionMode::AutoApproveAsk,
+        PromptPermissionMode::AutoApprove,
         &mut stdout,
         &mut stderr,
     )
@@ -1150,7 +1150,7 @@ async fn print_mode_auto_approves_ask_capability_so_ci_does_not_hang() {
     pump_prompt_events(
         rx,
         PromptFormat::Default,
-        PromptPermissionMode::AutoApproveAsk,
+        PromptPermissionMode::AutoApprove,
         &mut stdout,
         &mut stderr,
     )
@@ -1221,7 +1221,7 @@ async fn print_mode_can_deny_ask_capability_in_strict_mode() {
     pump_prompt_events(
         rx,
         PromptFormat::Default,
-        PromptPermissionMode::DenyAsk,
+        PromptPermissionMode::Deny,
         &mut stdout,
         &mut stderr,
     )
@@ -1275,7 +1275,7 @@ async fn pump_prompts_runs_bang_bang_prompt_in_text_mode_without_llm_context() {
         &agent,
         prompts,
         PromptFormat::Default,
-        PromptPermissionMode::AutoApproveAsk,
+        PromptPermissionMode::AutoApprove,
         &mut stdout,
         &mut stderr,
     )
@@ -1333,7 +1333,7 @@ async fn pump_prompts_emits_bang_bang_tool_events_in_json_mode() {
         &agent,
         prompts,
         PromptFormat::Json,
-        PromptPermissionMode::AutoApproveAsk,
+        PromptPermissionMode::AutoApprove,
         &mut stdout,
         &mut stderr,
     )
@@ -1423,7 +1423,7 @@ async fn pump_prompts_runs_normal_prompts_unchanged_when_no_bang_bang_present() 
         &agent,
         prompts,
         PromptFormat::Default,
-        PromptPermissionMode::AutoApproveAsk,
+        PromptPermissionMode::AutoApprove,
         &mut stdout,
         &mut stderr,
     )

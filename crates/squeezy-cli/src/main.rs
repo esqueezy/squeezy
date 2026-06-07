@@ -68,12 +68,15 @@ enum PromptFormat {
 enum PromptPermissionMode {
     /// Allow each permission request once. This preserves the historical
     /// non-interactive behavior and keeps CI prompts from hanging.
-    AutoApproveAsk,
+    #[value(name = "auto-approve-ask")]
+    AutoApprove,
     /// Deny each permission request and let the agent continue with the
     /// denied tool result.
-    DenyAsk,
+    #[value(name = "deny-ask")]
+    Deny,
     /// Deny the request and make the CLI command fail immediately.
-    FailOnAsk,
+    #[value(name = "fail-on-ask")]
+    Fail,
 }
 
 #[derive(Debug, Parser)]
@@ -125,7 +128,7 @@ struct Cli {
         long = "prompt-permission-mode",
         value_name = "MODE",
         value_enum,
-        default_value_t = PromptPermissionMode::AutoApproveAsk,
+        default_value_t = PromptPermissionMode::AutoApprove,
         help = "Permission behavior for non-interactive --prompt runs: auto-approve-ask, deny-ask, or fail-on-ask"
     )]
     prompt_permission_mode: PromptPermissionMode,
@@ -3142,7 +3145,7 @@ where
                 let tool_name = request.tool_name.clone();
                 let reason = request.reason.clone();
                 match permission_mode {
-                    PromptPermissionMode::AutoApproveAsk => {
+                    PromptPermissionMode::AutoApprove => {
                         match format {
                             PromptFormat::Default => {
                                 writeln!(
@@ -3160,7 +3163,7 @@ where
                         }
                         let _ = decision_tx.send(ToolApprovalDecision::AllowOnce);
                     }
-                    PromptPermissionMode::DenyAsk => {
+                    PromptPermissionMode::Deny => {
                         match format {
                             PromptFormat::Default => {
                                 writeln!(stderr, "approval: denying {tool_name} ({reason})")?;
@@ -3175,7 +3178,7 @@ where
                         }
                         let _ = decision_tx.send(ToolApprovalDecision::Denied);
                     }
-                    PromptPermissionMode::FailOnAsk => {
+                    PromptPermissionMode::Fail => {
                         match format {
                             PromptFormat::Default => {
                                 writeln!(stderr, "approval: failing on {tool_name} ({reason})")?;
