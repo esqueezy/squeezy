@@ -5093,6 +5093,20 @@ async fn complete_squeezy_help_turn(
         state.transcript.push(message.clone());
         merge_cost(&mut state.cost, &cost);
         state.metrics.merge_turn(&metrics);
+        // `merge_turn` folds the doc-help subagent's spend into the turn's
+        // `provider` cost (its TurnMetrics carries the cost on `.provider`, and
+        // the subagent loop records via `record_provider`, which never touches
+        // the ledger). Mirror it into the per-model ledger as a MAIN-origin
+        // entry keyed by the doc-help model so the `/cost` "By model" Σ stays
+        // equal to the headline instead of silently dropping squeezy-help spend.
+        if cost.estimated_usd_micros.is_some() || cost.input_tokens.is_some() {
+            let provider = squeezy_llm::provider_name(&config.provider);
+            let doc_help_model = subagent_model_for_kind(provider, &config, SubagentKind::DocHelp);
+            state
+                .metrics
+                .model_ledger
+                .record(provider, &doc_help_model, CostOrigin::Main, &cost);
+        }
         state.redactions += metrics.redactions;
         if let Some(session) = &session_log {
             let _ = session.write_resume_state(&state.to_resume_state());
@@ -9986,6 +10000,11 @@ fn apply_subagent_dispatch(
         // Attribute the subagent's whole provider spend to its own
         // `(provider, model)` under the SUBAGENT slot — the subagent may run a
         // different model than the parent (cheap tier for explore/review).
+        // `outcome.model` is the *requested* model; if a provider echoes a
+        // normalized id via `ServerModel`, the subagent's rounds are priced at
+        // that id but the ledger keys this row under the requested alias (the
+        // dollars are still correct — only the label may differ from the
+        // main-agent rows, which key on the effective model).
         broker.metrics.model_ledger.record(
             &outcome.provider,
             &outcome.model,
@@ -14466,6 +14485,16 @@ async fn permission_decision_for_request(
         // persisted session cost + per-model ledger (keyed by the reviewer
         // model, main-origin), keeping `state.cost` and `state.metrics.provider`
         // in lockstep so the `/cost` headline and the By-model drill agree.
+        //
+        // KNOWN LIMITATION: this bypasses the active turn's `CostBroker`, so
+        // the *current* turn's cap checks and live status-line snapshot (both
+        // read from the broker) don't see this reviewer spend until the next
+        // turn re-seeds the broker from `state.cost`. The gap is bounded by a
+        // single turn's reviewer spend — cheap-tier calls capped at
+        // `max_output_tokens: 120` — and persisted `/cost` accounting is always
+        // correct. Closing it fully needs out-of-band LLM cost to flow back to
+        // the round-loop broker (also true of the shell classifier), a
+        // separable change.
         if (reviewer_result.cost.estimated_usd_micros.is_some()
             || reviewer_result.cost.input_tokens.is_some()
             || reviewer_result.cost.output_tokens.is_some())
