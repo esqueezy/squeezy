@@ -388,8 +388,10 @@ pub(crate) fn audit_world_writable(
 
 // ── Public harness entry point ────────────────────────────────────────────────
 
-/// Run the world-writable audit and add a deny-write ACE for `deny_cap_sid` on
-/// every escape directory that is not under a writable root.
+/// Run the world-writable audit and add a non-inheriting deny-write ACE for
+/// `deny_cap_sid` on every escape directory that is not under a writable root.
+/// The deny is object-only so world-writable ancestors such as `%TEMP%` cannot
+/// override explicit writable-root allows on their descendants.
 ///
 /// This is best-effort: failures are logged with `tracing::warn!` but never
 /// propagate (a scan failure must not prevent a spawn).
@@ -409,7 +411,7 @@ pub(crate) fn apply_world_writable_denies(
     let flagged = audit_world_writable(cwd, env, &writable_root_keys);
 
     for dir in &flagged {
-        match acl::add_deny_write_ace(dir, deny_cap_sid) {
+        match acl::add_deny_write_ace_no_inherit(dir, deny_cap_sid) {
             Ok(()) => {
                 tracing::debug!(
                     path = %dir.display(),
