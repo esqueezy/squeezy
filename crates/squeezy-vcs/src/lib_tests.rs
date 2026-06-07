@@ -715,7 +715,7 @@ fn checkpoint_rollback_conflicts_on_user_chmod_after_checkpoint() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn checkpoint_rollback_keeps_case_sensitive_paths_distinct() {
     let root = temp_repo("checkpoint_case_sensitive");
