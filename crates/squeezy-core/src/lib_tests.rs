@@ -5856,3 +5856,97 @@ fn min_items_bypass_threshold_is_90pct_of_effective_window() {
     assert_eq!(windowed.min_items_bypass_threshold(), 160_200);
     assert!(windowed.min_items_bypass_threshold() <= windowed.summarize_threshold());
 }
+
+#[test]
+fn model_ledger_splits_origin_merges_and_totals() {
+    let mut ledger = ModelLedger::default();
+    assert!(ledger.is_empty());
+    ledger.record(
+        "anthropic",
+        "opus",
+        CostOrigin::Main,
+        &CostSnapshot {
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            estimated_usd_micros: Some(500),
+            ..Default::default()
+        },
+    );
+    ledger.record(
+        "anthropic",
+        "opus",
+        CostOrigin::Subagent,
+        &CostSnapshot {
+            input_tokens: Some(40),
+            estimated_usd_micros: Some(200),
+            ..Default::default()
+        },
+    );
+    ledger.record(
+        "anthropic",
+        "haiku",
+        CostOrigin::Main,
+        &CostSnapshot {
+            input_tokens: Some(5),
+            estimated_usd_micros: Some(7),
+            ..Default::default()
+        },
+    );
+    assert!(!ledger.is_empty());
+
+    let opus = ledger
+        .iter()
+        .find(|b| b.model == "opus")
+        .expect("opus bucket");
+    // Main vs subagent land in distinct slots.
+    assert_eq!(opus.main.input_tokens, Some(100));
+    assert_eq!(opus.main.estimated_usd_micros, Some(500));
+    assert_eq!(opus.subagent.input_tokens, Some(40));
+    assert_eq!(opus.subagent.estimated_usd_micros, Some(200));
+    assert_eq!(opus.total_usd_micros(), Some(700));
+
+    // totals() folds every bucket and both origins.
+    let totals = ledger.totals();
+    assert_eq!(totals.estimated_usd_micros, Some(707));
+    assert_eq!(totals.input_tokens, Some(145));
+
+    // merge accumulates field-wise into the matching key.
+    let mut other = ModelLedger::default();
+    other.record(
+        "anthropic",
+        "opus",
+        CostOrigin::Main,
+        &CostSnapshot {
+            input_tokens: Some(1),
+            estimated_usd_micros: Some(3),
+            ..Default::default()
+        },
+    );
+    ledger.merge(&other);
+    let opus = ledger.iter().find(|b| b.model == "opus").unwrap();
+    assert_eq!(opus.main.input_tokens, Some(101));
+    assert_eq!(opus.main.estimated_usd_micros, Some(503));
+}
+
+#[test]
+fn session_metrics_merge_turn_folds_model_ledger() {
+    let mut turn = TurnMetrics::default();
+    turn.model_ledger.record(
+        "openai",
+        "gpt-5.5",
+        CostOrigin::Main,
+        &CostSnapshot {
+            estimated_usd_micros: Some(42),
+            ..Default::default()
+        },
+    );
+    let mut session = SessionMetrics::default();
+    session.merge_turn(&turn);
+    session.merge_turn(&turn);
+    let bucket = session
+        .model_ledger
+        .iter()
+        .find(|b| b.model == "gpt-5.5")
+        .expect("gpt-5.5 bucket");
+    assert_eq!(bucket.main.estimated_usd_micros, Some(84));
+}

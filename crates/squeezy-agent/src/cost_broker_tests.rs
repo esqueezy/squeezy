@@ -95,7 +95,12 @@ fn unenforceable_cap_round_signals_once_and_freezes_accumulator() {
         ..Default::default()
     };
 
-    let cap_status = broker.record_provider_cost(&no_pricing);
+    let cap_status = broker.record_provider_cost(
+        "anthropic",
+        "claude-haiku-4-5-20251001",
+        CostOrigin::Main,
+        &no_pricing,
+    );
     assert!(
         cap_status.is_none(),
         "no dollar estimate means no warning/cap event can fire"
@@ -459,4 +464,84 @@ fn budget_denied_result_counts_once_across_accounting_paths() {
     broker.record_model_result(&result);
 
     assert_eq!(broker.metrics.budget_denials, 1);
+}
+
+#[test]
+fn record_provider_cost_populates_per_model_ledger_without_drift() {
+    let mut broker = CostBroker::new(&AppConfig::default());
+    broker.record_provider_cost(
+        "anthropic",
+        "opus",
+        CostOrigin::Main,
+        &CostSnapshot {
+            input_tokens: Some(100),
+            estimated_usd_micros: Some(500),
+            ..Default::default()
+        },
+    );
+    broker.record_provider_cost(
+        "anthropic",
+        "haiku",
+        CostOrigin::Subagent,
+        &CostSnapshot {
+            input_tokens: Some(20),
+            estimated_usd_micros: Some(30),
+            ..Default::default()
+        },
+    );
+
+    let models: Vec<String> = broker
+        .metrics
+        .model_ledger
+        .iter()
+        .map(|b| b.model.clone())
+        .collect();
+    assert!(models.contains(&"opus".to_string()));
+    assert!(models.contains(&"haiku".to_string()));
+
+    // The opus round was main-origin, the haiku round subagent-origin.
+    let opus = broker
+        .metrics
+        .model_ledger
+        .iter()
+        .find(|b| b.model == "opus")
+        .unwrap();
+    assert_eq!(opus.main.estimated_usd_micros, Some(500));
+    assert_eq!(opus.subagent.estimated_usd_micros, None);
+    let haiku = broker
+        .metrics
+        .model_ledger
+        .iter()
+        .find(|b| b.model == "haiku")
+        .unwrap();
+    assert_eq!(haiku.subagent.estimated_usd_micros, Some(30));
+    assert_eq!(haiku.main.estimated_usd_micros, None);
+
+    // The ledger total never drifts from the flat aggregate or the running
+    // session snapshot — they all sum the same recorded rounds.
+    assert_eq!(
+        broker.metrics.model_ledger.totals().estimated_usd_micros,
+        Some(530)
+    );
+    assert_eq!(broker.metrics.provider.estimated_usd_micros, Some(530));
+    assert_eq!(
+        broker.session_cost_snapshot().estimated_usd_micros,
+        Some(530)
+    );
+}
+
+#[test]
+fn session_metrics_without_model_ledger_field_deserializes_empty() {
+    // A session persisted before `model_ledger` existed (field absent) must
+    // deserialize with an empty ledger and never error — the resume-safety
+    // contract for the additive `#[serde(default)]` field.
+    let mut value = serde_json::to_value(squeezy_core::SessionMetrics::default())
+        .expect("serialize default SessionMetrics");
+    value
+        .as_object_mut()
+        .expect("metrics serialize to a JSON object")
+        .remove("model_ledger");
+    let metrics: squeezy_core::SessionMetrics =
+        serde_json::from_value(value).expect("legacy SessionMetrics without model_ledger");
+    assert!(metrics.model_ledger.is_empty());
 }

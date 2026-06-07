@@ -1033,6 +1033,7 @@ async fn print_mode_auto_approves_ask_capability_so_ci_does_not_hang() {
         context_estimate: squeezy_core::ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");

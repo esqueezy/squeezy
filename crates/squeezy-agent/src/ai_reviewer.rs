@@ -8,11 +8,12 @@ use std::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{
-    AppConfig, PermissionAction, PermissionCapability, PermissionRequest, PermissionRisk,
-    PermissionVerdict, Role, TranscriptItem, TurnId,
+    AppConfig, CostSnapshot, PermissionAction, PermissionCapability, PermissionRequest,
+    PermissionRisk, PermissionVerdict, Role, TranscriptItem, TurnId,
 };
 use squeezy_llm::{
-    LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest, provider_honors_output_schema,
+    LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest, estimate_cost,
+    provider_honors_output_schema,
 };
 use squeezy_skills::{APPROVAL_POLICY_DOC_PATH, bundled_doc};
 use squeezy_telemetry::{TelemetryClient, TelemetryEvent};
@@ -139,6 +140,29 @@ pub(crate) enum AiReviewerOutcome {
     CircuitTripped { reason: String },
 }
 
+/// A reviewer decision plus the cost of the reviewer's LLM call, so the caller
+/// can fold the (real, billable) review spend into session accounting instead
+/// of dropping it. `cost`/`model` are populated only when a review call
+/// actually billed; they default to an empty snapshot / empty model on paths
+/// that never reached the provider (reviewer disabled, circuit-bypassed,
+/// policy load failed, call errored, or timed out before a `Completed`).
+pub(crate) struct AiReviewerResult {
+    pub outcome: AiReviewerOutcome,
+    pub cost: CostSnapshot,
+    pub model: String,
+}
+
+impl AiReviewerResult {
+    /// Decision reached without (or before) a billable LLM call.
+    fn no_cost(outcome: AiReviewerOutcome) -> Self {
+        Self {
+            outcome,
+            cost: CostSnapshot::default(),
+            model: String::new(),
+        }
+    }
+}
+
 pub(crate) struct AiReviewerInput<'a> {
     pub(crate) config: &'a AppConfig,
     pub(crate) provider: Arc<dyn LlmProvider>,
@@ -150,12 +174,12 @@ pub(crate) struct AiReviewerInput<'a> {
     pub(crate) telemetry: TelemetryClient,
 }
 
-pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerOutcome {
+pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerResult {
     let reviewer = &input.config.permissions.ai_reviewer;
     if !reviewer.enabled {
-        return AiReviewerOutcome::NoDecision {
+        return AiReviewerResult::no_cost(AiReviewerOutcome::NoDecision {
             reason: "ai reviewer disabled".to_string(),
-        };
+        });
     }
 
     if let Some(reason) = {
@@ -171,7 +195,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         }
         reason
     } {
-        return AiReviewerOutcome::CircuitTripped { reason };
+        return AiReviewerResult::no_cost(AiReviewerOutcome::CircuitTripped { reason });
     }
 
     let policy = match load_policy(input.config) {
@@ -183,7 +207,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
                 ReviewerAuditVerdict::NoDecision,
                 &reason,
             );
-            return AiReviewerOutcome::NoDecision { reason };
+            return AiReviewerResult::no_cost(AiReviewerOutcome::NoDecision { reason });
         }
     };
     let prompt = {
@@ -224,13 +248,13 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         ..LlmRequest::default()
     };
     let timeout = Duration::from_secs(reviewer.timeout_secs);
-    let response = match tokio::time::timeout(
+    let (response, mut reviewer_cost) = match tokio::time::timeout(
         timeout,
         collect_reviewer_text(input.provider.clone(), request, input.cancel.clone()),
     )
     .await
     {
-        Ok(Ok(text)) => text,
+        Ok(Ok((text, cost))) => (text, cost),
         Ok(Err(reason)) => {
             input.state.lock().expect("ai reviewer state").record_audit(
                 input.turn_id,
@@ -238,7 +262,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
                 ReviewerAuditVerdict::NoDecision,
                 &reason,
             );
-            return AiReviewerOutcome::NoDecision { reason };
+            return AiReviewerResult::no_cost(AiReviewerOutcome::NoDecision { reason });
         }
         Err(_) => {
             let reason = "ai reviewer timed out".to_string();
@@ -248,8 +272,20 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
                 ReviewerAuditVerdict::NoDecision,
                 &reason,
             );
-            return AiReviewerOutcome::NoDecision { reason };
+            return AiReviewerResult::no_cost(AiReviewerOutcome::NoDecision { reason });
         }
+    };
+    // The reviewer LLM call is real billable spend; price it the same way the
+    // main loop does when the provider stays silent on usage, then carry it on
+    // every downstream return so the caller can fold it into session cost.
+    if reviewer_cost.estimated_usd_micros.is_none() {
+        reviewer_cost.estimated_usd_micros =
+            estimate_cost(input.provider.name(), &model, &reviewer_cost);
+    }
+    let reviewer_result = |outcome| AiReviewerResult {
+        outcome,
+        cost: reviewer_cost.clone(),
+        model: model.clone(),
     };
     let Some(decision) = parse_reviewer_response(&response) else {
         let reason = "ai reviewer returned invalid decision JSON".to_string();
@@ -259,9 +295,9 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
             ReviewerAuditVerdict::NoDecision,
             &reason,
         );
-        return AiReviewerOutcome::NoDecision { reason };
+        return reviewer_result(AiReviewerOutcome::NoDecision { reason });
     };
-    match decision.action {
+    reviewer_result(match decision.action {
         PermissionAction::Allow => {
             if reviewer_may_auto_allow(&reviewer.allow_capabilities, input.request) {
                 let reason = format!("AI reviewer approved: {}", decision.reason);
@@ -342,7 +378,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
                     ReviewerAuditVerdict::CircuitTripped,
                     &reason,
                 );
-                return AiReviewerOutcome::CircuitTripped { reason };
+                return reviewer_result(AiReviewerOutcome::CircuitTripped { reason });
             }
             let reason = format!("AI reviewer denied: {}", decision.reason);
             input.state.lock().expect("ai reviewer state").record_audit(
@@ -363,20 +399,29 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
                 silent: false,
             })
         }
-    }
+    })
 }
 
 async fn collect_reviewer_text(
     provider: Arc<dyn LlmProvider>,
     request: LlmRequest,
     cancel: CancellationToken,
-) -> Result<String, String> {
+) -> Result<(String, CostSnapshot), String> {
     let mut stream = provider.stream_response(request, cancel);
     let mut text = String::new();
+    let mut cost = CostSnapshot::default();
     while let Some(event) = stream.next().await {
         match event.map_err(|err| err.to_string())? {
             LlmEvent::TextDelta(delta) => text.push_str(&delta),
-            LlmEvent::Completed { .. } | LlmEvent::Cancelled => break,
+            // Capture the provider-reported usage so the caller can bill the
+            // review round; a mid-stream cancel leaves the default snapshot.
+            LlmEvent::Completed {
+                cost: completed, ..
+            } => {
+                cost = completed;
+                break;
+            }
+            LlmEvent::Cancelled => break,
             LlmEvent::Started
             | LlmEvent::ToolCall(_)
             | LlmEvent::ReasoningDelta { .. }
@@ -388,7 +433,7 @@ async fn collect_reviewer_text(
             _ => { /* future variant */ }
         }
     }
-    Ok(text)
+    Ok((text, cost))
 }
 
 fn load_policy(config: &AppConfig) -> Result<String, String> {

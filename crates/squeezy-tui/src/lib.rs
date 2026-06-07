@@ -837,6 +837,9 @@ async fn run_inner_with_terminal(
     app.attachments = agent.context_attachments_snapshot().await;
     app.context_compaction = agent.context_compaction_snapshot().await;
     app.context_estimate = agent.context_estimate_snapshot().await;
+    // Seed the session-cumulative cost from the resumed session so the status
+    // line shows prior spend immediately, before the first new turn completes.
+    app.cost = agent.session_accounting_snapshot().await.cost;
     app.job_rx = Some(agent.subscribe_jobs());
     app.jobs = agent
         .jobs_snapshot()
@@ -2629,7 +2632,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
-    if app.overlay.is_some() && handle_overlay_key(app, key) {
+    if app.overlay.is_some() && handle_overlay_key(app, agent, key) {
         return Ok(false);
     }
 
@@ -15863,6 +15866,11 @@ pub(crate) struct TuiApp {
     /// noisy `unified-diff fallback could not apply cleanly` that the
     /// agent immediately recovered from doesn't end up in scrollback.
     pub(crate) recent_edit_failures: HashMap<PathBuf, u64>,
+    /// Session-cumulative cost (token distribution + USD) shown on the status
+    /// line. Seeded from the resumed session at boot and refreshed from the
+    /// `session_cost` snapshot on `CostUpdate`/`Completed`/`Cancelled`/`Failed`
+    /// so it ticks live mid-turn and never blanks after a cancel/fail. Reset
+    /// only on `/clear`.
     pub(crate) cost: squeezy_core::CostSnapshot,
     /// Session-level cap in USD micros, sourced from
     /// `AppConfig.max_session_cost_usd_micros`. `None` (or a zero cap)

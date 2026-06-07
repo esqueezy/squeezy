@@ -13076,6 +13076,119 @@ impl SubagentKindBucket {
     }
 }
 
+/// Origin of a recorded provider cost: the main agent's own LLM rounds vs.
+/// work done inside a dispatched subagent. Selects which slot of a
+/// [`ModelCostBucket`] a round folds into. Not serialized — it is a
+/// record-time selector, not stored state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostOrigin {
+    Main,
+    Subagent,
+}
+
+/// Per-`(provider, model)` cost bucket, split by [`CostOrigin`] so `/cost`
+/// can show what the main agent spent on a model separately from what
+/// subagents spent on it. Each slot carries a full [`CostSnapshot`], so the
+/// input/output/cache-read/cache-write distribution is preserved per model
+/// and per origin. `provider`/`model` are stored inline because the map key
+/// in [`ModelLedger`] must be an opaque string — `serde_json` cannot
+/// serialize a map keyed by a struct.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCostBucket {
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub main: CostSnapshot,
+    #[serde(default)]
+    pub subagent: CostSnapshot,
+}
+
+impl ModelCostBucket {
+    pub fn merge(&mut self, other: &ModelCostBucket) {
+        merge_cost_snapshot(&mut self.main, &other.main);
+        merge_cost_snapshot(&mut self.subagent, &other.subagent);
+    }
+
+    /// Combined estimated USD across both origins (`None` only when neither
+    /// slot carries a priced round).
+    pub fn total_usd_micros(&self) -> Option<u64> {
+        add_optional_u64(
+            self.main.estimated_usd_micros,
+            self.subagent.estimated_usd_micros,
+        )
+    }
+}
+
+/// Per-`(provider, model)` cost ledger attached to [`TurnMetrics`] /
+/// [`SessionMetrics`]. Additive-only and parallel to the flat
+/// `provider`/`subagent_provider` totals — it is never summed into the
+/// session dollar total, only used to attribute already-computed spend to the
+/// model that produced it. Keyed by an opaque `provider\u{1f}model` string
+/// (the unit separator can't appear in a provider or model id), so the value
+/// round-trips through `serde_json`; render from the bucket's stored
+/// `provider`/`model` rather than parsing the key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelLedger(#[serde(default)] pub std::collections::BTreeMap<String, ModelCostBucket>);
+
+impl ModelLedger {
+    fn key(provider: &str, model: &str) -> String {
+        format!("{provider}\u{1f}{model}")
+    }
+
+    /// Fold one round's cost into the `(provider, model)` bucket on the side
+    /// selected by `origin`. Reuses [`merge_cost_snapshot`] so the field-wise
+    /// accumulation matches every other cost rollup.
+    pub fn record(&mut self, provider: &str, model: &str, origin: CostOrigin, cost: &CostSnapshot) {
+        let bucket = self
+            .0
+            .entry(Self::key(provider, model))
+            .or_insert_with(|| ModelCostBucket {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                ..Default::default()
+            });
+        let slot = match origin {
+            CostOrigin::Main => &mut bucket.main,
+            CostOrigin::Subagent => &mut bucket.subagent,
+        };
+        merge_cost_snapshot(slot, cost);
+    }
+
+    pub fn merge(&mut self, other: &ModelLedger) {
+        for (key, bucket) in other.0.iter() {
+            self.0
+                .entry(key.clone())
+                .or_insert_with(|| ModelCostBucket {
+                    provider: bucket.provider.clone(),
+                    model: bucket.model.clone(),
+                    ..Default::default()
+                })
+                .merge(bucket);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ModelCostBucket> {
+        self.0.values()
+    }
+
+    /// Combined cost across every bucket and both origins (main + subagent).
+    /// Used for the `/cost` "By model" Σ total row; equals the session's
+    /// `provider` + `subagent_provider` aggregate by construction, so the
+    /// drill's total matches the headline.
+    pub fn totals(&self) -> CostSnapshot {
+        let mut total = CostSnapshot::default();
+        for bucket in self.0.values() {
+            merge_cost_snapshot(&mut total, &bucket.main);
+            merge_cost_snapshot(&mut total, &bucket.subagent);
+        }
+        total
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMetrics {
     pub turns: u64,
@@ -13108,6 +13221,12 @@ pub struct SessionMetrics {
     pub subagent_provider: CostSnapshot,
     #[serde(default)]
     pub subagent_by_kind: SubagentKindMetrics,
+    /// Per-`(provider, model)` cost ledger: attributes the session's
+    /// already-computed spend to the model that produced it, split main vs
+    /// subagent. Additive-only and never summed into the dollar total. Empty
+    /// on sessions persisted before this field existed.
+    #[serde(default)]
+    pub model_ledger: ModelLedger,
     /// Cumulative USD micros spent on cheap-tier routing-judge calls
     /// across the session.
     #[serde(default)]
@@ -13162,6 +13281,7 @@ impl SessionMetrics {
         merge_cost_snapshot(&mut self.provider, &turn.provider);
         merge_cost_snapshot(&mut self.subagent_provider, &turn.subagent_provider);
         self.subagent_by_kind.merge(&turn.subagent_by_kind);
+        self.model_ledger.merge(&turn.model_ledger);
         self.routing_judge_usd_micros = self
             .routing_judge_usd_micros
             .saturating_add(turn.routing_judge_usd_micros);
@@ -13211,6 +13331,10 @@ pub struct TurnMetrics {
     pub subagent_provider: CostSnapshot,
     #[serde(default)]
     pub subagent_by_kind: SubagentKindMetrics,
+    /// Per-`(provider, model)` cost ledger for this turn, split main vs
+    /// subagent. Folded into the session ledger by [`SessionMetrics::merge_turn`].
+    #[serde(default)]
+    pub model_ledger: ModelLedger,
     /// USD micros spent on the borderline-classification call
     /// dispatched by the cheap-model fast path. Zero on turns where the
     /// heuristic fired (no judge call) or routing was disabled.

@@ -1799,6 +1799,7 @@ async fn cancelled_turn_auto_drains_next_queued_prompt() {
         turn_id: TurnId::new(1),
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
+        session_cost: None,
     })
     .await
     .expect("send cancelled");
@@ -1808,6 +1809,84 @@ async fn cancelled_turn_auto_drains_next_queued_prompt() {
     assert!(
         app.auto_drain_queue,
         "Cancelled with a non-empty queue must set the auto-drain flag",
+    );
+}
+
+#[tokio::test]
+async fn status_line_cost_ticks_live_and_survives_cancel() {
+    let mut app = test_app(SessionMode::Build);
+    assert_eq!(
+        app.cost.estimated_usd_micros, None,
+        "status-line cost starts blank"
+    );
+
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    // A mid-turn progress event carries the session-cumulative cost, so the
+    // status line ticks up live before the turn finishes.
+    tx.send(AgentEvent::CostUpdate {
+        turn_id: TurnId::new(1),
+        tool_count: 1,
+        input_tokens: 10,
+        micro_usd: 0,
+        session_cost: Some(CostSnapshot {
+            estimated_usd_micros: Some(1_234),
+            ..CostSnapshot::default()
+        }),
+    })
+    .await
+    .expect("send cost update");
+    // Cancelling mid-turn carries the cumulative partial; the status line must
+    // keep showing it rather than blanking to `-` (the reported bug).
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        session_cost: Some(CostSnapshot {
+            estimated_usd_micros: Some(1_500),
+            ..CostSnapshot::default()
+        }),
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        app.cost.estimated_usd_micros,
+        Some(1_500),
+        "cancel must keep the cumulative cost on the status line"
+    );
+}
+
+#[tokio::test]
+async fn status_line_cost_not_clobbered_by_no_broker_failure() {
+    let mut app = test_app(SessionMode::Build);
+    app.cost = CostSnapshot {
+        estimated_usd_micros: Some(900),
+        ..CostSnapshot::default()
+    };
+
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    // An outer / no-broker failure carries no cumulative snapshot; it must not
+    // wipe the last known cost off the status line.
+    tx.send(AgentEvent::Failed {
+        turn_id: TurnId::new(1),
+        error: squeezy_core::SqueezyError::Agent("boom".to_string()),
+        session_cost: None,
+    })
+    .await
+    .expect("send failed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        app.cost.estimated_usd_micros,
+        Some(900),
+        "a no-broker failure must leave the last cumulative cost intact"
     );
 }
 
@@ -2116,6 +2195,7 @@ async fn completed_transcript_is_plan_free_after_stream_extraction() {
         context_estimate: ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");
@@ -2174,6 +2254,7 @@ async fn unterminated_proposed_plan_block_does_not_duplicate_at_completion() {
         context_estimate: ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");
@@ -4191,6 +4272,122 @@ fn format_cost_command_renders_active_buckets() {
         raw.contains('\x1b'),
         "cost output should embed ANSI escapes: {raw:?}"
     );
+}
+
+#[test]
+fn format_cost_command_renders_by_model_drill() {
+    use squeezy_agent::{
+        AttachmentShape, ConversationShape, McpAccounting, SessionAccountingSnapshot,
+        SkillsAccounting, TranscriptShape,
+    };
+    use squeezy_core::{CostOrigin, CostSnapshot, ModelLedger, SessionMetrics, SessionMode};
+    use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
+
+    let estimate = RequestTokenEstimate {
+        input_tokens: 0,
+        context_window_tokens: None,
+        effective_context_window_tokens: None,
+        headroom_tokens: None,
+        max_output_tokens: None,
+        input_budget_tokens: None,
+        remaining_input_tokens: None,
+        used_input_percent_x100: None,
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        estimated: true,
+        limit_source: squeezy_llm::LimitSource::CuratedBundle,
+        limit_confidence: squeezy_llm::LimitConfidence::High,
+        observed_ceiling_tokens: None,
+        models_dev_window_tokens: None,
+        effective_context_window_percent: 95,
+        baseline_reserve_tokens: 12_000,
+    };
+
+    // Build a ledger spanning two models: opus (main only — the active model)
+    // and haiku (a routing-judge main slice plus subagent spend).
+    let mut model_ledger = ModelLedger::default();
+    model_ledger.record(
+        "anthropic",
+        "claude-opus-4-8",
+        CostOrigin::Main,
+        &CostSnapshot {
+            input_tokens: Some(320_000),
+            output_tokens: Some(8_000),
+            cached_input_tokens: Some(210_000),
+            cache_write_input_tokens: Some(90_000),
+            estimated_usd_micros: Some(900_000),
+            ..CostSnapshot::default()
+        },
+    );
+    model_ledger.record(
+        "anthropic",
+        "claude-haiku-4-5",
+        CostOrigin::Main,
+        &CostSnapshot {
+            input_tokens: Some(8_000),
+            output_tokens: Some(200),
+            estimated_usd_micros: Some(10_000),
+            ..CostSnapshot::default()
+        },
+    );
+    model_ledger.record(
+        "anthropic",
+        "claude-haiku-4-5",
+        CostOrigin::Subagent,
+        &CostSnapshot {
+            input_tokens: Some(24_000),
+            output_tokens: Some(900),
+            estimated_usd_micros: Some(48_000),
+            ..CostSnapshot::default()
+        },
+    );
+
+    let metrics = SessionMetrics {
+        subagent_calls: 1,
+        subagent_provider: CostSnapshot {
+            estimated_usd_micros: Some(48_000),
+            ..CostSnapshot::default()
+        },
+        model_ledger,
+        ..SessionMetrics::default()
+    };
+
+    let snapshot = SessionAccountingSnapshot {
+        session_id: Some("sess-1".to_string()),
+        provider: "anthropic",
+        model: "claude-opus-4-8".to_string(),
+        mode: SessionMode::Build,
+        store_responses: false,
+        previous_response_id: None,
+        // Main-origin aggregate (opus 900k + haiku judge 10k).
+        cost: CostSnapshot {
+            estimated_usd_micros: Some(910_000),
+            ..CostSnapshot::default()
+        },
+        metrics,
+        redactions: 0,
+        transcript: TranscriptShape::default(),
+        conversation: ConversationShape::default(),
+        attachments: AttachmentShape::default(),
+        transmitted_request: estimate,
+        full_history_request: estimate,
+        skills: SkillsAccounting::default(),
+        mcp: McpAccounting::default(),
+    };
+
+    let output = strip_ansi_escape_sequences(&commands::format_cost_command(&snapshot));
+    assert!(output.contains("By model"), "{output}");
+    // Highest-spend model first, marked active, with main/subagent split and
+    // the full token distribution.
+    assert!(output.contains("anthropic:claude-opus-4-8"), "{output}");
+    assert!(output.contains("(active)"), "{output}");
+    assert!(output.contains("anthropic:claude-haiku-4-5"), "{output}");
+    assert!(output.contains("main usd="), "{output}");
+    assert!(output.contains("subagent usd="), "{output}");
+    assert!(output.contains("cache_r=210000"), "{output}");
+    assert!(output.contains("cache_w=90000"), "{output}");
+    // Σ total == cost.estimated_usd (910000) + subagent_provider (48000) == 958000
+    // == sum of every ledger bucket. This invariant keeps the drill honest.
+    assert!(output.contains("total usd=$0.958000"), "{output}");
 }
 
 #[tokio::test]
@@ -9338,6 +9535,7 @@ async fn successful_edit_turn_pushes_diff_undo_hint() {
         context_estimate: ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");
@@ -9385,6 +9583,7 @@ async fn successful_edit_turn_hides_undo_hint_when_checkpointing_disabled() {
         context_estimate: ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");
@@ -9426,6 +9625,7 @@ async fn readonly_turn_does_not_push_undo_hint() {
         context_estimate: ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");
@@ -9472,6 +9672,7 @@ async fn repeated_raw_shell_output_is_not_rendered_as_assistant_reply() {
         context_estimate: ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");
@@ -9518,6 +9719,7 @@ async fn failed_edit_turn_error_status_mentions_undo() {
     tx.send(AgentEvent::Failed {
         turn_id: TurnId::new(1),
         error: SqueezyError::Permission("denied".to_string()),
+        session_cost: None,
     })
     .await
     .expect("send failed");
@@ -9586,6 +9788,7 @@ async fn completion_clears_cancelled_prompt() {
         context_estimate: ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");
@@ -9610,6 +9813,7 @@ async fn cancel_restores_prompt_into_composer() {
         turn_id: TurnId::new(1),
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
+        session_cost: None,
     })
     .await
     .expect("send cancelled");
@@ -9640,6 +9844,7 @@ async fn cancel_does_not_clobber_draft_typed_during_interrupt() {
         turn_id: TurnId::new(1),
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
+        session_cost: None,
     })
     .await
     .expect("send cancelled");
@@ -9747,6 +9952,7 @@ async fn send_completed_with_estimate(app: &mut TuiApp, turn: u64, estimate: Con
         context_estimate: estimate,
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");
@@ -9973,6 +10179,7 @@ async fn completed_event_preserves_scroll_offset_in_history() {
         context_estimate: ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");
@@ -10027,6 +10234,7 @@ async fn completed_event_suppresses_assistant_duplicate_shell_output_fence() {
         context_estimate: ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");
@@ -10086,6 +10294,7 @@ async fn completed_event_keeps_substantive_assistant_summary_after_tool_output()
         context_estimate: ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");
@@ -10155,6 +10364,7 @@ async fn completed_event_suppresses_materially_repeated_shell_output_fence() {
         context_estimate: ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");
@@ -12898,6 +13108,7 @@ async fn turn_completion_preserves_transcript_overlay_scrollbar_drag_mode() {
         context_estimate: ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");
@@ -12934,6 +13145,7 @@ async fn esc_still_closes_overlay_after_turn_completes_from_scrollbar_drag_mode(
         context_estimate: ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");
@@ -12975,6 +13187,7 @@ async fn ctrl_c_still_reaches_exit_confirm_after_turn_completes_from_scrollbar_d
         context_estimate: ContextEstimate::default(),
         stop_reason: None,
         reasoning_only_stop: false,
+        session_cost: None,
     })
     .await
     .expect("send completed");

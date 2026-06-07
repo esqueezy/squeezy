@@ -362,9 +362,9 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::Completed {
                     message,
-                    cost,
                     metrics,
                     context_estimate,
+                    session_cost,
                     ..
                 } => {
                     if let Some(message) = dedupe_assistant_repeated_tool_output(app, message) {
@@ -380,7 +380,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.last_turn_had_edits = false;
                     }
                     maybe_push_context_compaction_nudge(app);
-                    app.cost = cost;
+                    // The status-line cost segment shows session-cumulative
+                    // spend. Refresh it from the event's cumulative snapshot;
+                    // events without one (help / local-tool turns) leave the
+                    // last known value rather than blanking.
+                    if let Some(session_cost) = session_cost {
+                        app.cost = session_cost;
+                    }
                     app.metrics = metrics;
                     app.status = "ready".to_string();
                     app.turn_visual = TurnVisualState::Succeeded;
@@ -428,6 +434,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     tool_count,
                     input_tokens,
                     micro_usd,
+                    session_cost,
                     ..
                 } => {
                     // Progressive per-turn cost lives in the status bar so
@@ -435,6 +442,11 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // Suppress identical resends (the broker fires on a
                     // tool-count stride, not a token-delta).
                     app.update_turn_progress(tool_count, input_tokens, micro_usd);
+                    // Also tick the session-cumulative cost segment live, so it
+                    // is current mid-turn and never blanks if the turn breaks.
+                    if let Some(session_cost) = session_cost {
+                        app.cost = session_cost;
+                    }
                 }
                 AgentEvent::ToolProgress {
                     tool_name,
@@ -446,7 +458,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // one append per second drowns the actual output.
                     app.note_active_tool_progress(&tool_name, elapsed_ms);
                 }
-                AgentEvent::Cancelled { .. } => {
+                AgentEvent::Cancelled { session_cost, .. } => {
+                    // Keep the session-cumulative cost on the status line after
+                    // a mid-turn cancel (the partial round was already billed),
+                    // instead of letting it go stale / blank.
+                    if let Some(session_cost) = session_cost {
+                        app.cost = session_cost;
+                    }
                     let mut message = "cancelled; edit prompt or retry".to_string();
                     if app.last_turn_had_edits {
                         append_edit_recovery_hint(&mut message, app);
@@ -478,7 +496,16 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     app.auto_drain_queue = !app.prompt_queue.is_empty();
                     break;
                 }
-                AgentEvent::Failed { error, .. } => {
+                AgentEvent::Failed {
+                    error,
+                    session_cost,
+                    ..
+                } => {
+                    // A failed turn still billed for any completed rounds; keep
+                    // that spend on the status line instead of blanking it.
+                    if let Some(session_cost) = session_cost {
+                        app.cost = session_cost;
+                    }
                     let mut status = format_error_status(&error);
                     if app.last_turn_had_edits {
                         append_edit_recovery_hint(&mut status, app);

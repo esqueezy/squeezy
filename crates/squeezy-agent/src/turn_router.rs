@@ -447,6 +447,12 @@ pub(crate) struct ClassifyTurnInputs<'a> {
 pub(crate) struct ClassifyResult {
     pub decision: TurnRoutingDecision,
     pub judge_cost: CostSnapshot,
+    /// The model the routing judge actually billed, set only when a judge
+    /// call was dispatched. `None` on every early-return path that bills
+    /// nothing (heuristic, disabled, sticky, short follow-up, …) so the
+    /// caller attributes judge spend to the judge model and never invents a
+    /// per-model ledger key for a call that did not happen.
+    pub judge_model: Option<Arc<str>>,
 }
 
 impl ClassifyResult {
@@ -454,6 +460,7 @@ impl ClassifyResult {
         Self {
             decision: TurnRoutingDecision::Parent,
             judge_cost: CostSnapshot::default(),
+            judge_model: None,
         }
     }
 
@@ -461,6 +468,7 @@ impl ClassifyResult {
         Self {
             decision: TurnRoutingDecision::Cheap { reason, model },
             judge_cost: CostSnapshot::default(),
+            judge_model: None,
         }
     }
 }
@@ -572,10 +580,12 @@ pub(crate) async fn classify_turn(
                 model: cheap,
             },
             judge_cost,
+            judge_model: Some(judge_model),
         },
         _ => ClassifyResult {
             decision: TurnRoutingDecision::Parent,
             judge_cost,
+            judge_model: Some(judge_model),
         },
     }
 }
