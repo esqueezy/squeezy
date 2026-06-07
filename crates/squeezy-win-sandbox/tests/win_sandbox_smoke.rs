@@ -69,7 +69,7 @@ fn run_cmd_inner(
         Err(err) => return Err(format!("spawn_restricted_token returned error: {err}")),
     };
 
-    match rt.block_on(tokio::time::timeout(timeout, child.wait())) {
+    match rt.block_on(async { tokio::time::timeout(timeout, child.wait()).await }) {
         Ok(Ok(status)) => Ok(status),
         Ok(Err(err)) => Err(format!("wait failed: {err}")),
         Err(_) => {
