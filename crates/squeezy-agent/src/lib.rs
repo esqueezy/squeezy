@@ -94,7 +94,7 @@ use context_compaction::build_compaction_summary;
 use context_compaction::{
     PendingToolResult, SeenToolOutputs, compact_conversation, compact_conversation_with_strategy,
     drop_orphan_function_call_outputs, estimate_context, estimated_tokens,
-    maybe_compact_conversation, maybe_compact_mid_turn, next_context_pin_id, pack_tool_results,
+    maybe_compact_conversation, next_context_pin_id, pack_tool_results,
     repair_orphan_function_calls,
 };
 use cost_broker::{
@@ -103,9 +103,7 @@ use cost_broker::{
     round_input_gate_status,
 };
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
-use micro_compaction::{
-    SuccessfulEdit, mask_expired_reads_after_edits, maybe_micro_compact_mid_turn,
-};
+use micro_compaction::{SuccessfulEdit, mask_expired_reads_after_edits, maybe_micro_compact};
 use permission_persist::persist_permission_rule;
 use roles::{RoleModelPolicy, SubagentRole, role_config};
 
@@ -6469,6 +6467,33 @@ impl TurnRuntime {
             conversation.push(image_item.clone());
         }
         let mut context_compaction = prior_state.context_compaction.clone();
+        // Trim pre-pass: before the lossy summarize gate, reclaim older bulky
+        // `FunctionCallOutput` bodies (reads/shell/web) in place so they are
+        // cleared before any summary head replaces the older slice. Cheap and
+        // structure-preserving. It rewrites earlier items, so a successful trim
+        // invalidates response-id reuse below (forces a full resend).
+        let post_turn_trimmed =
+            if let Some(report) = maybe_micro_compact(&mut conversation, &self.config, None) {
+                self.log_event(
+                    "context_micro_compacted",
+                    Some(self.turn_id),
+                    Some(format!(
+                        "post-turn trim cleared {} tool outputs, freed {} bytes",
+                        report.cleared_call_ids.len(),
+                        report.bytes_saved,
+                    )),
+                    json!({
+                        "cleared_call_ids": &report.cleared_call_ids,
+                        "bytes_saved": report.bytes_saved,
+                        "before_estimated_tokens": report.before_estimated_tokens,
+                        "after_estimated_tokens": report.after_estimated_tokens,
+                        "phase": "post_turn",
+                    }),
+                );
+                true
+            } else {
+                false
+            };
         // PreCompact hook fires only when the auto trigger's
         // thresholds are crossed so handlers don't see a hook on every
         // turn — only when compaction will actually run. PostCompact
@@ -6492,7 +6517,7 @@ impl TurnRuntime {
         let compaction_likely = cc.enabled
             && (pre_compaction_estimate.items >= cc.min_items || over_high_water)
             && pre_compaction_estimate.items > effective_keep
-            && pre_compaction_tokens >= cc.post_turn_token_ceiling();
+            && pre_compaction_tokens >= cc.summarize_threshold();
         if compaction_likely {
             self.dispatch_pre_compact(pre_compaction_estimate.estimated_tokens);
         }
@@ -6546,7 +6571,12 @@ impl TurnRuntime {
         // previous_response_id must be invalidated the same way to keep
         // the provider state consistent.
         let mut previous_response_id = if self.config.store_responses {
-            if context_compaction.generation == prior_state.context_compaction.generation {
+            // A post-turn trim rewrote earlier outputs in place; reusing the
+            // server-side response id would leave the provider on its untrimmed
+            // copy, so force a full resend just like a generation bump does.
+            if !post_turn_trimmed
+                && context_compaction.generation == prior_state.context_compaction.generation
+            {
                 prior_state.previous_response_id.take()
             } else {
                 None
@@ -8546,37 +8576,26 @@ impl TurnRuntime {
                 }
             }
 
-            // Mid-turn compaction (F75): if the provider reported usage
-            // crossing the configured fraction of `model_context_window`,
-            // shrink the conversation before the next sample. Bumps the
-            // compaction generation, which forces previous_response_id
-            // off the next request to keep the provider state consistent
-            // with the new history.
-            //
-            // The PreCompact / PostCompact hook fan-out mirrors the
-            // pre-turn path: PreCompact fires only when the mid-turn
-            // gate will trip; PostCompact carries the report's
-            // before/after counts when the rewrite landed.
+            // Mid-turn trim: between tool rounds, reclaim older bulky
+            // `FunctionCallOutput` bodies in place when usage (provider-reported
+            // when available, else the local estimate) crosses the trim
+            // threshold, so a long tool-heavy turn does not outgrow the window.
+            // Summarize never runs mid-turn — it waits for the post-turn boundary
+            // or the forced overflow path. Trimming rewrites *earlier* outputs,
+            // so it forces the same response-id invalidation + full resend that
+            // expired-context masking does.
             let mid_turn_observed_tokens = total_tokens_from_cost(&completed_cost);
-            // Mid-tier micro-compaction (F12-cc-microcompaction): rewrite
-            // older `FunctionCallOutput` payloads in place before falling
-            // through to the all-or-nothing full tier. When the
-            // micro-threshold sits below the full-compaction threshold a
-            // successful micro pass can keep the conversation under the
-            // full gate, preserving per-turn tool-call structure. Pass the
-            // provider-reported total when we have one so the gate matches
-            // what the model actually saw.
-            let micro_report = maybe_micro_compact_mid_turn(
-                &mut conversation,
-                &self.config,
-                mid_turn_observed_tokens,
-            );
+            let micro_report = if self.config.context_compaction.enabled_mid_turn {
+                maybe_micro_compact(&mut conversation, &self.config, mid_turn_observed_tokens)
+            } else {
+                None
+            };
             if let Some(report) = micro_report.as_ref() {
                 self.log_event(
                     "context_micro_compacted",
                     Some(self.turn_id),
                     Some(format!(
-                        "mid-turn micro-compaction cleared {} tool outputs, freed {} bytes",
+                        "mid-turn trim cleared {} tool outputs, freed {} bytes",
                         report.cleared_call_ids.len(),
                         report.bytes_saved,
                     )),
@@ -8589,77 +8608,7 @@ impl TurnRuntime {
                     }),
                 );
             }
-            // After a micro pass the conversation is smaller; the
-            // provider-reported total reflects the pre-rewrite payload
-            // size and would over-fire the full-tier gate. Switch to the
-            // local estimate so full only fires if micro alone was not
-            // enough.
-            let full_gate_observed_tokens = if micro_report.is_some() {
-                Some(estimate_context(&conversation).estimated_tokens)
-            } else {
-                mid_turn_observed_tokens
-            };
-            let mid_turn_compaction_likely = mid_turn_compaction_will_fire(
-                &self.config,
-                &conversation,
-                full_gate_observed_tokens,
-            );
-            if mid_turn_compaction_likely {
-                let pre_estimate = full_gate_observed_tokens
-                    .unwrap_or_else(|| estimate_context(&conversation).estimated_tokens);
-                self.dispatch_pre_compact(pre_estimate);
-            }
-            let mid_turn_report = maybe_compact_mid_turn(
-                &mut conversation,
-                &mut context_compaction,
-                &active_attachments,
-                self.store.as_deref(),
-                &self.provider,
-                self.session_log.as_ref(),
-                &self.redactor,
-                &self.config,
-                full_gate_observed_tokens,
-            )
-            .await;
-            // Either tier mutates `conversation`, so the response-id reuse
-            // path must invalidate the cached id and resend the full
-            // conversation instead of the per-round outputs. Expired-context
-            // masking rewrites *earlier* outputs in place, so it must force
-            // the same full-resend — otherwise the per-round `outputs` would
-            // carry the verbatim bodies and the provider's server-side state
-            // would diverge from the locally-masked `conversation`.
-            let mid_turn_compacted =
-                mid_turn_report.is_some() || micro_report.is_some() || expired_context_masked;
-            if let Some(report) = mid_turn_report {
-                self.dispatch_post_compact(
-                    report.record.before.estimated_tokens,
-                    report.record.after.estimated_tokens,
-                );
-                self.log_event(
-                    "context_compacted",
-                    Some(self.turn_id),
-                    Some(format!(
-                        "mid-turn compacted gen={} {}->{} estimated tokens",
-                        report.record.generation,
-                        report.record.before.estimated_tokens,
-                        report.record.after.estimated_tokens,
-                    )),
-                    json!({
-                        "record": report.record,
-                        "summary": report.summary,
-                        "replacement_id": report.record.replacement_id,
-                        "conversation": report.post_compact,
-                        "phase": "mid_turn",
-                    }),
-                );
-                let _ = self
-                    .tx
-                    .send(AgentEvent::ContextCompacted {
-                        turn_id: self.turn_id,
-                        report,
-                    })
-                    .await;
-            }
+            let mid_turn_compacted = micro_report.is_some() || expired_context_masked;
 
             if self.config.store_responses {
                 previous_response_id = if implicit_instructions_added || mid_turn_compacted {
@@ -16801,28 +16750,6 @@ fn total_tokens_from_cost(cost: &CostSnapshot) -> Option<u64> {
         total = total.saturating_add(value);
     }
     if saw_any { Some(total) } else { None }
-}
-
-/// Mirror of the gate inside `maybe_compact_mid_turn`. Returns `true`
-/// when the configured threshold is crossed so the agent can fire a
-/// `HookEvent::PreCompact` before the rewrite call. Kept here (rather
-/// than in `context_compaction.rs`) because the hook fan-out is an
-/// agent-loop concern; the function reads only public config and
-/// estimator state so it stays a thin predicate.
-fn mid_turn_compaction_will_fire(
-    config: &AppConfig,
-    conversation: &[LlmInputItem],
-    last_total_tokens: Option<u64>,
-) -> bool {
-    if !config.context_compaction.enabled_mid_turn {
-        return false;
-    }
-    let Some(threshold) = config.context_compaction.mid_turn_full_threshold() else {
-        return false;
-    };
-    let observed =
-        last_total_tokens.unwrap_or_else(|| estimate_context(conversation).estimated_tokens);
-    observed >= threshold
 }
 
 pub(crate) fn compact_text(text: &str, max_chars: usize) -> String {
