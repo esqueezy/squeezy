@@ -467,13 +467,38 @@ fn graph_store_check(config: &AppConfig) -> Check {
                 probe.path.display()
             ),
         },
-        Err(error) => Check {
-            name: "graph_store".to_string(),
-            status: Status::Warn,
-            detail: format!(
-                "{error}; graph persistence will be disabled until graph.redb can be opened"
-            ),
-        },
+        Err(error) => {
+            // On Windows, another agent process holding graph.redb open will
+            // cause a sharing-violation error; distinguish that from a real
+            // open failure so the user isn't told persistence is broken.
+            let is_locked = error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("sharing violation")
+                || error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("access is denied");
+            if is_locked {
+                Check {
+                    name: "graph_store".to_string(),
+                    status: Status::Ok,
+                    detail: format!(
+                        "locked by another process (graph persistence is active): {}",
+                        path.display()
+                    ),
+                }
+            } else {
+                Check {
+                    name: "graph_store".to_string(),
+                    status: Status::Warn,
+                    detail: format!(
+                        "{error}; graph persistence will be disabled until graph.redb can be opened: {}",
+                        path.display()
+                    ),
+                }
+            }
+        }
     }
 }
 

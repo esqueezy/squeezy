@@ -171,16 +171,21 @@ fn randomish_nonce() -> u128 {
 
 #[cfg(windows)]
 fn replace_file_windows(from: &Path, to: &Path) -> io::Result<()> {
-    use std::{iter, os::windows::ffi::OsStrExt};
+    use std::{ffi::OsString, iter, os::windows::ffi::OsStrExt};
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
+    // MoveFileExW does not honour the long-path registry setting; use the \\?\
+    // prefix for absolute paths so paths longer than MAX_PATH succeed.
     fn wide(path: &Path) -> Vec<u16> {
-        path.as_os_str()
-            .encode_wide()
-            .chain(iter::once(0))
-            .collect()
+        let extended: OsString =
+            if path.is_absolute() && !path.as_os_str().to_string_lossy().starts_with(r"\\") {
+                OsString::from(format!(r"\\?\{}", path.display()))
+            } else {
+                path.as_os_str().to_owned()
+            };
+        extended.encode_wide().chain(iter::once(0)).collect()
     }
 
     let from = wide(from);

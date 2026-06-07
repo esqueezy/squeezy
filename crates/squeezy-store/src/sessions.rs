@@ -1283,11 +1283,8 @@ fn append_payload_once(
         }
         Ok(written)
     })();
-    if let Err(error) = lock.unlock()
-        && result.is_ok()
-    {
-        return Err((written, error));
-    }
+    // Unlock best-effort; the OS releases the lock when `lock` drops regardless.
+    let _ = lock.unlock();
     result
 }
 
@@ -2972,7 +2969,9 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
-    lock.unlock()?;
+    // The new index is on disk. Unlock best-effort; the OS releases the lock
+    // when `lock` drops regardless.
+    let _ = lock.unlock();
     Ok(())
 }
 

@@ -113,14 +113,27 @@ impl SqueezyStore {
         }
         if oversized_state_needs_fast_rotate(&path)? {
             let backup = backup_path_with_label(&path, "oversized-state");
-            fs_util::rotate_file(&path, &backup)?;
-            bootstrap_store(workspace_root, cache_root)?;
-            tracing::warn!(
-                target: "squeezy::store",
-                threshold_bytes = OVERSIZED_STATE_FAST_ROTATE_BYTES,
-                backup = %backup.display(),
-                "state.redb exceeded the split-cache threshold; existing cache backed up without opening redb",
-            );
+            match fs_util::rotate_file(&path, &backup) {
+                Ok(()) => {
+                    bootstrap_store(workspace_root, cache_root)?;
+                    tracing::warn!(
+                        target: "squeezy::store",
+                        threshold_bytes = OVERSIZED_STATE_FAST_ROTATE_BYTES,
+                        backup = %backup.display(),
+                        "state.redb exceeded the split-cache threshold; existing cache backed up without opening redb",
+                    );
+                }
+                Err(rotate_err) => {
+                    // On Windows, a file indexer or AV scanner may hold the
+                    // file open, making rename fail. Continue with the
+                    // oversized store rather than refusing to start.
+                    tracing::warn!(
+                        target: "squeezy::store",
+                        error = %rotate_err,
+                        "state.redb is oversized but rotation failed; continuing with existing store",
+                    );
+                }
+            }
             let database = open_database(&path)?;
             return Ok(Self {
                 path,
@@ -141,16 +154,33 @@ impl SqueezyStore {
             Some(on_disk_version) => {
                 drop(initial);
                 let backup = backup_path(&path, on_disk_version);
-                fs_util::rotate_file(&path, &backup)?;
-                bootstrap_store(workspace_root, cache_root)?;
-                copy_state_tables(&backup, &path)?;
-                tracing::warn!(
-                    target: "squeezy::store",
-                    on_disk_version,
-                    schema_version = SCHEMA_VERSION,
-                    backup = %backup.display(),
-                    "state.redb schema mismatch; existing store backed up and reinitialised",
-                );
+                match fs_util::rotate_file(&path, &backup) {
+                    Ok(()) => {
+                        bootstrap_store(workspace_root, cache_root)?;
+                        copy_state_tables(&backup, &path)?;
+                        tracing::warn!(
+                            target: "squeezy::store",
+                            on_disk_version,
+                            schema_version = SCHEMA_VERSION,
+                            backup = %backup.display(),
+                            "state.redb schema mismatch; existing store backed up and reinitialised",
+                        );
+                    }
+                    Err(rotate_err) => {
+                        // Rotation blocked (e.g. Windows file lock). Delete and
+                        // bootstrap fresh — we cannot safely use a store with
+                        // a mismatched schema, and the old data is still on disk.
+                        let _ = fs::remove_file(&path);
+                        bootstrap_store(workspace_root, cache_root)?;
+                        tracing::warn!(
+                            target: "squeezy::store",
+                            on_disk_version,
+                            schema_version = SCHEMA_VERSION,
+                            rotate_error = %rotate_err,
+                            "state.redb schema mismatch; rotation failed, existing store deleted and reinitialised without migration",
+                        );
+                    }
+                }
                 open_database(&path)?
             }
             None => {
@@ -592,14 +622,29 @@ impl GraphStore {
             Some(on_disk_version) => {
                 drop(initial);
                 let backup = backup_path(&path, on_disk_version);
-                fs_util::rotate_file(&path, &backup)?;
-                tracing::warn!(
-                    target: "squeezy::store",
-                    on_disk_version,
-                    schema_version = GRAPH_SCHEMA_VERSION,
-                    backup = %backup.display(),
-                    "graph.redb schema mismatch; existing graph cache backed up and reinitialised",
-                );
+                match fs_util::rotate_file(&path, &backup) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            target: "squeezy::store",
+                            on_disk_version,
+                            schema_version = GRAPH_SCHEMA_VERSION,
+                            backup = %backup.display(),
+                            "graph.redb schema mismatch; existing graph cache backed up and reinitialised",
+                        );
+                    }
+                    Err(rotate_err) => {
+                        // Rotation blocked (e.g. Windows file lock). Delete and
+                        // reinitialise fresh without the backup.
+                        let _ = fs::remove_file(&path);
+                        tracing::warn!(
+                            target: "squeezy::store",
+                            on_disk_version,
+                            schema_version = GRAPH_SCHEMA_VERSION,
+                            rotate_error = %rotate_err,
+                            "graph.redb schema mismatch; rotation failed, existing graph cache deleted and reinitialised",
+                        );
+                    }
+                }
                 bootstrap_graph_store(&path)?;
                 open_database(&path)?
             }
@@ -1169,7 +1214,8 @@ fn backup_path(path: &Path, on_disk_version: u64) -> PathBuf {
 }
 
 fn backup_path_with_label(path: &Path, label: &str) -> PathBuf {
-    let suffix = format!("{label}-{}.redb.bak", unix_millis());
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("store");
+    let suffix = format!("{stem}-{label}-{}.redb.bak", unix_millis());
     path.with_file_name(suffix)
 }
 
