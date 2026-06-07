@@ -255,6 +255,7 @@ fn cli_sessions_and_repo_json_flags_parse() {
 fn session_cli_json_uses_public_id_field() {
     let metadata = SessionMetadata {
         session_id: "session-123".to_string(),
+        parent_id: Some("parent-session-456".to_string()),
         ..Default::default()
     };
     let metadata_json = session_metadata_for_cli(&metadata).expect("metadata json");
@@ -266,6 +267,13 @@ fn session_cli_json_uses_public_id_field() {
             .starts_with("sess_")
     );
     assert!(metadata_json.get("session_id").is_none());
+    assert_ne!(metadata_json["parent_id"], "parent-session-456");
+    assert!(
+        metadata_json["parent_id"]
+            .as_str()
+            .expect("public parent id string")
+            .starts_with("sess_")
+    );
 
     let replay_json = session_replay_for_cli(SessionReplayTape {
         schema_version: 1,
@@ -276,6 +284,31 @@ fn session_cli_json_uses_public_id_field() {
     .expect("replay json");
     assert_eq!(replay_json["id"], metadata_json["id"]);
     assert!(replay_json.get("session_id").is_none());
+}
+
+#[test]
+fn session_cli_events_rewrite_raw_session_ids() {
+    let metadata = SessionMetadata {
+        session_id: "child-session".to_string(),
+        parent_id: Some("parent-session".to_string()),
+        ..Default::default()
+    };
+    let mapping = public_session_id_map_for_metadata(&metadata);
+    let events = vec![SessionEvent::new(
+        "session_forked",
+        None,
+        Some("forked from parent-session into child-session".to_string()),
+        serde_json::json!({
+            "parent_session_id": "parent-session",
+            "child_session_id": "child-session",
+        }),
+    )];
+
+    let events_json = session_events_for_cli(&events, &mapping).expect("events json");
+    let rendered = serde_json::to_string(&events_json).expect("render events");
+    assert!(!rendered.contains("parent-session"));
+    assert!(!rendered.contains("child-session"));
+    assert!(rendered.contains("sess_"));
 }
 
 #[test]

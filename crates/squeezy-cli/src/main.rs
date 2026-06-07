@@ -37,9 +37,9 @@ use config_browse::handle_browse_command;
 use doctor::DoctorArgs;
 use providers::{ProvidersCommand, handle_providers_command};
 use squeezy_store::{
-    BugReportOptions, CleanupMode, RepoProfileLoad, SemanticSupport, SessionMetadata, SessionQuery,
-    SessionReplayTape, SessionStatus, SessionStore, default_bug_report_path, ensure_repo_profile,
-    parse_bug_report_section, refresh_repo_profile,
+    BugReportOptions, CleanupMode, RepoProfileLoad, SemanticSupport, SessionEvent, SessionMetadata,
+    SessionQuery, SessionReplayTape, SessionStatus, SessionStore, default_bug_report_path,
+    ensure_repo_profile, parse_bug_report_section, refresh_repo_profile,
 };
 use squeezy_telemetry::{
     FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
@@ -1896,16 +1896,22 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             let resolved = resolve_session_show_id(&store, id)?;
             let record = store.show(&resolved)?;
             if *json {
+                let session_id_map = public_session_id_map_for_metadata(&record.metadata);
                 let metadata = session_metadata_for_cli(&record.metadata)?;
-                let replay = record.replay.map(session_replay_for_cli).transpose()?;
-                let body = serde_json::json!({
+                let events = session_events_for_cli(&record.events, &session_id_map)?;
+                let replay = record
+                    .replay
+                    .map(|tape| session_replay_for_cli_with_mapping(tape, &session_id_map))
+                    .transpose()?;
+                let mut body = serde_json::json!({
                     "metadata": metadata,
-                    "events": record.events,
+                    "events": events,
                     "event_warnings": record.event_warnings,
                     "resume_state": record.resume_state,
                     "attachments": record.attachments,
                     "replay": replay,
                 });
+                sanitize_session_ids_in_value(&mut body, &session_id_map);
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&body).map_err(|err| {
@@ -3023,6 +3029,12 @@ impl PublicSessionHandle {
     }
 }
 
+impl AsRef<str> for PublicSessionHandle {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 impl std::fmt::Display for PublicSessionHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -3039,9 +3051,11 @@ impl Serialize for PublicSessionHandle {
 }
 
 fn session_metadata_for_cli(metadata: &SessionMetadata) -> squeezy_core::Result<serde_json::Value> {
+    let session_id_map = public_session_id_map_for_metadata(metadata);
     let mut value = serde_json::to_value(metadata).map_err(|err| {
         SqueezyError::Parse(format!("failed to serialize session metadata: {err}"))
     })?;
+    sanitize_session_ids_in_value(&mut value, &session_id_map);
     let Some(object) = value.as_object_mut() else {
         return Err(SqueezyError::Parse(
             "session metadata did not serialize to an object".to_string(),
@@ -3057,12 +3071,84 @@ fn session_metadata_for_cli(metadata: &SessionMetadata) -> squeezy_core::Result<
 }
 
 fn session_replay_for_cli(tape: SessionReplayTape) -> squeezy_core::Result<serde_json::Value> {
+    let mut session_id_map = BTreeMap::new();
+    add_public_session_id_mapping(&mut session_id_map, &tape.session_id);
+    session_replay_for_cli_with_mapping(tape, &session_id_map)
+}
+
+fn session_replay_for_cli_with_mapping(
+    tape: SessionReplayTape,
+    session_id_map: &BTreeMap<String, String>,
+) -> squeezy_core::Result<serde_json::Value> {
+    let mut events = serde_json::to_value(tape.events).map_err(|err| {
+        SqueezyError::Parse(format!("failed to serialize session replay events: {err}"))
+    })?;
+    sanitize_session_ids_in_value(&mut events, session_id_map);
     Ok(serde_json::json!({
         "schema_version": tape.schema_version,
         "id": PublicSessionHandle::for_store_id(&tape.session_id),
-        "events": tape.events,
+        "events": events,
         "warnings": tape.warnings,
     }))
+}
+
+fn session_events_for_cli(
+    events: &[SessionEvent],
+    session_id_map: &BTreeMap<String, String>,
+) -> squeezy_core::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(events)
+        .map_err(|err| SqueezyError::Parse(format!("failed to serialize session events: {err}")))?;
+    sanitize_session_ids_in_value(&mut value, session_id_map);
+    Ok(value)
+}
+
+fn public_session_id_map_for_metadata(metadata: &SessionMetadata) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    add_public_session_id_mapping(&mut map, &metadata.session_id);
+    if let Some(parent_id) = metadata.parent_id.as_deref() {
+        add_public_session_id_mapping(&mut map, parent_id);
+    }
+    map
+}
+
+fn add_public_session_id_mapping(map: &mut BTreeMap<String, String>, session_id: &str) {
+    if session_id.is_empty() {
+        return;
+    }
+    map.insert(
+        session_id.to_string(),
+        PublicSessionHandle::for_store_id(session_id)
+            .as_ref()
+            .to_string(),
+    );
+}
+
+fn sanitize_session_ids_in_value(
+    value: &mut serde_json::Value,
+    session_id_map: &BTreeMap<String, String>,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            let mut replacements = session_id_map.iter().collect::<Vec<_>>();
+            replacements.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
+            for (raw, public) in replacements {
+                if raw != public {
+                    *text = text.replace(raw, public);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                sanitize_session_ids_in_value(item, session_id_map);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for item in object.values_mut() {
+                sanitize_session_ids_in_value(item, session_id_map);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
 }
 
 fn resolve_session_show_id(store: &SessionStore, id: &str) -> squeezy_core::Result<String> {
