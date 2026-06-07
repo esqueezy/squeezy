@@ -279,13 +279,15 @@ fn builtin_theme(name: &str) -> Theme {
 
 // "Starlight" — the default night-sky theme. A deep indigo sky, cool
 // silver starlight text tiered across a four-step slate ramp, and a
-// single warm undertone (amber) reserved for the live agent and the
-// brand glyphs so gold reads as the rare star rather than chrome. All
+// single warm undertone (a soft, muted honey-gold) reserved for the
+// live agent and the brand glyphs so gold reads as the rare star
+// rather than chrome — pitched lower in chroma/luminance than a raw
+// amber so it glows instead of glaring on the near-black sky. All
 // structural and semantic tones share a slate-blue undertone (hue ~228)
 // so the interface reads as one moonlight at several brightnesses.
 const DEFAULT_COLORS: &[(&str, TuiRgb)] = &[
-    (token::PALETTE_ACCENT, [242, 199, 92]),
-    (token::PALETTE_SECONDARY, [242, 217, 160]),
+    (token::PALETTE_ACCENT, [216, 185, 112]),
+    (token::PALETTE_SECONDARY, [224, 202, 156]),
     (token::PALETTE_RED, [236, 140, 156]),
     (token::PALETTE_GREEN, [143, 217, 176]),
     (token::PALETTE_YELLOW, [232, 214, 154]),
@@ -322,7 +324,7 @@ const DEFAULT_COLORS: &[(&str, TuiRgb)] = &[
     (token::DIFF_REMOVED_BG, [52, 30, 39]),
     (token::DIFF_CONTEXT, [86, 93, 120]),
     (token::DIFF_HUNK, [242, 217, 160]),
-    (token::EFFECTS_SHIMMER, [232, 201, 122]),
+    (token::EFFECTS_SHIMMER, [228, 200, 142]),
     (token::SEPARATOR_PRIMARY, [90, 100, 134]),
     (token::INLINE_CODE, [132, 206, 220]),
     (token::INLINE_MODEL, [183, 157, 224]),
