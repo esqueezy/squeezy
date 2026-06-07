@@ -1298,12 +1298,12 @@ impl CheckpointStore {
                 before_symlink_target: before_entry
                     .as_ref()
                     .filter(|entry| entry.is_symlink())
-                    .and_then(|_| before.as_deref())
+                    .and(before.as_deref())
                     .map(symlink_target_display),
                 after_symlink_target: after_entry
                     .as_ref()
                     .filter(|entry| entry.is_symlink())
-                    .and_then(|_| after.as_deref())
+                    .and(after.as_deref())
                     .map(symlink_target_display),
                 before_sha256: before.as_deref().map(sha256_hex),
                 after_sha256: after.as_deref().map(sha256_hex),
@@ -1445,19 +1445,19 @@ impl CheckpointStore {
         path: &str,
         current_state: &WorkspaceEntryState,
     ) -> Result<Option<RollbackConflict>> {
-        if let Some(expected_type) = file.after_file_type {
-            if current_state.file_type != Some(expected_type) {
-                return Ok(Some(RollbackConflict {
-                    checkpoint_id: record.id.clone(),
-                    path: path.to_string(),
-                    expected_sha256: file.after_sha256.clone(),
-                    current_sha256: current_state.sha256.clone(),
-                    reason: format!(
-                        "file type changed after checkpoint; expected {:?}, got {:?}; leaving current content untouched",
-                        expected_type, current_state.file_type
-                    ),
-                }));
-            }
+        if let Some(expected_type) = file.after_file_type
+            && current_state.file_type != Some(expected_type)
+        {
+            return Ok(Some(RollbackConflict {
+                checkpoint_id: record.id.clone(),
+                path: path.to_string(),
+                expected_sha256: file.after_sha256.clone(),
+                current_sha256: current_state.sha256.clone(),
+                reason: format!(
+                    "file type changed after checkpoint; expected {:?}, got {:?}; leaving current content untouched",
+                    expected_type, current_state.file_type
+                ),
+            }));
         }
         if let Some(expected_mode) = file.after_mode.as_deref()
             && current_state.mode.as_deref() != Some(expected_mode)
@@ -1484,19 +1484,18 @@ impl CheckpointStore {
             }));
         }
         let before_lookup = file.from_path.as_deref().unwrap_or(file.path.as_str());
-        if let Some(entry) = self.tree_entry(&record.before_tree, before_lookup)? {
-            if entry.object_type != "blob"
-                || self.blob_bytes(&record.before_tree, before_lookup).is_err()
-            {
-                return Ok(Some(RollbackConflict {
-                    checkpoint_id: record.id.clone(),
-                    path: path.to_string(),
-                    expected_sha256: file.after_sha256.clone(),
-                    current_sha256: current_state.sha256.clone(),
-                    reason: "checkpoint object is missing; leaving current content untouched"
-                        .to_string(),
-                }));
-            }
+        if let Some(entry) = self.tree_entry(&record.before_tree, before_lookup)?
+            && (entry.object_type != "blob"
+                || self.blob_bytes(&record.before_tree, before_lookup).is_err())
+        {
+            return Ok(Some(RollbackConflict {
+                checkpoint_id: record.id.clone(),
+                path: path.to_string(),
+                expected_sha256: file.after_sha256.clone(),
+                current_sha256: current_state.sha256.clone(),
+                reason: "checkpoint object is missing; leaving current content untouched"
+                    .to_string(),
+            }));
         }
         Ok(None)
     }
@@ -2010,7 +2009,7 @@ fn restore_regular_file_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> 
 
 #[cfg(unix)]
 fn restore_symlink_atomic(path: &Path, target: &[u8]) -> Result<()> {
-    use std::{ffi::OsString, os::unix::ffi::OsStringExt, os::unix::fs::symlink};
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -2386,13 +2385,6 @@ fn diff_large_files(
         }
     }
     changed.into_iter().collect()
-}
-
-fn rel_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 fn file_len(path: &Path) -> std::io::Result<u64> {
