@@ -75,6 +75,96 @@ fn helper() {}
 }
 
 #[test]
+fn parse_error_diagnostics_include_language_span_excerpt_and_partial_summary() {
+    let source = "fn broken( {\n    let value = ;\n}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/broken.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let diagnostic = parsed
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.partial_parse.is_some())
+        .expect("malformed Rust should emit a partial-parse diagnostic");
+    assert_eq!(diagnostic.language, Some(LanguageKind::Rust));
+    assert!(
+        diagnostic.message.contains("Rust parse has")
+            || diagnostic.message.contains("Rust parse is missing"),
+        "diagnostic should name the language and parse state: {diagnostic:?}"
+    );
+    assert!(diagnostic.span.is_some());
+    assert!(
+        diagnostic
+            .node_kind
+            .as_deref()
+            .is_some_and(|kind| !kind.is_empty()),
+        "diagnostic should include the smallest tree-sitter node kind"
+    );
+    assert!(
+        diagnostic
+            .excerpt
+            .as_deref()
+            .is_some_and(|excerpt| !excerpt.is_empty()),
+        "diagnostic should include a compact source excerpt"
+    );
+    let partial = diagnostic.partial_parse.as_ref().unwrap();
+    assert_eq!(partial.confidence, Confidence::Partial);
+    assert!(partial.partially_trusted);
+    assert!(partial.parse_error_count >= 1);
+}
+
+#[test]
+fn parser_feature_coverage_report_groups_emitted_facts_by_language() {
+    let source = r#"
+use crate::service::Service;
+
+pub struct Runner;
+
+impl Runner {
+    pub fn run(&self, service: Service) {
+        service.execute();
+        helper();
+    }
+}
+
+fn helper() {}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let report = parser_feature_coverage_report(&[parsed]);
+    let rust = report
+        .languages
+        .iter()
+        .find(|coverage| coverage.language == LanguageKind::Rust)
+        .expect("Rust coverage missing");
+
+    assert_eq!(rust.files, 1);
+    assert_eq!(rust.declaration_kinds.get("struct"), Some(&1));
+    assert!(
+        rust.declaration_kinds.get("method").copied().unwrap_or(0) >= 1,
+        "method declarations should be counted: {rust:?}"
+    );
+    assert_eq!(rust.import_kinds.get("named"), Some(&1));
+    assert!(
+        rust.call_kinds.get("method").copied().unwrap_or(0) >= 1,
+        "method calls should be counted: {rust:?}"
+    );
+    assert!(
+        rust.reference_kinds.get("type").copied().unwrap_or(0) >= 1,
+        "type references should be counted: {rust:?}"
+    );
+    assert!(
+        rust.confidence_distribution
+            .get(Confidence::ExactSyntax.id())
+            .copied()
+            .unwrap_or(0)
+            >= 1,
+        "confidence distribution should include emitted exact-syntax facts: {rust:?}"
+    );
+}
+
+#[test]
 fn language_parser_initializes_parsers_on_demand() {
     let mut parser = LanguageParser::new().unwrap();
     assert!(parser.parsers.parsers.is_empty());

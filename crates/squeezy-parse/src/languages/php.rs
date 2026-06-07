@@ -18,13 +18,7 @@ pub(crate) fn extract_php(file: FileRecord, source: &str, tree: &Tree) -> Parsed
         go_type_index: std::collections::HashMap::new(),
     };
     let root = tree.root_node();
-    if root.has_error() {
-        ctx.diagnostics.push(ParseDiagnostic {
-            message: "tree-sitter reported parse errors".to_string(),
-            span: Some(span_from_node(root)),
-            confidence: Confidence::Partial,
-        });
-    }
+    record_parse_error_diagnostics(root, &mut ctx);
 
     let mut scope = PhpScope::default();
     visit_php_node(root, &mut ctx, None, None, &mut scope);
@@ -91,11 +85,7 @@ fn visit_php_node(
     scope: &mut PhpScope,
 ) {
     if node.is_missing() {
-        ctx.diagnostics.push(ParseDiagnostic {
-            message: format!("missing {}", node.kind()),
-            span: Some(span_from_node(node)),
-            confidence: Confidence::Partial,
-        });
+        record_missing_node_diagnostic(node, ctx);
         return;
     }
 

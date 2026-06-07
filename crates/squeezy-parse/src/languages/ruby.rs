@@ -33,13 +33,7 @@ pub(crate) fn extract_ruby(file: FileRecord, source: &str, tree: &Tree) -> Parse
         go_type_index: HashMap::new(),
     };
     let root = tree.root_node();
-    if root.has_error() {
-        ctx.diagnostics.push(ParseDiagnostic {
-            message: "tree-sitter reported parse errors".to_string(),
-            span: Some(span_from_node(root)),
-            confidence: Confidence::Partial,
-        });
-    }
+    record_parse_error_diagnostics(root, &mut ctx);
 
     visit_ruby_node(root, &mut ctx, None, None, None);
     dedup_ruby_facts(&mut ctx);
@@ -69,11 +63,7 @@ fn visit_ruby_node(
     host_class: Option<(SymbolId, SymbolKind)>,
 ) {
     if node.is_missing() {
-        ctx.diagnostics.push(ParseDiagnostic {
-            message: format!("missing {}", node.kind()),
-            span: Some(span_from_node(node)),
-            confidence: Confidence::Partial,
-        });
+        record_missing_node_diagnostic(node, ctx);
         return;
     }
 

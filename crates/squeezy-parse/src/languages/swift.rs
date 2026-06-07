@@ -30,13 +30,7 @@ pub(crate) fn extract_swift(file: FileRecord, source: &str, tree: &Tree) -> Pars
         go_type_index: HashMap::new(),
     };
     let root = tree.root_node();
-    if root.has_error() {
-        ctx.diagnostics.push(ParseDiagnostic {
-            message: "tree-sitter reported parse errors".to_string(),
-            span: Some(span_from_node(root)),
-            confidence: Confidence::Partial,
-        });
-    }
+    record_parse_error_diagnostics(root, &mut ctx);
 
     visit_swift_node(root, &mut ctx, None, None, None);
     dedup_swift_facts(&mut ctx);
@@ -76,11 +70,7 @@ fn visit_swift_node(
     extension_owner: ExtensionOwner<'_>,
 ) {
     if node.is_missing() {
-        ctx.diagnostics.push(ParseDiagnostic {
-            message: format!("missing {}", node.kind()),
-            span: Some(span_from_node(node)),
-            confidence: Confidence::Partial,
-        });
+        record_missing_node_diagnostic(node, ctx);
         return;
     }
 

@@ -59,8 +59,11 @@ that forwards raw LSP responses to the model.
   and attributes scoped to the nearest owning symbol.
 
 Unsupported files are retained as structured unsupported results so callers can
-fall back to bounded read/grep/list navigation without pretending the graph knows
-more than it does.
+fall back to bounded read/grep/list navigation for the specific file without
+pretending the graph knows more than it does. Parser diagnostics retain partial
+tree-sitter evidence with language, smallest error spans, parent-node context,
+compact source excerpts, and partial-confidence summaries so graph/tool callers
+can show why a file is only partially trusted.
 
 Generated, vendored, dependency cache, build output, binary, lockfile, and large
 files are excluded from graph indexing by default with compact reason-tagged
