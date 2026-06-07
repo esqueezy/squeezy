@@ -122,33 +122,60 @@ fn apply_ace(
     Ok(())
 }
 
-/// Grant `FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE`
-/// (inheritable) to `sid_str` on `path`.
-pub(crate) fn add_allow_ace(path: &Path, sid_str: &str) -> crate::Result<()> {
-    let mask = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
-    apply_ace(path, sid_str, mask, SET_ACCESS, true)
+fn apply_ace_recursive(
+    path: &Path,
+    sid_str: &str,
+    access_mask: u32,
+    mode: ACCESS_MODE,
+) -> crate::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    apply_ace(
+        path,
+        sid_str,
+        access_mask,
+        mode,
+        metadata.file_type().is_dir(),
+    )?;
+
+    if !metadata.file_type().is_dir() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let child_type = entry.file_type()?;
+        if child_type.is_symlink() {
+            continue;
+        }
+        apply_ace_recursive(&entry.path(), sid_str, access_mask, mode)?;
+    }
+    Ok(())
 }
 
-/// Add an inheritable deny ACE blocking all write operations.
-pub(crate) fn add_deny_write_ace(path: &Path, sid_str: &str) -> crate::Result<()> {
+/// Grant read/write/execute on `path` and every existing non-symlink descendant.
+pub(crate) fn add_allow_ace_recursive(path: &Path, sid_str: &str) -> crate::Result<()> {
+    let mask = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+    apply_ace_recursive(path, sid_str, mask, SET_ACCESS)
+}
+
+/// Add a deny-write ACE on `path` and every existing non-symlink descendant.
+pub(crate) fn add_deny_write_ace_recursive(path: &Path, sid_str: &str) -> crate::Result<()> {
     let mask = FILE_GENERIC_WRITE
         | FILE_WRITE_DATA
         | FILE_APPEND_DATA
         | FILE_WRITE_EA
         | FILE_WRITE_ATTRIBUTES
         | DELETE;
-    apply_ace(path, sid_str, mask, DENY_ACCESS, true)
+    apply_ace_recursive(path, sid_str, mask, DENY_ACCESS)
 }
 
-/// Add an inheritable deny ACE blocking all read operations.
-pub(crate) fn add_deny_read_ace(path: &Path, sid_str: &str) -> crate::Result<()> {
-    apply_ace(path, sid_str, FILE_GENERIC_READ, DENY_ACCESS, true)
+/// Add a deny-read ACE on `path` and every existing non-symlink descendant.
+pub(crate) fn add_deny_read_ace_recursive(path: &Path, sid_str: &str) -> crate::Result<()> {
+    apply_ace_recursive(path, sid_str, FILE_GENERIC_READ, DENY_ACCESS)
 }
 
-/// Grant `FILE_GENERIC_READ | FILE_GENERIC_EXECUTE` (inheritable) to `sid_str`
-/// on `path`.  Used by the elevated tier to grant read-only access to
-/// `spec.read_roots`.
-pub(crate) fn add_allow_read_ace(path: &Path, sid_str: &str) -> crate::Result<()> {
+/// Grant read/execute on `path` and every existing non-symlink descendant.
+pub(crate) fn add_allow_read_ace_recursive(path: &Path, sid_str: &str) -> crate::Result<()> {
     let mask = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
-    apply_ace(path, sid_str, mask, SET_ACCESS, true)
+    apply_ace_recursive(path, sid_str, mask, SET_ACCESS)
 }

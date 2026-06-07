@@ -409,7 +409,7 @@ pub(crate) fn apply_world_writable_denies(
     let flagged = audit_world_writable(cwd, env, &writable_root_keys);
 
     for dir in &flagged {
-        match acl::add_deny_write_ace(dir, deny_cap_sid) {
+        match acl::add_deny_write_ace_recursive(dir, deny_cap_sid) {
             Ok(()) => {
                 tracing::debug!(
                     path = %dir.display(),

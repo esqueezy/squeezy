@@ -82,7 +82,7 @@ fn write_inside_workspace_allowed() {
     let workspace = fresh_workspace("write_inside");
     let out_file = workspace.join("out.txt");
 
-    let cmdline = format!(r#"echo hi > "{}""#, out_file.display());
+    let cmdline = "echo hi > out.txt".to_string();
     let Some(status) = run_cmd(&workspace, &cmdline) else {
         return;
     };
@@ -137,7 +137,7 @@ fn append_inside_allowed() {
     let target = workspace.join("append.txt");
     std::fs::write(&target, "line1\n").expect("seed file");
 
-    let cmdline = format!(r#"echo line2 >> "{}""#, target.display());
+    let cmdline = "echo line2 >> append.txt".to_string();
     let Some(status) = run_cmd(&workspace, &cmdline) else {
         return;
     };
@@ -162,7 +162,7 @@ fn delete_inside_allowed() {
     let target = workspace.join("delme.txt");
     std::fs::write(&target, "x").expect("seed file");
 
-    let cmdline = format!(r#"del /q "{}""#, target.display());
+    let cmdline = "del /q delme.txt".to_string();
     let Some(status) = run_cmd(&workspace, &cmdline) else {
         return;
     };
@@ -185,9 +185,8 @@ fn delete_inside_allowed() {
 fn read_system_still_works() {
     let workspace = fresh_workspace("read_system");
 
-    // `dir C:\Windows` lists the directory — a read-only operation that should
-    // always succeed on the restricted-token tier.
-    let Some(status) = run_cmd(&workspace, r"dir C:\Windows") else {
+    // Suppress listing output so the child cannot block on a full stdout pipe.
+    let Some(status) = run_cmd(&workspace, r"dir C:\Windows > nul") else {
         return;
     };
 
