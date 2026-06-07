@@ -2970,6 +2970,7 @@ dependencies = [
  "squeezy-telemetry",
  "squeezy-tools",
  "squeezy-tui",
+ "squeezy-workspace",
  "tokio",
  "tokio-util",
  "toml_edit",
