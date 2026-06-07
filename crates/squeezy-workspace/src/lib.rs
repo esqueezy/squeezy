@@ -834,31 +834,11 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
 }
 
 fn is_protected_root(root: &Path) -> bool {
-    if WorkspaceRootProfile::from_path(root)
-        .negative_signals()
-        .iter()
-        .any(|signal| signal.blocking)
-    {
-        return true;
-    }
-    const PROTECTED: &[&str] = &[
-        "/",
-        "/Applications",
-        "/Library",
-        "/Network",
-        "/System",
-        "/Users",
-        "/Volumes",
-        "/bin",
-        "/dev",
-        "/etc",
-        "/opt",
-        "/private",
-        "/sbin",
-        "/usr",
-        "/var",
-    ];
-    PROTECTED.iter().any(|path| Path::new(path) == root)
+    let normalized = normalized_filesystem_path(root);
+    !matches!(
+        WorkspaceRootKind::from_normalized(&normalized),
+        WorkspaceRootKind::Other
+    )
 }
 
 fn is_personal_folder(root: &Path) -> bool {
