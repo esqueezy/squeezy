@@ -198,9 +198,7 @@ impl ToolRegistry {
         call: &ToolCall,
         target: RollbackTarget<'_>,
     ) -> Option<ToolResult> {
-        let Some(checkpoints) = self.checkpoints.as_ref() else {
-            return None;
-        };
+        let checkpoints = self.checkpoints.as_ref()?;
         match checkpoints.rollback_paths(target) {
             Ok(paths) => {
                 for path in paths {
