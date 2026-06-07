@@ -1496,18 +1496,16 @@ impl CheckpointStore {
                 };
                 if let Some(conflict) = self.rollback_conflict(record, file, current_sha256)? {
                     conflicts.push(conflict);
-                } else {
-                    if file.status == DiffFileStatus::Renamed {
-                        virtual_hashes.insert(identity, None);
-                        if let Some(from_path) = file.from_path.as_deref() {
-                            virtual_hashes.insert(
-                                path_identity_key(from_path),
-                                rollback_before_virtual_hash(file),
-                            );
-                        }
-                    } else {
-                        virtual_hashes.insert(identity, rollback_before_virtual_hash(file));
+                } else if file.status == DiffFileStatus::Renamed {
+                    virtual_hashes.insert(identity, None);
+                    if let Some(from_path) = file.from_path.as_deref() {
+                        virtual_hashes.insert(
+                            path_identity_key(from_path),
+                            rollback_before_virtual_hash(file),
+                        );
                     }
+                } else {
+                    virtual_hashes.insert(identity, rollback_before_virtual_hash(file));
                 }
             }
         }
