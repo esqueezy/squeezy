@@ -174,7 +174,7 @@ fn session_store_index_tracks_archive_and_purge() {
     assert_eq!(archived[0].session_id, session_id);
 
     let report = store
-        .cleanup_with(&[session_id.clone()], None, CleanupMode::Purge)
+        .cleanup_with(std::slice::from_ref(&session_id), None, CleanupMode::Purge)
         .expect("purge archived session");
     assert_eq!(report.removed, vec![session_id]);
     assert_eq!(store.session_index_diagnostics().indexed_sessions, 0);

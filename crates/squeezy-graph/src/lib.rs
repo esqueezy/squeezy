@@ -536,7 +536,7 @@ impl SemanticGraph {
         graph.rebuild_java_project_facts();
         graph.rebuild_dotnet_project_facts();
         graph.rebuild_kotlin_project_facts();
-        let resolver_cache = load_resolver_cache(store, &mut graph, records).unwrap_or_else(|_| {
+        let resolver_cache = load_resolver_cache(store, &mut graph, records).unwrap_or({
             ResolverCacheLoadReport {
                 entries_loaded: 0,
                 entries_missed: records.len(),
@@ -1626,10 +1626,6 @@ impl SemanticGraph {
                 self.edges_by_to.entry(to.clone()).or_default().push(index);
             }
         }
-    }
-
-    fn rebuild_resolution_indexes(&mut self) {
-        self.rebuild_resolution_indexes_with_cached_resolver(false);
     }
 
     pub(crate) fn rebuild_resolution_indexes_with_cached_resolver(
