@@ -29,7 +29,15 @@ fn repo_profile_detects_mixed_language_repo_and_commands() {
     )
     .unwrap();
 
-    let profile = RepoProfile::detect(&root, &GraphConfig::default()).unwrap();
+    let graph = GraphConfig {
+        languages: vec![
+            "rust".to_string(),
+            "python".to_string(),
+            "typescript".to_string(),
+        ],
+        ..GraphConfig::default()
+    };
+    let profile = RepoProfile::detect(&root, &graph).unwrap();
 
     assert!(
         profile
