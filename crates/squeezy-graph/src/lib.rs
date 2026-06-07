@@ -25,6 +25,7 @@ use squeezy_parse::{
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
 use squeezy_workspace::{CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler};
+use tracing::warn;
 
 use crate::languages::{
     csharp::{
@@ -2043,11 +2044,21 @@ impl WatcherMode {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatcherStatus {
     pub mode: WatcherMode,
     pub backend: &'static str,
     pub fallback_reason: Option<String>,
+}
+
+impl Default for WatcherStatus {
+    fn default() -> Self {
+        Self {
+            mode: WatcherMode::Disabled,
+            backend: "none",
+            fallback_reason: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2173,6 +2184,7 @@ impl GraphManager {
             ),
             Err(native_err) => {
                 let fallback_reason = native_err.to_string();
+                warn!(reason = %fallback_reason, "native watcher failed; falling back to polling watcher");
                 let handle = Arc::clone(&manager.pending_changed_paths);
                 let file_watcher =
                     watcher::FileWatcher::start_polling(watcher_config, move |batch| {
@@ -2317,8 +2329,8 @@ impl GraphManager {
             .unwrap_or(0)
     }
 
-    pub fn watcher_status(&self) -> WatcherStatus {
-        self.watcher_status.clone()
+    pub fn watcher_status(&self) -> &WatcherStatus {
+        &self.watcher_status
     }
 
     pub fn record_changed_path(&mut self, path: impl Into<PathBuf>) {

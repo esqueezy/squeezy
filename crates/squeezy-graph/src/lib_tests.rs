@@ -1828,8 +1828,19 @@ fn graph_manager_open_watching_records_active_watcher_status() {
     .unwrap();
 
     let status = manager.watcher_status();
-    assert_ne!(status.mode, WatcherMode::Disabled);
-    assert_ne!(status.backend, "none");
+    assert!(
+        matches!(
+            status.mode,
+            WatcherMode::Native | WatcherMode::PollingFallback
+        ),
+        "expected native or polling fallback watcher mode, got {:?}",
+        status.mode,
+    );
+    assert!(
+        !status.backend.is_empty() && status.backend != "none",
+        "expected a non-empty, non-disabled backend name, got {:?}",
+        status.backend,
+    );
 
     let _ = fs::remove_dir_all(root);
 }

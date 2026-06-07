@@ -143,6 +143,8 @@ impl FileWatcher {
         F: Fn(ChangeBatch) + Send + 'static,
     {
         let timeout = Duration::from_millis(config.debounce_ms);
+        // Poll at most every 50 ms, but never faster than the debounce window
+        // (minimum 1 ms) so a very short debounce does not spin the poll loop.
         let poll_interval = Duration::from_millis(50).min(timeout.max(Duration::from_millis(1)));
         let mut debouncer = notify_debouncer_full::new_debouncer_opt::<
             _,
@@ -201,11 +203,17 @@ fn handle_debounce_result(result: DebounceEventResult) -> Option<ChangeBatch> {
     let mut modified = Vec::new();
     let mut removed = Vec::new();
     for path in all_paths {
-        let path = normalize_event_path(path);
         // Partition by existence rather than EventKind: on macOS FSEvents
         // may fire a Modify event for a deletion (the file is already gone
         // when we check). The post-debounce existence check is the most
         // portable signal.
+        //
+        // Do NOT canonicalize event paths here. FileWatcher::start already
+        // registers the canonical watched root, so notify reports paths that
+        // are already rooted at the canonical root. Calling canonicalize() on
+        // individual entries would silently resolve internal workspace symlinks
+        // to their targets, breaking refresh attribution for files that the
+        // crawler records under their symlink spelling.
         if path.exists() {
             modified.push(path);
         } else {
@@ -215,10 +223,6 @@ fn handle_debounce_result(result: DebounceEventResult) -> Option<ChangeBatch> {
 
     let batch = ChangeBatch { modified, removed };
     if batch.is_empty() { None } else { Some(batch) }
-}
-
-fn normalize_event_path(path: PathBuf) -> PathBuf {
-    path.canonicalize().unwrap_or(path)
 }
 
 fn classify_event(kind: EventKind, paths: &[PathBuf], all_paths: &mut Vec<PathBuf>) {

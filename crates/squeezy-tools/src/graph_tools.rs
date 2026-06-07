@@ -756,12 +756,13 @@ pub(crate) fn graph_payload(
     // count of still-pending changed paths (read from the manager, since the
     // unprocessed paths are left queued in that case). Emitted only when the
     // refresh did not fully complete, so a healthy graph pays no byte cost.
+    // Capture once: acquiring the mutex twice for the same counter would be
+    // redundant and could produce inconsistent values if a watcher thread
+    // enqueues a path between the two calls.
+    let pending_events = manager.pending_changed_count();
     if refresh.budget_exhausted {
         payload.insert("refresh_incomplete".to_string(), json!(true));
-        payload.insert(
-            "stale_pending".to_string(),
-            json!(manager.pending_changed_count()),
-        );
+        payload.insert("stale_pending".to_string(), json!(pending_events));
     }
     let watcher = manager.watcher_status();
     payload.insert(
@@ -769,7 +770,7 @@ pub(crate) fn graph_payload(
         json!({
             "watcher_mode": watcher.mode.as_str(),
             "watcher_backend": watcher.backend,
-            "pending_events": manager.pending_changed_count(),
+            "pending_events": pending_events,
             "fallback_reason": watcher.fallback_reason,
         }),
     );

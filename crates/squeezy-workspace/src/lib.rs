@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     env,
     ffi::OsString,
     fs,
@@ -833,20 +833,19 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
         format!("indexing allowed: {}", positive_signals.join(", "))
     } else if blocked_by_root {
         format!("indexing skipped: {}", negative_signals.join(", "))
+    } else if workspace_signals.has_case_mismatches {
+        // Case-mismatch branch before README: a near-miss marker is a more
+        // actionable diagnostic than a README-only message.
+        format!(
+            "indexing skipped: no exact project marker or shallow source file; {}",
+            negative_signals.join(", ")
+        )
     } else if positive_signals
         .iter()
         .any(|signal| signal.contains("README"))
     {
         "indexing skipped: README alone is a weak signal without repository, project config, or shallow source files"
             .to_string()
-    } else if negative_signals
-        .iter()
-        .any(|signal| signal.contains("case differs from expected project marker"))
-    {
-        format!(
-            "indexing skipped: no exact project marker or shallow source file; {}",
-            negative_signals.join(", ")
-        )
     } else {
         "indexing skipped: no VCS marker, project config, or shallow source file".to_string()
     };
@@ -860,6 +859,15 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
 }
 
 fn is_protected_root(root: &Path) -> bool {
+    // macOS system roots and Linux pseudo-filesystem roots are unconditionally
+    // blocked: they are never real project roots and can contain enormous or
+    // virtual file trees that must not be crawled.
+    //
+    // Broad Linux package/source trees (/opt, /usr, /var) are intentionally
+    // NOT listed here. They can contain real project checkouts and source trees.
+    // The indexing-signal check (VCS marker, project config, shallow sources)
+    // prevents accidental bulk indexing of system-managed content within them.
+    // On macOS, /var canonicalises to /private/var which is in the list below.
     const PROTECTED: &[&str] = &[
         "/",
         "/Applications",
@@ -920,6 +928,10 @@ struct WorkspaceSignalScan {
     has_readme: bool,
     project_markers: Vec<String>,
     project_marker_case_mismatches: Vec<String>,
+    /// True when `project_marker_case_mismatches` is non-empty. Checked
+    /// structurally in `decide_indexing` rather than by substring-matching
+    /// the human-readable message strings.
+    has_case_mismatches: bool,
     shallow_source_markers: Vec<String>,
     code_directory_markers: Vec<String>,
 }
@@ -937,6 +949,7 @@ fn scan_workspace_signals(root: &Path) -> WorkspaceSignalScan {
     let project_markers = project_markers_from_root(root, Some((&root_entry_names, &root_entries)));
     let project_marker_case_mismatches =
         project_marker_case_mismatches(&root_entry_names, &root_entries);
+    let has_case_mismatches = !project_marker_case_mismatches.is_empty();
 
     let mut source_scan = SourceMarkerScan::default();
     collect_source_markers_from_entries(&root_entries, 0, None, &mut source_scan);
@@ -948,6 +961,7 @@ fn scan_workspace_signals(root: &Path) -> WorkspaceSignalScan {
         has_readme,
         project_markers,
         project_marker_case_mismatches,
+        has_case_mismatches,
         shallow_source_markers: source_scan.signals,
         code_directory_markers,
     }
@@ -1012,19 +1026,24 @@ fn project_marker_case_mismatches(
     root_entry_names: &BTreeSet<OsString>,
     entries: &[fs::DirEntry],
 ) -> Vec<String> {
+    // Build a case-folded lookup table once so each marker check is O(1)
+    // rather than scanning all directory entries linearly.
+    let lower_to_actual: HashMap<String, &OsString> = root_entry_names
+        .iter()
+        .filter_map(|name| name.to_str().map(|s| (s.to_ascii_lowercase(), name)))
+        .collect();
+
     let mut mismatches = Vec::new();
     for marker in CODE_PROJECT_MARKERS.iter().copied() {
         if marker.contains('/') || root_entry_names.contains(std::ffi::OsStr::new(marker)) {
             continue;
         }
-        if let Some(actual) = root_entry_names
-            .iter()
-            .filter_map(|name| name.to_str())
-            .find(|name| name.eq_ignore_ascii_case(marker))
-        {
-            mismatches.push(format!(
-                "project marker case differs from expected project marker {marker}: found {actual}"
-            ));
+        if let Some(actual_os) = lower_to_actual.get(&marker.to_ascii_lowercase()) {
+            if let Some(actual) = actual_os.to_str() {
+                mismatches.push(format!(
+                    "project marker case differs from expected project marker {marker}: found {actual}"
+                ));
+            }
         }
     }
     for entry in entries {
