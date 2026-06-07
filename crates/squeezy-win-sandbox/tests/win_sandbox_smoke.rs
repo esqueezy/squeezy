@@ -126,7 +126,7 @@ fn write_inside_workspace_allowed() {
     let out_file = workspace.join("out.txt");
 
     let cmdline = "echo hi > out.txt";
-    let Some(output) = run_cmd(&workspace, &cmdline) else {
+    let Some(output) = run_cmd(&workspace, cmdline) else {
         return;
     };
 
@@ -186,7 +186,7 @@ fn append_inside_allowed() {
     std::fs::write(&target, "line1\n").expect("seed file");
 
     let cmdline = "echo line2 >> append.txt";
-    let Some(output) = run_cmd(&workspace, &cmdline) else {
+    let Some(output) = run_cmd(&workspace, cmdline) else {
         return;
     };
 
@@ -215,7 +215,7 @@ fn delete_inside_allowed() {
     std::fs::write(&target, "x").expect("seed file");
 
     let cmdline = "del /q delme.txt";
-    let Some(output) = run_cmd(&workspace, &cmdline) else {
+    let Some(output) = run_cmd(&workspace, cmdline) else {
         return;
     };
 
