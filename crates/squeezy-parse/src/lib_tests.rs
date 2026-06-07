@@ -147,8 +147,8 @@ fn helper() {}
     );
     assert_eq!(rust.import_kinds.get("named"), Some(&1));
     assert!(
-        rust.call_kinds.get("method").copied().unwrap_or(0) >= 1,
-        "method calls should be counted: {rust:?}"
+        rust.call_kinds.get("direct").copied().unwrap_or(0) >= 1,
+        "direct calls should be counted: {rust:?}"
     );
     assert!(
         rust.reference_kinds.get("type").copied().unwrap_or(0) >= 1,
