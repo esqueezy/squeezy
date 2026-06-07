@@ -832,6 +832,8 @@ fn checkpoint_rollback_conflicts_on_user_chmod_after_checkpoint() {
     let _ = fs::remove_dir_all(root);
 }
 
+// Scoped to Linux rather than all of Unix because macOS APFS/HFS+ volumes
+// are case-insensitive by default and cannot hold both `Foo.rs` and `foo.rs`.
 #[cfg(target_os = "linux")]
 #[test]
 fn checkpoint_rollback_keeps_case_sensitive_paths_distinct() {
@@ -1251,15 +1253,20 @@ fn shadow_repo_open_rejects_concurrent_process_lock() {
         message.contains("shadow-repo lock"),
         "expected lock-held error, got: {message}"
     );
-    // On Unix, the lock-file body is readable while the lock is held (advisory
-    // locks don't block reads), so we expect the pid/timestamp diagnostics.
-    // On Windows, exclusive file locking prevents the second opener from
-    // reading the file, so the implementation falls back to
-    // "holder details unavailable".
+    // On Unix, the lock-file body is readable while the advisory lock is held,
+    // so we expect the pid/timestamp diagnostics written by the lock holder.
+    // On Windows, the lock holder's second open for writing the diagnostics
+    // body may fail due to the initial handle's file-sharing flags, so the
+    // implementation gracefully falls back to "holder details unavailable".
     #[cfg(unix)]
     assert!(
         message.contains("holder pid=") && message.contains("locked_at_ms="),
         "expected lock-held error to include Unix diagnostics, got: {message}"
+    );
+    #[cfg(windows)]
+    assert!(
+        message.contains("holder details unavailable"),
+        "expected Windows lock-held fallback message, got: {message}"
     );
 
     drop(first);

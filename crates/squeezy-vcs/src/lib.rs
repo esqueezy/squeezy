@@ -1472,23 +1472,20 @@ impl CheckpointStore {
                     });
                 }
                 if let Some(from_path) = file.from_path.as_deref()
-                    && let Some(action) = self.restore_tree_path(&record.before_tree, from_path)?
+                    && let Some(action) =
+                        self.restore_tree_path(&record.before_tree, from_path, &record.id)?
                 {
                     result.restored_files.push(from_path.to_string());
-                    result.file_actions.push(RollbackFileAction {
-                        checkpoint_id: record.id.clone(),
-                        ..action
-                    });
+                    result.file_actions.push(action);
                 }
                 continue;
             }
 
-            if let Some(action) = self.restore_tree_path(&record.before_tree, &file.path)? {
+            if let Some(action) =
+                self.restore_tree_path(&record.before_tree, &file.path, &record.id)?
+            {
                 result.restored_files.push(file.path.clone());
-                result.file_actions.push(RollbackFileAction {
-                    checkpoint_id: record.id.clone(),
-                    ..action
-                });
+                result.file_actions.push(action);
             } else if remove_workspace_file(&path)? {
                 result.deleted_files.push(file.path.clone());
                 result.file_actions.push(RollbackFileAction {
@@ -1540,17 +1537,19 @@ impl CheckpointStore {
                     mode: Some(entry.mode),
                 };
                 if workspace_entry_state(&path)? != expected
-                    && let Some(action) = self.restore_tree_path(&record.before_tree, rel)?
+                    && let Some(action) =
+                        self.restore_tree_path(&record.before_tree, rel, &record.id)?
                 {
                     result.restored_files.push(rel.clone());
-                    result.file_actions.push(RollbackFileAction {
-                        checkpoint_id: record.id.clone(),
-                        ..action
-                    });
+                    result.file_actions.push(action);
                 }
             }
 
             let relinked = restore_hardlink_group(&self.root, &group)?;
+            // `restore_hardlink_group` already verified the group internally;
+            // capture the result once here rather than re-running O(N)
+            // `symlink_metadata` calls per re-linked member.
+            let verified = verify_hardlink_group(&self.root, &group)?;
             for rel in relinked {
                 let Some(entry) = self.tree_entry(&record.before_tree, &rel)? else {
                     continue;
@@ -1563,7 +1562,7 @@ impl CheckpointStore {
                     action: RollbackFileActionKind::RestoreHardlink,
                     mode: Some(mode),
                     file_type: Some(file_type),
-                    verified_after_rollback: verify_hardlink_group(&self.root, &group)?,
+                    verified_after_rollback: verified,
                 });
             }
         }
@@ -1580,15 +1579,23 @@ impl CheckpointStore {
         if let Some(expected_type) = file.after_file_type
             && current_state.file_type != Some(expected_type)
         {
+            let reason = if current_state.file_type.is_none() {
+                format!(
+                    "file was deleted after checkpoint; expected {:?}; leaving it deleted",
+                    expected_type
+                )
+            } else {
+                format!(
+                    "file type changed after checkpoint; expected {:?}, got {:?}; leaving current content untouched",
+                    expected_type, current_state.file_type
+                )
+            };
             return Ok(Some(RollbackConflict {
                 checkpoint_id: record.id.clone(),
                 path: path.to_string(),
                 expected_sha256: file.after_sha256.clone(),
                 current_sha256: current_state.sha256.clone(),
-                reason: format!(
-                    "file type changed after checkpoint; expected {:?}, got {:?}; leaving current content untouched",
-                    expected_type, current_state.file_type
-                ),
+                reason,
             }));
         }
         if let Some(expected_mode) = file.after_mode.as_deref()
@@ -1632,7 +1639,12 @@ impl CheckpointStore {
         Ok(None)
     }
 
-    fn restore_tree_path(&self, tree: &str, rel: &str) -> Result<Option<RollbackFileAction>> {
+    fn restore_tree_path(
+        &self,
+        tree: &str,
+        rel: &str,
+        checkpoint_id: &str,
+    ) -> Result<Option<RollbackFileAction>> {
         let Some(entry) = self.tree_entry(tree, rel)? else {
             return Ok(None);
         };
@@ -1655,21 +1667,22 @@ impl CheckpointStore {
             restore_regular_file_atomic(&path, &bytes, entry.unix_mode())?;
             RollbackFileActionKind::RestoreRegular
         };
+        verify_restored_entry(
+            rel,
+            &path,
+            &WorkspaceEntryState {
+                sha256: Some(sha256_hex(&bytes)),
+                file_type: Some(file_type),
+                mode: Some(mode.clone()),
+            },
+        )?;
         Ok(Some(RollbackFileAction {
-            checkpoint_id: String::new(),
+            checkpoint_id: checkpoint_id.to_string(),
             path: rel.to_string(),
             action,
-            mode: Some(mode.clone()),
+            mode: Some(mode),
             file_type: Some(file_type),
-            verified_after_rollback: verify_restored_entry(
-                rel,
-                &path,
-                &WorkspaceEntryState {
-                    sha256: Some(sha256_hex(&bytes)),
-                    file_type: Some(file_type),
-                    mode: Some(mode),
-                },
-            )?,
+            verified_after_rollback: true,
         }))
     }
 
@@ -2074,7 +2087,7 @@ fn hardlink_paths_for(groups: &BTreeMap<String, Vec<String>>, path: &str) -> Opt
     groups.get(path).filter(|paths| paths.len() > 1).cloned()
 }
 
-fn verify_restored_entry(rel: &str, path: &Path, expected: &WorkspaceEntryState) -> Result<bool> {
+fn verify_restored_entry(rel: &str, path: &Path, expected: &WorkspaceEntryState) -> Result<()> {
     let actual = workspace_entry_state(path)?;
     if &actual != expected {
         return Err(SqueezyError::Tool(format!(
@@ -2082,7 +2095,7 @@ fn verify_restored_entry(rel: &str, path: &Path, expected: &WorkspaceEntryState)
             expected, actual
         )));
     }
-    Ok(true)
+    Ok(())
 }
 
 fn workspace_entry_state(path: &Path) -> Result<WorkspaceEntryState> {
@@ -2144,6 +2157,10 @@ fn path_bytes(path: &OsStr) -> Vec<u8> {
 
 #[cfg(not(unix))]
 fn path_bytes(path: &OsStr) -> Vec<u8> {
+    // FIXME: `to_string_lossy` replaces non-UTF-8 sequences with U+FFFD,
+    // producing a sha256 that will never match the Git-blob hash for symlink
+    // targets that contain non-Unicode bytes. Acceptable for now because
+    // symlink restore is not supported on non-Unix platforms.
     path.to_string_lossy().as_bytes().to_vec()
 }
 
@@ -2163,9 +2180,18 @@ fn workspace_regular_file_git_mode(_metadata: &fs::Metadata) -> String {
 }
 
 fn symlink_target_display(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).to_string()
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// Returns `root.join(rel)` after verifying that `rel` contains no absolute
+/// prefix, parent-dir components, or `.squeezy` protected-metadata prefix.
+///
+/// **Limitation:** this check is purely lexical. It does not resolve symlinks
+/// in intermediate directory components. A journal path whose parent directory
+/// is a symlink pointing outside `root` would pass these checks. Callers that
+/// create parent directories (e.g. `restore_regular_file_atomic`) may
+/// inadvertently follow such a symlink. Fully eliminating that risk requires
+/// walking and stat-checking each component before descent.
 fn safe_workspace_path(root: &Path, rel: &str) -> Result<PathBuf> {
     let path = Path::new(rel);
     if path.is_absolute()
