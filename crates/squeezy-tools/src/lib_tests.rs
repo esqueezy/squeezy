@@ -6417,7 +6417,7 @@ fn shell_default_sandbox_runs_benign_command() {
                     call_id: "call_default_shell".to_string(),
                     name: "shell".to_string(),
                     arguments: json!({
-                        "command": "printf ok",
+                        "command": "echo ok",
                         "description": "check default shell sandbox posture"
                     }),
                 },
