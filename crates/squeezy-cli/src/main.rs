@@ -13,6 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use squeezy_agent::{Agent, AgentEvent, RequestUserInputResponse, ToolApprovalDecision};
 use squeezy_core::{
     AppConfig, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpTransport,
@@ -1873,7 +1874,7 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
                 );
             } else {
                 for session in sessions {
-                    let handle = PublicSessionHandle::from_store_session_id(&session.session_id);
+                    let handle = PublicSessionHandle::for_store_id(&session.session_id);
                     println!(
                         "{}\t{}\t{}\t{}\t{}\t{}",
                         handle,
@@ -1892,7 +1893,8 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             Ok(())
         }
         SessionsCommand::Show { id, json } => {
-            let record = store.show(id)?;
+            let resolved = resolve_session_show_id(&store, id)?;
+            let record = store.show(&resolved)?;
             if *json {
                 let metadata = session_metadata_for_cli(&record.metadata)?;
                 let replay = record.replay.map(session_replay_for_cli).transpose()?;
@@ -1911,8 +1913,7 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
                     })?
                 );
             } else {
-                let handle =
-                    PublicSessionHandle::from_store_session_id(&record.metadata.session_id);
+                let handle = PublicSessionHandle::for_store_id(&record.metadata.session_id);
                 println!("id={handle}");
                 println!("status={}", record.metadata.status.as_str());
                 println!("started_at_ms={}", record.metadata.started_at_ms);
@@ -3009,8 +3010,16 @@ fn parse_session_status(value: &str) -> squeezy_core::Result<SessionStatus> {
 struct PublicSessionHandle(String);
 
 impl PublicSessionHandle {
-    fn from_store_session_id(value: &str) -> Self {
-        Self(value.to_string())
+    fn for_store_id(value: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"squeezy-public-session-id-v1\0");
+        hasher.update(value.as_bytes());
+        let digest = hasher.finalize();
+        let mut out = String::from("sess_");
+        for byte in &digest[..8] {
+            let _ = write!(&mut out, "{byte:02x}");
+        }
+        Self(out)
     }
 }
 
@@ -3041,10 +3050,8 @@ fn session_metadata_for_cli(metadata: &SessionMetadata) -> squeezy_core::Result<
     object.remove("session_id");
     object.insert(
         "id".to_string(),
-        serde_json::to_value(PublicSessionHandle::from_store_session_id(
-            &metadata.session_id,
-        ))
-        .map_err(|err| SqueezyError::Parse(format!("failed to serialize session id: {err}")))?,
+        serde_json::to_value(PublicSessionHandle::for_store_id(&metadata.session_id))
+            .map_err(|err| SqueezyError::Parse(format!("failed to serialize session id: {err}")))?,
     );
     Ok(value)
 }
@@ -3052,10 +3059,28 @@ fn session_metadata_for_cli(metadata: &SessionMetadata) -> squeezy_core::Result<
 fn session_replay_for_cli(tape: SessionReplayTape) -> squeezy_core::Result<serde_json::Value> {
     Ok(serde_json::json!({
         "schema_version": tape.schema_version,
-        "id": PublicSessionHandle::from_store_session_id(&tape.session_id),
+        "id": PublicSessionHandle::for_store_id(&tape.session_id),
         "events": tape.events,
         "warnings": tape.warnings,
     }))
+}
+
+fn resolve_session_show_id(store: &SessionStore, id: &str) -> squeezy_core::Result<String> {
+    if store.read_metadata(id).is_ok() {
+        return Ok(id.to_string());
+    }
+
+    let query = SessionQuery {
+        include_archived: true,
+        ..Default::default()
+    };
+    for metadata in store.list(&query)? {
+        if PublicSessionHandle::for_store_id(&metadata.session_id).0 == id {
+            return Ok(metadata.session_id);
+        }
+    }
+
+    Ok(id.to_string())
 }
 
 fn format_optional_u64(value: Option<u64>) -> String {

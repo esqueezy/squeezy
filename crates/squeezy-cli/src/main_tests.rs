@@ -258,7 +258,13 @@ fn session_cli_json_uses_public_id_field() {
         ..Default::default()
     };
     let metadata_json = session_metadata_for_cli(&metadata).expect("metadata json");
-    assert_eq!(metadata_json["id"], "session-123");
+    assert_ne!(metadata_json["id"], "session-123");
+    assert!(
+        metadata_json["id"]
+            .as_str()
+            .expect("public id string")
+            .starts_with("sess_")
+    );
     assert!(metadata_json.get("session_id").is_none());
 
     let replay_json = session_replay_for_cli(SessionReplayTape {
@@ -268,7 +274,7 @@ fn session_cli_json_uses_public_id_field() {
         warnings: 0,
     })
     .expect("replay json");
-    assert_eq!(replay_json["id"], "session-123");
+    assert_eq!(replay_json["id"], metadata_json["id"]);
     assert!(replay_json.get("session_id").is_none());
 }
 
