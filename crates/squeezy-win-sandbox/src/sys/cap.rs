@@ -44,26 +44,23 @@ fn load_cap_sids(state_dir: &Path) -> crate::Result<Option<CapSids>> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = std::fs::read_to_string(&path).map_err(|_| WinSandboxError::Io(
-        std::io::Error::other("failed to read cap_sids.json"),
-    ))?;
-    let caps: CapSids = serde_json::from_str(&text).map_err(|e| {
-        WinSandboxError::win32(format!("cap_sids.json parse error: {e}"))
-    })?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|_| WinSandboxError::Io(std::io::Error::other("failed to read cap_sids.json")))?;
+    let caps: CapSids = serde_json::from_str(&text)
+        .map_err(|e| WinSandboxError::win32(format!("cap_sids.json parse error: {e}")))?;
     Ok(Some(caps))
 }
 
 fn save_cap_sids(state_dir: &Path, caps: &CapSids) -> crate::Result<()> {
     let path = cap_sids_path(state_dir);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|_| WinSandboxError::Io(
-            std::io::Error::other("failed to create cap_sids dir"),
-        ))?;
+        std::fs::create_dir_all(parent).map_err(|_| {
+            WinSandboxError::Io(std::io::Error::other("failed to create cap_sids dir"))
+        })?;
     }
     let json = serde_json::to_string(caps).expect("CapSids serialization failed");
-    std::fs::write(&path, json).map_err(|_| WinSandboxError::Io(
-        std::io::Error::other("failed to write cap_sids.json"),
-    ))?;
+    std::fs::write(&path, json)
+        .map_err(|_| WinSandboxError::Io(std::io::Error::other("failed to write cap_sids.json")))?;
     Ok(())
 }
 

@@ -154,7 +154,11 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         } else {
             sandbox_setup_action(AppConfig::from_env_and_settings().ok().as_ref())
         };
-        let exit_code = if matches!(check.status, Status::Fail) { 1 } else { 0 };
+        let exit_code = if matches!(check.status, Status::Fail) {
+            1
+        } else {
+            0
+        };
         return Ok(DoctorReport {
             exit_code,
             checks: vec![check],

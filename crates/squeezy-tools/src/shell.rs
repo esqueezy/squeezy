@@ -595,8 +595,10 @@ impl ToolRegistry {
         // Windows has no `pre_exec`). Everything else uses the standard tokio
         // command path. `pty_master`/`ask_server` apply only to the tokio path.
         #[cfg(windows)]
-        let win_sandbox_backend =
-            matches!(sandbox_plan.backend, "windows-restricted-token" | "windows-elevated");
+        let win_sandbox_backend = matches!(
+            sandbox_plan.backend,
+            "windows-restricted-token" | "windows-elevated"
+        );
         #[cfg(not(windows))]
         let win_sandbox_backend = false;
 
@@ -1548,7 +1550,9 @@ fn apply_shell_environment_policy(command: &mut Command, config: &ShellSandboxCo
 /// `HashMap<String, String>` the crate expects (lossy for the rare non-UTF-16
 /// value, which is acceptable for a scrubbed sandbox environment).
 #[cfg(windows)]
-fn preserved_env_string_map(config: &ShellSandboxConfig) -> std::collections::HashMap<String, String> {
+fn preserved_env_string_map(
+    config: &ShellSandboxConfig,
+) -> std::collections::HashMap<String, String> {
     compute_preserved_env(config)
         .into_iter()
         .map(|(name, value)| (name, value.to_string_lossy().into_owned()))

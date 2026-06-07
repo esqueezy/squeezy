@@ -41,12 +41,7 @@ impl ProcThreadAttrList {
         unsafe {
             // Passing a null pointer is the documented way to query the size;
             // the function will return FALSE but populates `size`.
-            InitializeProcThreadAttributeList(
-                std::ptr::null_mut(),
-                attr_count,
-                0,
-                &mut size,
-            );
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), attr_count, 0, &mut size);
         }
         if size == 0 {
             return Err(WinSandboxError::win32(format!(
@@ -94,12 +89,12 @@ impl ProcThreadAttrList {
         let ok = unsafe {
             UpdateProcThreadAttribute(
                 list,
-                0,                                        // dwFlags — reserved, must be 0
+                0, // dwFlags — reserved, must be 0
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
                 self.handle_list.as_mut_ptr().cast(),
                 std::mem::size_of_val(self.handle_list.as_slice()),
-                std::ptr::null_mut(),                     // lpPreviousValue — not used
-                std::ptr::null(),                         // lpReturnSize — not used
+                std::ptr::null_mut(), // lpPreviousValue — not used
+                std::ptr::null(),     // lpReturnSize — not used
             )
         };
         if ok == 0 {

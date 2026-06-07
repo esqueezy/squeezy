@@ -142,11 +142,14 @@ jobs:
           # squeezy-win-sandbox elevated tier resolves squeezy-sandbox-setup.exe
           # next to squeezy.exe (helper_materialization), so it must ship in the
           # archive or `squeezy doctor --sandbox-setup` fails.
-          if [[ "${{ matrix.target }}" == *-windows-msvc ]]; then
-            cargo build --profile dist -p squeezy -p squeezy-win-sandbox --target "${{ matrix.target }}"
-          else
-            cargo build --profile dist -p squeezy --target "${{ matrix.target }}"
-          fi
+          case "${{ matrix.target }}" in
+            *-windows-msvc)
+              cargo build --profile dist -p squeezy -p squeezy-win-sandbox --target "${{ matrix.target }}"
+              ;;
+            *)
+              cargo build --profile dist -p squeezy --target "${{ matrix.target }}"
+              ;;
+          esac
 
       - name: Smoke-test release binary
         shell: bash

@@ -6,7 +6,6 @@ use std::path::Path;
 use crate::{Result, TeardownReport, WinSandboxChildHandles, WinSandboxSpec};
 
 mod acl;
-mod wfp;
 mod cap;
 mod deny_read_resolver;
 mod desktop;
@@ -25,6 +24,7 @@ mod setup_error;
 mod ssh_config;
 mod token;
 mod users;
+mod wfp;
 mod winutil;
 mod world_writable;
 

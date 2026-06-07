@@ -2,18 +2,18 @@
 
 use std::ffi::c_void;
 
-use windows_sys::Win32::Foundation::{GetLastError, HANDLE, HLOCAL, LocalFree, LUID};
-use windows_sys::Win32::Security::{
-    AdjustTokenPrivileges, CopySid, CreateRestrictedToken, GetLengthSid, GetTokenInformation,
-    LookupPrivilegeValueW, SetTokenInformation, SID_AND_ATTRIBUTES,
-    TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-    TOKEN_PRIVILEGES, TOKEN_QUERY, TokenDefaultDacl, TokenGroups, PSID,
-};
+use windows_sys::Win32::Foundation::{GetLastError, HANDLE, HLOCAL, LUID, LocalFree};
+use windows_sys::Win32::Security::ACL;
 use windows_sys::Win32::Security::Authorization::{
     EXPLICIT_ACCESS_W, GRANT_ACCESS, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
     TRUSTEE_W,
 };
-use windows_sys::Win32::Security::ACL;
+use windows_sys::Win32::Security::{
+    AdjustTokenPrivileges, CopySid, CreateRestrictedToken, GetLengthSid, GetTokenInformation,
+    LookupPrivilegeValueW, PSID, SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    TokenDefaultDacl, TokenGroups,
+};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use super::winutil::{self, OwnedSid, ScopedHandle, SidBuf};
@@ -171,7 +171,9 @@ fn enable_change_notify(token: HANDLE) -> crate::Result<()> {
     };
     let ok = unsafe { LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut luid) };
     if ok == 0 {
-        return Err(winutil::err("LookupPrivilegeValueW(SeChangeNotifyPrivilege)"));
+        return Err(winutil::err(
+            "LookupPrivilegeValueW(SeChangeNotifyPrivilege)",
+        ));
     }
 
     let mut tp: TOKEN_PRIVILEGES = unsafe { std::mem::zeroed() };
@@ -180,14 +182,7 @@ fn enable_change_notify(token: HANDLE) -> crate::Result<()> {
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
     let ok2 = unsafe {
-        AdjustTokenPrivileges(
-            token,
-            0,
-            &tp,
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
+        AdjustTokenPrivileges(token, 0, &tp, 0, std::ptr::null_mut(), std::ptr::null_mut())
     };
     if ok2 == 0 {
         return Err(winutil::err("AdjustTokenPrivileges"));

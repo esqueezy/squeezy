@@ -58,11 +58,7 @@ fn fresh_workspace(tag: &str) -> PathBuf {
 /// if the spawn was skipped because the host can't create restricted tokens.
 fn run_cmd(workspace: &Path, cmdline_arg: &str) -> Option<std::process::ExitStatus> {
     let spec = make_spec(workspace);
-    let argv = vec![
-        "cmd".to_string(),
-        "/c".to_string(),
-        cmdline_arg.to_string(),
-    ];
+    let argv = vec!["cmd".to_string(), "/c".to_string(), cmdline_arg.to_string()];
     let env: HashMap<String, String> = std::env::vars().collect();
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");

@@ -847,9 +847,9 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
                     ),
                 ))
             }
-            WindowsSandboxLevel::RestrictedToken => {
-                Ok(windows_restricted_plan(command, config, root, required, None))
-            }
+            WindowsSandboxLevel::RestrictedToken => Ok(windows_restricted_plan(
+                command, config, root, required, None,
+            )),
         }
     }
 

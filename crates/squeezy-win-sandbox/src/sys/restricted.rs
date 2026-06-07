@@ -84,9 +84,7 @@ pub(crate) fn spawn(
     // prevents the sandboxed process (which carries World as a restricting SID)
     // from writing to pre-existing world-writable directories.  Best-effort —
     // failures are logged but never propagate.
-    if spec.token_mode == WinTokenMode::WritableRootsCapability
-        && !spec.writable_roots.is_empty()
-    {
+    if spec.token_mode == WinTokenMode::WritableRootsCapability && !spec.writable_roots.is_empty() {
         // all_cap_sids[0] = readonly cap SID; [1] = first writable-root cap SID.
         // The token carries every cap SID as a restricting SID, so denying any
         // one of them blocks the sandbox (all restricting SIDs must pass).

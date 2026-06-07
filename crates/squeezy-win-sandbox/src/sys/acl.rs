@@ -3,15 +3,12 @@
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
-use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSID,
-};
-use windows_sys::Win32::Security::Authorization::{
-    ACCESS_MODE, DENY_ACCESS, EXPLICIT_ACCESS_W, GetNamedSecurityInfoW,
-    SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW,
-    TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
-};
 use windows_sys::Win32::Security::ACL;
+use windows_sys::Win32::Security::Authorization::{
+    ACCESS_MODE, DENY_ACCESS, EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, SE_FILE_OBJECT, SET_ACCESS,
+    SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+};
+use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSID};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_APPEND_DATA, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
@@ -59,7 +56,11 @@ fn apply_ace(
         )));
     }
 
-    let inheritance = if inherit { INHERIT_FLAGS } else { NO_INHERITANCE };
+    let inheritance = if inherit {
+        INHERIT_FLAGS
+    } else {
+        NO_INHERITANCE
+    };
 
     let ea = EXPLICIT_ACCESS_W {
         grfAccessPermissions: access_mask,
@@ -75,9 +76,7 @@ fn apply_ace(
     };
 
     let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
-    let code2 = unsafe {
-        SetEntriesInAclW(1, &ea, p_dacl, &mut p_new_dacl)
-    };
+    let code2 = unsafe { SetEntriesInAclW(1, &ea, p_dacl, &mut p_new_dacl) };
 
     if code2 != ERROR_SUCCESS {
         unsafe {

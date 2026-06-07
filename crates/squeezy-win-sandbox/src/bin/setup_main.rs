@@ -27,10 +27,10 @@ fn run() -> Result<(), String> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use serde::Deserialize;
+    use squeezy_win_sandbox::{SETUP_VERSION, run_setup_privileged};
     use squeezy_win_sandbox::{
         WinNetwork, WinSandboxError, WinSandboxSpec, WinTokenMode, WinWritableRoot,
     };
-    use squeezy_win_sandbox::{SETUP_VERSION, run_setup_privileged};
     use std::path::PathBuf;
 
     let args: Vec<String> = std::env::args().collect();
@@ -66,8 +66,8 @@ fn run() -> Result<(), String> {
         sensitive_path_patterns: Vec<String>,
     }
 
-    let payload: ElevationPayload = serde_json::from_slice(&payload_json)
-        .map_err(|e| format!("JSON parse: {e}"))?;
+    let payload: ElevationPayload =
+        serde_json::from_slice(&payload_json).map_err(|e| format!("JSON parse: {e}"))?;
 
     if payload.version != SETUP_VERSION {
         return Err(format!(

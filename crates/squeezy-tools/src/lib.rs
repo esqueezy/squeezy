@@ -158,11 +158,11 @@ use shell_sandbox::{
     ShellSandboxBackendStatus, prepare_shell_sandbox_plan_with_probe,
     shell_sandbox_runtime_unavailable_with_probe,
 };
+pub use shell_sandbox::{ShellSandboxDoctor, shell_sandbox_doctor};
 use shell_sandbox::{
     ShellSandboxHealth, ShellSandboxPlan, apply_shell_sandbox_backend_health,
     prepare_shell_sandbox_plan, shell_sandbox_backend_probe_failure,
 };
-pub use shell_sandbox::{ShellSandboxDoctor, shell_sandbox_doctor};
 
 /// Provision the Windows elevated sandbox tier (one-time, prompts for UAC):
 /// creates the hidden local sandbox users and installs the persistent WFP

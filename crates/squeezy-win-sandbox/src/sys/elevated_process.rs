@@ -10,9 +10,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE,
-    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW,
-    CreateProcessWithLogonW,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithLogonW,
+    LOGON_WITH_PROFILE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 use super::winutil::{ScopedHandle, err, to_wide, to_wide_path};
@@ -98,9 +97,7 @@ pub(crate) fn spawn_with_logon(
         (stdin_write, "stdin_write"),
     ] {
         if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) } == 0 {
-            return Err(err(&format!(
-                "SetHandleInformation({label} non-inherit)"
-            )));
+            return Err(err(&format!("SetHandleInformation({label} non-inherit)")));
         }
     }
 
@@ -132,7 +129,7 @@ pub(crate) fn spawn_with_logon(
             domain_wide.as_ptr(),
             pass_wide.as_ptr(),
             LOGON_WITH_PROFILE,
-            std::ptr::null(),          // lpApplicationName — use command line
+            std::ptr::null(), // lpApplicationName — use command line
             command_line.as_mut_ptr(),
             // CREATE_SUSPENDED so the child is bound to its kill-on-close Job
             // Object before it can spawn descendants (no escape race) — the

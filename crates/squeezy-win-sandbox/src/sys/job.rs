@@ -43,12 +43,16 @@ pub(crate) fn create_and_assign(process: HANDLE) -> Option<HANDLE> {
             mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         ) == 0
         {
-            tracing::warn!("SetInformationJobObject failed; sandboxed child runs without tree-kill");
+            tracing::warn!(
+                "SetInformationJobObject failed; sandboxed child runs without tree-kill"
+            );
             CloseHandle(job);
             return None;
         }
         if AssignProcessToJobObject(job, process) == 0 {
-            tracing::warn!("AssignProcessToJobObject failed; sandboxed child runs without tree-kill");
+            tracing::warn!(
+                "AssignProcessToJobObject failed; sandboxed child runs without tree-kill"
+            );
             CloseHandle(job);
             return None;
         }

@@ -21,12 +21,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
+use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
-    ACE_HEADER, ACL, ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
     DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, PSID,
-};
-use windows_sys::Win32::Security::Authorization::{
-    GetNamedSecurityInfoW, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -233,17 +231,17 @@ fn gather_candidates(cwd: &Path, env: &HashMap<String, String>) -> Vec<PathBuf> 
 
     // 3. User-profile roots.
     for var in ["USERPROFILE", "PUBLIC"] {
-        if let Some(v) = env
-            .get(var)
-            .cloned()
-            .or_else(|| std::env::var(var).ok())
-        {
+        if let Some(v) = env.get(var).cloned().or_else(|| std::env::var(var).ok()) {
             push(PathBuf::from(v));
         }
     }
 
     // 4. PATH entries.
-    if let Some(path_val) = env.get("PATH").cloned().or_else(|| std::env::var("PATH").ok()) {
+    if let Some(path_val) = env
+        .get("PATH")
+        .cloned()
+        .or_else(|| std::env::var("PATH").ok())
+    {
         for part in std::env::split_paths(std::ffi::OsStr::new(&path_val)) {
             if !part.as_os_str().is_empty() {
                 push(part);
@@ -278,35 +276,35 @@ pub(crate) fn audit_world_writable(
             .any(|root_key| key == *root_key || key.starts_with(&format!("{}/", root_key)))
     };
 
-    let check_and_flag = |p: &Path,
-                               flagged: &mut Vec<PathBuf>,
-                               seen_flagged: &mut HashSet<String>| {
-        if is_reparse_point(p) || !is_directory_attr(p) {
-            return;
-        }
-        if is_under_writable_root(p) {
-            return;
-        }
-        match world_has_write_access(p) {
-            Ok(true) => {
-                let key = path_norm::canonical_key(p);
-                if seen_flagged.insert(key) {
-                    flagged.push(p.to_path_buf());
+    let check_and_flag =
+        |p: &Path, flagged: &mut Vec<PathBuf>, seen_flagged: &mut HashSet<String>| {
+            if is_reparse_point(p) || !is_directory_attr(p) {
+                return;
+            }
+            if is_under_writable_root(p) {
+                return;
+            }
+            match world_has_write_access(p) {
+                Ok(true) => {
+                    let key = path_norm::canonical_key(p);
+                    if seen_flagged.insert(key) {
+                        flagged.push(p.to_path_buf());
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        path = %p.display(),
+                        err = %e,
+                        "world_writable: error checking ACL; skipping"
+                    );
                 }
             }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(
-                    path = %p.display(),
-                    err = %e,
-                    "world_writable: error checking ACL; skipping"
-                );
-            }
-        }
-    };
+        };
 
-    let over_limit =
-        |start: &Instant, checked: usize| -> bool { start.elapsed() > AUDIT_TIME_LIMIT || checked > MAX_TOTAL_CHECKED };
+    let over_limit = |start: &Instant, checked: usize| -> bool {
+        start.elapsed() > AUDIT_TIME_LIMIT || checked > MAX_TOTAL_CHECKED
+    };
 
     // Fast path: CWD immediate children first (workspace escape issues caught early).
     if !over_limit(&start, checked)

@@ -18,9 +18,7 @@ use windows_sys::Win32::Security::{
     AllocateAndInitializeSid, CheckTokenMembership, FreeSid, SECURITY_NT_AUTHORITY,
 };
 use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
-use windows_sys::Win32::UI::Shell::{
-    SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
-};
+use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 
 use crate::{TeardownReport, WinSandboxError, WinSandboxSpec};
 
@@ -78,11 +76,8 @@ fn is_elevated() -> crate::Result<bool> {
         }
         let mut is_member: i32 = 0;
         // Pass null handle so CheckTokenMembership uses the thread/process token.
-        let check = CheckTokenMembership(
-            std::ptr::null_mut(),
-            admins_sid,
-            &mut is_member as *mut _,
-        );
+        let check =
+            CheckTokenMembership(std::ptr::null_mut(), admins_sid, &mut is_member as *mut _);
         FreeSid(admins_sid);
         if check == 0 {
             return Err(WinSandboxError::win32(format!(
@@ -128,7 +123,11 @@ fn payload_from_spec(spec: &WinSandboxSpec) -> ElevationPayload {
     ElevationPayload {
         version: SETUP_VERSION,
         state_dir: spec.state_dir.clone(),
-        writable_roots: spec.writable_roots.iter().map(SerWritableRoot::from).collect(),
+        writable_roots: spec
+            .writable_roots
+            .iter()
+            .map(SerWritableRoot::from)
+            .collect(),
         read_roots: spec.read_roots.clone(),
         deny_read_paths: spec.deny_read_paths.clone(),
         protected_metadata_names: spec.protected_metadata_names.clone(),
@@ -138,10 +137,7 @@ fn payload_from_spec(spec: &WinSandboxSpec) -> ElevationPayload {
 
 // ── UAC re-launch ─────────────────────────────────────────────────────────────
 
-fn launch_elevated_helper(
-    payload: &ElevationPayload,
-    state_dir: &Path,
-) -> crate::Result<()> {
+fn launch_elevated_helper(payload: &ElevationPayload, state_dir: &Path) -> crate::Result<()> {
     let helper = setup_helper_exe().map_err(|e| {
         let _ = write_setup_error_report(
             state_dir,
@@ -153,9 +149,8 @@ fn launch_elevated_helper(
         e
     })?;
 
-    let json = serde_json::to_string(payload).map_err(|e| {
-        WinSandboxError::win32(format!("serialise elevation payload: {e}"))
-    })?;
+    let json = serde_json::to_string(payload)
+        .map_err(|e| WinSandboxError::win32(format!("serialise elevation payload: {e}")))?;
     let b64 = BASE64.encode(json.as_bytes());
 
     let exe_w: Vec<u16> = to_wide(&helper);
@@ -192,7 +187,10 @@ fn launch_elevated_helper(
         );
         let _ = write_setup_error_report(
             state_dir,
-            &SetupErrorReport { code, message: msg.clone() },
+            &SetupErrorReport {
+                code,
+                message: msg.clone(),
+            },
         );
         return Err(WinSandboxError::win32(msg));
     }
@@ -235,9 +233,8 @@ fn read_helper_error(state_dir: &Path, exit_code: u32) -> WinSandboxError {
 /// the `"runas"` verb (UAC prompt).
 pub(crate) fn run_elevated_setup(spec: &WinSandboxSpec) -> crate::Result<()> {
     std::fs::create_dir_all(&spec.state_dir)?;
-    let elevated = is_elevated().map_err(|e| {
-        WinSandboxError::win32(format!("elevation check: {e}"))
-    })?;
+    let elevated =
+        is_elevated().map_err(|e| WinSandboxError::win32(format!("elevation check: {e}")))?;
     if elevated {
         return run_setup_privileged(spec);
     }
@@ -283,24 +280,20 @@ fn provision_privileged(spec: &WinSandboxSpec) -> crate::Result<()> {
     let online_pwd = generate_password();
 
     // Create / update users.
-    create_or_update_user(OFFLINE_USERNAME, &offline_pwd).map_err(|e| {
-        WinSandboxError::win32(format!("create offline user: {e}"))
-    })?;
-    create_or_update_user(ONLINE_USERNAME, &online_pwd).map_err(|e| {
-        WinSandboxError::win32(format!("create online user: {e}"))
-    })?;
+    create_or_update_user(OFFLINE_USERNAME, &offline_pwd)
+        .map_err(|e| WinSandboxError::win32(format!("create offline user: {e}")))?;
+    create_or_update_user(ONLINE_USERNAME, &online_pwd)
+        .map_err(|e| WinSandboxError::win32(format!("create online user: {e}")))?;
 
     // Hide from login screen.
     hide_user_from_login(OFFLINE_USERNAME)?;
     hide_user_from_login(ONLINE_USERNAME)?;
 
     // DPAPI-encrypt passwords.
-    let offline_blob = super::dpapi::protect(offline_pwd.as_bytes()).map_err(|e| {
-        WinSandboxError::win32(format!("DPAPI protect offline: {e}"))
-    })?;
-    let online_blob = super::dpapi::protect(online_pwd.as_bytes()).map_err(|e| {
-        WinSandboxError::win32(format!("DPAPI protect online: {e}"))
-    })?;
+    let offline_blob = super::dpapi::protect(offline_pwd.as_bytes())
+        .map_err(|e| WinSandboxError::win32(format!("DPAPI protect offline: {e}")))?;
+    let online_blob = super::dpapi::protect(online_pwd.as_bytes())
+        .map_err(|e| WinSandboxError::win32(format!("DPAPI protect online: {e}")))?;
 
     // Write users file.
     let users_file = SandboxUsersFile {
@@ -314,9 +307,8 @@ fn provision_privileged(spec: &WinSandboxSpec) -> crate::Result<()> {
             password_dpapi_b64: BASE64.encode(&online_blob),
         },
     };
-    write_users_file(&spec.state_dir, &users_file).map_err(|e| {
-        WinSandboxError::win32(format!("write sandbox_users.json: {e}"))
-    })?;
+    write_users_file(&spec.state_dir, &users_file)
+        .map_err(|e| WinSandboxError::win32(format!("write sandbox_users.json: {e}")))?;
 
     // Write marker.
     let marker = SetupMarker {
@@ -324,25 +316,21 @@ fn provision_privileged(spec: &WinSandboxSpec) -> crate::Result<()> {
         offline_username: OFFLINE_USERNAME.to_string(),
         online_username: ONLINE_USERNAME.to_string(),
     };
-    write_marker(&spec.state_dir, &marker).map_err(|e| {
-        WinSandboxError::win32(format!("write setup_marker.json: {e}"))
-    })?;
+    write_marker(&spec.state_dir, &marker)
+        .map_err(|e| WinSandboxError::win32(format!("write setup_marker.json: {e}")))?;
 
     // Resolve SIDs and apply ACLs.
-    let offline_sid = account_sid_string(OFFLINE_USERNAME).map_err(|e| {
-        WinSandboxError::win32(format!("SID for offline user: {e}"))
-    })?;
-    let online_sid = account_sid_string(ONLINE_USERNAME).map_err(|e| {
-        WinSandboxError::win32(format!("SID for online user: {e}"))
-    })?;
+    let offline_sid = account_sid_string(OFFLINE_USERNAME)
+        .map_err(|e| WinSandboxError::win32(format!("SID for offline user: {e}")))?;
+    let online_sid = account_sid_string(ONLINE_USERNAME)
+        .map_err(|e| WinSandboxError::win32(format!("SID for online user: {e}")))?;
 
     apply_root_acls(spec, &offline_sid, &online_sid)?;
 
     // Install WFP egress-block filters for the offline sandbox user.
     // Network blocking is part of the elevated-tier guarantee; fail hard.
-    super::wfp::install_block_filters(&offline_sid).map_err(|e| {
-        WinSandboxError::win32(format!("WFP install_block_filters: {e}"))
-    })?;
+    super::wfp::install_block_filters(&offline_sid)
+        .map_err(|e| WinSandboxError::win32(format!("WFP install_block_filters: {e}")))?;
 
     Ok(())
 }
@@ -366,9 +354,7 @@ pub(crate) fn run_setup_refresh(spec: &WinSandboxSpec) -> crate::Result<()> {
 }
 
 /// Remove all persistent machine state created by the elevated tier.
-pub(crate) fn teardown_machine_state(
-    state_dir: &Path,
-) -> crate::Result<TeardownReport> {
+pub(crate) fn teardown_machine_state(state_dir: &Path) -> crate::Result<TeardownReport> {
     let mut report = TeardownReport::default();
 
     for username in &[OFFLINE_USERNAME, ONLINE_USERNAME] {

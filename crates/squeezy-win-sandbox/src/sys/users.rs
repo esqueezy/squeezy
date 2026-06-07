@@ -3,16 +3,14 @@
 
 use std::ffi::OsStr;
 
-use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, HLOCAL, LocalFree,
-};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HLOCAL, LocalFree};
 use windows_sys::Win32::NetworkManagement::NetManagement::{
-    NERR_Success, NERR_UserExists, NERR_UserNotFound, NetUserAdd, NetUserDel,
-    NetUserSetInfo, UF_DONT_EXPIRE_PASSWD, UF_PASSWD_CANT_CHANGE, UF_SCRIPT, USER_INFO_1,
-    USER_INFO_1003, USER_PRIV_USER,
+    NERR_Success, NERR_UserExists, NERR_UserNotFound, NetUserAdd, NetUserDel, NetUserSetInfo,
+    UF_DONT_EXPIRE_PASSWD, UF_PASSWD_CANT_CHANGE, UF_SCRIPT, USER_INFO_1, USER_INFO_1003,
+    USER_PRIV_USER,
 };
-use windows_sys::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows_sys::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE,
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW,
@@ -159,12 +157,7 @@ pub(crate) fn account_sid_string(username: &str) -> crate::Result<String> {
 
     // Convert SID to string.
     let mut str_ptr: *mut u16 = std::ptr::null_mut();
-    let ok = unsafe {
-        ConvertSidToStringSidW(
-            sid_buf.as_mut_ptr() as *mut _,
-            &mut str_ptr,
-        )
-    };
+    let ok = unsafe { ConvertSidToStringSidW(sid_buf.as_mut_ptr() as *mut _, &mut str_ptr) };
     if ok == 0 || str_ptr.is_null() {
         return Err(err("ConvertSidToStringSidW"));
     }

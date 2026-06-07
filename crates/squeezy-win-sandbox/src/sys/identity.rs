@@ -87,10 +87,7 @@ pub(crate) fn elevated_setup_is_complete(state_dir: &Path) -> bool {
 /// Returns `NotProvisioned` if the users file is absent or version-mismatched.
 /// The runner phase consumes this function.
 #[allow(dead_code)]
-pub(crate) fn sandbox_creds(
-    state_dir: &Path,
-    network: WinNetwork,
-) -> crate::Result<SandboxCreds> {
+pub(crate) fn sandbox_creds(state_dir: &Path, network: WinNetwork) -> crate::Result<SandboxCreds> {
     let users = load_users(state_dir)?.ok_or_else(|| {
         crate::WinSandboxError::NotProvisioned(
             "sandbox_users.json missing; run elevated setup first".into(),
@@ -109,11 +106,17 @@ pub(crate) fn sandbox_creds(
     let blob = BASE64
         .decode(record.password_dpapi_b64.as_bytes())
         .map_err(|e| {
-            crate::WinSandboxError::win32(format!("base64 decode password for '{}': {e}", record.username))
+            crate::WinSandboxError::win32(format!(
+                "base64 decode password for '{}': {e}",
+                record.username
+            ))
         })?;
     let plaintext = super::dpapi::unprotect(&blob)?;
     let password = String::from_utf8(plaintext).map_err(|e| {
-        crate::WinSandboxError::win32(format!("password UTF-8 decode for '{}': {e}", record.username))
+        crate::WinSandboxError::win32(format!(
+            "password UTF-8 decode for '{}': {e}",
+            record.username
+        ))
     })?;
     Ok(SandboxCreds {
         username: record.username,
@@ -124,27 +127,19 @@ pub(crate) fn sandbox_creds(
 // ── Writers (called from setup.rs) ───────────────────────────────────────────
 
 /// Serialise and write `SandboxUsersFile` to `<state_dir>/sandbox_users.json`.
-pub(crate) fn write_users_file(
-    state_dir: &Path,
-    file: &SandboxUsersFile,
-) -> crate::Result<()> {
+pub(crate) fn write_users_file(state_dir: &Path, file: &SandboxUsersFile) -> crate::Result<()> {
     std::fs::create_dir_all(state_dir)?;
-    let json = serde_json::to_vec_pretty(file).map_err(|e| {
-        crate::WinSandboxError::win32(format!("serialise sandbox_users.json: {e}"))
-    })?;
+    let json = serde_json::to_vec_pretty(file)
+        .map_err(|e| crate::WinSandboxError::win32(format!("serialise sandbox_users.json: {e}")))?;
     std::fs::write(users_path(state_dir), json)?;
     Ok(())
 }
 
 /// Serialise and write `SetupMarker` to `<state_dir>/setup_marker.json`.
-pub(crate) fn write_marker(
-    state_dir: &Path,
-    marker: &SetupMarker,
-) -> crate::Result<()> {
+pub(crate) fn write_marker(state_dir: &Path, marker: &SetupMarker) -> crate::Result<()> {
     std::fs::create_dir_all(state_dir)?;
-    let json = serde_json::to_vec_pretty(marker).map_err(|e| {
-        crate::WinSandboxError::win32(format!("serialise setup_marker.json: {e}"))
-    })?;
+    let json = serde_json::to_vec_pretty(marker)
+        .map_err(|e| crate::WinSandboxError::win32(format!("serialise setup_marker.json: {e}")))?;
     std::fs::write(marker_path(state_dir), json)?;
     Ok(())
 }

@@ -46,14 +46,7 @@ pub(crate) fn ssh_config_dependency_paths(home: Option<&Path>) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = vec![config_path.clone()];
     let mut visited: HashSet<PathBuf> = HashSet::new();
 
-    visit_config(
-        &config_path,
-        home,
-        &ssh_dir,
-        &mut visited,
-        &mut paths,
-        0,
-    );
+    visit_config(&config_path, home, &ssh_dir, &mut visited, &mut paths, 0);
 
     paths
 }
@@ -148,7 +141,11 @@ fn expand_include(arg: &str, home: &Path, ssh_dir: &Path) -> Vec<PathBuf> {
         .filter_map(|e| {
             let p = e.path();
             let p_str = p.to_string_lossy().replace('\\', "/");
-            if glob_set.is_match(&p_str) { Some(p) } else { None }
+            if glob_set.is_match(&p_str) {
+                Some(p)
+            } else {
+                None
+            }
         })
         .collect()
 }

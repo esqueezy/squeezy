@@ -66,8 +66,7 @@ pub(crate) fn write_setup_error_report(
 ) -> std::result::Result<(), std::io::Error> {
     std::fs::create_dir_all(state_dir)?;
     let path = setup_error_path(state_dir);
-    let json = serde_json::to_vec_pretty(report)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_vec_pretty(report).map_err(std::io::Error::other)?;
     std::fs::write(path, json)
 }
 

@@ -19,15 +19,14 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_ACTION_BLOCK, FWP_ACTRL_MATCH_FILTER, FWP_BYTE_BLOB, FWP_CONDITION_VALUE0,
-    FWP_CONDITION_VALUE0_0, FWP_EMPTY, FWP_MATCH_EQUAL, FWP_SECURITY_DESCRIPTOR_TYPE, FWP_UINT16,
-    FWP_UINT8, FWP_VALUE0, FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_ALE_USER_ID,
+    FWP_CONDITION_VALUE0_0, FWP_EMPTY, FWP_MATCH_EQUAL, FWP_SECURITY_DESCRIPTOR_TYPE, FWP_UINT8,
+    FWP_UINT16, FWP_VALUE0, FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_ALE_USER_ID,
     FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0,
-    FWPM_FILTER0, FWPM_FILTER0_0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERSISTENT,
-    FWPM_PROVIDER0, FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_SESSION0, FWPM_SUBLAYER0,
-    FWPM_SUBLAYER_FLAG_PERSISTENT, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0,
-    FwpmFilterDeleteByKey0, FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmSubLayerAdd0,
-    FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
-    FwpmTransactionCommit0,
+    FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0, FWPM_FILTER0_0,
+    FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_PROVIDER0, FWPM_SESSION0, FWPM_SUBLAYER_FLAG_PERSISTENT,
+    FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteByKey0,
+    FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
+    FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
 };
 use windows_sys::Win32::Security::Authorization::{
     BuildExplicitAccessWithNameW, BuildSecurityDescriptorW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
@@ -65,17 +64,9 @@ impl Engine {
         session.txnWaitTimeoutInMSec = INFINITE;
         // Flags = 0 → persistent session (filters survive engine close).
 
-        let mut handle: windows_sys::Win32::Foundation::HANDLE =
-            unsafe { zeroed() };
-        let rc = unsafe {
-            FwpmEngineOpen0(
-                null(),
-                RPC_C_AUTHN_WINNT,
-                null(),
-                &session,
-                &mut handle,
-            )
-        };
+        let mut handle: windows_sys::Win32::Foundation::HANDLE = unsafe { zeroed() };
+        let rc =
+            unsafe { FwpmEngineOpen0(null(), RPC_C_AUTHN_WINNT, null(), &session, &mut handle) };
         wfp_ok(rc, "FwpmEngineOpen0")?;
         Ok(Self { handle })
     }
@@ -164,9 +155,9 @@ impl UserMatchCondition {
                 null_mut(), // group: keep default
                 1,          // count of EXPLICIT_ACCESS entries
                 &access,
-                0,           // no deny ACEs
-                null_mut(),  // no deny-ACE array
-                null_mut(),  // no existing descriptor to merge
+                0,          // no deny ACEs
+                null_mut(), // no deny-ACE array
+                null_mut(), // no existing descriptor to merge
                 &mut sd_size,
                 &mut sd,
             )
@@ -418,18 +409,10 @@ pub(crate) fn remove_filters() -> crate::Result<usize> {
 
     // Best-effort: remove sublayer then provider (ignore not-found).
     let rc = unsafe { FwpmSubLayerDeleteByKey0(engine.handle, &SUBLAYER_KEY) };
-    let _ = wfp_ok_or(
-        rc,
-        "FwpmSubLayerDeleteByKey0",
-        &[FWP_E_NOT_FOUND as u32],
-    );
+    let _ = wfp_ok_or(rc, "FwpmSubLayerDeleteByKey0", &[FWP_E_NOT_FOUND as u32]);
 
     let rc = unsafe { FwpmProviderDeleteByKey0(engine.handle, &PROVIDER_KEY) };
-    let _ = wfp_ok_or(
-        rc,
-        "FwpmProviderDeleteByKey0",
-        &[FWP_E_NOT_FOUND as u32],
-    );
+    let _ = wfp_ok_or(rc, "FwpmProviderDeleteByKey0", &[FWP_E_NOT_FOUND as u32]);
 
     tx.commit()?;
     Ok(removed)

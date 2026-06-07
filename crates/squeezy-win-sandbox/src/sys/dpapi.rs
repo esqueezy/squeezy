@@ -6,8 +6,8 @@
 
 use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
 use windows_sys::Win32::Security::Cryptography::{
-    CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN,
-    CryptProtectData, CryptUnprotectData,
+    CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
+    CryptUnprotectData,
 };
 
 use crate::WinSandboxError;
@@ -38,9 +38,9 @@ pub(crate) fn protect(plaintext: &[u8]) -> crate::Result<Vec<u8>> {
         )
     };
     if ok == 0 {
-        return Err(WinSandboxError::win32(
-            super::winutil::format_win_error("CryptProtectData"),
-        ));
+        return Err(WinSandboxError::win32(super::winutil::format_win_error(
+            "CryptProtectData",
+        )));
     }
     let result =
         unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) }.to_vec();
@@ -71,9 +71,9 @@ pub(crate) fn unprotect(ciphertext: &[u8]) -> crate::Result<Vec<u8>> {
         )
     };
     if ok == 0 {
-        return Err(WinSandboxError::win32(
-            super::winutil::format_win_error("CryptUnprotectData"),
-        ));
+        return Err(WinSandboxError::win32(super::winutil::format_win_error(
+            "CryptUnprotectData",
+        )));
     }
     let result =
         unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) }.to_vec();

@@ -9,8 +9,9 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, CreateProcessAsUserW,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+    EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW,
 };
 
 use super::proc_thread_attr::ProcThreadAttrList;
@@ -112,11 +113,11 @@ pub(crate) fn spawn_with_token(
     let ok = unsafe {
         CreateProcessAsUserW(
             token,
-            std::ptr::null(),          // lpApplicationName — use command line
+            std::ptr::null(), // lpApplicationName — use command line
             command_line.as_mut_ptr(),
-            std::ptr::null(),          // lpProcessAttributes
-            std::ptr::null(),          // lpThreadAttributes
-            1,                         // bInheritHandles = TRUE
+            std::ptr::null(), // lpProcessAttributes
+            std::ptr::null(), // lpThreadAttributes
+            1,                // bInheritHandles = TRUE
             // CREATE_SUSPENDED so the child is assigned to its kill-on-close Job
             // Object before it can spawn any descendants (no escape race).
             CREATE_UNICODE_ENVIRONMENT

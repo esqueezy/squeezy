@@ -13,9 +13,8 @@ const SETUP_EXE: &str = "squeezy-sandbox-setup.exe";
 
 /// Locate the elevated-setup helper binary.
 pub(crate) fn setup_helper_exe() -> crate::Result<PathBuf> {
-    let current_exe = std::env::current_exe().map_err(|e| {
-        crate::WinSandboxError::win32(format!("resolve current executable: {e}"))
-    })?;
+    let current_exe = std::env::current_exe()
+        .map_err(|e| crate::WinSandboxError::win32(format!("resolve current executable: {e}")))?;
 
     if let Some(dir) = current_exe.parent() {
         let candidate = dir.join(SETUP_EXE);

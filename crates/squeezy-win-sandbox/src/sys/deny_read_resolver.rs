@@ -120,9 +120,7 @@ fn literal_scan_root(pattern: &str) -> PathBuf {
     let literal_prefix = &pattern[..first_glob];
 
     // Trim to the last path separator within the literal prefix.
-    let sep_idx = literal_prefix
-        .rfind(['/', '\\'])
-        .unwrap_or(0);
+    let sep_idx = literal_prefix.rfind(['/', '\\']).unwrap_or(0);
 
     let dir_part = if sep_idx == 0 && !literal_prefix.is_empty() {
         // The glob starts at the root or has no separator: scan the pattern root.
@@ -244,7 +242,10 @@ mod tests {
         let result = resolve_deny_read_paths(&patterns, std::slice::from_ref(&f), None, &tmp);
 
         let count = result.iter().filter(|p| p.ends_with("dup.txt")).count();
-        assert_eq!(count, 1, "expected exactly one entry for dup.txt; got {result:?}");
+        assert_eq!(
+            count, 1,
+            "expected exactly one entry for dup.txt; got {result:?}"
+        );
 
         cleanup(&tmp);
     }
