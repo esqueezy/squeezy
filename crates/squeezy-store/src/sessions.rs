@@ -268,36 +268,40 @@ impl SessionStore {
         {
             return entries;
         }
-        let Ok(file) = fs::File::open(&path) else {
-            return Vec::new();
-        };
-        let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        let mut raw_lines = 0usize;
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => return Vec::new(),
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(trimmed) else {
-                continue;
+        let (mut entries, raw_lines) = {
+            let Ok(file) = fs::File::open(&path) else {
+                return Vec::new();
             };
-            raw_lines += 1;
-            match by_id.get(&entry.session_id) {
-                Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => continue,
-                _ => {
-                    by_id.insert(entry.session_id.clone(), entry);
+            let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
+            let mut reader = BufReader::new(file);
+            let mut line = String::new();
+            let mut raw_lines = 0usize;
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => return Vec::new(),
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(trimmed) else {
+                    continue;
+                };
+                raw_lines += 1;
+                match by_id.get(&entry.session_id) {
+                    Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => {
+                        continue;
+                    }
+                    _ => {
+                        by_id.insert(entry.session_id.clone(), entry);
+                    }
                 }
             }
-        }
-        let mut entries: Vec<GlobalSessionIndexEntry> = by_id.into_values().collect();
+            (by_id.into_values().collect::<Vec<_>>(), raw_lines)
+        };
         // Drop all but the most-recent `GLOBAL_INDEX_MAX_ENTRIES` so the index
         // can never grow unbounded with a user's lifetime session count. The
         // newest-first return order below is what the picker consumes.
