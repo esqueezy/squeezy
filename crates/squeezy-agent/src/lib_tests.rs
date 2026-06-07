@@ -2844,6 +2844,96 @@ async fn ai_reviewer_denies_without_user_prompt() {
 }
 
 #[tokio::test]
+async fn ai_reviewer_escalation_denial_reaches_user_prompt() {
+    let root = temp_workspace("agent_ai_reviewer_escalation_denial");
+    let doomed = root.join("created.txt");
+    fs::write(&doomed, "keep\n").expect("write fixture");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "rm_1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "rm -rf created.txt",
+                    "description": "destructive shell"
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                r#"{"action":"deny","reason":"destructive capability requests are never auto-approved per policy; must escalate to human"}"#.to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("reviewer".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let mut config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            destructive: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.permissions.ai_reviewer.enabled = true;
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("delete fixture".to_string(), CancellationToken::new());
+    let mut approvals_seen = 0usize;
+    let mut shell_result = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ApprovalRequested { decision_tx, .. } => {
+                approvals_seen += 1;
+                decision_tx
+                    .send(ToolApprovalDecision::Denied)
+                    .expect("send decision");
+            }
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "rm_1" => {
+                shell_result = Some(result);
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(approvals_seen, 1);
+    assert!(doomed.exists(), "human denial must keep fixture intact");
+    let shell_result = shell_result.expect("shell result");
+    assert_eq!(shell_result.status, ToolStatus::Denied);
+    assert!(
+        shell_result.content["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("user denied tool call")),
+        "{:?}",
+        shell_result.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn ai_reviewer_allow_for_non_allowlisted_edit_escalates_to_user() {
     let root = temp_workspace("agent_ai_reviewer_edit_escalates");
     let provider = Arc::new(MockProvider::new(vec![
@@ -4554,11 +4644,8 @@ fn plan_mode_keeps_discovery_capabilities_on_normal_policy_path() {
     for capability in [
         PermissionCapability::Read,
         PermissionCapability::Search,
-        PermissionCapability::Shell,
-        PermissionCapability::Git,
         PermissionCapability::Network,
         PermissionCapability::Mcp,
-        PermissionCapability::Compiler,
     ] {
         let request = permission_request_for_capability(capability);
         assert_eq!(
@@ -4568,6 +4655,76 @@ fn plan_mode_keeps_discovery_capabilities_on_normal_policy_path() {
         assert_eq!(
             mode_permission_verdict(SessionMode::Build, &request, None),
             None
+        );
+    }
+    for request in [
+        shell_permission_request(
+            "sonar context list --json",
+            PermissionCapability::Shell,
+            PermissionRisk::Medium,
+        ),
+        shell_permission_request(
+            "git status --short",
+            PermissionCapability::Git,
+            PermissionRisk::Low,
+        ),
+        shell_permission_request(
+            "cargo test -p squeezy-agent",
+            PermissionCapability::Compiler,
+            PermissionRisk::Medium,
+        ),
+    ] {
+        assert_eq!(
+            mode_permission_verdict(SessionMode::Plan, &request, None),
+            None
+        );
+        assert_eq!(
+            mode_permission_verdict(SessionMode::Build, &request, None),
+            None
+        );
+    }
+}
+
+#[test]
+fn plan_mode_shell_requests_must_be_proven_read_only() {
+    for (command, capability) in [
+        (
+            "sonar context guidelines get --languages java 2>/dev/null",
+            PermissionCapability::Shell,
+        ),
+        ("cargo fmt --check", PermissionCapability::Compiler),
+        (
+            "cargo test -p squeezy-agent",
+            PermissionCapability::Compiler,
+        ),
+        ("git status --short", PermissionCapability::Git),
+        ("git diff -- crates", PermissionCapability::Git),
+    ] {
+        let request = shell_permission_request(command, capability, PermissionRisk::Medium);
+        assert_eq!(
+            mode_permission_verdict(SessionMode::Plan, &request, None),
+            None,
+            "{command} should stay on the normal policy path"
+        );
+    }
+
+    for (command, capability) in [
+        ("cargo fmt", PermissionCapability::Compiler),
+        ("cargo clippy --fix", PermissionCapability::Compiler),
+        ("git checkout -b x", PermissionCapability::Git),
+        ("git branch x", PermissionCapability::Git),
+        ("node script.js", PermissionCapability::Shell),
+    ] {
+        let request = shell_permission_request(command, capability, PermissionRisk::High);
+        let verdict = mode_permission_verdict(SessionMode::Plan, &request, None)
+            .expect("mutating shell command should be denied in plan mode");
+        assert_eq!(verdict.action, PermissionAction::Deny);
+        assert!(
+            verdict
+                .reason
+                .contains("mutating or unproven shell command"),
+            "{command} denial reason should name shell mutation: {}",
+            verdict.reason
         );
     }
 }
@@ -5160,6 +5317,25 @@ fn permission_request_for_capability(capability: PermissionCapability) -> Permis
         risk: PermissionRisk::Medium,
         summary: format!("{} request", capability.as_str()),
         metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    }
+}
+
+fn shell_permission_request(
+    command: &str,
+    capability: PermissionCapability,
+    risk: PermissionRisk,
+) -> PermissionRequest {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("command".to_string(), command.to_string());
+    PermissionRequest {
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        capability,
+        target: "shell:*".to_string(),
+        risk,
+        summary: command.to_string(),
+        metadata,
         suggested_rules: Vec::new(),
     }
 }

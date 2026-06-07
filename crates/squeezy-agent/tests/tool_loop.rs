@@ -1925,7 +1925,7 @@ async fn plan_mode_still_denies_destructive_shell_without_approval() {
         outputs[0].1["content"]["error"]
             .as_str()
             .expect("denial reason")
-            .contains("plan mode refuses destructive")
+            .contains("plan mode refuses mutating or unproven shell command")
     );
 
     let _ = fs::remove_dir_all(root);
